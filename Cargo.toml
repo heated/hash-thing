@@ -1,0 +1,21 @@
+[package]
+name = "hash-thing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "29"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+rustc-hash = "2"
+
+# Optimize dependencies in dev builds (our code stays debug for fast iteration)
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
