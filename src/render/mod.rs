@@ -1,2 +1,5 @@
 mod renderer;
-pub use renderer::Renderer;
+mod svdag;
+
+pub use renderer::{RenderMode, Renderer};
+pub use svdag::Svdag;

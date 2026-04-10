@@ -13,16 +13,34 @@ struct Uniforms {
     params: [f32; 4],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenderMode {
+    Flat3D,
+    Svdag,
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+
+    // Flat 3D texture path
+    flat_pipeline: wgpu::RenderPipeline,
+    flat_bind_group: wgpu::BindGroup,
     volume_texture: wgpu::Texture,
+
+    // SVDAG path
+    svdag_pipeline: wgpu::RenderPipeline,
+    svdag_bind_group_layout: wgpu::BindGroupLayout,
+    svdag_bind_group: Option<wgpu::BindGroup>,
+    svdag_buffer: Option<wgpu::Buffer>,
+    svdag_buffer_cap: u64, // current allocation in bytes
+
+    // Shared
+    uniform_buffer: wgpu::Buffer,
     volume_size: u32,
+    pub mode: RenderMode,
     pub camera_yaw: f32,
     pub camera_pitch: f32,
     pub camera_dist: f32,
@@ -113,8 +131,10 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bind_group_layout"),
+        // === Flat 3D texture pipeline ===
+
+        let flat_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("flat_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -139,9 +159,9 @@ impl Renderer {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind_group"),
-            layout: &bind_group_layout,
+        let flat_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flat_bg"),
+            layout: &flat_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -154,28 +174,96 @@ impl Renderer {
             ],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("raycast shader"),
+        let flat_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("flat raycast shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("raycast.wgsl").into()),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline_layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+        let flat_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("flat_pl"),
+            bind_group_layouts: &[Some(&flat_bind_group_layout)],
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("render_pipeline"),
-            layout: Some(&pipeline_layout),
+        let flat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("flat_rp"),
+            layout: Some(&flat_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &flat_shader,
                 entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &flat_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // === SVDAG pipeline ===
+
+        let svdag_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("svdag_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let svdag_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("svdag raycast shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("svdag_raycast.wgsl").into()),
+        });
+
+        let svdag_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("svdag_pl"),
+            bind_group_layouts: &[Some(&svdag_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let svdag_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("svdag_rp"),
+            layout: Some(&svdag_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &svdag_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &svdag_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -199,15 +287,65 @@ impl Renderer {
             device,
             queue,
             config,
-            pipeline,
-            uniform_buffer,
-            bind_group,
+            flat_pipeline,
+            flat_bind_group,
             volume_texture,
+            svdag_pipeline,
+            svdag_bind_group_layout,
+            svdag_bind_group: None,
+            svdag_buffer: None,
+            svdag_buffer_cap: 0,
+            uniform_buffer,
             volume_size,
+            mode: RenderMode::Svdag,
             camera_yaw: std::f32::consts::FRAC_PI_4,
             camera_pitch: 0.4,
             camera_dist: 2.0,
             camera_target: [0.5, 0.5, 0.5],
+        }
+    }
+
+    /// Upload (or re-upload) a serialized SVDAG to the GPU.
+    pub fn upload_svdag(&mut self, dag: &super::Svdag) {
+        let bytes: &[u8] = bytemuck::cast_slice(&dag.nodes);
+        let needed = bytes.len() as u64;
+
+        // Allocate a larger buffer if necessary (grow-only)
+        if self.svdag_buffer.is_none() || needed > self.svdag_buffer_cap {
+            // Grow to next power of 2 with a floor of 64KB
+            let mut cap = self.svdag_buffer_cap.max(65536);
+            while cap < needed {
+                cap *= 2;
+            }
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("svdag_buffer"),
+                size: cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.svdag_buffer = Some(buffer);
+            self.svdag_buffer_cap = cap;
+
+            // Rebuild bind group
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("svdag_bg"),
+                layout: &self.svdag_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.svdag_buffer.as_ref().unwrap().as_entire_binding(),
+                    },
+                ],
+            });
+            self.svdag_bind_group = Some(bg);
+        }
+
+        if let Some(buf) = &self.svdag_buffer {
+            self.queue.write_buffer(buf, 0, bytes);
         }
     }
 
@@ -317,9 +455,25 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.draw(0..6, 0..1);
+            match self.mode {
+                RenderMode::Flat3D => {
+                    render_pass.set_pipeline(&self.flat_pipeline);
+                    render_pass.set_bind_group(0, &self.flat_bind_group, &[]);
+                    render_pass.draw(0..6, 0..1);
+                }
+                RenderMode::Svdag => {
+                    if let Some(bg) = &self.svdag_bind_group {
+                        render_pass.set_pipeline(&self.svdag_pipeline);
+                        render_pass.set_bind_group(0, bg, &[]);
+                        render_pass.draw(0..6, 0..1);
+                    } else {
+                        // No SVDAG uploaded yet — fall back to flat path.
+                        render_pass.set_pipeline(&self.flat_pipeline);
+                        render_pass.set_bind_group(0, &self.flat_bind_group, &[]);
+                        render_pass.draw(0..6, 0..1);
+                    }
+                }
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

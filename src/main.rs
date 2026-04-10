@@ -50,10 +50,21 @@ impl App {
         }
     }
 
-    fn upload_volume(&self) {
-        if let Some(renderer) = &self.renderer {
+    fn upload_volume(&mut self) {
+        if let Some(renderer) = &mut self.renderer {
             let data = self.world.flatten();
             renderer.upload_volume(&data);
+            // Also rebuild the SVDAG so the other render path stays in sync.
+            let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
+            if self.world.generation % 10 == 0 {
+                log::info!(
+                    "SVDAG: {} nodes, {} bytes, root_level={}",
+                    dag.node_count,
+                    dag.byte_size(),
+                    dag.root_level,
+                );
+            }
+            renderer.upload_svdag(&dag);
         }
     }
 }
@@ -130,6 +141,15 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("4") => {
                             self.rule = sim::GameOfLife3D::pyroclastic();
                             log::info!("Rule: Pyroclastic");
+                        }
+                        winit::keyboard::Key::Character("v") => {
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.mode = match renderer.mode {
+                                    render::RenderMode::Flat3D => render::RenderMode::Svdag,
+                                    render::RenderMode::Svdag => render::RenderMode::Flat3D,
+                                };
+                                log::info!("Render mode: {:?}", renderer.mode);
+                            }
                         }
                         _ => {}
                     }
@@ -214,6 +234,7 @@ fn main() {
     log::info!("  S: single step");
     log::info!("  R: reset");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
+    log::info!("  V: toggle Flat3D / SVDAG rendering");
     log::info!("  Esc: quit");
 
     let event_loop = EventLoop::new().unwrap();
