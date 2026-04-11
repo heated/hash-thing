@@ -120,11 +120,13 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         let pos = ro + rd * t;
 
         // If the current top-of-stack no longer contains `pos`, pop.
-        // NOTE: STRICT bounds (no EPS slack). The step-past advances `t` by +EPS
-        // which moves pos past the boundary by |rd_axis| * EPS > 0. If we allowed
-        // EPS slack here, the pop would consider pos "inside" after a step-past
-        // across an octant boundary (since |rd| * EPS < EPS on the pop side),
-        // causing infinite loops on simultaneous two-axis boundary crossings.
+        // NOTE: STRICT bounds (no EPS slack). The step-past below advances `t`
+        // past the octant exit by a scale-aware nudge sized to the child cell,
+        // guaranteeing pos is comfortably above f32 ULP past the boundary on the
+        // exit axis (hash-thing-27m). If we allowed EPS slack here, the pop would
+        // still consider pos "inside" after a step-past since the slack on this
+        // side could equal or exceed the per-axis positional advance, causing
+        // infinite loops on simultaneous two-axis boundary crossings.
         var top = depth;
         loop {
             let node_min = stack_min[top];
@@ -178,7 +180,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         }
 
         // Step the ray past the current (empty) octant.
-        // Compute t-value at which the ray exits the octant we're in.
+        // hash-thing-27m fix: per-axis exit + cell-scaled nudge so the
+        // post-step advance on the exit axis is comfortably above f32 ULP
+        // even at deep depths and grazing rays. The old fixed `+1e-5`
+        // stalled at depth >= 10 with |rd_axis| < ~0.01 because the
+        // resulting per-axis pos advance was sub-ULP near pos ~ 0.5.
         let node_min = stack_min[depth];
         let half = stack_half[depth];
         let oct = octant_of(pos, node_min, half);
@@ -188,9 +194,38 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             node_min.z + f32((oct >> 2u) & 1u) * half,
         );
         let child_max = child_min + vec3<f32>(half);
-        let oct_hit = intersect_aabb(ro, inv_rd, child_min, child_max);
-        // Advance t past the octant exit
-        t = oct_hit.y + 1e-5;
+        // Per-axis exit times. oct_far is the smallest tmax across the
+        // three axes — same value the old `intersect_aabb(...).y` returned
+        // — but exposed per-axis so we can identify which axis is the
+        // actual exit and scale the post-exit nudge against its |rd|.
+        let t1 = (child_min - ro) * inv_rd;
+        let t2 = (child_max - ro) * inv_rd;
+        let tmax_v = max(t1, t2);
+        var oct_far: f32 = tmax_v.x;
+        var exit_rd: f32 = abs(rd.x);
+        if tmax_v.y < oct_far {
+            oct_far = tmax_v.y;
+            exit_rd = abs(rd.y);
+        }
+        if tmax_v.z < oct_far {
+            oct_far = tmax_v.z;
+            exit_rd = abs(rd.z);
+        }
+        // Cell-scaled nudge clipped to 1e-5 at shallow levels (so the root
+        // behaves identically to the old `+1e-5` code) and shrinking with
+        // half at deeper levels. nudge_world IS the pos-advance on the exit
+        // axis (since dt = nudge / exit_rd → dt * exit_rd = nudge). The 1/64
+        // fraction at depth 14 (half ~ 6e-5) gives ~9.5e-7, ~16x f32 ULP at
+        // pos ~ 0.5.
+        let nudge_world = min(half * (1.0 / 64.0), 1e-5);
+        let dt_raw = nudge_world / max(exit_rd, 1e-6);
+        // Cap dt so the fastest axis advances at most one child span,
+        // preventing the step from skipping a non-empty sibling on a
+        // dominant axis.
+        let max_rd = max(max(abs(rd.x), abs(rd.y)), abs(rd.z));
+        let dt_cap = half / max(max_rd, 1e-6);
+        let dt = min(dt_raw, dt_cap);
+        t = oct_far + dt;
     }
 
     return vec4<f32>(0.0);

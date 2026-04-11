@@ -218,13 +218,14 @@ pub mod cpu_trace {
             let pos = [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
 
             // Pop until top contains pos.
-            // NOTE: pop check is STRICT (no EPS slack). The step-past advances `t`
-            // by +EPS which moves pos past the boundary by |rd_axis| * EPS > 0.
-            // If we allowed EPS slack here, the pop check would still consider pos
-            // "inside" after a step-past across an octant boundary (since the
-            // positional advance |rd| * EPS is smaller than the pop slack EPS),
-            // causing an infinite loop on boundary crossings. Strict bounds work
-            // because t = t_near + EPS on entry also places pos clearly inside.
+            // NOTE: pop check is STRICT (no EPS slack). The step-past below
+            // advances `t` past the octant exit by a scale-aware nudge sized
+            // to the current child cell, guaranteeing pos lands comfortably
+            // above f32 ULP past the boundary on the exit axis (hash-thing-27m).
+            // If we allowed EPS slack here, the pop check would still consider
+            // pos "inside" after a step-past since the slack on this side could
+            // equal or exceed the per-axis positional advance, causing infinite
+            // loops on simultaneous two-axis boundary crossings.
             let mut top = depth;
             loop {
                 let node_min = stack_min[top];
@@ -290,7 +291,18 @@ pub mod cpu_trace {
                 }
             }
 
-            // Step past
+            // Step past the current (empty) octant.
+            // hash-thing-27m fix: per-axis exit + cell-scaled, exit-axis-aware
+            // nudge. The old fixed `+EPS` advanced the per-axis position by
+            // `|rd_axis| * EPS`, which collapses below f32 ULP (~6e-8 near
+            // pos ~ 0.5) for exit_rd < 6e-3 — a configuration the traversal
+            // naturally enters at deep depths when pos lands close to an
+            // inter-octant face on a grazing axis. When that happens the
+            // pop/descend loop oscillates on the same boundary until MAX_STEPS
+            // fires. The replacement advances `t` so the exit-axis position
+            // advances by a world-space nudge of ~1e-5 (or ~half/64 at deep
+            // levels where 1e-5 would overshoot a cell), then caps dt so the
+            // fastest axis never crosses more than one child span.
             let node_min = stack_min[depth];
             let half = stack_half[depth];
             let oct = octant_of(pos, node_min, half);
@@ -300,9 +312,48 @@ pub mod cpu_trace {
                 node_min[2] + ((oct >> 2) & 1) as f32 * half,
             ];
             let child_max = [child_min[0] + half, child_min[1] + half, child_min[2] + half];
-            let (_, oct_far) = intersect_aabb(ro, inv_rd, child_min, child_max);
+            // Per-axis exit times. oct_far is the smallest tmax across the
+            // three axes (same value the old `intersect_aabb(...).1` returned)
+            // but exposed per-axis so we can identify which axis is the actual
+            // exit and scale the post-exit nudge against its |rd|.
+            let t1 = [
+                (child_min[0] - ro[0]) * inv_rd[0],
+                (child_min[1] - ro[1]) * inv_rd[1],
+                (child_min[2] - ro[2]) * inv_rd[2],
+            ];
+            let t2 = [
+                (child_max[0] - ro[0]) * inv_rd[0],
+                (child_max[1] - ro[1]) * inv_rd[1],
+                (child_max[2] - ro[2]) * inv_rd[2],
+            ];
+            let tmax_v = [t1[0].max(t2[0]), t1[1].max(t2[1]), t1[2].max(t2[2])];
+            let mut oct_far = tmax_v[0];
+            let mut exit_rd = rd[0].abs();
+            if tmax_v[1] < oct_far {
+                oct_far = tmax_v[1];
+                exit_rd = rd[1].abs();
+            }
+            if tmax_v[2] < oct_far {
+                oct_far = tmax_v[2];
+                exit_rd = rd[2].abs();
+            }
+            // World-space exit-axis nudge. `dt_raw = nudge / exit_rd` means
+            // pos advances by exactly `nudge_world` on the exit axis. Clip
+            // to EPS at shallow levels (root half/64 = 7.8e-3 would be ~1
+            // cell at depth 7, overshooting fine structure); shrink with
+            // half at deep levels (at depth 14, half/64 ~ 9.5e-7 ≥ 16x ULP).
+            let nudge_world = (half * (1.0 / 64.0)).min(EPS);
+            let dt_raw = nudge_world / exit_rd.max(1e-6);
+            // Cap dt so the fastest axis advances at most one child span,
+            // preventing the step from skipping a non-empty sibling on a
+            // dominant axis. For ultra-grazing rays (|rd_axis| < ~1e-5 at
+            // MAX_DEPTH) the cap binds and the exit-axis advance collapses
+            // below ULP — the f32 frontier noted in the plan.
+            let max_rd = rd[0].abs().max(rd[1].abs()).max(rd[2].abs());
+            let dt_cap = half / max_rd.max(1e-6);
+            let dt = dt_raw.min(dt_cap);
             let t_old = t;
-            t = oct_far + EPS;
+            t = oct_far + dt;
             if record { events.push(TraceEvent::StepPast { t_old, t_new: t }); }
         }
 
@@ -493,5 +544,55 @@ mod tests {
             misses,
             voxels.len()
         );
+    }
+
+    /// Regression: grazing rays at deep depth must make forward progress
+    /// through empty space in bounded steps. Before hash-thing-27m the
+    /// step-past used a fixed `+EPS` nudge, which on grazing rays (small
+    /// |rd_axis|) produced a per-axis positional advance of `|rd_axis| * EPS`
+    /// that fell below f32 ULP near pos ~ 0.5, stalling the traversal on
+    /// octant boundaries until MAX_STEPS fired.
+    ///
+    /// These three cases were captured from a fuzz sweep (seed 0xC0FFEE_u64,
+    /// `|rd| ~ 1e-3 to 3e-2`, depth 12) where the old code stalled 711/2000
+    /// times. With the fix, every case here resolves in <20 steps.
+    #[test]
+    fn grazing_ray_deep_forward_progress() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(12);
+        // Single deep voxel near the center so grazing rays sweep a lot of
+        // empty space at MAX_DEPTH before hitting (or missing).
+        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        let dag = Svdag::build(&store, root, 12);
+
+        // (origin, raw_direction) — captured from fuzz. Directions are not
+        // pre-normalized; the test normalizes below.
+        let cases: [([f32; 3], [f32; 3]); 3] = [
+            (
+                [-1.4759017, 0.49990046, 0.50164545],
+                [0.99999964, 5.037533e-5, -0.00083276606],
+            ),
+            (
+                [2.2919006, 0.4996382, 0.50008905],
+                [-1.0, 0.00020190649, -4.9705064e-5],
+            ),
+            (
+                [0.50007397, 0.5001334, 2.438742],
+                [-3.8144954e-5, -6.881864e-5, -1.0],
+            ),
+        ];
+
+        for (i, (ro, rd)) in cases.iter().enumerate() {
+            let rd_n = normalize(*rd);
+            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            // 400 << MAX_STEPS (512). Pre-fix code stalled at 512 on all three.
+            // Post-fix, observed step count is ≤ 20 on every case.
+            assert!(
+                result.steps < 400,
+                "case {i} (ro={ro:?}, rd={rd:?}): forward-progress regression — \
+                 used {steps} steps out of MAX_STEPS=512. Old code stalled here.",
+                steps = result.steps,
+            );
+        }
     }
 }
