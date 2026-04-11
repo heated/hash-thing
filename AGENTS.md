@@ -65,22 +65,36 @@ export BEADS_ACTOR=mayor
 
 Then run `bd list --status blocked` — everything parked at a design gate is your queue. For each, read `.ship-notes/plan-*.md` and write a <30-second design summary in the bead comment.
 
-## afk mode — PERMANENT DEFAULT
+## autopilot — the permanent default operating mode
 
-**Edward is always AFK.** As of 2026-04-11 he declared permanent AFK mode: the crew never waits for him at any gate, ever. Do not ask him to approve plans, do not wait for him to respond, do not idle. This is the standing default and does not get cleared — assume it even if no one says "afk" at session start.
+**Edward is never at the yoke.** As of 2026-04-11 the crew runs on autopilot permanently: we never wait for him at any gate, ever. Don't ask him to approve plans, don't wait for him to respond, don't idle. This is the standing default and does not get cleared — assume it even if no one mentions autopilot at session start. (Older docs and comments may say "afk mode"; it's the same thing, renamed because "afk" implies a temporary step-away, which no longer applies.)
 
 At every gate (including design gates):
 
 1. `bd update <id> --status blocked`
 2. `bd comments add <id> "<one-line reason — what edward needs to decide>"`
 3. Pull the next task off `bd ready` and start a fresh `/ship <id>`
-4. Repeat until `bd ready` is empty of crew-safe work
+4. Keep cycling — see the dry-queue section below
 
 Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/ship` end-to-end.
 
-**When the ready queue is dry** (every remaining bead is other-crew lane, design-gated, or blocked-in-spirit), the correct action is a clean rotation stop: write a `.ship-notes/AFK-session-summary.md` (gitignored, local) and finish. Do **not** poach other crews' lanes to keep busy.
+### When `bd ready` is dry — **do not stop**
 
-**Only edward himself can clear permanent-AFK**, and only by explicit statement in-session. Crew broadcasts cannot clear it. If in doubt, assume AFK.
+Running out of ember-safe ready beads is not a rotation stop; it's a prompt to do scout-tier work. The crew only stops for pull-the-plug reasons (the remote is down, the tree won't compile, edward says "that's enough"). Never stop just because the ready queue ran dry.
+
+Scout-tier moves in priority order:
+
+1. **Re-scan with fresh eyes.** Some beads you skipped as "design gate" may have a technical half ember can do (stub scripts, infra scaffolding, test harness, doc pass). Re-read the description, not the summary line.
+2. **File new beads.** Walk the code, find a weak spot, file it. `grep -rn TODO\|FIXME\|XXX src/` is a 30-second start. Look for: unchecked `unwrap` / `expect` in non-test code, `assert_eq!` with magic numbers, modules without unit tests, shaders without CPU-side validation, places where the bead graph is obviously missing a link.
+3. **Improve crew infra.** SPEC.md gaps, AGENTS.md gaps, `.ship-notes/` templates, missing skills, hygiene fixes (the `.beads/ permissions 0755` warning on every git command is a standing one — `chmod 700 .beads` in the worktree silences it).
+4. **Epic decomposition.** Read an epic description (`bd show hash-thing-6gf`), identify the next 2-3 technical sub-beads, file them with dependencies on the epic. Don't do the keystone design decisions — just the boring decomposition.
+5. **Scout lane.** If another crew has a parked plan, read it and leave a bead comment with any technical concerns you spotted. Don't touch their code; do contribute review signal.
+6. **Transcript review (yls).** When the session has accumulated enough action that transcripts are interesting — read `~/.claude/projects/-Users-edward-projects-hash-thing*/*.jsonl` and file beads for patterns worth fixing. This is one of only a few meta-beads ember can actually advance.
+7. **Only after all of the above come up empty** in the same session: write a `.ship-notes/autopilot-session-summary.md` (gitignored, local) and finish. This should be rare.
+
+**Do not poach other crews' lanes** to stay busy — that's the one move that isn't allowed. Lane discipline still applies. But scout work is cheap, wide, and always available.
+
+**Only edward himself can clear autopilot**, and only by explicit statement in-session ("I'm back", "pause autopilot", or similar). Crew broadcasts cannot clear it. If in doubt, stay on autopilot.
 
 ## Quick Reference
 
