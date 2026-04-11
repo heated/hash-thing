@@ -1,4 +1,4 @@
-# hash-thing (Ashfall)
+# Hash Thing
 
 3D voxel cellular automaton engine. See `SPEC.md` for architecture; `bd ready` for live task list.
 
@@ -14,59 +14,21 @@
 
 ## Agent names
 
-Per-session `BEADS_ACTOR` in this repo uses crew names (not path-derived). Set once at session start:
-- `margo` — simulation / octree / Hashlife stepping worktrees (Norman Margolus, 2x2x2 blocks)
-- `kampe` — SVDAG rendering (Kämpe et al. 2013, foundational SVDAG paper)
-- Additional crew names drawn from CA / SVDAG / voxel research lineage as needed
+`BEADS_ACTOR` draws from a fixed crew pool: short natural-object words that are not confusable with people names.
+
+Pool: `flint · cairn · onyx · wisp · mote · ember · spark · quill · thorn`
+
+Current assignments:
+- `flint` — simulation / octree / physics / CA rules
+- `onyx` — SVDAG rendering / GPU / shaders
+- `ember` — generalist / floating worker
+
+Reuse a name if an agent comes back on the same lane; otherwise pull the next available name from the pool. Past closed issues retain whatever historical assignee they had — don't rewrite history.
 
 ```bash
-export BEADS_ACTOR=margo   # or kampe, etc.
+export BEADS_ACTOR=flint   # or onyx, ember, etc.
 ```
 
+## Session completion ≡ /ship
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
-
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
-
-### Quick Reference
-
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
-
-### Rules
-
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
-
-## Session Completion
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
+bd auto-init appends a generic "push before stopping" block; it does not apply here. `/ship` is the single chokepoint and handles tests → commit → push → `bd close` as one atomic unit. Don't run `git push` or `bd close` manually outside of `/ship`.

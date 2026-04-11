@@ -1,4 +1,4 @@
-# Ashfall — Design Spec
+# Hash Thing — Design Spec
 
 > A 3D voxel cellular automaton engine with hash-consed octree storage, Hashlife-style simulation stepping, Margolus-block physics, material-type CA rules, and SVDAG rendering. Targeting infinitely explorable worlds with emergent physics and redstone-style computation.
 
