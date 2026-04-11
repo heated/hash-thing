@@ -69,3 +69,132 @@ pub fn octant_index(x: u32, y: u32, z: u32) -> usize {
 pub fn octant_coords(idx: usize) -> (u32, u32, u32) {
     (idx as u32 & 1, (idx as u32 >> 1) & 1, (idx as u32 >> 2) & 1)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pure-helper tests for `node.rs`: the octant index/coords bijection
+    //! and `Node` level/emptiness/side_len accessors.
+    //!
+    //! These helpers are load-bearing contracts. `octant_index` is called
+    //! on every subtree build in `store.rs` (set_cell, from_flat_recursive,
+    //! interior construction). `octant_coords` is called on every store
+    //! traversal (flatten_into, population_recursive). A silent off-by-one
+    //! in either direction produces rotated or mirrored children
+    //! everywhere — higher-level tests (raycaster visuals, compaction
+    //! invariants) would eventually notice, but slowly and expensively.
+    //! Direct unit coverage fails in microseconds and pinpoints the break.
+    use super::*;
+
+    /// Exhaustive mapping of (x,y,z) ∈ {0,1}³ to the expected octant index,
+    /// following the documented layout `idx = x + y*2 + z*4`.
+    #[test]
+    fn octant_index_matches_formula() {
+        assert_eq!(octant_index(0, 0, 0), 0);
+        assert_eq!(octant_index(1, 0, 0), 1);
+        assert_eq!(octant_index(0, 1, 0), 2);
+        assert_eq!(octant_index(1, 1, 0), 3);
+        assert_eq!(octant_index(0, 0, 1), 4);
+        assert_eq!(octant_index(1, 0, 1), 5);
+        assert_eq!(octant_index(0, 1, 1), 6);
+        assert_eq!(octant_index(1, 1, 1), 7);
+    }
+
+    /// `octant_index(octant_coords(i)) == i` for every valid index.
+    /// Catches a `>> 1` vs `>> 2` typo in `octant_coords`.
+    #[test]
+    fn octant_coords_is_inverse_of_octant_index() {
+        for i in 0..8 {
+            let (x, y, z) = octant_coords(i);
+            assert_eq!(octant_index(x, y, z), i, "roundtrip failed for idx {i}");
+        }
+    }
+
+    /// `octant_coords(octant_index(x,y,z)) == (x,y,z)` for every input.
+    /// Both directions of the roundtrip because they're separately maintained.
+    #[test]
+    fn octant_roundtrip_coordinates() {
+        for x in 0..2 {
+            for y in 0..2 {
+                for z in 0..2 {
+                    let i = octant_index(x, y, z);
+                    let (rx, ry, rz) = octant_coords(i);
+                    assert_eq!(
+                        (rx, ry, rz),
+                        (x, y, z),
+                        "roundtrip failed for ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Leaves are always level 0, regardless of cell state.
+    #[test]
+    fn leaf_level_is_zero() {
+        assert_eq!(Node::Leaf(0).level(), 0);
+        assert_eq!(Node::Leaf(5).level(), 0);
+    }
+
+    /// Interior nodes return the stored level unchanged.
+    #[test]
+    fn interior_level_echoes_field() {
+        let n = Node::Interior {
+            level: 3,
+            children: [NodeId::EMPTY; 8],
+            population: 0,
+        };
+        assert_eq!(n.level(), 3);
+    }
+
+    /// `Leaf(0)` is empty; any nonzero cell state is not. Pins the payload-
+    /// aware emptiness semantics — a leaf with a live material is *not*
+    /// empty even though the sentinel for "empty" happens to be 0.
+    #[test]
+    fn leaf_is_empty_iff_zero_state() {
+        assert!(Node::Leaf(0).is_empty());
+        assert!(!Node::Leaf(1).is_empty());
+        assert!(!Node::Leaf(CellState::MAX).is_empty());
+    }
+
+    /// Interior emptiness is driven by `population`, not children. If this
+    /// flips sign, compaction and DAG build both break.
+    #[test]
+    fn interior_is_empty_iff_population_zero() {
+        let empty = Node::Interior {
+            level: 2,
+            children: [NodeId::EMPTY; 8],
+            population: 0,
+        };
+        assert!(empty.is_empty());
+        let full = Node::Interior {
+            level: 2,
+            children: [NodeId::EMPTY; 8],
+            population: 1,
+        };
+        assert!(!full.is_empty());
+    }
+
+    /// `side_len()` is `1 << level` — pinning the documented 2^level.
+    #[test]
+    fn side_len_is_power_of_two() {
+        assert_eq!(Node::Leaf(0).side_len(), 1);
+        let l1 = Node::Interior {
+            level: 1,
+            children: [NodeId::EMPTY; 8],
+            population: 0,
+        };
+        assert_eq!(l1.side_len(), 2);
+        let l5 = Node::Interior {
+            level: 5,
+            children: [NodeId::EMPTY; 8],
+            population: 0,
+        };
+        assert_eq!(l5.side_len(), 32);
+        let l10 = Node::Interior {
+            level: 10,
+            children: [NodeId::EMPTY; 8],
+            population: 0,
+        };
+        assert_eq!(l10.side_len(), 1024);
+    }
+}
