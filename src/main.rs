@@ -1,6 +1,6 @@
 mod octree;
-mod sim;
 mod render;
+mod sim;
 
 use std::sync::Arc;
 use winit::{
@@ -172,8 +172,8 @@ impl ApplicationHandler for App {
                         let dy = (position.y - ly) as f32;
                         if let Some(renderer) = &mut self.renderer {
                             renderer.camera_yaw += dx * 0.005;
-                            renderer.camera_pitch = (renderer.camera_pitch + dy * 0.005)
-                                .clamp(-1.4, 1.4);
+                            renderer.camera_pitch =
+                                (renderer.camera_pitch + dy * 0.005).clamp(-1.4, 1.4);
                         }
                     }
                     self.last_mouse = Some((position.x, position.y));

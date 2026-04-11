@@ -1,5 +1,5 @@
-use crate::octree::{CellState, NodeId, NodeStore};
 use super::rule::CaRule;
+use crate::octree::{Cell, CellState, NodeId, NodeStore};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -18,7 +18,12 @@ impl World {
     pub fn new(level: u32) -> Self {
         let mut store = NodeStore::new();
         let root = store.empty(level);
-        Self { store, root, level, generation: 0 }
+        Self {
+            store,
+            root,
+            level,
+            generation: 0,
+        }
     }
 
     pub fn side(&self) -> usize {
@@ -45,7 +50,7 @@ impl World {
     pub fn step_flat(&mut self, rule: &dyn CaRule) {
         let side = self.side();
         let grid = self.flatten();
-        let mut next = vec![0u8; side * side * side];
+        let mut next = vec![0 as CellState; side * side * side];
 
         for z in 0..side {
             for y in 0..side {
@@ -72,10 +77,10 @@ impl World {
                     let dx = x as f64 - center as f64;
                     let dy = y as f64 - center as f64;
                     let dz = z as f64 - center as f64;
-                    if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64) {
-                        if rng.next_f64() < density {
-                            self.set(x, y, z, 1);
-                        }
+                    if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
+                        && rng.next_f64() < density
+                    {
+                        self.set(x, y, z, Cell::pack(1, 0).raw());
                     }
                 }
             }
@@ -89,7 +94,7 @@ impl World {
 
 /// Get the 26 Moore neighbors of a cell, wrapping at boundaries.
 fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [CellState; 26] {
-    let mut neighbors = [0u8; 26];
+    let mut neighbors = [0 as CellState; 26];
     let mut idx = 0;
     for dz in [-1i32, 0, 1] {
         for dy in [-1i32, 0, 1] {

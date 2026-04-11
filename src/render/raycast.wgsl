@@ -43,9 +43,14 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
     return vec2<f32>(t_near, t_far);
 }
 
-// Material color palette
-fn material_color(mat: u32) -> vec3<f32> {
-    switch mat {
+// Material color palette. Input is a packed cell word:
+//   bits 15..6 material_id (10 bits)
+//   bits  5..0 metadata    ( 6 bits)
+// We index the palette by material_id only; metadata is ignored here
+// (the material registry in 1v0.2 will replace this hard-coded switch).
+fn material_color(packed: u32) -> vec3<f32> {
+    let mat_id = packed >> 6u;
+    switch mat_id {
         case 1u: { return vec3<f32>(0.4, 0.8, 0.3); }  // green (life)
         case 2u: { return vec3<f32>(0.8, 0.3, 0.2); }  // red
         case 3u: { return vec3<f32>(0.2, 0.4, 0.9); }  // blue
