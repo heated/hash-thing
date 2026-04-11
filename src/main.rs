@@ -14,6 +14,11 @@ use winit::{
 
 const VOLUME_SIZE: u32 = 64;
 
+/// Wall-clock cadence for the consolidated perf log line. Decoupled from
+/// `world.generation` so the log keeps ticking even when the sim is paused
+/// or stepping slowly — see hash-thing-q63.
+const LOG_INTERVAL_SECS: f64 = 2.0;
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
@@ -21,6 +26,10 @@ struct App {
     rule: sim::GameOfLife3D,
     paused: bool,
     step_timer: std::time::Instant,
+    /// Wall-clock checkpoint for the next perf summary line. Reset each
+    /// time the line fires so cadence stays ~LOG_INTERVAL_SECS regardless
+    /// of sim/step rate.
+    log_timer: std::time::Instant,
     // Mouse interaction state
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
@@ -48,6 +57,7 @@ impl App {
             rule: sim::GameOfLife3D::amoeba(),
             paused: false,
             step_timer: std::time::Instant::now(),
+            log_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
             perf: perf::Perf::new(),
@@ -66,7 +76,7 @@ impl App {
 
     /// SVDAG node count + byte size + root level for the consolidated
     /// `Gen N:` log line. Rebuilds the SVDAG to inspect — call only on the
-    /// per-10-gen log path, not every redraw.
+    /// wall-clock log path (every LOG_INTERVAL_SECS), not every redraw.
     fn svdag_stats(&self) -> (usize, usize, u32) {
         let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
         (dag.node_count, dag.byte_size(), dag.root_level)
@@ -223,24 +233,30 @@ impl ApplicationHandler for App {
                     self.perf.record("upload_cpu", upload_start.elapsed());
 
                     self.step_timer = std::time::Instant::now();
+                }
 
-                    if self.world.generation.is_multiple_of(10) {
-                        let (nodes, cache) = self.world.store.stats();
-                        let mem_kb = (nodes * std::mem::size_of::<crate::octree::Node>()) / 1024;
-                        let (svdag_nodes, svdag_bytes, svdag_root_level) = self.svdag_stats();
-                        log::info!(
-                            "Gen {}: pop={} nodes={} (~{}KB) cache={} svdag={}/{}KB(L{}) | {}",
-                            self.world.generation,
-                            self.world.population(),
-                            nodes,
-                            mem_kb,
-                            cache,
-                            svdag_nodes,
-                            svdag_bytes / 1024,
-                            svdag_root_level,
-                            self.perf.summary(),
-                        );
-                    }
+                // Wall-clock perf summary (hash-thing-q63). Sits outside the
+                // step gate so it fires on its own cadence regardless of
+                // sim/step rate — including when paused. Showing the same
+                // Gen repeatedly is intentional: it tells the user the app
+                // is still alive.
+                if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
+                    let (nodes, cache) = self.world.store.stats();
+                    let mem_kb = (nodes * std::mem::size_of::<crate::octree::Node>()) / 1024;
+                    let (svdag_nodes, svdag_bytes, svdag_root_level) = self.svdag_stats();
+                    log::info!(
+                        "Gen {}: pop={} nodes={} (~{}KB) cache={} svdag={}/{}KB(L{}) | {}",
+                        self.world.generation,
+                        self.world.population(),
+                        nodes,
+                        mem_kb,
+                        cache,
+                        svdag_nodes,
+                        svdag_bytes / 1024,
+                        svdag_root_level,
+                        self.perf.summary(),
+                    );
+                    self.log_timer = std::time::Instant::now();
                 }
 
                 // Time render. NLL lets us split-borrow self.renderer and
