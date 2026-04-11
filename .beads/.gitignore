@@ -44,3 +44,6 @@ export-state/
 # contributors to accidentally commit upstream issue databases.
 # The JSONL files (issues.jsonl, interactions.jsonl) and config files
 # are tracked by git by default since no pattern above ignores them.
+
+# Per-worktree crew assignment (e.g. flint, cairn, onyx). See CLAUDE.md.
+actor
