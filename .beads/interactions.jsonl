@@ -1,0 +1,4 @@
+{"id":"int-2a138751","kind":"field_change","created_at":"2026-04-11T16:20:22.543638Z","actor":"Edward Swernofsky","issue_id":"hash-thing-k5r","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-225c972c","kind":"field_change","created_at":"2026-04-11T16:26:21.788611Z","actor":"Edward Swernofsky","issue_id":"hash-thing-52b","extra":{"field":"status","new_value":"blocked","old_value":"open"}}
+{"id":"int-3dbf1266","kind":"field_change","created_at":"2026-04-11T16:30:10.871486Z","actor":"Edward Swernofsky","issue_id":"hash-thing-dmf","extra":{"field":"status","new_value":"open","old_value":"in_progress"}}
+{"id":"int-45b3ee9a","kind":"field_change","created_at":"2026-04-11T16:30:10.872005Z","actor":"Edward Swernofsky","issue_id":"hash-thing-dmf","extra":{"field":"assignee","new_value":"","old_value":"Edward Swernofsky"}}
