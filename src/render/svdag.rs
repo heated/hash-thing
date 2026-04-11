@@ -48,13 +48,34 @@ impl Svdag {
     ///
     /// Walks the DAG in depth-first order, interning each `NodeId` to a flat-buffer
     /// offset so shared subtrees become shared offsets in the output.
+    ///
+    /// Leaf roots (a uniform world, a single-voxel test fixture, or a future
+    /// root-collapse optimization) are serialized as a **degenerate single-node
+    /// interior** with all 8 children pointing at the leaf's inline encoding —
+    /// the shader already handles that path with no special casing, and the
+    /// caller sees `node_count = 1` regardless of `root_level` (hash-thing-nch).
     pub fn build(store: &NodeStore, root: NodeId, root_level: u32) -> Self {
-        debug_assert!(
-            root_level >= 1,
-            "Svdag::build expects an interior root (level >= 1); got level {root_level}",
-        );
         let mut nodes: Vec<u32> = Vec::new();
         let mut id_to_offset: FxHashMap<NodeId, u32> = FxHashMap::default();
+
+        if let Node::Leaf(state) = store.get(root) {
+            // Degenerate single-node DAG: all 8 children point at the same
+            // inline leaf. Mask is 0xff when populated, 0 when empty — matches
+            // the inline-leaf semantics used for interior-node children below.
+            const NODE_STRIDE: usize = 9;
+            nodes.resize(NODE_STRIDE, 0);
+            let mask = if *state != 0 { 0xffu32 } else { 0u32 };
+            nodes[0] = mask;
+            let leaf_slot = LEAF_BIT | (*state as u32);
+            for i in 0..8 {
+                nodes[1 + i] = leaf_slot;
+            }
+            return Svdag {
+                nodes,
+                root_level,
+                node_count: 1,
+            };
+        }
 
         // Reserve slot 0 for the root; we'll fill it in after recursion.
         let root_offset = Self::write_node(&mut nodes, &mut id_to_offset, store, root);
@@ -98,11 +119,14 @@ impl Svdag {
 
         match store.get(id) {
             Node::Leaf(_) => {
-                // Leaves don't get their own node entry; the parent encodes them inline.
-                // This branch should only hit if someone calls write_node on a leaf at the root.
-                // We emit a degenerate "all-leaf" interior node for this case.
-                // (In practice the root will always be level >= 1 for our demo.)
-                panic!("write_node called on a leaf — handle leaves in parent's child slot");
+                // Leaves don't get their own node entry; the parent encodes
+                // them inline. `Svdag::build` intercepts leaf roots above and
+                // emits a degenerate single-node interior, so this branch is
+                // unreachable via the public API (hash-thing-nch).
+                unreachable!(
+                    "write_node called on a leaf — parents must encode leaves inline, \
+                     and leaf roots are intercepted by Svdag::build"
+                );
             }
             Node::Interior { children, .. } => {
                 // Reserve our own slot before recursing so that cyclic refs (impossible here
@@ -737,6 +761,78 @@ mod tests {
     #[test]
     fn leaf_bit_matches_shader() {
         assert_eq!(LEAF_BIT, 0x8000_0000);
+    }
+
+    /// Regression for hash-thing-nch I4: `Svdag::build` must accept a leaf
+    /// root (uniform world, single-cell fixture, future root-collapse) by
+    /// emitting a degenerate 9-u32 single-node interior DAG. Before this
+    /// fix, `write_node` panicked on leaf roots with a hand-wave comment
+    /// that "the root will always be level >= 1 in practice."
+    #[test]
+    fn leaf_root_builds_degenerate_dag() {
+        let mut store = NodeStore::new();
+        let root = store.leaf(3);
+
+        // Any root_level should work. Pick something non-trivial to prove
+        // the level is preserved on the `Svdag` struct independent of the
+        // node encoding.
+        let dag = Svdag::build(&store, root, 5);
+        assert_eq!(dag.node_count, 1, "degenerate leaf-root DAG is one node");
+        assert_eq!(dag.nodes.len(), 9, "one interior node = 9 u32s");
+        assert_eq!(
+            dag.nodes[0], 0xffu32,
+            "all 8 octants populated for a nonzero leaf root"
+        );
+        for i in 0..8 {
+            assert_eq!(
+                dag.nodes[1 + i],
+                LEAF_BIT | 3u32,
+                "child slot {i} must encode the leaf state inline",
+            );
+        }
+        assert_eq!(dag.root_level, 5);
+
+        // Trace a ray straight through the center; must hit material 3.
+        let ro = [-1.0, 0.5, 0.5];
+        let rd = [1.0, 0.0, 0.0];
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+        assert_eq!(
+            result.hit_material,
+            Some(3),
+            "ray through a uniform leaf-root world must hit, events: {:#?}",
+            result.events,
+        );
+    }
+
+    /// Regression for hash-thing-nch I4: empty leaf roots (state 0) build
+    /// into an all-empty DAG — the mask is 0, traversal never enters, and
+    /// rays miss cleanly instead of panicking in `write_node`.
+    #[test]
+    fn empty_leaf_root_builds_dag_with_zero_mask() {
+        let mut store = NodeStore::new();
+        let root = store.leaf(0);
+        let dag = Svdag::build(&store, root, 4);
+        assert_eq!(dag.node_count, 1);
+        assert_eq!(dag.nodes[0], 0u32, "empty leaf root → zero mask");
+        for i in 0..8 {
+            assert_eq!(
+                dag.nodes[1 + i],
+                LEAF_BIT,
+                "empty leaf slot is LEAF_BIT with state=0"
+            );
+        }
+
+        let ro = [-1.0, 0.5, 0.5];
+        let rd = [1.0, 0.0, 0.0];
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+        assert_eq!(
+            result.hit_material, None,
+            "ray through empty world must miss cleanly"
+        );
+        assert!(
+            !result.exhausted,
+            "empty leaf-root miss must not trip the budget"
+        );
     }
 
     /// Regression: grazing rays at deep depth must make forward progress

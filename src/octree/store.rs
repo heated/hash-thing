@@ -294,20 +294,28 @@ impl NodeStore {
 
     /// Build an octree from a flat 3D array.
     /// Grid is indexed as [x + y*side + z*side*side], side must be a power of 2.
+    ///
+    /// Release-panics on non-power-of-two `side` or mismatched grid length:
+    /// pre-hash-thing-nch this was a `debug_assert!` plus a silent
+    /// `(side as f64).log2() as u32` truncation — `side=48` built a depth-5
+    /// (32³) tree over 48³ data and read past the buffer end on the upper
+    /// 16 cells of every axis. Contract violations are release-panics now.
     #[allow(clippy::wrong_self_convention)]
     pub fn from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
-        debug_assert!(
+        assert!(
             side.is_power_of_two() && side >= 1,
-            "from_flat: side must be a power of 2 >= 1; got {side}",
+            "from_flat: side must be a power of two >= 1; got {side}",
         );
-        debug_assert_eq!(
+        assert_eq!(
             grid.len(),
             side * side * side,
             "from_flat: grid length {} does not match side^3 = {}",
             grid.len(),
             side * side * side,
         );
-        let level = (side as f64).log2() as u32;
+        // `trailing_zeros()` is exact on power-of-two values and can't
+        // truncate the way `(side as f64).log2() as u32` did.
+        let level = side.trailing_zeros();
         self.from_flat_recursive(grid, side, 0, 0, 0, level)
     }
 
@@ -590,6 +598,49 @@ mod tests {
         }
         for &(x, y, z, s) in probes {
             assert_eq!(store.get_cell(root, x, y, z), s, "cell ({x},{y},{z})");
+        }
+    }
+
+    /// Regression for hash-thing-nch I5: non-power-of-two `side` must
+    /// release-panic at the API boundary. Pre-fix, `(side as f64).log2()
+    /// as u32` silently truncated (`side=48` → `level=5`), so
+    /// `from_flat_recursive` built a 32³ tree over 48³ data and read past
+    /// the source buffer on the upper 16 cells of every axis.
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn from_flat_rejects_non_pow2() {
+        let mut store = NodeStore::new();
+        let side = 48usize;
+        let grid = vec![0u8; side * side * side];
+        let _ = store.from_flat(&grid, side);
+    }
+
+    /// Regression for hash-thing-nch I5: each power-of-two `side` must
+    /// resolve to the correct octree level via `trailing_zeros()`. Spot
+    /// every level from 0 through 8 so a future refactor that re-introduces
+    /// the `log2` truncation or shifts the level by one trips on the
+    /// smallest possible grid.
+    #[test]
+    fn from_flat_pow2_levels_roundtrip() {
+        for level in 0u32..=6 {
+            let side = 1usize << level;
+            let mut grid = vec![0u8; side * side * side];
+            // Drop a single live cell at the far corner so level-0
+            // (single-cell) and level-6 (64³) both exercise a non-empty
+            // build.
+            let last = side - 1;
+            grid[last + last * side + last * side * side] = 1;
+            let mut store = NodeStore::new();
+            let root = store.from_flat(&grid, side);
+            assert_eq!(
+                store.get(root).level(),
+                level,
+                "from_flat(side={side}) should build a level-{level} tree",
+            );
+            // Roundtrip sanity: flatten it back and check the single live
+            // cell survives.
+            let out = store.flatten(root, side);
+            assert_eq!(out[last + last * side + last * side * side], 1);
         }
     }
 
