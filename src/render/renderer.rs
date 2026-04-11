@@ -147,7 +147,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R8Uint,
+            format: wgpu::TextureFormat::R16Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -337,9 +337,9 @@ impl Renderer {
             svdag_buffer_cap: 0,
             uniform_buffer,
             volume_size,
-            // R8Uint: 1 byte per texel. Update alongside the `format:` line
-            // above if the texture format ever widens.
-            volume_bytes_per_texel: 1,
+            // R16Uint: 2 bytes per texel. Update alongside the `format:` line
+            // above if the texture format ever widens again.
+            volume_bytes_per_texel: 2,
             mode: RenderMode::Svdag,
             camera_yaw: std::f32::consts::FRAC_PI_4,
             camera_pitch: 0.4,
@@ -421,26 +421,31 @@ impl Renderer {
         }
     }
 
-    pub fn upload_volume(&self, data: &[u8]) {
+    /// Upload a full `volume_size³` cell grid to the R16Uint 3D texture.
+    /// `data` is one `u16` per voxel in x-major, y-stride, z-slice order.
+    /// Row strides are padded up to `COPY_BYTES_PER_ROW_ALIGNMENT` via
+    /// `padded_bytes_per_row` — see that helper for the full story.
+    pub fn upload_volume(&self, data: &[u16]) {
         let w = self.volume_size;
         let bpt = self.volume_bytes_per_texel;
         let unpadded = w * bpt;
         let padded = padded_bytes_per_row(w, bpt);
+        let data_bytes: &[u8] = bytemuck::cast_slice(data);
 
         // Fast path: row length already aligned, pass the caller's slice
         // straight through. Slow path: copy row-by-row into a padded staging
         // buffer. Per-upload allocation is fine — uploads are infrequent
-        // (once per generation tick) and ~64KiB for 64³ R8Uint.
+        // (once per generation tick) and ~128KiB for 64³ R16Uint.
         let staging: Vec<u8>;
         let (rows_data, row_stride) = if padded == unpadded {
-            (data, unpadded)
+            (data_bytes, unpadded)
         } else {
             let total_rows = (w * w) as usize; // height × depth
             let mut buf = vec![0u8; total_rows * padded as usize];
             let unpadded_usize = unpadded as usize;
             let padded_usize = padded as usize;
             for row in 0..total_rows {
-                let src = &data[row * unpadded_usize..][..unpadded_usize];
+                let src = &data_bytes[row * unpadded_usize..][..unpadded_usize];
                 let dst = &mut buf[row * padded_usize..][..unpadded_usize];
                 dst.copy_from_slice(src);
             }

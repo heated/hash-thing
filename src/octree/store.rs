@@ -248,7 +248,7 @@ impl NodeStore {
     /// Flatten a region of the octree into a flat 3D array.
     /// Returns a Vec of size side^3, indexed as [x + y*side + z*side*side].
     pub fn flatten(&self, root: NodeId, side: usize) -> Vec<CellState> {
-        let mut grid = vec![0u8; side * side * side];
+        let mut grid = vec![0 as CellState; side * side * side];
         self.flatten_into(root, &mut grid, side, 0, 0, 0);
         grid
     }

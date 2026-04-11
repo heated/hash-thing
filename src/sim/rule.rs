@@ -77,7 +77,12 @@ impl fmt::Display for GameOfLife3D {
 
 impl CaRule for GameOfLife3D {
     fn step_cell(&self, center: CellState, neighbors: &[CellState; 26]) -> CellState {
+        // Binary GoL: any non-zero cell counts as "alive", regardless of
+        // material ID or metadata. Reborn cells use the default "alive"
+        // material ID 1 (will become meaningful once the material registry
+        // lands in 1v0.2).
         let alive_count: u8 = neighbors.iter().map(|&n| if n > 0 { 1u8 } else { 0 }).sum();
+        const ALIVE: CellState = 1 << crate::octree::Cell::METADATA_BITS; // material 1, metadata 0
         if center > 0 {
             // alive: survive?
             if alive_count >= self.survive_min && alive_count <= self.survive_max {
@@ -88,7 +93,7 @@ impl CaRule for GameOfLife3D {
         } else {
             // dead: birth?
             if alive_count >= self.birth_min && alive_count <= self.birth_max {
-                1
+                ALIVE
             } else {
                 0
             }
