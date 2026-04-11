@@ -245,11 +245,12 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Time render. Borrow the renderer, time + render in scope,
-                // record after the borrow ends.
-                if self.renderer.is_some() {
+                // Time render. NLL lets us split-borrow self.renderer and
+                // self.perf because the renderer borrow ends at `.render()`,
+                // before `self.perf.record` reaches for &mut self again.
+                if let Some(renderer) = self.renderer.as_mut() {
                     let render_start = std::time::Instant::now();
-                    self.renderer.as_mut().unwrap().render();
+                    renderer.render();
                     self.perf.record("render_cpu", render_start.elapsed());
                 }
 
