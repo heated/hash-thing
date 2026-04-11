@@ -11,9 +11,23 @@ pub struct NodeStore {
     nodes: Vec<Node>,
     /// Reverse lookup: node -> its canonical id.
     intern: FxHashMap<Node, NodeId>,
-    /// Memoized step results: (node_id, rule_id) -> result_node_id.
-    /// The result of a level-n node is the center (level n-1) cube
-    /// after 2^(n-2) steps.
+    /// Memoized step results: `node_id -> result_node_id`.
+    ///
+    /// The result of a level-n node is the center (level n-1) cube after
+    /// 2^(n-2) steps.
+    ///
+    /// **Caller contract — read this before adding a memoized stepper:**
+    ///
+    /// The key is `NodeId` only. Rule identity is *not* part of the key.
+    /// Callers must invoke [`Self::clear_step_cache`] whenever the active
+    /// rule changes, or the cache will return stale results from the
+    /// previous rule. The brute-force `World::step_flat` path bypasses this
+    /// cache entirely, so today the contract is dormant — but the moment
+    /// hash-thing-6gf.1 lands a memoized recursive stepper, every code path
+    /// that swaps rules must clear the cache.
+    ///
+    /// hash-thing-6gf.2 will widen the key to a struct that includes rule
+    /// identity (and the recursion phase), retiring this contract.
     step_cache: FxHashMap<NodeId, NodeId>,
 }
 
@@ -226,7 +240,13 @@ impl NodeStore {
         self.step_cache.get(&input).copied()
     }
 
-    /// Clear step cache (call when changing rules).
+    /// Clear the step cache.
+    ///
+    /// **Must be called whenever the active rule changes.** The cache key is
+    /// `NodeId` only — see the `step_cache` field doc for the full contract.
+    /// Failure to clear after a rule swap will silently return stale results
+    /// from the previous rule once a memoized stepper is in place
+    /// (hash-thing-6gf.1).
     pub fn clear_step_cache(&mut self) {
         self.step_cache.clear();
     }
