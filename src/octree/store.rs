@@ -1,5 +1,5 @@
+use super::node::{octant_index, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
-use super::node::{CellState, Node, NodeId, octant_index};
 
 /// Canonical node store — the core of hash-consing.
 ///
@@ -11,9 +11,20 @@ pub struct NodeStore {
     nodes: Vec<Node>,
     /// Reverse lookup: node -> its canonical id.
     intern: FxHashMap<Node, NodeId>,
-    /// Memoized step results: (node_id, rule_id) -> result_node_id.
-    /// The result of a level-n node is the center (level n-1) cube
-    /// after 2^(n-2) steps.
+    /// Memoized step results: `NodeId -> result_NodeId`.
+    ///
+    /// The result of a level-n node is the center (level n-1) cube after
+    /// `2^(n-2)` steps. **Currently dead code** — the flat stepper in
+    /// `World::step_flat` does not use it. Scaffolding for Hashlife
+    /// recursive stepping.
+    ///
+    /// **WARNING — rule-blindness is not yet handled.** The key is only the
+    /// input `NodeId`, not `(NodeId, rule_id)`. When the Hashlife stepper
+    /// lands, every rule swap in `main.rs` MUST call `clear_step_cache`, or
+    /// the cache must be rekeyed by `(NodeId, rule_id)`. Today's rule-swap
+    /// path in `main.rs` (keys `1`–`4`) does NOT clear this cache, which is
+    /// safe today only because nothing ever populates it. See the
+    /// determinism audit at `.ship-notes/audit-h34.2.md`.
     step_cache: FxHashMap<NodeId, NodeId>,
 }
 
@@ -104,7 +115,9 @@ impl NodeStore {
         let node = self.get(root).clone();
         match node {
             Node::Leaf(_) => self.leaf(state),
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -125,7 +138,9 @@ impl NodeStore {
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         match self.get(root) {
             Node::Leaf(s) => *s,
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -160,7 +175,12 @@ impl NodeStore {
             Node::Leaf(s) => {
                 grid[ox + oy * side + oz * side * side] = *s;
             }
-            Node::Interior { level, children, population, .. } => {
+            Node::Interior {
+                level,
+                children,
+                population,
+                ..
+            } => {
                 if *population == 0 {
                     return; // skip entirely empty subtrees
                 }

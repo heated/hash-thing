@@ -1,5 +1,6 @@
 use super::rule::CaRule;
 use crate::octree::{CellState, NodeId, NodeStore};
+use crate::rng::cell_rand_bool;
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
@@ -67,21 +68,29 @@ impl World {
         self.generation += 1;
     }
 
-    /// Place a random seed pattern in the center of the world.
+    /// Place a random spherical seed pattern in the center of the world.
+    ///
+    /// Randomness is drawn from the stateless `cell_rand_bool(x, y, z, ...)`
+    /// primitive in `rng.rs`, not a stream RNG. This makes the output a pure
+    /// function of `(position, seed)` — independent of loop order, independent
+    /// of which cells are visited first, independent of whether we ever
+    /// parallelize this loop. That is the h34.2 determinism rule: no scan-
+    /// order dependence for anything that reaches simulation state.
     pub fn seed_center(&mut self, radius: u64, density: f64) {
+        const SEED: u64 = 0xD15C_05EE_5EED_5EED; // "disco see seed seed"
         let center = self.side() as u64 / 2;
-        let mut rng = SimpleRng::new(42);
         for z in (center - radius)..(center + radius) {
             for y in (center - radius)..(center + radius) {
                 for x in (center - radius)..(center + radius) {
-                    // Spherical mask
                     let dx = x as f64 - center as f64;
                     let dy = y as f64 - center as f64;
                     let dz = z as f64 - center as f64;
-                    if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64) {
-                        if rng.next_f64() < density {
-                            self.set(x, y, z, 1);
-                        }
+                    let inside_sphere =
+                        dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64);
+                    if inside_sphere
+                        && cell_rand_bool(x as i64, y as i64, z as i64, 0, SEED, density)
+                    {
+                        self.set(x, y, z, 1);
                     }
                 }
             }
@@ -132,24 +141,4 @@ fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) 
         }
     }
     neighbors
-}
-
-/// Minimal RNG — xorshift64 so we don't need a dependency.
-struct SimpleRng(u64);
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
-    }
 }
