@@ -1,6 +1,7 @@
 mod octree;
-mod sim;
 mod render;
+mod rng;
+mod sim;
 
 use std::sync::Arc;
 use winit::{
