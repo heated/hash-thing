@@ -224,7 +224,7 @@ impl ApplicationHandler for App {
 
                     self.step_timer = std::time::Instant::now();
 
-                    if self.world.generation % 10 == 0 {
+                    if self.world.generation.is_multiple_of(10) {
                         let (nodes, cache) = self.world.store.stats();
                         let mem_kb = (nodes * std::mem::size_of::<crate::octree::Node>()) / 1024;
                         let (svdag_nodes, svdag_bytes, svdag_root_level) = self.svdag_stats();

@@ -35,6 +35,7 @@ pub enum Node {
 }
 
 impl Node {
+    #[allow(dead_code)]
     pub fn level(&self) -> u32 {
         match self {
             Node::Leaf(_) => 0,
@@ -42,6 +43,7 @@ impl Node {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         match self {
             Node::Leaf(s) => *s == 0,
@@ -50,6 +52,7 @@ impl Node {
     }
 
     /// Side length of this node in cells.
+    #[allow(dead_code)]
     pub fn side_len(&self) -> u64 {
         1u64 << self.level()
     }

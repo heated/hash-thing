@@ -100,6 +100,7 @@ impl NodeStore {
     }
 
     /// Get children of an interior node. Panics if called on a leaf.
+    #[allow(dead_code)]
     pub fn children(&self, id: NodeId) -> [NodeId; 8] {
         match self.get(id) {
             Node::Interior { children, .. } => *children,
@@ -108,6 +109,7 @@ impl NodeStore {
     }
 
     /// Get a specific child by octant index.
+    #[allow(dead_code)]
     pub fn child(&self, id: NodeId, octant: usize) -> NodeId {
         self.children(id)[octant]
     }
@@ -136,6 +138,7 @@ impl NodeStore {
     }
 
     /// Get a single cell value.
+    #[allow(dead_code)]
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         match self.get(root) {
             Node::Leaf(s) => *s,
@@ -180,10 +183,10 @@ impl NodeStore {
                 }
                 let half = 1usize << (level - 1);
                 let children = *children;
-                for oct in 0..8 {
+                for (oct, child) in children.iter().enumerate() {
                     let (cx, cy, cz) = super::node::octant_coords(oct);
                     self.flatten_into(
-                        children[oct],
+                        *child,
                         grid,
                         side,
                         ox + cx as usize * half,
@@ -197,6 +200,7 @@ impl NodeStore {
 
     /// Build an octree from a flat 3D array.
     /// Grid is indexed as [x + y*side + z*side*side], side must be a power of 2.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
         debug_assert!(
             side.is_power_of_two() && side >= 1,
@@ -213,6 +217,7 @@ impl NodeStore {
         self.from_flat_recursive(grid, side, 0, 0, 0, level)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn from_flat_recursive(
         &mut self,
         grid: &[CellState],
@@ -227,9 +232,9 @@ impl NodeStore {
         }
         let half = 1usize << (level - 1);
         let mut children = [NodeId::EMPTY; 8];
-        for oct in 0..8 {
+        for (oct, child) in children.iter_mut().enumerate() {
             let (cx, cy, cz) = super::node::octant_coords(oct);
-            children[oct] = self.from_flat_recursive(
+            *child = self.from_flat_recursive(
                 grid,
                 side,
                 ox + cx as usize * half,
@@ -242,11 +247,13 @@ impl NodeStore {
     }
 
     /// Cache a step result.
+    #[allow(dead_code)]
     pub fn cache_step(&mut self, input: NodeId, result: NodeId) {
         self.step_cache.insert(input, result);
     }
 
     /// Look up a cached step result.
+    #[allow(dead_code)]
     pub fn get_cached_step(&self, input: NodeId) -> Option<NodeId> {
         self.step_cache.get(&input).copied()
     }
@@ -258,6 +265,7 @@ impl NodeStore {
     /// Failure to clear after a rule swap will silently return stale results
     /// from the previous rule once a memoized stepper is in place
     /// (hash-thing-6gf.1).
+    #[allow(dead_code)]
     pub fn clear_step_cache(&mut self) {
         self.step_cache.clear();
     }

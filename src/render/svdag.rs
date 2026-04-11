@@ -129,7 +129,7 @@ impl Svdag {
                                 nodes[header_start + 1 + i] = child_offset; // high bit clear = interior
                             } else {
                                 // Empty interior subtree — encode as empty leaf
-                                nodes[header_start + 1 + i] = (1u32 << 31) | 0;
+                                nodes[header_start + 1 + i] = 1u32 << 31;
                             }
                         }
                     }

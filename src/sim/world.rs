@@ -31,6 +31,7 @@ impl World {
     }
 
     /// Get a cell.
+    #[allow(dead_code)]
     pub fn get(&self, x: u64, y: u64, z: u64) -> CellState {
         self.store.get_cell(self.root, x, y, z)
     }
@@ -72,10 +73,10 @@ impl World {
                     let dx = x as f64 - center as f64;
                     let dy = y as f64 - center as f64;
                     let dz = z as f64 - center as f64;
-                    if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64) {
-                        if rng.next_f64() < density {
-                            self.set(x, y, z, 1);
-                        }
+                    if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
+                        && rng.next_f64() < density
+                    {
+                        self.set(x, y, z, 1);
                     }
                 }
             }
