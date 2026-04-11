@@ -138,22 +138,22 @@ impl ApplicationHandler for App {
                         // without clearing yields stale results from the previous rule.
                         winit::keyboard::Key::Character("1") => {
                             self.rule = sim::GameOfLife3D::amoeba();
-                            log::info!("Rule: Amoeba");
+                            log::info!("Rule: Amoeba ({})", self.rule);
                         }
                         // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("2") => {
                             self.rule = sim::GameOfLife3D::crystal();
-                            log::info!("Rule: Crystal");
+                            log::info!("Rule: Crystal ({})", self.rule);
                         }
                         // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("3") => {
                             self.rule = sim::GameOfLife3D::rule445();
-                            log::info!("Rule: 445");
+                            log::info!("Rule: 445 ({})", self.rule);
                         }
                         // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("4") => {
                             self.rule = sim::GameOfLife3D::pyroclastic();
-                            log::info!("Rule: Pyroclastic");
+                            log::info!("Rule: Pyroclastic ({})", self.rule);
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
