@@ -1,5 +1,5 @@
-use crate::octree::{CellState, NodeId, NodeStore};
 use super::rule::CaRule;
+use crate::octree::{CellState, NodeId, NodeStore};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -18,7 +18,12 @@ impl World {
     pub fn new(level: u32) -> Self {
         let mut store = NodeStore::new();
         let root = store.empty(level);
-        Self { store, root, level, generation: 0 }
+        Self {
+            store,
+            root,
+            level,
+            generation: 0,
+        }
     }
 
     pub fn side(&self) -> usize {
@@ -59,6 +64,15 @@ impl World {
 
         self.root = self.store.from_flat(&next, side);
         self.generation += 1;
+
+        // Fresh-store compaction: `from_flat` interned a brand new generation
+        // into the append-only store, leaving the previous generation's
+        // subtrees unreachable but still present. Rebuild into a fresh store
+        // so memory tracks live-scene size, not cumulative history.
+        // See hash-thing-88d.
+        let (new_store, new_root) = self.store.compacted(self.root);
+        self.store = new_store;
+        self.root = new_root;
     }
 
     /// Place a random seed pattern in the center of the world.
