@@ -110,7 +110,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R8Uint,
+            format: wgpu::TextureFormat::R16Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -133,31 +133,32 @@ impl Renderer {
 
         // === Flat 3D texture pipeline ===
 
-        let flat_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("flat_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let flat_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("flat_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         let flat_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("flat_bg"),
@@ -216,42 +217,44 @@ impl Renderer {
 
         // === SVDAG pipeline ===
 
-        let svdag_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("svdag_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let svdag_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("svdag_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         let svdag_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("svdag raycast shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("svdag_raycast.wgsl").into()),
         });
 
-        let svdag_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("svdag_pl"),
-            bind_group_layouts: &[Some(&svdag_bind_group_layout)],
-            immediate_size: 0,
-        });
+        let svdag_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("svdag_pl"),
+                bind_group_layouts: &[Some(&svdag_bind_group_layout)],
+                immediate_size: 0,
+            });
 
         let svdag_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("svdag_rp"),
@@ -357,7 +360,10 @@ impl Renderer {
         }
     }
 
-    pub fn upload_volume(&self, data: &[u8]) {
+    /// Upload a full `volume_size³` cell grid to the R16Uint 3D texture.
+    /// `data` is one `u16` per voxel in x-major, y-stride, z-slice order.
+    pub fn upload_volume(&self, data: &[u16]) {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.volume_texture,
@@ -365,10 +371,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            data,
+            bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(self.volume_size),
+                bytes_per_row: Some(self.volume_size * 2),
                 rows_per_image: Some(self.volume_size),
             },
             wgpu::Extent3d {
@@ -392,17 +398,15 @@ impl Renderer {
             _ => return false,
         };
 
-        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         // Camera
         let (sin_yaw, cos_yaw) = self.camera_yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.camera_pitch.sin_cos();
 
-        let cam_dir = [
-            -cos_pitch * sin_yaw,
-            -sin_pitch,
-            -cos_pitch * cos_yaw,
-        ];
+        let cam_dir = [-cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw];
         let cam_pos = [
             self.camera_target[0] - cam_dir[0] * self.camera_dist,
             self.camera_target[1] - cam_dir[1] * self.camera_dist,
@@ -426,11 +430,14 @@ impl Renderer {
             camera_right: [right[0], right[1], right[2], 0.0],
             params: [self.volume_size as f32, aspect, fov_tan, 0.0],
         };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render encoder"),
+            });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

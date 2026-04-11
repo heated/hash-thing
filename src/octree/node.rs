@@ -1,5 +1,116 @@
-/// Cell state — 8 bits for now (256 materials), expandable later.
-pub type CellState = u8;
+/// Packed cell state: 10-bit material ID + 6-bit metadata in a single u16.
+///
+/// Layout (MSB → LSB):
+///   bits 15..6  material_id  (10 bits, 0..=1023)
+///   bits  5..0  metadata     ( 6 bits, 0..=63)
+///
+/// Material 0 is reserved as "empty" — the whole cell word is 0 iff the cell
+/// is empty, which preserves the hash-cons invariant that `NodeId::EMPTY`
+/// (a `Leaf(0)`) represents pure void. Attempting to attach metadata to
+/// material 0 is a programming error (there is no "empty with flavor"):
+/// `Cell::pack` panics in debug.
+///
+/// Hashlife treats `CellState` as an opaque bit pattern — it memoizes by
+/// pattern equality and never inspects the material/metadata split. The
+/// simulation kernel and renderer unpack as needed.
+pub type CellState = u16;
+
+/// Typed view over a `CellState` word. `Copy` and `repr(transparent)` so it
+/// can be stored interchangeably with a raw `u16`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(transparent)]
+pub struct Cell(pub CellState);
+
+impl Cell {
+    /// Canonical empty cell (material 0, metadata 0).
+    pub const EMPTY: Cell = Cell(0);
+
+    /// Number of bits reserved for the metadata field.
+    pub const METADATA_BITS: u32 = 6;
+
+    /// Maximum representable material ID (inclusive).
+    pub const MAX_MATERIAL: u16 = (1 << (16 - Self::METADATA_BITS)) - 1; // 1023
+
+    /// Maximum representable metadata value (inclusive).
+    pub const MAX_METADATA: u16 = (1 << Self::METADATA_BITS) - 1; // 63
+
+    const METADATA_MASK: u16 = Self::MAX_METADATA;
+
+    /// Pack a (material, metadata) pair. Panics in debug if either overflows
+    /// its field, or if metadata is nonzero on material 0 (ambiguous empty).
+    #[inline]
+    pub const fn pack(material: u16, metadata: u16) -> Cell {
+        debug_assert!(
+            material <= Self::MAX_MATERIAL,
+            "material id overflows 10 bits"
+        );
+        debug_assert!(metadata <= Self::MAX_METADATA, "metadata overflows 6 bits");
+        debug_assert!(
+            material != 0 || metadata == 0,
+            "material 0 is reserved for empty; metadata must also be 0",
+        );
+        Cell((material << Self::METADATA_BITS) | metadata)
+    }
+
+    /// Construct a cell from a raw `CellState` word (e.g. when loading from
+    /// the octree store or a GPU buffer).
+    #[inline]
+    pub const fn from_raw(raw: CellState) -> Cell {
+        Cell(raw)
+    }
+
+    /// Raw `CellState` word. This is what Hashlife memoizes on.
+    #[inline]
+    pub const fn raw(self) -> CellState {
+        self.0
+    }
+
+    /// Material ID (10 bits).
+    #[inline]
+    pub const fn material(self) -> u16 {
+        self.0 >> Self::METADATA_BITS
+    }
+
+    /// Metadata (6 bits).
+    #[inline]
+    pub const fn metadata(self) -> u16 {
+        self.0 & Self::METADATA_MASK
+    }
+
+    /// `true` iff this cell is the canonical empty cell (material 0, metadata 0).
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Produce a new cell with the material replaced, metadata preserved.
+    /// Panics in debug if `material` overflows or if `material==0` while
+    /// metadata is nonzero (the resulting cell would alias empty-with-flavor).
+    #[inline]
+    pub const fn with_material(self, material: u16) -> Cell {
+        Cell::pack(material, self.metadata())
+    }
+
+    /// Produce a new cell with the metadata replaced, material preserved.
+    #[inline]
+    pub const fn with_metadata(self, metadata: u16) -> Cell {
+        Cell::pack(self.material(), metadata)
+    }
+}
+
+impl From<u16> for Cell {
+    #[inline]
+    fn from(raw: u16) -> Cell {
+        Cell(raw)
+    }
+}
+
+impl From<Cell> for u16 {
+    #[inline]
+    fn from(cell: Cell) -> u16 {
+        cell.0
+    }
+}
 
 /// Index into the canonical node store. u32 to keep nodes small.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -65,4 +176,87 @@ pub fn octant_index(x: u32, y: u32, z: u32) -> usize {
 #[inline]
 pub fn octant_coords(idx: usize) -> (u32, u32, u32) {
     (idx as u32 & 1, (idx as u32 >> 1) & 1, (idx as u32 >> 2) & 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_cell_roundtrip() {
+        let c = Cell::EMPTY;
+        assert!(c.is_empty());
+        assert_eq!(c.material(), 0);
+        assert_eq!(c.metadata(), 0);
+        assert_eq!(c.raw(), 0);
+    }
+
+    #[test]
+    fn pack_unpack_basic() {
+        let c = Cell::pack(5, 3);
+        assert_eq!(c.material(), 5);
+        assert_eq!(c.metadata(), 3);
+        assert!(!c.is_empty());
+    }
+
+    #[test]
+    fn pack_unpack_boundary() {
+        let c = Cell::pack(Cell::MAX_MATERIAL, Cell::MAX_METADATA);
+        assert_eq!(c.material(), Cell::MAX_MATERIAL);
+        assert_eq!(c.metadata(), Cell::MAX_METADATA);
+        assert_eq!(c.raw(), 0xFFFF);
+    }
+
+    #[test]
+    fn raw_value_layout() {
+        // Material 1, metadata 0 -> bits 15..6 = 0000000001, bits 5..0 = 000000
+        // = 0b0000_0000_0100_0000 = 0x0040 = 64
+        assert_eq!(Cell::pack(1, 0).raw(), 0x0040);
+        // Material 1, metadata 1 -> 0x0041
+        assert_eq!(Cell::pack(1, 1).raw(), 0x0041);
+        // Material 2, metadata 0 -> 0x0080
+        assert_eq!(Cell::pack(2, 0).raw(), 0x0080);
+    }
+
+    #[test]
+    fn with_material_preserves_metadata() {
+        let c = Cell::pack(7, 42);
+        let d = c.with_material(9);
+        assert_eq!(d.material(), 9);
+        assert_eq!(d.metadata(), 42);
+    }
+
+    #[test]
+    fn with_metadata_preserves_material() {
+        let c = Cell::pack(7, 42);
+        let d = c.with_metadata(11);
+        assert_eq!(d.material(), 7);
+        assert_eq!(d.metadata(), 11);
+    }
+
+    #[test]
+    fn from_raw_roundtrip() {
+        for raw in [0u16, 1, 0x0040, 0x1234, 0xFFFF] {
+            assert_eq!(Cell::from_raw(raw).raw(), raw);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "material id overflows")]
+    fn pack_material_overflow_panics() {
+        // Cell::MAX_MATERIAL is 1023; 1024 overflows.
+        let _ = Cell::pack(1024, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "metadata overflows")]
+    fn pack_metadata_overflow_panics() {
+        let _ = Cell::pack(1, 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "material 0 is reserved")]
+    fn empty_with_flavor_panics() {
+        let _ = Cell::pack(0, 1);
+    }
 }

@@ -1,5 +1,5 @@
+use super::node::{octant_index, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
-use super::node::{CellState, Node, NodeId, octant_index};
 
 /// Canonical node store — the core of hash-consing.
 ///
@@ -104,7 +104,9 @@ impl NodeStore {
         let node = self.get(root).clone();
         match node {
             Node::Leaf(_) => self.leaf(state),
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -125,7 +127,9 @@ impl NodeStore {
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         match self.get(root) {
             Node::Leaf(s) => *s,
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -142,7 +146,7 @@ impl NodeStore {
     /// Flatten a region of the octree into a flat 3D array.
     /// Returns a Vec of size side^3, indexed as [x + y*side + z*side*side].
     pub fn flatten(&self, root: NodeId, side: usize) -> Vec<CellState> {
-        let mut grid = vec![0u8; side * side * side];
+        let mut grid = vec![0 as CellState; side * side * side];
         self.flatten_into(root, &mut grid, side, 0, 0, 0);
         grid
     }
@@ -160,7 +164,12 @@ impl NodeStore {
             Node::Leaf(s) => {
                 grid[ox + oy * side + oz * side * side] = *s;
             }
-            Node::Interior { level, children, population, .. } => {
+            Node::Interior {
+                level,
+                children,
+                population,
+                ..
+            } => {
                 if *population == 0 {
                     return; // skip entirely empty subtrees
                 }
