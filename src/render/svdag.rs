@@ -833,4 +833,195 @@ mod tests {
             "expected at least one StepPast event to sanity-check the bound",
         );
     }
+
+    /// Permanent seeded property test for the 27m step-past fix.
+    ///
+    /// The `grazing_ray_deep_forward_progress` test above preserves three
+    /// hand-plucked tuples from an ad-hoc fuzz sweep that caught the
+    /// 711/2000 stall rate before 27m. Those tuples are the fossils; this
+    /// test is the sweep. Per Claude Critical / Codex Evolutionary / Gemini
+    /// Evolutionary in the 27m trident review: "the three frozen cases are
+    /// a floor, not a ceiling — promote the fuzz harness to a permanent
+    /// seeded property test so future regressions catch the whole
+    /// distribution." (hash-thing-ysg).
+    ///
+    /// Shape: 2000 axis-dominant rays at seed `0xC0FFEE_u64`, with grazing
+    /// secondary `rd` components in `[-3e-2, 3e-2]`, targeting a single
+    /// depth-12 voxel near the cube center. For each case:
+    ///   1. `steps < 400` — forward progress within the budget (the
+    ///      original stall symptom was hitting MAX_STEPS=512).
+    ///   2. Every `StepPast` event has strict `t_new > t_old` — pre-27m
+    ///      far-camera rays produced `t_new == t_old` (Codex Critical
+    ///      zero-forward-progress blocker, resolved by ro clamp in v2).
+    ///   3. Aggregate hit count agrees with analytical ray-AABB ground
+    ///      truth within a small tolerance — catches a "fast miss"
+    ///      regression where the traversal silently drops hits (Codex
+    ///      Standard §1 concern).
+    #[test]
+    fn fuzz_grazing_forward_progress_property() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(12);
+        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        let dag = Svdag::build(&store, root, 12);
+
+        // Tight AABB of the single depth-12 voxel in world coordinates.
+        // At depth 12, cell width is 1/4096 ≈ 2.44e-4.
+        let voxel_min: [f32; 3] = [0.5, 0.5, 0.5];
+        let voxel_max: [f32; 3] = [
+            2049.0 / 4096.0,
+            2049.0 / 4096.0,
+            2049.0 / 4096.0,
+        ];
+
+        // Analytical ray-AABB: `t_far >= max(t_near, 0)` → hit. Uses the
+        // same slab math as cpu_trace::intersect_aabb so we're comparing
+        // against an oracle written in the same floating-point regime.
+        fn hits_voxel(
+            ro: [f32; 3],
+            rd: [f32; 3],
+            bmin: [f32; 3],
+            bmax: [f32; 3],
+        ) -> bool {
+            let inv = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+            let mut t_near = f32::NEG_INFINITY;
+            let mut t_far = f32::INFINITY;
+            for i in 0..3 {
+                let t1 = (bmin[i] - ro[i]) * inv[i];
+                let t2 = (bmax[i] - ro[i]) * inv[i];
+                t_near = t_near.max(t1.min(t2));
+                t_far = t_far.min(t1.max(t2));
+            }
+            t_far >= t_near.max(0.0)
+        }
+
+        // Same LCG the other svdag fuzz tests use, seeded at the value
+        // originally used to mine the three frozen tuples. Single closure
+        // so we don't fight the borrow checker with two independent
+        // closures both capturing `seed` mutably.
+        let mut seed: u64 = 0x00C0_FFEE_u64;
+        let mut next_u32 = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 32) as u32
+        };
+
+        // Unit-interval helper — pure fn on u32, no closure capture.
+        let u32_to_unit = |x: u32| (x as f32) / (u32::MAX as f32 + 1.0);
+
+        let mut total_steps: u64 = 0;
+        let mut traversal_hits: i32 = 0;
+        let mut analytic_hits: i32 = 0;
+
+        for i in 0..2000 {
+            // Dominant axis: {0, 1, 2}. Sign: {+, -}.
+            let axis = (next_u32() % 3) as usize;
+            let dom_pos = (next_u32() & 1) == 0;
+
+            // Dominant ro: outside the unit cube on one side so the ray
+            // enters. Pointing toward the cube requires rd_dom's sign to
+            // oppose ro_dom's side.
+            let dom_u = u32_to_unit(next_u32());
+            let dom_ro: f32 = if dom_pos {
+                2.0 + dom_u * 2.0 // +2 .. +4, ray heads -axis
+            } else {
+                -1.0 - dom_u * 2.0 // -3 .. -1, ray heads +axis
+            };
+
+            // Secondary ro near 0.5 (close to the voxel) with ±0.01 jitter
+            // — large enough to produce a mix of near-grazing hits and
+            // near-grazing misses.
+            let ro_a = 0.5 + (u32_to_unit(next_u32()) - 0.5) * 0.02;
+            let ro_b = 0.5 + (u32_to_unit(next_u32()) - 0.5) * 0.02;
+
+            let mut ro = [0f32; 3];
+            ro[axis] = dom_ro;
+            ro[(axis + 1) % 3] = ro_a;
+            ro[(axis + 2) % 3] = ro_b;
+
+            // Dominant rd: unit magnitude on the dominant axis, sign
+            // opposite to ro_dom so the ray points into the cube.
+            let rd_dom: f32 = if dom_pos { -1.0 } else { 1.0 };
+
+            // Grazing secondaries in [-3e-2, +3e-2]. Nudge away from zero
+            // so `1.0 / rd` never produces a ±inf — the traversal handles
+            // it but the ground-truth AABB oracle would divide by zero.
+            let mut rd_a = (u32_to_unit(next_u32()) - 0.5) * 6e-2;
+            let mut rd_b = (u32_to_unit(next_u32()) - 0.5) * 6e-2;
+            if rd_a.abs() < 1e-6 {
+                rd_a = if rd_a < 0.0 { -1e-6 } else { 1e-6 };
+            }
+            if rd_b.abs() < 1e-6 {
+                rd_b = if rd_b < 0.0 { -1e-6 } else { 1e-6 };
+            }
+
+            let mut rd_raw = [0f32; 3];
+            rd_raw[axis] = rd_dom;
+            rd_raw[(axis + 1) % 3] = rd_a;
+            rd_raw[(axis + 2) % 3] = rd_b;
+            let rd_n = normalize(rd_raw);
+
+            let result = cpu_trace::raycast(&dag.nodes, ro, rd_n, true);
+
+            // Hard assertion #1: forward progress within the step budget.
+            assert!(
+                result.steps < 400,
+                "ysg fuzz case {i} (axis={axis}, ro={ro:?}, rd={rd_n:?}): \
+                 forward-progress regression — used {steps} steps out of \
+                 MAX_STEPS=512. Pre-27m, ~35% of this distribution stalled \
+                 at MAX_STEPS.",
+                steps = result.steps,
+            );
+
+            // Hard assertion #2: every step-past strictly advances `t`.
+            // Pre-27m-v2 far-camera rays hit a `t_new == t_old` regime
+            // (Codex Critical blocker).
+            for (ev_idx, ev) in result.events.iter().enumerate() {
+                if let cpu_trace::TraceEvent::StepPast { t_old, t_new } = ev {
+                    assert!(
+                        t_new > t_old,
+                        "ysg fuzz case {i} event {ev_idx}: zero-forward-\
+                         progress regression — t_old={t_old} t_new={t_new} \
+                         (ro={ro:?}, rd={rd_n:?}). The 27m v2 ro clamp has \
+                         been broken.",
+                    );
+                }
+            }
+
+            total_steps += result.steps as u64;
+            if result.hit_material.is_some() {
+                traversal_hits += 1;
+            }
+            if hits_voxel(ro, rd_n, voxel_min, voxel_max) {
+                analytic_hits += 1;
+            }
+        }
+
+        // Aggregate hit-count sanity (Codex Standard §1): a "fast miss"
+        // regression would drop traversal_hits to zero while analytic_hits
+        // stays put. A `>|tolerance|` gap indicates systematic hit/miss
+        // drift. Exact match is unrealistic at the f32 grazing frontier
+        // (a handful of tangent rays can disagree on tangent-boundary
+        // cases), so we allow a small slack.
+        //
+        // With this geometry (single depth-12 voxel, |rd_secondary| up
+        // to 3e-2, secondary jitter ±0.01), the voxel is ~2.4e-4 wide so
+        // most rays miss; both counts should be small and agree to within
+        // a handful.
+        let diff = (traversal_hits - analytic_hits).abs();
+        assert!(
+            diff <= 5,
+            "ysg fuzz hit-count drift: traversal={traversal_hits} \
+             analytic={analytic_hits} diff={diff} (tolerance 5). \
+             Systematic hit/miss drift indicates a traversal regression \
+             that per-case forward-progress checks can't catch.",
+        );
+
+        // Sanity: assert we actually exercised the traversal non-trivially.
+        assert!(
+            total_steps > 2000,
+            "ysg fuzz: total_steps {total_steps} too low — the harness \
+             isn't exercising step-past paths (average < 1 step per ray).",
+        );
+    }
 }
