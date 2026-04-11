@@ -115,9 +115,24 @@ impl NodeStore {
     }
 
     /// Set a single cell in the octree. Returns a new root.
-    /// Coordinates are relative to the node's origin (0,0,0 corner).
+    ///
+    /// Coordinates are relative to the node's origin (0,0,0 corner) and MUST
+    /// be strictly less than `1 << root_level`. Out-of-bounds writes **panic**
+    /// (hash-thing-fb5): silent data corruption is unacceptable, and the
+    /// bounds check is a single compare against `side` at the public entry.
+    ///
+    /// Footgun: `root` must be an actual world root whose `Node::level()`
+    /// reflects the realized extent. Passing `NodeId::EMPTY` (level 0) turns
+    /// every non-origin coordinate into an OOB panic because the entry's
+    /// `side` computation resolves to 1.
+    #[track_caller]
     pub fn set_cell(&mut self, root: NodeId, x: u64, y: u64, z: u64, state: CellState) -> NodeId {
         let level = self.get(root).level();
+        let side = 1u64 << level;
+        assert!(
+            x < side && y < side && z < side,
+            "NodeStore::set_cell: coord ({x}, {y}, {z}) out of bounds for side {side} (level {level})",
+        );
         self.set_cell_at(root, level, x, y, z, state)
     }
 
@@ -125,6 +140,11 @@ impl NodeStore {
     /// as seen from its parent — this may differ from `Node::level()` when a
     /// `Leaf` represents a uniform subtree compressed at an intermediate level
     /// (uniform-subtree compression, empty-subtree collapse, etc.).
+    ///
+    /// Precondition: coordinates are already in-bounds for `level`. The
+    /// public `set_cell` entry enforces this; direct callers would have to
+    /// re-derive it. The `debug_assert!` below makes the contract executable
+    /// in dev without adding release overhead.
     fn set_cell_at(
         &mut self,
         node: NodeId,
@@ -134,6 +154,10 @@ impl NodeStore {
         z: u64,
         state: CellState,
     ) -> NodeId {
+        debug_assert!(
+            level == 0 || (x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level)),
+            "set_cell_at: coord ({x}, {y}, {z}) out of bounds for level {level}",
+        );
         if level == 0 {
             return self.leaf(state);
         }
@@ -163,14 +187,44 @@ impl NodeStore {
     }
 
     /// Get a single cell value.
+    ///
+    /// Out-of-bounds reads return `0` silently (hash-thing-fb5). `get_cell`
+    /// is a pure function — it never grows storage, never panics. Outside
+    /// the realized region is conceptually unrealized empty space. The
+    /// raycaster, the eventual Hashlife stepper, and any debug visualizer
+    /// rely on this contract to probe arbitrarily far without ballooning
+    /// storage. Realization happens through separate explicit APIs
+    /// (`World::ensure_contains`, future `realize_region`), not here.
+    ///
+    /// Footgun: `root` must be a real world root. `NodeId::EMPTY` has level
+    /// 0, so every non-origin coordinate reflects to 0 via the OOB branch.
     #[allow(dead_code)]
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
-        match self.get(root) {
+        let level = self.get(root).level();
+        let side = 1u64 << level;
+        if x >= side || y >= side || z >= side {
+            return 0;
+        }
+        self.get_cell_at(root, level, x, y, z)
+    }
+
+    /// Recursive worker for `get_cell`. Precondition: coordinates are in
+    /// bounds for `level`. The public `get_cell` entry enforces this; the
+    /// `debug_assert!` makes the contract executable in dev without any
+    /// release overhead.
+    fn get_cell_at(&self, node: NodeId, level: u32, x: u64, y: u64, z: u64) -> CellState {
+        debug_assert!(
+            level == 0 || (x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level)),
+            "get_cell_at: coord ({x}, {y}, {z}) out of bounds for level {level}",
+        );
+        match self.get(node) {
             Node::Leaf(s) => *s,
             Node::Interior {
-                level, children, ..
+                level: node_level,
+                children,
+                ..
             } => {
-                let half = 1u64 << (level - 1);
+                let half = 1u64 << (node_level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
                 let oz = if z >= half { 1u32 } else { 0 };
@@ -178,7 +232,7 @@ impl NodeStore {
                 let lx = if ox == 1 { x - half } else { x };
                 let ly = if oy == 1 { y - half } else { y };
                 let lz = if oz == 1 { z - half } else { z };
-                self.get_cell(children[idx], lx, ly, lz)
+                self.get_cell_at(children[idx], node_level - 1, lx, ly, lz)
             }
         }
     }
@@ -1092,5 +1146,97 @@ mod tests {
         assert_eq!(NodeId::EMPTY, NodeId(0));
         assert!(matches!(compacted.get(NodeId::EMPTY), Node::Leaf(0)));
         assert_eq!(compacted.population(NodeId::EMPTY), 0);
+    }
+
+    // ===========================================================================
+    // Bounds-check tests (hash-thing-fb5 / 819 bug-fix half).
+    //
+    // set_cell panics on OOB writes; get_cell silently returns 0 on OOB reads.
+    // These tests pin the asymmetric policy: writes are intent (silent loss
+    // is unacceptable), reads are queries (far-field probe across an
+    // unrealized frontier must not panic).
+    // ===========================================================================
+
+    /// Regression for the silent-alias bug: before fb5, `get_cell(8, 0, 0)`
+    /// on a level-2 (side 4) root walked the upper-octant branch at every
+    /// level and aliased to `(3, 3, 3)`. Now it returns 0.
+    #[test]
+    fn get_cell_returns_empty_outside_root() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // side 4
+        root = store.set_cell(root, 3, 3, 3, 9); // corner cell, distinct value
+                                                 // Sanity: the corner read works.
+        assert_eq!(store.get_cell(root, 3, 3, 3), 9);
+        // OOB reads on every axis return 0 (not the boundary cell).
+        assert_eq!(store.get_cell(root, 4, 0, 0), 0);
+        assert_eq!(store.get_cell(root, 0, 4, 0), 0);
+        assert_eq!(store.get_cell(root, 0, 0, 4), 0);
+        assert_eq!(store.get_cell(root, 100, 100, 100), 0);
+        assert_eq!(store.get_cell(root, u64::MAX, 0, 0), 0);
+        assert_eq!(store.get_cell(root, 0, u64::MAX, 0), 0);
+        assert_eq!(store.get_cell(root, 0, 0, u64::MAX), 0);
+    }
+
+    /// OOB writes panic on every axis. Three #[should_panic] tests because
+    /// the upper-octant recursion path is independently broken on each axis
+    /// and we want to lock all three down.
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn set_cell_panics_outside_root_x() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2); // side 4
+        store.set_cell(root, 4, 0, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn set_cell_panics_outside_root_y() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2);
+        store.set_cell(root, 0, 4, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn set_cell_panics_outside_root_z() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2);
+        store.set_cell(root, 0, 0, 4, 1);
+    }
+
+    /// Sanity that the bounds check doesn't off-by-one: max-in-bounds writes
+    /// and reads still work for `(side-1, side-1, side-1)` and `(0, 0, 0)`.
+    #[test]
+    fn set_cell_in_bounds_still_works() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3); // side 8
+        root = store.set_cell(root, 7, 7, 7, 5);
+        root = store.set_cell(root, 0, 0, 0, 3);
+        assert_eq!(store.get_cell(root, 7, 7, 7), 5);
+        assert_eq!(store.get_cell(root, 0, 0, 0), 3);
+    }
+
+    /// Explicit max-in-bounds read — catches `>=` vs `>` mistakes in the
+    /// entry-level bounds check.
+    #[test]
+    fn get_cell_at_max_in_bounds() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // side 4
+        root = store.set_cell(root, 3, 3, 3, 42);
+        assert_eq!(store.get_cell(root, 3, 3, 3), 42);
+    }
+
+    /// Lock in the "no-assert on OOB read" decision — a future contributor
+    /// might see the OOB branch and add a debug_assert!. This test runs
+    /// in debug builds and verifies OOB reads don't panic.
+    #[test]
+    fn get_cell_no_assert_on_oob() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2);
+        // Must not panic in debug builds.
+        let _ = store.get_cell(root, 4, 0, 0);
+        let _ = store.get_cell(root, 0, 4, 0);
+        let _ = store.get_cell(root, 0, 0, 4);
+        let _ = store.get_cell(root, u64::MAX, u64::MAX, u64::MAX);
     }
 }

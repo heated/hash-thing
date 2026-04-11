@@ -31,11 +31,30 @@ impl World {
     }
 
     /// Set a cell.
+    ///
+    /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). Silent data
+    /// loss is unacceptable; once `World::ensure_contains` (hash-thing-819
+    /// contract half) and lazy root expansion (hash-thing-e9h) land, callers
+    /// will route OOB writes through explicit realization — for now the
+    /// primitive defends itself.
+    #[track_caller]
     pub fn set(&mut self, x: u64, y: u64, z: u64, state: CellState) {
+        let side = self.side() as u64;
+        assert!(
+            x < side && y < side && z < side,
+            "World::set: coord ({x}, {y}, {z}) out of bounds for side {side}",
+        );
         self.root = self.store.set_cell(self.root, x, y, z, state);
     }
 
     /// Get a cell.
+    ///
+    /// Out-of-bounds reads return `0` silently (hash-thing-fb5). `get` is a
+    /// pure query over the realized region — outside that region is
+    /// conceptually unrealized empty space. Future stepper neighbor-gathers
+    /// and debug visualizers probe across the root edge relying on this
+    /// contract; a panic would be catastrophic there. No `debug_assert!` —
+    /// the assert would fire on the exact pattern the API sanctions.
     #[allow(dead_code)]
     pub fn get(&self, x: u64, y: u64, z: u64) -> CellState {
         self.store.get_cell(self.root, x, y, z)
@@ -452,5 +471,37 @@ mod tests {
         let mut w = World::new(6);
         w.seed_center(12, 0.35);
         assert!(w.population() > 0);
+    }
+
+    // -----------------------------------------------------------------
+    // 9-11. Bounds check on World::set / World::get (hash-thing-fb5 /
+    //       819 bug-fix half). Writes panic OOB, reads return 0. See
+    //       src/octree/store.rs for the NodeStore-layer counterparts.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn world_set_panics_oob() {
+        let mut w = World::new(2); // side 4
+        w.set(4, 0, 0, 1);
+    }
+
+    #[test]
+    fn world_set_in_bounds_at_max_corner() {
+        let mut w = World::new(2); // side 4
+        w.set(3, 3, 3, 1);
+        assert_eq!(w.get(3, 3, 3), 1);
+        // And the complementary corner.
+        w.set(0, 0, 0, 2);
+        assert_eq!(w.get(0, 0, 0), 2);
+    }
+
+    #[test]
+    fn world_get_returns_zero_oob() {
+        let w = World::new(2); // side 4
+        assert_eq!(w.get(4, 0, 0), 0);
+        assert_eq!(w.get(0, 4, 0), 0);
+        assert_eq!(w.get(0, 0, 4), 0);
+        assert_eq!(w.get(u64::MAX, 0, 0), 0);
     }
 }
