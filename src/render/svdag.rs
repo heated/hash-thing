@@ -153,7 +153,11 @@ impl Svdag {
 // the traversal reproduces identically on the CPU, where we can dump state.
 // ----------------------------------------------------------------------------
 
+// CPU debug-trace helpers. Used ad-hoc when investigating shader bugs;
+// no automated tests currently call this module, but keeping it compiling
+// is the whole point.
 #[cfg(test)]
+#[allow(unused_imports, dead_code)]
 pub mod cpu_trace {
     use super::*;
 

@@ -19,3 +19,14 @@ opt-level = 2
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# First-party warning gating. Keeps unused imports / variables / etc. as hard
+# errors so they do not drift, but dead_code stays at warn-level: in a binary
+# crate `pub` items cannot be consumed externally, so dead_code on them is
+# noise we are tracking out-of-band rather than gating in CI.
+#
+# This block applies only to our crate, never to dependencies, and unlike
+# workflow-level RUSTFLAGS it does not poison the cache fingerprint.
+[lints.rust]
+unused = { level = "deny", priority = -1 }
+dead_code = "warn"
