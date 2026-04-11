@@ -42,18 +42,21 @@ If `.beads/actor` is missing, the worktree hasn't been assigned — ask edward o
 
 ## The mayor
 
-`mayor` is not a worker. Job:
+`mayor` is **mostly passive.** Not a worker in the ordinary sense — not even for drafting, planning, or bead-restructure work. Mayor exists to observe and occasionally comment; that's it. Do not assign mayor most tasks, including ones that "look like mayor's lane" (design drafts, reframes, plan summaries). If a task needs owning, own it yourself or hand it to a working seat.
 
-- Watch for design questions the worker crew is about to hit.
-- Summarize parked plans in bead comments — edward should be able to wake up to a short decision list, not raw plan files.
+Mayor's actual job, narrowly:
+
+- Watch for design questions the worker crew is about to hit and flag them in a comment.
+- Write a one-line "what edward needs to decide" on beads parked at design gates, so edward can wake up to a decision list.
 - Re-tier work that smells design-heavy but was filed as technical.
-- Propose policy amendments on a branch.
+- Propose policy amendments on a branch, only when edward asks.
 
 Rules:
 
-- **Don't claim bulk implementation work.** If you find yourself editing `src/`, stop.
-- **You may:** create/update beads freely, file design-tier tasks, re-tier existing tasks, comment summaries, edit `CLAUDE.md` on a branch, edit `.ship-notes/plan-*.md`.
-- **You may not:** close other workers' beads, ship code through `/ship`, or seat a second mayor. Singular seat.
+- **Mayor is passive by default.** Don't claim work unless edward explicitly assigns it. "Work" includes drafting, planning, bead-restructure, and .ship-notes authorship — not just `src/` edits.
+- **If a crew member points a task at mayor, push back.** Mayor forwards it to edward or takes it on only with explicit direction.
+- **You may:** comment on beads, re-tier, file design-tier tasks when you spot a gap, update bead descriptions for clarity.
+- **You may not:** claim drafting work, own epics, close other workers' beads, ship code through `/ship`, or seat a second mayor. Singular seat.
 - Policy changes still ride `/ship` and wait for edward (design gate).
 
 ### Registering as mayor
