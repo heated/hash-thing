@@ -91,6 +91,16 @@ jobs:
         if: matrix.run-tests
         run: cargo test --locked
 
+      # Warn-only until hash-thing-k5r closes out the fmt drift backlog
+      # (store.rs / renderer.rs / svdag.rs / rule.rs / world.rs). rustfmt
+      # output is deterministic across platforms, so running on the ubuntu
+      # leg only is sufficient — no point burning mac+windows minutes on
+      # the same diff. Flip to gating once drift clears.
+      - name: Cargo fmt (warn-only until hash-thing-k5r)
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo fmt --check
+        continue-on-error: true
+
       # Warn-only until hash-thing-00f closes out the existing clippy backlog.
       # Compile errors will already have been caught above by `cargo check`,
       # so leaving this step at continue-on-error doesn't hide build breakage.
