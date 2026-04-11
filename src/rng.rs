@@ -46,14 +46,16 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-// Distinct odd multipliers derived from the golden ratio & related irrationals
-// so that each axis/field enters the hash with a different spread. Using
-// distinct primes prevents trivial symmetries like `cell_hash(a,b,c,..) ==
-// cell_hash(b,a,c,..)`.
-const MX: u64 = 0x9E3779B97F4A7C15; // φ
-const MY: u64 = 0xBF58476D1CE4E5B9;
-const MZ: u64 = 0x94D049BB133111EB;
-const MG: u64 = 0xD1B54A32D192ED03;
+// Distinct odd 64-bit multipliers so each axis/field enters the hash with a
+// different spread. Breaking axis symmetry prevents trivial collisions like
+// `cell_hash(a,b,c,..) == cell_hash(b,a,c,..)`. We deliberately avoid the
+// two SplitMix64 finalizer constants used inside `mix64` below, pulling
+// instead from the xxHash / Murmur3 families so the per-field multiply and
+// the subsequent mix step are doing structurally distinct work.
+const MX: u64 = 0x9E3779B97F4A7C15; // 2^64 / φ (golden ratio)
+const MY: u64 = 0xC2B2AE3D27D4EB4F; // xxHash64 PRIME2
+const MZ: u64 = 0x165667B19E3779F9; // xxHash64 PRIME3
+const MG: u64 = 0x85EBCA77C2B2AE63; // Murmur3-class, distinct from mix64 constants
 
 /// Hash a (position, generation, seed) tuple to a pseudo-random `u64`.
 ///
@@ -77,20 +79,24 @@ pub fn cell_rand_f64(x: i64, y: i64, z: i64, generation: u64, seed: u64) -> f64 
     (bits as f64) * (1.0 / ((1u64 << 53) as f64))
 }
 
-/// Unbiased uniform integer in `[0, n)`. Panics if `n == 0`.
+/// Near-uniform integer in `[0, n)`. Panics if `n == 0`.
 ///
 /// Uses Lemire's fast-range trick (64×64→128-bit multiply, take the high
-/// half). This has a tiny modulo bias that is undetectable for any `n` a CA
-/// rule would reasonably ask for; if you need strict unbiased-ness, reject
-/// the high-bias band instead.
+/// half). Residual modulo bias is bounded by `n / 2^64`, which is far below
+/// any observable threshold for any `n` a CA rule would realistically ask
+/// for. If you need strictly unbiased output, reject the high-bias band.
 #[inline]
 pub fn cell_rand_range(x: i64, y: i64, z: i64, generation: u64, seed: u64, n: u64) -> u64 {
-    assert!(n > 0, "cell_rand_range: n must be > 0");
+    assert!(n > 0, "cell_rand_range: n must be > 0, got {n}");
     let h = cell_hash(x, y, z, generation, seed) as u128;
     ((h * n as u128) >> 64) as u64
 }
 
 /// Boolean that is true with probability `p` (clamped to `[0, 1]`).
+///
+/// `NaN` inputs return `false` — `f64::clamp` passes NaN through unchanged,
+/// and `_ < NaN` is always false, so the result is well-defined (if not
+/// particularly meaningful). Callers that care should not pass NaN.
 #[inline]
 pub fn cell_rand_bool(x: i64, y: i64, z: i64, generation: u64, seed: u64, p: f64) -> bool {
     let p = p.clamp(0.0, 1.0);
@@ -159,14 +165,17 @@ mod tests {
     #[test]
     fn f64_roughly_uniform() {
         // Split [0,1) into 10 buckets over 10_000 samples. Each bucket
-        // should hold ~1000 samples. Loose bound: [600, 1400].
+        // should hold ~1000 samples. Loose bound: [600, 1400]. We vary x, y,
+        // AND generation so a hash that's only weak on one axis still fails.
         let mut buckets = [0u32; 10];
         let mut n = 0u32;
-        for x in 0..100i64 {
-            for y in 0..100i64 {
-                let v = cell_rand_f64(x, y, 0, 0, 0xC0FFEE);
-                buckets[(v * 10.0) as usize] += 1;
-                n += 1;
+        for g in 0..10u64 {
+            for x in 0..50i64 {
+                for y in 0..20i64 {
+                    let v = cell_rand_f64(x, y, 0, g, 0xC0FFEE);
+                    buckets[(v * 10.0) as usize] += 1;
+                    n += 1;
+                }
             }
         }
         assert_eq!(n, 10_000);
@@ -216,22 +225,49 @@ mod tests {
     #[test]
     fn avalanche_single_bit_flip() {
         // Flipping one bit of one input should change ~half of the output
-        // bits on average. We just check "a lot" to guard against total
-        // linearity. A good hash gets ~32; we accept [16, 48] as "clearly
-        // mixing."
-        let base = cell_hash(0, 0, 0, 0, 0);
-        let mut total = 0u32;
-        let mut samples = 0u32;
-        for bit in 0..64 {
-            let flipped = cell_hash(0, 0, 0, 0, 1u64 << bit);
-            total += (base ^ flipped).count_ones();
-            samples += 1;
+        // bits on average. A good hash gets ~32; we accept [16, 48] as
+        // "clearly mixing." We probe all five input channels independently
+        // so a weak-on-one-axis mixer still fails.
+        fn measure_channel<F: Fn(u64) -> u64>(base: u64, f: F) -> u32 {
+            let mut total = 0u32;
+            for bit in 0..64 {
+                let flipped = f(1u64 << bit);
+                total += (base ^ flipped).count_ones();
+            }
+            total / 64
         }
-        let avg = total / samples;
-        assert!(
-            (16..=48).contains(&avg),
-            "avalanche mean = {avg} bits, expected ~32"
-        );
+
+        // Use nonzero baselines so zero-multiplier corner cases don't sneak
+        // a pass. (mix64(0) is still 0, but the other fields prevent that
+        // from mattering here.)
+        let base = cell_hash(17, 29, 41, 53, 0x01234567_89ABCDEF);
+        let avg_x = measure_channel(base, |b| {
+            cell_hash(17 ^ b as i64, 29, 41, 53, 0x01234567_89ABCDEF)
+        });
+        let avg_y = measure_channel(base, |b| {
+            cell_hash(17, 29 ^ b as i64, 41, 53, 0x01234567_89ABCDEF)
+        });
+        let avg_z = measure_channel(base, |b| {
+            cell_hash(17, 29, 41 ^ b as i64, 53, 0x01234567_89ABCDEF)
+        });
+        let avg_g = measure_channel(base, |b| {
+            cell_hash(17, 29, 41, 53 ^ b, 0x01234567_89ABCDEF)
+        });
+        let avg_s = measure_channel(base, |b| {
+            cell_hash(17, 29, 41, 53, 0x01234567_89ABCDEF ^ b)
+        });
+        for (name, avg) in [
+            ("x", avg_x),
+            ("y", avg_y),
+            ("z", avg_z),
+            ("generation", avg_g),
+            ("seed", avg_s),
+        ] {
+            assert!(
+                (16..=48).contains(&avg),
+                "avalanche mean for {name} = {avg} bits, expected ~32"
+            );
+        }
     }
 
     #[test]
