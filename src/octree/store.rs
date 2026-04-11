@@ -811,11 +811,11 @@ mod tests {
     fn set_cell_preserves_siblings_when_child_is_leaf_at_intermediate_level() {
         let mut store = NodeStore::new();
 
-        // Level-2 root (4x4x4). Octant 0 is a raw Leaf(7): by structural
+        // Level-2 root (4x4x4). Octant 0 is a raw Leaf(mat(7)): by structural
         // convention a Leaf child of a level-2 Interior represents a uniform
         // 2x2x2 block. The other 7 octants are fully-expanded empty level-1
         // nodes so the bug has somewhere to hide.
-        let leaf7 = store.leaf(7);
+        let leaf7 = store.leaf(mat(7));
         let empty_l1 = store.empty(1);
         let root = store.interior(
             2,
@@ -825,11 +825,11 @@ mod tests {
         );
 
         // Change one cell inside the compressed uniform block.
-        let new_root = store.set_cell(root, 0, 0, 0, 9);
+        let new_root = store.set_cell(root, 0, 0, 0, mat(9));
 
-        // The written cell is 9.
-        assert_eq!(store.get_cell(new_root, 0, 0, 0), 9);
-        // The other 7 cells that used to be covered by Leaf(7) are still 7.
+        // The written cell is material 9.
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), mat(9));
+        // The other 7 cells that used to be covered by Leaf(mat(7)) are still mat(7).
         for &(x, y, z) in &[
             (1, 0, 0),
             (0, 1, 0),
@@ -841,7 +841,7 @@ mod tests {
         ] {
             assert_eq!(
                 store.get_cell(new_root, x, y, z),
-                7,
+                mat(7),
                 "cell ({x},{y},{z}) should survive set_cell on a sibling",
             );
         }
@@ -857,9 +857,9 @@ mod tests {
     fn set_cell_expands_leaf_through_multiple_intermediate_levels() {
         let mut store = NodeStore::new();
 
-        // Level-3 root (8x8x8) whose octant 0 is Leaf(5) — a uniform 4x4x4
+        // Level-3 root (8x8x8) whose octant 0 is Leaf(mat(5)) — a uniform 4x4x4
         // block. set_cell must expand it twice on the way down.
-        let leaf5 = store.leaf(5);
+        let leaf5 = store.leaf(mat(5));
         let empty_l2 = store.empty(2);
         let root = store.interior(
             3,
@@ -868,14 +868,14 @@ mod tests {
             ],
         );
 
-        let new_root = store.set_cell(root, 2, 1, 3, 9);
+        let new_root = store.set_cell(root, 2, 1, 3, mat(9));
 
-        assert_eq!(store.get_cell(new_root, 2, 1, 3), 9);
+        assert_eq!(store.get_cell(new_root, 2, 1, 3), mat(9));
         // Spot-check that the rest of the uniform block survived.
         for &(x, y, z) in &[(0, 0, 0), (3, 3, 3), (0, 3, 0), (2, 1, 2), (2, 0, 3)] {
             assert_eq!(
                 store.get_cell(new_root, x, y, z),
-                5,
+                mat(5),
                 "cell ({x},{y},{z}) should survive deep set_cell",
             );
         }
@@ -886,8 +886,8 @@ mod tests {
     fn set_cell_on_leaf_root_level_zero() {
         let mut store = NodeStore::new();
         let root = store.leaf(0);
-        let new_root = store.set_cell(root, 0, 0, 0, 5);
-        assert_eq!(store.get_cell(new_root, 0, 0, 0), 5);
+        let new_root = store.set_cell(root, 0, 0, 0, mat(5));
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), mat(5));
     }
 
     // ===========================================================================
@@ -925,14 +925,14 @@ mod tests {
         // Build store A: empty(6), set one cell.
         let mut a = NodeStore::new();
         let mut root_a = a.empty(6);
-        root_a = a.set_cell(root_a, 10, 20, 30, 7);
+        root_a = a.set_cell(root_a, 10, 20, 30, mat(7));
         let pre_nodes = a.stats().0;
         let (compacted_a, new_root_a) = a.compacted(root_a);
 
         // Build store B: a fresh one-cell world — empty(6), set the same cell.
         let mut b = NodeStore::new();
         let mut root_b = b.empty(6);
-        root_b = b.set_cell(root_b, 10, 20, 30, 7);
+        root_b = b.set_cell(root_b, 10, 20, 30, mat(7));
         // Compact B too so both sides went through the same canonicalization.
         let (compacted_b, _new_root_b) = b.compacted(root_b);
 
@@ -948,7 +948,7 @@ mod tests {
             compacted_a.stats().0
         );
         // Cell round-trip.
-        assert_eq!(compacted_a.get_cell(new_root_a, 10, 20, 30), 7);
+        assert_eq!(compacted_a.get_cell(new_root_a, 10, 20, 30), mat(7));
         assert_eq!(compacted_a.get_cell(new_root_a, 0, 0, 0), 0);
     }
 
@@ -960,9 +960,9 @@ mod tests {
         let side = 16usize;
         let mut store = NodeStore::new();
         // Seed a recognizable pattern.
-        let mut grid = vec![0u8; side * side * side];
+        let mut grid = vec![0 as CellState; side * side * side];
         for i in 0..side {
-            grid[i + i * side + i * side * side] = (i as u8 % 7) + 1;
+            grid[i + i * side + i * side * side] = mat((i as u16 % 7) + 1);
         }
         let mut root = store.from_flat(&grid, side);
         // Churn: rebuild a handful of generations. We don't need real CA
@@ -970,7 +970,7 @@ mod tests {
         // with slightly different grids, leaking old subtrees.
         for gen in 0..5 {
             for (x, cell) in grid.iter_mut().enumerate().take(side) {
-                *cell = ((gen + x) as u8 % 5) + 1;
+                *cell = mat(((gen + x) as u16 % 5) + 1);
             }
             root = store.from_flat(&grid, side);
         }
@@ -1005,16 +1005,16 @@ mod tests {
     #[test]
     fn compact_cells_match_fresh_build() {
         let side = 8usize;
-        let mut grid = vec![0u8; side * side * side];
-        grid[0] = 5;
-        grid[side * side * side - 1] = 9;
-        grid[3 + 4 * side + 5 * side * side] = 2;
+        let mut grid = vec![0 as CellState; side * side * side];
+        grid[0] = mat(5);
+        grid[side * side * side - 1] = mat(9);
+        grid[3 + 4 * side + 5 * side * side] = mat(2);
 
         let mut dirty = NodeStore::new();
         // Churn the store: build, mutate, build again — leaves dead nodes.
         let _waste1 = dirty.from_flat(&grid, side);
         let mut grid2 = grid.clone();
-        grid2[1] = 3;
+        grid2[1] = mat(3);
         let _waste2 = dirty.from_flat(&grid2, side);
         let final_root = dirty.from_flat(&grid, side);
 
@@ -1043,8 +1043,8 @@ mod tests {
         let mut store = NodeStore::new();
         // Build a non-trivial level-1 subtree (not all-empty, not uniform).
         let l0 = store.leaf(0);
-        let l1 = store.leaf(1);
-        let l2 = store.leaf(2);
+        let l1 = store.leaf(mat(1));
+        let l2 = store.leaf(mat(2));
         let shared = store.interior(1, [l1, l0, l2, l0, l1, l0, l2, l0]);
         // Use `shared` in two slots of a level-2 parent (alongside other stuff).
         let other = store.interior(1, [l0, l1, l0, l1, l0, l1, l0, l1]);
@@ -1087,14 +1087,17 @@ mod tests {
     }
 
     /// T6: compaction preserves per-cell material payload across multiple
-    /// distinct `CellState` values. `CellState` is `u8` so 255 materials;
-    /// compaction must be payload-transparent, not just shape-transparent.
+    /// distinct `CellState` values. `CellState` is now a packed 10-bit
+    /// material id + 6-bit metadata `u16`; compaction must be
+    /// payload-transparent, not just shape-transparent.
     #[test]
     fn compact_preserves_multiple_cell_states() {
         let side = 8usize;
-        let mut grid = vec![0u8; side * side * side];
-        // Sprinkle a handful of distinct states.
-        let cells: &[(usize, usize, usize, u8)] = &[
+        let mut grid = vec![0 as CellState; side * side * side];
+        // Sprinkle a handful of distinct material ids. Each tuple is
+        // (x, y, z, material_id); stored as `mat(material_id)` so the raw
+        // cell word is a valid Cell.
+        let cells: &[(usize, usize, usize, u16)] = &[
             (0, 0, 0, 1),
             (1, 0, 0, 2),
             (2, 0, 0, 3),
@@ -1105,21 +1108,21 @@ mod tests {
             (7, 7, 7, 255),
             (3, 4, 5, 128),
         ];
-        for &(x, y, z, s) in cells {
-            grid[x + y * side + z * side * side] = s;
+        for &(x, y, z, m) in cells {
+            grid[x + y * side + z * side * side] = mat(m);
         }
         let mut store = NodeStore::new();
         // Churn so compaction has something to drop.
         let mut g2 = grid.clone();
-        g2[0] = 99;
+        g2[0] = mat(99);
         let _waste = store.from_flat(&g2, side);
         let root = store.from_flat(&grid, side);
         let (compacted, new_root) = store.compacted(root);
 
-        for &(x, y, z, s) in cells {
+        for &(x, y, z, m) in cells {
             assert_eq!(
                 compacted.get_cell(new_root, x as u64, y as u64, z as u64),
-                s,
+                mat(m),
                 "cell ({x},{y},{z}) material drifted"
             );
         }
@@ -1133,21 +1136,24 @@ mod tests {
     #[test]
     fn compact_is_idempotent() {
         let side = 16usize;
-        let mut grid = vec![0u8; side * side * side];
+        let mut grid = vec![0 as CellState; side * side * side];
         for z in 0..side {
             for y in 0..side {
                 for x in 0..side {
-                    grid[x + y * side + z * side * side] = ((x * 7 + y * 11 + z * 13) % 17) as u8;
+                    // Material id 0..=16. 0 stays as raw empty; non-zero wraps
+                    // through `mat()` to produce a valid Cell word.
+                    let m = ((x * 7 + y * 11 + z * 13) % 17) as u16;
+                    grid[x + y * side + z * side * side] = if m == 0 { 0 } else { mat(m) };
                 }
             }
         }
         let mut dirty = NodeStore::new();
         // Churn.
         let mut g2 = grid.clone();
-        g2[0] = 254;
+        g2[0] = mat(254);
         let _w1 = dirty.from_flat(&g2, side);
         let mut g3 = grid.clone();
-        g3[1] = 253;
+        g3[1] = mat(253);
         let _w2 = dirty.from_flat(&g3, side);
         let root = dirty.from_flat(&grid, side);
 
@@ -1180,14 +1186,14 @@ mod tests {
     #[test]
     fn compact_population_invariant_at_every_interior() {
         let side = 16usize;
-        let mut grid = vec![0u8; side * side * side];
+        let mut grid = vec![0 as CellState; side * side * side];
         for i in 0..side {
-            grid[i + (i % 4) * side + (i % 3) * side * side] = ((i % 7) + 1) as u8;
+            grid[i + (i % 4) * side + (i % 3) * side * side] = mat(((i % 7) + 1) as u16);
         }
         let mut store = NodeStore::new();
         // Churn.
         let mut g2 = grid.clone();
-        g2[0] = 77;
+        g2[0] = mat(77);
         let _waste = store.from_flat(&g2, side);
         let root = store.from_flat(&grid, side);
         let (compacted, new_root) = store.compacted(root);
@@ -1228,7 +1234,7 @@ mod tests {
     fn compact_preserves_empty_at_slot_zero() {
         let mut store = NodeStore::new();
         let mut root = store.empty(4);
-        root = store.set_cell(root, 3, 3, 3, 1);
+        root = store.set_cell(root, 3, 3, 3, mat(1));
         let (compacted, _new_root) = store.compacted(root);
         assert_eq!(NodeId::EMPTY, NodeId(0));
         assert!(matches!(compacted.get(NodeId::EMPTY), Node::Leaf(0)));
@@ -1251,9 +1257,9 @@ mod tests {
     fn get_cell_returns_empty_outside_root() {
         let mut store = NodeStore::new();
         let mut root = store.empty(2); // side 4
-        root = store.set_cell(root, 3, 3, 3, 9); // corner cell, distinct value
-                                                 // Sanity: the corner read works.
-        assert_eq!(store.get_cell(root, 3, 3, 3), 9);
+        root = store.set_cell(root, 3, 3, 3, mat(9)); // corner cell, distinct value
+                                                      // Sanity: the corner read works.
+        assert_eq!(store.get_cell(root, 3, 3, 3), mat(9));
         // OOB reads on every axis return 0 (not the boundary cell).
         assert_eq!(store.get_cell(root, 4, 0, 0), 0);
         assert_eq!(store.get_cell(root, 0, 4, 0), 0);
@@ -1272,7 +1278,7 @@ mod tests {
     fn set_cell_panics_outside_root_x() {
         let mut store = NodeStore::new();
         let root = store.empty(2); // side 4
-        store.set_cell(root, 4, 0, 0, 1);
+        store.set_cell(root, 4, 0, 0, mat(1));
     }
 
     #[test]
@@ -1280,7 +1286,7 @@ mod tests {
     fn set_cell_panics_outside_root_y() {
         let mut store = NodeStore::new();
         let root = store.empty(2);
-        store.set_cell(root, 0, 4, 0, 1);
+        store.set_cell(root, 0, 4, 0, mat(1));
     }
 
     #[test]
@@ -1288,7 +1294,7 @@ mod tests {
     fn set_cell_panics_outside_root_z() {
         let mut store = NodeStore::new();
         let root = store.empty(2);
-        store.set_cell(root, 0, 0, 4, 1);
+        store.set_cell(root, 0, 0, 4, mat(1));
     }
 
     /// Sanity that the bounds check doesn't off-by-one: max-in-bounds writes
@@ -1297,10 +1303,10 @@ mod tests {
     fn set_cell_in_bounds_still_works() {
         let mut store = NodeStore::new();
         let mut root = store.empty(3); // side 8
-        root = store.set_cell(root, 7, 7, 7, 5);
-        root = store.set_cell(root, 0, 0, 0, 3);
-        assert_eq!(store.get_cell(root, 7, 7, 7), 5);
-        assert_eq!(store.get_cell(root, 0, 0, 0), 3);
+        root = store.set_cell(root, 7, 7, 7, mat(5));
+        root = store.set_cell(root, 0, 0, 0, mat(3));
+        assert_eq!(store.get_cell(root, 7, 7, 7), mat(5));
+        assert_eq!(store.get_cell(root, 0, 0, 0), mat(3));
     }
 
     /// Explicit max-in-bounds read — catches `>=` vs `>` mistakes in the
@@ -1309,8 +1315,8 @@ mod tests {
     fn get_cell_max_in_bounds() {
         let mut store = NodeStore::new();
         let mut root = store.empty(2); // side 4
-        root = store.set_cell(root, 3, 3, 3, 42);
-        assert_eq!(store.get_cell(root, 3, 3, 3), 42);
+        root = store.set_cell(root, 3, 3, 3, mat(42));
+        assert_eq!(store.get_cell(root, 3, 3, 3), mat(42));
     }
 
     /// Lock in the "no-assert on OOB read" decision — a future contributor

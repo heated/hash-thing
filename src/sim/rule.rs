@@ -1,6 +1,13 @@
 use crate::octree::CellState;
 use std::fmt;
 
+/// Default "alive" cell word: material id 1, metadata 0. Raw value
+/// `1 << METADATA_BITS`. Used as the reborn-cell payload by the binary
+/// Game-of-Life step and as the ground truth for "a live cell" in tests.
+/// Lives at module scope (not inside `step_cell`) so test modules in
+/// `rule.rs` and `world.rs` can reach it without duplicating the constant.
+pub(crate) const ALIVE: CellState = 1 << crate::octree::Cell::METADATA_BITS;
+
 /// A cellular automaton rule operating on the 26-cell Moore neighborhood in 3D.
 pub trait CaRule {
     /// Given a cell's current state and its 26 neighbors, return the next state.
@@ -82,7 +89,6 @@ impl CaRule for GameOfLife3D {
         // material ID 1 (will become meaningful once the material registry
         // lands in 1v0.2).
         let alive_count: u8 = neighbors.iter().map(|&n| if n > 0 { 1u8 } else { 0 }).sum();
-        const ALIVE: CellState = 1 << crate::octree::Cell::METADATA_BITS; // material 1, metadata 0
         if center > 0 {
             // alive: survive?
             if alive_count >= self.survive_min && alive_count <= self.survive_max {
@@ -193,7 +199,7 @@ mod tests {
     fn rule445_birth_range_boundary() {
         let rule = GameOfLife3D::rule445();
         assert_eq!(rule.step_cell(0, &neighbors_with_alive(3)), 0);
-        assert_eq!(rule.step_cell(0, &neighbors_with_alive(4)), 1);
+        assert_eq!(rule.step_cell(0, &neighbors_with_alive(4)), ALIVE);
         assert_eq!(rule.step_cell(0, &neighbors_with_alive(5)), 0);
     }
 
@@ -211,6 +217,11 @@ mod tests {
 
     /// Any nonzero neighbor counts as alive — guards against a future
     /// refactor that compares against a specific material ID.
+    ///
+    /// The neighbor slots hold bare `u16` values, not validated `Cell`
+    /// words, because `step_cell` only reads them via `n > 0`. The only
+    /// assertion that has to be a valid Cell is the **output** of
+    /// `step_cell`, and that's always `ALIVE` on birth.
     #[test]
     fn nonzero_neighbors_all_count_as_alive() {
         // Place 4 distinct nonzero values, rest zero. Under rule445 a
@@ -221,7 +232,7 @@ mod tests {
         n[2] = 42;
         n[3] = 255;
         let rule = GameOfLife3D::rule445();
-        assert_eq!(rule.step_cell(0, &n), 1);
+        assert_eq!(rule.step_cell(0, &n), ALIVE);
     }
 
     /// With all 26 neighbors alive: amoeba (S 9..=26) survives; the other
