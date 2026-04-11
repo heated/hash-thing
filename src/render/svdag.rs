@@ -738,6 +738,59 @@ mod tests {
         );
     }
 
+    /// Throughput regression for Claude Critical's deep-level concern:
+    /// a dominant-axis ray through a mostly-empty MAX_DEPTH scene should
+    /// converge in a reasonable step budget. Claude Critical feared that
+    /// `min(half/64, 1e-5)` would starve dominant-axis rays at depth 13
+    /// by reducing per-step advance to ~9.5e-7. That analysis conflated
+    /// `dt` (ULP padding) with the total step advance. Per-step advance
+    /// is `(oct_far - t_prev) + dt`, dominated by the cell-exit time
+    /// `oct_far - t_prev` which is O(cell_span / |rd|) — 128x larger
+    /// than `dt` for dominant-axis rays. Sparse scenes coalesce empty
+    /// space into shallow cells, so most step-pasts happen at coarse
+    /// levels anyway. This test asserts the actual observed behavior:
+    /// hitting or missing a single-voxel scene at root_level=14 from
+    /// multiple ray directions completes in well under MAX_STEPS/4.
+    #[test]
+    fn dominant_axis_throughput_max_depth() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(14);
+        root = store.set_cell(root, 8192, 8192, 8192, 1);
+        let dag = Svdag::build(&store, root, 14);
+
+        // Dominant-axis rays hitting and missing the single deep voxel
+        // from different entry angles. `|ro|` kept small here because
+        // this test is about throughput, not far-camera clamp behavior
+        // (that's covered by step_past_t_is_local_frame).
+        let cases: [([f32; 3], [f32; 3]); 6] = [
+            // x-axis hit
+            ([-0.5, 0.5, 0.5], [1.0, 0.0, 0.0]),
+            // y-axis hit
+            ([0.5, -0.5, 0.5], [0.0, 1.0, 0.0]),
+            // z-axis hit
+            ([0.5, 0.5, -0.5], [0.0, 0.0, 1.0]),
+            // x-axis miss (grazing)
+            ([-0.5, 0.25, 0.25], [1.0, 0.0, 0.0]),
+            // Diagonal hit through center
+            ([-0.5, -0.5, -0.5], [1.0, 1.0, 1.0]),
+            // Axis-dominant with tiny perpendicular components
+            ([-0.5, 0.5001, 0.4999], [1.0, 1e-4, -1e-4]),
+        ];
+
+        for (i, (ro, rd)) in cases.iter().enumerate() {
+            let rd_n = normalize(*rd);
+            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            assert!(
+                result.steps < 128,
+                "case {i} (ro={ro:?}, rd={rd:?}): dominant-axis throughput \
+                 regression at root_level=14 — used {steps} steps, expected \
+                 < 128. If this fires, Claude Critical's `min` vs `max` \
+                 concern may be warranted after all.",
+                steps = result.steps,
+            );
+        }
+    }
+
     /// Direct regression for the 27m v2 `ro` clamp: after clamping, the
     /// in-loop `t` variable is local-frame and bounded by the in-cube
     /// traversal length (≤ √3 plus a tiny EPS overshoot). Pre-clamp,
