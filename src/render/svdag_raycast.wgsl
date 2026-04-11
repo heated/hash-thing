@@ -102,6 +102,16 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
 
+    // hash-thing-27m v2: clamp ro to the root-cube entry (Laine-Karras).
+    // After this, `t` inside the loop is the in-cube traversal length,
+    // bounded by √3, so ULP(t) stays ≤ ~2.4e-7 regardless of original
+    // camera distance. Without this, far-camera rays stall because
+    // ULP(t) exceeds the depth-scaled nudge (~9.5e-7 at MAX_DEPTH) and
+    // `t_new = oct_far + dt` rounds back to `t_old` in f32.
+    let entry = max(root_hit.x, 0.0);
+    let ro_local = ro + rd * entry;
+    let t_exit = root_hit.y - entry;
+
     // Stack of (node_offset, node_min, half_size)
     var stack_node: array<u32, MAX_DEPTH>;
     var stack_min: array<vec3<f32>, MAX_DEPTH>;
@@ -112,20 +122,27 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     stack_min[0] = vec3<f32>(0.0);
     stack_half[0] = 0.5;
 
-    // Start the ray just past the root entry point.
-    var t = max(root_hit.x, 0.0) + 1e-5;
+    // Local-frame starting t — just past the root entry. `ro_local`
+    // already sits on the root face, so we nudge forward by EPS.
+    var t = 1e-5;
 
     for (var step = 0u; step < MAX_STEPS; step = step + 1u) {
-        if t > root_hit.y { break; }
-        let pos = ro + rd * t;
+        if t > t_exit { break; }
+        let pos = ro_local + rd * t;
 
         // If the current top-of-stack no longer contains `pos`, pop.
-        // NOTE: STRICT bounds (no EPS slack). The step-past below advances `t`
-        // past the octant exit by a scale-aware nudge sized to the child cell,
-        // guaranteeing pos is comfortably above f32 ULP past the boundary on the
-        // exit axis (hash-thing-27m). If we allowed EPS slack here, the pop would
-        // still consider pos "inside" after a step-past since the slack on this
-        // side could equal or exceed the per-axis positional advance, causing
+        // NOTE: STRICT bounds (no EPS slack). Two guarantees keep this safe:
+        //   (1) ro is clamped to the root-cube entry (27m v2), so `t` inside
+        //       the loop is local-frame and bounded by √3; ULP(t_local)
+        //       stays ≤ ~2.4e-7.
+        //   (2) The step-past below uses a cell-scaled nudge of at least
+        //       ~9.5e-7 on the identified exit axis at MAX_DEPTH.
+        // Together (1) > (2) means pos advances strictly past the octant
+        // boundary on the exit axis in the common uncapped path. The
+        // cap-bound path (ultra-grazing |rd_axis| at MAX_DEPTH) can still
+        // collapse below ULP — that remains the known f32 frontier and
+        // requires integer DDA to fully resolve. Allowing EPS slack in the
+        // pop would defeat the strict step-past ordering and reintroduce
         // infinite loops on simultaneous two-axis boundary crossings.
         var top = depth;
         loop {
@@ -156,8 +173,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                 if mat > 0u {
                     // HIT
                     let base = material_color(mat);
-                    // Cheap lighting: distance fog + flat shading based on ray dir
-                    let fog = exp(-t * 1.2);
+                    // Cheap lighting: distance fog + flat shading based on ray dir.
+                    // Fog uses world-space distance (entry + local t) so it
+                    // matches the pre-27m-v2 visual output.
+                    let t_world = t + entry;
+                    let fog = exp(-t_world * 1.2);
                     let shade = 0.35 + 0.65 * abs(rd.y);
                     return vec4<f32>(base * shade * fog, 1.0);
                 }
@@ -198,8 +218,8 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // three axes — same value the old `intersect_aabb(...).y` returned
         // — but exposed per-axis so we can identify which axis is the
         // actual exit and scale the post-exit nudge against its |rd|.
-        let t1 = (child_min - ro) * inv_rd;
-        let t2 = (child_max - ro) * inv_rd;
+        let t1 = (child_min - ro_local) * inv_rd;
+        let t2 = (child_max - ro_local) * inv_rd;
         let tmax_v = max(t1, t2);
         var oct_far: f32 = tmax_v.x;
         var exit_rd: f32 = abs(rd.x);
