@@ -68,12 +68,19 @@ impl World {
     }
 
     /// Place a random seed pattern in the center of the world.
+    ///
+    /// The loop bounds are clamped to `[0, side)` so `radius > center` does
+    /// not underflow `u64` (which would debug-panic or release-wrap into an
+    /// 18-quintillion-iteration hang).
     pub fn seed_center(&mut self, radius: u64, density: f64) {
-        let center = self.side() as u64 / 2;
+        let side = self.side() as u64;
+        let center = side / 2;
+        let lo = center.saturating_sub(radius);
+        let hi = center.saturating_add(radius).min(side);
         let mut rng = SimpleRng::new(42);
-        for z in (center - radius)..(center + radius) {
-            for y in (center - radius)..(center + radius) {
-                for x in (center - radius)..(center + radius) {
+        for z in lo..hi {
+            for y in lo..hi {
+                for x in lo..hi {
                     // Spherical mask
                     let dx = x as f64 - center as f64;
                     let dy = y as f64 - center as f64;
@@ -403,5 +410,38 @@ mod tests {
             0,
             "corner live cell must die under amoeba (0 neighbors)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 7. Regression for hash-thing-2o5: seed_center with radius > center.
+    //
+    // Level 4 -> side 16, center 8. Pre-fix, radius=12 made the loop
+    // range `(center - radius)..(center + radius)` on u64, which
+    // underflows to a 2^64-scale range and debug-panics (or release-wraps
+    // into an 18-quintillion-iteration hang). Post-fix the bounds are
+    // clamped to `[0, side)` and the spherical mask still fills a large
+    // fraction of cells at density 0.35.
+    // -----------------------------------------------------------------
+    #[test]
+    fn seed_center_radius_larger_than_center_does_not_underflow() {
+        let mut w = World::new(4);
+        w.seed_center(12, 0.35);
+        assert!(
+            w.population() > 0,
+            "clamped seed region should still populate some cells"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 8. Non-underflow path: demo default level 6 (side 64), radius 12,
+    //    density 0.35 — matches main.rs VOLUME_SIZE=64. Radius < center
+    //    here, so the clamp is a no-op and this exercises the normal
+    //    path alongside the clamp regression above.
+    // -----------------------------------------------------------------
+    #[test]
+    fn seed_center_normal_radius_produces_population() {
+        let mut w = World::new(6);
+        w.seed_center(12, 0.35);
+        assert!(w.population() > 0);
     }
 }
