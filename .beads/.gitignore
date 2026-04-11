@@ -31,6 +31,10 @@ bd.db
 # Must not be committed as paths would be wrong in other clones
 redirect
 
+# Per-worktree crew identity (ember, flint, onyx, etc.)
+# Sourced at session start via: export BEADS_ACTOR=$(cat .beads/actor)
+actor
+
 # Merge artifacts (temporary files from 3-way merge)
 beads.base.jsonl
 beads.base.meta.json
