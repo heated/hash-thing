@@ -53,9 +53,13 @@ impl Svdag {
         debug_assert_eq!(root_offset, 0, "root must be at offset 0");
 
         // Each emitted interior node is exactly NODE_STRIDE u32s (mask + 8 children).
-        // `id_to_offset` includes leaf NodeIds that are encoded inline rather than
-        // emitted, so it overcounts — divide the buffer length to get the real
-        // emitted-interior count, matching what `byte_size()` reports.
+        // Derive node_count from the buffer length so it stays in lock-step with
+        // `byte_size() / 36` by construction; the debug_assert below catches any
+        // future change that breaks the stride invariant. (Today this happens to
+        // equal `id_to_offset.len()` because only interior nodes are interned —
+        // leaves are encoded inline in the parent's child slot — but that
+        // equivalence is a coincidence of the current writer, not an invariant
+        // we want to depend on.)
         const NODE_STRIDE: usize = 9;
         debug_assert_eq!(
             nodes.len() % NODE_STRIDE,
