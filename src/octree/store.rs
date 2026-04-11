@@ -1,5 +1,5 @@
+use super::node::{octant_index, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
-use super::node::{CellState, Node, NodeId, octant_index};
 
 /// Canonical node store — the core of hash-consing.
 ///
@@ -17,6 +17,9 @@ pub struct NodeStore {
     step_cache: FxHashMap<NodeId, NodeId>,
 }
 
+// Scaffold API used by upcoming Hashlife work (stepper, compaction, debug
+// inspection) — keep even if unused today.
+#[allow(dead_code)]
 impl NodeStore {
     pub fn new() -> Self {
         let mut store = Self {
@@ -104,7 +107,9 @@ impl NodeStore {
         let node = self.get(root).clone();
         match node {
             Node::Leaf(_) => self.leaf(state),
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -125,7 +130,9 @@ impl NodeStore {
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         match self.get(root) {
             Node::Leaf(s) => *s,
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -160,16 +167,21 @@ impl NodeStore {
             Node::Leaf(s) => {
                 grid[ox + oy * side + oz * side * side] = *s;
             }
-            Node::Interior { level, children, population, .. } => {
+            Node::Interior {
+                level,
+                children,
+                population,
+                ..
+            } => {
                 if *population == 0 {
                     return; // skip entirely empty subtrees
                 }
                 let half = 1usize << (level - 1);
                 let children = *children;
-                for oct in 0..8 {
+                for (oct, &child) in children.iter().enumerate() {
                     let (cx, cy, cz) = super::node::octant_coords(oct);
                     self.flatten_into(
-                        children[oct],
+                        child,
                         grid,
                         side,
                         ox + cx as usize * half,
@@ -183,11 +195,13 @@ impl NodeStore {
 
     /// Build an octree from a flat 3D array.
     /// Grid is indexed as [x + y*side + z*side*side], side must be a power of 2.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
         let level = (side as f64).log2() as u32;
         self.from_flat_recursive(grid, side, 0, 0, 0, level)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn from_flat_recursive(
         &mut self,
         grid: &[CellState],
@@ -202,9 +216,9 @@ impl NodeStore {
         }
         let half = 1usize << (level - 1);
         let mut children = [NodeId::EMPTY; 8];
-        for oct in 0..8 {
+        for (oct, slot) in children.iter_mut().enumerate() {
             let (cx, cy, cz) = super::node::octant_coords(oct);
-            children[oct] = self.from_flat_recursive(
+            *slot = self.from_flat_recursive(
                 grid,
                 side,
                 ox + cx as usize * half,

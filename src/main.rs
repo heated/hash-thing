@@ -57,7 +57,7 @@ impl App {
             renderer.upload_volume(&data);
             // Also rebuild the SVDAG so the other render path stays in sync.
             let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
-            if self.world.generation % 10 == 0 {
+            if self.world.generation.is_multiple_of(10) {
                 log::info!(
                     "SVDAG: {} nodes, {} bytes, root_level={}",
                     dag.node_count,
@@ -173,8 +173,8 @@ impl ApplicationHandler for App {
                         let dy = (position.y - ly) as f32;
                         if let Some(renderer) = &mut self.renderer {
                             renderer.camera_yaw += dx * 0.005;
-                            renderer.camera_pitch = (renderer.camera_pitch + dy * 0.005)
-                                .clamp(-1.4, 1.4);
+                            renderer.camera_pitch =
+                                (renderer.camera_pitch + dy * 0.005).clamp(-1.4, 1.4);
                         }
                     }
                     self.last_mouse = Some((position.x, position.y));
@@ -198,7 +198,7 @@ impl ApplicationHandler for App {
                     self.upload_volume();
                     self.step_timer = std::time::Instant::now();
 
-                    if self.world.generation % 10 == 0 {
+                    if self.world.generation.is_multiple_of(10) {
                         let (nodes, cache) = self.world.store.stats();
                         log::info!(
                             "Gen {}: pop={}, nodes={}, cache={}",

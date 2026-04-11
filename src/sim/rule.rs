@@ -25,7 +25,12 @@ pub struct GameOfLife3D {
 
 impl GameOfLife3D {
     pub fn new(survive_min: u8, survive_max: u8, birth_min: u8, birth_max: u8) -> Self {
-        Self { survive_min, survive_max, birth_min, birth_max }
+        Self {
+            survive_min,
+            survive_max,
+            birth_min,
+            birth_max,
+        }
     }
 
     /// "Amoeba" rule — produces organic-looking growth.

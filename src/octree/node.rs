@@ -34,6 +34,8 @@ pub enum Node {
     },
 }
 
+// Scaffold API used by upcoming Hashlife work — keep even if unused today.
+#[allow(dead_code)]
 impl Node {
     pub fn level(&self) -> u32 {
         match self {
