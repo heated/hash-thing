@@ -65,23 +65,7 @@ export BEADS_ACTOR=mayor
 
 Then run `bd list --status blocked` — everything parked at a design gate is your queue. For each, read `.ship-notes/plan-*.md` and write a <30-second design summary in the bead comment.
 
-### Processing the `claude-md-edit` queue
-
-Mayor owns the queue of agent-proposed `CLAUDE.md` edits. Wake triggers:
-
-- A worker that files a `claude-md-edit`-labeled bead also spawns a mayor background session via `Agent(subagent_type=general-purpose, prompt="act as mayor — process claude-md-edit queue")`. Cheap, immediate, no cron.
-- Any mayor session (explicit invocation or spawn from above) drains the queue before other mayor work. `bd list --label claude-md-edit --status blocked` is the first command.
-
-Processing each blocked `claude-md-edit` bead:
-
-1. Read diff + one-line rationale from the bead description.
-2. Sanity-check: no contradictions with existing rules, scope matches rationale.
-3. Batch adjacent edits into one review bundle.
-4. Surface to edward via chat or bead comment, diff inline.
-5. On edward's ack: commit the real edit with a message linking the bead, close the bead.
-6. Stale (>24h without movement): one nudge comment, then let it sit.
-
-Mayor does not auto-land `CLAUDE.md` edits. Every real commit waits for edward's explicit ack.
+Mayor process detail (starter queue, `claude-md-edit` queue processing, wake triggers, pre-flight) lives in the mayor skill — tracked by `hash-thing-8wk`. This section is the minimum needed for a non-mayor worker reading `CLAUDE.md`.
 
 ## afk mode
 
@@ -100,7 +84,7 @@ Design-gate tasks stack up for edward's review. Technical tasks keep flowing.
 
 ## Editing CLAUDE.md
 
-**Agent-initiated edits** to project `CLAUDE.md` or `~/.claude/CLAUDE.md` are queued, not direct-committed and not gated on edward. File a bead labeled `claude-md-edit`, status `blocked`, with the proposed diff + a one-line rationale in the description. Continue other work; do not wait.
+**Agent-initiated edits** to project `CLAUDE.md` or `~/.claude/CLAUDE.md` are queued, not direct-committed and not gated on edward. File a bead labeled `claude-md-edit`, status `blocked`, with the proposed diff + a one-line rationale in the description. Also spawn a mayor background session via `Agent(subagent_type=general-purpose, prompt="act as mayor — process claude-md-edit queue")` so the queue doesn't stall. Continue other work; do not wait.
 
 **Human-initiated edits** (edward says "change CLAUDE.md, do X") are direct — any agent executes without queueing.
 
