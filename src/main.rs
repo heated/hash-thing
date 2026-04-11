@@ -111,8 +111,12 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                         winit::keyboard::Key::Character("s") => {
-                            // Single step
-                            self.world.step_flat(&self.rule);
+                            // Single step via the mutation-channel tick loop.
+                            // apply_mutations is a no-op here (no entities yet),
+                            // but it's load-bearing: step_ca debug-asserts the
+                            // queue is empty (hash-thing-1v0.9).
+                            self.world.apply_mutations();
+                            self.world.step_ca(&self.rule);
                             self.upload_volume();
                             log::info!(
                                 "Gen {}: pop={}",
@@ -192,9 +196,15 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // Step simulation
+                // Step simulation via the mutation-channel tick loop.
+                // See hash-thing-1v0.9: apply_mutations → step_ca is the
+                // closed-world-invariant entry point. Wall-clock timer
+                // only gates *when* the step runs, never *what* it
+                // computes (the sim is a pure function of generation
+                // count and seed — see .ship-notes/determinism-audit.md).
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
-                    self.world.step_flat(&self.rule);
+                    self.world.apply_mutations();
+                    self.world.step_ca(&self.rule);
                     self.upload_volume();
                     self.step_timer = std::time::Instant::now();
 
