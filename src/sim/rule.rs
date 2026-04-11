@@ -36,7 +36,12 @@ pub struct GameOfLife3D {
 
 impl GameOfLife3D {
     pub fn new(survive_min: u8, survive_max: u8, birth_min: u8, birth_max: u8) -> Self {
-        Self { survive_min, survive_max, birth_min, birth_max }
+        Self {
+            survive_min,
+            survive_max,
+            birth_min,
+            birth_max,
+        }
     }
 
     /// "Amoeba" preset — `S9-26/B5-7`. Organic spreading growth.
@@ -93,6 +98,14 @@ impl CaRule for GameOfLife3D {
 
 #[cfg(test)]
 mod tests {
+    //! Unit coverage for `GameOfLife3D`:
+    //!   - Preset numeric ranges (hash-thing-pbx): source of truth for doc
+    //!     comments and main.rs display labels.
+    //!   - `step_cell` boundary conditions (hash-thing-1di): survive/birth
+    //!     range edges, preset quirks, and the payload-transparency
+    //!     invariant that survival returns `center` unchanged. Pinned
+    //!     before any refactor touches the module (material tags,
+    //!     recursive Hashlife stepper, etc.).
     use super::*;
 
     /// Lock in the numeric ranges of every preset. This test is the source
@@ -120,5 +133,100 @@ mod tests {
         assert_eq!((pyro.survive_min, pyro.survive_max), (4, 7));
         assert_eq!((pyro.birth_min, pyro.birth_max), (6, 8));
         assert_eq!(format!("{}", pyro), "S4-7/B6-8");
+    }
+
+    /// Construct a 26-neighbor array with exactly `count` live cells
+    /// (using material id 1) and the rest empty.
+    fn neighbors_with_alive(count: usize) -> [CellState; 26] {
+        assert!(count <= 26);
+        let mut n = [0 as CellState; 26];
+        for slot in n.iter_mut().take(count) {
+            *slot = 1;
+        }
+        n
+    }
+
+    /// Dead cell with zero neighbors stays dead under every preset.
+    /// All presets have `birth_min >= 1`, so zero neighbors never births.
+    #[test]
+    fn dead_with_zero_neighbors_stays_dead_all_presets() {
+        let zero = neighbors_with_alive(0);
+        assert_eq!(GameOfLife3D::amoeba().step_cell(0, &zero), 0);
+        assert_eq!(GameOfLife3D::crystal().step_cell(0, &zero), 0);
+        assert_eq!(GameOfLife3D::rule445().step_cell(0, &zero), 0);
+        assert_eq!(GameOfLife3D::pyroclastic().step_cell(0, &zero), 0);
+    }
+
+    /// Crystal preset quirk: `survive_min = 0` — a live cell with zero
+    /// neighbors actually survives. Pin the behavior so a future author
+    /// doesn't "fix" it into a death.
+    #[test]
+    fn crystal_isolated_live_cell_survives() {
+        let zero = neighbors_with_alive(0);
+        assert_eq!(GameOfLife3D::crystal().step_cell(1, &zero), 1);
+    }
+
+    /// Amoeba `survive_min = 9`: isolated live cells die immediately.
+    #[test]
+    fn amoeba_isolated_live_cell_dies() {
+        let zero = neighbors_with_alive(0);
+        assert_eq!(GameOfLife3D::amoeba().step_cell(1, &zero), 0);
+    }
+
+    /// rule445 survive range is `4..=4`. Check both sides of the boundary
+    /// plus the hit to catch any off-by-one in the inclusive range check.
+    #[test]
+    fn rule445_survive_range_boundary() {
+        let rule = GameOfLife3D::rule445();
+        assert_eq!(rule.step_cell(1, &neighbors_with_alive(3)), 0);
+        assert_eq!(rule.step_cell(1, &neighbors_with_alive(4)), 1);
+        assert_eq!(rule.step_cell(1, &neighbors_with_alive(5)), 0);
+    }
+
+    /// rule445 birth range is `4..=4`. Same three cases, center dead.
+    #[test]
+    fn rule445_birth_range_boundary() {
+        let rule = GameOfLife3D::rule445();
+        assert_eq!(rule.step_cell(0, &neighbors_with_alive(3)), 0);
+        assert_eq!(rule.step_cell(0, &neighbors_with_alive(4)), 1);
+        assert_eq!(rule.step_cell(0, &neighbors_with_alive(5)), 0);
+    }
+
+    /// Survival returns `center` unchanged — *not* a constant "alive"
+    /// value. This is the payload-transparency invariant that 1v0.2 will
+    /// rely on when CellState carries material tags.
+    #[test]
+    fn survival_preserves_center_payload() {
+        let rule = GameOfLife3D::crystal();
+        // crystal S(0..=6): zero neighbors still survives, so center=42
+        // round-trips through step_cell unchanged.
+        let zero = neighbors_with_alive(0);
+        assert_eq!(rule.step_cell(42, &zero), 42);
+    }
+
+    /// Any nonzero neighbor counts as alive — guards against a future
+    /// refactor that compares against a specific material ID.
+    #[test]
+    fn nonzero_neighbors_all_count_as_alive() {
+        // Place 4 distinct nonzero values, rest zero. Under rule445 a
+        // dead center with exactly 4 alive neighbors births.
+        let mut n = [0 as CellState; 26];
+        n[0] = 1;
+        n[1] = 7;
+        n[2] = 42;
+        n[3] = 255;
+        let rule = GameOfLife3D::rule445();
+        assert_eq!(rule.step_cell(0, &n), 1);
+    }
+
+    /// With all 26 neighbors alive: amoeba (S 9..=26) survives; the other
+    /// three presets have upper survive bounds below 26 so they die.
+    #[test]
+    fn all_26_neighbors_alive_survival_by_preset() {
+        let full = neighbors_with_alive(26);
+        assert_eq!(GameOfLife3D::amoeba().step_cell(1, &full), 1);
+        assert_eq!(GameOfLife3D::crystal().step_cell(1, &full), 0);
+        assert_eq!(GameOfLife3D::rule445().step_cell(1, &full), 0);
+        assert_eq!(GameOfLife3D::pyroclastic().step_cell(1, &full), 0);
     }
 }
