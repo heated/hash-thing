@@ -70,9 +70,9 @@ Then run `bd list --status blocked` — everything parked at a design gate is yo
 
 Mayor process detail (starter queue, `claude-md-edit` queue processing, wake triggers, pre-flight) lives in the mayor skill — tracked by `hash-thing-8wk`. This section is the minimum needed for a non-mayor worker reading `CLAUDE.md`.
 
-## autopilot — the permanent default operating mode
+## How the crew runs
 
-**Edward is never at the yoke.** As of 2026-04-11 the crew runs on autopilot permanently: we never wait for him at any gate, ever. Don't ask him to approve plans, don't wait for him to respond, don't idle. This is the standing default and does not get cleared — assume it even if no one mentions autopilot at session start. (Older docs and comments may say "afk mode"; it's the same thing, renamed because "afk" implies a temporary step-away, which no longer applies.)
+**Edward is never at the yoke.** The crew never waits for him at any gate, ever. Don't ask him to approve plans, don't wait for him to respond, don't idle.
 
 At every gate (including design gates):
 
@@ -83,7 +83,7 @@ At every gate (including design gates):
 
 Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/ship` end-to-end.
 
-**Design gates are narrower than they look.** Per edward 2026-04-11: if a scout finds two independent implementations of the same bead, do NOT park at a human gate just because there's a choice to make. Review both and pick one yourself. Only genuine user-facing design calls (what the system *is*, not how it's built) warrant the gate. Internal-API / implementation-detail decisions are autonomous. See `hash-thing-52b` for the precedent.
+**Design gates are narrower than they look.** If a scout finds two independent implementations of the same bead, do NOT park at a human gate just because there's a choice to make. Review both and pick one yourself. Only genuine user-facing design calls (what the system *is*, not how it's built) warrant the gate. Internal-API / implementation-detail decisions are autonomous. See `hash-thing-52b` for the precedent.
 
 ### When `bd ready` is dry — **do not stop**
 
@@ -97,15 +97,13 @@ Scout-tier moves in priority order:
 4. **Epic decomposition.** Read an epic description (`bd show hash-thing-6gf`), identify the next 2-3 technical sub-beads, file them with dependencies on the epic. Don't do the keystone design decisions — just the boring decomposition.
 5. **Scout lane.** If another crew has a parked plan, read it and leave a bead comment with any technical concerns you spotted. Don't touch their code; do contribute review signal.
 6. **Transcript review (yls).** When the session has accumulated enough action that transcripts are interesting — read `~/.claude/projects/-Users-edward-projects-hash-thing*/*.jsonl` and file beads for patterns worth fixing. This is one of only a few meta-beads ember can actually advance.
-7. **Only after all of the above come up empty** in the same session: write a `.ship-notes/autopilot-session-summary.md` (gitignored, local) and finish. This should be rare.
+7. **Only after all of the above come up empty** in the same session: write a `.ship-notes/session-summary.md` (gitignored, local) and finish. This should be rare.
 
 **Do not poach other crews' lanes** to stay busy — that's the one move that isn't allowed. Lane discipline still applies. But scout work is cheap, wide, and always available.
 
-**Only edward himself can clear autopilot**, and only by explicit statement in-session ("I'm back", "pause autopilot", or similar). Crew broadcasts cannot clear it. If in doubt, stay on autopilot.
-
 ### Drift-unparking autonomy
 
-Any agent may autonomously unblock a bead parked under autopilot if **none of the listed "what edward needs to decide" items is actually a design call** under the Gate Tiers rubric. Bug fixes, refactors, naming, on-disk formats, module layout, and plan-file open questions that are just style/scope picks are drift-parked by autopilot reflex, not real gates — reopen them and let the owner ship.
+Any agent may autonomously unblock a bead whose park comment lists **no actual design call** under the Gate Tiers rubric. Bug fixes, refactors, naming, on-disk formats, module layout, and plan-file open questions that are just style/scope picks are drift-parked by reflex, not real gates — reopen them and let the owner ship.
 
 Procedure:
 1. Re-read the park comment. If the question maps to "ship without asking" in the gate-tier rubric, it's drift.
