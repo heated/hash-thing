@@ -2,6 +2,7 @@ mod octree;
 mod render;
 mod rng;
 mod sim;
+mod terrain;
 
 use std::sync::Arc;
 use winit::{
@@ -28,23 +29,28 @@ struct App {
 impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-        // Seed with a sphere of random cells
-        world.seed_center(12, 0.35);
+        let params = terrain::TerrainParams::default();
+        let stats = world.seed_terrain(&params);
 
         let (nodes, _) = world.store.stats();
         log::info!(
-            "Initial world: {}^3, population={}, nodes={}",
+            "Initial terrain: {}^3, population={}, nodes={}, gen_calls={}, collapses={}",
             world.side(),
             world.population(),
-            nodes
+            nodes,
+            stats.calls_total,
+            stats.total_collapses(),
         );
 
+        // Start paused so the active CA rule (legacy GoL) does not
+        // immediately treat solid terrain as alive and destroy it. Press
+        // Space to step.
         Self {
             window: None,
             renderer: None,
             world,
             rule: sim::GameOfLife3D::amoeba(),
-            paused: false,
+            paused: true,
             step_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
@@ -121,11 +127,25 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Reset
+                            // Re-seed terrain. Stays paused.
+                            let params = terrain::TerrainParams::default();
+                            let stats = self.world.seed_terrain(&params);
+                            self.paused = true;
+                            self.upload_volume();
+                            log::info!(
+                                "Reset terrain: pop={}, gen_calls={}, collapses={}",
+                                self.world.population(),
+                                stats.calls_total,
+                                stats.total_collapses(),
+                            );
+                        }
+                        winit::keyboard::Key::Character("g") => {
+                            // Swap to legacy GoL sphere seed (kept for CA scaffold demos).
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
                             self.world.seed_center(12, 0.35);
+                            self.paused = true;
                             self.upload_volume();
-                            log::info!("Reset");
+                            log::info!("Reset GoL sphere: pop={}", self.world.population(),);
                         }
                         winit::keyboard::Key::Character("1") => {
                             self.rule = sim::GameOfLife3D::amoeba();
@@ -173,8 +193,8 @@ impl ApplicationHandler for App {
                         let dy = (position.y - ly) as f32;
                         if let Some(renderer) = &mut self.renderer {
                             renderer.camera_yaw += dx * 0.005;
-                            renderer.camera_pitch = (renderer.camera_pitch + dy * 0.005)
-                                .clamp(-1.4, 1.4);
+                            renderer.camera_pitch =
+                                (renderer.camera_pitch + dy * 0.005).clamp(-1.4, 1.4);
                         }
                     }
                     self.last_mouse = Some((position.x, position.y));
@@ -233,7 +253,8 @@ fn main() {
     log::info!("  Scroll: zoom");
     log::info!("  Space: pause/resume");
     log::info!("  S: single step");
-    log::info!("  R: reset");
+    log::info!("  R: reset terrain (heightmap)");
+    log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");
     log::info!("  Esc: quit");

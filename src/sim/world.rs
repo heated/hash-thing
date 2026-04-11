@@ -1,5 +1,6 @@
-use crate::octree::{CellState, NodeId, NodeStore};
 use super::rule::CaRule;
+use crate::octree::{CellState, NodeId, NodeStore};
+use crate::terrain::{gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -18,7 +19,12 @@ impl World {
     pub fn new(level: u32) -> Self {
         let mut store = NodeStore::new();
         let root = store.empty(level);
-        Self { store, root, level, generation: 0 }
+        Self {
+            store,
+            root,
+            level,
+            generation: 0,
+        }
     }
 
     pub fn side(&self) -> usize {
@@ -84,6 +90,24 @@ impl World {
 
     pub fn population(&self) -> u64 {
         self.store.population(self.root)
+    }
+
+    /// Replace the root with terrain generated from `params`. Resets
+    /// `generation` to 0 and clears the step cache so a fresh seed never
+    /// inherits stale memoized step results from the previous world.
+    ///
+    /// **Does not change `paused`** — the caller is responsible for keeping
+    /// the simulation paused while terrain is fresh, otherwise the active
+    /// rule (e.g. legacy GoL) will immediately treat solid cells as alive
+    /// and destroy the world.
+    pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
+        params.validate().expect("invalid TerrainParams");
+        self.store.clear_step_cache();
+        let field = params.to_heightmap();
+        let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        self.root = root;
+        self.generation = 0;
+        stats
     }
 }
 
