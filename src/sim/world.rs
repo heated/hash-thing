@@ -96,10 +96,12 @@ impl World {
     /// `generation` to 0 and clears the step cache so a fresh seed never
     /// inherits stale memoized step results from the previous world.
     ///
-    /// **Does not change `paused`** — the caller is responsible for keeping
-    /// the simulation paused while terrain is fresh, otherwise the active
-    /// rule (e.g. legacy GoL) will immediately treat solid cells as alive
-    /// and destroy the world.
+    /// **The caller MUST keep the simulation paused around this call.** This
+    /// method intentionally does NOT touch `paused`, because only the caller
+    /// knows whether the current `CaRule` is terrain-safe. The legacy GoL
+    /// rule, for example, will immediately treat every solid cell as alive
+    /// and annihilate the terrain on the first step. Every in-tree call
+    /// site today sets `paused = true` explicitly; keep it that way.
     pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
         params.validate().expect("invalid TerrainParams");
         self.store.clear_step_cache();

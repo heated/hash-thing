@@ -55,9 +55,17 @@ fn value_2d(x: f32, z: f32, seed: u64) -> f32 {
 /// Octave-summed value noise. Result is in `[0, 1]` by construction (each
 /// octave is in `[0, 1]`, the weighted sum is divided by the total weight).
 ///
-/// `octaves` must be `>= 1`. The `debug_assert!` on the return value is the
-/// proof precondition for `HeightmapField::classify_box` — if it ever fires,
-/// the y-band short-circuit becomes unsound.
+/// The mathematical result is `<= 1 - 2^-24`, but the final `sum / total`
+/// divide can legitimately round to exactly `1.0` under IEEE-754
+/// round-to-nearest, and under adversarial input sequences could in principle
+/// round a few ulp higher. The explicit `.clamp(0.0, 1.0)` at the return
+/// makes the `[0, 1]` bound tight — which in turn makes the y-band proof in
+/// `HeightmapField::classify_box` bulletproof rather than "sound with
+/// margin". The clamp cost is one min/max per call; at 64³ only a few
+/// thousand surface-band calls hit this path (sky and deep stone short-
+/// circuit via `classify_box` without sampling).
+///
+/// `octaves` must be `>= 1`.
 pub fn fractal_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
     debug_assert!(octaves >= 1, "fractal_2d needs at least one octave");
     let mut sum = 0.0f32;
@@ -70,12 +78,9 @@ pub fn fractal_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
         amp *= 0.5;
         freq *= 2.0;
     }
-    let result = sum / total;
-    debug_assert!(
-        (0.0..=1.0).contains(&result),
-        "fractal_2d out of [0,1]: {result}"
-    );
-    result
+    // Tight clamp — makes `classify_box`'s y-band proof bulletproof. See
+    // the doc comment above for the rounding story.
+    (sum / total).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]

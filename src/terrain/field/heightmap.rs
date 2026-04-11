@@ -13,8 +13,13 @@ use crate::terrain::materials::{material_from_depth, AIR, STONE};
 use crate::terrain::noise::fractal_2d;
 
 /// Cells above the maximum possible surface before we trust the AIR
-/// short-circuit. Just needs to absorb f32→i64 cast slop at coordinate
-/// magnitudes we care about (≪ 1 cell at 64³). 2 is generous.
+/// short-circuit. The margin absorbs a few ulps of FP rounding in
+/// `fractal_2d`'s final `sum / total` divide — which, under adversarial
+/// input, could push the computed `surface_y` microscopically above the
+/// ideal `base_y + amplitude` bound. (At 64³ the `i64 → f32` casts on the
+/// box coordinates themselves are exact, so that's not where the slop
+/// comes from.) 2 cells of headroom is vastly more than needed and keeps
+/// the proof robust against future noise-function changes.
 pub const SURFACE_MARGIN: f32 = 2.0;
 
 /// Cells below the minimum possible surface before we trust the STONE
