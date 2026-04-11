@@ -1,5 +1,5 @@
+use super::node::{octant_index, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
-use super::node::{CellState, Node, NodeId, octant_index};
 
 /// Canonical node store — the core of hash-consing.
 ///
@@ -100,6 +100,7 @@ impl NodeStore {
     }
 
     /// Get children of an interior node. Panics if called on a leaf.
+    #[allow(dead_code)]
     pub fn children(&self, id: NodeId) -> [NodeId; 8] {
         match self.get(id) {
             Node::Interior { children, .. } => *children,
@@ -108,38 +109,129 @@ impl NodeStore {
     }
 
     /// Get a specific child by octant index.
+    #[allow(dead_code)]
     pub fn child(&self, id: NodeId, octant: usize) -> NodeId {
         self.children(id)[octant]
     }
 
     /// Set a single cell in the octree. Returns a new root.
-    /// Coordinates are relative to the node's origin (0,0,0 corner).
+    ///
+    /// Coordinates are relative to the node's origin (0,0,0 corner) and MUST
+    /// be strictly less than `1 << root_level`. Out-of-bounds writes **panic**
+    /// (hash-thing-fb5): silent data corruption is unacceptable, and the
+    /// bounds check is a single compare against `side` at the public entry.
+    ///
+    /// Footgun: `root` must be an actual world root whose `Node::level()`
+    /// reflects the realized extent. Passing `NodeId::EMPTY` (level 0) turns
+    /// every non-origin coordinate into an OOB panic because the entry's
+    /// `side` computation resolves to 1.
+    #[track_caller]
     pub fn set_cell(&mut self, root: NodeId, x: u64, y: u64, z: u64, state: CellState) -> NodeId {
-        let node = self.get(root).clone();
-        match node {
-            Node::Leaf(_) => self.leaf(state),
-            Node::Interior { level, children, .. } => {
-                let half = 1u64 << (level - 1);
-                let ox = if x >= half { 1u32 } else { 0 };
-                let oy = if y >= half { 1u32 } else { 0 };
-                let oz = if z >= half { 1u32 } else { 0 };
-                let idx = octant_index(ox, oy, oz);
-                let lx = if ox == 1 { x - half } else { x };
-                let ly = if oy == 1 { y - half } else { y };
-                let lz = if oz == 1 { z - half } else { z };
-                let new_child = self.set_cell(children[idx], lx, ly, lz, state);
-                let mut new_children = children;
-                new_children[idx] = new_child;
-                self.interior(level, new_children)
-            }
+        let level = self.get(root).level();
+        let side = 1u64 << level;
+        assert!(
+            x < side && y < side && z < side,
+            "NodeStore::set_cell: coord ({x}, {y}, {z}) out of bounds for side {side} (level {level})",
+        );
+        self.set_cell_at(root, level, x, y, z, state)
+    }
+
+    /// Recursive worker for `set_cell`. `level` is the target level of `node`
+    /// as seen from its parent — this may differ from `Node::level()` when a
+    /// `Leaf` represents a uniform subtree compressed at an intermediate level
+    /// (uniform-subtree compression, empty-subtree collapse, etc.).
+    ///
+    /// Precondition: coordinates are already in-bounds for `level`. The
+    /// public `set_cell` entry enforces this; direct callers would have to
+    /// re-derive it. The `debug_assert!` below makes the contract executable
+    /// in dev without adding release overhead.
+    fn set_cell_at(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        x: u64,
+        y: u64,
+        z: u64,
+        state: CellState,
+    ) -> NodeId {
+        // Unconditional — at level 0 the check is `x == 0 && y == 0 && z == 0`,
+        // which is the only valid coord triple inside a single-voxel leaf and
+        // is exactly what the public entry's recursion preserves. Keeping the
+        // assert fire-able at the base case is load-bearing: if someone ever
+        // adds level-0 coord logic, this catches an out-of-range leak.
+        debug_assert!(
+            x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level),
+            "set_cell_at: coord ({x}, {y}, {z}) out of bounds for level {level}",
+        );
+        if level == 0 {
+            return self.leaf(state);
         }
+        // If we encounter a Leaf at level > 0, the caller's context says this
+        // node stands for a uniform 2^level × 2^level × 2^level block. Expand
+        // it to 8 identical children at level-1 before descending, so we only
+        // rewrite the one octant that actually changed.
+        let children = match self.get(node).clone() {
+            Node::Leaf(s) => {
+                let child = self.uniform(level - 1, s);
+                [child; 8]
+            }
+            Node::Interior { children, .. } => children,
+        };
+        let half = 1u64 << (level - 1);
+        let ox = if x >= half { 1u32 } else { 0 };
+        let oy = if y >= half { 1u32 } else { 0 };
+        let oz = if z >= half { 1u32 } else { 0 };
+        let idx = octant_index(ox, oy, oz);
+        let lx = if ox == 1 { x - half } else { x };
+        let ly = if oy == 1 { y - half } else { y };
+        let lz = if oz == 1 { z - half } else { z };
+        let new_child = self.set_cell_at(children[idx], level - 1, lx, ly, lz, state);
+        let mut new_children = children;
+        new_children[idx] = new_child;
+        self.interior(level, new_children)
     }
 
     /// Get a single cell value.
+    ///
+    /// Out-of-bounds reads return `0` silently (hash-thing-fb5). `get_cell`
+    /// is a pure function — it never grows storage, never panics. Outside
+    /// the realized region is conceptually unrealized empty space. The
+    /// raycaster, the eventual Hashlife stepper, and any debug visualizer
+    /// rely on this contract to probe arbitrarily far without ballooning
+    /// storage. Realization happens through separate explicit APIs
+    /// (`World::ensure_contains`, future `realize_region`), not here.
+    ///
+    /// Footgun: `root` must be a real world root. `NodeId::EMPTY` has level
+    /// 0, so every non-origin coordinate reflects to 0 via the OOB branch.
+    #[allow(dead_code)]
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
-        match self.get(root) {
+        let level = self.get(root).level();
+        let side = 1u64 << level;
+        if x >= side || y >= side || z >= side {
+            return 0;
+        }
+        self.get_cell_at(root, level, x, y, z)
+    }
+
+    /// Recursive worker for `get_cell`. Precondition: coordinates are in
+    /// bounds for `level`. The public `get_cell` entry enforces this; the
+    /// `debug_assert!` makes the contract executable in dev without any
+    /// release overhead.
+    ///
+    /// Note: unlike `set_cell_at`, this path does not need Leaf-at-
+    /// intermediate-level expansion — reads fall through the Leaf arm and
+    /// return the uniform value. `level` is the parent-visible level; for
+    /// Interior nodes it equals `self.get(node).level()` by the invariant
+    /// the public entry establishes. Recursion uses `level` consistently
+    /// with `set_cell_at` for symmetry.
+    fn get_cell_at(&self, node: NodeId, level: u32, x: u64, y: u64, z: u64) -> CellState {
+        debug_assert!(
+            x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level),
+            "get_cell_at: coord ({x}, {y}, {z}) out of bounds for level {level}",
+        );
+        match self.get(node) {
             Node::Leaf(s) => *s,
-            Node::Interior { level, children, .. } => {
+            Node::Interior { children, .. } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -148,7 +240,7 @@ impl NodeStore {
                 let lx = if ox == 1 { x - half } else { x };
                 let ly = if oy == 1 { y - half } else { y };
                 let lz = if oz == 1 { z - half } else { z };
-                self.get_cell(children[idx], lx, ly, lz)
+                self.get_cell_at(children[idx], level - 1, lx, ly, lz)
             }
         }
     }
@@ -174,16 +266,21 @@ impl NodeStore {
             Node::Leaf(s) => {
                 grid[ox + oy * side + oz * side * side] = *s;
             }
-            Node::Interior { level, children, population, .. } => {
+            Node::Interior {
+                level,
+                children,
+                population,
+                ..
+            } => {
                 if *population == 0 {
                     return; // skip entirely empty subtrees
                 }
                 let half = 1usize << (level - 1);
                 let children = *children;
-                for oct in 0..8 {
+                for (oct, child) in children.iter().enumerate() {
                     let (cx, cy, cz) = super::node::octant_coords(oct);
                     self.flatten_into(
-                        children[oct],
+                        *child,
                         grid,
                         side,
                         ox + cx as usize * half,
@@ -197,6 +294,7 @@ impl NodeStore {
 
     /// Build an octree from a flat 3D array.
     /// Grid is indexed as [x + y*side + z*side*side], side must be a power of 2.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
         debug_assert!(
             side.is_power_of_two() && side >= 1,
@@ -213,6 +311,7 @@ impl NodeStore {
         self.from_flat_recursive(grid, side, 0, 0, 0, level)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn from_flat_recursive(
         &mut self,
         grid: &[CellState],
@@ -227,9 +326,9 @@ impl NodeStore {
         }
         let half = 1usize << (level - 1);
         let mut children = [NodeId::EMPTY; 8];
-        for oct in 0..8 {
+        for (oct, child) in children.iter_mut().enumerate() {
             let (cx, cy, cz) = super::node::octant_coords(oct);
-            children[oct] = self.from_flat_recursive(
+            *child = self.from_flat_recursive(
                 grid,
                 side,
                 ox + cx as usize * half,
@@ -242,11 +341,13 @@ impl NodeStore {
     }
 
     /// Cache a step result.
+    #[allow(dead_code)]
     pub fn cache_step(&mut self, input: NodeId, result: NodeId) {
         self.step_cache.insert(input, result);
     }
 
     /// Look up a cached step result.
+    #[allow(dead_code)]
     pub fn get_cached_step(&self, input: NodeId) -> Option<NodeId> {
         self.step_cache.get(&input).copied()
     }
@@ -258,6 +359,7 @@ impl NodeStore {
     /// Failure to clear after a rule swap will silently return stale results
     /// from the previous rule once a memoized stepper is in place
     /// (hash-thing-6gf.1).
+    #[allow(dead_code)]
     pub fn clear_step_cache(&mut self) {
         self.step_cache.clear();
     }
@@ -266,6 +368,92 @@ impl NodeStore {
     pub fn stats(&self) -> (usize, usize) {
         (self.nodes.len(), self.step_cache.len())
     }
+
+    /// Return a fresh `NodeStore` containing only the nodes reachable from
+    /// `root`, together with the remapped root id.
+    ///
+    /// ## Why this exists
+    ///
+    /// `NodeStore` is append-only: `set_cell` and `from_flat` intern new
+    /// nodes on every call and never drop the old ones. Over time, that
+    /// means every obsolete generation's subtrees leak into `nodes` forever.
+    /// `compacted` is the explicit "new epoch" that drops everything
+    /// unreachable from `root` by rebuilding a clean store.
+    ///
+    /// ## Semantics
+    ///
+    /// The returned store is structurally equivalent (every cell under
+    /// `root` is preserved, hash-cons sharing is preserved — structurally
+    /// equal subtrees still share a single NodeId). `NodeId::EMPTY` still
+    /// lives at slot 0. All other NodeIds from `self` are invalid against
+    /// the returned store and must not be mixed.
+    ///
+    /// ## Cache lifetime
+    ///
+    /// `compacted` cannot currently preserve `step_cache`: the cache is
+    /// keyed on `NodeId`, and the new store uses a fresh id space. The
+    /// `debug_assert!` below enforces "cache lifetime == store epoch" —
+    /// callers must clear the step cache before compacting (or, once
+    /// hash-thing-6gf.2 lands, the memoization layer must live outside
+    /// `NodeStore` or remap across compaction).
+    pub fn compacted(&self, root: NodeId) -> (NodeStore, NodeId) {
+        debug_assert!(
+            self.step_cache.is_empty(),
+            "compacted() cannot preserve step_cache yet — see hash-thing-6gf.2"
+        );
+        let mut dst = NodeStore::new();
+        let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        // Pre-seed EMPTY as a perf short-circuit. Note: this is NOT
+        // semantically load-bearing — `dst.leaf(0)` already dedups to
+        // `NodeId::EMPTY` via the hash-cons path — but it skips the
+        // recursive walk whenever we hit an empty subtree.
+        remap.insert(NodeId::EMPTY, NodeId::EMPTY);
+        let new_root = clone_reachable(self, &mut dst, &mut remap, root);
+        (dst, new_root)
+    }
+}
+
+/// Recursively clone the subtree rooted at `old` from `src` into `dst`,
+/// populating `remap` with old-id → new-id entries.
+///
+/// ## Post-order ordering is load-bearing
+///
+/// This function walks **post-order**: every child is cloned into `dst`
+/// before the parent is interned. That ordering is required because
+/// `NodeStore::interior` re-computes the parent's `population` by
+/// calling `dst.population(child)` on each new child — it reads from
+/// `dst`, not from `src`. If we interned the parent before cloning its
+/// children into `dst`, the lookup would hit uninitialized slots (or
+/// worse, stale values from other nodes). Post-order guarantees the
+/// children are canonical in `dst` by the time the parent is built, so
+/// hash-cons dedup, population folding, and NodeId identity all come out
+/// right in a single pass.
+///
+/// TODO: this is recursive. At level 6 (our current root) that's 7
+/// stack frames, which is fine. At level 20+ it would need iteration.
+fn clone_reachable(
+    src: &NodeStore,
+    dst: &mut NodeStore,
+    remap: &mut FxHashMap<NodeId, NodeId>,
+    old: NodeId,
+) -> NodeId {
+    if let Some(&new_id) = remap.get(&old) {
+        return new_id;
+    }
+    let new_id = match src.get(old).clone() {
+        Node::Leaf(state) => dst.leaf(state),
+        Node::Interior {
+            level, children, ..
+        } => {
+            let mut new_children = [NodeId::EMPTY; 8];
+            for (i, &child) in children.iter().enumerate() {
+                new_children[i] = clone_reachable(src, dst, remap, child);
+            }
+            dst.interior(level, new_children)
+        }
+    };
+    remap.insert(old, new_id);
+    new_id
 }
 
 #[cfg(test)]
@@ -535,5 +723,528 @@ mod tests {
         store.cache_step(a, b);
         let (_, c1) = store.stats();
         assert_eq!(c1, 1);
+    }
+
+    /// Regression for hash-thing-7rq: when an Interior's child is a Leaf that
+    /// stands for a uniform subtree at level > 0, set_cell must only rewrite
+    /// the one target cell — not collapse the whole subtree to a single leaf.
+    #[test]
+    fn set_cell_preserves_siblings_when_child_is_leaf_at_intermediate_level() {
+        let mut store = NodeStore::new();
+
+        // Level-2 root (4x4x4). Octant 0 is a raw Leaf(7): by structural
+        // convention a Leaf child of a level-2 Interior represents a uniform
+        // 2x2x2 block. The other 7 octants are fully-expanded empty level-1
+        // nodes so the bug has somewhere to hide.
+        let leaf7 = store.leaf(7);
+        let empty_l1 = store.empty(1);
+        let root = store.interior(
+            2,
+            [
+                leaf7, empty_l1, empty_l1, empty_l1, empty_l1, empty_l1, empty_l1, empty_l1,
+            ],
+        );
+
+        // Change one cell inside the compressed uniform block.
+        let new_root = store.set_cell(root, 0, 0, 0, 9);
+
+        // The written cell is 9.
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), 9);
+        // The other 7 cells that used to be covered by Leaf(7) are still 7.
+        for &(x, y, z) in &[
+            (1, 0, 0),
+            (0, 1, 0),
+            (1, 1, 0),
+            (0, 0, 1),
+            (1, 0, 1),
+            (0, 1, 1),
+            (1, 1, 1),
+        ] {
+            assert_eq!(
+                store.get_cell(new_root, x, y, z),
+                7,
+                "cell ({x},{y},{z}) should survive set_cell on a sibling",
+            );
+        }
+        // Cells in sibling octants are still empty.
+        assert_eq!(store.get_cell(new_root, 2, 0, 0), 0);
+        assert_eq!(store.get_cell(new_root, 0, 2, 0), 0);
+        assert_eq!(store.get_cell(new_root, 3, 3, 3), 0);
+    }
+
+    /// The Leaf-at-intermediate expansion must nest correctly: deep writes
+    /// through multiple compressed levels should touch exactly one cell.
+    #[test]
+    fn set_cell_expands_leaf_through_multiple_intermediate_levels() {
+        let mut store = NodeStore::new();
+
+        // Level-3 root (8x8x8) whose octant 0 is Leaf(5) — a uniform 4x4x4
+        // block. set_cell must expand it twice on the way down.
+        let leaf5 = store.leaf(5);
+        let empty_l2 = store.empty(2);
+        let root = store.interior(
+            3,
+            [
+                leaf5, empty_l2, empty_l2, empty_l2, empty_l2, empty_l2, empty_l2, empty_l2,
+            ],
+        );
+
+        let new_root = store.set_cell(root, 2, 1, 3, 9);
+
+        assert_eq!(store.get_cell(new_root, 2, 1, 3), 9);
+        // Spot-check that the rest of the uniform block survived.
+        for &(x, y, z) in &[(0, 0, 0), (3, 3, 3), (0, 3, 0), (2, 1, 2), (2, 0, 3)] {
+            assert_eq!(
+                store.get_cell(new_root, x, y, z),
+                5,
+                "cell ({x},{y},{z}) should survive deep set_cell",
+            );
+        }
+    }
+
+    /// Sanity check: set_cell on a bare Leaf root (level 0) still works.
+    #[test]
+    fn set_cell_on_leaf_root_level_zero() {
+        let mut store = NodeStore::new();
+        let root = store.leaf(0);
+        let new_root = store.set_cell(root, 0, 0, 0, 5);
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), 5);
+    }
+
+    // ===========================================================================
+    // Fresh-store compaction tests (hash-thing-88d, T1–T9).
+    //
+    // `compacted()` rebuilds the arena into a fresh `NodeStore` containing only
+    // nodes reachable from `root`. The invariants we care about:
+    //   (a) every cell under `root` round-trips identically,
+    //   (b) hash-cons sharing is preserved (structurally-equal subtrees still
+    //       share a NodeId),
+    //   (c) population folds up correctly at every interior node,
+    //   (d) `NodeId::EMPTY` survives at slot 0,
+    //   (e) compaction is idempotent.
+    // ===========================================================================
+
+    /// T1: empty store compacts to a single-EMPTY store.
+    #[test]
+    fn compact_nothing_empty() {
+        let store = NodeStore::new();
+        let (compacted, new_root) = store.compacted(NodeId::EMPTY);
+        assert_eq!(new_root, NodeId::EMPTY);
+        let (nodes, cache) = compacted.stats();
+        assert_eq!(
+            nodes, 1,
+            "empty compaction should yield only the canonical empty leaf"
+        );
+        assert_eq!(cache, 0);
+    }
+
+    /// T2: after one `set_cell`, compaction's node count matches a
+    /// freshly-built one-cell world — NOT the pre-compaction size, because
+    /// `set_cell` is persistent and the clone path's old nodes are dead.
+    #[test]
+    fn compact_after_set_cell_matches_fresh_one_cell_world() {
+        // Build store A: empty(6), set one cell.
+        let mut a = NodeStore::new();
+        let mut root_a = a.empty(6);
+        root_a = a.set_cell(root_a, 10, 20, 30, 7);
+        let pre_nodes = a.stats().0;
+        let (compacted_a, new_root_a) = a.compacted(root_a);
+
+        // Build store B: a fresh one-cell world — empty(6), set the same cell.
+        let mut b = NodeStore::new();
+        let mut root_b = b.empty(6);
+        root_b = b.set_cell(root_b, 10, 20, 30, 7);
+        // Compact B too so both sides went through the same canonicalization.
+        let (compacted_b, _new_root_b) = b.compacted(root_b);
+
+        assert_eq!(
+            compacted_a.stats().0,
+            compacted_b.stats().0,
+            "compacted one-cell world should match fresh one-cell world node count"
+        );
+        assert!(
+            compacted_a.stats().0 < pre_nodes,
+            "compaction should drop dead clone-path nodes ({} → {})",
+            pre_nodes,
+            compacted_a.stats().0
+        );
+        // Cell round-trip.
+        assert_eq!(compacted_a.get_cell(new_root_a, 10, 20, 30), 7);
+        assert_eq!(compacted_a.get_cell(new_root_a, 0, 0, 0), 0);
+    }
+
+    /// T3: after several step-like rebuilds (simulate churn by calling
+    /// `from_flat` repeatedly on mutated grids), compacted node count is
+    /// ≤ pre-compaction count, and every cell still round-trips.
+    #[test]
+    fn compact_after_churn_preserves_cells() {
+        let side = 16usize;
+        let mut store = NodeStore::new();
+        // Seed a recognizable pattern.
+        let mut grid = vec![0u8; side * side * side];
+        for i in 0..side {
+            grid[i + i * side + i * side * side] = (i as u8 % 7) + 1;
+        }
+        let mut root = store.from_flat(&grid, side);
+        // Churn: rebuild a handful of generations. We don't need real CA
+        // semantics — just that the store sees repeated `from_flat` calls
+        // with slightly different grids, leaking old subtrees.
+        for gen in 0..5 {
+            for (x, cell) in grid.iter_mut().enumerate().take(side) {
+                *cell = ((gen + x) as u8 % 5) + 1;
+            }
+            root = store.from_flat(&grid, side);
+        }
+        let pre_nodes = store.stats().0;
+        let (compacted, new_root) = store.compacted(root);
+        assert!(
+            compacted.stats().0 <= pre_nodes,
+            "compaction should not grow the store ({} → {})",
+            pre_nodes,
+            compacted.stats().0
+        );
+        // Every cell under the final root must match.
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let expected = store.get_cell(root, x as u64, y as u64, z as u64);
+                    let got = compacted.get_cell(new_root, x as u64, y as u64, z as u64);
+                    assert_eq!(
+                        got, expected,
+                        "cell ({x},{y},{z}) drifted during compaction"
+                    );
+                }
+            }
+        }
+    }
+
+    /// T4: cell-by-cell equality against a freshly-built world. We deliberately
+    /// do NOT compare node counts against a fresh `from_flat` build — that
+    /// breaks on the all-empty edge (compacted empty root = 1 node,
+    /// `from_flat` empty = 7 nodes one-per-level before the level-0 dedup
+    /// cascade). Cell equality is the real contract.
+    #[test]
+    fn compact_cells_match_fresh_build() {
+        let side = 8usize;
+        let mut grid = vec![0u8; side * side * side];
+        grid[0] = 5;
+        grid[side * side * side - 1] = 9;
+        grid[3 + 4 * side + 5 * side * side] = 2;
+
+        let mut dirty = NodeStore::new();
+        // Churn the store: build, mutate, build again — leaves dead nodes.
+        let _waste1 = dirty.from_flat(&grid, side);
+        let mut grid2 = grid.clone();
+        grid2[1] = 3;
+        let _waste2 = dirty.from_flat(&grid2, side);
+        let final_root = dirty.from_flat(&grid, side);
+
+        let (compacted, new_root) = dirty.compacted(final_root);
+
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    assert_eq!(
+                        compacted.get_cell(new_root, x as u64, y as u64, z as u64),
+                        grid[x + y * side + z * side * side],
+                        "cell ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// T5: hash-cons preservation across compaction. If a non-trivial subtree
+    /// is reused in two child slots of a parent in the source, the compacted
+    /// store must also land on a single NodeId for both slots. This is the
+    /// load-bearing dedup test — it's what makes compaction safe under future
+    /// memoization.
+    #[test]
+    fn compact_preserves_shared_non_empty_interiors() {
+        let mut store = NodeStore::new();
+        // Build a non-trivial level-1 subtree (not all-empty, not uniform).
+        let l0 = store.leaf(0);
+        let l1 = store.leaf(1);
+        let l2 = store.leaf(2);
+        let shared = store.interior(1, [l1, l0, l2, l0, l1, l0, l2, l0]);
+        // Use `shared` in two slots of a level-2 parent (alongside other stuff).
+        let other = store.interior(1, [l0, l1, l0, l1, l0, l1, l0, l1]);
+        let parent = store.interior(
+            2,
+            [shared, other, shared, other, other, shared, other, shared],
+        );
+        // Sanity: shared is indeed non-empty.
+        assert!(store.population(shared) > 0);
+
+        let (compacted, new_parent) = store.compacted(parent);
+        let children = compacted.children(new_parent);
+        // Slots 0, 2, 5, 7 were `shared`; slots 1, 3, 4, 6 were `other`.
+        assert_eq!(
+            children[0], children[2],
+            "shared subtree slots 0/2 must dedup"
+        );
+        assert_eq!(
+            children[0], children[5],
+            "shared subtree slots 0/5 must dedup"
+        );
+        assert_eq!(
+            children[0], children[7],
+            "shared subtree slots 0/7 must dedup"
+        );
+        assert_eq!(
+            children[1], children[3],
+            "other subtree slots 1/3 must dedup"
+        );
+        assert_eq!(
+            children[1], children[4],
+            "other subtree slots 1/4 must dedup"
+        );
+        assert_eq!(
+            children[1], children[6],
+            "other subtree slots 1/6 must dedup"
+        );
+        // And shared ≠ other post-compaction.
+        assert_ne!(children[0], children[1]);
+    }
+
+    /// T6: compaction preserves per-cell material payload across multiple
+    /// distinct `CellState` values. `CellState` is `u8` so 255 materials;
+    /// compaction must be payload-transparent, not just shape-transparent.
+    #[test]
+    fn compact_preserves_multiple_cell_states() {
+        let side = 8usize;
+        let mut grid = vec![0u8; side * side * side];
+        // Sprinkle a handful of distinct states.
+        let cells: &[(usize, usize, usize, u8)] = &[
+            (0, 0, 0, 1),
+            (1, 0, 0, 2),
+            (2, 0, 0, 3),
+            (0, 1, 0, 4),
+            (0, 2, 0, 5),
+            (0, 0, 1, 6),
+            (0, 0, 2, 7),
+            (7, 7, 7, 255),
+            (3, 4, 5, 128),
+        ];
+        for &(x, y, z, s) in cells {
+            grid[x + y * side + z * side * side] = s;
+        }
+        let mut store = NodeStore::new();
+        // Churn so compaction has something to drop.
+        let mut g2 = grid.clone();
+        g2[0] = 99;
+        let _waste = store.from_flat(&g2, side);
+        let root = store.from_flat(&grid, side);
+        let (compacted, new_root) = store.compacted(root);
+
+        for &(x, y, z, s) in cells {
+            assert_eq!(
+                compacted.get_cell(new_root, x as u64, y as u64, z as u64),
+                s,
+                "cell ({x},{y},{z}) material drifted"
+            );
+        }
+        // And a few off-pattern cells should be zero.
+        assert_eq!(compacted.get_cell(new_root, 5, 5, 5), 0);
+        assert_eq!(compacted.get_cell(new_root, 4, 4, 4), 0);
+    }
+
+    /// T7: idempotence. Compacting twice must give a store with identical
+    /// `nodes.len()` and identical cell contents — `compacted` is a fixpoint.
+    #[test]
+    fn compact_is_idempotent() {
+        let side = 16usize;
+        let mut grid = vec![0u8; side * side * side];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    grid[x + y * side + z * side * side] = ((x * 7 + y * 11 + z * 13) % 17) as u8;
+                }
+            }
+        }
+        let mut dirty = NodeStore::new();
+        // Churn.
+        let mut g2 = grid.clone();
+        g2[0] = 254;
+        let _w1 = dirty.from_flat(&g2, side);
+        let mut g3 = grid.clone();
+        g3[1] = 253;
+        let _w2 = dirty.from_flat(&g3, side);
+        let root = dirty.from_flat(&grid, side);
+
+        let (once, root_once) = dirty.compacted(root);
+        let (twice, root_twice) = once.compacted(root_once);
+        assert_eq!(
+            once.stats().0,
+            twice.stats().0,
+            "compaction is not idempotent ({} → {})",
+            once.stats().0,
+            twice.stats().0
+        );
+        // Cell-by-cell equality across the two compactions.
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let a = once.get_cell(root_once, x as u64, y as u64, z as u64);
+                    let b = twice.get_cell(root_twice, x as u64, y as u64, z as u64);
+                    assert_eq!(a, b, "cell ({x},{y},{z}) changed across second compaction");
+                }
+            }
+        }
+    }
+
+    /// T8: population invariant holds at every interior node in the compacted
+    /// store, not just at the root. This is the structural check that
+    /// `dst.interior`'s population refold ran in the right order during
+    /// `clone_reachable` — the function's post-order walk is load-bearing
+    /// because `dst.interior` reads children populations from `dst`.
+    #[test]
+    fn compact_population_invariant_at_every_interior() {
+        let side = 16usize;
+        let mut grid = vec![0u8; side * side * side];
+        for i in 0..side {
+            grid[i + (i % 4) * side + (i % 3) * side * side] = ((i % 7) + 1) as u8;
+        }
+        let mut store = NodeStore::new();
+        // Churn.
+        let mut g2 = grid.clone();
+        g2[0] = 77;
+        let _waste = store.from_flat(&g2, side);
+        let root = store.from_flat(&grid, side);
+        let (compacted, new_root) = store.compacted(root);
+
+        // Walk every reachable interior node from new_root and assert
+        // population = sum(children populations).
+        fn walk(store: &NodeStore, id: NodeId, visited: &mut FxHashMap<NodeId, ()>) {
+            if visited.insert(id, ()).is_some() {
+                return;
+            }
+            match store.get(id) {
+                Node::Leaf(_) => {}
+                Node::Interior {
+                    children,
+                    population,
+                    ..
+                } => {
+                    let sum: u64 = children.iter().map(|&c| store.population(c)).sum();
+                    assert_eq!(
+                        *population, sum,
+                        "interior node {id:?} population {} != sum of children {}",
+                        *population, sum
+                    );
+                    for &c in children {
+                        walk(store, c, visited);
+                    }
+                }
+            }
+        }
+        let mut visited = FxHashMap::default();
+        walk(&compacted, new_root, &mut visited);
+    }
+
+    /// T9: `NodeId::EMPTY` survives compaction at slot 0. The fresh store is
+    /// constructed with the canonical empty leaf pre-reserved; compaction
+    /// must not shift it.
+    #[test]
+    fn compact_preserves_empty_at_slot_zero() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        root = store.set_cell(root, 3, 3, 3, 1);
+        let (compacted, _new_root) = store.compacted(root);
+        assert_eq!(NodeId::EMPTY, NodeId(0));
+        assert!(matches!(compacted.get(NodeId::EMPTY), Node::Leaf(0)));
+        assert_eq!(compacted.population(NodeId::EMPTY), 0);
+    }
+
+    // ===========================================================================
+    // Bounds-check tests (hash-thing-fb5 / 819 bug-fix half).
+    //
+    // set_cell panics on OOB writes; get_cell silently returns 0 on OOB reads.
+    // These tests pin the asymmetric policy: writes are intent (silent loss
+    // is unacceptable), reads are queries (far-field probe across an
+    // unrealized frontier must not panic).
+    // ===========================================================================
+
+    /// Regression for the silent-alias bug: before fb5, `get_cell(8, 0, 0)`
+    /// on a level-2 (side 4) root walked the upper-octant branch at every
+    /// level and aliased to `(3, 3, 3)`. Now it returns 0.
+    #[test]
+    fn get_cell_returns_empty_outside_root() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // side 4
+        root = store.set_cell(root, 3, 3, 3, 9); // corner cell, distinct value
+                                                 // Sanity: the corner read works.
+        assert_eq!(store.get_cell(root, 3, 3, 3), 9);
+        // OOB reads on every axis return 0 (not the boundary cell).
+        assert_eq!(store.get_cell(root, 4, 0, 0), 0);
+        assert_eq!(store.get_cell(root, 0, 4, 0), 0);
+        assert_eq!(store.get_cell(root, 0, 0, 4), 0);
+        assert_eq!(store.get_cell(root, 100, 100, 100), 0);
+        assert_eq!(store.get_cell(root, u64::MAX, 0, 0), 0);
+        assert_eq!(store.get_cell(root, 0, u64::MAX, 0), 0);
+        assert_eq!(store.get_cell(root, 0, 0, u64::MAX), 0);
+    }
+
+    /// OOB writes panic on every axis. Three #[should_panic] tests because
+    /// the upper-octant recursion path is independently broken on each axis
+    /// and we want to lock all three down.
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn set_cell_panics_outside_root_x() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2); // side 4
+        store.set_cell(root, 4, 0, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn set_cell_panics_outside_root_y() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2);
+        store.set_cell(root, 0, 4, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn set_cell_panics_outside_root_z() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2);
+        store.set_cell(root, 0, 0, 4, 1);
+    }
+
+    /// Sanity that the bounds check doesn't off-by-one: max-in-bounds writes
+    /// and reads still work for `(side-1, side-1, side-1)` and `(0, 0, 0)`.
+    #[test]
+    fn set_cell_in_bounds_still_works() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3); // side 8
+        root = store.set_cell(root, 7, 7, 7, 5);
+        root = store.set_cell(root, 0, 0, 0, 3);
+        assert_eq!(store.get_cell(root, 7, 7, 7), 5);
+        assert_eq!(store.get_cell(root, 0, 0, 0), 3);
+    }
+
+    /// Explicit max-in-bounds read — catches `>=` vs `>` mistakes in the
+    /// entry-level bounds check.
+    #[test]
+    fn get_cell_max_in_bounds() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // side 4
+        root = store.set_cell(root, 3, 3, 3, 42);
+        assert_eq!(store.get_cell(root, 3, 3, 3), 42);
+    }
+
+    /// Lock in the "no-assert on OOB read" decision — a future contributor
+    /// might see the OOB branch and add a debug_assert!. This test runs
+    /// in debug builds and verifies OOB reads don't panic.
+    #[test]
+    fn get_cell_no_assert_on_oob() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2);
+        // Must not panic in debug builds.
+        let _ = store.get_cell(root, 4, 0, 0);
+        let _ = store.get_cell(root, 0, 4, 0);
+        let _ = store.get_cell(root, 0, 0, 4);
+        let _ = store.get_cell(root, u64::MAX, u64::MAX, u64::MAX);
     }
 }

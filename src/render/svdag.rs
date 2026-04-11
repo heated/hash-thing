@@ -125,11 +125,12 @@ impl Svdag {
                             if *population > 0 {
                                 mask |= 1 << i;
                                 // Recurse
-                                let child_offset = Self::write_node(nodes, id_to_offset, store, child_id);
+                                let child_offset =
+                                    Self::write_node(nodes, id_to_offset, store, child_id);
                                 nodes[header_start + 1 + i] = child_offset; // high bit clear = interior
                             } else {
                                 // Empty interior subtree — encode as empty leaf
-                                nodes[header_start + 1 + i] = (1u32 << 31) | 0;
+                                nodes[header_start + 1 + i] = 1u32 << 31;
                             }
                         }
                     }
@@ -168,11 +169,28 @@ pub mod cpu_trace {
 
     #[derive(Clone, Copy, Debug)]
     pub enum TraceEvent {
-        Descend { depth: usize, oct: u32, child_offset: u32 },
-        EmptyLeaf { depth: usize, oct: u32 },
-        Hit { depth: usize, mat: u32, t: f32 },
-        StepPast { t_old: f32, t_new: f32 },
-        Popped { from: usize, to: usize },
+        Descend {
+            depth: usize,
+            oct: u32,
+            child_offset: u32,
+        },
+        EmptyLeaf {
+            depth: usize,
+            oct: u32,
+        },
+        Hit {
+            depth: usize,
+            mat: u32,
+            t: f32,
+        },
+        StepPast {
+            t_old: f32,
+            t_new: f32,
+        },
+        Popped {
+            from: usize,
+            to: usize,
+        },
         ExitedRoot,
     }
 
@@ -184,9 +202,15 @@ pub mod cpu_trace {
 
     fn octant_of(pos: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
         let mut idx = 0u32;
-        if pos[0] >= node_min[0] + half { idx |= 1; }
-        if pos[1] >= node_min[1] + half { idx |= 2; }
-        if pos[2] >= node_min[2] + half { idx |= 4; }
+        if pos[0] >= node_min[0] + half {
+            idx |= 1;
+        }
+        if pos[1] >= node_min[1] + half {
+            idx |= 2;
+        }
+        if pos[2] >= node_min[2] + half {
+            idx |= 4;
+        }
         idx
     }
 
@@ -219,7 +243,11 @@ pub mod cpu_trace {
 
         let (root_near, root_far) = intersect_aabb(ro, inv_rd, [0.0; 3], [1.0; 3]);
         if root_near > root_far || root_far < 0.0 {
-            return TraceResult { hit_material: None, steps: 0, events };
+            return TraceResult {
+                hit_material: None,
+                steps: 0,
+                events,
+            };
         }
 
         let mut stack_node = [0u32; MAX_DEPTH];
@@ -235,7 +263,11 @@ pub mod cpu_trace {
 
         for step in 0..MAX_STEPS {
             if t > root_far {
-                return TraceResult { hit_material: None, steps: step, events };
+                return TraceResult {
+                    hit_material: None,
+                    steps: step,
+                    events,
+                };
             }
             let pos = [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
 
@@ -261,13 +293,22 @@ pub mod cpu_trace {
                     break;
                 }
                 if top == 0 {
-                    if record { events.push(TraceEvent::ExitedRoot); }
-                    return TraceResult { hit_material: None, steps: step, events };
+                    if record {
+                        events.push(TraceEvent::ExitedRoot);
+                    }
+                    return TraceResult {
+                        hit_material: None,
+                        steps: step,
+                        events,
+                    };
                 }
                 top -= 1;
             }
             if record && top != depth {
-                events.push(TraceEvent::Popped { from: depth, to: top });
+                events.push(TraceEvent::Popped {
+                    from: depth,
+                    to: top,
+                });
             }
             depth = top;
 
@@ -282,17 +323,23 @@ pub mod cpu_trace {
                 if child_slot & LEAF_BIT != 0 {
                     let mat = child_slot & 0xFFFF;
                     if mat > 0 {
-                        if record { events.push(TraceEvent::Hit { depth, mat, t }); }
+                        if record {
+                            events.push(TraceEvent::Hit { depth, mat, t });
+                        }
                         return TraceResult {
                             hit_material: Some(mat),
                             steps: step,
                             events,
                         };
                     }
-                    if record { events.push(TraceEvent::EmptyLeaf { depth, oct }); }
+                    if record {
+                        events.push(TraceEvent::EmptyLeaf { depth, oct });
+                    }
                     break;
                 } else {
-                    if depth + 1 >= MAX_DEPTH { break; }
+                    if depth + 1 >= MAX_DEPTH {
+                        break;
+                    }
                     let child_min = [
                         node_min[0] + (oct & 1) as f32 * half,
                         node_min[1] + ((oct >> 1) & 1) as f32 * half,
@@ -321,11 +368,17 @@ pub mod cpu_trace {
                 node_min[1] + ((oct >> 1) & 1) as f32 * half,
                 node_min[2] + ((oct >> 2) & 1) as f32 * half,
             ];
-            let child_max = [child_min[0] + half, child_min[1] + half, child_min[2] + half];
+            let child_max = [
+                child_min[0] + half,
+                child_min[1] + half,
+                child_min[2] + half,
+            ];
             let (_, oct_far) = intersect_aabb(ro, inv_rd, child_min, child_max);
             let t_old = t;
             t = oct_far + EPS;
-            if record { events.push(TraceEvent::StepPast { t_old, t_new: t }); }
+            if record {
+                events.push(TraceEvent::StepPast { t_old, t_new: t });
+            }
         }
 
         TraceResult {
@@ -357,13 +410,14 @@ mod tests {
         // Ray aimed at the voxel's center (0.5078125, 0.5078125, 0.5078125) from outside
         let target = [0.5 + 0.5 / 64.0, 0.5 + 0.5 / 64.0, 0.5 + 0.5 / 64.0];
         let ro = [2.0, 2.0, 2.0];
-        let rd = normalize([
-            target[0] - ro[0],
-            target[1] - ro[1],
-            target[2] - ro[2],
-        ]);
+        let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
         let result = cpu_trace::raycast(&dag.nodes, ro, rd, true);
-        assert_eq!(result.hit_material, Some(1), "expected hit, events: {:#?}", result.events);
+        assert_eq!(
+            result.hit_material,
+            Some(1),
+            "expected hit, events: {:#?}",
+            result.events
+        );
     }
 
     #[test]
@@ -396,11 +450,7 @@ mod tests {
                         (z as f32 + 2.0) / 64.0,
                     ];
                     let ro = [2.0, 2.0, 2.0];
-                    let rd = normalize([
-                        target[0] - ro[0],
-                        target[1] - ro[1],
-                        target[2] - ro[2],
-                    ]);
+                    let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
                     let result = cpu_trace::raycast(&dag.nodes, ro, rd, false);
                     if result.hit_material.is_none() {
                         misses.push((x, y, z));
@@ -449,11 +499,7 @@ mod tests {
                 (cy as f32 + 0.5) / 64.0,
                 (cz as f32 + 0.5) / 64.0,
             ];
-            let rd = normalize([
-                target[0] - ro[0],
-                target[1] - ro[1],
-                target[2] - ro[2],
-            ]);
+            let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
             let result = cpu_trace::raycast(&dag.nodes, ro, rd, false);
             if result.hit_material.is_none() {
                 misses += 1;
@@ -462,7 +508,8 @@ mod tests {
         // Every ray is aimed at the center of a filled voxel, so every ray should hit
         // SOMETHING (either its target or another voxel it passes through first).
         assert_eq!(
-            misses, 0,
+            misses,
+            0,
             "expected every voxel-targeted ray to hit, {} / {} missed",
             misses,
             voxels.len()
@@ -479,7 +526,9 @@ mod tests {
         // Simple hash-based PRNG for reproducibility
         let mut seed: u64 = 0xdead_beef_u64;
         let mut rand_u32 = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 32) as u32
         };
         for _ in 0..300 {
@@ -499,18 +548,15 @@ mod tests {
                 (cy as f32 + 0.5) / 64.0,
                 (cz as f32 + 0.5) / 64.0,
             ];
-            let rd = normalize([
-                target[0] - ro[0],
-                target[1] - ro[1],
-                target[2] - ro[2],
-            ]);
+            let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
             let result = cpu_trace::raycast(&dag.nodes, ro, rd, false);
             if result.hit_material.is_none() {
                 misses += 1;
             }
         }
         assert_eq!(
-            misses, 0,
+            misses,
+            0,
             "expected every random sparse voxel to be hit, {} / {} missed",
             misses,
             voxels.len()

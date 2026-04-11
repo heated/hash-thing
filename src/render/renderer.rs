@@ -2,6 +2,20 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+/// wgpu requires `bytes_per_row` on multi-row texture copies to be a multiple
+/// of `COPY_BYTES_PER_ROW_ALIGNMENT` (256). For a 64³ R8Uint volume the natural
+/// row length is 64 bytes, which is not aligned — spec-violating even if it
+/// happens to work on most backends today. When the format widens to R16Uint
+/// (hash-thing-1v0.1) the same row becomes 128 bytes, still not aligned. This
+/// helper returns the padded row stride in bytes; callers use it as the upload
+/// `bytes_per_row` and pad rows in a staging buffer if the padded value
+/// differs from the unpadded one.
+fn padded_bytes_per_row(width: u32, bytes_per_texel: u32) -> u32 {
+    let unpadded = width * bytes_per_texel;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    unpadded.div_ceil(align) * align
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -40,6 +54,10 @@ pub struct Renderer {
     // Shared
     uniform_buffer: wgpu::Buffer,
     volume_size: u32,
+    /// Bytes-per-texel for the volume format. R8Uint = 1, R16Uint = 2. Stored
+    /// alongside `volume_size` so `upload_volume` can compute row padding
+    /// without re-deriving it from the texture format enum.
+    volume_bytes_per_texel: u32,
     pub mode: RenderMode,
     pub camera_yaw: f32,
     pub camera_pitch: f32,
@@ -133,31 +151,32 @@ impl Renderer {
 
         // === Flat 3D texture pipeline ===
 
-        let flat_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("flat_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let flat_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("flat_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         let flat_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("flat_bg"),
@@ -216,42 +235,44 @@ impl Renderer {
 
         // === SVDAG pipeline ===
 
-        let svdag_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("svdag_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let svdag_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("svdag_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         let svdag_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("svdag raycast shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("svdag_raycast.wgsl").into()),
         });
 
-        let svdag_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("svdag_pl"),
-            bind_group_layouts: &[Some(&svdag_bind_group_layout)],
-            immediate_size: 0,
-        });
+        let svdag_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("svdag_pl"),
+                bind_group_layouts: &[Some(&svdag_bind_group_layout)],
+                immediate_size: 0,
+            });
 
         let svdag_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("svdag_rp"),
@@ -297,6 +318,9 @@ impl Renderer {
             svdag_buffer_cap: 0,
             uniform_buffer,
             volume_size,
+            // R8Uint: 1 byte per texel. Update alongside the `format:` line
+            // above if the texture format ever widens.
+            volume_bytes_per_texel: 1,
             mode: RenderMode::Svdag,
             camera_yaw: std::f32::consts::FRAC_PI_4,
             camera_pitch: 0.4,
@@ -358,6 +382,32 @@ impl Renderer {
     }
 
     pub fn upload_volume(&self, data: &[u8]) {
+        let w = self.volume_size;
+        let bpt = self.volume_bytes_per_texel;
+        let unpadded = w * bpt;
+        let padded = padded_bytes_per_row(w, bpt);
+
+        // Fast path: row length already aligned, pass the caller's slice
+        // straight through. Slow path: copy row-by-row into a padded staging
+        // buffer. Per-upload allocation is fine — uploads are infrequent
+        // (once per generation tick) and ~64KiB for 64³ R8Uint.
+        let staging: Vec<u8>;
+        let (rows_data, row_stride) = if padded == unpadded {
+            (data, unpadded)
+        } else {
+            let total_rows = (w * w) as usize; // height × depth
+            let mut buf = vec![0u8; total_rows * padded as usize];
+            let unpadded_usize = unpadded as usize;
+            let padded_usize = padded as usize;
+            for row in 0..total_rows {
+                let src = &data[row * unpadded_usize..][..unpadded_usize];
+                let dst = &mut buf[row * padded_usize..][..unpadded_usize];
+                dst.copy_from_slice(src);
+            }
+            staging = buf;
+            (staging.as_slice(), padded)
+        };
+
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.volume_texture,
@@ -365,16 +415,16 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            data,
+            rows_data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(self.volume_size),
-                rows_per_image: Some(self.volume_size),
+                bytes_per_row: Some(row_stride),
+                rows_per_image: Some(w),
             },
             wgpu::Extent3d {
-                width: self.volume_size,
-                height: self.volume_size,
-                depth_or_array_layers: self.volume_size,
+                width: w,
+                height: w,
+                depth_or_array_layers: w,
             },
         );
     }
@@ -392,17 +442,15 @@ impl Renderer {
             _ => return false,
         };
 
-        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         // Camera
         let (sin_yaw, cos_yaw) = self.camera_yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.camera_pitch.sin_cos();
 
-        let cam_dir = [
-            -cos_pitch * sin_yaw,
-            -sin_pitch,
-            -cos_pitch * cos_yaw,
-        ];
+        let cam_dir = [-cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw];
         let cam_pos = [
             self.camera_target[0] - cam_dir[0] * self.camera_dist,
             self.camera_target[1] - cam_dir[1] * self.camera_dist,
@@ -426,11 +474,14 @@ impl Renderer {
             camera_right: [right[0], right[1], right[2], 0.0],
             params: [self.volume_size as f32, aspect, fov_tan, 0.0],
         };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render encoder"),
+            });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -480,5 +531,40 @@ impl Renderer {
         surface_texture.present();
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::padded_bytes_per_row;
+
+    const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+    #[test]
+    fn padded_row_rounds_up_to_alignment() {
+        // 64 R8Uint texels = 64 bytes; rounds up to the 256-byte alignment.
+        assert_eq!(padded_bytes_per_row(64, 1), ALIGN);
+    }
+
+    #[test]
+    fn padded_row_respects_bytes_per_texel() {
+        // 64 R16Uint texels = 128 bytes; still under ALIGN, still rounds up.
+        assert_eq!(padded_bytes_per_row(64, 2), ALIGN);
+    }
+
+    #[test]
+    fn padded_row_passes_through_already_aligned() {
+        // 256 R8Uint texels = 256 bytes exactly: one alignment unit, no padding.
+        assert_eq!(padded_bytes_per_row(ALIGN, 1), ALIGN);
+        // 128 R16Uint texels = 256 bytes: same story.
+        assert_eq!(padded_bytes_per_row(ALIGN / 2, 2), ALIGN);
+    }
+
+    #[test]
+    fn padded_row_rounds_up_beyond_single_unit() {
+        // 300 R8Uint texels = 300 bytes; rounds up to 512 (next alignment unit).
+        assert_eq!(padded_bytes_per_row(300, 1), 2 * ALIGN);
+        // 300 R16Uint texels = 600 bytes; rounds up to 768 (3 alignment units).
+        assert_eq!(padded_bytes_per_row(300, 2), 3 * ALIGN);
     }
 }
