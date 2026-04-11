@@ -18,3 +18,5 @@
 {"id":"int-a7277c65","kind":"field_change","created_at":"2026-04-11T20:17:37.108942Z","actor":"Edward Swernofsky","issue_id":"hash-thing-9to","extra":{"field":"assignee","new_value":"mayor","old_value":""}}
 {"id":"int-82689da3","kind":"field_change","created_at":"2026-04-11T20:18:45.045607Z","actor":"Edward Swernofsky","issue_id":"hash-thing-8wk","extra":{"field":"status","new_value":"open","old_value":"closed"}}
 {"id":"int-2e952f6f","kind":"field_change","created_at":"2026-04-11T21:19:42.202392Z","actor":"Edward Swernofsky","issue_id":"hash-thing-al1","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-9c4719f5","kind":"field_change","created_at":"2026-04-11T21:20:57.614753Z","actor":"Edward Swernofsky","issue_id":"hash-thing-8wk","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-50ba283f","kind":"field_change","created_at":"2026-04-11T21:37:43.847011Z","actor":"Edward Swernofsky","issue_id":"hash-thing-fb6","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
