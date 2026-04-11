@@ -85,6 +85,17 @@ Design-gate tasks stack up for edward's review. Technical tasks keep flowing.
 
 `afk` is the standing default once said; clear it only when edward explicitly says he's back.
 
+### Drift-unparking autonomy
+
+Any agent may autonomously unblock a bead parked in afk mode if **none of the listed "what edward needs to decide" items is actually a design call** under the Gate Tiers rubric. Bug fixes, refactors, naming, on-disk formats, module layout, and plan-file open questions that are just style/scope picks are drift-parked by afk reflex, not real gates — reopen them and let the owner ship.
+
+Procedure:
+1. Re-read the park comment. If the question maps to "ship without asking" in the gate-tier rubric, it's drift.
+2. `bd update <id> --status open` and add a comment citing drift-unparking autonomy + the one-line reason the parked question wasn't actually a design call.
+3. Do not claim work on someone else's bead as part of unparking — just unblock so the original owner can resume.
+
+Mayor should sweep for drift-parked beads during any invocation. Workers may unpark their own beads when they realize the park was reflexive.
+
 ## Editing CLAUDE.md
 
 **Agent-initiated edits** to project `CLAUDE.md` or `~/.claude/CLAUDE.md` are queued, not direct-committed and not gated on edward. File a bead labeled `claude-md-edit`, status `blocked`, with the proposed diff + a one-line rationale in the description. Also spawn a mayor background session via `Agent(subagent_type=general-purpose, prompt="act as mayor — process claude-md-edit queue")` so the queue doesn't stall. Continue other work; do not wait.
