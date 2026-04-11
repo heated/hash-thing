@@ -230,7 +230,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - Epsilon bug fixed: pop-check slack was beating step-past advance on multi-axis boundary crossings
 - ✅ **Foundations pass (hash-thing-h34.1 + h34.2 + h34.3)**
   - `h34.1`: stateless `hash(position, generation, seed)` PRNG in `src/rng.rs`. Frozen vectors derived from an independent oracle, multi-stream API via `hash_cell_stream(..., stream)`, `#[must_use]` extractors, edge-case contracts pinned.
-  - `h34.2`: determinism audit — no global PRNG, no scan-order dependence, all FxHashMap usages are point-lookup only. Fixed `World::seed_center` (was the one stateful stream). Documented `NodeStore::step_cache` rule-blindness as a latent hazard to rekey when Hashlife lands. Audit report at `.ship-notes/audit-h34.2.md`.
+  - `h34.2`: determinism audit — no global PRNG, no scan-order dependence, all FxHashMap usages are point-lookup only. Fixed `World::seed_center` (was the one stateful stream). `NodeStore::step_cache` rule-blindness was flagged as a latent hazard and has since been given an interim answer by `hash-thing-88d` (cache lifetime ≡ store epoch, `debug_assert!(step_cache.is_empty())` at `compacted()` boundary; cross-epoch memoization deferred to `6gf.2`). Audit report at `.ship-notes/audit-h34.2.md`.
   - `h34.3`: `src/perf.rs` — `PerfCounters` + `OpCounter` + `perf::time()` scope helper + `memory_bytes_estimate()`. Wired into `main.rs`, auto-logs every 2s while unpaused, `P` key for on-demand summary. 13 unit tests.
 - ✅ **Terrain generator (hash-thing-3fq.1 + 3fq.5)**
   - `3fq.1`: `RegionField` trait + recursive direct-octree builder in `src/terrain/gen.rs` + `HeightmapField` with proof-based `classify_box` (y-band only, no corner-agreement heuristic). `ConstField` / `HalfSpaceField` independent oracles. `AIR=0` invariant pinned across store + rule + materials. Release 64³ gen budget is ~5ms.
@@ -247,7 +247,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ☐ Foundations & determinism (`h34`): only `h34.4` remains (retire GoL3D scaffolding). `h34.1`/`h34.2`/`h34.3` landed above.
 - ☐ Terrain generation & infinite worlds (`3fq`): `3fq.2` cave smoothing CA pass, `3fq.3` dungeon carving layer, `3fq.4` lazy root expansion for infinite worlds. `3fq.1` + `3fq.5` landed above.
 - ☐ Cross-platform distribution (`xb7`): CI matrix, macOS notarization, Linux AppImage, Windows .exe, WASM/WebGPU, Steam (P4)
-- ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable. Research note at `.ship-notes/investigation-5bb.6.md` — decision still open, pending `1v0.1` cell encoding.
+- ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable. Research note at `.ship-notes/investigation-5bb.6.md` — decision still open, now gated on `hash-thing-sos` (per-material `CaRule` reframe) rather than `1v0.1` directly, since orientation semantics migrate into rules under the closed-world invariant.
 
 ---
 
