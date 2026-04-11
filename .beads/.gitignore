@@ -13,6 +13,13 @@ bd.sock
 sync-state.json
 last-touched
 
+# Per-worktree crew identity (see CLAUDE.md "The crew" section)
+actor
+
+# Daemon push state (local-only, per-machine)
+push-state.json
+backup/
+
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
 
