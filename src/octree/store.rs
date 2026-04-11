@@ -117,24 +117,49 @@ impl NodeStore {
     /// Set a single cell in the octree. Returns a new root.
     /// Coordinates are relative to the node's origin (0,0,0 corner).
     pub fn set_cell(&mut self, root: NodeId, x: u64, y: u64, z: u64, state: CellState) -> NodeId {
-        let node = self.get(root).clone();
-        match node {
-            Node::Leaf(_) => self.leaf(state),
-            Node::Interior { level, children, .. } => {
-                let half = 1u64 << (level - 1);
-                let ox = if x >= half { 1u32 } else { 0 };
-                let oy = if y >= half { 1u32 } else { 0 };
-                let oz = if z >= half { 1u32 } else { 0 };
-                let idx = octant_index(ox, oy, oz);
-                let lx = if ox == 1 { x - half } else { x };
-                let ly = if oy == 1 { y - half } else { y };
-                let lz = if oz == 1 { z - half } else { z };
-                let new_child = self.set_cell(children[idx], lx, ly, lz, state);
-                let mut new_children = children;
-                new_children[idx] = new_child;
-                self.interior(level, new_children)
-            }
+        let level = self.get(root).level();
+        self.set_cell_at(root, level, x, y, z, state)
+    }
+
+    /// Recursive worker for `set_cell`. `level` is the target level of `node`
+    /// as seen from its parent — this may differ from `Node::level()` when a
+    /// `Leaf` represents a uniform subtree compressed at an intermediate level
+    /// (uniform-subtree compression, empty-subtree collapse, etc.).
+    fn set_cell_at(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        x: u64,
+        y: u64,
+        z: u64,
+        state: CellState,
+    ) -> NodeId {
+        if level == 0 {
+            return self.leaf(state);
         }
+        // If we encounter a Leaf at level > 0, the caller's context says this
+        // node stands for a uniform 2^level × 2^level × 2^level block. Expand
+        // it to 8 identical children at level-1 before descending, so we only
+        // rewrite the one octant that actually changed.
+        let children = match self.get(node).clone() {
+            Node::Leaf(s) => {
+                let child = self.uniform(level - 1, s);
+                [child; 8]
+            }
+            Node::Interior { children, .. } => children,
+        };
+        let half = 1u64 << (level - 1);
+        let ox = if x >= half { 1u32 } else { 0 };
+        let oy = if y >= half { 1u32 } else { 0 };
+        let oz = if z >= half { 1u32 } else { 0 };
+        let idx = octant_index(ox, oy, oz);
+        let lx = if ox == 1 { x - half } else { x };
+        let ly = if oy == 1 { y - half } else { y };
+        let lz = if oz == 1 { z - half } else { z };
+        let new_child = self.set_cell_at(children[idx], level - 1, lx, ly, lz, state);
+        let mut new_children = children;
+        new_children[idx] = new_child;
+        self.interior(level, new_children)
     }
 
     /// Get a single cell value.
@@ -543,5 +568,91 @@ mod tests {
         store.cache_step(a, b);
         let (_, c1) = store.stats();
         assert_eq!(c1, 1);
+    }
+
+    /// Regression for hash-thing-7rq: when an Interior's child is a Leaf that
+    /// stands for a uniform subtree at level > 0, set_cell must only rewrite
+    /// the one target cell — not collapse the whole subtree to a single leaf.
+    #[test]
+    fn set_cell_preserves_siblings_when_child_is_leaf_at_intermediate_level() {
+        let mut store = NodeStore::new();
+
+        // Level-2 root (4x4x4). Octant 0 is a raw Leaf(7): by structural
+        // convention a Leaf child of a level-2 Interior represents a uniform
+        // 2x2x2 block. The other 7 octants are fully-expanded empty level-1
+        // nodes so the bug has somewhere to hide.
+        let leaf7 = store.leaf(7);
+        let empty_l1 = store.empty(1);
+        let root = store.interior(
+            2,
+            [
+                leaf7, empty_l1, empty_l1, empty_l1, empty_l1, empty_l1, empty_l1, empty_l1,
+            ],
+        );
+
+        // Change one cell inside the compressed uniform block.
+        let new_root = store.set_cell(root, 0, 0, 0, 9);
+
+        // The written cell is 9.
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), 9);
+        // The other 7 cells that used to be covered by Leaf(7) are still 7.
+        for &(x, y, z) in &[
+            (1, 0, 0),
+            (0, 1, 0),
+            (1, 1, 0),
+            (0, 0, 1),
+            (1, 0, 1),
+            (0, 1, 1),
+            (1, 1, 1),
+        ] {
+            assert_eq!(
+                store.get_cell(new_root, x, y, z),
+                7,
+                "cell ({x},{y},{z}) should survive set_cell on a sibling",
+            );
+        }
+        // Cells in sibling octants are still empty.
+        assert_eq!(store.get_cell(new_root, 2, 0, 0), 0);
+        assert_eq!(store.get_cell(new_root, 0, 2, 0), 0);
+        assert_eq!(store.get_cell(new_root, 3, 3, 3), 0);
+    }
+
+    /// The Leaf-at-intermediate expansion must nest correctly: deep writes
+    /// through multiple compressed levels should touch exactly one cell.
+    #[test]
+    fn set_cell_expands_leaf_through_multiple_intermediate_levels() {
+        let mut store = NodeStore::new();
+
+        // Level-3 root (8x8x8) whose octant 0 is Leaf(5) — a uniform 4x4x4
+        // block. set_cell must expand it twice on the way down.
+        let leaf5 = store.leaf(5);
+        let empty_l2 = store.empty(2);
+        let root = store.interior(
+            3,
+            [
+                leaf5, empty_l2, empty_l2, empty_l2, empty_l2, empty_l2, empty_l2, empty_l2,
+            ],
+        );
+
+        let new_root = store.set_cell(root, 2, 1, 3, 9);
+
+        assert_eq!(store.get_cell(new_root, 2, 1, 3), 9);
+        // Spot-check that the rest of the uniform block survived.
+        for &(x, y, z) in &[(0, 0, 0), (3, 3, 3), (0, 3, 0), (2, 1, 2), (2, 0, 3)] {
+            assert_eq!(
+                store.get_cell(new_root, x, y, z),
+                5,
+                "cell ({x},{y},{z}) should survive deep set_cell",
+            );
+        }
+    }
+
+    /// Sanity check: set_cell on a bare Leaf root (level 0) still works.
+    #[test]
+    fn set_cell_on_leaf_root_level_zero() {
+        let mut store = NodeStore::new();
+        let root = store.leaf(0);
+        let new_root = store.set_cell(root, 0, 0, 0, 5);
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), 5);
     }
 }
