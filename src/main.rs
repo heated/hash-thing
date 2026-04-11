@@ -1,4 +1,5 @@
 mod octree;
+mod perf;
 mod render;
 mod rng;
 mod sim;
@@ -23,6 +24,7 @@ struct App {
     // Mouse interaction state
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
+    perf: perf::Perf,
 }
 
 impl App {
@@ -48,6 +50,7 @@ impl App {
             step_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
+            perf: perf::Perf::new(),
         }
     }
 
@@ -57,16 +60,16 @@ impl App {
             renderer.upload_volume(&data);
             // Also rebuild the SVDAG so the other render path stays in sync.
             let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
-            if self.world.generation % 10 == 0 {
-                log::info!(
-                    "SVDAG: {} nodes, {} bytes, root_level={}",
-                    dag.node_count,
-                    dag.byte_size(),
-                    dag.root_level,
-                );
-            }
             renderer.upload_svdag(&dag);
         }
+    }
+
+    /// SVDAG node count + byte size + root level for the consolidated
+    /// `Gen N:` log line. Rebuilds the SVDAG to inspect — call only on the
+    /// per-10-gen log path, not every redraw.
+    fn svdag_stats(&self) -> (usize, usize, u32) {
+        let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
+        (dag.node_count, dag.byte_size(), dag.root_level)
     }
 }
 
@@ -121,9 +124,11 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Reset
+                            // Reset — drop perf samples too so post-reset
+                            // stats aren't poisoned by stale pre-reset values.
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
                             self.world.seed_center(12, 0.35);
+                            self.perf.clear();
                             self.upload_volume();
                             log::info!("Reset");
                         }
@@ -201,24 +206,51 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
-                    self.world.step_flat(&self.rule);
+                    // Time the step. Bind both world+perf as locals before the
+                    // closure so the borrow split is unambiguous (the closure
+                    // captures locals, not `self`).
+                    {
+                        let world = &mut self.world;
+                        let perf = &mut self.perf;
+                        let rule = &self.rule;
+                        perf.time("step", || world.step_flat(rule));
+                    }
+                    // Time upload as one aggregate (flatten + Svdag::build +
+                    // upload_volume + upload_svdag). CPU-side submit only —
+                    // wgpu queue writes are async.
+                    let upload_start = std::time::Instant::now();
                     self.upload_volume();
+                    self.perf.record("upload_cpu", upload_start.elapsed());
+
                     self.step_timer = std::time::Instant::now();
 
                     if self.world.generation % 10 == 0 {
                         let (nodes, cache) = self.world.store.stats();
+                        let mem_kb =
+                            (nodes * std::mem::size_of::<crate::octree::Node>()) / 1024;
+                        let (svdag_nodes, svdag_bytes, svdag_root_level) =
+                            self.svdag_stats();
                         log::info!(
-                            "Gen {}: pop={}, nodes={}, cache={}",
+                            "Gen {}: pop={} nodes={} (~{}KB) cache={} svdag={}/{}KB(L{}) | {}",
                             self.world.generation,
                             self.world.population(),
                             nodes,
-                            cache
+                            mem_kb,
+                            cache,
+                            svdag_nodes,
+                            svdag_bytes / 1024,
+                            svdag_root_level,
+                            self.perf.summary(),
                         );
                     }
                 }
 
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.render();
+                // Time render. Borrow the renderer, time + render in scope,
+                // record after the borrow ends.
+                if self.renderer.is_some() {
+                    let render_start = std::time::Instant::now();
+                    self.renderer.as_mut().unwrap().render();
+                    self.perf.record("render_cpu", render_start.elapsed());
                 }
 
                 if let Some(window) = &self.window {
