@@ -1,5 +1,5 @@
+use super::node::{octant_index, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
-use super::node::{CellState, Node, NodeId, octant_index};
 
 /// Canonical node store — the core of hash-consing.
 ///
@@ -104,7 +104,9 @@ impl NodeStore {
         let node = self.get(root).clone();
         match node {
             Node::Leaf(_) => self.leaf(state),
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -125,7 +127,9 @@ impl NodeStore {
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         match self.get(root) {
             Node::Leaf(s) => *s,
-            Node::Interior { level, children, .. } => {
+            Node::Interior {
+                level, children, ..
+            } => {
                 let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
@@ -160,7 +164,12 @@ impl NodeStore {
             Node::Leaf(s) => {
                 grid[ox + oy * side + oz * side * side] = *s;
             }
-            Node::Interior { level, children, population, .. } => {
+            Node::Interior {
+                level,
+                children,
+                population,
+                ..
+            } => {
                 if *population == 0 {
                     return; // skip entirely empty subtrees
                 }
@@ -184,7 +193,14 @@ impl NodeStore {
     /// Build an octree from a flat 3D array.
     /// Grid is indexed as [x + y*side + z*side*side], side must be a power of 2.
     pub fn from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
-        let level = (side as f64).log2() as u32;
+        // Integer log2 — `side.trailing_zeros()` is exact for powers of 2 and
+        // avoids f64 in the determinism-critical sim path. See
+        // .ship-notes/determinism-audit.md (hash-thing-i6y).
+        debug_assert!(
+            side.is_power_of_two(),
+            "from_flat: side must be power of 2, got {side}"
+        );
+        let level = side.trailing_zeros();
         self.from_flat_recursive(grid, side, 0, 0, 0, level)
     }
 

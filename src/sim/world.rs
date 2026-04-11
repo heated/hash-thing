@@ -1,5 +1,5 @@
-use crate::octree::{CellState, NodeId, NodeStore};
 use super::rule::CaRule;
+use crate::octree::{CellState, NodeId, NodeStore};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -18,7 +18,12 @@ impl World {
     pub fn new(level: u32) -> Self {
         let mut store = NodeStore::new();
         let root = store.empty(level);
-        Self { store, root, level, generation: 0 }
+        Self {
+            store,
+            root,
+            level,
+            generation: 0,
+        }
     }
 
     pub fn side(&self) -> usize {
@@ -125,5 +130,45 @@ impl SimpleRng {
 
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::rule::GameOfLife3D;
+
+    /// End-to-end determinism canary. Two independently constructed worlds
+    /// seeded and stepped identically must land on the same canonical root
+    /// NodeId — not just the same population. This is the load-bearing
+    /// property for Hashlife: the step cache is keyed on NodeId, so if
+    /// equivalent states don't share a root, the cache silently corrupts.
+    ///
+    /// This test is the regression canary for hash-thing-i6y — any future
+    /// change that introduces non-determinism into the sim path (HashMap
+    /// iteration, thread_rng, f32 reductions, wall-clock leakage) will
+    /// break this assertion.
+    #[test]
+    fn seed_and_step_are_deterministic_end_to_end() {
+        let level = 5u32; // 32^3 — small enough for a fast test, big enough to exercise depth
+        let rule = GameOfLife3D::amoeba();
+
+        let mut a = World::new(level);
+        let mut b = World::new(level);
+        a.seed_center(8, 0.35);
+        b.seed_center(8, 0.35);
+        assert_eq!(a.root, b.root, "seeded roots diverge");
+
+        for gen in 0..10 {
+            a.step_flat(&rule);
+            b.step_flat(&rule);
+            assert_eq!(a.root, b.root, "roots diverge at generation {}", gen + 1);
+            assert_eq!(
+                a.population(),
+                b.population(),
+                "populations diverge at generation {}",
+                gen + 1
+            );
+        }
     }
 }
