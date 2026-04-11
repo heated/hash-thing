@@ -24,6 +24,14 @@
 use crate::octree::{Node, NodeId, NodeStore};
 use rustc_hash::FxHashMap;
 
+/// High bit of a child slot marks it as an inline leaf. Interior-node offsets
+/// must fit strictly below this bound, checked in `write_node` at serialize
+/// time — a violation is a silent GPU-corruption bug (the decoder would read
+/// a legitimate offset as a leaf and emit a garbage material). This mirrors
+/// `LEAF_BIT = 0x80000000u` in `src/render/svdag_raycast.wgsl`; if you change
+/// one, change the other.
+pub(crate) const LEAF_BIT: u32 = 0x8000_0000;
+
 /// GPU-friendly serialized DAG.
 pub struct Svdag {
     /// Packed node data. Each interior node takes 9 u32s:
@@ -100,6 +108,17 @@ impl Svdag {
                 // Reserve our own slot before recursing so that cyclic refs (impossible here
                 // but conceptually clean) would be handled. Write a placeholder, record offset.
                 let my_offset = nodes.len() as u32;
+                // Guard against silent 31-bit overflow: interior offsets MUST fit
+                // strictly below LEAF_BIT or the GPU decoder misreads them as leaf
+                // words (hash-thing-x9r). Release-panic beats release-corruption.
+                // Empirically unreachable today — blowing this assert needs ~8 GB of
+                // node storage — but stays cheap as a sanity rail.
+                assert!(
+                    my_offset < LEAF_BIT,
+                    "SVDAG interior node count exceeded 31 bits ({}); \
+                     widen the encoding (hash-thing-x9r follow-up)",
+                    nodes.len()
+                );
                 id_to_offset.insert(id, my_offset);
 
                 // Reserve 9 slots: mask + 8 children
@@ -119,7 +138,7 @@ impl Svdag {
                             if *state != 0 {
                                 mask |= 1 << i;
                             }
-                            nodes[header_start + 1 + i] = (1u32 << 31) | (*state as u32);
+                            nodes[header_start + 1 + i] = LEAF_BIT | (*state as u32);
                         }
                         Node::Interior { population, .. } => {
                             if *population > 0 {
@@ -130,7 +149,7 @@ impl Svdag {
                                 nodes[header_start + 1 + i] = child_offset; // high bit clear = interior
                             } else {
                                 // Empty interior subtree — encode as empty leaf
-                                nodes[header_start + 1 + i] = 1u32 << 31;
+                                nodes[header_start + 1 + i] = LEAF_BIT;
                             }
                         }
                     }
@@ -164,7 +183,8 @@ pub mod cpu_trace {
 
     const MAX_DEPTH: usize = 14;
     const MAX_STEPS: usize = 512;
-    const LEAF_BIT: u32 = 0x8000_0000;
+    // LEAF_BIT comes from `use super::*` above — kept in one place so the
+    // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
 
     #[derive(Clone, Copy, Debug)]
@@ -561,5 +581,13 @@ mod tests {
             misses,
             voxels.len()
         );
+    }
+
+    /// Pin the Rust-side `LEAF_BIT` to the exact bit pattern the shader reads.
+    /// If someone widens the encoding they have to touch this test *and* the
+    /// WGSL — the test is the tripwire (hash-thing-x9r).
+    #[test]
+    fn leaf_bit_matches_shader() {
+        assert_eq!(LEAF_BIT, 0x8000_0000);
     }
 }
