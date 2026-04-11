@@ -105,9 +105,15 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let inv_rd = 1.0 / rd;
 
     // Per-ray step budget (hash-thing-2w5). Derived from u.params.x which the
-    // host sets to `2^root_level` cells per side. Saturation on the upper
-    // bound mirrors the CPU replica's `root_level.min(30)` clamp.
-    let root_side = u32(u.params.x);
+    // host sets to `1 << dag.root_level` cells per side. Must stay in
+    // lockstep with `cpu_trace::step_budget` in svdag.rs — the clamp at
+    // `1 << 29` mirrors the CPU replica's `root_level.min(30)` +
+    // `saturating_mul` guard so a pathological root_level can't overflow
+    // `root_side * STEP_BUDGET_FUDGE` silently in u32. At the upper clamp
+    // (root_side = 2^29), `* 8 = 2^32` would wrap — so the clamp is one
+    // notch tighter than the CPU to leave headroom in u32.
+    let root_side_raw = u32(u.params.x);
+    let root_side = min(root_side_raw, 1u << 28u);
     let max_steps = max(MIN_STEP_BUDGET, root_side * STEP_BUDGET_FUDGE);
 
     // Intersect ray with root cube [0,1]^3
@@ -141,7 +147,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     var t = 1e-5;
 
     for (var step = 0u; step < max_steps; step = step + 1u) {
-        if t > t_exit { break; }
+        // Normal miss path: walked past the root exit cleanly. Must be an
+        // explicit background return, NOT a `break` — the post-loop
+        // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
+        // so any `break` here would render every clean root-exit as magenta.
+        if t > t_exit { return vec4<f32>(0.0); }
         let pos = ro_local + rd * t;
 
         // If the current top-of-stack no longer contains `pos`, pop.

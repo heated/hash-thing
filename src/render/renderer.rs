@@ -330,7 +330,28 @@ impl Renderer {
     }
 
     /// Upload (or re-upload) a serialized SVDAG to the GPU.
+    ///
+    /// hash-thing-2w5: the shader derives its step budget from `params.x`,
+    /// which is `self.volume_size as f32`. The CPU-side raycast replica uses
+    /// `dag.root_level` directly. For the two to agree byte-for-byte we
+    /// need `self.volume_size == 1 << dag.root_level`. Today this holds by
+    /// coincidence — `main.rs` threads the same `VOLUME_SIZE` into both the
+    /// renderer and `sim::World::new(VOLUME_SIZE.trailing_zeros())`, and
+    /// nothing else resizes either. A future caller that hands us a DAG
+    /// whose root_level differs from the renderer's captured volume_size
+    /// would silently desync the shader step budget from the CPU replica's
+    /// regression suite, so we pin the invariant here with a debug_assert.
+    /// When this fires, either wire a dedicated `root_level` uniform field
+    /// or call a `set_root_level` helper before `upload_svdag`.
     pub fn upload_svdag(&mut self, dag: &super::Svdag) {
+        debug_assert_eq!(
+            self.volume_size,
+            1u32 << dag.root_level,
+            "upload_svdag: renderer.volume_size ({}) must equal 1 << dag.root_level ({}); \
+             shader/CPU step budget would desync otherwise (hash-thing-2w5)",
+            self.volume_size,
+            1u32 << dag.root_level,
+        );
         let bytes: &[u8] = bytemuck::cast_slice(&dag.nodes);
         let needed = bytes.len() as u64;
 

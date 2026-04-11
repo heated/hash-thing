@@ -204,12 +204,16 @@ pub mod cpu_trace {
     /// For root_level=6 (256³): `max(1024, 8 * 64) = 1024`.
     /// For root_level=12 (4096³): `max(1024, 8 * 4096) = 32768`.
     /// For root_level=14 (16384³): `max(1024, 8 * 16384) = 131072`.
+    /// Saturates above root_level=28 at `(1 << 28) * 8 = 2^31 = 2_147_483_648`.
     ///
-    /// Uses `saturating_mul` to avoid overflow panic if a future caller
-    /// passes an absurd root_level; the saturated result is still a valid
-    /// (if very large) step count.
+    /// The `.min(28)` ceiling is picked to keep the WGSL mirror u32-safe:
+    /// `root_side * 8` fits in u32 iff `root_side ≤ 2^28`. Both clamps agree
+    /// byte-for-byte at every real root_level so the CPU replica and shader
+    /// never diverge on budget. `saturating_mul` is a belt-and-braces guard
+    /// for hypothetical 32-bit usize targets; on 64-bit targets the product
+    /// trivially fits.
     pub fn step_budget(root_level: u32) -> usize {
-        let side = 1usize << root_level.min(30);
+        let side = 1usize << root_level.min(28);
         MIN_STEP_BUDGET.max(side.saturating_mul(STEP_BUDGET_FUDGE))
     }
 
@@ -289,6 +293,9 @@ pub mod cpu_trace {
         (t_near, t_far)
     }
 
+    /// Raycast with a root-level-derived step budget. Thin wrapper around
+    /// `raycast_with_budget` that computes the budget from `root_level` via
+    /// `step_budget`. Production callers use this entry point.
     pub fn raycast(
         dag: &[u32],
         root_level: u32,
@@ -296,7 +303,20 @@ pub mod cpu_trace {
         rd: [f32; 3],
         record: bool,
     ) -> TraceResult {
-        let max_steps = step_budget(root_level);
+        raycast_with_budget(dag, step_budget(root_level), ro, rd, record)
+    }
+
+    /// Raycast with an explicit step budget. Exposed so tests can force the
+    /// budget below the natural value and assert the `exhausted` path is
+    /// reached — a witness `step_budget` covering cannot provide on its own
+    /// because every realistic scene completes well under the natural budget.
+    pub fn raycast_with_budget(
+        dag: &[u32],
+        max_steps: usize,
+        ro: [f32; 3],
+        rd: [f32; 3],
+        record: bool,
+    ) -> TraceResult {
         let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
         let mut events = Vec::new();
 
@@ -1216,45 +1236,56 @@ mod tests {
         assert_eq!(cpu_trace::step_budget(8), 2048); // 8 * 256
         assert_eq!(cpu_trace::step_budget(12), 32768); // 8 * 4096 (SPEC target)
         assert_eq!(cpu_trace::step_budget(14), 131072); // 8 * 16384 (MAX_DEPTH)
-                                                        // Saturation: an absurd root_level must not panic. The .min(30)
-                                                        // clamp keeps the shift in-range; saturating_mul handles anything
-                                                        // the shift produces.
-        let huge = cpu_trace::step_budget(u32::MAX);
-        assert!(
-            huge >= 1024,
-            "step_budget must respect floor even on overflow"
+                                                        // Saturation: an absurd root_level must not panic. The .min(28)
+                                                        // clamp keeps the shift in-range AND keeps `root_side * 8` within
+                                                        // u32 so the shader mirror can use the same arithmetic. At
+                                                        // root_level=28, budget = (1 << 28) * 8 = 2^31 = 2_147_483_648.
+                                                        // Exact equality pins the clamp: a future refactor that drops
+                                                        // the .min(28) would silently produce a different saturation
+                                                        // value (2^33 pre-ysg review catch).
+        assert_eq!(
+            cpu_trace::step_budget(u32::MAX),
+            1usize << 31,
+            "step_budget saturation value must match the .min(28) clamp"
         );
+        // Boundary: root_level=28 equals the saturation value.
+        assert_eq!(cpu_trace::step_budget(28), 1usize << 31);
+        // One below the clamp: root_level=27 gives 2^30.
+        assert_eq!(cpu_trace::step_budget(27), 1usize << 30);
     }
 
-    /// hash-thing-2w5 regression: at SPEC-target depth (root_level=12,
+    /// hash-thing-2w5 invariant pin: at SPEC-target depth (root_level=12,
     /// i.e. 4096³), a single voxel placed at the far corner must still be
     /// reachable via a corner-to-corner ray without the traversal budget
-    /// being exhausted. Pre-2w5, MAX_STEPS=512 hard-capped every scene
-    /// regardless of root_side, silently returning background on long
-    /// traversals. Post-2w5, the budget is `max(1024, 8 * root_side)` =
-    /// 32768 for this scene, which is guaranteed to be enough for any
-    /// reasonable sparse traversal at this depth.
+    /// being exhausted. This is *not* a budget-pressure test: single-voxel
+    /// sparse scenes coalesce empty space into shallow leaves, so a
+    /// full-diagonal ray completes in ~5 outer iterations regardless of
+    /// root_level. What this test DOES pin:
     ///
-    /// This test does not attempt to *saturate* the budget — doing so
-    /// cleanly requires a dense scene, which contradicts the sparse-DAG
-    /// assumption. Instead it pins the invariant "basic corner traversal
-    /// at SPEC-scale does not exhaust the budget" and gives the
-    /// `exhausted` flag a known-false witness. A future tighter test
-    /// should construct a genuinely pathological scene and assert the
-    /// magenta sentinel triggers.
+    ///   1. The `exhausted: false` path is exercised on a realistic hit.
+    ///      Gives the flag a non-trivial non-exhausted witness.
+    ///   2. Hit correctness at SPEC-scale — if a future refactor breaks
+    ///      the far-corner traversal this catches it separately from
+    ///      budget mechanics.
+    ///   3. `step_budget(12) = 32768` is not secretly clamped to something
+    ///      smaller than the actually-used step count.
+    ///
+    /// What this test does NOT pin (and the review artifact calls out
+    /// explicitly): that any natural single-voxel scene requires more
+    /// than the pre-2w5 MAX_STEPS=512. It doesn't — sparse coalescing
+    /// makes budget bite unreachable with single-voxel scenes. The
+    /// follow-on `budget_exhaustion_via_low_budget_override` test
+    /// exercises the exhausted=true path via an artificially low budget
+    /// instead, which is the only reliable way to surface the flag
+    /// without constructing a dense pathological scene.
     #[test]
-    fn sparse_long_traverse_depth12_under_budget() {
+    fn sparse_far_corner_hit_is_not_exhausted_depth12() {
         let mut store = NodeStore::new();
         let mut root = store.empty(12);
-        // Place the voxel at the far corner (4095, 4095, 4095) so the ray
-        // traverses the full length of the root cube before hitting.
         root = store.set_cell(root, 4095, 4095, 4095, 1);
         let dag = Svdag::build(&store, root, 12);
         assert_eq!(dag.root_level, 12);
 
-        // Ray from (2,2,2) aimed at the voxel's center in world space.
-        // side = 4096, so voxel world min = 4095/4096 ≈ 0.99976, center
-        // ≈ 0.99988. The ray direction is (~-1, ~-1, ~-1)/√3.
         let ro = [2.0, 2.0, 2.0];
         let target = [4095.5 / 4096.0, 4095.5 / 4096.0, 4095.5 / 4096.0];
         let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
@@ -1262,61 +1293,103 @@ mod tests {
 
         assert!(
             !result.exhausted,
-            "depth-12 corner traversal exhausted the step budget — expected \
-             false, got true (steps={})",
+            "far-corner depth-12 hit exhausted the budget — expected false, \
+             got true (steps={})",
             result.steps,
+        );
+        assert_eq!(result.hit_material, Some(1));
+        assert!(result.steps < cpu_trace::step_budget(12));
+    }
+
+    /// hash-thing-2w5 exhausted-flag witness. Forces the budget-exhaustion
+    /// branch via `raycast_with_budget` with an artificially low budget,
+    /// since natural single-voxel scenes coalesce empty space aggressively
+    /// and never organically need more than a few outer iterations.
+    ///
+    /// Why this matters: the only way a `raycast` caller ever observes
+    /// `exhausted = true` without an override would require a dense
+    /// pathological scene. Without this test, a future refactor that
+    /// silently dropped the post-loop fall-through (e.g. changed it to
+    /// `exhausted: false`, or removed the `exhausted` field entirely)
+    /// would compile clean and pass every other test in this module.
+    #[test]
+    fn budget_exhaustion_via_low_budget_override() {
+        // Empty depth-12 scene: every root child is an empty leaf, so
+        // the diagonal ray walks through multiple empty root octants in
+        // sequence before t_exit. That guarantees a natural step count of
+        // > 1, which is what the artificially-low budget needs to bite.
+        let mut store = NodeStore::new();
+        let root = store.empty(12);
+        let dag = Svdag::build(&store, root, 12);
+
+        // Diagonal ray from (2,2,2) toward (-1,-1,-1). Passes through
+        // multiple root-level octants before exiting at (0,0,0).
+        let ro = [2.0, 2.0, 2.0];
+        let rd = normalize([-1.0, -1.0, -1.0]);
+
+        // Sanity: at natural budget the ray exits cleanly (miss), not
+        // exhausted, with steps > 1 — otherwise the budget=1 witness
+        // below would be vacuously satisfied.
+        let natural = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+        assert_eq!(natural.hit_material, None);
+        assert!(
+            !natural.exhausted,
+            "natural diagonal miss must not exhaust at budget=32768"
+        );
+        let natural_steps = natural.steps;
+        assert!(
+            natural_steps > 1,
+            "prerequisite: natural step count must be > 1 for the exhaustion \
+             witness to be non-vacuous (observed {natural_steps})",
+        );
+
+        // Force exhaustion. `raycast_with_budget` uses the exact body of
+        // `raycast`, so this path exercises the same post-loop fall-through
+        // that the shader's magenta sentinel is tied to.
+        let budget = 1;
+        let result = cpu_trace::raycast_with_budget(&dag.nodes, budget, ro, rd, false);
+        assert!(
+            result.exhausted,
+            "raycast_with_budget({budget}) must set exhausted=true when \
+             the natural traversal ({natural_steps} steps) exceeds the \
+             override — got exhausted={}, steps={}, hit={:?}",
+            result.exhausted, result.steps, result.hit_material,
         );
         assert_eq!(
-            result.hit_material,
-            Some(1),
-            "depth-12 corner traversal missed the sole voxel (steps={}, \
-             exhausted={})",
-            result.steps,
-            result.exhausted,
+            result.hit_material, None,
+            "exhausted traversal must report no hit (CPU path must match \
+             shader behavior where the magenta sentinel replaces any hit)",
         );
-        assert!(
-            result.steps < cpu_trace::step_budget(12),
-            "used {} of {} available steps",
-            result.steps,
-            cpu_trace::step_budget(12),
+        assert_eq!(
+            result.steps, budget,
+            "exhausted steps count should equal the budget"
         );
     }
 
-    /// hash-thing-2w5 regression: same shape as depth12 but one level
-    /// deeper. Depth 13 (8192³) puts us past the current SPEC debug scale
-    /// and gives more headroom into the 4096³+ target range. Budget here
-    /// is `8 * 8192 = 65536` steps.
+    /// hash-thing-2w5: the `raycast` → `raycast_with_budget` wrapper must
+    /// produce byte-identical results when called with the same effective
+    /// budget. Without this pin, the refactor split could silently diverge.
     #[test]
-    fn sparse_long_traverse_depth13_under_budget() {
+    fn raycast_and_raycast_with_budget_agree_at_natural_budget() {
         let mut store = NodeStore::new();
-        let mut root = store.empty(13);
-        root = store.set_cell(root, 8191, 8191, 8191, 1);
-        let dag = Svdag::build(&store, root, 13);
-        assert_eq!(dag.root_level, 13);
+        let mut root = store.empty(12);
+        root = store.set_cell(root, 4095, 4095, 4095, 1);
+        let dag = Svdag::build(&store, root, 12);
 
         let ro = [2.0, 2.0, 2.0];
-        let target = [8191.5 / 8192.0, 8191.5 / 8192.0, 8191.5 / 8192.0];
+        let target = [4095.5 / 4096.0, 4095.5 / 4096.0, 4095.5 / 4096.0];
         let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
-        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
 
-        assert!(
-            !result.exhausted,
-            "depth-13 corner traversal exhausted the step budget (steps={})",
-            result.steps,
+        let via_root_level = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+        let via_budget = cpu_trace::raycast_with_budget(
+            &dag.nodes,
+            cpu_trace::step_budget(dag.root_level),
+            ro,
+            rd,
+            false,
         );
-        assert_eq!(
-            result.hit_material,
-            Some(1),
-            "depth-13 corner traversal missed the sole voxel (steps={}, \
-             exhausted={})",
-            result.steps,
-            result.exhausted,
-        );
-        assert!(
-            result.steps < cpu_trace::step_budget(13),
-            "used {} of {} available steps",
-            result.steps,
-            cpu_trace::step_budget(13),
-        );
+        assert_eq!(via_root_level.hit_material, via_budget.hit_material);
+        assert_eq!(via_root_level.steps, via_budget.steps);
+        assert_eq!(via_root_level.exhausted, via_budget.exhausted);
     }
 }
