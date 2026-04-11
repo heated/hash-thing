@@ -1,4 +1,5 @@
 mod octree;
+mod perf;
 mod render;
 mod rng;
 mod sim;
@@ -21,6 +22,9 @@ struct App {
     rule: sim::GameOfLife3D,
     paused: bool,
     step_timer: std::time::Instant,
+    /// When to next emit an auto perf summary. Reset on each emission.
+    perf_log_timer: std::time::Instant,
+    perf: perf::PerfCounters,
     // Mouse interaction state
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
@@ -29,17 +33,21 @@ struct App {
 impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+        let mut perf_counters = perf::PerfCounters::default();
+
         let params = terrain::TerrainParams::default();
-        let stats = world.seed_terrain(&params);
+        let (stats, elapsed) = perf::time(|| world.seed_terrain(&params));
+        perf_counters.record_gen(elapsed, world.store.stats());
 
         let (nodes, _) = world.store.stats();
         log::info!(
-            "Initial terrain: {}^3, population={}, nodes={}, gen_calls={}, collapses={}",
+            "Initial terrain: {}^3, population={}, nodes={}, gen_calls={}, collapses={}, gen_time={:.2}ms",
             world.side(),
             world.population(),
             nodes,
             stats.calls_total,
             stats.total_collapses(),
+            elapsed.as_micros() as f64 / 1_000.0,
         );
 
         // Start paused so the active CA rule (legacy GoL) does not
@@ -52,6 +60,8 @@ impl App {
             rule: sim::GameOfLife3D::amoeba(),
             paused: true,
             step_timer: std::time::Instant::now(),
+            perf_log_timer: std::time::Instant::now(),
+            perf: perf_counters,
             mouse_pressed: false,
             last_mouse: None,
         }
@@ -59,11 +69,20 @@ impl App {
 
     fn upload_volume(&mut self) {
         if let Some(renderer) = &mut self.renderer {
+            // `flatten` is intentionally NOT folded into the perf timer.
+            // h34.3's spec names "step, terrain gen, DAG serialization";
+            // flatten is the Flat3D render path's own cost, not the
+            // SVDAG build's. If the Flat3D renderer is retired later,
+            // this call goes away; if it stays, it deserves its own
+            // counter rather than being hidden inside `svdag[...]`.
             let data = self.world.flatten();
             renderer.upload_volume(&data);
-            // Also rebuild the SVDAG so the other render path stays in sync.
-            let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
-            if self.world.generation % 10 == 0 {
+            // Measure just the rebuild — the GPU upload is wgpu's problem.
+            let (dag, elapsed) = perf::time(|| {
+                render::Svdag::build(&self.world.store, self.world.root, self.world.level)
+            });
+            self.perf.record_svdag(elapsed, self.world.store.stats());
+            if self.world.generation.is_multiple_of(10) {
                 log::info!(
                     "SVDAG: {} nodes, {} bytes, root_level={}",
                     dag.node_count,
@@ -118,7 +137,8 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("s") => {
                             // Single step
-                            self.world.step_flat(&self.rule);
+                            let (_, elapsed) = perf::time(|| self.world.step_flat(&self.rule));
+                            self.perf.record_step(elapsed, self.world.store.stats());
                             self.upload_volume();
                             log::info!(
                                 "Gen {}: pop={}",
@@ -129,15 +149,21 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("r") => {
                             // Re-seed terrain. Stays paused.
                             let params = terrain::TerrainParams::default();
-                            let stats = self.world.seed_terrain(&params);
+                            let (stats, elapsed) = perf::time(|| self.world.seed_terrain(&params));
+                            self.perf.record_gen(elapsed, self.world.store.stats());
                             self.paused = true;
                             self.upload_volume();
                             log::info!(
-                                "Reset terrain: pop={}, gen_calls={}, collapses={}",
+                                "Reset terrain: pop={}, gen_calls={}, collapses={}, gen_time={:.2}ms",
                                 self.world.population(),
                                 stats.calls_total,
                                 stats.total_collapses(),
+                                elapsed.as_micros() as f64 / 1_000.0,
                             );
+                        }
+                        winit::keyboard::Key::Character("p") => {
+                            // Dump perf summary on demand.
+                            log::info!("{}", self.perf.summary());
                         }
                         winit::keyboard::Key::Character("g") => {
                             // Swap to legacy GoL sphere seed (kept for CA scaffold demos).
@@ -214,11 +240,12 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
-                    self.world.step_flat(&self.rule);
+                    let (_, elapsed) = perf::time(|| self.world.step_flat(&self.rule));
+                    self.perf.record_step(elapsed, self.world.store.stats());
                     self.upload_volume();
                     self.step_timer = std::time::Instant::now();
 
-                    if self.world.generation % 10 == 0 {
+                    if self.world.generation.is_multiple_of(10) {
                         let (nodes, cache) = self.world.store.stats();
                         log::info!(
                             "Gen {}: pop={}, nodes={}, cache={}",
@@ -228,6 +255,15 @@ impl ApplicationHandler for App {
                             cache
                         );
                     }
+                }
+
+                // Auto perf summary while the simulation is running. We
+                // skip the dump when paused so the log stays quiet if you
+                // tab out after seeding a world. Press `P` for an
+                // on-demand summary regardless of pause state.
+                if !self.paused && self.perf_log_timer.elapsed().as_secs() >= 2 {
+                    log::info!("{}", self.perf.summary());
+                    self.perf_log_timer = std::time::Instant::now();
                 }
 
                 if let Some(renderer) = &mut self.renderer {
@@ -257,6 +293,7 @@ fn main() {
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");
+    log::info!("  P: dump perf summary");
     log::info!("  Esc: quit");
 
     let event_loop = EventLoop::new().unwrap();
