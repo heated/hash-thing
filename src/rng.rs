@@ -250,12 +250,8 @@ mod tests {
         let avg_z = measure_channel(base, |b| {
             cell_hash(17, 29, 41 ^ b as i64, 53, 0x01234567_89ABCDEF)
         });
-        let avg_g = measure_channel(base, |b| {
-            cell_hash(17, 29, 41, 53 ^ b, 0x01234567_89ABCDEF)
-        });
-        let avg_s = measure_channel(base, |b| {
-            cell_hash(17, 29, 41, 53, 0x01234567_89ABCDEF ^ b)
-        });
+        let avg_g = measure_channel(base, |b| cell_hash(17, 29, 41, 53 ^ b, 0x01234567_89ABCDEF));
+        let avg_s = measure_channel(base, |b| cell_hash(17, 29, 41, 53, 0x01234567_89ABCDEF ^ b));
         for (name, avg) in [
             ("x", avg_x),
             ("y", avg_y),

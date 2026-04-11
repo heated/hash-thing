@@ -185,8 +185,8 @@ impl ApplicationHandler for App {
                         let dy = (position.y - ly) as f32;
                         if let Some(renderer) = &mut self.renderer {
                             renderer.camera_yaw += dx * 0.005;
-                            renderer.camera_pitch = (renderer.camera_pitch + dy * 0.005)
-                                .clamp(-1.4, 1.4);
+                            renderer.camera_pitch =
+                                (renderer.camera_pitch + dy * 0.005).clamp(-1.4, 1.4);
                         }
                     }
                     self.last_mouse = Some((position.x, position.y));
@@ -226,10 +226,8 @@ impl ApplicationHandler for App {
 
                     if self.world.generation % 10 == 0 {
                         let (nodes, cache) = self.world.store.stats();
-                        let mem_kb =
-                            (nodes * std::mem::size_of::<crate::octree::Node>()) / 1024;
-                        let (svdag_nodes, svdag_bytes, svdag_root_level) =
-                            self.svdag_stats();
+                        let mem_kb = (nodes * std::mem::size_of::<crate::octree::Node>()) / 1024;
+                        let (svdag_nodes, svdag_bytes, svdag_root_level) = self.svdag_stats();
                         log::info!(
                             "Gen {}: pop={} nodes={} (~{}KB) cache={} svdag={}/{}KB(L{}) | {}",
                             self.world.generation,
