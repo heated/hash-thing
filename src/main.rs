@@ -38,6 +38,11 @@ struct App {
     /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
     /// on the wall-clock log path.
     mem_stats: perf::MemStats,
+    /// Cached SVDAG stats captured during `upload_volume` so the wall-clock
+    /// log line can read them without rebuilding the SVDAG. Updated every
+    /// time the DAG is rebuilt for render. Tuple: (node_count, byte_size,
+    /// root_level).
+    last_svdag_stats: (usize, usize, u32),
 }
 
 impl App {
@@ -66,6 +71,7 @@ impl App {
             last_mouse: None,
             perf: perf::Perf::new(),
             mem_stats: perf::MemStats::new(),
+            last_svdag_stats: (0, 0, 0),
         }
     }
 
@@ -75,16 +81,11 @@ impl App {
             renderer.upload_volume(&data);
             // Also rebuild the SVDAG so the other render path stays in sync.
             let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
+            // Capture stats here so the wall-clock log path (fb6) reads
+            // them without triggering a second build.
+            self.last_svdag_stats = (dag.node_count, dag.byte_size(), dag.root_level);
             renderer.upload_svdag(&dag);
         }
-    }
-
-    /// SVDAG node count + byte size + root level for the consolidated
-    /// `Gen N:` log line. Rebuilds the SVDAG to inspect — call only on the
-    /// wall-clock log path (every LOG_INTERVAL_SECS), not every redraw.
-    fn svdag_stats(&self) -> (usize, usize, u32) {
-        let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
-        (dag.node_count, dag.byte_size(), dag.root_level)
     }
 }
 
@@ -251,7 +252,7 @@ impl ApplicationHandler for App {
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
                     let (nodes, cache) = self.world.store.stats();
                     self.mem_stats.update(nodes, cache);
-                    let (svdag_nodes, svdag_bytes, svdag_root_level) = self.svdag_stats();
+                    let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                     log::info!(
                         "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
                         self.world.generation,
