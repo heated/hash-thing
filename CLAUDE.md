@@ -12,7 +12,8 @@ gate-sensitivity: medium
 
 Named agents working on this repo. `BEADS_ACTOR` draws from a small pool of natural-object words, not confusable with real names.
 
-Pool: `flint · cairn · onyx · wisp · mote · ember · spark · quill · thorn · mayor`
+Auto-assign pool (used by the `claude -w` seat hook): `flint · cairn · onyx · ember · spark`
+Explicit-only seat: `mayor` — singular, never auto-assigned, see the mayor skill
 
 Current seats:
 - **flint** — simulation / octree / physics / CA rules
