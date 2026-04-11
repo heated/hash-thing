@@ -79,8 +79,16 @@ fn octant_of(pos: vec3<f32>, node_min: vec3<f32>, half: f32) -> u32 {
 }
 
 const MAX_DEPTH: u32 = 14u;
-const MAX_STEPS: u32 = 512u;
 const LEAF_BIT: u32 = 0x80000000u;
+
+// hash-thing-2w5: step budget scales with root_level so deep scenes don't
+// silently black out on long sparse traversals. Must stay in lockstep with
+// `render::svdag::tests::step_budget` on the CPU replica.
+//   MIN_STEP_BUDGET = 1024  (floor for shallow demo worlds)
+//   STEP_BUDGET_FUDGE = 8   (per-cell multiplier above the 3*root_side
+//                            diagonal worst case)
+const MIN_STEP_BUDGET: u32 = 1024u;
+const STEP_BUDGET_FUDGE: u32 = 8u;
 
 // Iterative DAG descent.
 //
@@ -95,6 +103,12 @@ const LEAF_BIT: u32 = 0x80000000u;
 // coalescing) can be layered on later.
 fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let inv_rd = 1.0 / rd;
+
+    // Per-ray step budget (hash-thing-2w5). Derived from u.params.x which the
+    // host sets to `2^root_level` cells per side. Saturation on the upper
+    // bound mirrors the CPU replica's `root_level.min(30)` clamp.
+    let root_side = u32(u.params.x);
+    let max_steps = max(MIN_STEP_BUDGET, root_side * STEP_BUDGET_FUDGE);
 
     // Intersect ray with root cube [0,1]^3
     let root_hit = intersect_aabb(ro, inv_rd, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -126,7 +140,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // already sits on the root face, so we nudge forward by EPS.
     var t = 1e-5;
 
-    for (var step = 0u; step < MAX_STEPS; step = step + 1u) {
+    for (var step = 0u; step < max_steps; step = step + 1u) {
         if t > t_exit { break; }
         let pos = ro_local + rd * t;
 
@@ -248,7 +262,15 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         t = oct_far + dt;
     }
 
-    return vec4<f32>(0.0);
+    // hash-thing-2w5: post-loop fall-through means we blew the step budget
+    // while still inside the root cube (neither hit nor exited). Pre-2w5
+    // this returned a silent black pixel indistinguishable from the real
+    // background — budget exhaustion would just visually black out deep
+    // worlds. Now we surface it as a magenta sentinel so the failure mode
+    // is impossible to miss on screen. The CPU replica sets
+    // `TraceResult.exhausted = true` for the same condition so tests can
+    // assert on it directly.
+    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
 }
 
 @fragment

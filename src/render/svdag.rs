@@ -182,10 +182,36 @@ pub mod cpu_trace {
     use super::*;
 
     const MAX_DEPTH: usize = 14;
-    const MAX_STEPS: usize = 512;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
+
+    /// Absolute minimum step budget. Shallow scenes get this even if the
+    /// root_level-derived bound is smaller; prevents a tiny analytical bound
+    /// from starving demo-sized worlds. Must stay ≥ the pre-2w5 fixed cap
+    /// (512) so nothing regresses on the existing regression suite.
+    const MIN_STEP_BUDGET: usize = 1024;
+
+    /// Per-cell fudge factor on top of `root_side`. A straight diagonal ray
+    /// crosses at most `3 * root_side` cells; real rays re-enter neighbor
+    /// cells across boundaries and need headroom. `8 *` is conservative —
+    /// instrumentable via the new `exhausted` flag on `TraceResult`.
+    const STEP_BUDGET_FUDGE: usize = 8;
+
+    /// Compute the MAX_STEPS budget for a given `root_level`.
+    ///
+    /// Result: `max(MIN_STEP_BUDGET, STEP_BUDGET_FUDGE * (1 << root_level))`.
+    /// For root_level=6 (256³): `max(1024, 8 * 64) = 1024`.
+    /// For root_level=12 (4096³): `max(1024, 8 * 4096) = 32768`.
+    /// For root_level=14 (16384³): `max(1024, 8 * 16384) = 131072`.
+    ///
+    /// Uses `saturating_mul` to avoid overflow panic if a future caller
+    /// passes an absurd root_level; the saturated result is still a valid
+    /// (if very large) step count.
+    pub fn step_budget(root_level: u32) -> usize {
+        let side = 1usize << root_level.min(30);
+        MIN_STEP_BUDGET.max(side.saturating_mul(STEP_BUDGET_FUDGE))
+    }
 
     #[derive(Clone, Copy, Debug)]
     pub enum TraceEvent {
@@ -218,6 +244,12 @@ pub mod cpu_trace {
         pub hit_material: Option<u32>,
         pub steps: usize,
         pub events: Vec<TraceEvent>,
+        /// True iff traversal ran out of steps before terminating (neither
+        /// hit nor exited the root cube). Pre-2w5 this case returned a silent
+        /// miss indistinguishable from a real background pixel; now the
+        /// shader surfaces it as a magenta sentinel and the CPU replica
+        /// exposes it here for test assertions.
+        pub exhausted: bool,
     }
 
     fn octant_of(pos: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
@@ -257,7 +289,14 @@ pub mod cpu_trace {
         (t_near, t_far)
     }
 
-    pub fn raycast(dag: &[u32], ro: [f32; 3], rd: [f32; 3], record: bool) -> TraceResult {
+    pub fn raycast(
+        dag: &[u32],
+        root_level: u32,
+        ro: [f32; 3],
+        rd: [f32; 3],
+        record: bool,
+    ) -> TraceResult {
+        let max_steps = step_budget(root_level);
         let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
         let mut events = Vec::new();
 
@@ -267,6 +306,7 @@ pub mod cpu_trace {
                 hit_material: None,
                 steps: 0,
                 events,
+                exhausted: false,
             };
         }
 
@@ -299,12 +339,13 @@ pub mod cpu_trace {
         // already on the root face.
         let mut t = EPS;
 
-        for step in 0..MAX_STEPS {
+        for step in 0..max_steps {
             if t > t_exit {
                 return TraceResult {
                     hit_material: None,
                     steps: step,
                     events,
+                    exhausted: false,
                 };
             }
             let pos = [
@@ -349,6 +390,7 @@ pub mod cpu_trace {
                         hit_material: None,
                         steps: step,
                         events,
+                        exhausted: false,
                     };
                 }
                 top -= 1;
@@ -379,6 +421,7 @@ pub mod cpu_trace {
                             hit_material: Some(mat),
                             steps: step,
                             events,
+                            exhausted: false,
                         };
                     }
                     if record {
@@ -428,7 +471,11 @@ pub mod cpu_trace {
                 node_min[1] + ((oct >> 1) & 1) as f32 * half,
                 node_min[2] + ((oct >> 2) & 1) as f32 * half,
             ];
-            let child_max = [child_min[0] + half, child_min[1] + half, child_min[2] + half];
+            let child_max = [
+                child_min[0] + half,
+                child_min[1] + half,
+                child_min[2] + half,
+            ];
             // Per-axis exit times. oct_far is the smallest tmax across the
             // three axes (same value the old `intersect_aabb(...).1` returned)
             // but exposed per-axis so we can identify which axis is the actual
@@ -476,10 +523,16 @@ pub mod cpu_trace {
             }
         }
 
+        // Post-loop fall-through: budget exhausted while still inside the
+        // root cube (neither hit nor exit). Pre-2w5 this returned a silent
+        // miss indistinguishable from background. Now the flag is surfaced
+        // so tests can assert on it, and the GPU shader renders the same
+        // state as a magenta sentinel pixel.
         TraceResult {
             hit_material: None,
-            steps: MAX_STEPS,
+            steps: max_steps,
             events,
+            exhausted: true,
         }
     }
 }
@@ -506,7 +559,7 @@ mod tests {
         let target = [0.5 + 0.5 / 64.0, 0.5 + 0.5 / 64.0, 0.5 + 0.5 / 64.0];
         let ro = [2.0, 2.0, 2.0];
         let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
-        let result = cpu_trace::raycast(&dag.nodes, ro, rd, true);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, true);
         assert_eq!(
             result.hit_material,
             Some(1),
@@ -546,7 +599,7 @@ mod tests {
                     ];
                     let ro = [2.0, 2.0, 2.0];
                     let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
-                    let result = cpu_trace::raycast(&dag.nodes, ro, rd, false);
+                    let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
                     if result.hit_material.is_none() {
                         misses.push((x, y, z));
                     }
@@ -595,7 +648,7 @@ mod tests {
                 (cz as f32 + 0.5) / 64.0,
             ];
             let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
-            let result = cpu_trace::raycast(&dag.nodes, ro, rd, false);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
             if result.hit_material.is_none() {
                 misses += 1;
             }
@@ -644,7 +697,7 @@ mod tests {
                 (cz as f32 + 0.5) / 64.0,
             ];
             let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
-            let result = cpu_trace::raycast(&dag.nodes, ro, rd, false);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
             if result.hit_material.is_none() {
                 misses += 1;
             }
@@ -704,7 +757,7 @@ mod tests {
 
         for (i, (ro, rd)) in cases.iter().enumerate() {
             let rd_n = normalize(*rd);
-            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd_n, false);
             // 400 << MAX_STEPS (512). Pre-fix code stalled at 512 on all three.
             // Post-fix, observed step count is ≤ 20 on every case.
             assert!(
@@ -754,7 +807,7 @@ mod tests {
 
         for (i, (ro, rd)) in cases.iter().enumerate() {
             let rd_n = normalize(*rd);
-            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd_n, false);
             assert!(
                 result.steps < 400,
                 "case {i} (ro={ro:?}, rd={rd:?}): far-camera forward-progress \
@@ -788,7 +841,7 @@ mod tests {
 
         for (i, (ro, rd)) in cases.iter().enumerate() {
             let rd_n = normalize(*rd);
-            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd_n, false);
             assert!(
                 result.steps < 400,
                 "case {i} (ro={ro:?}, rd={rd:?}): far-camera MAX_DEPTH \
@@ -871,7 +924,7 @@ mod tests {
 
         for (i, (ro, rd)) in cases.iter().enumerate() {
             let rd_n = normalize(*rd);
-            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd_n, false);
             assert!(
                 result.steps < 128,
                 "case {i} (ro={ro:?}, rd={rd:?}): dominant-axis throughput \
@@ -901,7 +954,7 @@ mod tests {
         // inside the loop. Post-clamp local-frame t stays ≤ √3 + ε.
         let ro: [f32; 3] = [100.5, 0.5001, 0.4999];
         let rd_n = normalize([-1.0, 1e-5, -1e-5]);
-        let result = cpu_trace::raycast(&dag.nodes, ro, rd_n, true);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd_n, true);
 
         // Cube diagonal plus a small margin for overshoot.
         const T_BOUND: f32 = 2.0;
@@ -975,11 +1028,7 @@ mod tests {
         // Tight AABB of the single depth-12 voxel in world coordinates.
         // At depth 12, cell width is 1/4096 ≈ 2.44e-4.
         let voxel_min: [f32; 3] = [0.5, 0.5, 0.5];
-        let voxel_max: [f32; 3] = [
-            2049.0 / 4096.0,
-            2049.0 / 4096.0,
-            2049.0 / 4096.0,
-        ];
+        let voxel_max: [f32; 3] = [2049.0 / 4096.0, 2049.0 / 4096.0, 2049.0 / 4096.0];
 
         // Analytical ray-AABB: `t_far >= max(t_near, 0)` → hit. Uses the
         // same slab math as cpu_trace::intersect_aabb so we're comparing
@@ -991,12 +1040,7 @@ mod tests {
         // the same as "ray hits a non-empty leaf," and this oracle would
         // no longer be ground truth. Do not generalize without also
         // switching to a scene-wide occupancy check.
-        fn hits_voxel(
-            ro: [f32; 3],
-            rd: [f32; 3],
-            bmin: [f32; 3],
-            bmax: [f32; 3],
-        ) -> bool {
+        fn hits_voxel(ro: [f32; 3], rd: [f32; 3], bmin: [f32; 3], bmax: [f32; 3]) -> bool {
             let inv = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
             let mut t_near = f32::NEG_INFINITY;
             let mut t_far = f32::INFINITY;
@@ -1078,7 +1122,7 @@ mod tests {
             rd_raw[(axis + 2) % 3] = rd_b;
             let rd_n = normalize(rd_raw);
 
-            let result = cpu_trace::raycast(&dag.nodes, ro, rd_n, true);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd_n, true);
 
             // Hard assertion #1: forward progress within the step budget.
             assert!(
@@ -1155,6 +1199,124 @@ mod tests {
             "ysg fuzz: total_steps {total_steps} too low — the harness \
              isn't exercising step-past paths (expected >4000, observed \
              ~6149 at commit time).",
+        );
+    }
+
+    /// hash-thing-2w5: The step budget formula must honor its floor and its
+    /// per-cell fudge. Pinning the observable values keeps future tuning
+    /// honest — raising MIN_STEP_BUDGET or STEP_BUDGET_FUDGE should be a
+    /// visible test change, not a silent drift.
+    #[test]
+    fn step_budget_respects_floor_and_fudge() {
+        // Shallow: fudge × side < floor → floor wins.
+        assert_eq!(cpu_trace::step_budget(0), 1024); // 8 * 1 = 8, floored to 1024
+        assert_eq!(cpu_trace::step_budget(6), 1024); // 8 * 64 = 512, floored to 1024
+        assert_eq!(cpu_trace::step_budget(7), 1024); // 8 * 128 = 1024, still floor
+                                                     // Deep: fudge × side > floor → fudge × side wins.
+        assert_eq!(cpu_trace::step_budget(8), 2048); // 8 * 256
+        assert_eq!(cpu_trace::step_budget(12), 32768); // 8 * 4096 (SPEC target)
+        assert_eq!(cpu_trace::step_budget(14), 131072); // 8 * 16384 (MAX_DEPTH)
+                                                        // Saturation: an absurd root_level must not panic. The .min(30)
+                                                        // clamp keeps the shift in-range; saturating_mul handles anything
+                                                        // the shift produces.
+        let huge = cpu_trace::step_budget(u32::MAX);
+        assert!(
+            huge >= 1024,
+            "step_budget must respect floor even on overflow"
+        );
+    }
+
+    /// hash-thing-2w5 regression: at SPEC-target depth (root_level=12,
+    /// i.e. 4096³), a single voxel placed at the far corner must still be
+    /// reachable via a corner-to-corner ray without the traversal budget
+    /// being exhausted. Pre-2w5, MAX_STEPS=512 hard-capped every scene
+    /// regardless of root_side, silently returning background on long
+    /// traversals. Post-2w5, the budget is `max(1024, 8 * root_side)` =
+    /// 32768 for this scene, which is guaranteed to be enough for any
+    /// reasonable sparse traversal at this depth.
+    ///
+    /// This test does not attempt to *saturate* the budget — doing so
+    /// cleanly requires a dense scene, which contradicts the sparse-DAG
+    /// assumption. Instead it pins the invariant "basic corner traversal
+    /// at SPEC-scale does not exhaust the budget" and gives the
+    /// `exhausted` flag a known-false witness. A future tighter test
+    /// should construct a genuinely pathological scene and assert the
+    /// magenta sentinel triggers.
+    #[test]
+    fn sparse_long_traverse_depth12_under_budget() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(12);
+        // Place the voxel at the far corner (4095, 4095, 4095) so the ray
+        // traverses the full length of the root cube before hitting.
+        root = store.set_cell(root, 4095, 4095, 4095, 1);
+        let dag = Svdag::build(&store, root, 12);
+        assert_eq!(dag.root_level, 12);
+
+        // Ray from (2,2,2) aimed at the voxel's center in world space.
+        // side = 4096, so voxel world min = 4095/4096 ≈ 0.99976, center
+        // ≈ 0.99988. The ray direction is (~-1, ~-1, ~-1)/√3.
+        let ro = [2.0, 2.0, 2.0];
+        let target = [4095.5 / 4096.0, 4095.5 / 4096.0, 4095.5 / 4096.0];
+        let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+
+        assert!(
+            !result.exhausted,
+            "depth-12 corner traversal exhausted the step budget — expected \
+             false, got true (steps={})",
+            result.steps,
+        );
+        assert_eq!(
+            result.hit_material,
+            Some(1),
+            "depth-12 corner traversal missed the sole voxel (steps={}, \
+             exhausted={})",
+            result.steps,
+            result.exhausted,
+        );
+        assert!(
+            result.steps < cpu_trace::step_budget(12),
+            "used {} of {} available steps",
+            result.steps,
+            cpu_trace::step_budget(12),
+        );
+    }
+
+    /// hash-thing-2w5 regression: same shape as depth12 but one level
+    /// deeper. Depth 13 (8192³) puts us past the current SPEC debug scale
+    /// and gives more headroom into the 4096³+ target range. Budget here
+    /// is `8 * 8192 = 65536` steps.
+    #[test]
+    fn sparse_long_traverse_depth13_under_budget() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(13);
+        root = store.set_cell(root, 8191, 8191, 8191, 1);
+        let dag = Svdag::build(&store, root, 13);
+        assert_eq!(dag.root_level, 13);
+
+        let ro = [2.0, 2.0, 2.0];
+        let target = [8191.5 / 8192.0, 8191.5 / 8192.0, 8191.5 / 8192.0];
+        let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+
+        assert!(
+            !result.exhausted,
+            "depth-13 corner traversal exhausted the step budget (steps={})",
+            result.steps,
+        );
+        assert_eq!(
+            result.hit_material,
+            Some(1),
+            "depth-13 corner traversal missed the sole voxel (steps={}, \
+             exhausted={})",
+            result.steps,
+            result.exhausted,
+        );
+        assert!(
+            result.steps < cpu_trace::step_budget(13),
+            "used {} of {} available steps",
+            result.steps,
+            cpu_trace::step_budget(13),
         );
     }
 }
