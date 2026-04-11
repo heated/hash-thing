@@ -209,22 +209,38 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ## Current state
 
+> Live task tracking lives in `.beads/issues.jsonl` (via `bd`). This section is a
+> narrative summary; `bd ready` / `bd list` is the source of truth for open work.
+
+### Landed
+
 - ✅ Cargo project scaffold, `src/{octree,sim,render}` modules
 - ✅ Hash-consed octree with NodeStore (intern/lookup, flatten, from_flat, set_cell, stats)
 - ✅ 3D Game of Life CA rules (4 presets: amoeba, crystal, 445, pyroclastic) — scaffolding for experimentation, to be replaced by material-type CA
 - ✅ Brute-force grid stepping (temporary, will be replaced by recursive Hashlife stepping)
-- ✅ wgpu raycaster with orbit camera (mouse drag + scroll), fullscreen-quad fragment shader, DDA voxel traversal, directional lighting
-- ✅ Main loop: keyboard controls (space pause, S step, R reset, 1-4 rule switch, Esc exit)
+- ✅ Flat 3D-texture wgpu raycaster with orbit camera (mouse drag + scroll), fullscreen-quad fragment shader, DDA voxel traversal, directional lighting
+- ✅ Main loop: keyboard controls (space pause, S step, R reset, 1-4 rule switch, V render-mode toggle, Esc exit)
 - ✅ Builds and runs on macOS with Metal backend
 - ✅ Pushed to `git@github.com:heated/ashfall.git`
-- 🚧 SVDAG rendering scaffold (in progress)
-- ☐ Recursive Hashlife stepping (not yet; currently flatten-then-step)
-- ☐ Material-type CA with hand-authored interaction tables
-- ☐ Margolus block movement phase
-- ☐ Procedural terrain generation
-- ☐ Infinite world via lazy octree expansion
-- ☐ CI matrix for Mac/Linux/Windows builds
-- ☐ Web build configuration
+- ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3)**
+  - `Svdag::build` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker)
+  - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant
+  - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
+  - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) + 4 regression tests
+  - Epsilon bug fixed: pop-check slack was beating step-past advance on multi-axis boundary crossings
+
+### Next up (P1, from bd)
+
+- ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step, `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). Currently we flatten-then-step; this is the biggest single perf unlock.
+- ☐ **Material-type CA** (epic `1v0`: `1v0.1` 16-bit tagged cell, `1v0.2` material registry, `1v0.3` hand-authored interaction table, `1v0.4` Margolus movement phase). Replaces the GoL3D scaffolding.
+- ☐ **SVDAG continuation**: `5bb.4` per-leaf material attributes (Molenaar-style), `5bb.5` HashDAG-style incremental edit uploads (so we don't re-serialize the whole DAG every step).
+
+### Later (P2+, from bd)
+
+- ☐ Foundations & determinism (`h34`): `hash(position, generation, seed)` PRNG, determinism audit, perf measurement infra, retire GoL3D scaffolding
+- ☐ Terrain generation & infinite worlds (`3fq`): multi-res `gen(node_region) → NodeId`, cave smoothing, dungeon carving, lazy root expansion, terrain-gen perf tracking
+- ☐ Cross-platform distribution (`xb7`): CI matrix, macOS notarization, Linux AppImage, Windows .exe, WASM/WebGPU, Steam (P4)
+- ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 
 ---
 
