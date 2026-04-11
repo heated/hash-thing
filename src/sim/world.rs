@@ -1,5 +1,6 @@
 use super::rule::CaRule;
 use crate::octree::{CellState, NodeId, NodeStore};
+use crate::rng::cell_rand_bool;
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -68,9 +69,13 @@ impl World {
     }
 
     /// Place a random seed pattern in the center of the world.
-    pub fn seed_center(&mut self, radius: u64, density: f64) {
+    ///
+    /// Uses `cell_rand_bool` keyed on (x, y, z, generation=0, seed) so the
+    /// result is a pure function of position and seed — no scan-order
+    /// coupling. Identical subtrees seed identically, which keeps the
+    /// initial world Hashlife-compatible.
+    pub fn seed_center(&mut self, radius: u64, density: f64, seed: u64) {
         let center = self.side() as u64 / 2;
-        let mut rng = SimpleRng::new(42);
         for z in (center - radius)..(center + radius) {
             for y in (center - radius)..(center + radius) {
                 for x in (center - radius)..(center + radius) {
@@ -79,7 +84,7 @@ impl World {
                     let dy = y as f64 - center as f64;
                     let dz = z as f64 - center as f64;
                     if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
-                        && rng.next_f64() < density
+                        && cell_rand_bool(x as i64, y as i64, z as i64, 0, seed, density)
                     {
                         self.set(x, y, z, 1);
                     }
@@ -114,22 +119,71 @@ fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) 
     neighbors
 }
 
-/// Minimal RNG — xorshift64 so we don't need a dependency.
-struct SimpleRng(u64);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
+    /// Same seed → same root NodeId. Because seed_center is now a pure
+    /// function of (x, y, z, seed), two independently constructed worlds
+    /// with identical parameters must share a canonical root via hash-cons.
+    /// This is the load-bearing property for Hashlife compatibility: the
+    /// step cache can key on NodeId only if identical subtrees intern once.
+    #[test]
+    fn seed_center_is_deterministic_and_hash_consed() {
+        let mut a = World::new(6);
+        let mut b = World::new(6);
+        a.seed_center(12, 0.35, 42);
+        b.seed_center(12, 0.35, 42);
+        assert_eq!(a.root, b.root);
+        assert_eq!(a.population(), b.population());
+        assert!(
+            a.population() > 0,
+            "seed_center should place at least one cell"
+        );
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+    /// Different seeds produce structurally different worlds. This rules
+    /// out the "seed is silently ignored" regression.
+    #[test]
+    fn seed_center_different_seeds_differ() {
+        let mut a = World::new(6);
+        let mut b = World::new(6);
+        a.seed_center(12, 0.35, 1);
+        b.seed_center(12, 0.35, 2);
+        assert_ne!(a.root, b.root);
     }
 
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    /// Scan order independence: the set of live cells is a pure function
+    /// of position. We verify this by recomputing the expected population
+    /// from `cell_rand_bool` directly, with no reference to scan order at
+    /// all, and confirming it matches World::population().
+    #[test]
+    fn seed_center_population_matches_pure_function() {
+        let level = 6u32;
+        let side = 1u64 << level;
+        let center = side / 2;
+        let radius = 12u64;
+        let density = 0.35;
+        let seed = 0xC0FFEE_u64;
+
+        let mut expected = 0u64;
+        for z in (center - radius)..(center + radius) {
+            for y in (center - radius)..(center + radius) {
+                for x in (center - radius)..(center + radius) {
+                    let dx = x as f64 - center as f64;
+                    let dy = y as f64 - center as f64;
+                    let dz = z as f64 - center as f64;
+                    if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
+                        && cell_rand_bool(x as i64, y as i64, z as i64, 0, seed, density)
+                    {
+                        expected += 1;
+                    }
+                }
+            }
+        }
+
+        let mut world = World::new(level);
+        world.seed_center(radius, density, seed);
+        assert_eq!(world.population(), expected);
     }
 }

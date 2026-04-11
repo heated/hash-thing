@@ -12,6 +12,10 @@ use winit::{
 };
 
 const VOLUME_SIZE: u32 = 64;
+/// Seed for the initial spherical random fill. Fixed so repeated runs of
+/// the same binary produce the same starting world (was the hard-coded 42
+/// inside a now-retired SimpleRng).
+const WORLD_SEED: u64 = 42;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -29,7 +33,7 @@ impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
         // Seed with a sphere of random cells
-        world.seed_center(12, 0.35);
+        world.seed_center(12, 0.35, WORLD_SEED);
 
         let (nodes, _) = world.store.stats();
         log::info!(
@@ -123,7 +127,7 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("r") => {
                             // Reset
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-                            self.world.seed_center(12, 0.35);
+                            self.world.seed_center(12, 0.35, WORLD_SEED);
                             self.upload_volume();
                             log::info!("Reset");
                         }
