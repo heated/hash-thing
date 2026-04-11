@@ -15,10 +15,10 @@ Running list of design calls edward has made on hash-thing. Mayor owns this file
 - **Cache lifetime == store epoch** (architectural rule that falls out of 88d) — any future memo cache must be epoch-scoped to the store, moved out of the store, or remapped across compaction. Rolls forward as a constraint on `hash-thing-6gf.2`.
 - **SVDAG is the primary render path; flat 3D-texture is debug/fallback** — `hash-thing-5bb.1/2/3` (all closed). Iterative GPU traversal in Laine-Karras lineage.
 - **NodeStore is hash-consed by structural identity** — implicit since project start. `intern_node` dedups on `(level, children…)`.
-- **Mayor seat exists** — singular policy/observer role, no implementation work in `src/`. AGENTS.md "The crew" + "The mayor" sections.
+- **Mayor seat exists** — singular policy/observer role, no implementation work in `src/`. `CLAUDE.md` "The crew" + "The mayor" sections (`AGENTS.md` is a symlink to `CLAUDE.md`).
 - **Gate-tier rubric** — `~/.claude/CLAUDE.md` "Gate Tiers" section. Default `gate-sensitivity: medium`. Bug fixes / refactors / on-disk formats / module layout / naming = ship without asking. User-visible behavior / capability shifts / one-way doors = pull human in.
 - **afk mode** — when edward says "afk", crew never waits at gates: park + comment + pull next.
-- **Crew /ship-by-default + plan-review tier table** — `hash-thing-3au` (closed). Landed across global `~/.claude/CLAUDE.md` "Gate Tiers" + "Reviews" default-tier-by-priority table + AGENTS.md "Peer autonomy" + "afk mode" + "The mayor" sections. Agent proposing the task picks the tier; override up allowed.
+- **Crew /ship-by-default + plan-review tier table** — `hash-thing-3au` (closed). Landed across global `~/.claude/CLAUDE.md` "Gate Tiers" + "Reviews" default-tier-by-priority table + project `CLAUDE.md` "Peer autonomy" + "afk mode" + "The mayor" sections. Agent proposing the task picks the tier; override up allowed.
 
 ---
 
