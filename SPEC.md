@@ -228,18 +228,26 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
   - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) + 4 regression tests
   - Epsilon bug fixed: pop-check slack was beating step-past advance on multi-axis boundary crossings
+- ✅ **Foundations progress (epic `h34`, 2/4)**
+  - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
+  - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`. Two beads remain (determinism audit `h34.2`, retire-GoL `h34.4`)
+- ✅ **NodeStore hash-cons unit tests (`1lq`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths
+- ✅ **CI + release (epic `xb7`, 2/6)**
+  - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets` before warn-only clippy
+  - `xb7.4` tag-triggered release workflow producing Windows `hash-thing.exe` via `gh release` CLI (no new third-party action deps). Sibling jobs for Mac (`xb7.2` notarization) and Linux (`xb7.3` AppImage) extend as they land
 
 ### Next up (P1, from bd)
 
 - ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step, `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). Currently we flatten-then-step; this is the biggest single perf unlock.
 - ☐ **Material-type CA** (epic `1v0`: `1v0.1` 16-bit tagged cell, `1v0.2` material registry, `1v0.3` hand-authored interaction table, `1v0.4` Margolus movement phase). Replaces the GoL3D scaffolding.
 - ☐ **SVDAG continuation**: `5bb.4` per-leaf material attributes (Molenaar-style), `5bb.5` HashDAG-style incremental edit uploads (so we don't re-serialize the whole DAG every step).
+- ☐ **Hash-cons compaction (`88d`)**: NodeStore is currently append-only — every dead generation's subtrees are retained forever. Plan in flight (`plan-flint-88d.md`, fresh-store rebuild via `NodeStore::compacted`).
 
 ### Later (P2+, from bd)
 
-- ☐ Foundations & determinism (`h34`): `hash(position, generation, seed)` PRNG, determinism audit, perf measurement infra, retire GoL3D scaffolding
+- ☐ Foundations & determinism (`h34`): determinism audit (`h34.2`), retire GoL3D scaffolding (`h34.4` — blocked on 1v0 material CA landing)
 - ☐ Terrain generation & infinite worlds (`3fq`): multi-res `gen(node_region) → NodeId`, cave smoothing, dungeon carving, lazy root expansion, terrain-gen perf tracking
-- ☐ Cross-platform distribution (`xb7`): CI matrix, macOS notarization, Linux AppImage, Windows .exe, WASM/WebGPU, Steam (P4)
+- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, design-gated), Steam (`xb7.6`, P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 
 ---
