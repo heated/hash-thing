@@ -23,7 +23,10 @@
 //!    the render path would touch the determinism contract under h34.1 / h34.2.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::time::Duration;
+
+use crate::octree::{Node, NodeId};
 
 const RING_CAPACITY: usize = 64;
 
@@ -148,6 +151,116 @@ impl Perf {
     }
 }
 
+/// Memory-watchdog metric family for `NodeStore`.
+///
+/// Orthogonal to `Perf` (which tracks latency). `MemStats` is the "did we
+/// just blow the memory budget?" alarm — it watches node count and
+/// step-cache size, tracks ratcheting peaks, and exposes an
+/// order-of-magnitude byte estimate derived at compile time from
+/// `size_of::<Node>()` and `size_of::<NodeId>()`.
+///
+/// Ratcheting is deliberate: we want the OOM signal to survive a transient
+/// dip in live state. Call `reset_peaks()` on a world-reset boundary if you
+/// want the signal to follow the new world's growth curve.
+///
+/// The byte estimate is intentionally pessimistic — see the `NODE_BYTES`
+/// constants below for the math. This is an alarm, not an accountant;
+/// overestimating keeps it sensitive.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemStats {
+    /// Node count at the most recent `update` call.
+    pub last_node_count: usize,
+    /// Step-cache size at the most recent `update` call.
+    pub last_step_cache: usize,
+    /// Highest node count seen since the last `reset_peaks` (or `new`).
+    pub peak_node_count: usize,
+    /// Highest step-cache size seen since the last `reset_peaks` (or `new`).
+    pub peak_step_cache: usize,
+}
+
+impl MemStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a fresh sample from `NodeStore::stats()`. Peaks ratchet — they
+    /// never retreat. `last_*` tracks the most recent sample directly.
+    pub fn update(&mut self, node_count: usize, step_cache: usize) {
+        self.last_node_count = node_count;
+        self.last_step_cache = step_cache;
+        if node_count > self.peak_node_count {
+            self.peak_node_count = node_count;
+        }
+        if step_cache > self.peak_step_cache {
+            self.peak_step_cache = step_cache;
+        }
+    }
+
+    /// Drop the peaks (and the last-sample) back to zero. Use on a world
+    /// reset so the post-reset alarm tracks the new world's growth curve.
+    pub fn reset_peaks(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Order-of-magnitude byte estimate for the current (`last_*`) sample.
+    /// See `memory_bytes_estimate` for the math.
+    pub fn memory_bytes_estimate(&self) -> usize {
+        memory_bytes_estimate(self.last_node_count, self.last_step_cache)
+    }
+
+    /// One-line summary suitable for periodic logging. Format:
+    /// `mem: nodes=N (peak P), step-cache=C (peak P), ~BYTES`
+    pub fn summary(&self) -> String {
+        format!(
+            "mem: nodes={} (peak {}), step-cache={} (peak {}), ~{}",
+            self.last_node_count,
+            self.peak_node_count,
+            self.last_step_cache,
+            self.peak_step_cache,
+            fmt_bytes(self.memory_bytes_estimate()),
+        )
+    }
+}
+
+/// Rough byte estimate for a `NodeStore` with `node_count` interned nodes
+/// and `step_cache` cached step entries.
+///
+/// Per-entry sizes are derived at compile time from `size_of::<Node>()`
+/// and `size_of::<NodeId>()`, so widening either type (e.g. 32-bit →
+/// 64-bit `NodeId` when lazy-root-expansion lands) is picked up
+/// automatically. No hardcoded `NODE_BYTES` constant to chase.
+///
+/// The `* 2` factor on hash-map entries is **deliberate pessimism.** Real
+/// hashbrown load factor is ~0.875, so real per-entry cost is ~1.14× the
+/// raw payload. Rounding up to 2× keeps the OOM alarm sensitive rather
+/// than accurate — overestimating is the safe direction for an alarm.
+const NODE_BYTES: usize = size_of::<Node>();
+const NODE_ID_BYTES: usize = size_of::<NodeId>();
+const NODES_ENTRY: usize = NODE_BYTES; // Vec<Node> slot
+const INTERN_ENTRY: usize = (NODE_BYTES + NODE_ID_BYTES) * 2; // FxHashMap<Node, NodeId>
+const STEP_CACHE_ENTRY: usize = (NODE_ID_BYTES + NODE_ID_BYTES) * 2; // FxHashMap<NodeId, NodeId>
+
+pub fn memory_bytes_estimate(node_count: usize, step_cache: usize) -> usize {
+    // Interned nodes and their NodeId slots are 1:1 — every interned node
+    // lives in both the Vec<Node> and the FxHashMap<Node, NodeId>.
+    node_count * (NODES_ENTRY + INTERN_ENTRY) + step_cache * STEP_CACHE_ENTRY
+}
+
+fn fmt_bytes(bytes: usize) -> String {
+    const KB: usize = 1 << 10;
+    const MB: usize = 1 << 20;
+    const GB: usize = 1 << 30;
+    if bytes >= GB {
+        format!("{:.2}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +379,85 @@ mod tests {
         // After a fresh push, recording works normally.
         perf.record("a", ms(7));
         assert_eq!(perf.sample_count("a"), 1);
+    }
+
+    #[test]
+    fn memstats_update_tracks_last_sample() {
+        let mut m = MemStats::new();
+        m.update(100, 50);
+        assert_eq!(m.last_node_count, 100);
+        assert_eq!(m.last_step_cache, 50);
+        m.update(42, 7);
+        assert_eq!(m.last_node_count, 42);
+        assert_eq!(m.last_step_cache, 7);
+    }
+
+    #[test]
+    fn memstats_peak_never_retreats() {
+        // Ratchet property: peaks only climb, never descend, even when the
+        // live sample shrinks. This is the "did we ever blow the budget?"
+        // signal — it must survive transient dips in live state.
+        let mut m = MemStats::new();
+        m.update(100, 50);
+        m.update(200, 100);
+        m.update(50, 10); // big dip
+        assert_eq!(m.last_node_count, 50);
+        assert_eq!(m.last_step_cache, 10);
+        assert_eq!(m.peak_node_count, 200);
+        assert_eq!(m.peak_step_cache, 100);
+        // Push above previous peak: peak should climb.
+        m.update(300, 150);
+        assert_eq!(m.peak_node_count, 300);
+        assert_eq!(m.peak_step_cache, 150);
+    }
+
+    #[test]
+    fn memstats_reset_peaks_zeroes_everything() {
+        let mut m = MemStats::new();
+        m.update(500, 200);
+        m.update(300, 150);
+        m.reset_peaks();
+        assert_eq!(m.last_node_count, 0);
+        assert_eq!(m.last_step_cache, 0);
+        assert_eq!(m.peak_node_count, 0);
+        assert_eq!(m.peak_step_cache, 0);
+    }
+
+    #[test]
+    fn memory_bytes_estimate_scales_linearly_with_node_count() {
+        // Linearity property: doubling node count doubles the estimate
+        // (step_cache contribution held at zero). Pins the formula so a
+        // future refactor that tacks on a constant overhead term is caught.
+        let zero = memory_bytes_estimate(0, 0);
+        assert_eq!(zero, 0);
+        let a = memory_bytes_estimate(1000, 0);
+        let b = memory_bytes_estimate(2000, 0);
+        assert_eq!(b, 2 * a);
+        // Step cache contribution is independent and additive.
+        let with_cache = memory_bytes_estimate(1000, 500);
+        assert!(with_cache > a);
+        assert_eq!(with_cache - a, memory_bytes_estimate(0, 500));
+    }
+
+    #[test]
+    fn memstats_summary_reports_last_and_peak() {
+        let mut m = MemStats::new();
+        m.update(100, 50);
+        m.update(200, 100);
+        m.update(50, 10);
+        let s = m.summary();
+        assert!(s.contains("nodes=50"));
+        assert!(s.contains("peak 200"));
+        assert!(s.contains("step-cache=10"));
+        assert!(s.contains("peak 100"));
+    }
+
+    #[test]
+    fn fmt_bytes_picks_sensible_units() {
+        assert_eq!(fmt_bytes(0), "0B");
+        assert_eq!(fmt_bytes(1023), "1023B");
+        assert!(fmt_bytes(2 * 1024).ends_with("KB"));
+        assert!(fmt_bytes(5 * 1024 * 1024).ends_with("MB"));
+        assert!(fmt_bytes(3 * 1024 * 1024 * 1024).ends_with("GB"));
     }
 }

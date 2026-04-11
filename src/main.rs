@@ -34,6 +34,10 @@ struct App {
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
     perf: perf::Perf,
+    /// Memory-watchdog metric family — node-count + step-cache ratcheting
+    /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
+    /// on the wall-clock log path.
+    mem_stats: perf::MemStats,
 }
 
 impl App {
@@ -61,6 +65,7 @@ impl App {
             mouse_pressed: false,
             last_mouse: None,
             perf: perf::Perf::new(),
+            mem_stats: perf::MemStats::new(),
         }
     }
 
@@ -134,11 +139,14 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Reset — drop perf samples too so post-reset
-                            // stats aren't poisoned by stale pre-reset values.
+                            // Reset — drop perf samples and mem peaks too so
+                            // post-reset stats aren't poisoned by stale
+                            // pre-reset values. The watchdog follows the new
+                            // world's growth curve, not the old world's.
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
                             self.world.seed_center(12, 0.35);
                             self.perf.clear();
+                            self.mem_stats.reset_peaks();
                             self.upload_volume();
                             log::info!("Reset");
                         }
@@ -242,18 +250,16 @@ impl ApplicationHandler for App {
                 // is still alive.
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
                     let (nodes, cache) = self.world.store.stats();
-                    let mem_kb = (nodes * std::mem::size_of::<crate::octree::Node>()) / 1024;
+                    self.mem_stats.update(nodes, cache);
                     let (svdag_nodes, svdag_bytes, svdag_root_level) = self.svdag_stats();
                     log::info!(
-                        "Gen {}: pop={} nodes={} (~{}KB) cache={} svdag={}/{}KB(L{}) | {}",
+                        "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
                         self.world.generation,
                         self.world.population(),
-                        nodes,
-                        mem_kb,
-                        cache,
                         svdag_nodes,
                         svdag_bytes / 1024,
                         svdag_root_level,
+                        self.mem_stats.summary(),
                         self.perf.summary(),
                     );
                     self.log_timer = std::time::Instant::now();
