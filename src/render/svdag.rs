@@ -912,7 +912,7 @@ mod tests {
             // Codex Critical reproducer (un-normalized direction).
             (
                 [12.78218, -2.47332, -7.13861],
-                [-0.86086446, 0.16658753, 0.48079199],
+                [-0.86086446, 0.16658753, 0.480_792],
             ),
             // Axis-dominant far-camera ray with tiny secondary axes —
             // lands on grazing inter-octant faces at depth ≥ 12.

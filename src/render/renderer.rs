@@ -33,6 +33,25 @@ pub enum RenderMode {
     Svdag,
 }
 
+/// Outcome of a single `Renderer::render` call. Replaces an earlier `bool`
+/// return so the caller can distinguish "frame submitted" from "skip — window
+/// is invisible" and stop hot-spinning `request_redraw` while occluded
+/// (hash-thing-8jp).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameOutcome {
+    /// Frame submitted successfully.
+    Rendered,
+    /// Surface is occluded (minimized / hidden). Caller should pause redraw
+    /// requests until the window becomes visible again.
+    Occluded,
+    /// Surface was outdated or lost; we reconfigured. Caller should request
+    /// the next frame to redraw with the new configuration.
+    Reconfigured,
+    /// Frame acquisition timed out. Caller should request the next frame;
+    /// this is expected transient behavior.
+    Timeout,
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -450,17 +469,38 @@ impl Renderer {
         );
     }
 
-    pub fn render(&mut self) -> bool {
+    pub fn render(&mut self) -> FrameOutcome {
         use wgpu::CurrentSurfaceTexture;
 
+        // No catch-all: `CurrentSurfaceTexture` is not `#[non_exhaustive]`, so
+        // any future wgpu variant becomes a compile error pointing here,
+        // instead of getting silently swallowed (hash-thing-8jp I1a).
         let surface_texture = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(tex) | CurrentSurfaceTexture::Suboptimal(tex) => tex,
-            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return false,
-            CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return false;
+            CurrentSurfaceTexture::Occluded => return FrameOutcome::Occluded,
+            CurrentSurfaceTexture::Timeout => {
+                log::warn!("surface texture acquire: Timeout");
+                return FrameOutcome::Timeout;
             }
-            _ => return false,
+            CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                return FrameOutcome::Reconfigured;
+            }
+            CurrentSurfaceTexture::Lost => {
+                log::error!("surface texture Lost — reconfiguring");
+                self.surface.configure(&self.device, &self.config);
+                return FrameOutcome::Reconfigured;
+            }
+            // A validation error was raised inside `get_current_texture`
+            // and captured by an error scope. The surface itself is fine —
+            // no reconfigure needed — but the caller should request the
+            // next frame so rendering resumes after the programmer/driver
+            // issue is resolved. Logged at error level so it actually
+            // surfaces during GPU debugging.
+            CurrentSurfaceTexture::Validation => {
+                log::error!("surface texture acquire: Validation error");
+                return FrameOutcome::Timeout;
+            }
         };
 
         let view = surface_texture
@@ -551,15 +591,33 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
 
-        true
+        FrameOutcome::Rendered
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::padded_bytes_per_row;
+    use super::{padded_bytes_per_row, FrameOutcome};
 
     const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+    #[test]
+    fn frame_outcome_variants_are_distinct() {
+        // hash-thing-8jp — if a future refactor collapses or removes a
+        // variant, this pins the semantic split between the four cases so
+        // the main-loop gate (`matches!(_, Occluded)`) keeps working.
+        let all = [
+            FrameOutcome::Rendered,
+            FrameOutcome::Occluded,
+            FrameOutcome::Reconfigured,
+            FrameOutcome::Timeout,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a == b, i == j, "{a:?} vs {b:?}");
+            }
+        }
+    }
 
     #[test]
     fn padded_row_rounds_up_to_alignment() {

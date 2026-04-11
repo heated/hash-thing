@@ -43,6 +43,13 @@ struct App {
     /// time the DAG is rebuilt for render. Tuple: (node_count, byte_size,
     /// root_level).
     last_svdag_stats: (usize, usize, u32),
+    /// Window visibility gate (hash-thing-8jp). When `true`, the redraw
+    /// treadmill is paused — `RedrawRequested` becomes a no-op and
+    /// `request_redraw` is not called. Flipped by `WindowEvent::Occluded`
+    /// (both edges) and by the renderer's `FrameOutcome::Occluded` as a
+    /// belt-and-suspenders signal in case winit doesn't fire the event on
+    /// some platform.
+    occluded: bool,
 }
 
 impl App {
@@ -72,6 +79,7 @@ impl App {
             perf: perf::Perf::new(),
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
+            occluded: false,
         }
     }
 
@@ -116,6 +124,22 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
+                }
+            }
+
+            // Pause the redraw treadmill while the window is hidden
+            // (minimized, behind another window, screen locked). On un-occlude,
+            // re-arm the loop with a single `request_redraw`. See
+            // hash-thing-8jp — previously the main loop ignored
+            // `render()`'s outcome and unconditionally requested the next
+            // redraw, pegging CPU at 100% when winit kept delivering
+            // `RedrawRequested` into a surface that couldn't be acquired.
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
 
@@ -223,6 +247,14 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                // If the window is hidden, skip the whole redraw path —
+                // stepping the sim + uploading the SVDAG during a 100%-CPU
+                // spin on an invisible surface is exactly what 8jp was about.
+                // `WindowEvent::Occluded(false)` re-arms the loop.
+                if self.occluded {
+                    return;
+                }
+
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
                     // Time the step. Bind both world+perf as locals before the
@@ -269,10 +301,23 @@ impl ApplicationHandler for App {
                 // Time render. NLL lets us split-borrow self.renderer and
                 // self.perf because the renderer borrow ends at `.render()`,
                 // before `self.perf.record` reaches for &mut self again.
-                if let Some(renderer) = self.renderer.as_mut() {
+                let outcome = if let Some(renderer) = self.renderer.as_mut() {
                     let render_start = std::time::Instant::now();
-                    renderer.render();
+                    let outcome = renderer.render();
                     self.perf.record("render_cpu", render_start.elapsed());
+                    Some(outcome)
+                } else {
+                    None
+                };
+
+                // Belt-and-suspenders: if the surface reports Occluded
+                // before winit fires `WindowEvent::Occluded(true)` (some
+                // platforms are lazy about that event), latch the flag here
+                // so the next RedrawRequested short-circuits at the top of
+                // the arm.
+                if matches!(outcome, Some(render::FrameOutcome::Occluded)) {
+                    self.occluded = true;
+                    return;
                 }
 
                 if let Some(window) = &self.window {
