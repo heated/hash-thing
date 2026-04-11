@@ -110,9 +110,24 @@ impl World {
         self.store.population(self.root)
     }
 
-    /// Replace the root with terrain generated from `params`. Resets
-    /// `generation` to 0 and clears the step cache so a fresh seed never
-    /// inherits stale memoized step results from the previous world.
+    /// Replace the world with terrain generated from `params`. Starts a
+    /// fresh `NodeStore` — every `NodeId` from the previous world is
+    /// invalidated. Resets `generation` to 0.
+    ///
+    /// ## Fresh-store epoch
+    ///
+    /// `seed_terrain` is a new epoch in the same sense as `step_flat`'s
+    /// post-tick `compacted()` call: everything from the previous world
+    /// is unreachable after this returns, so there is no point interning
+    /// the new terrain into a store full of garbage. Building into a
+    /// fresh store is cheaper (no post-build compaction walk), keeps
+    /// node counts honest, and makes the epoch boundary explicit.
+    ///
+    /// Under the closed-world invariant (see `metaverse-design-decision`)
+    /// any caller holding a `NodeId` across this call is holding a
+    /// dangling id; this matches the `compacted()` contract. Today no
+    /// caller does — `World::root` is the only long-lived id holder and
+    /// is updated in-place here.
     ///
     /// **The caller MUST keep the simulation paused around this call.** This
     /// method intentionally does NOT touch `paused`, because only the caller
@@ -122,7 +137,7 @@ impl World {
     /// site today sets `paused = true` explicitly; keep it that way.
     pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
         params.validate().expect("invalid TerrainParams");
-        self.store.clear_step_cache();
+        self.store = NodeStore::new();
         let field = params.to_heightmap();
         let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
         self.root = root;
@@ -150,4 +165,39 @@ fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) 
         }
     }
     neighbors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::TerrainParams;
+
+    /// Re-seeding terrain must not accumulate nodes from the previous
+    /// world. `seed_terrain` is an epoch boundary in the same sense as
+    /// `step_flat`'s `compacted()` tail — after it returns, nothing
+    /// from the previous world is reachable, and the store's node
+    /// count should reflect only the freshly built terrain.
+    ///
+    /// Regression guard for the fresh-store pattern: if someone ever
+    /// reverts `self.store = NodeStore::new()` back to building into
+    /// a polluted store, node counts grow on every re-seed and this
+    /// test fires.
+    #[test]
+    fn seed_terrain_is_an_epoch_boundary() {
+        let mut world = World::new(6);
+        let params = TerrainParams::default();
+
+        let _ = world.seed_terrain(&params);
+        let nodes_after_first = world.store.stats().0;
+
+        let _ = world.seed_terrain(&params);
+        let nodes_after_second = world.store.stats().0;
+
+        assert_eq!(
+            nodes_after_first, nodes_after_second,
+            "seed_terrain must start a fresh epoch; node count drifted \
+             from {nodes_after_first} to {nodes_after_second} across a \
+             deterministic re-seed",
+        );
+    }
 }
