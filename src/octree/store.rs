@@ -1,4 +1,4 @@
-use super::node::{octant_index, CellState, Node, NodeId};
+use super::node::{octant_index, Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 
 /// Canonical node store — the core of hash-consing.
@@ -61,8 +61,12 @@ impl NodeStore {
         &self.nodes[id.0 as usize]
     }
 
-    /// Create a leaf node.
+    /// Create a leaf node. Validates the `Cell` invariant on `state`
+    /// (raw bit patterns in `1..=MAX_METADATA` are rejected because they
+    /// would decode to "empty with flavor" and silently alias `NodeId::EMPTY`
+    /// after hash-consing).
     pub fn leaf(&mut self, state: CellState) -> NodeId {
+        let _ = Cell::from_raw(state);
         self.intern_node(Node::Leaf(state))
     }
 
@@ -121,12 +125,18 @@ impl NodeStore {
     /// (hash-thing-fb5): silent data corruption is unacceptable, and the
     /// bounds check is a single compare against `side` at the public entry.
     ///
+    /// Also validates the `Cell` invariant on `state` at entry (hash-thing-1v0.1):
+    /// passing e.g. a raw `1` (which would decode to material 0, metadata 1 and
+    /// corrupt hash-consing by aliasing `Leaf(0) == NodeId::EMPTY`) panics
+    /// immediately instead of silently poisoning the store.
+    ///
     /// Footgun: `root` must be an actual world root whose `Node::level()`
     /// reflects the realized extent. Passing `NodeId::EMPTY` (level 0) turns
     /// every non-origin coordinate into an OOB panic because the entry's
     /// `side` computation resolves to 1.
     #[track_caller]
     pub fn set_cell(&mut self, root: NodeId, x: u64, y: u64, z: u64, state: CellState) -> NodeId {
+        let _ = Cell::from_raw(state);
         let level = self.get(root).level();
         let side = 1u64 << level;
         assert!(

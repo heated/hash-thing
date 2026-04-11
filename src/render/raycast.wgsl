@@ -48,6 +48,11 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
 //   bits  5..0 metadata    ( 6 bits)
 // We index the palette by material_id only; metadata is ignored here
 // (the material registry in 1v0.2 will replace this hard-coded switch).
+//
+// DRIFT GUARD: the shift amount `6u` below mirrors `Cell::METADATA_BITS`
+// in src/octree/node.rs. If that constant ever changes, update this
+// shader AND src/render/svdag_raycast.wgsl together. There is a pinning
+// test in src/render/mod.rs (test `wgsl_metadata_shift_matches_rust`).
 fn material_color(packed: u32) -> vec3<f32> {
     let mat_id = packed >> 6u;
     switch mat_id {
