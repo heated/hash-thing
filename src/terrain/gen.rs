@@ -17,12 +17,28 @@ use crate::octree::{octant_coords, CellState, NodeId, NodeStore};
 
 /// Per-call generation diagnostics. Logged on `seed_terrain`; used by tests
 /// to verify that proof-based collapses actually fire.
+///
+/// **Field semantics for the "is noise the bottleneck?" question**
+/// (tracked in hash-thing-3fq.5): `leaves` counts `RegionField::sample()`
+/// calls one-for-one — every level-0 build dispatches exactly one sample,
+/// and sampling is the only place noise evaluation lives. `classify_calls`
+/// counts `RegionField::classify_box()` invocations regardless of outcome
+/// (collapse or descent). Together with a one-time `probe_sample_ns`
+/// microbenchmark, you can estimate `sample_time ≈ leaves * ns_per_sample`
+/// and read off the noise fraction of a gen pass without per-call timing
+/// overhead (which would double 64³ gen cost).
 #[derive(Default, Debug, Clone, Copy)]
 pub struct GenStats {
     pub calls_total: u64,
     pub calls_per_level: [u64; 32],
     pub collapses_by_proof: [u64; 32],
     pub leaves: u64,
+    /// Total `RegionField::classify_box` invocations, whether they
+    /// collapsed or not. Equals `calls_total - leaves` by construction in
+    /// the current builder; stored explicitly so a future restructure of
+    /// the recursion (e.g. early-outs, lazy child generation) can't silently
+    /// break the invariant without a test failing.
+    pub classify_calls: u64,
     pub interiors_interned: u64,
 }
 
@@ -78,6 +94,7 @@ impl<'a, F: RegionField> Builder<'a, F> {
         }
 
         // Proof-based collapse — the only short-circuit.
+        self.stats.classify_calls += 1;
         if let Some(state) = self.field.classify_box(origin, size_log2) {
             self.stats.collapses_by_proof[size_log2 as usize] += 1;
             return self.uniform(size_log2, state);
@@ -113,6 +130,39 @@ pub fn gen_region<F: RegionField>(
     (root, builder.stats)
 }
 
+/// Micro-probe for `RegionField::sample()` cost. Runs `samples` sample
+/// calls over a 64×64×64 coordinate walk and returns `ns/call`. Multiply
+/// by `GenStats::leaves` to estimate how much of a gen pass was spent
+/// inside `sample()` — i.e. "is noise the bottleneck?" — without paying
+/// per-call `Instant::now()` cost (which at 262k leaves would roughly
+/// double the gen time).
+///
+/// **Not a benchmark.** No warmup, no variance estimate, no distribution.
+/// Runs cold on whatever core you happen to be on. Budget `samples` so a
+/// single call takes ~1 ms (typically 10_000 for value noise); any more
+/// and it eats into interactive gen latency. The XOR sink + `black_box`
+/// keep LLVM from constant-folding the loop body.
+///
+/// This is the "is this thing slow?" signal the hash-thing-3fq.5 bead
+/// asked for. Use it from `main.rs` at terrain reset time and log the
+/// estimated sample fraction alongside total gen time.
+pub fn probe_sample_ns<F: RegionField>(field: &F, samples: u64) -> f64 {
+    debug_assert!(samples >= 1, "probe_sample_ns needs at least one sample");
+    let start = std::time::Instant::now();
+    let mut sink: i64 = 0;
+    for i in 0..samples {
+        // Spread across a 64×64×64 coordinate cube so the probe walks
+        // genuinely distinct noise inputs instead of hammering one cell.
+        let x = (i & 63) as i64;
+        let z = ((i >> 6) & 63) as i64;
+        let y = ((i >> 12) & 63) as i64;
+        sink ^= field.sample([x, y, z]) as i64;
+    }
+    std::hint::black_box(sink);
+    let elapsed = start.elapsed();
+    elapsed.as_nanos() as f64 / samples as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +186,9 @@ mod tests {
         // One root-level proof collapse, no descent.
         assert_eq!(stats.calls_total, 1);
         assert_eq!(stats.collapses_by_proof[6], 1);
+        // Exactly one classify call (the root) and zero leaves.
+        assert_eq!(stats.classify_calls, 1);
+        assert_eq!(stats.leaves, 0);
     }
 
     #[test]
@@ -392,6 +445,76 @@ mod tests {
             stats.total_collapses() > 0,
             "expected at least one proof-based collapse: {stats:?}",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // hash-thing-3fq.5: noise-fraction accounting.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_calls_plus_leaves_equals_calls_total() {
+        // Invariant guard: every build() either samples a leaf or
+        // classifies a box, never both, never neither. Protects the
+        // derived `leaves * ns_per_sample` estimate against future
+        // restructures of the recursion.
+        let mut store = NodeStore::new();
+        let field = default_heightmap(1);
+        let (_, stats) = gen_region(&mut store, &field, [0, 0, 0], 6);
+        assert_eq!(
+            stats.leaves + stats.classify_calls,
+            stats.calls_total,
+            "every build() must be exactly one sample OR one classify: {stats:?}",
+        );
+    }
+
+    #[test]
+    fn classify_calls_counts_descent_not_just_collapses() {
+        // Straddling half-space: the root classify returns None, so we
+        // descend into 8 children, each classify called exactly once,
+        // two of which collapse (the fully-above and fully-below octants)
+        // and six of which descend further. The invariant we care about
+        // is just `classify_calls > total_collapses`, proving the counter
+        // isn't mistakenly tracking only successful collapses.
+        let mut store = NodeStore::new();
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 16,
+            below: STONE,
+            above: AIR,
+        };
+        // Size 5 cube at [0, 0, 0] → [0, 32, 0]. Threshold y=16 splits it.
+        let (_, stats) = gen_region(&mut store, &field, [0, 0, 0], 5);
+        assert!(
+            stats.classify_calls > stats.total_collapses(),
+            "classify_calls should count all invocations, not just collapses: {stats:?}",
+        );
+    }
+
+    #[test]
+    fn probe_sample_ns_returns_plausible_number() {
+        // Soft-check: the probe measures *something* positive for a real
+        // field. Exact values are host-dependent (emulated CI vs bare
+        // metal spans orders of magnitude) so we only sanity-check the
+        // bounds: 1ns < ns_per_call < 1ms. Value noise at four octaves is
+        // comfortably inside that range on any machine that can run the
+        // renderer at all.
+        let field = default_heightmap(1);
+        let ns = probe_sample_ns(&field, 10_000);
+        assert!(
+            ns > 1.0 && ns < 1_000_000.0,
+            "probe_sample_ns out of plausible range: {ns}",
+        );
+    }
+
+    #[test]
+    fn probe_sample_ns_does_not_observe_sink_through_dead_code_elim() {
+        // Regression guard against a future refactor that drops the
+        // `black_box(sink)` and lets LLVM fold the whole loop away.
+        // If the probe is ever optimized to zero, this test starts
+        // returning ~0ns/call and fails the lower bound.
+        let field = ConstField::new(STONE);
+        let ns = probe_sample_ns(&field, 1_000);
+        assert!(ns > 0.0, "probe must measure something nonzero: {ns}");
     }
 
     // Helps the dead-code lint not complain about Node when only used here.

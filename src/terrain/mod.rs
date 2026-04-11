@@ -12,7 +12,7 @@ pub mod materials;
 pub mod noise;
 
 pub use field::HeightmapField;
-pub use gen::{gen_region, GenStats};
+pub use gen::{gen_region, probe_sample_ns, GenStats};
 
 /// Parameters for the v1 heightmap seeder. Lifted into a struct so the
 /// runtime can swap them without touching the builder.

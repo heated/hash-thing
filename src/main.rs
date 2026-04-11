@@ -15,6 +15,52 @@ use winit::{
 
 const VOLUME_SIZE: u32 = 64;
 
+/// One-line gen summary. Centralised so the `App::new` startup path and the
+/// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
+/// classify_calls / nodes_delta / noise_fraction fields; the rest is carried
+/// over from the pre-3fq.5 log line.
+///
+/// `noise_ns_per_sample` comes from `terrain::probe_sample_ns`. The "noise
+/// fraction" number is `leaves * ns_per_sample / gen_time` — an *estimate*,
+/// not a measurement. It deliberately skips timing individual sample calls
+/// (which would roughly double gen cost). Read as "if every sample really
+/// costs the probe's ns/call, here's how much of the pass it accounts for";
+/// deviation from 100% means the bottleneck is elsewhere (classify, intern,
+/// allocation). The probe is not precise enough to call anything under ~5%
+/// or over ~95% with confidence.
+#[allow(clippy::too_many_arguments)]
+fn log_gen_stats(
+    label: &str,
+    side: usize,
+    population: u64,
+    nodes: usize,
+    nodes_delta: usize,
+    stats: &terrain::GenStats,
+    elapsed: std::time::Duration,
+    noise_ns_per_sample: f64,
+) {
+    let gen_us = elapsed.as_micros() as f64;
+    let gen_ms = gen_us / 1_000.0;
+    let sample_us = stats.leaves as f64 * noise_ns_per_sample / 1_000.0;
+    let sample_pct = if gen_us > 0.0 {
+        (sample_us / gen_us * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    log::info!(
+        "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
+         gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
+         gen_time={gen_ms:.2}ms | noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
+        pop = population,
+        delta = nodes_delta,
+        calls = stats.calls_total,
+        samples = stats.leaves,
+        classifies = stats.classify_calls,
+        collapses = stats.total_collapses(),
+        ns = noise_ns_per_sample,
+    );
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
@@ -25,6 +71,10 @@ struct App {
     /// When to next emit an auto perf summary. Reset on each emission.
     perf_log_timer: std::time::Instant,
     perf: perf::PerfCounters,
+    /// One-time microbench of `HeightmapField::sample()` in ns/call.
+    /// Used to estimate noise fraction of each gen pass (hash-thing-3fq.5).
+    /// Refreshed on terrain reset so a wildly different param set reprobes.
+    noise_ns_per_sample: f64,
     // Mouse interaction state
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
@@ -36,18 +86,26 @@ impl App {
         let mut perf_counters = perf::PerfCounters::default();
 
         let params = terrain::TerrainParams::default();
+        let nodes_before = world.store.stats().0;
         let (stats, elapsed) = perf::time(|| world.seed_terrain(&params));
         perf_counters.record_gen(elapsed, world.store.stats());
 
-        let (nodes, _) = world.store.stats();
-        log::info!(
-            "Initial terrain: {}^3, population={}, nodes={}, gen_calls={}, collapses={}, gen_time={:.2}ms",
+        // Noise-bottleneck probe. One-time microbench of `sample()`
+        // called outside the timed gen region so it does not pollute
+        // `record_gen`. See hash-thing-3fq.5.
+        let noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+
+        let (nodes_after, _) = world.store.stats();
+        let nodes_delta = nodes_after - nodes_before;
+        log_gen_stats(
+            "Initial terrain",
             world.side(),
             world.population(),
-            nodes,
-            stats.calls_total,
-            stats.total_collapses(),
-            elapsed.as_micros() as f64 / 1_000.0,
+            nodes_after,
+            nodes_delta,
+            &stats,
+            elapsed,
+            noise_ns_per_sample,
         );
 
         // Start paused so the active CA rule (legacy GoL) does not
@@ -62,6 +120,7 @@ impl App {
             step_timer: std::time::Instant::now(),
             perf_log_timer: std::time::Instant::now(),
             perf: perf_counters,
+            noise_ns_per_sample,
             mouse_pressed: false,
             last_mouse: None,
         }
@@ -149,16 +208,25 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("r") => {
                             // Re-seed terrain. Stays paused.
                             let params = terrain::TerrainParams::default();
+                            let nodes_before = self.world.store.stats().0;
                             let (stats, elapsed) = perf::time(|| self.world.seed_terrain(&params));
                             self.perf.record_gen(elapsed, self.world.store.stats());
+                            // Re-probe in case params drifted. Cheap (~1ms).
+                            self.noise_ns_per_sample =
+                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
                             self.paused = true;
                             self.upload_volume();
-                            log::info!(
-                                "Reset terrain: pop={}, gen_calls={}, collapses={}, gen_time={:.2}ms",
+                            let (nodes_after, _) = self.world.store.stats();
+                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
+                            log_gen_stats(
+                                "Reset terrain",
+                                self.world.side(),
                                 self.world.population(),
-                                stats.calls_total,
-                                stats.total_collapses(),
-                                elapsed.as_micros() as f64 / 1_000.0,
+                                nodes_after,
+                                nodes_delta,
+                                &stats,
+                                elapsed,
+                                self.noise_ns_per_sample,
                             );
                         }
                         winit::keyboard::Key::Character("p") => {
