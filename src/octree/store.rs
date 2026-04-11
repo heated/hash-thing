@@ -1,4 +1,4 @@
-use super::node::{octant_index, CellState, Node, NodeId};
+use super::node::{octant_index, Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 
 /// Canonical node store — the core of hash-consing.
@@ -47,8 +47,12 @@ impl NodeStore {
         &self.nodes[id.0 as usize]
     }
 
-    /// Create a leaf node.
+    /// Create a leaf node. Validates the `Cell` invariant on `state`
+    /// (raw bit patterns in `1..=MAX_METADATA` are rejected because they
+    /// would decode to "empty with flavor" and silently alias `NodeId::EMPTY`
+    /// after hash-consing).
     pub fn leaf(&mut self, state: CellState) -> NodeId {
+        let _ = Cell::from_raw(state);
         self.intern_node(Node::Leaf(state))
     }
 
@@ -100,7 +104,13 @@ impl NodeStore {
 
     /// Set a single cell in the octree. Returns a new root.
     /// Coordinates are relative to the node's origin (0,0,0 corner).
+    ///
+    /// Validates the `Cell` invariant on `state` at entry — so passing
+    /// e.g. a raw `1` (which would decode to material 0, metadata 1 and
+    /// corrupt hash-consing) panics immediately instead of silently
+    /// aliasing empty.
     pub fn set_cell(&mut self, root: NodeId, x: u64, y: u64, z: u64, state: CellState) -> NodeId {
+        let _ = Cell::from_raw(state);
         let node = self.get(root).clone();
         match node {
             Node::Leaf(_) => self.leaf(state),

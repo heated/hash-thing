@@ -21,7 +21,7 @@
 //!
 //! Root is always at index 0.
 
-use crate::octree::{Node, NodeId, NodeStore};
+use crate::octree::{Cell, Node, NodeId, NodeStore};
 use rustc_hash::FxHashMap;
 
 /// GPU-friendly serialized DAG.
@@ -382,7 +382,8 @@ mod tests {
         let mut store = NodeStore::new();
         let mut root = store.empty(6);
         // One voxel at (32,32,32) -> world (0.5, 0.5, 0.5)..(0.515625, ...)
-        root = store.set_cell(root, 32, 32, 32, 1);
+        let mat1 = Cell::pack(1, 0).raw();
+        root = store.set_cell(root, 32, 32, 32, mat1);
         let dag = Svdag::build(&store, root, 6);
 
         // Ray aimed at the voxel's center (0.5078125, 0.5078125, 0.5078125) from outside
@@ -390,9 +391,10 @@ mod tests {
         let ro = [2.0, 2.0, 2.0];
         let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
         let result = cpu_trace::raycast(&dag.nodes, ro, rd, true);
+        // `hit_material` is the raw packed cell word, not the decoded material id.
         assert_eq!(
             result.hit_material,
-            Some(1),
+            Some(mat1 as u32),
             "expected hit, events: {:#?}",
             result.events
         );
@@ -402,13 +404,14 @@ mod tests {
     fn eight_corners_each_visible() {
         let mut store = NodeStore::new();
         let mut root = store.empty(6);
+        let mat1 = Cell::pack(1, 0).raw();
         for &x in &[16u64, 48] {
             for &y in &[16u64, 48] {
                 for &z in &[16u64, 48] {
                     for dx in 0..4u64 {
                         for dy in 0..4u64 {
                             for dz in 0..4u64 {
-                                root = store.set_cell(root, x + dx, y + dy, z + dz, 1);
+                                root = store.set_cell(root, x + dx, y + dy, z + dz, mat1);
                             }
                         }
                     }
@@ -451,6 +454,7 @@ mod tests {
     fn eight_corners_per_voxel_visible() {
         let mut store = NodeStore::new();
         let mut root = store.empty(6);
+        let mat1 = Cell::pack(1, 0).raw();
         let mut voxels = Vec::new();
         for &x in &[16u64, 48] {
             for &y in &[16u64, 48] {
@@ -458,7 +462,7 @@ mod tests {
                     for dx in 0..4u64 {
                         for dy in 0..4u64 {
                             for dz in 0..4u64 {
-                                root = store.set_cell(root, x + dx, y + dy, z + dz, 1);
+                                root = store.set_cell(root, x + dx, y + dy, z + dz, mat1);
                                 voxels.push((x + dx, y + dy, z + dz));
                             }
                         }
@@ -509,11 +513,12 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 32) as u32
         };
+        let mat1 = Cell::pack(1, 0).raw();
         for _ in 0..300 {
             let x = (rand_u32() % 64) as u64;
             let y = (rand_u32() % 64) as u64;
             let z = (rand_u32() % 64) as u64;
-            root = store.set_cell(root, x, y, z, 1);
+            root = store.set_cell(root, x, y, z, mat1);
             voxels.push((x, y, z));
         }
         let dag = Svdag::build(&store, root, 6);

@@ -7,12 +7,19 @@
 /// Material 0 is reserved as "empty" — the whole cell word is 0 iff the cell
 /// is empty, which preserves the hash-cons invariant that `NodeId::EMPTY`
 /// (a `Leaf(0)`) represents pure void. Attempting to attach metadata to
-/// material 0 is a programming error (there is no "empty with flavor"):
-/// `Cell::pack` panics in debug.
+/// material 0 is a programming error (there is no "empty with flavor");
+/// `Cell::pack` and `Cell::from_raw` panic — in both debug **and release** —
+/// because a violation silently corrupts hash-consing.
 ///
 /// Hashlife treats `CellState` as an opaque bit pattern — it memoizes by
 /// pattern equality and never inspects the material/metadata split. The
 /// simulation kernel and renderer unpack as needed.
+///
+/// **Rust↔WGSL drift guard:** `METADATA_BITS = 6` is duplicated in
+/// `src/render/raycast.wgsl` and `src/render/svdag_raycast.wgsl` as the
+/// hardcoded `packed >> 6u` material decode. If `METADATA_BITS` changes
+/// here, both shaders must be updated to match. A unit test in
+/// `src/render/mod.rs` (or equivalent) should pin these together.
 pub type CellState = u16;
 
 /// Typed view over a `CellState` word. `Copy` and `repr(transparent)` so it
@@ -36,16 +43,19 @@ impl Cell {
 
     const METADATA_MASK: u16 = Self::MAX_METADATA;
 
-    /// Pack a (material, metadata) pair. Panics in debug if either overflows
-    /// its field, or if metadata is nonzero on material 0 (ambiguous empty).
+    /// Pack a (material, metadata) pair. Panics (in both debug AND release)
+    /// if either field overflows, or if metadata is nonzero on material 0
+    /// (ambiguous "empty with flavor" — would silently alias `Cell::EMPTY`
+    /// and corrupt hash-consing). `assert!` is deliberate: foundational
+    /// invariant, the cost of a branch beats shipping a corrupt tree.
     #[inline]
     pub const fn pack(material: u16, metadata: u16) -> Cell {
-        debug_assert!(
+        assert!(
             material <= Self::MAX_MATERIAL,
             "material id overflows 10 bits"
         );
-        debug_assert!(metadata <= Self::MAX_METADATA, "metadata overflows 6 bits");
-        debug_assert!(
+        assert!(metadata <= Self::MAX_METADATA, "metadata overflows 6 bits");
+        assert!(
             material != 0 || metadata == 0,
             "material 0 is reserved for empty; metadata must also be 0",
         );
@@ -53,9 +63,32 @@ impl Cell {
     }
 
     /// Construct a cell from a raw `CellState` word (e.g. when loading from
-    /// the octree store or a GPU buffer).
+    /// the octree store or a GPU buffer). Validates the "material 0 ⇒
+    /// metadata 0" invariant and panics in both debug and release if it is
+    /// violated. Raw u16 values ≤ `MAX_METADATA` that are nonzero are the
+    /// forbidden range — any such value decodes to `material=0` with
+    /// nonzero metadata.
+    ///
+    /// The overflow fields (material / metadata bit-width) cannot be
+    /// violated by a `u16` input, so we only check the empty-invariant.
     #[inline]
     pub const fn from_raw(raw: CellState) -> Cell {
+        // Any raw value in 1..=MAX_METADATA decodes to material=0 with
+        // nonzero metadata, which is the forbidden "empty with flavor".
+        assert!(
+            raw == 0 || raw > Self::MAX_METADATA,
+            "raw cell in forbidden range: material 0 with nonzero metadata",
+        );
+        Cell(raw)
+    }
+
+    /// Construct a cell from a raw `CellState` word without validating the
+    /// "material 0 ⇒ metadata 0" invariant. Only use this on bit patterns
+    /// that are already known to be well-formed (e.g. bits that came out of
+    /// a previously validated `Cell`). Violating the invariant silently
+    /// corrupts hash-consing — there is no safety net downstream.
+    #[inline]
+    pub const fn from_raw_unchecked(raw: CellState) -> Cell {
         Cell(raw)
     }
 
@@ -98,12 +131,11 @@ impl Cell {
     }
 }
 
-impl From<u16> for Cell {
-    #[inline]
-    fn from(raw: u16) -> Cell {
-        Cell(raw)
-    }
-}
+// Intentionally no `impl From<u16> for Cell` — a silent `u16 -> Cell`
+// conversion bypasses the "material 0 ⇒ metadata 0" invariant. Callers
+// must go through `Cell::pack` (for logical values) or `Cell::from_raw`
+// (for storage round-trips, validated) or `Cell::from_raw_unchecked`
+// (documented escape hatch).
 
 impl From<Cell> for u16 {
     #[inline]
@@ -236,9 +268,31 @@ mod tests {
 
     #[test]
     fn from_raw_roundtrip() {
-        for raw in [0u16, 1, 0x0040, 0x1234, 0xFFFF] {
+        // Only valid raws: 0 (empty) and anything where material > 0
+        // (i.e. raw > MAX_METADATA). Raws in 1..=63 are forbidden.
+        for raw in [0u16, 0x0040, 0x0041, 0x1234, 0xFFFF] {
             assert_eq!(Cell::from_raw(raw).raw(), raw);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "forbidden range")]
+    fn from_raw_rejects_empty_with_flavor() {
+        let _ = Cell::from_raw(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "forbidden range")]
+    fn from_raw_rejects_max_metadata_alone() {
+        // raw = MAX_METADATA (63) = material 0, metadata 63 → forbidden.
+        let _ = Cell::from_raw(Cell::MAX_METADATA);
+    }
+
+    #[test]
+    fn from_raw_unchecked_skips_validation() {
+        // Escape hatch does not panic even on forbidden bit patterns.
+        let bogus = Cell::from_raw_unchecked(1);
+        assert_eq!(bogus.raw(), 1);
     }
 
     #[test]
