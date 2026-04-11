@@ -8,6 +8,19 @@ Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` un
 gate-sensitivity: medium
 ```
 
+## Agent surface — where project skills and commands live
+
+This project is designed to work with **any of three CLI agents**: Claude Code (the primary seat), Codex Exec, and Gemini CLI. To keep the three in sync:
+
+- **`AGENTS.md`** is a symlink to this file (`CLAUDE.md`). Codex and Gemini auto-load `AGENTS.md`; Claude Code auto-loads `CLAUDE.md`. Same content, one source of truth.
+- **`.agents/commands/`** holds the project-local slash-command / prompt definitions that `/ship` and related workflows depend on: `code_review.md`, `code_review_critical.md`, `trident-code-review.md`, `trident-plan-review.md`, `ship.md`, `diagram.md`. These are **copies**, not symlinks into `~/.claude/`, so a fresh `git clone` on another machine has everything needed.
+- **`.agents/skills/`** holds the skill definitions the workflows reference, most importantly `review-tiers/SKILL.md` which `/ship` reads to pick its review tier.
+- **Refreshing from `~/.claude/`**: if edward updates his global Claude config, re-sync via `.agents/README.md`'s refresh command. Drift is a file the claude-md-edit queue (or any seat noticing stale content) should refile.
+
+**Why this matters for cost**: edward's Claude Code $200/month plan is maxing out. Shifting review workload from all-Claude trident (9 Claude agents) to real-trident (3 Claude + 3 Codex + 3 Gemini) saves ~2/3 of Claude token spend. That only works if Codex and Gemini sessions can read the same project instructions and workflows — which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
+
+**When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). The `/ship` skill itself may still hardcode the user-global path — if so, file a bead or fix it inline. Until then, splicing the project-local file into the prompt is sufficient.
+
 ## The crew
 
 Named agents working on this repo. `BEADS_ACTOR` draws from a small pool of natural-object words, not confusable with real names.
@@ -84,6 +97,8 @@ At every gate (including design gates):
 Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/ship` end-to-end.
 
 **Design gates are narrower than they look.** Per edward 2026-04-11: if a scout finds two independent implementations of the same bead, do NOT park at a human gate just because there's a choice to make. Review both and pick one yourself. Only genuine user-facing design calls (what the system *is*, not how it's built) warrant the gate. Internal-API / implementation-detail decisions are autonomous. See `hash-thing-52b` for the precedent.
+
+**But "autonomous" ≠ "single reviewer."** Picking internally still needs external validation — a single seat's pick is too easy to be wrong about. Run a **trident code review** on the pick (9-way preferred) or **at minimum a three-way review** (Claude + Codex + Gemini). The review doesn't ask edward to approve; it catches the cases where the picker missed something that a fresh reviewer would spot instantly. The rule is: no one-seat implementation picks land on main without at least 3 independent reviewer perspectives.
 
 ### When `bd ready` is dry — **do not stop**
 
