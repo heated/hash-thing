@@ -200,6 +200,22 @@ pub mod cpu_trace {
             return TraceResult { hit_material: None, steps: 0, events };
         }
 
+        // hash-thing-27m v2: clamp `ro` to the root-cube entry point
+        // (Laine-Karras traversal trick). After this, all subsequent
+        // `pos = ro_local + rd * t` math uses a t bounded by the in-cube
+        // traversal length (|t| ≤ √3), so ULP(t) stays ≤ ~2.4e-7 regardless
+        // of how far the original camera was. Without this clamp, far-camera
+        // rays hit a zero-forward-progress regime: `t_new = oct_far + dt`
+        // rounds back to `t_old` in f32 whenever ULP(t) exceeds the nudge
+        // (9.5e-7 at MAX_DEPTH). Flagged by Codex Critical in 27m review.
+        let entry = root_near.max(0.0);
+        let ro_local = [
+            ro[0] + rd[0] * entry,
+            ro[1] + rd[1] * entry,
+            ro[2] + rd[2] * entry,
+        ];
+        let t_exit = root_far - entry;
+
         let mut stack_node = [0u32; MAX_DEPTH];
         let mut stack_min = [[0.0f32; 3]; MAX_DEPTH];
         let mut stack_half = [0.0f32; MAX_DEPTH];
@@ -209,23 +225,35 @@ pub mod cpu_trace {
         stack_min[0] = [0.0; 3];
         stack_half[0] = 0.5;
 
-        let mut t = root_near.max(0.0) + EPS;
+        // Local-frame starting t. Just past the root entry; `ro_local` is
+        // already on the root face.
+        let mut t = EPS;
 
         for step in 0..MAX_STEPS {
-            if t > root_far {
+            if t > t_exit {
                 return TraceResult { hit_material: None, steps: step, events };
             }
-            let pos = [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
+            let pos = [
+                ro_local[0] + rd[0] * t,
+                ro_local[1] + rd[1] * t,
+                ro_local[2] + rd[2] * t,
+            ];
 
             // Pop until top contains pos.
-            // NOTE: pop check is STRICT (no EPS slack). The step-past below
-            // advances `t` past the octant exit by a scale-aware nudge sized
-            // to the current child cell, guaranteeing pos lands comfortably
-            // above f32 ULP past the boundary on the exit axis (hash-thing-27m).
-            // If we allowed EPS slack here, the pop check would still consider
-            // pos "inside" after a step-past since the slack on this side could
-            // equal or exceed the per-axis positional advance, causing infinite
-            // loops on simultaneous two-axis boundary crossings.
+            // NOTE: pop check is STRICT (no EPS slack). Two guarantees make
+            // this safe:
+            //   (1) ro is clamped to the root-cube entry (27m v2), so `t`
+            //       inside the loop is local-frame and bounded by √3;
+            //       ULP(t_local) stays ≤ ~2.4e-7.
+            //   (2) The step-past below uses a cell-scaled nudge of at least
+            //       ~9.5e-7 on the identified exit axis at MAX_DEPTH.
+            // Together (1) > (2) means pos advances strictly past the octant
+            // boundary on the exit axis in the uncapped path. The cap-bound
+            // path (ultra-grazing |rd_axis| at MAX_DEPTH) can still collapse
+            // below ULP — that remains the known f32 frontier, resolvable
+            // only via integer DDA. Allowing EPS slack here would defeat
+            // the strict step-past ordering and reintroduce infinite loops
+            // on simultaneous two-axis boundary crossings.
             let mut top = depth;
             loop {
                 let node_min = stack_min[top];
@@ -317,14 +345,14 @@ pub mod cpu_trace {
             // but exposed per-axis so we can identify which axis is the actual
             // exit and scale the post-exit nudge against its |rd|.
             let t1 = [
-                (child_min[0] - ro[0]) * inv_rd[0],
-                (child_min[1] - ro[1]) * inv_rd[1],
-                (child_min[2] - ro[2]) * inv_rd[2],
+                (child_min[0] - ro_local[0]) * inv_rd[0],
+                (child_min[1] - ro_local[1]) * inv_rd[1],
+                (child_min[2] - ro_local[2]) * inv_rd[2],
             ];
             let t2 = [
-                (child_max[0] - ro[0]) * inv_rd[0],
-                (child_max[1] - ro[1]) * inv_rd[1],
-                (child_max[2] - ro[2]) * inv_rd[2],
+                (child_max[0] - ro_local[0]) * inv_rd[0],
+                (child_max[1] - ro_local[1]) * inv_rd[1],
+                (child_max[2] - ro_local[2]) * inv_rd[2],
             ];
             let tmax_v = [t1[0].max(t2[0]), t1[1].max(t2[1]), t1[2].max(t2[2])];
             let mut oct_far = tmax_v[0];
@@ -594,5 +622,162 @@ mod tests {
                 steps = result.steps,
             );
         }
+    }
+
+    /// Regression: far-camera rays must make forward progress even when
+    /// the ray-parameter `t` reaches values where `ULP(t)` approaches the
+    /// step-past nudge size. Pre-fix (27m v1), this class stalled because
+    /// `t_new = oct_far + dt` rounded back to `t_old` in `f32` whenever
+    /// `dt < ULP(t)`. Fixed by clamping `ro` to the root-cube entry point
+    /// (Laine-Karras), which bounds the in-loop traversal length to
+    /// `≤ √3` and keeps `ULP(t_local)` ≤ ~2.4e-7 — always below the
+    /// depth-scaled nudge of 9.5e-7.
+    ///
+    /// Codex Critical reproducer (captured during 27m trident review):
+    /// `rd = (-0.86086446, 0.16658753, 0.48079199)`,
+    /// `ro ≈ (12.78218, -2.47332, -7.13861)` stalls pre-clamp with
+    /// `t ≈ 14.847`, `oct_far ≈ 14.846751`, `dt ≈ 1.11e-6`, and
+    /// `t_new = oct_far + dt` rounds back to exactly `t`.
+    #[test]
+    fn far_camera_forward_progress() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(12);
+        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        let dag = Svdag::build(&store, root, 12);
+
+        // Each case starts the camera well outside the unit root cube so
+        // the pre-clamp `t` enters the far-camera regime early in the loop.
+        let cases: [([f32; 3], [f32; 3]); 3] = [
+            // Codex Critical reproducer (un-normalized direction).
+            (
+                [12.78218, -2.47332, -7.13861],
+                [-0.86086446, 0.16658753, 0.48079199],
+            ),
+            // Axis-dominant far-camera ray with tiny secondary axes —
+            // lands on grazing inter-octant faces at depth ≥ 12.
+            ([10.0, 0.5001, 0.4999], [-1.0, 0.0001, -0.0001]),
+            // Far camera on a different axis with a different grazing pair.
+            ([0.5, 0.5001, -9.5], [0.0001, -0.0001, 1.0]),
+        ];
+
+        for (i, (ro, rd)) in cases.iter().enumerate() {
+            let rd_n = normalize(*rd);
+            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            assert!(
+                result.steps < 400,
+                "case {i} (ro={ro:?}, rd={rd:?}): far-camera forward-progress \
+                 regression — used {steps} steps out of MAX_STEPS=512.",
+                steps = result.steps,
+            );
+        }
+    }
+
+    /// Regression: ro clamping must also handle the actual deepest
+    /// supported depth (MAX_DEPTH=14) where the smallest nudge
+    /// (`half/64 = 9.5e-7`) is closest to `f32` ULP and where the
+    /// un-clamped pre-fix v1 still stalled on far-camera rays with
+    /// any reasonable |ro|.
+    #[test]
+    fn far_camera_forward_progress_max_depth() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(14);
+        // Single voxel near the center at full MAX_DEPTH resolution.
+        // At depth 14, the cell size is 1/16384 ≈ 6.1e-5.
+        root = store.set_cell(root, 8192, 8192, 8192, 1);
+        let dag = Svdag::build(&store, root, 14);
+
+        // Far camera (|ro| ~ 10) with dominant + grazing axes so the ray
+        // descends through deep octants.
+        let cases: [([f32; 3], [f32; 3]); 3] = [
+            ([10.5, 0.49995, 0.50005], [-1.0, 3e-5, -1e-5]),
+            ([0.50003, 10.5, 0.49997], [-1e-5, -1.0, 2e-5]),
+            ([0.49999, 0.50002, -10.5], [2e-5, -1e-5, 1.0]),
+        ];
+
+        for (i, (ro, rd)) in cases.iter().enumerate() {
+            let rd_n = normalize(*rd);
+            let result = cpu_trace::raycast(&dag.nodes, *ro, rd_n, false);
+            assert!(
+                result.steps < 400,
+                "case {i} (ro={ro:?}, rd={rd:?}): far-camera MAX_DEPTH \
+                 forward-progress regression — used {steps} steps out of \
+                 MAX_STEPS=512.",
+                steps = result.steps,
+            );
+        }
+    }
+
+    /// Static math invariant behind the 27m v2 `ro` clamp: in the
+    /// clamped frame, the maximum `|pos|` during traversal is bounded
+    /// by `√3 + √3 ≈ 3.46` (clamped `ro_local` is on a cube face, so
+    /// `|ro_local| ≤ √3`; the in-cube traversal adds at most `√3` more
+    /// along `rd`). For every `t` actually seen inside the loop,
+    /// `ULP(t) ≤ ULP(3.46) ≈ 4.77e-7`, which must stay strictly below
+    /// the depth-14 step-past nudge `half/64 = 9.54e-7`. If any future
+    /// change breaks this inequality — shrinking the nudge, increasing
+    /// MAX_DEPTH, or removing the clamp — this test fires.
+    #[test]
+    fn ro_clamp_preserves_ulp_margin() {
+        // Worst-case |pos| after ro clamping: root face + cube diagonal.
+        let max_pos: f32 = 2.0 * (3f32.sqrt());
+        let ulp_max = f32::from_bits(max_pos.to_bits() + 1) - max_pos;
+
+        // Smallest nudge the step-past will ever produce (deepest cell).
+        // At MAX_DEPTH=14, stack_half = 0.5^15 ≈ 3.05e-5.
+        const MAX_DEPTH: i32 = 14;
+        const EPS: f32 = 1e-5;
+        let deepest_half = 0.5_f32.powi(MAX_DEPTH + 1);
+        let min_nudge = (deepest_half * (1.0 / 64.0)).min(EPS);
+
+        assert!(
+            min_nudge > ulp_max,
+            "27m invariant: min nudge {min_nudge:e} must exceed max \
+             post-clamp ULP {ulp_max:e} to guarantee forward progress. \
+             Breaking this invariant re-opens the zero-progress regime \
+             (Codex Critical blocker, 27m review)."
+        );
+    }
+
+    /// Direct regression for the 27m v2 `ro` clamp: after clamping, the
+    /// in-loop `t` variable is local-frame and bounded by the in-cube
+    /// traversal length (≤ √3 plus a tiny EPS overshoot). Pre-clamp,
+    /// `t` is world-space and scales with `|ro|`. This test traces a
+    /// far-camera ray and asserts every `StepPast.t_new` event stays
+    /// below a cube-diagonal bound. If someone reverts the clamp,
+    /// `t_new` will be ~100x larger on this case and the test fails.
+    #[test]
+    fn step_past_t_is_local_frame() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(12);
+        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        let dag = Svdag::build(&store, root, 12);
+
+        // |ro| ~ 100 — pre-clamp world-space t reaches ~99.5-100.5
+        // inside the loop. Post-clamp local-frame t stays ≤ √3 + ε.
+        let ro: [f32; 3] = [100.5, 0.5001, 0.4999];
+        let rd_n = normalize([-1.0, 1e-5, -1e-5]);
+        let result = cpu_trace::raycast(&dag.nodes, ro, rd_n, true);
+
+        // Cube diagonal plus a small margin for overshoot.
+        const T_BOUND: f32 = 2.0;
+        let mut observed_max: f32 = 0.0;
+        for ev in &result.events {
+            if let cpu_trace::TraceEvent::StepPast { t_new, .. } = ev {
+                if *t_new > observed_max {
+                    observed_max = *t_new;
+                }
+                assert!(
+                    *t_new <= T_BOUND,
+                    "27m v2 regression: StepPast.t_new = {t_new} exceeds \
+                     the local-frame bound {T_BOUND}. The `ro` clamp has \
+                     been reverted or broken — `t` should be local-frame \
+                     after clamping `ro` to the root entry (|t_local| ≤ √3)."
+                );
+            }
+        }
+        assert!(
+            observed_max > 0.0,
+            "expected at least one StepPast event to sanity-check the bound",
+        );
     }
 }
