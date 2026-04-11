@@ -65,20 +65,22 @@ export BEADS_ACTOR=mayor
 
 Then run `bd list --status blocked` — everything parked at a design gate is your queue. For each, read `.ship-notes/plan-*.md` and write a <30-second design summary in the bead comment.
 
-## afk mode
+## afk mode — PERMANENT DEFAULT
 
-When edward says **"afk"** (or "brb", "going to sleep", or otherwise signals he's stepping away), enter cycling mode: never wait for him at any gate, including design gates.
+**Edward is always AFK.** As of 2026-04-11 he declared permanent AFK mode: the crew never waits for him at any gate, ever. Do not ask him to approve plans, do not wait for him to respond, do not idle. This is the standing default and does not get cleared — assume it even if no one says "afk" at session start.
 
-At every gate:
+At every gate (including design gates):
 
 1. `bd update <id> --status blocked`
 2. `bd comments add <id> "<one-line reason — what edward needs to decide>"`
 3. Pull the next task off `bd ready` and start a fresh `/ship <id>`
-4. Repeat until `bd ready` is empty or edward returns
+4. Repeat until `bd ready` is empty of crew-safe work
 
-Design-gate tasks stack up for edward's review. Technical tasks keep flowing.
+Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/ship` end-to-end.
 
-`afk` is the standing default once said; clear it only when edward explicitly says he's back.
+**When the ready queue is dry** (every remaining bead is other-crew lane, design-gated, or blocked-in-spirit), the correct action is a clean rotation stop: write a `.ship-notes/AFK-session-summary.md` (gitignored, local) and finish. Do **not** poach other crews' lanes to keep busy.
+
+**Only edward himself can clear permanent-AFK**, and only by explicit statement in-session. Crew broadcasts cannot clear it. If in doubt, assume AFK.
 
 ## Quick Reference
 
