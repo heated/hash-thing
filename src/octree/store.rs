@@ -486,7 +486,21 @@ mod tests {
     //!
     //! Out-of-bounds coordinate handling is deliberately NOT tested here —
     //! that's tracked separately by hash-thing-819.
+    //!
+    //! Cell encoding note (hash-thing-1v0.1): `CellState` is a packed
+    //! `u16 = material(10 bits) | metadata(6 bits)`, and raw values in
+    //! `1..=63` are forbidden (they decode to material 0 with nonzero
+    //! metadata, which would silently alias `Cell::EMPTY`). Tests that want
+    //! to distinguish "material N" fixture values must use the `mat()`
+    //! helper below, which produces a valid raw encoding (`N << 6`).
+    use super::super::node::Cell;
     use super::*;
+
+    /// Test helper: encode a material id as a raw `CellState` with metadata=0.
+    /// Rejects `material == 0` (empty) loudly so tests can't silently alias.
+    fn mat(material: u16) -> CellState {
+        Cell::pack(material, 0).raw()
+    }
 
     /// Canonical empty leaf is at NodeId(0).
     #[test]
@@ -511,11 +525,11 @@ mod tests {
     #[test]
     fn intern_dedup_leaf() {
         let mut store = NodeStore::new();
-        let a = store.leaf(7);
-        let b = store.leaf(7);
+        let a = store.leaf(mat(7));
+        let b = store.leaf(mat(7));
         assert_eq!(a, b);
         // And a different state gets a different id.
-        let c = store.leaf(8);
+        let c = store.leaf(mat(8));
         assert_ne!(a, c);
     }
 
@@ -525,7 +539,7 @@ mod tests {
     fn intern_dedup_interior() {
         let mut store = NodeStore::new();
         let l0 = store.leaf(0);
-        let l1 = store.leaf(1);
+        let l1 = store.leaf(mat(1));
         // Two independent calls to build an interior with the same
         // children must return the same NodeId.
         let a = store.interior(1, [l0, l1, l0, l1, l0, l1, l0, l1]);
@@ -561,7 +575,7 @@ mod tests {
     fn population_folds_up_correctly() {
         let mut store = NodeStore::new();
         let l0 = store.leaf(0);
-        let l1 = store.leaf(1);
+        let l1 = store.leaf(mat(1));
         // Interior with 3 live leaves → pop 3.
         let n = store.interior(1, [l1, l0, l1, l0, l1, l0, l0, l0]);
         assert_eq!(store.population(n), 3);
@@ -579,12 +593,12 @@ mod tests {
     fn set_get_roundtrip_small() {
         let mut store = NodeStore::new();
         let mut root = store.empty(3); // 8^3
-        root = store.set_cell(root, 0, 0, 0, 5);
-        root = store.set_cell(root, 7, 7, 7, 9);
-        root = store.set_cell(root, 3, 4, 5, 2);
-        assert_eq!(store.get_cell(root, 0, 0, 0), 5);
-        assert_eq!(store.get_cell(root, 7, 7, 7), 9);
-        assert_eq!(store.get_cell(root, 3, 4, 5), 2);
+        root = store.set_cell(root, 0, 0, 0, mat(5));
+        root = store.set_cell(root, 7, 7, 7, mat(9));
+        root = store.set_cell(root, 3, 4, 5, mat(2));
+        assert_eq!(store.get_cell(root, 0, 0, 0), mat(5));
+        assert_eq!(store.get_cell(root, 7, 7, 7), mat(9));
+        assert_eq!(store.get_cell(root, 3, 4, 5), mat(2));
         // Untouched cells stay empty.
         assert_eq!(store.get_cell(root, 1, 1, 1), 0);
     }
@@ -595,13 +609,13 @@ mod tests {
     fn set_get_roundtrip_level_6() {
         let mut store = NodeStore::new();
         let mut root = store.empty(6); // 64^3
-        let probes: &[(u64, u64, u64, u8)] = &[
-            (0, 0, 0, 1),
-            (63, 63, 63, 2),
-            (31, 31, 31, 3),
-            (32, 32, 32, 4),
-            (10, 20, 30, 5),
-            (50, 5, 25, 6),
+        let probes: &[(u64, u64, u64, CellState)] = &[
+            (0, 0, 0, mat(1)),
+            (63, 63, 63, mat(2)),
+            (31, 31, 31, mat(3)),
+            (32, 32, 32, mat(4)),
+            (10, 20, 30, mat(5)),
+            (50, 5, 25, mat(6)),
         ];
         for &(x, y, z, s) in probes {
             root = store.set_cell(root, x, y, z, s);
@@ -658,12 +672,16 @@ mod tests {
     #[test]
     fn from_flat_flatten_roundtrip() {
         let side = 8usize;
-        let mut grid = vec![0u8; side * side * side];
-        // Put a recognizable pattern in.
+        let mut grid = vec![0 as CellState; side * side * side];
+        // Put a recognizable pattern in: each cell gets material id in 0..=7,
+        // encoded as `material << METADATA_BITS` so every nonzero value is a
+        // valid Cell (material != 0, metadata == 0). Material 0 stays 0 (empty).
         for z in 0..side {
             for y in 0..side {
                 for x in 0..side {
-                    grid[x + y * side + z * side * side] = ((x ^ y ^ z) & 0x7) as u8;
+                    let material = ((x ^ y ^ z) & 0x7) as u16;
+                    grid[x + y * side + z * side * side] =
+                        if material == 0 { 0 } else { mat(material) };
                 }
             }
         }
@@ -679,7 +697,7 @@ mod tests {
     #[test]
     fn from_flat_empty_dedups_with_empty_subtree() {
         let side = 32usize;
-        let grid = vec![0u8; side * side * side];
+        let grid = vec![0 as CellState; side * side * side];
         let mut store = NodeStore::new();
         let via_flat = store.from_flat(&grid, side);
         let via_empty = store.empty(5);
@@ -691,7 +709,7 @@ mod tests {
     #[test]
     fn from_flat_population_matches_source() {
         let side = 8usize;
-        let mut grid = vec![0u8; side * side * side];
+        let mut grid = vec![0 as CellState; side * side * side];
         // Exactly 17 live cells.
         let live: &[(usize, usize, usize)] = &[
             (0, 0, 0),
@@ -713,7 +731,7 @@ mod tests {
             (4, 4, 4),
         ];
         for &(x, y, z) in live {
-            grid[x + y * side + z * side * side] = 1;
+            grid[x + y * side + z * side * side] = mat(1);
         }
         let mut store = NodeStore::new();
         let root = store.from_flat(&grid, side);
@@ -725,17 +743,17 @@ mod tests {
     #[test]
     fn structurally_equal_trees_share_root() {
         let side = 8usize;
-        let mut grid = vec![0u8; side * side * side];
-        grid[0] = 1;
-        grid[side - 1] = 2;
-        grid[(side - 1) * side + 4] = 3;
+        let mut grid = vec![0 as CellState; side * side * side];
+        grid[0] = mat(1);
+        grid[side - 1] = mat(2);
+        grid[(side - 1) * side + 4] = mat(3);
         let mut store = NodeStore::new();
         let a = store.from_flat(&grid, side);
         let b = store.from_flat(&grid, side);
         assert_eq!(a, b);
         // And a grid that differs by one cell must NOT share.
         let mut grid2 = grid.clone();
-        grid2[1] = 1;
+        grid2[1] = mat(1);
         let c = store.from_flat(&grid2, side);
         assert_ne!(a, c);
     }
@@ -748,7 +766,7 @@ mod tests {
     #[test]
     fn empty_world_is_compact() {
         let side = 64usize;
-        let grid = vec![0u8; side * side * side];
+        let grid = vec![0 as CellState; side * side * side];
         let mut store = NodeStore::new();
         let _root = store.from_flat(&grid, side);
         let (nodes, _) = store.stats();
@@ -761,8 +779,8 @@ mod tests {
     #[test]
     fn step_cache_insert_lookup_clear() {
         let mut store = NodeStore::new();
-        let a = store.leaf(1);
-        let b = store.leaf(2);
+        let a = store.leaf(mat(1));
+        let b = store.leaf(mat(2));
         assert_eq!(store.get_cached_step(a), None);
         store.cache_step(a, b);
         assert_eq!(store.get_cached_step(a), Some(b));
@@ -777,8 +795,8 @@ mod tests {
         let (n0, c0) = store.stats();
         assert_eq!(n0, 1); // just the empty leaf
         assert_eq!(c0, 0);
-        let a = store.leaf(1);
-        let b = store.leaf(2);
+        let a = store.leaf(mat(1));
+        let b = store.leaf(mat(2));
         let (n1, _) = store.stats();
         assert_eq!(n1, 3);
         store.cache_step(a, b);
