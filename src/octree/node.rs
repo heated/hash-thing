@@ -117,14 +117,21 @@ impl Cell {
     }
 
     /// Produce a new cell with the material replaced, metadata preserved.
-    /// Panics in debug if `material` overflows or if `material==0` while
-    /// metadata is nonzero (the resulting cell would alias empty-with-flavor).
+    /// Panics (debug **and** release) if `material` overflows 10 bits, or if
+    /// `material == 0` while this cell's metadata is nonzero (the resulting
+    /// cell would alias empty-with-flavor). Delegates to `Cell::pack`, which
+    /// owns the invariant.
     #[inline]
     pub const fn with_material(self, material: u16) -> Cell {
         Cell::pack(material, self.metadata())
     }
 
     /// Produce a new cell with the metadata replaced, material preserved.
+    /// Panics (debug **and** release) if `metadata` overflows 6 bits, or if
+    /// this cell is empty (`material == 0`) and `metadata != 0` — the result
+    /// would alias empty-with-flavor. `Cell::EMPTY.with_metadata(0)` is a
+    /// no-op and does not panic; any nonzero metadata on an empty cell does.
+    /// Delegates to `Cell::pack`, which owns the invariant.
     #[inline]
     pub const fn with_metadata(self, metadata: u16) -> Cell {
         Cell::pack(self.material(), metadata)
