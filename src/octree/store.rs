@@ -154,8 +154,13 @@ impl NodeStore {
         z: u64,
         state: CellState,
     ) -> NodeId {
+        // Unconditional — at level 0 the check is `x == 0 && y == 0 && z == 0`,
+        // which is the only valid coord triple inside a single-voxel leaf and
+        // is exactly what the public entry's recursion preserves. Keeping the
+        // assert fire-able at the base case is load-bearing: if someone ever
+        // adds level-0 coord logic, this catches an out-of-range leak.
         debug_assert!(
-            level == 0 || (x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level)),
+            x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level),
             "set_cell_at: coord ({x}, {y}, {z}) out of bounds for level {level}",
         );
         if level == 0 {
@@ -212,19 +217,22 @@ impl NodeStore {
     /// bounds for `level`. The public `get_cell` entry enforces this; the
     /// `debug_assert!` makes the contract executable in dev without any
     /// release overhead.
+    ///
+    /// Note: unlike `set_cell_at`, this path does not need Leaf-at-
+    /// intermediate-level expansion — reads fall through the Leaf arm and
+    /// return the uniform value. `level` is the parent-visible level; for
+    /// Interior nodes it equals `self.get(node).level()` by the invariant
+    /// the public entry establishes. Recursion uses `level` consistently
+    /// with `set_cell_at` for symmetry.
     fn get_cell_at(&self, node: NodeId, level: u32, x: u64, y: u64, z: u64) -> CellState {
         debug_assert!(
-            level == 0 || (x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level)),
+            x < (1u64 << level) && y < (1u64 << level) && z < (1u64 << level),
             "get_cell_at: coord ({x}, {y}, {z}) out of bounds for level {level}",
         );
         match self.get(node) {
             Node::Leaf(s) => *s,
-            Node::Interior {
-                level: node_level,
-                children,
-                ..
-            } => {
-                let half = 1u64 << (node_level - 1);
+            Node::Interior { children, .. } => {
+                let half = 1u64 << (level - 1);
                 let ox = if x >= half { 1u32 } else { 0 };
                 let oy = if y >= half { 1u32 } else { 0 };
                 let oz = if z >= half { 1u32 } else { 0 };
@@ -232,7 +240,7 @@ impl NodeStore {
                 let lx = if ox == 1 { x - half } else { x };
                 let ly = if oy == 1 { y - half } else { y };
                 let lz = if oz == 1 { z - half } else { z };
-                self.get_cell_at(children[idx], node_level - 1, lx, ly, lz)
+                self.get_cell_at(children[idx], level - 1, lx, ly, lz)
             }
         }
     }
@@ -1219,7 +1227,7 @@ mod tests {
     /// Explicit max-in-bounds read — catches `>=` vs `>` mistakes in the
     /// entry-level bounds check.
     #[test]
-    fn get_cell_at_max_in_bounds() {
+    fn get_cell_max_in_bounds() {
         let mut store = NodeStore::new();
         let mut root = store.empty(2); // side 4
         root = store.set_cell(root, 3, 3, 3, 42);
