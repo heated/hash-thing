@@ -1,3 +1,4 @@
 /target
 .claude/
-.ship-notes/
+.ship-notes/*
+!.ship-notes/design-ledger.md
