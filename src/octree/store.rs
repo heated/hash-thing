@@ -198,6 +198,17 @@ impl NodeStore {
     /// Build an octree from a flat 3D array.
     /// Grid is indexed as [x + y*side + z*side*side], side must be a power of 2.
     pub fn from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
+        debug_assert!(
+            side.is_power_of_two() && side >= 1,
+            "from_flat: side must be a power of 2 >= 1; got {side}",
+        );
+        debug_assert_eq!(
+            grid.len(),
+            side * side * side,
+            "from_flat: grid length {} does not match side^3 = {}",
+            grid.len(),
+            side * side * side,
+        );
         let level = (side as f64).log2() as u32;
         self.from_flat_recursive(grid, side, 0, 0, 0, level)
     }

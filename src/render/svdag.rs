@@ -41,6 +41,10 @@ impl Svdag {
     /// Walks the DAG in depth-first order, interning each `NodeId` to a flat-buffer
     /// offset so shared subtrees become shared offsets in the output.
     pub fn build(store: &NodeStore, root: NodeId, root_level: u32) -> Self {
+        debug_assert!(
+            root_level >= 1,
+            "Svdag::build expects an interior root (level >= 1); got level {root_level}",
+        );
         let mut nodes: Vec<u32> = Vec::new();
         let mut id_to_offset: FxHashMap<NodeId, u32> = FxHashMap::default();
 
@@ -48,7 +52,17 @@ impl Svdag {
         let root_offset = Self::write_node(&mut nodes, &mut id_to_offset, store, root);
         debug_assert_eq!(root_offset, 0, "root must be at offset 0");
 
-        let node_count = id_to_offset.len();
+        // Each emitted interior node is exactly NODE_STRIDE u32s (mask + 8 children).
+        // `id_to_offset` includes leaf NodeIds that are encoded inline rather than
+        // emitted, so it overcounts — divide the buffer length to get the real
+        // emitted-interior count, matching what `byte_size()` reports.
+        const NODE_STRIDE: usize = 9;
+        debug_assert_eq!(
+            nodes.len() % NODE_STRIDE,
+            0,
+            "SVDAG buffer length should be a multiple of {NODE_STRIDE}",
+        );
+        let node_count = nodes.len() / NODE_STRIDE;
         Svdag {
             nodes,
             root_level,

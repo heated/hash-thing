@@ -21,7 +21,7 @@ impl NodeId {
 ///   3 = (+x, +y, −z)  aka (1,1,0)
 ///   4 = (−x, −y, +z)  aka (0,0,1)
 ///   5 = (+x, −y, +z)  aka (1,0,1)
-///   6 = (−x, +y, +z)  aka (0,1,0)
+///   6 = (−x, +y, +z)  aka (0,1,1)
 ///   7 = (+x, +y, +z)  aka (1,1,1)
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Node {
