@@ -228,9 +228,10 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
   - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) + 4 regression tests
   - Epsilon bug fixed: pop-check slack was beating step-past advance on multi-axis boundary crossings
-- ✅ **Foundations progress (epic `h34`, 2/4)**
+- ✅ **Foundations progress (epic `h34`, 3/4)**
   - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
-  - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`. Two beads remain (determinism audit `h34.2`, retire-GoL `h34.4`)
+  - `h34.2` determinism audit: walked every file in sim + terrain-gen paths, no global PRNG / scan-order dependencies found, two minor follow-ups filed and closed (`99e` step_cache rule_id doc fix, `c6k` seed_center migrating to cell_rand_bool). Audit notes in `.ship-notes/ship-h34.2-determinism-audit.md`
+  - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`. One bead remains (retire-GoL `h34.4`, blocked on 1v0 material CA)
 - ✅ **NodeStore hash-cons unit tests (`1lq`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths
 - ✅ **CI + release (epic `xb7`, 2/6)**
   - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets` before warn-only clippy
@@ -245,7 +246,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Later (P2+, from bd)
 
-- ☐ Foundations & determinism (`h34`): determinism audit (`h34.2`), retire GoL3D scaffolding (`h34.4` — blocked on 1v0 material CA landing)
+- ☐ Foundations & determinism (`h34`): retire GoL3D scaffolding (`h34.4` — blocked on 1v0 material CA landing)
 - ☐ Terrain generation & infinite worlds (`3fq`): multi-res `gen(node_region) → NodeId`, cave smoothing, dungeon carving, lazy root expansion, terrain-gen perf tracking
 - ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, design-gated), Steam (`xb7.6`, P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
