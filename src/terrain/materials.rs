@@ -208,6 +208,7 @@ impl MaterialRegistry {
         Some(self.rules[entry.rule_id.0].as_ref())
     }
 
+    #[allow(dead_code)]
     pub fn block_rule_for_cell(&self, cell: Cell) -> Option<&dyn BlockRule> {
         let entry = self.entry(cell.material())?;
         let block_rule_id = entry.block_rule_id?;
@@ -238,6 +239,7 @@ impl MaterialRegistry {
         rule_id
     }
 
+    #[allow(dead_code)]
     pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
     where
         R: BlockRule + 'static,
@@ -247,6 +249,7 @@ impl MaterialRegistry {
         id
     }
 
+    #[allow(dead_code)]
     pub fn assign_block_rule(&mut self, material_id: MaterialId, block_rule_id: BlockRuleId) {
         self.entries[material_id as usize]
             .as_mut()

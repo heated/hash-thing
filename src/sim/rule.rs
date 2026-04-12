@@ -17,6 +17,7 @@ pub trait CaRule {
 /// All fields are pure functions of position + generation + seed, so block rules
 /// remain Hashlife-compatible (no global mutable state).
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct BlockContext {
     /// World-space origin of the block's (0,0,0) corner.
     pub block_origin: [i64; 3],

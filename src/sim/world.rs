@@ -120,7 +120,7 @@ impl World {
     /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
     /// distinct rule exists, run it. If zero or multiple: skip (identity).
     fn step_blocks(&self, grid: &mut [CellState], side: usize) {
-        let offset = if self.generation % 2 == 0 { 0 } else { 1 };
+        let offset = if self.generation.is_multiple_of(2) { 0 } else { 1 };
 
         let mut bz = offset;
         while bz + 1 < side {
@@ -629,5 +629,179 @@ mod tests {
 
         assert_eq!(world.get(4, 4, 4), FIRE);
         assert_eq!(world.get(5, 4, 4), GRASS);
+    }
+
+    // -----------------------------------------------------------------
+    // Margolus block-rule integration tests
+    // -----------------------------------------------------------------
+
+    use crate::sim::margolus::{GravityBlockRule, IdentityBlockRule};
+    use crate::terrain::materials::{
+        DIRT_MATERIAL_ID, STONE_MATERIAL_ID, WATER_MATERIAL_ID,
+    };
+
+    fn simple_density(cell: Cell) -> f32 {
+        if cell.is_empty() {
+            return 0.0;
+        }
+        match cell.material() {
+            1 => 5.0,  // stone
+            2 => 2.0,  // dirt
+            3 => 1.2,  // grass
+            4 => 0.05, // fire
+            5 => 1.0,  // water
+            _ => 1.0,
+        }
+    }
+
+    /// Wire a gravity block rule onto specific materials and return the world.
+    fn gravity_world(materials_with_gravity: &[u16]) -> World {
+        let mut world = World::new(3); // 8x8x8
+        let gravity_id =
+            world.materials.register_block_rule(GravityBlockRule::new(simple_density));
+        for &mat_id in materials_with_gravity {
+            world.materials.assign_block_rule(mat_id, gravity_id);
+        }
+        world
+    }
+
+    #[test]
+    fn identity_block_rule_leaves_world_unchanged() {
+        let mut world = World::new(3);
+        let identity_id = world.materials.register_block_rule(IdentityBlockRule);
+        world
+            .materials
+            .assign_block_rule(STONE_MATERIAL_ID, identity_id);
+
+        // Place some stone cells.
+        world.set(2, 4, 2, STONE);
+        world.set(3, 4, 2, STONE);
+        let pop_before = world.population();
+        let flat_before = world.flatten();
+
+        world.step();
+
+        assert_eq!(world.population(), pop_before);
+        // CaRule for stone is NoopRule, identity BlockRule changes nothing.
+        assert_eq!(world.flatten(), flat_before);
+    }
+
+    #[test]
+    fn gravity_drops_heavy_cell_one_step() {
+        // Use even generation (offset=0) so block at (2,2,2) is aligned.
+        let mut world = gravity_world(&[DIRT_MATERIAL_ID]);
+        // Place dirt at y=3 (top of block), air at y=2 (bottom of block).
+        // Block origin = (2,2,2), so positions (2,2,2) and (2,3,2) are
+        // in the same block column.
+        world.set(2, 3, 2, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        assert_eq!(world.get(2, 2, 2), 0, "bottom should be air initially");
+        assert_eq!(
+            world.get(2, 3, 2),
+            Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
+            "top should be dirt initially"
+        );
+
+        world.step();
+
+        // After step, dirt should have fallen from y=3 to y=2.
+        assert_eq!(
+            world.get(2, 2, 2),
+            Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
+            "dirt should have fallen to bottom"
+        );
+        assert_eq!(world.get(2, 3, 2), 0, "top should now be air");
+    }
+
+    #[test]
+    fn gravity_conserves_population() {
+        let mut world = gravity_world(&[DIRT_MATERIAL_ID, WATER_MATERIAL_ID]);
+        // Scatter some cells in even-aligned positions.
+        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(2, 1, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.set(4, 3, 4, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        let pop_before = world.population();
+
+        for _ in 0..4 {
+            world.step();
+        }
+
+        assert_eq!(
+            world.population(),
+            pop_before,
+            "gravity must conserve total cell count"
+        );
+    }
+
+    #[test]
+    fn alternating_offset_covers_different_blocks() {
+        // Even gen: offset 0 → block at (0,0,0). Odd gen: offset 1 → block at (1,1,1).
+        // A cell at (1,1,1) is in the even block but NOT the odd block's origin.
+        let mut world = gravity_world(&[DIRT_MATERIAL_ID]);
+        // Place dirt at (0, 1, 0) — in even block (0,0,0), column (0,_,0).
+        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        assert_eq!(world.generation, 0);
+
+        // Gen 0 (even offset=0): block (0,0,0) is active → dirt falls from y=1 to y=0.
+        world.step();
+        assert_eq!(
+            world.get(0, 0, 0),
+            Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
+            "dirt should fall on even generation"
+        );
+        assert_eq!(world.get(0, 1, 0), 0);
+    }
+
+    #[test]
+    fn mixed_block_rules_skip_block() {
+        // Two materials with different block rules → block should be skipped.
+        let mut world = World::new(3);
+        let gravity_a =
+            world.materials.register_block_rule(GravityBlockRule::new(simple_density));
+        let gravity_b =
+            world.materials.register_block_rule(GravityBlockRule::new(simple_density));
+        world
+            .materials
+            .assign_block_rule(DIRT_MATERIAL_ID, gravity_a);
+        world
+            .materials
+            .assign_block_rule(WATER_MATERIAL_ID, gravity_b);
+
+        // Place dirt and water in the same block — different rule IDs.
+        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(1, 0, 0, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+
+        let flat_before = world.flatten();
+        world.step();
+
+        // CaRule (NoopRule) doesn't change dirt/water. Block rule is skipped.
+        assert_eq!(
+            world.flatten(),
+            flat_before,
+            "mixed-rule block should be skipped (identity)"
+        );
+    }
+
+    #[test]
+    fn block_rule_deterministic_across_runs() {
+        let make_world = || {
+            let mut w = gravity_world(&[DIRT_MATERIAL_ID]);
+            w.simulation_seed = 12345;
+            w.set(2, 3, 2, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+            w.set(4, 5, 4, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+            w
+        };
+
+        let mut a = make_world();
+        let mut b = make_world();
+        for _ in 0..5 {
+            a.step();
+            b.step();
+        }
+
+        assert_eq!(
+            a.flatten(),
+            b.flatten(),
+            "block stepping must be deterministic"
+        );
     }
 }
