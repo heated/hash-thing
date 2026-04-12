@@ -269,7 +269,7 @@ pub mod cpu_trace {
     }
 
     pub struct TraceResult {
-        pub hit_material: Option<u32>,
+        pub hit_cell: Option<u32>,
         pub steps: usize,
         pub events: Vec<TraceEvent>,
         /// True iff traversal ran out of steps before terminating (neither
@@ -373,7 +373,7 @@ pub mod cpu_trace {
         let (root_near, root_far) = intersect_aabb(ro, inv_rd, [0.0; 3], [1.0; 3]);
         if root_near > root_far || root_far < 0.0 {
             return TraceResult {
-                hit_material: None,
+                hit_cell: None,
                 steps: 0,
                 events,
                 exhausted: false,
@@ -413,7 +413,7 @@ pub mod cpu_trace {
         for step in 0..max_steps {
             if t > t_exit {
                 return TraceResult {
-                    hit_material: None,
+                    hit_cell: None,
                     steps: step,
                     events,
                     exhausted: false,
@@ -459,7 +459,7 @@ pub mod cpu_trace {
                         events.push(TraceEvent::ExitedRoot);
                     }
                     return TraceResult {
-                        hit_material: None,
+                        hit_cell: None,
                         steps: step,
                         events,
                         exhausted: false,
@@ -547,7 +547,7 @@ pub mod cpu_trace {
                             [0.0, 0.0, -rd[2].signum()]
                         };
                         return TraceResult {
-                            hit_material: Some(mat),
+                            hit_cell: Some(mat),
                             steps: step,
                             events,
                             exhausted: false,
@@ -659,7 +659,7 @@ pub mod cpu_trace {
         // so tests can assert on it, and the GPU shader renders the same
         // state as a magenta sentinel pixel.
         TraceResult {
-            hit_material: None,
+            hit_cell: None,
             steps: max_steps,
             events,
             exhausted: true,
@@ -701,9 +701,9 @@ mod tests {
         let ro = [2.0, 2.0, 2.0];
         let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, true);
-        // `hit_material` is the raw packed cell word, not the decoded material id.
+        // `hit_cell` is the raw packed cell word, not the decoded material id.
         assert_eq!(
-            result.hit_material,
+            result.hit_cell,
             Some(mat1 as u32),
             "expected hit, events: {:#?}",
             result.events
@@ -743,7 +743,7 @@ mod tests {
                     let ro = [2.0, 2.0, 2.0];
                     let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
                     let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
-                    if result.hit_material.is_none() {
+                    if result.hit_cell.is_none() {
                         misses.push((x, y, z));
                     }
                 }
@@ -793,7 +793,7 @@ mod tests {
             ];
             let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
             let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
-            if result.hit_material.is_none() {
+            if result.hit_cell.is_none() {
                 misses += 1;
             }
         }
@@ -843,7 +843,7 @@ mod tests {
             ];
             let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
             let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
-            if result.hit_material.is_none() {
+            if result.hit_cell.is_none() {
                 misses += 1;
             }
         }
@@ -900,7 +900,7 @@ mod tests {
         let rd = [1.0, 0.0, 0.0];
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
         assert_eq!(
-            result.hit_material,
+            result.hit_cell,
             Some(mat3 as u32),
             "ray through a uniform leaf-root world must hit, events: {:#?}",
             result.events,
@@ -929,7 +929,7 @@ mod tests {
         let rd = [1.0, 0.0, 0.0];
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
         assert_eq!(
-            result.hit_material, None,
+            result.hit_cell, None,
             "ray through empty world must miss cleanly"
         );
         assert!(
@@ -1371,7 +1371,7 @@ mod tests {
             }
 
             total_steps += result.steps as u64;
-            if let Some(hit) = result.hit_material {
+            if let Some(hit) = result.hit_cell {
                 // Defensive: the scene has exactly one non-empty material
                 // — the raw packed word `mat(1)` (= `material=1 << 6 = 64`).
                 // Hitting anything else indicates a corruption in the DAG
@@ -1640,7 +1640,7 @@ mod tests {
              got true (steps={})",
             result.steps,
         );
-        assert_eq!(result.hit_material, Some(mat1 as u32));
+        assert_eq!(result.hit_cell, Some(mat1 as u32));
         assert!(result.steps < cpu_trace::step_budget(12));
     }
 
@@ -1674,7 +1674,7 @@ mod tests {
         // exhausted, with steps > 1 — otherwise the budget=1 witness
         // below would be vacuously satisfied.
         let natural = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
-        assert_eq!(natural.hit_material, None);
+        assert_eq!(natural.hit_cell, None);
         assert_eq!(
             natural.hit_normal, None,
             "clean miss must carry no normal (hash-thing-rv4 invariant)"
@@ -1700,10 +1700,10 @@ mod tests {
             "raycast_with_budget({budget}) must set exhausted=true when \
              the natural traversal ({natural_steps} steps) exceeds the \
              override — got exhausted={}, steps={}, hit={:?}",
-            result.exhausted, result.steps, result.hit_material,
+            result.exhausted, result.steps, result.hit_cell,
         );
         assert_eq!(
-            result.hit_material, None,
+            result.hit_cell, None,
             "exhausted traversal must report no hit (CPU path must match \
              shader behavior where the magenta sentinel replaces any hit)",
         );
@@ -1740,7 +1740,7 @@ mod tests {
             rd,
             false,
         );
-        assert_eq!(via_root_level.hit_material, via_budget.hit_material);
+        assert_eq!(via_root_level.hit_cell, via_budget.hit_cell);
         assert_eq!(via_root_level.steps, via_budget.steps);
         assert_eq!(via_root_level.exhausted, via_budget.exhausted);
     }
@@ -1785,10 +1785,10 @@ mod tests {
         for (name, ro, expected_normal) in cases {
             let rd = normalize([cx - ro[0], cy - ro[1], cz - ro[2]]);
             let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd, false);
-            // hit_material is the raw packed cell word, not the decoded
+            // hit_cell is the raw packed cell word, not the decoded
             // material id (post-1v0.1 16-bit tagged encoding).
             assert_eq!(
-                result.hit_material,
+                result.hit_cell,
                 Some(mat1 as u32),
                 "{name}: expected hit, got miss (exhausted={})",
                 result.exhausted,
@@ -1825,11 +1825,7 @@ mod tests {
         let ro = [cx - 1.0, cy - 1.0, cz];
         let rd = normalize([1.0, 1.0, 0.0]);
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
-        assert_eq!(
-            result.hit_material,
-            Some(mat1 as u32),
-            "corner hit must land"
-        );
+        assert_eq!(result.hit_cell, Some(mat1 as u32), "corner hit must land");
 
         let normal = result.hit_normal.expect("hit must carry a normal");
         // The cascade's first comparator is `tmin_v[0] >= tmin_v[1]`, so on
@@ -1877,7 +1873,7 @@ mod tests {
         for (name, rd, expected_normal) in cases {
             let result = cpu_trace::raycast(&dag.nodes, dag.root_level, center, *rd, false);
             assert_eq!(
-                result.hit_material,
+                result.hit_cell,
                 Some(mat1 as u32),
                 "{name}: expected inside-leaf hit, got miss (exhausted={})",
                 result.exhausted,
@@ -1900,7 +1896,7 @@ mod tests {
         let rd = normalize([1.0, 2.0, 3.0]);
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, center, rd, false);
         assert_eq!(
-            result.hit_material,
+            result.hit_cell,
             Some(mat1 as u32),
             "diagonal: expected inside-leaf hit, got miss (exhausted={})",
             result.exhausted,
@@ -1918,7 +1914,7 @@ mod tests {
     /// path. The CPU trace has four miss/exhausted sites; this test
     /// exercises the two most reachable ones (clean miss, pre-root miss).
     /// Empty-leaf and exhausted paths are covered by existing tests via
-    /// their `hit_material: None` assertion — the invariant "miss ⇒ no
+    /// their `hit_cell: None` assertion — the invariant "miss ⇒ no
     /// normal" holds by construction of the struct literals, but pinning
     /// it here is cheap insurance against future edits.
     #[test]
@@ -1932,7 +1928,7 @@ mod tests {
         let ro = [2.0, 2.0, 2.0];
         let rd = normalize([1.0, 1.0, 1.0]);
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
-        assert_eq!(result.hit_material, None, "ray away from root must miss");
+        assert_eq!(result.hit_cell, None, "ray away from root must miss");
         assert_eq!(
             result.hit_normal, None,
             "pre-root miss must carry no normal"
@@ -1943,7 +1939,7 @@ mod tests {
         let rd = normalize([-1.0, 0.0, 0.0]);
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
         assert_eq!(
-            result.hit_material, None,
+            result.hit_cell, None,
             "ray through empty corner of root must miss (voxel is at center)",
         );
         assert_eq!(result.hit_normal, None, "in-root miss must carry no normal");
