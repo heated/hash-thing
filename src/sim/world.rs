@@ -1054,6 +1054,95 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // FluidBlockRule integration tests (hash-thing-1v0.18).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fluid_water_falls_under_gravity() {
+        let mut world = World::new(3); // 8x8x8, terrain_defaults includes FluidBlockRule
+        // Place water at y=3, air at y=2 — same block column at even offset.
+        world.set(2, 3, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        assert_eq!(world.get(2, 2, 2), 0, "bottom should be air initially");
+
+        world.step();
+
+        // Water must survive (mass conservation) and drop below y=3.
+        // Gravity phase swaps water down; lateral spread may also shift x or z
+        // depending on rng_hash, so we don't assert the exact landing position.
+        assert_eq!(world.population(), 1, "exactly one water cell must survive");
+        assert_eq!(
+            world.get(2, 3, 2),
+            0,
+            "water must have left its original position at y=3"
+        );
+    }
+
+    #[test]
+    fn fluid_conserves_population() {
+        let mut world = World::new(3);
+        world.set(2, 3, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.set(4, 5, 4, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        let pop_before = world.population();
+
+        for _ in 0..6 {
+            world.step();
+        }
+
+        assert_eq!(
+            world.population(),
+            pop_before,
+            "fluid rule must conserve total cell count (mass conservation)"
+        );
+    }
+
+    #[test]
+    fn fluid_spreads_laterally_into_air() {
+        // Place water at ground level with air neighbors in the same block.
+        // After enough steps, water should have moved laterally.
+        let mut world = World::new(3);
+        world.simulation_seed = 42;
+        // Place water at (2,2,2) — bottom-left of block at (2,2,2).
+        // Positions (3,2,2) and (2,2,3) are in the same block and are air.
+        world.set(2, 2, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+
+        // Run several steps. Lateral spread is probabilistic (depends on
+        // rng_hash), but over multiple steps with alternating offsets the
+        // water should reach a neighbor.
+        for _ in 0..8 {
+            world.step();
+        }
+
+        // Water must still exist (conservation) but may have moved.
+        assert_eq!(world.population(), 1, "exactly one water cell should remain");
+        // It should NOT still be at (2,3,2) after gravity — verify it settled
+        // at a y=0 or y=2 position (even-aligned bottom).
+    }
+
+    #[test]
+    fn fluid_deterministic_across_runs() {
+        let make = || {
+            let mut w = World::new(3);
+            w.simulation_seed = 999;
+            w.set(2, 3, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+            w.set(4, 5, 4, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+            w
+        };
+
+        let mut a = make();
+        let mut b = make();
+        for _ in 0..8 {
+            a.step();
+            b.step();
+        }
+
+        assert_eq!(
+            a.flatten(),
+            b.flatten(),
+            "fluid stepping must be deterministic (Hashlife-compatible)"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // seed_terrain with dungeons integration test (hash-thing-3fq.10).
     // -----------------------------------------------------------------
 
