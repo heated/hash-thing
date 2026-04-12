@@ -979,6 +979,34 @@ mod tests {
     }
 
     #[test]
+    fn exposed_inert_stone_block_is_fixed_point() {
+        let mut brute = World::new(3);
+        let mut recur = World::new(3);
+        brute.set(wc(3), wc(3), wc(3), STONE);
+        recur.set(wc(3), wc(3), wc(3), STONE);
+        let before = brute.flatten();
+
+        brute.step();
+        recur.step_recursive();
+
+        assert_eq!(
+            brute.flatten(),
+            before,
+            "brute step should leave the stone fixed"
+        );
+        assert_eq!(
+            recur.flatten(),
+            before,
+            "recursive step should leave the stone fixed"
+        );
+        assert_eq!(
+            recur.flatten(),
+            brute.flatten(),
+            "recursive and brute-force stepping must agree on exposed inert blocks"
+        );
+    }
+
+    #[test]
     fn inert_uniform_state_detects_static_uniform_subtrees() {
         let mut world = World::new(3);
         let stone = world.store.uniform(3, STONE);
