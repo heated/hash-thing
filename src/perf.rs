@@ -21,6 +21,15 @@
 //! 3. **Don't call from sim/render/octree code.** Instrumentation lives at
 //!    call sites in `main.rs`. Threading `&mut Perf` through `step_flat` or
 //!    the render path would touch the determinism contract under h34.1 / h34.2.
+//!
+//! 4. **p95 collapses to max during warmup.** The p95 index is
+//!    `ceil(len * 0.95) - 1`, so for `len < ~20` samples the chosen
+//!    index is the last sorted entry — i.e. the session maximum. For
+//!    the first ~10 s of a run (or the first few seconds post-`R`
+//!    reset) the "p95" column in `summary()` is literally the max,
+//!    not a percentile. Wait until each metric has ~20+ samples
+//!    before trusting the p95 figure as a tail-latency signal.
+//!    `hash-thing-07f`.
 
 use std::collections::HashMap;
 use std::mem::size_of;
