@@ -7,6 +7,7 @@
 use std::fmt;
 
 use crate::octree::{Cell, CellState};
+use crate::sim::margolus::FluidBlockRule;
 use crate::sim::rule::{BlockRule, CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
 
 pub type MaterialId = u16;
@@ -26,6 +27,24 @@ pub const DIRT: CellState = Cell::pack(DIRT_MATERIAL_ID, 0).raw();
 pub const GRASS: CellState = Cell::pack(GRASS_MATERIAL_ID, 0).raw();
 pub const FIRE: CellState = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
 pub const WATER: CellState = Cell::pack(WATER_MATERIAL_ID, 0).raw();
+
+/// Density lookup for block rules (gravity, fluid). Maps material ID → density.
+///
+/// Values here must match `MaterialPhysicalProperties::density` in `terrain_defaults()`.
+/// If a material is missing, it gets density 0.0 (floats like air).
+pub fn material_density(cell: Cell) -> f32 {
+    if cell.is_empty() {
+        return 0.0;
+    }
+    match cell.material() {
+        STONE_MATERIAL_ID => 5.0,
+        DIRT_MATERIAL_ID => 2.0,
+        GRASS_MATERIAL_ID => 1.2,
+        WATER_MATERIAL_ID => 1.0,
+        FIRE_MATERIAL_ID => 0.05,
+        _ => 0.0,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleId(pub usize);
@@ -84,6 +103,8 @@ impl MaterialRegistry {
             reactive_material: FIRE_MATERIAL_ID,
             reaction_product: Cell::pack(STONE_MATERIAL_ID, 0),
         });
+        let fluid_block_rule =
+            registry.register_block_rule(FluidBlockRule::new(material_density, WATER_MATERIAL_ID));
 
         registry.insert(
             AIR_MATERIAL_ID,
@@ -184,7 +205,7 @@ impl MaterialRegistry {
                     conductivity: 0.6,
                 },
                 rule_id: water_rule,
-                block_rule_id: None,
+                block_rule_id: Some(fluid_block_rule),
             },
         );
 
@@ -633,5 +654,63 @@ mod tests {
         assert!(s.contains("stone"), "Display must list stone");
         assert!(s.contains("fire"), "Display must list fire");
         assert!(s.contains("MaterialRegistry"), "Display must have header");
+    }
+
+    #[test]
+    fn material_density_matches_registry() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let ids = [
+            AIR_MATERIAL_ID,
+            STONE_MATERIAL_ID,
+            DIRT_MATERIAL_ID,
+            GRASS_MATERIAL_ID,
+            FIRE_MATERIAL_ID,
+            WATER_MATERIAL_ID,
+        ];
+        for &id in &ids {
+            let cell = if id == AIR_MATERIAL_ID {
+                Cell::EMPTY
+            } else {
+                Cell::pack(id, 0)
+            };
+            let fn_density = material_density(cell);
+            let reg_density = registry.entry(id).unwrap().physical.density;
+            assert!(
+                (fn_density - reg_density).abs() < f32::EPSILON,
+                "material_density({}) = {fn_density}, registry = {reg_density}",
+                registry.entry(id).unwrap().visual.label
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_defaults_water_has_block_rule() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let water = registry.entry(WATER_MATERIAL_ID).unwrap();
+        assert!(
+            water.block_rule_id.is_some(),
+            "water must have a block rule for fluid flow"
+        );
+    }
+
+    #[test]
+    fn terrain_defaults_stone_grass_no_block_rule() {
+        let registry = MaterialRegistry::terrain_defaults();
+        assert!(
+            registry
+                .entry(STONE_MATERIAL_ID)
+                .unwrap()
+                .block_rule_id
+                .is_none(),
+            "stone should not have a block rule"
+        );
+        assert!(
+            registry
+                .entry(GRASS_MATERIAL_ID)
+                .unwrap()
+                .block_rule_id
+                .is_none(),
+            "grass should not have a block rule"
+        );
     }
 }
