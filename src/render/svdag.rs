@@ -205,7 +205,7 @@ impl Svdag {
 pub mod cpu_trace {
     use super::*;
 
-    const MAX_DEPTH: usize = 14;
+    pub const MAX_DEPTH: usize = 14;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
