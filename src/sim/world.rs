@@ -385,7 +385,7 @@ impl World {
             "step_ca called with {} pending mutations — call apply_mutations first",
             self.queue.len()
         );
-        self.step();
+        self.step_recursive();
     }
 
     /// Step the simulation forward one generation.

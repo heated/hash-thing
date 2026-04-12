@@ -296,13 +296,12 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                         winit::keyboard::Key::Character("s") => {
-                            // Single step. Instrumented with the same
-                            // `perf.start("step")` Timer as the auto-step
-                            // path (hash-thing-5qh + hash-thing-yri).
+                            // Single step via recursive Hashlife path, matching
+                            // the auto-step loop (hash-thing-6gf.8).
                             {
                                 let _t = self.perf.start("step");
                                 self.world.apply_mutations();
-                                self.world.step();
+                                self.world.step_recursive();
                                 let mut queue = std::mem::take(&mut self.world.queue);
                                 self.entities.update(&self.world, &mut queue);
                                 self.world.queue = queue;
@@ -478,7 +477,7 @@ impl ApplicationHandler for App {
                     {
                         let _t = self.perf.start("step");
                         self.world.apply_mutations();
-                        self.world.step();
+                        self.world.step_recursive();
                         let mut queue = std::mem::take(&mut self.world.queue);
                         self.entities.update(&self.world, &mut queue);
                         self.world.queue = queue;
