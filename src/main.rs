@@ -188,7 +188,11 @@ impl ApplicationHandler for App {
             let attrs = WindowAttributes::default()
                 .with_title("hash-thing | 3D Hashlife Engine")
                 .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
-            let window = Arc::new(event_loop.create_window(attrs).unwrap());
+            let window = Arc::new(
+                event_loop
+                    .create_window(attrs)
+                    .expect("failed to create main window"),
+            );
             self.window = Some(window.clone());
 
             let mut renderer =
@@ -601,8 +605,10 @@ fn main() {
     log::info!("  P: dump perf + memory summary (on demand)");
     log::info!("  Esc: quit");
 
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new();
-    event_loop.run_app(&mut app).unwrap();
+    event_loop
+        .run_app(&mut app)
+        .expect("event loop terminated with error");
 }
