@@ -584,11 +584,20 @@ pub mod cpu_trace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::octree::{Cell, NodeStore};
+    use crate::octree::{Cell, CellState, NodeStore};
 
     fn normalize(v: [f32; 3]) -> [f32; 3] {
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         [v[0] / len, v[1] / len, v[2] / len]
+    }
+
+    /// Pack a material id into a raw `CellState` word (metadata=0) so the
+    /// `Cell::from_raw` invariant holds at `set_cell` / `leaf` call sites.
+    /// Under the 16-bit tagged encoding raw values 1..=63 are the forbidden
+    /// "material 0 with metadata flavor" range, so tests that stored bare
+    /// u8 ids before 1v0.1 must round-trip through this helper.
+    fn mat(id: u16) -> CellState {
+        Cell::pack(id, 0).raw()
     }
 
     #[test]
@@ -776,7 +785,8 @@ mod tests {
     #[test]
     fn leaf_root_builds_degenerate_dag() {
         let mut store = NodeStore::new();
-        let root = store.leaf(3);
+        let mat3 = mat(3);
+        let root = store.leaf(mat3);
 
         // Any root_level should work. Pick something non-trivial to prove
         // the level is preserved on the `Svdag` struct independent of the
@@ -791,19 +801,20 @@ mod tests {
         for i in 0..8 {
             assert_eq!(
                 dag.nodes[1 + i],
-                LEAF_BIT | 3u32,
+                LEAF_BIT | mat3 as u32,
                 "child slot {i} must encode the leaf state inline",
             );
         }
         assert_eq!(dag.root_level, 5);
 
-        // Trace a ray straight through the center; must hit material 3.
+        // Trace a ray straight through the center; must hit the raw packed
+        // cell word for material 3 (not the bare material id).
         let ro = [-1.0, 0.5, 0.5];
         let rd = [1.0, 0.0, 0.0];
         let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
         assert_eq!(
             result.hit_material,
-            Some(3),
+            Some(mat3 as u32),
             "ray through a uniform leaf-root world must hit, events: {:#?}",
             result.events,
         );
@@ -856,7 +867,7 @@ mod tests {
         let mut root = store.empty(12);
         // Single deep voxel near the center so grazing rays sweep a lot of
         // empty space at MAX_DEPTH before hitting (or missing).
-        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        root = store.set_cell(root, 2048, 2048, 2048, mat(1));
         let dag = Svdag::build(&store, root, 12);
 
         // (origin, raw_direction) — captured from fuzz. Directions are not
@@ -904,11 +915,13 @@ mod tests {
     /// `ro ≈ (12.78218, -2.47332, -7.13861)` stalls pre-clamp with
     /// `t ≈ 14.847`, `oct_far ≈ 14.846751`, `dt ≈ 1.11e-6`, and
     /// `t_new = oct_far + dt` rounds back to exactly `t`.
+    // The fuzz reproducer is pasted verbatim — don't round it down.
+    #[allow(clippy::excessive_precision)]
     #[test]
     fn far_camera_forward_progress() {
         let mut store = NodeStore::new();
         let mut root = store.empty(12);
-        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        root = store.set_cell(root, 2048, 2048, 2048, mat(1));
         let dag = Svdag::build(&store, root, 12);
 
         // Each case starts the camera well outside the unit root cube so
@@ -949,7 +962,7 @@ mod tests {
         let mut root = store.empty(14);
         // Single voxel near the center at full MAX_DEPTH resolution.
         // At depth 14, the cell size is 1/16384 ≈ 6.1e-5.
-        root = store.set_cell(root, 8192, 8192, 8192, 1);
+        root = store.set_cell(root, 8192, 8192, 8192, mat(1));
         let dag = Svdag::build(&store, root, 14);
 
         // Far camera (|ro| ~ 10) with dominant + grazing axes so the ray
@@ -1021,7 +1034,7 @@ mod tests {
     fn dominant_axis_throughput_max_depth() {
         let mut store = NodeStore::new();
         let mut root = store.empty(14);
-        root = store.set_cell(root, 8192, 8192, 8192, 1);
+        root = store.set_cell(root, 8192, 8192, 8192, mat(1));
         let dag = Svdag::build(&store, root, 14);
 
         // Dominant-axis rays hitting and missing the single deep voxel
@@ -1068,7 +1081,7 @@ mod tests {
     fn step_past_t_is_local_frame() {
         let mut store = NodeStore::new();
         let mut root = store.empty(12);
-        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        root = store.set_cell(root, 2048, 2048, 2048, mat(1));
         let dag = Svdag::build(&store, root, 12);
 
         // |ro| ~ 100 — pre-clamp world-space t reaches ~99.5-100.5
@@ -1143,7 +1156,7 @@ mod tests {
     fn fuzz_grazing_forward_progress_property() {
         let mut store = NodeStore::new();
         let mut root = store.empty(12);
-        root = store.set_cell(root, 2048, 2048, 2048, 1);
+        root = store.set_cell(root, 2048, 2048, 2048, mat(1));
         let dag = Svdag::build(&store, root, 12);
 
         // Tight AABB of the single depth-12 voxel in world coordinates.
@@ -1271,14 +1284,16 @@ mod tests {
             }
 
             total_steps += result.steps as u64;
-            if let Some(mat) = result.hit_material {
+            if let Some(hit) = result.hit_material {
                 // Defensive: the scene has exactly one non-empty material
-                // (mat=1). Hitting anything else indicates a corruption in
-                // the DAG or the traversal reporting an empty leaf as hit.
+                // — the raw packed word `mat(1)` (= `material=1 << 6 = 64`).
+                // Hitting anything else indicates a corruption in the DAG
+                // or the traversal reporting an empty leaf as hit.
+                let expected = mat(1) as u32;
                 assert_eq!(
-                    mat, 1,
-                    "ysg fuzz case {i}: unexpected hit material {mat}, \
-                     only mat=1 exists in this scene",
+                    hit, expected,
+                    "ysg fuzz case {i}: unexpected hit word {hit}, \
+                     only packed cell {expected} exists in this scene",
                 );
                 traversal_hits += 1;
             }
@@ -1383,7 +1398,8 @@ mod tests {
     fn sparse_far_corner_hit_is_not_exhausted_depth12() {
         let mut store = NodeStore::new();
         let mut root = store.empty(12);
-        root = store.set_cell(root, 4095, 4095, 4095, 1);
+        let mat1 = mat(1);
+        root = store.set_cell(root, 4095, 4095, 4095, mat1);
         let dag = Svdag::build(&store, root, 12);
         assert_eq!(dag.root_level, 12);
 
@@ -1398,7 +1414,7 @@ mod tests {
              got true (steps={})",
             result.steps,
         );
-        assert_eq!(result.hit_material, Some(1));
+        assert_eq!(result.hit_material, Some(mat1 as u32));
         assert!(result.steps < cpu_trace::step_budget(12));
     }
 
@@ -1474,7 +1490,7 @@ mod tests {
     fn raycast_and_raycast_with_budget_agree_at_natural_budget() {
         let mut store = NodeStore::new();
         let mut root = store.empty(12);
-        root = store.set_cell(root, 4095, 4095, 4095, 1);
+        root = store.set_cell(root, 4095, 4095, 4095, mat(1));
         let dag = Svdag::build(&store, root, 12);
 
         let ro = [2.0, 2.0, 2.0];

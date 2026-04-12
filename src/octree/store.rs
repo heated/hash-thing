@@ -635,7 +635,7 @@ mod tests {
     fn from_flat_rejects_non_pow2() {
         let mut store = NodeStore::new();
         let side = 48usize;
-        let grid = vec![0u8; side * side * side];
+        let grid = vec![0 as CellState; side * side * side];
         let _ = store.from_flat(&grid, side);
     }
 
@@ -648,12 +648,12 @@ mod tests {
     fn from_flat_pow2_levels_roundtrip() {
         for level in 0u32..=6 {
             let side = 1usize << level;
-            let mut grid = vec![0u8; side * side * side];
+            let mut grid = vec![0 as CellState; side * side * side];
             // Drop a single live cell at the far corner so level-0
             // (single-cell) and level-6 (64³) both exercise a non-empty
             // build.
             let last = side - 1;
-            grid[last + last * side + last * side * side] = 1;
+            grid[last + last * side + last * side * side] = mat(1);
             let mut store = NodeStore::new();
             let root = store.from_flat(&grid, side);
             assert_eq!(
@@ -664,7 +664,7 @@ mod tests {
             // Roundtrip sanity: flatten it back and check the single live
             // cell survives.
             let out = store.flatten(root, side);
-            assert_eq!(out[last + last * side + last * side * side], 1);
+            assert_eq!(out[last + last * side + last * side * side], mat(1));
         }
     }
 
