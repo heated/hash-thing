@@ -339,7 +339,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### In progress (P0-P1, from bd)
 
-- ☐ **Core engine validation** (epic `m1f`, 1/12): proving the full loop — stepping + rendering + interaction — works at scale. `m1f.12` landed (stable NodeIds). Open P1: benchmarks (`m1f.1` hashlife, `m1f.2` SVDAG), edit propagation (`m1f.3`), infinite world growth (`m1f.4`), SVDAG arbitrary depth (`m1f.8`), content-only Margolus rewrite (`m1f.9`), incremental cache invalidation (`m1f.11`). Open P2: SVDAG edit sync (`m1f.5`), new CA rules (`m1f.6`), end-to-end demo (`m1f.7`).
+- ☐ **Core engine validation** (epic `m1f`, 10/13): proving the full loop works at scale. Landed: `m1f.3` edit propagation, `m1f.4` infinite world, `m1f.5` SVDAG edit sync, `m1f.6` new CA rules (sand/lava), `m1f.8` SVDAG depth 24, `m1f.9` content-only Margolus, `m1f.10` PRNG research, `m1f.11` incremental cache invalidation, `m1f.12` stable NodeIds, `m1f.13` spatial memoization enabled. Also: `99o` cache invalidation on direct edits, `7cz` terrain default scene. Open: `m1f.1` hashlife benchmark (in progress), `m1f.2` SVDAG benchmark, `m1f.7` end-to-end demo.
 
 ### Later (P2+, from bd)
 
