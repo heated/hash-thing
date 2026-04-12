@@ -111,7 +111,12 @@ impl HeadlessRenderer {
             camera_dir: [0.0; 4],
             camera_up: [0.0, 1.0, 0.0, 0.0],
             camera_right: [1.0, 0.0, 0.0, 0.0],
-            params: [64.0, RENDER_WIDTH as f32 / RENDER_HEIGHT as f32, 1.0, 0.0],
+            params: [
+                64.0,
+                RENDER_WIDTH as f32 / RENDER_HEIGHT as f32,
+                1.0,
+                RENDER_HEIGHT as f32,
+            ],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),

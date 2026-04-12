@@ -44,7 +44,7 @@ struct Uniforms {
     camera_dir: [f32; 4],
     camera_up: [f32; 4],
     camera_right: [f32; 4],
-    /// x: volume_size, y: aspect_ratio, z: fov_tan, w: time
+    /// x: volume_size, y: aspect_ratio, z: fov_tan, w: screen_height
     params: [f32; 4],
 }
 
@@ -953,7 +953,12 @@ impl Renderer {
             camera_dir: [cam_dir[0], cam_dir[1], cam_dir[2], 0.0],
             camera_up: [up[0], up[1], up[2], 0.0],
             camera_right: [right[0], right[1], right[2], 0.0],
-            params: [self.volume_size as f32, aspect, fov_tan, 0.0],
+            params: [
+                self.volume_size as f32,
+                aspect,
+                fov_tan,
+                self.config.height as f32,
+            ],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));

@@ -26,7 +26,7 @@ struct Uniforms {
     camera_dir: vec4<f32>,
     camera_up: vec4<f32>,
     camera_right: vec4<f32>,
-    // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: time
+    // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: screen_height
     params: vec4<f32>,
 };
 
@@ -177,6 +177,14 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let ro_local = ro_m + rd_m * entry;
     let t_exit = root_hit.y - entry;
 
+    // LOD (x5w): pixel angular size in [0,1]³ world-space. A voxel smaller
+    // than ~1 pixel isn't visually distinguishable — we can stop descending
+    // and treat it as a hit. `pixel_world` is the world-space size of one
+    // pixel at distance 1.0 from the camera.
+    let screen_height = u.params.w;
+    let fov_tan = u.params.z;
+    let pixel_world = select(0.0, 2.0 * fov_tan / screen_height, screen_height > 0.0);
+
     // Integer DDA state (hash-thing-pck).
     var int_pos: vec3<u32> = vec3<u32>(
         u32(clamp(floor(ro_local.x * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
@@ -233,6 +241,60 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let node_offset = stack_node[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
+
+            // LOD cutoff (x5w): if this voxel is sub-pixel, scan children
+            // for the first non-empty leaf and treat the whole octant as
+            // a solid hit at that color. Dramatically cuts step count for
+            // distant or complex geometry.
+            let t_dist = max(t + entry, 1e-4);
+            if pixel_world > 0.0 && half < pixel_world * t_dist {
+                // Find any non-empty child in this node.
+                var lod_mat: u32 = 0u;
+                for (var c = 0u; c < 8u; c = c + 1u) {
+                    let cs = dag_nodes[node_offset + 1u + c];
+                    if (cs & LEAF_BIT) != 0u {
+                        let m = cs & 0xFFFFu;
+                        if m > 0u { lod_mat = m; break; }
+                    } else if cs != 0u {
+                        // Interior child — pick its first leaf recursively
+                        // would be expensive; just use the first child of
+                        // the interior node as an approximation.
+                        let inner_first = dag_nodes[cs + 1u];
+                        if (inner_first & LEAF_BIT) != 0u {
+                            let m = inner_first & 0xFFFFu;
+                            if m > 0u { lod_mat = m; break; }
+                        }
+                    }
+                }
+                if lod_mat > 0u {
+                    // Shade as a flat-color hit at node center.
+                    let base = material_color(lod_mat);
+                    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+                    // Approximate normal: use the entry face of this node.
+                    let nmin = node_min;
+                    let nmax = node_min + vec3<f32>(half * 2.0);
+                    let nt1 = (nmin - ro_local) * inv_rd;
+                    let nt2 = (nmax - ro_local) * inv_rd;
+                    let ntmin_v = min(nt1, nt2);
+                    var normal = vec3<f32>(0.0, 1.0, 0.0);
+                    if ntmin_v.x >= ntmin_v.y && ntmin_v.x >= ntmin_v.z {
+                        normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);
+                    } else if ntmin_v.y >= ntmin_v.z {
+                        normal = vec3<f32>(0.0, -sign(rd.y), 0.0);
+                    } else {
+                        normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
+                    }
+                    let diffuse = max(dot(normal, light_dir), 0.0);
+                    let lit = base * (0.3 + diffuse * 0.7);
+                    let t_world = t + entry;
+                    let fog = exp(-t_world * 1.5);
+                    let fog_color = vec3<f32>(0.55, 0.70, 0.90);
+                    return vec4<f32>(mix(fog_color, lit, fog), 1.0);
+                }
+                // All children empty — step past this node
+                break;
+            }
+
             let oct = octant_of(pos, rd_m, node_min, half);
             // Stage 2: XOR to un-mirror the octant for DAG lookup.
             let child_slot = dag_nodes[node_offset + 1u + (oct ^ mirror_mask)];
