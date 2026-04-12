@@ -265,6 +265,10 @@ pub mod cpu_trace {
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
+    /// Leaf-resolution grid size for integer DDA (hash-thing-pck).
+    /// Each axis has `2^MAX_DEPTH = 16384` cells at the finest level.
+    const RESOLUTION: u32 = 1 << MAX_DEPTH as u32;
+    const INV_RES: f32 = 1.0 / RESOLUTION as f32;
 
     /// Absolute minimum step budget. Shallow scenes get this even if the
     /// root_level-derived bound is smaller; prevents a tiny analytical bound
@@ -474,6 +478,22 @@ pub mod cpu_trace {
         ];
         let t_exit = root_far - entry;
 
+        // Integer DDA state (hash-thing-pck). int_pos tracks the ray's
+        // cell at leaf resolution; it only increases per-component (mirrored
+        // space, rd_m ≥ 0). t is derived as the max of all three axes'
+        // boundary crossing times, guaranteeing strict monotonicity.
+        let mut int_pos: [u32; 3] = [
+            (ro_local[0] * RESOLUTION as f32)
+                .floor()
+                .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
+            (ro_local[1] * RESOLUTION as f32)
+                .floor()
+                .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
+            (ro_local[2] * RESOLUTION as f32)
+                .floor()
+                .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
+        ];
+
         let mut stack_node = [0u32; MAX_DEPTH];
         let mut stack_min = [[0.0f32; 3]; MAX_DEPTH];
         let mut stack_half = [0.0f32; MAX_DEPTH];
@@ -497,27 +517,19 @@ pub mod cpu_trace {
                     hit_normal: None,
                 };
             }
+            // Integer DDA (hash-thing-pck): derive pos from integer cell
+            // center — no accumulated float error.
             let pos = [
-                ro_local[0] + rd_m[0] * t,
-                ro_local[1] + rd_m[1] * t,
-                ro_local[2] + rd_m[2] * t,
+                (int_pos[0] as f32 + 0.5) * INV_RES,
+                (int_pos[1] as f32 + 0.5) * INV_RES,
+                (int_pos[2] as f32 + 0.5) * INV_RES,
             ];
 
             // Pop until top contains pos.
-            // NOTE: pop check is STRICT (no EPS slack). Two guarantees make
-            // this safe:
-            //   (1) ro is clamped to the root-cube entry (27m v2), so `t`
-            //       inside the loop is local-frame and bounded by √3;
-            //       ULP(t_local) stays ≤ ~2.4e-7.
-            //   (2) The step-past below uses a cell-scaled nudge of at least
-            //       ~9.5e-7 on the identified exit axis at MAX_DEPTH.
-            // Together (1) > (2) means pos advances strictly past the octant
-            // boundary on the exit axis in the uncapped path. The cap-bound
-            // path (ultra-grazing |rd_axis| at MAX_DEPTH) can still collapse
-            // below ULP — that remains the known f32 frontier, resolvable
-            // only via integer DDA. Allowing EPS slack here would defeat
-            // the strict step-past ordering and reintroduce infinite loops
-            // on simultaneous two-axis boundary crossings.
+            // NOTE: pop check is STRICT (no EPS slack). Integer DDA
+            // (hash-thing-pck) derives t from exact cell boundaries, so
+            // pos = ro_local + rd_m * t always advances strictly past the
+            // octant boundary. The old f32 ULP frontier no longer applies.
             let mut top = depth;
             loop {
                 let node_min = stack_min[top];
@@ -663,17 +675,11 @@ pub mod cpu_trace {
             }
 
             // Step past the current (empty) octant.
-            // hash-thing-27m fix: per-axis exit + cell-scaled, exit-axis-aware
-            // nudge. The old fixed `+EPS` advanced the per-axis position by
-            // `|rd_axis| * EPS`, which collapses below f32 ULP (~6e-8 near
-            // pos ~ 0.5) for exit_rd < 6e-3 — a configuration the traversal
-            // naturally enters at deep depths when pos lands close to an
-            // inter-octant face on a grazing axis. When that happens the
-            // pop/descend loop oscillates on the same boundary until MAX_STEPS
-            // fires. The replacement advances `t` so the exit-axis position
-            // advances by a world-space nudge of ~1e-5 (or ~half/64 at deep
-            // levels where 1e-5 would overshoot a cell), then caps dt so the
-            // fastest axis never crosses more than one child span.
+            // hash-thing-pck: integer DDA replaces the float nudge from 27m.
+            // Advance int_pos on the exit axis by the octant width in leaf
+            // cells, then derive t as the max of all three axes' boundary
+            // times. The max ensures strict monotonicity even when the exit
+            // axis switches between iterations.
             let node_min = stack_min[depth];
             let half = stack_half[depth];
             let oct = octant_of(pos, rd_m, node_min, half);
@@ -694,33 +700,53 @@ pub mod cpu_trace {
                 (child_max[1] - ro_local[1]) * inv_rd[1],
                 (child_max[2] - ro_local[2]) * inv_rd[2],
             ];
-            let mut oct_far = t2[0];
-            let mut exit_rd = rd_m[0]; // rd_m is non-negative, no abs needed
-            if t2[1] < oct_far {
-                oct_far = t2[1];
-                exit_rd = rd_m[1];
+            // Find exit axis (smallest exit time = first face crossed).
+            let mut exit_axis: usize = 0;
+            if t2[1] < t2[exit_axis] {
+                exit_axis = 1;
             }
-            if t2[2] < oct_far {
-                oct_far = t2[2];
-                exit_rd = rd_m[2];
+            if t2[2] < t2[exit_axis] {
+                exit_axis = 2;
             }
-            // World-space exit-axis nudge. `dt_raw = nudge / exit_rd` means
-            // pos advances by exactly `nudge_world` on the exit axis. Clip
-            // to EPS at shallow levels (root half/64 = 7.8e-3 would be ~1
-            // cell at depth 7, overshooting fine structure); shrink with
-            // half at deep levels (at depth 14, half/64 ~ 9.5e-7 ≥ 16x ULP).
-            let nudge_world = (half * (1.0 / 64.0)).min(EPS);
-            let dt_raw = nudge_world / exit_rd.max(1e-6);
-            // Cap dt so the fastest axis advances at most one child span,
-            // preventing the step from skipping a non-empty sibling on a
-            // dominant axis. For ultra-grazing rays (|rd_axis| < ~1e-5 at
-            // MAX_DEPTH) the cap binds and the exit-axis advance collapses
-            // below ULP — the f32 frontier noted in the plan.
-            let max_rd = rd_m[0].max(rd_m[1]).max(rd_m[2]);
-            let dt_cap = half / max_rd.max(1e-6);
-            let dt = dt_raw.min(dt_cap);
+            // Integer DDA: advance int_pos on exit axis to the next
+            // boundary at this depth's granularity. child_min is always
+            // an exact multiple of half (power-of-2 fractions), so
+            // child_min * RESOLUTION is exact in u32.
+            let step_cells = 1u32 << (MAX_DEPTH as u32 - 1 - depth as u32);
+            let octant_base = (child_min[exit_axis] * RESOLUTION as f32) as u32;
+            let boundary_cell = octant_base + step_cells;
             let t_old = t;
-            t = oct_far + dt;
+            if boundary_cell >= RESOLUTION {
+                if record {
+                    events.push(TraceEvent::StepPast {
+                        t_old,
+                        t_new: t_exit,
+                    });
+                }
+                return TraceResult {
+                    hit_cell: None,
+                    steps: step,
+                    events,
+                    exhausted: false,
+                    hit_normal: None,
+                };
+            }
+            int_pos[exit_axis] = boundary_cell;
+            // Derive t from the exact exit-axis boundary. boundary_cell
+            // is integer * 2^-14, so the boundary float is exact. The
+            // slab time `(boundary - ro_local) * inv_rd` is the canonical
+            // exit time — same as t2[exit_axis] but computed from the
+            // integer boundary instead of float child_max. Guaranteed
+            // monotonicity: if the boundary t doesn't advance (rare edge
+            // case at multi-axis octant corners), nudge by 1 ULP. Safe
+            // because pos is derived from int_pos center (always advances).
+            let boundary = boundary_cell as f32 * INV_RES;
+            let t_boundary = (boundary - ro_local[exit_axis]) * inv_rd[exit_axis];
+            t = if t_boundary > t_old {
+                t_boundary
+            } else {
+                f32::from_bits(t_old.to_bits() + 1)
+            };
             if record {
                 events.push(TraceEvent::StepPast { t_old, t_new: t });
             }

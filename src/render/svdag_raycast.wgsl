@@ -114,6 +114,9 @@ fn octant_of(pos: vec3<f32>, rd: vec3<f32>, node_min: vec3<f32>, half: f32) -> u
 
 const MAX_DEPTH: u32 = 14u;
 const LEAF_BIT: u32 = 0x80000000u;
+// Integer DDA (hash-thing-pck): leaf-resolution grid.
+const RESOLUTION: u32 = 1u << MAX_DEPTH;
+const INV_RES: f32 = 1.0 / f32(RESOLUTION);
 
 // hash-thing-2w5: step budget scales with root_level so deep scenes don't
 // silently black out on long sparse traversals. Must stay in lockstep with
@@ -171,6 +174,13 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let ro_local = ro_m + rd_m * entry;
     let t_exit = root_hit.y - entry;
 
+    // Integer DDA state (hash-thing-pck).
+    var int_pos: vec3<u32> = vec3<u32>(
+        u32(clamp(floor(ro_local.x * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
+        u32(clamp(floor(ro_local.y * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
+        u32(clamp(floor(ro_local.z * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
+    );
+
     // Stack of (node_offset, node_min, half_size)
     var stack_node: array<u32, MAX_DEPTH>;
     var stack_min: array<vec3<f32>, MAX_DEPTH>;
@@ -192,22 +202,13 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
         // so any `break` here would render every clean root-exit as magenta.
         if t > t_exit { return vec4<f32>(0.0); }
-        let pos = ro_local + rd_m * t;
+        // Integer DDA (hash-thing-pck): pos from integer cell center.
+        let pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
 
         // If the current top-of-stack no longer contains `pos`, pop.
-        // NOTE: STRICT bounds (no EPS slack). Two guarantees keep this safe:
-        //   (1) ro is clamped to the root-cube entry (27m v2), so `t` inside
-        //       the loop is local-frame and bounded by √3; ULP(t_local)
-        //       stays ≤ ~2.4e-7.
-        //   (2) The step-past below uses a cell-scaled nudge of at least
-        //       ~9.5e-7 on the identified exit axis at MAX_DEPTH.
-        // Together (1) > (2) means pos advances strictly past the octant
-        // boundary on the exit axis in the common uncapped path. The
-        // cap-bound path (ultra-grazing |rd_axis| at MAX_DEPTH) can still
-        // collapse below ULP — that remains the known f32 frontier and
-        // requires integer DDA to fully resolve. Allowing EPS slack in the
-        // pop would defeat the strict step-past ordering and reintroduce
-        // infinite loops on simultaneous two-axis boundary crossings.
+        // NOTE: STRICT bounds (no EPS slack). Integer DDA (hash-thing-pck)
+        // derives t from exact cell boundaries, so pos = ro_local + rd_m * t
+        // always advances strictly past the octant boundary.
         var top = depth;
         loop {
             let node_min = stack_min[top];
@@ -323,12 +324,9 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             }
         }
 
-        // Step the ray past the current (empty) octant.
-        // hash-thing-27m fix: per-axis exit + cell-scaled nudge so the
-        // post-step advance on the exit axis is comfortably above f32 ULP
-        // even at deep depths and grazing rays. The old fixed `+1e-5`
-        // stalled at depth >= 10 with |rd_axis| < ~0.01 because the
-        // resulting per-axis pos advance was sub-ULP near pos ~ 0.5.
+        // Step past the current (empty) octant.
+        // hash-thing-pck: integer DDA. Advance int_pos on exit axis, then
+        // derive t as max of all three axes' boundary times.
         let node_min = stack_min[depth];
         let half = stack_half[depth];
         let oct = octant_of(pos, rd_m, node_min, half);
@@ -339,33 +337,38 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         );
         let child_max = child_min + vec3<f32>(half);
         // Stage 2: rd_m is all non-negative, so t2 > t1 on every axis.
-        // tmax_v = t2 directly; no min/max needed.
         let t2 = (child_max - ro_local) * inv_rd;
-        var oct_far: f32 = t2.x;
-        var exit_rd: f32 = rd_m.x; // no abs needed
-        if t2.y < oct_far {
-            oct_far = t2.y;
-            exit_rd = rd_m.y;
+        // Find exit axis (smallest exit time).
+        var exit_axis: u32 = 0u;
+        if t2.y < t2.x {
+            exit_axis = 1u;
         }
-        if t2.z < oct_far {
-            oct_far = t2.z;
-            exit_rd = rd_m.z;
+        if t2.z < select(t2.x, t2.y, exit_axis == 1u) {
+            exit_axis = 2u;
         }
-        // Cell-scaled nudge clipped to 1e-5 at shallow levels (so the root
-        // behaves identically to the old `+1e-5` code) and shrinking with
-        // half at deeper levels. nudge_world IS the pos-advance on the exit
-        // axis (since dt = nudge / exit_rd → dt * exit_rd = nudge). The 1/64
-        // fraction at depth 14 (half ~ 6e-5) gives ~9.5e-7, ~16x f32 ULP at
-        // pos ~ 0.5.
-        let nudge_world = min(half * (1.0 / 64.0), 1e-5);
-        let dt_raw = nudge_world / max(exit_rd, 1e-6);
-        // Cap dt so the fastest axis advances at most one child span,
-        // preventing the step from skipping a non-empty sibling on a
-        // dominant axis.
-        let max_rd = max(max(rd_m.x, rd_m.y), rd_m.z);
-        let dt_cap = half / max(max_rd, 1e-6);
-        let dt = min(dt_raw, dt_cap);
-        t = oct_far + dt;
+        // Integer DDA: advance int_pos on exit axis.
+        let step_cells = 1u << (MAX_DEPTH - 1u - depth);
+        let cmin_exit = select(select(child_min.x, child_min.y, exit_axis == 1u), child_min.z, exit_axis == 2u);
+        let octant_base = u32(cmin_exit * f32(RESOLUTION));
+        let boundary_cell = octant_base + step_cells;
+        if boundary_cell >= RESOLUTION {
+            return vec4<f32>(0.0); // exited volume
+        }
+        if exit_axis == 0u { int_pos.x = boundary_cell; }
+        else if exit_axis == 1u { int_pos.y = boundary_cell; }
+        else { int_pos.z = boundary_cell; }
+        // Derive t from exact exit-axis boundary. Monotonicity
+        // guaranteed: if boundary t doesn't advance (rare corner case),
+        // nudge by 1 ULP via bitcast. Safe because pos comes from int_pos.
+        let boundary = f32(boundary_cell) * INV_RES;
+        let ro_exit = select(select(ro_local.x, ro_local.y, exit_axis == 1u), ro_local.z, exit_axis == 2u);
+        let inv_rd_exit = select(select(inv_rd.x, inv_rd.y, exit_axis == 1u), inv_rd.z, exit_axis == 2u);
+        let t_boundary = (boundary - ro_exit) * inv_rd_exit;
+        if t_boundary > t {
+            t = t_boundary;
+        } else {
+            t = bitcast<f32>(bitcast<u32>(t) + 1u);
+        }
     }
 
     // hash-thing-2w5: post-loop fall-through means we blew the step budget

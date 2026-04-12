@@ -613,4 +613,3 @@ fn main() {
         .run_app(&mut app)
         .expect("event loop terminated with error");
 }
-
