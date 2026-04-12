@@ -424,7 +424,15 @@ pub mod cpu_trace {
         rd: [f32; 3],
         record: bool,
     ) -> TraceResult {
-        let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+        // Guard against zero ray-direction components (hash-thing-5bb.8).
+        // Clamp near-zero values to ±ε so 1/d stays finite (≈±1e30) rather
+        // than producing inf/NaN that can break AABB slab tests.
+        #[inline]
+        fn safe_rcp(d: f32) -> f32 {
+            const EPS: f32 = 1e-30;
+            1.0 / if d.abs() < EPS { EPS.copysign(d) } else { d }
+        }
+        let inv_rd = [safe_rcp(rd[0]), safe_rcp(rd[1]), safe_rcp(rd[2])];
         let mut events = Vec::new();
 
         let (root_near, root_far) = intersect_aabb(ro, inv_rd, [0.0; 3], [1.0; 3]);
@@ -997,6 +1005,38 @@ mod tests {
             !result.exhausted,
             "empty leaf-root miss must not trip the budget"
         );
+    }
+
+    /// Axis-aligned rays with exactly-zero direction components must not
+    /// produce inf/NaN in the AABB slab test (hash-thing-5bb.8). Tests
+    /// all three principal axes hitting a known voxel at the center.
+    #[test]
+    fn zero_direction_components_no_inf() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        // Place a voxel at (8,8,8) in a 16³ world (level 4).
+        root = store.set_cell(root, 8, 8, 8, mat(1));
+        let dag = Svdag::build(&store, root, 4);
+
+        // Axis-aligned rays through the center, two components exactly 0.0.
+        let cases: [([f32; 3], [f32; 3]); 6] = [
+            ([-1.0, 0.53125, 0.53125], [1.0, 0.0, 0.0]),
+            ([2.0, 0.53125, 0.53125], [-1.0, 0.0, 0.0]),
+            ([0.53125, -1.0, 0.53125], [0.0, 1.0, 0.0]),
+            ([0.53125, 2.0, 0.53125], [0.0, -1.0, 0.0]),
+            ([0.53125, 0.53125, -1.0], [0.0, 0.0, 1.0]),
+            ([0.53125, 0.53125, 2.0], [0.0, 0.0, -1.0]),
+        ];
+
+        for (i, (ro, rd)) in cases.iter().enumerate() {
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, *rd, false);
+            assert!(
+                result.hit_cell.is_some(),
+                "case {i} (rd={rd:?}): axis-aligned ray with zero components \
+                 must hit the center voxel, not produce inf/NaN miss"
+            );
+            assert!(!result.exhausted, "case {i}: must not exhaust step budget");
+        }
     }
 
     /// Regression: grazing rays at deep depth must make forward progress

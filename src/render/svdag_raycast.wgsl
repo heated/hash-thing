@@ -136,7 +136,14 @@ const STEP_BUDGET_FUDGE: u32 = 8u;
 // budget. Optimizations (ray-octant mirroring, ancestor memoization, bitmask
 // coalescing) can be layered on later.
 fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
-    let inv_rd = 1.0 / rd;
+    // Guard against zero ray-direction components (hash-thing-5bb.8).
+    // Clamp near-zero to ±ε so 1/d stays finite, avoiding inf/NaN in
+    // AABB slab tests. sign(0)=0 in WGSL, so we use a < comparison for
+    // the negative branch — IEEE -0 < 0 is false, mapping to +ε (fine).
+    let rd_eps = vec3<f32>(1e-30);
+    let rd_sign = select(vec3<f32>(1.0), vec3<f32>(-1.0), rd < vec3<f32>(0.0));
+    let safe_rd = select(rd, rd_sign * rd_eps, abs(rd) < rd_eps);
+    let inv_rd = 1.0 / safe_rd;
 
     // Per-ray step budget (hash-thing-2w5). Derived from u.params.x which the
     // host sets to `1 << dag.root_level` cells per side. Must stay in

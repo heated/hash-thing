@@ -85,7 +85,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ro = u.camera_pos.xyz;
 
     // Volume sits in [0, 1]³
-    let hit = intersect_aabb(ro, 1.0 / rd, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Guard zero ray-direction components (hash-thing-5bb.8).
+    let rd_eps = vec3<f32>(1e-30);
+    let rd_sign = select(vec3<f32>(1.0), vec3<f32>(-1.0), rd < vec3<f32>(0.0));
+    let safe_rd = select(rd, rd_sign * rd_eps, abs(rd) < rd_eps);
+    let hit = intersect_aabb(ro, 1.0 / safe_rd, vec3<f32>(0.0), vec3<f32>(1.0));
 
     if hit.x > hit.y || hit.y < 0.0 {
         // Miss — background gradient
