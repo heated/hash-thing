@@ -1578,7 +1578,7 @@ mod tests {
     fn region_tracks_ensure_contains_growth() {
         let mut world = World::new(3); // side=8
         assert_eq!(world.region().side(), 8);
-        world.ensure_contains(20, 0, 0);
+        world.ensure_contains(wc(20), wc(0), wc(0));
         assert!(world.region().side() > 20);
         assert_eq!(world.region().level, world.level);
     }
