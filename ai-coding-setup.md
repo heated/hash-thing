@@ -308,6 +308,5 @@ Minimum viable reproduction for another repo:
 ## 9. Known Drift / Open Follow-Ups
 
 - `~/.claude/CLAUDE.md` still references `~/cmux-repo`, but that source checkout is not present here
-- project docs prefer `.bin/bd`; some Codex launch prompts still instruct `/usr/local/bin/bd`
 - browser automation is evidenced by logs, but its active config surface is not captured in one obvious file here
 - this file is a snapshot, not a self-updating system; if Edward wants it to stay current, it should either become part of the `.agents/` refresh discipline or get its own upkeep bead

@@ -8,7 +8,10 @@ Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` un
 
 ```
 gate-sensitivity: medium
+soft-max-command-seconds: 60
 ```
+
+Prefer commands that finish in under ~60s. Benchmarks, large builds, long test suites: run the smallest representative scale first. Only go bigger if explicitly asked or the small run was inconclusive. Background long runs rather than blocking.
 
 ## Agent surface — where project skills and commands live
 

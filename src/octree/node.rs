@@ -16,9 +16,9 @@
 /// simulation kernel and renderer unpack as needed.
 ///
 /// **Rust↔WGSL drift guard:** `METADATA_BITS = 6` is duplicated in
-/// `src/render/raycast.wgsl` and `src/render/svdag_raycast.wgsl` as the
-/// hardcoded `packed >> 6u` material decode. If `METADATA_BITS` changes
-/// here, both shaders must be updated to match. A unit test in
+/// `src/render/svdag_raycast.wgsl` as the hardcoded `packed >> 6u`
+/// material decode. If `METADATA_BITS` changes here, the shader must
+/// be updated to match. A unit test in
 /// `src/render/mod.rs` (or equivalent) should pin these together.
 pub type CellState = u16;
 
@@ -143,6 +143,14 @@ impl From<Cell> for u16 {
         cell.0
     }
 }
+
+/// Number of octree levels a gameplay "block" spans above leaf cells.
+/// K=0 → 1×1×1 (cell = block), K=3 → 8×8×8 cells per block.
+/// This is the single configurable knob for cell/block granularity.
+pub const CELLS_PER_BLOCK_LOG2: u32 = 3;
+
+/// Cells per block edge: 2^K.
+pub const CELLS_PER_BLOCK: u32 = 1 << CELLS_PER_BLOCK_LOG2;
 
 /// Index into the canonical node store. u32 to keep nodes small.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

@@ -1,5 +1,6 @@
 pub mod octree;
 pub mod perf;
+pub mod player;
 pub mod render;
 pub mod rng;
 pub mod sim;

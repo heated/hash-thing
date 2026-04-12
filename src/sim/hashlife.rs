@@ -18,15 +18,23 @@
 //!      (each level n-1), recursively step each → 8 results at level n-2.
 //!      Assemble into the level-(n-1) output.
 //!
-//! Step results are memoized by (NodeId, origin) so identical subtrees at
+//! Step results are memoized by (NodeId, origin, parity) so identical subtrees at
 //! the same world-space position are computed only once per generation.
-//! Since BlockRule is now a pure function of block contents (no position or
-//! generation dependency), spatial memoization is possible: identical subtrees
-//! at different positions can share cached results.
+//! After each step, compaction remaps NodeIds; the cache entries are translated
+//! through the remap table rather than cleared. Entries for GC'd nodes are
+//! dropped automatically. Since parity alternates 0/1, cache hits occur every
+//! OTHER frame for stable subtrees (parity match on frame N+2, not N+1).
 
 use super::world::World;
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, NodeId};
+use rustc_hash::FxHashMap;
+
+const LEVEL3_SIDE: usize = 8;
+const LEVEL3_CELL_COUNT: usize = LEVEL3_SIDE * LEVEL3_SIDE * LEVEL3_SIDE;
+const CENTER_LEVEL3_SIDE: usize = 4;
+const CENTER_LEVEL3_CELL_COUNT: usize =
+    CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE;
 
 impl World {
     /// Step the world forward one generation using the recursive Hashlife path.
@@ -36,6 +44,11 @@ impl World {
             "step_recursive requires level >= 3, got {}",
             self.level
         );
+        self.hashlife_stats = super::world::HashlifeStats::default();
+        // Auto-enable spatial memoization for CaRule-only worlds.
+        // BlockRule partition alignment depends on world-space origin, so
+        // origin must remain in the cache key when block rules are present.
+        self.spatial_memo = !self.materials.has_any_block_rules();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         // World-space origin of the padded root: the original world is
@@ -47,12 +60,10 @@ impl World {
         self.root = result;
         self.generation += 1;
 
-        self.hashlife_cache.clear();
-        self.hashlife_macro_cache.clear();
-        self.store.clear_step_cache();
-        let (new_store, new_root) = self.store.compacted(self.root);
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.remap_caches(&remap);
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -73,6 +84,7 @@ impl World {
             for _ in 0..steps {
                 self.step();
             }
+            self.block_rule_present = None; // brute-force may have consumed block-rule cells
             return;
         }
         let padded_root = self.pad_root();
@@ -83,20 +95,47 @@ impl World {
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
 
-        self.hashlife_cache.clear();
-        self.hashlife_macro_cache.clear();
-        self.store.clear_step_cache();
-        let (new_store, new_root) = self.store.compacted(self.root);
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.remap_caches(&remap);
     }
 
-    fn has_block_rule_cells(&self) -> bool {
-        self.flatten().into_iter().any(|state| {
+    fn has_block_rule_cells(&mut self) -> bool {
+        if let Some(cached) = self.block_rule_present {
+            return cached;
+        }
+        let result = self.flatten().into_iter().any(|state| {
             self.materials
                 .block_rule_id_for_cell(Cell::from_raw(state))
                 .is_some()
-        })
+        });
+        self.block_rule_present = Some(result);
+        result
+    }
+
+    /// Remap hashlife cache keys and values through a compaction remap table.
+    /// Entries referencing unreachable nodes (not in remap) are dropped.
+    fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
+        // Remap hashlife_cache: (NodeId, origin, parity) → NodeId
+        let old_cache = std::mem::take(&mut self.hashlife_cache);
+        self.hashlife_cache.reserve(old_cache.len());
+        for ((node, origin, parity), result) in old_cache {
+            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+                self.hashlife_cache
+                    .insert((new_node, origin, parity), new_result);
+            }
+        }
+
+        // Remap hashlife_macro_cache: (NodeId, origin, generation) → NodeId
+        let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
+        self.hashlife_macro_cache.reserve(old_macro.len());
+        for ((node, origin, gen), result) in old_macro {
+            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+                self.hashlife_macro_cache
+                    .insert((new_node, origin, gen), new_result);
+            }
+        }
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -117,12 +156,42 @@ impl World {
     /// Recursively step a node. Input level n (≥ 3), output level n-1.
     /// `origin` is the world-space coordinate of the node's (0,0,0) corner.
     fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
-        debug_assert!(level >= 3, "step_node requires level >= 3, got {level}");
+        assert!(level >= 3, "step_node requires level >= 3, got {level}");
+
+        // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
+        // (NoopRule is identity; GoL-family rules have birth_min >= 1). No BlockRule on air.
+        if self.store.population(node) == 0 {
+            self.hashlife_stats.empty_skips += 1;
+            return self.store.empty(level - 1);
+        }
+
+        // Spatial memoization: for CaRule-only worlds, identical subtrees at
+        // different positions produce the same result. Use (NodeId, parity)
+        // as cache key instead of (NodeId, origin, parity).
+        if self.spatial_memo {
+            let spatial_key = (node, parity);
+            if let Some(&cached) = self.hashlife_spatial_cache.get(&spatial_key) {
+                self.hashlife_stats.cache_hits += 1;
+                return cached;
+            }
+            self.hashlife_stats.cache_misses += 1;
+
+            let result = if level == 3 {
+                self.step_base_case(node, origin, parity)
+            } else {
+                self.step_recursive_case(node, level, origin, parity)
+            };
+
+            self.hashlife_spatial_cache.insert(spatial_key, result);
+            return result;
+        }
 
         let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
+            self.hashlife_stats.cache_hits += 1;
             return cached;
         }
+        self.hashlife_stats.cache_misses += 1;
 
         let result = if level == 3 {
             self.step_base_case(node, origin, parity)
@@ -137,9 +206,8 @@ impl World {
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
     fn step_base_case(&mut self, node: NodeId, origin: [i64; 3], _parity: u32) -> NodeId {
-        let side = 8usize;
-        let grid = self.store.flatten(node, side);
-        let next = self.step_grid_once(&grid, side, origin, self.generation);
+        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        let next = self.step_grid_once(&grid, origin, self.generation);
         self.center_level3_grid_to_node(&next)
     }
 
@@ -154,6 +222,12 @@ impl World {
             level >= 3,
             "step_node_macro requires level >= 3, got {level}"
         );
+
+        // Empty nodes step to empty across any number of generations:
+        // identity^N = identity. CaRule-only worlds (macro path prerequisite).
+        if self.store.population(node) == 0 {
+            return self.store.empty(level - 1);
+        }
 
         let key = (node, origin, generation);
         if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
@@ -171,25 +245,24 @@ impl World {
     }
 
     fn step_base_case_macro(&mut self, node: NodeId, origin: [i64; 3], generation: u64) -> NodeId {
-        let side = 8usize;
-        let grid = self.store.flatten(node, side);
-        let next = self.step_grid_once(&grid, side, origin, generation);
-        let next = self.step_grid_once(&next, side, origin, generation + 1);
+        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        let next = self.step_grid_once(&grid, origin, generation);
+        let next = self.step_grid_once(&next, origin, generation + 1);
         self.center_level3_grid_to_node(&next)
     }
 
     fn step_grid_once(
         &self,
         grid: &[CellState],
-        side: usize,
         origin: [i64; 3],
         generation: u64,
-    ) -> Vec<CellState> {
+    ) -> [CellState; LEVEL3_CELL_COUNT] {
+        let side = LEVEL3_SIDE;
         // Phase 1: CaRule on interior cells (1..side-1 on each axis).
         // The outermost ring cannot be evolved correctly because its neighbors
         // would wrap outside the padded region. Callers only extract the center
         // that remains valid after the requested number of steps.
-        let mut next = vec![0 as CellState; side * side * side];
+        let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
         for z in 1..side - 1 {
             for y in 1..side - 1 {
                 for x in 1..side - 1 {
@@ -232,17 +305,18 @@ impl World {
     }
 
     fn center_level3_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
-        let center_side = 4usize;
-        let mut center_grid = vec![0 as CellState; center_side * center_side * center_side];
-        for cz in 0..center_side {
-            for cy in 0..center_side {
-                for cx in 0..center_side {
-                    center_grid[cx + cy * center_side + cz * center_side * center_side] =
-                        grid[(cx + 2) + (cy + 2) * 8 + (cz + 2) * 8 * 8];
+        let mut center_grid = [0 as CellState; CENTER_LEVEL3_CELL_COUNT];
+        for cz in 0..CENTER_LEVEL3_SIDE {
+            for cy in 0..CENTER_LEVEL3_SIDE {
+                for cx in 0..CENTER_LEVEL3_SIDE {
+                    center_grid[cx
+                        + cy * CENTER_LEVEL3_SIDE
+                        + cz * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE] = grid
+                        [(cx + 2) + (cy + 2) * LEVEL3_SIDE + (cz + 2) * LEVEL3_SIDE * LEVEL3_SIDE];
                 }
             }
         }
-        self.store.from_flat(&center_grid, center_side)
+        self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
     }
 
     /// Apply a single block rule within a flat grid.
@@ -450,7 +524,7 @@ impl World {
 
     /// Extract the center (level n-1) of a level-n node.
     fn center_node(&mut self, node: NodeId, level: u32) -> NodeId {
-        debug_assert!(level >= 2, "center_node requires level >= 2");
+        assert!(level >= 2, "center_node requires level >= 2");
         let children = self.store.children(node);
         let mut center_children = [NodeId::EMPTY; 8];
         for oct in 0..8usize {
@@ -662,10 +736,10 @@ mod tests {
 
     #[test]
     fn recursive_matches_brute_force_multiple_steps() {
-        // Use level 4 (16x16x16) to keep materials away from the world boundary.
-        // FluidBlockRule's content-based hash can push water toward edges; a small
-        // world (level 3 = 8x8x8) risks cells reaching the boundary where brute-force
-        // and hashlife clip differently.
+        // Level 4 (16³) so cells stay well inside the boundary over 4 steps.
+        // Level 3 (8³) would let water drift to the edge where brute-force
+        // clips blocks and hashlife pads with empty — different boundary
+        // semantics that aren't the thing under test.
         let mut brute = World::new(4);
         let mut recur = World::new(4);
         for &(x, y, z, mat) in &[
@@ -756,10 +830,10 @@ mod tests {
             ("445", GameOfLife3D::rule445()),
             ("pyroclastic", GameOfLife3D::new(4, 7, 6, 8)),
         ];
-        let cases = [(3_u32, 1_usize, 2_u64), (4_u32, 3_usize, 4_u64)];
+        let cases = [(3_u32, 1_usize), (4_u32, 3_usize)];
 
         for (preset_idx, &(label, rule)) in presets.iter().enumerate() {
-            for (level, steps, margin) in cases {
+            for (level, steps) in cases {
                 for case_seed in 0..4_u64 {
                     let simulation_seed = 0x6f03_u64
                         ^ ((preset_idx as u64) << 16)
@@ -768,8 +842,8 @@ mod tests {
                     let initial_seed = simulation_seed ^ 0xa11ce_u64;
                     let mut brute = gol_world(level, rule, simulation_seed);
                     let mut recur = gol_world(level, rule, simulation_seed);
-                    seed_random_alive_cells(&mut brute, initial_seed, margin);
-                    seed_random_alive_cells(&mut recur, initial_seed, margin);
+                    seed_random_alive_cells(&mut brute, initial_seed, 0);
+                    seed_random_alive_cells(&mut recur, initial_seed, 0);
 
                     let case =
                         format!("{label} level={level} steps={steps} seed={simulation_seed:#x}");
@@ -882,9 +956,9 @@ mod tests {
     }
 
     /// Timing comparison: brute-force vs recursive Hashlife on 64³ terrain.
-    /// Run with `cargo test --release bench_stepper_comparison -- --ignored --nocapture`.
-    /// At 64³ the recursive path is ~3x slower due to hash-consing overhead;
-    /// its value comes from larger worlds, spatial redundancy, and exponential time-skip.
+    /// Run with `cargo test --release --lib bench_stepper_comparison -- --ignored --nocapture`.
+    /// At 64³ the recursive path is roughly at parity with brute-force thanks to
+    /// the empty-node short-circuit (6gf.14) and incremental cache (m1f.11/m1f.12).
     #[test]
     #[ignore]
     fn bench_stepper_comparison() {
@@ -947,5 +1021,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_level5_stone_only() {
+        // Level 5 = 32³ with inert stone only (no BlockRule).
+        // Exercises deep recursion without Margolus complexity.
+        let mut brute = World::new(5);
+        let mut recur = World::new(5);
+        let mut rng = SimpleRng::new(0xdee5_u64);
+        for z in 0..32u64 {
+            for y in 0..32u64 {
+                for x in 0..32u64 {
+                    if rng.next_u64().is_multiple_of(4) {
+                        brute.set(wc(x), wc(y), wc(z), STONE);
+                        recur.set(wc(x), wc(y), wc(z), STONE);
+                    }
+                }
+            }
+        }
+        assert_recursive_matches_bruteforce(brute, recur, 2, "level5-stone");
+    }
+
+    /// Seed water and stone with a margin. CaRule boundaries now match
+    /// (both absorbing), but BlockRule still differs: brute-force clips
+    /// partial blocks at edges, hashlife processes them via overlapping
+    /// sub-cubes. Margins keep block-rule-bearing cells away from edges.
+    fn seed_random_material_cells_margined(world: &mut World, seed: u64, margin: u64) {
+        let mut rng = SimpleRng::new(seed);
+        let side = world.side() as u64;
+        let water = crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw();
+        for z in margin..(side - margin) {
+            for y in margin..(side - margin) {
+                for x in margin..(side - margin) {
+                    let roll = rng.next_u64() % 7;
+                    let state = match roll {
+                        0 | 1 => water,
+                        2 => STONE,
+                        _ => 0,
+                    };
+                    if state != 0 {
+                        world.set(wc(x), wc(y), wc(z), state);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_level4_materials() {
+        let mut brute = World::new(4);
+        let mut recur = World::new(4);
+        seed_random_material_cells_margined(&mut brute, 0xdee4_u64, 2);
+        seed_random_material_cells_margined(&mut recur, 0xdee4_u64, 2);
+        assert_recursive_matches_bruteforce(brute, recur, 3, "level4-materials");
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_level5_materials() {
+        let mut brute = World::new(5);
+        let mut recur = World::new(5);
+        seed_random_material_cells_margined(&mut brute, 0xdee5_u64, 3);
+        seed_random_material_cells_margined(&mut recur, 0xdee5_u64, 3);
+        assert_recursive_matches_bruteforce(brute, recur, 2, "level5-materials");
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_level5_gol() {
+        // GoL at level 5 — the CaRule-only path through deep recursion
+        let rule = GameOfLife3D::rule445();
+        let mut brute = gol_world(5, rule, 0xd33f_u64);
+        let mut recur = gol_world(5, rule, 0xd33f_u64);
+        seed_random_alive_cells(&mut brute, 0xd33f_u64 ^ 0xa11ce, 0);
+        seed_random_alive_cells(&mut recur, 0xd33f_u64 ^ 0xa11ce, 0);
+        assert_recursive_matches_bruteforce(brute, recur, 2, "level5-gol-445");
+    }
+
+    #[test]
+    fn source_index_all_valid_pairs() {
+        assert_eq!(source_index(0, 0), (0, 0));
+        assert_eq!(source_index(0, 1), (0, 1));
+        assert_eq!(source_index(1, 0), (0, 1));
+        assert_eq!(source_index(1, 1), (1, 0));
+        assert_eq!(source_index(2, 0), (1, 0));
+        assert_eq!(source_index(2, 1), (1, 1));
+    }
+
+    #[test]
+    #[should_panic]
+    fn source_index_out_of_range_panics() {
+        source_index(3, 0);
     }
 }

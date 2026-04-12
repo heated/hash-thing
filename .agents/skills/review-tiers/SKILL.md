@@ -22,8 +22,9 @@ Gemini is rate-limited and fails ~50% of the time. If Gemini fails, proceed with
 ### Step 1: Compute diff stats
 
 ```bash
-git diff origin/master...HEAD --stat
-git diff origin/master...HEAD --numstat
+BASE_BRANCH=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)
+git diff "$BASE_BRANCH"...HEAD --stat
+git diff "$BASE_BRANCH"...HEAD --numstat
 ```
 
 Extract: **lines added**, **lines deleted**, **files changed**.

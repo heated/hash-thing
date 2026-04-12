@@ -88,31 +88,38 @@ PROMPT="You are crew seat '$SEAT' on the hash-thing project (a 3D voxel engine i
 CRITICAL SETUP — run these first:
   export BEADS_ACTOR=$SEAT
 
-IMPORTANT: Use the project '.bin/bd' wrapper, NOT bare 'bd'.
-The wrapper retries Dolt lock contention and carries project-local close checks.
+IMPORTANT: Use '.bin/bd' wrapper, NOT bare 'bd' — it retries Dolt lock contention.
 
+Read AGENTS.md for full project instructions, then:
   .bin/bd ready -n 10
 
-WORKFLOW — for each bead you pick:
+WORKFLOW — autonomous bead loop:
   1. .bin/bd update <id> --claim
-  2. Read the bead description: .bin/bd show <id>
-  3. Implement the fix/feature in Rust
-  4. Validate: cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
-  5. If cargo fmt --check fails, run cargo fmt
-  6. Commit (use git commit, match recent commit style from git log --oneline -5)
-  7. Land on main: git fetch origin && git rebase origin/main && git push origin HEAD:main
-  8. .bin/bd close <id>
-  9. Pick the next bead from .bin/bd ready
+  2. .bin/bd show <id> — read the full description
+  3. Implement in Rust
+  4. Validate: cargo test && cargo clippy --all-targets --locked -- -D warnings && cargo fmt
+  5. Commit (match style from git log --oneline -5)
+  6. Land on main: git fetch origin && git rebase origin/main && git push origin HEAD:main
+  7. .bin/bd close <id>
+  8. Re-poll: .bin/bd ready — take the top item
+
+Work in short chunks (5-30 min). Re-check .bin/bd ready between beads —
+a higher-priority bead may have appeared while you were working.
+
+DESIGN GATES — only park for genuine user-visible behavior changes:
+- User sees/does something different → park as blocked with a one-line reason
+- Implementation details, naming, module layout, on-disk format, refactors → decide yourself
+- When in doubt, check the gate-tier rubric in AGENTS.md
+
+WHEN QUEUE IS DRY — don't stop. Scout-tier work:
+- grep -rn 'TODO\|FIXME\|XXX' src/ and file new beads
+- Improve tests, docs, or crew infra
+- Only stop if nothing productive remains after scouting
 
 RULES:
-- Read AGENTS.md for full project instructions
 - Never pick beads with status 'blocked' or type 'epic'
-- If a bead requires a design decision (user-visible behavior change), park it:
-    .bin/bd update <id> --status blocked
-    .bin/bd comments add <id> 'Design gate: <reason>'
-  Then pick the next bead.
-- Always run cargo test before committing
-- Land every completed bead on origin/main before moving to the next one"
+- Always validate before committing
+- Land every completed bead on origin/main before picking the next"
 
 # Always write the prompt file (used by both modes)
 PROMPT_FILE="$WORKTREE_PATH/.codex-crew-prompt.md"

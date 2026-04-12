@@ -16,6 +16,25 @@ BD_REAL="${BD_REAL:-/usr/local/bin/bd}"
 MAX_RETRIES=5
 BASE_DELAY=1  # seconds
 
+# Worktrees get a stale .beads/ snapshot — always run bd from the main repo
+# root so every seat shares one authoritative Dolt database.  hash-thing-4p2
+#
+# Preserve the caller's identity: if BEADS_ACTOR isn't set, read .beads/actor
+# from the *original* cwd (the worktree) before cd'ing to main. Otherwise the
+# cd would pick up main's .beads/actor and misattribute work.
+main_repo_root() {
+    git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //'
+}
+if [ -z "${BEADS_ACTOR:-}" ] && [ -f .beads/actor ]; then
+    export BEADS_ACTOR
+    BEADS_ACTOR="$(cat .beads/actor)"
+fi
+ORIG_CWD="$PWD"
+MAIN_ROOT="$(main_repo_root)"
+if [ -n "$MAIN_ROOT" ] && [ -d "$MAIN_ROOT/.beads" ]; then
+    cd "$MAIN_ROOT"
+fi
+
 run_bd() {
     local output rc attempt
     for attempt in $(seq 0 "$MAX_RETRIES"); do
@@ -123,16 +142,19 @@ preflight_close() {
         return 2
     fi
 
+    # Use the caller's git context (worktree), not the main repo we cd'd into
+    local git_cwd="${ORIG_CWD:-.}"
+
     if [ -z "$require_commit" ]; then
-        require_commit=$(git rev-parse HEAD)
+        require_commit=$(git -C "$git_cwd" rev-parse HEAD)
     fi
 
-    if ! git rev-parse --verify "$require_commit^{commit}" >/dev/null 2>&1; then
+    if ! git -C "$git_cwd" rev-parse --verify "$require_commit^{commit}" >/dev/null 2>&1; then
         printf 'bd close: commit %s does not exist locally\n' "$require_commit" >&2
         return 2
     fi
 
-    if ! git merge-base --is-ancestor "$require_commit" HEAD; then
+    if ! git -C "$git_cwd" merge-base --is-ancestor "$require_commit" HEAD; then
         printf 'bd close: commit %s is not reachable from HEAD\n' "$require_commit" >&2
         return 2
     fi
