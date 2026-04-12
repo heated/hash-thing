@@ -90,6 +90,10 @@ pub struct World {
     /// Key: (NodeId, world-space origin). Value: stepped result NodeId.
     /// Cleared after each generation and on rule changes.
     pub(crate) hashlife_cache: FxHashMap<(NodeId, [i64; 3], u32), NodeId>,
+    /// Memoization cache for the exponential Hashlife macro-stepper (6gf.7).
+    /// Key: (NodeId, world-space origin, starting generation).
+    /// Cleared after each macro-step and on rule changes.
+    pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, [i64; 3], u64), NodeId>,
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
@@ -122,6 +126,7 @@ impl World {
             materials,
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
+            hashlife_macro_cache: FxHashMap::default(),
             queue: MutationQueue::new(),
         }
     }
@@ -146,6 +151,7 @@ impl World {
     pub fn invalidate_rule_caches(&mut self) {
         self.store.clear_step_cache();
         self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
@@ -662,6 +668,8 @@ impl World {
         params.validate().expect("invalid TerrainParams");
         self.store = NodeStore::new();
         self.store.clear_step_cache();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         let field = params.to_heightmap();
         let gen_start = std::time::Instant::now();
         let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
@@ -1784,6 +1792,34 @@ mod tests {
             w_caves.population(),
             w_plain.population()
         );
+    }
+
+    #[test]
+    fn expand_terrain_matches_direct_gen() {
+        // A world grown by expansion should produce the same terrain
+        // as one generated at the larger size from the start. This
+        // verifies there are no seams at expansion boundaries.
+        let params = TerrainParams::default();
+
+        // Path A: generate at level 3, then expand to level 4.
+        let mut grown = World::new(3);
+        grown.seed_terrain(&params);
+        grown.ensure_contains(wc(10), wc(0), wc(0)); // grows to level 4
+
+        // Path B: generate at level 4 directly.
+        let mut direct = World::new(4);
+        direct.seed_terrain(&params);
+
+        // Spot-check cells across the expansion boundary (x=8 is the seam).
+        for x in 0..16u64 {
+            for yz in [0u64, 3, 7] {
+                assert_eq!(
+                    grown.get(wc(x), wc(yz), wc(yz)),
+                    direct.get(wc(x), wc(yz), wc(yz)),
+                    "seam mismatch at ({x}, {yz}, {yz})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -56,7 +56,9 @@ impl NodeStore {
         if let Some(&id) = self.intern.get(&node) {
             return id;
         }
-        let id = NodeId(self.nodes.len() as u32);
+        let id = NodeId(
+            u32::try_from(self.nodes.len()).expect("NodeStore overflow: exceeded 2^32 nodes"),
+        );
         self.intern.insert(node.clone(), id);
         self.nodes.push(node);
         id

@@ -49,10 +49,55 @@ impl World {
         self.generation += 1;
 
         self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         self.store.clear_step_cache();
         let (new_store, new_root) = self.store.compacted(self.root);
         self.store = new_store;
         self.root = new_root;
+    }
+
+    /// Number of generations advanced by [`Self::step_recursive_pow2`].
+    pub fn recursive_pow2_step_count(&self) -> u64 {
+        1u64 << (self.level - 1)
+    }
+
+    /// Step the world forward by the largest power-of-two skip supported by
+    /// the current realized root size.
+    pub fn step_recursive_pow2(&mut self) {
+        assert!(
+            self.level >= 3,
+            "step_recursive_pow2 requires level >= 3, got {}",
+            self.level
+        );
+        if self.has_block_rule_cells() {
+            let steps = self.recursive_pow2_step_count();
+            for _ in 0..steps {
+                self.step();
+            }
+            return;
+        }
+        let padded_root = self.pad_root();
+        let padded_level = self.level + 1;
+        let quarter = 1u64 << (self.level - 1);
+        let origin = [-(quarter as i64); 3];
+        let result = self.step_node_macro(padded_root, padded_level, origin, self.generation);
+        self.root = result;
+        self.generation += self.recursive_pow2_step_count();
+
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.store.clear_step_cache();
+        let (new_store, new_root) = self.store.compacted(self.root);
+        self.store = new_store;
+        self.root = new_root;
+    }
+
+    fn has_block_rule_cells(&self) -> bool {
+        self.flatten().into_iter().any(|state| {
+            self.materials
+                .block_rule_id_for_cell(Cell::from_raw(state))
+                .is_some()
+        })
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -73,7 +118,7 @@ impl World {
     /// Recursively step a node. Input level n (≥ 3), output level n-1.
     /// `origin` is the world-space coordinate of the node's (0,0,0) corner.
     fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
-        debug_assert!(level >= 3, "step_node requires level >= 3, got {level}");
+        assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
@@ -92,21 +137,65 @@ impl World {
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
-    fn step_base_case(&mut self, node: NodeId, origin: [i64; 3], parity: u32) -> NodeId {
+    fn step_base_case(&mut self, node: NodeId, origin: [i64; 3], _parity: u32) -> NodeId {
         let side = 8usize;
         let grid = self.store.flatten(node, side);
+        let next = self.step_grid_once(&grid, side, origin, self.generation);
+        self.center_level3_grid_to_node(&next)
+    }
 
-        // Phase 1: CaRule on interior cells (1..7 on each axis).
-        // The outermost ring (0 and 7) can't have correct CaRule results because
-        // their neighbors would wrap incorrectly. But we only need the center
-        // 4×4×4 (positions 2..6) and the 1-cell border for BlockRule (1..7),
-        // so running CaRule on 1..7 suffices.
+    fn step_node_macro(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        origin: [i64; 3],
+        generation: u64,
+    ) -> NodeId {
+        debug_assert!(
+            level >= 3,
+            "step_node_macro requires level >= 3, got {level}"
+        );
+
+        let key = (node, origin, generation);
+        if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
+            return cached;
+        }
+
+        let result = if level == 3 {
+            self.step_base_case_macro(node, origin, generation)
+        } else {
+            self.step_recursive_case_macro(node, level, origin, generation)
+        };
+
+        self.hashlife_macro_cache.insert(key, result);
+        result
+    }
+
+    fn step_base_case_macro(&mut self, node: NodeId, origin: [i64; 3], generation: u64) -> NodeId {
+        let side = 8usize;
+        let grid = self.store.flatten(node, side);
+        let next = self.step_grid_once(&grid, side, origin, generation);
+        let next = self.step_grid_once(&next, side, origin, generation + 1);
+        self.center_level3_grid_to_node(&next)
+    }
+
+    fn step_grid_once(
+        &self,
+        grid: &[CellState],
+        side: usize,
+        origin: [i64; 3],
+        generation: u64,
+    ) -> Vec<CellState> {
+        // Phase 1: CaRule on interior cells (1..side-1 on each axis).
+        // The outermost ring cannot be evolved correctly because its neighbors
+        // would wrap outside the padded region. Callers only extract the center
+        // that remains valid after the requested number of steps.
         let mut next = vec![0 as CellState; side * side * side];
         for z in 1..side - 1 {
             for y in 1..side - 1 {
                 for x in 1..side - 1 {
                     let cell = Cell::from_raw(grid[x + y * side + z * side * side]);
-                    let neighbors = get_neighbors_from_grid(&grid, side, x, y, z);
+                    let neighbors = get_neighbors_from_grid(grid, side, x, y, z);
                     let rule = self.materials.rule_for_cell(cell).unwrap_or_else(|| {
                         panic!("missing CaRule for material {}", cell.material())
                     });
@@ -116,9 +205,7 @@ impl World {
         }
 
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
-        let offset = parity as usize;
-        // Iterate blocks whose origins are in [1, side-2] so they stay within
-        // the CaRule-valid interior.
+        let offset = (generation % 2) as usize;
         let start = offset;
         let mut bz = start;
         while bz + 1 < side - 1 {
@@ -126,16 +213,16 @@ impl World {
             while by + 1 < side - 1 {
                 let mut bx = start;
                 while bx + 1 < side - 1 {
-                    // World-space block origin.
                     let wbx = origin[0] + bx as i64;
                     let wby = origin[1] + by as i64;
                     let wbz = origin[2] + bz as i64;
-                    // Only fire if aligned with the generation's offset.
                     if wbx.rem_euclid(2) == offset as i64
                         && wby.rem_euclid(2) == offset as i64
                         && wbz.rem_euclid(2) == offset as i64
                     {
-                        self.apply_block_in_grid(&mut next, side, bx, by, bz, wbx, wby, wbz);
+                        self.apply_block_in_grid(
+                            &mut next, side, bx, by, bz, wbx, wby, wbz, generation,
+                        );
                     }
                     bx += 2;
                 }
@@ -144,14 +231,17 @@ impl World {
             bz += 2;
         }
 
-        // Extract center 4×4×4 (positions 2..6) → level-2 node.
+        next
+    }
+
+    fn center_level3_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
         let center_side = 4usize;
         let mut center_grid = vec![0 as CellState; center_side * center_side * center_side];
         for cz in 0..center_side {
             for cy in 0..center_side {
                 for cx in 0..center_side {
                     center_grid[cx + cy * center_side + cz * center_side * center_side] =
-                        next[(cx + 2) + (cy + 2) * side + (cz + 2) * side * side];
+                        grid[(cx + 2) + (cy + 2) * 8 + (cz + 2) * 8 * 8];
                 }
             }
         }
@@ -170,6 +260,7 @@ impl World {
         wbx: i64,
         wby: i64,
         wbz: i64,
+        generation: u64,
     ) {
         let mut block = [Cell::EMPTY; 8];
         for dz in 0..2 {
@@ -194,9 +285,9 @@ impl World {
         let rule = self.materials.block_rule(rule_id);
         let ctx = BlockContext {
             block_origin: [wbx, wby, wbz],
-            generation: self.generation,
+            generation,
             world_seed: self.simulation_seed,
-            rng_hash: cell_hash(wbx, wby, wbz, self.generation, self.simulation_seed),
+            rng_hash: cell_hash(wbx, wby, wbz, generation, self.simulation_seed),
         };
 
         let result = rule.step_block(&block, &ctx);
@@ -292,9 +383,89 @@ impl World {
         self.store.interior(level - 1, result_children)
     }
 
+    fn step_recursive_case_macro(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        origin: [i64; 3],
+        generation: u64,
+    ) -> NodeId {
+        debug_assert!(level > 3, "macro recursive case requires level > 3");
+        let children = self.store.children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+
+        let quarter = 1i64 << (level - 2);
+        let half_quarter = quarter / 2;
+        let half_skip = 1u64 << (level - 3);
+
+        // Phase 1: compute each overlapping level-(n-1) intermediate node's
+        // center after half of the parent's time skip.
+        let mut phased = [NodeId::EMPTY; 27];
+        for pz in 0..3usize {
+            for py in 0..3usize {
+                for px in 0..3usize {
+                    let mut octants = [NodeId::EMPTY; 8];
+                    for sz in 0..2usize {
+                        for sy in 0..2usize {
+                            for sx in 0..2usize {
+                                let (parent_x, sub_x) = source_index(px, sx);
+                                let (parent_y, sub_y) = source_index(py, sy);
+                                let (parent_z, sub_z) = source_index(pz, sz);
+                                let parent_oct =
+                                    octant_index(parent_x as u32, parent_y as u32, parent_z as u32);
+                                let sub_oct =
+                                    octant_index(sub_x as u32, sub_y as u32, sub_z as u32);
+                                octants[octant_index(sx as u32, sy as u32, sz as u32)] =
+                                    sub[parent_oct][sub_oct];
+                            }
+                        }
+                    }
+                    let inter = self.store.interior(level - 1, octants);
+                    let inter_origin = [
+                        origin[0] + (px as i64) * quarter,
+                        origin[1] + (py as i64) * quarter,
+                        origin[2] + (pz as i64) * quarter,
+                    ];
+                    phased[px + py * 3 + pz * 9] =
+                        self.step_node_macro(inter, level - 1, inter_origin, generation);
+                }
+            }
+        }
+
+        // Phase 2: assemble those half-stepped centers into the 8 overlapping
+        // sub-cubes, then advance the remaining half-skip from the shifted
+        // generation base.
+        let mut result_children = [NodeId::EMPTY; 8];
+        for oz in 0..2usize {
+            for oy in 0..2usize {
+                for ox in 0..2usize {
+                    let mut sub_cube = [NodeId::EMPTY; 8];
+                    for dz in 0..2usize {
+                        for dy in 0..2usize {
+                            for dx in 0..2usize {
+                                sub_cube[octant_index(dx as u32, dy as u32, dz as u32)] =
+                                    phased[(ox + dx) + (oy + dy) * 3 + (oz + dz) * 9];
+                            }
+                        }
+                    }
+                    let sub_root = self.store.interior(level - 1, sub_cube);
+                    let sub_origin = [
+                        origin[0] + half_quarter + (ox as i64) * quarter,
+                        origin[1] + half_quarter + (oy as i64) * quarter,
+                        origin[2] + half_quarter + (oz as i64) * quarter,
+                    ];
+                    result_children[octant_index(ox as u32, oy as u32, oz as u32)] = self
+                        .step_node_macro(sub_root, level - 1, sub_origin, generation + half_skip);
+                }
+            }
+        }
+
+        self.store.interior(level - 1, result_children)
+    }
+
     /// Extract the center (level n-1) of a level-n node.
     fn center_node(&mut self, node: NodeId, level: u32) -> NodeId {
-        debug_assert!(level >= 2, "center_node requires level >= 2");
+        assert!(level >= 2, "center_node requires level >= 2");
         let children = self.store.children(node);
         let mut center_children = [NodeId::EMPTY; 8];
         for oct in 0..8usize {
@@ -419,6 +590,68 @@ mod tests {
                 brute.generation, recur.generation,
                 "{label}: generation counter diverged"
             );
+        }
+    }
+
+    fn embed_world_in_center(source: &World, target: &mut World) {
+        let source_side = source.side() as u64;
+        let target_side = target.side() as u64;
+        let offset = (target_side - source_side) / 2;
+        let grid = source.flatten();
+
+        for z in 0..source_side {
+            for y in 0..source_side {
+                for x in 0..source_side {
+                    let idx = x as usize
+                        + y as usize * source_side as usize
+                        + z as usize * source_side as usize * source_side as usize;
+                    let state = grid[idx];
+                    if state != 0 {
+                        target.set(wc(offset + x), wc(offset + y), wc(offset + z), state);
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_center_cube(world: &World, side: u64) -> Vec<CellState> {
+        let world_side = world.side() as u64;
+        let offset = (world_side - side) / 2;
+        let mut grid = vec![0; (side * side * side) as usize];
+
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let idx = x as usize
+                        + y as usize * side as usize
+                        + z as usize * side as usize * side as usize;
+                    grid[idx] = world.get(wc(offset + x), wc(offset + y), wc(offset + z));
+                }
+            }
+        }
+
+        grid
+    }
+
+    fn seed_random_material_cells(world: &mut World, seed: u64) {
+        let mut rng = SimpleRng::new(seed);
+        let side = world.side() as u64;
+        let water = crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw();
+
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let roll = rng.next_u64() % 7;
+                    let state = match roll {
+                        0 | 1 => water,
+                        2 => STONE,
+                        _ => 0,
+                    };
+                    if state != 0 {
+                        world.set(wc(x), wc(y), wc(z), state);
+                    }
+                }
+            }
         }
     }
     #[test]
@@ -558,6 +791,65 @@ mod tests {
     }
 
     #[test]
+    fn recursive_pow2_matches_centered_bruteforce_reference() {
+        let presets = [
+            ("amoeba", GameOfLife3D::new(9, 26, 5, 7)),
+            ("crystal", GameOfLife3D::new(0, 6, 1, 3)),
+            ("445", GameOfLife3D::rule445()),
+            ("pyroclastic", GameOfLife3D::new(4, 7, 6, 8)),
+        ];
+
+        for (preset_idx, &(label, rule)) in presets.iter().enumerate() {
+            for level in [3_u32, 4_u32] {
+                let simulation_seed = 0x6f07_u64 ^ ((preset_idx as u64) << 16) ^ (level as u64);
+                let mut fast = gol_world(level, rule, simulation_seed);
+                let mut brute = gol_world(level + 1, rule, simulation_seed);
+                seed_random_alive_cells(&mut fast, simulation_seed ^ 0xfeed_u64, 0);
+                embed_world_in_center(&fast, &mut brute);
+
+                let skip = fast.recursive_pow2_step_count();
+                for _ in 0..skip {
+                    brute.step();
+                }
+                fast.step_recursive_pow2();
+
+                assert_eq!(
+                    fast.flatten(),
+                    extract_center_cube(&brute, fast.side() as u64),
+                    "{label} level={level} skip={skip}: macro-step mismatch"
+                );
+                assert_eq!(
+                    fast.generation, skip,
+                    "{label} level={level}: generation should advance by the macro skip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_pow2_tracks_nonzero_generation_for_material_rules() {
+        let mut fast = World::new(3);
+        let mut expected = World::new(3);
+        fast.generation = 1;
+        expected.generation = 1;
+        seed_random_material_cells(&mut fast, 0x5eed_u64);
+        seed_random_material_cells(&mut expected, 0x5eed_u64);
+
+        let skip = fast.recursive_pow2_step_count();
+        for _ in 0..skip {
+            expected.step();
+        }
+        fast.step_recursive_pow2();
+
+        assert_eq!(
+            fast.flatten(),
+            expected.flatten(),
+            "material pow2 fallback should match repeated brute-force stepping"
+        );
+        assert_eq!(fast.generation, 1 + skip);
+    }
+
+    #[test]
     fn recursive_conserves_population_with_stone() {
         let mut world = World::new(3);
         world.set(wc(3), wc(3), wc(3), STONE);
@@ -666,5 +958,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn source_index_all_valid_pairs() {
+        assert_eq!(source_index(0, 0), (0, 0));
+        assert_eq!(source_index(0, 1), (0, 1));
+        assert_eq!(source_index(1, 0), (0, 1));
+        assert_eq!(source_index(1, 1), (1, 0));
+        assert_eq!(source_index(2, 0), (1, 0));
+        assert_eq!(source_index(2, 1), (1, 1));
+    }
+
+    #[test]
+    #[should_panic]
+    fn source_index_out_of_range_panics() {
+        source_index(3, 0);
     }
 }
