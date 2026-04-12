@@ -10,6 +10,10 @@ pub(crate) const ALIVE: Cell = Cell::pack(1, 0);
 /// neighbors and return the next cell state for that center.
 pub trait CaRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
+
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 /// A block-based CA rule operating on 2x2x2 cell blocks.
@@ -47,6 +51,10 @@ pub struct NoopRule;
 impl CaRule for NoopRule {
     fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
         center
+    }
+
+    fn is_noop(&self) -> bool {
+        true
     }
 }
 

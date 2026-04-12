@@ -48,12 +48,13 @@ fn bench_step(label: &str, level: u32, generations: usize, spatial_memo: bool) {
 
         if gen < 3 || gen == generations - 1 {
             eprintln!(
-                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, rate={:.1}%",
+                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
                 us as f64 / 1000.0,
                 world.population(),
                 s.cache_hits,
                 s.cache_misses,
                 s.empty_skips,
+                s.fixed_point_skips,
                 hit_rate,
             );
         } else if gen == 3 {
@@ -116,8 +117,11 @@ fn bench_edit_propagation(label: &str, level: u32, edits: usize) {
     let warm_ms = t.elapsed().as_millis();
     let warm_stats = world.hashlife_stats;
     eprintln!(
-        "  warm step: {warm_ms}ms, hits={}, misses={}, empty={}",
-        warm_stats.cache_hits, warm_stats.cache_misses, warm_stats.empty_skips,
+        "  warm step: {warm_ms}ms, hits={}, misses={}, empty={}, fixed={}",
+        warm_stats.cache_hits,
+        warm_stats.cache_misses,
+        warm_stats.empty_skips,
+        warm_stats.fixed_point_skips,
     );
 
     // Place block(s) in the middle of the world, then re-step
@@ -147,8 +151,11 @@ fn bench_edit_propagation(label: &str, level: u32, edits: usize) {
         f64::INFINITY
     };
     eprintln!(
-        "  post-edit step: {edit_ms}ms ({speedup:.1}x vs warm), hits={}, misses={}, empty={}, rate={hit_rate:.1}%",
-        edit_stats.cache_hits, edit_stats.cache_misses, edit_stats.empty_skips,
+        "  post-edit step: {edit_ms}ms ({speedup:.1}x vs warm), hits={}, misses={}, empty={}, fixed={}, rate={hit_rate:.1}%",
+        edit_stats.cache_hits,
+        edit_stats.cache_misses,
+        edit_stats.empty_skips,
+        edit_stats.fixed_point_skips,
     );
     eprintln!();
 }
@@ -186,16 +193,16 @@ fn bench_edit_cache_impact_64() {
     world.step_recursive();
     let warm = world.hashlife_stats;
     eprintln!(
-        "warm:      hits={}, misses={}, empty={}",
-        warm.cache_hits, warm.cache_misses, warm.empty_skips
+        "warm:      hits={}, misses={}, empty={}, fixed={}",
+        warm.cache_hits, warm.cache_misses, warm.empty_skips, warm.fixed_point_skips
     );
 
     // No edit — re-step same world (all cache hits)
     world.step_recursive();
     let cached = world.hashlife_stats;
     eprintln!(
-        "no-edit:   hits={}, misses={}, empty={}",
-        cached.cache_hits, cached.cache_misses, cached.empty_skips
+        "no-edit:   hits={}, misses={}, empty={}, fixed={}",
+        cached.cache_hits, cached.cache_misses, cached.empty_skips, cached.fixed_point_skips
     );
 
     // One edit — measure cache survival
@@ -208,7 +215,7 @@ fn bench_edit_cache_impact_64() {
     world.step_recursive();
     let edited = world.hashlife_stats;
     eprintln!(
-        "one-edit:  hits={}, misses={}, empty={}",
-        edited.cache_hits, edited.cache_misses, edited.empty_skips
+        "one-edit:  hits={}, misses={}, empty={}, fixed={}",
+        edited.cache_hits, edited.cache_misses, edited.empty_skips, edited.fixed_point_skips
     );
 }

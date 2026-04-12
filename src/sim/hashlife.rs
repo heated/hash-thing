@@ -27,7 +27,7 @@
 
 use super::world::World;
 use crate::octree::node::octant_index;
-use crate::octree::{Cell, CellState, NodeId};
+use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 
 const LEVEL3_SIDE: usize = 8;
@@ -114,6 +114,32 @@ impl World {
         result
     }
 
+    fn inert_uniform_state(&mut self, node: NodeId) -> Option<CellState> {
+        if let Some(&cached) = self.hashlife_inert_cache.get(&node) {
+            return cached;
+        }
+
+        let result = match self.store.get(node).clone() {
+            Node::Leaf(state) => self
+                .materials
+                .cell_is_inert_fixed_point(Cell::from_raw(state))
+                .then_some(state),
+            Node::Interior { children, .. } => {
+                let state = self.inert_uniform_state(children[0])?;
+                for child in children.into_iter().skip(1) {
+                    if self.inert_uniform_state(child) != Some(state) {
+                        self.hashlife_inert_cache.insert(node, None);
+                        return None;
+                    }
+                }
+                Some(state)
+            }
+        };
+
+        self.hashlife_inert_cache.insert(node, result);
+        result
+    }
+
     /// Remap hashlife cache keys and values through a compaction remap table.
     /// Entries referencing unreachable nodes (not in remap) are dropped.
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
@@ -134,6 +160,25 @@ impl World {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
                 self.hashlife_macro_cache
                     .insert((new_node, origin, gen), new_result);
+            }
+        }
+
+        // Remap hashlife_spatial_cache: (NodeId, parity) → NodeId
+        let old_spatial = std::mem::take(&mut self.hashlife_spatial_cache);
+        self.hashlife_spatial_cache.reserve(old_spatial.len());
+        for ((node, parity), result) in old_spatial {
+            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+                self.hashlife_spatial_cache
+                    .insert((new_node, parity), new_result);
+            }
+        }
+
+        // Remap hashlife_inert_cache: NodeId → Option<CellState>
+        let old_inert = std::mem::take(&mut self.hashlife_inert_cache);
+        self.hashlife_inert_cache.reserve(old_inert.len());
+        for (node, state) in old_inert {
+            if let Some(&new_node) = remap.get(&node) {
+                self.hashlife_inert_cache.insert(new_node, state);
             }
         }
     }
@@ -163,6 +208,11 @@ impl World {
         if self.store.population(node) == 0 {
             self.hashlife_stats.empty_skips += 1;
             return self.store.empty(level - 1);
+        }
+
+        if let Some(state) = self.inert_uniform_state(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return self.store.uniform(level - 1, state);
         }
 
         // Spatial memoization: for CaRule-only worlds, identical subtrees at
@@ -227,6 +277,11 @@ impl World {
         // identity^N = identity. CaRule-only worlds (macro path prerequisite).
         if self.store.population(node) == 0 {
             return self.store.empty(level - 1);
+        }
+
+        if let Some(state) = self.inert_uniform_state(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return self.store.uniform(level - 1, state);
         }
 
         let key = (node, origin, generation);
@@ -920,6 +975,50 @@ mod tests {
         let pop_before = world.population();
         world.step_recursive();
         assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn inert_uniform_state_detects_static_uniform_subtrees() {
+        let mut world = World::new(3);
+        let stone = world.store.uniform(3, STONE);
+        let water = world
+            .store
+            .uniform(3, crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        let stone_leaf = world.store.leaf(STONE);
+        let empty_leaf = world.store.leaf(0);
+        let mixed = world.store.interior(
+            1,
+            [
+                stone_leaf, stone_leaf, stone_leaf, stone_leaf, stone_leaf, stone_leaf, stone_leaf,
+                empty_leaf,
+            ],
+        );
+
+        assert_eq!(world.inert_uniform_state(stone), Some(STONE));
+        assert_eq!(world.inert_uniform_state(water), None);
+        assert_eq!(world.inert_uniform_state(mixed), None);
+    }
+
+    #[test]
+    fn step_node_short_circuits_uniform_inert_subtrees() {
+        let mut world = World::new(3);
+        let stone = world.store.uniform(3, STONE);
+
+        let stepped = world.step_node(stone, 3, [0, 0, 0], 0);
+
+        assert_eq!(stepped, world.store.uniform(2, STONE));
+        assert_eq!(world.hashlife_stats.fixed_point_skips, 1);
+    }
+
+    #[test]
+    fn step_node_macro_short_circuits_uniform_inert_subtrees() {
+        let mut world = World::new(3);
+        let stone = world.store.uniform(3, STONE);
+
+        let stepped = world.step_node_macro(stone, 3, [0, 0, 0], 0);
+
+        assert_eq!(stepped, world.store.uniform(2, STONE));
+        assert_eq!(world.hashlife_stats.fixed_point_skips, 1);
     }
 
     #[test]

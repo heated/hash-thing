@@ -93,6 +93,10 @@ pub struct World {
     /// Key: (NodeId, parity) — no origin, so identical subtrees anywhere
     /// in the world share a single cache entry.
     pub(crate) hashlife_spatial_cache: FxHashMap<(NodeId, u32), NodeId>,
+    /// Uniform inert-subtree detection cache (m1f.14).
+    /// Key: NodeId. Value: `Some(state)` iff the subtree is uniform and
+    /// guaranteed to step to itself under both CaRule and BlockRule.
+    pub(crate) hashlife_inert_cache: FxHashMap<NodeId, Option<CellState>>,
     /// When true, `step_recursive` uses spatial memoization (origin-free
     /// cache key). Only correct for CaRule-only worlds — BlockRule depends
     /// on world-space coordinates for RNG. Defaults to false.
@@ -117,6 +121,7 @@ pub struct HashlifeStats {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub empty_skips: u64,
+    pub fixed_point_skips: u64,
 }
 
 impl World {
@@ -148,6 +153,7 @@ impl World {
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_spatial_cache: FxHashMap::default(),
+            hashlife_inert_cache: FxHashMap::default(),
             spatial_memo: false,
             hashlife_stats: HashlifeStats::default(),
             block_rule_present: None,
@@ -168,10 +174,17 @@ impl World {
         }
     }
 
-    /// Invalidate caches whose keys depend on the active CA rule.
-    pub fn invalidate_rule_caches(&mut self) {
+    /// Clear all recursive hashlife-side caches.
+    fn clear_hashlife_caches(&mut self) {
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
+        self.hashlife_spatial_cache.clear();
+        self.hashlife_inert_cache.clear();
+    }
+
+    /// Invalidate caches whose keys depend on the active CA rule.
+    pub fn invalidate_rule_caches(&mut self) {
+        self.clear_hashlife_caches();
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
@@ -205,8 +218,7 @@ impl World {
             y.0,
             z.0,
         );
-        self.hashlife_cache.clear();
-        self.hashlife_macro_cache.clear();
+        self.clear_hashlife_caches();
         self.root = self.store.set_cell(self.root, x.0, y.0, z.0, state);
         self.block_rule_present = None; // invalidate cache
     }
@@ -697,12 +709,12 @@ impl World {
         // so memory tracks live-scene size, not cumulative history.
         // See hash-thing-88d.
         //
-        // Brute-force compaction remaps all NodeIds without updating
-        // hashlife_cache, so clear it to prevent stale cross-path hits.
+        // Brute-force compaction remaps all NodeIds without updating the
+        // recursive caches, so drop every hashlife-side cache here.
         let (new_store, new_root) = self.store.compacted(self.root);
         self.store = new_store;
         self.root = new_root;
-        self.hashlife_cache.clear();
+        self.clear_hashlife_caches();
     }
 
     /// Replace the world with terrain generated from `params`. Uses
@@ -721,8 +733,7 @@ impl World {
     pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
         params.validate().expect("invalid TerrainParams");
         self.store = NodeStore::new();
-        self.hashlife_cache.clear();
-        self.hashlife_macro_cache.clear();
+        self.clear_hashlife_caches();
         let field = params.to_heightmap();
         let gen_start = std::time::Instant::now();
         let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
@@ -1896,6 +1907,12 @@ mod tests {
         world
             .hashlife_macro_cache
             .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world
+            .hashlife_spatial_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world
+            .hashlife_inert_cache
+            .insert(NodeId::EMPTY, Some(STONE));
 
         world.set(wc(3), wc(3), wc(3), STONE);
 
@@ -1906,6 +1923,14 @@ mod tests {
         assert!(
             world.hashlife_macro_cache.is_empty(),
             "direct edits must drop stale macro-step cache entries"
+        );
+        assert!(
+            world.hashlife_spatial_cache.is_empty(),
+            "direct edits must drop stale spatial memo entries"
+        );
+        assert!(
+            world.hashlife_inert_cache.is_empty(),
+            "direct edits must drop stale inert-subtree cache entries"
         );
     }
 
@@ -1919,6 +1944,12 @@ mod tests {
         world
             .hashlife_macro_cache
             .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world
+            .hashlife_spatial_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world
+            .hashlife_inert_cache
+            .insert(NodeId::EMPTY, Some(STONE));
         world.queue.push(WorldMutation::SetCell {
             x: wc(2),
             y: wc(2),
@@ -1935,6 +1966,14 @@ mod tests {
         assert!(
             world.hashlife_macro_cache.is_empty(),
             "mutation flush must clear stale macro-step cache entries"
+        );
+        assert!(
+            world.hashlife_spatial_cache.is_empty(),
+            "mutation flush must clear stale spatial memo entries"
+        );
+        assert!(
+            world.hashlife_inert_cache.is_empty(),
+            "mutation flush must clear stale inert-subtree cache entries"
         );
     }
 
