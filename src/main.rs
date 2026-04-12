@@ -337,7 +337,11 @@ impl App {
         let Some((eye, dir)) = self.player_eye_ray() else {
             return;
         };
-        if let Some((_hit, prev)) = self.raycast_cells(eye, dir) {
+        if let Some((hit, prev)) = self.raycast_cells(eye, dir) {
+            // Skip if origin is inside a solid cell (prev == hit on first step).
+            if prev == hit {
+                return;
+            }
             // Place at the empty cell just before the hit.
             let state = hash_thing::octree::Cell::pack(held_material, 0).raw();
             self.world.set(
@@ -502,6 +506,10 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::Focused(false) => {
+                self.keys_held.clear();
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 // Track physical key state for per-frame movement polling.
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
@@ -526,6 +534,10 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
                             event_loop.exit();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F5) => {
+                            self.paused = !self.paused;
+                            log::info!("Paused: {}", self.paused);
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
                             self.camera_mode = match self.camera_mode {
@@ -700,7 +712,7 @@ impl ApplicationHandler for App {
                                     if let sim::EntityKind::Player(ref mut ps) = player.kind {
                                         ps.yaw += dx * LOOK_SENSITIVITY;
                                         ps.pitch =
-                                            (ps.pitch - dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
+                                            (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
                                     }
                                 }
                             }
@@ -715,12 +727,15 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
-                };
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.camera_dist = (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
+                if self.camera_mode == CameraMode::Orbit {
+                    let scroll = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
+                    };
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.camera_dist =
+                            (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
+                    }
                 }
             }
 

@@ -143,22 +143,18 @@ impl EntityStore {
         for slot in &mut self.entities {
             let Some(entity) = slot else { continue };
 
-            // Apply velocity.
-            entity.pos[0] += entity.vel[0];
-            entity.pos[1] += entity.vel[1];
-            entity.pos[2] += entity.vel[2];
-
             match &mut entity.kind {
                 EntityKind::Player(_) => {
-                    // Player movement is input-driven (handled in main.rs),
-                    // not physics-driven. Skip velocity/gravity/collision here.
-                    // Undo the velocity applied above — player vel is zeroed
-                    // each frame after input processing.
-                    entity.pos[0] -= entity.vel[0];
-                    entity.pos[1] -= entity.vel[1];
-                    entity.pos[2] -= entity.vel[2];
+                    // Player movement is input-driven (handled in main.rs).
+                    // No velocity, gravity, or collision here.
+                    continue;
                 }
                 EntityKind::Particle(state) => {
+                    // Apply velocity.
+                    entity.pos[0] += entity.vel[0];
+                    entity.pos[1] += entity.vel[1];
+                    entity.pos[2] += entity.vel[2];
+
                     if state.ttl == 0 {
                         // Despawn: optionally write a cell.
                         if let Some(cell_state) = state.on_despawn {
