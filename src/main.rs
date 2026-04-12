@@ -310,7 +310,7 @@ impl App {
                 sim::WorldCoord(hit[0]),
                 sim::WorldCoord(hit[1]),
                 sim::WorldCoord(hit[2]),
-                0, // empty
+                hash_thing::octree::Cell::EMPTY.raw(),
             );
             // Re-upload volume since we modified the world directly.
             Self::upload_volume(
