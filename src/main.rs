@@ -502,16 +502,17 @@ impl ApplicationHandler for App {
                             let particle_data: Vec<[f32; 4]> = self
                                 .entities
                                 .iter()
-                                .map(|e| {
+                                .filter_map(|e| {
                                     let mat = match &e.kind {
                                         sim::EntityKind::Particle(p) => p.material as u32,
+                                        sim::EntityKind::Player(_) => return None,
                                     };
-                                    [
+                                    Some([
                                         e.pos[0] as f32 * inv_size,
                                         e.pos[1] as f32 * inv_size,
                                         e.pos[2] as f32 * inv_size,
                                         f32::from_bits(mat),
-                                    ]
+                                    ])
                                 })
                                 .collect();
                             renderer.upload_particles(&particle_data);

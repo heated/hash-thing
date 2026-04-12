@@ -23,11 +23,24 @@ pub struct EntityId(pub u64);
 /// 3D position/velocity as `[f64; 3]`. No external math lib needed yet.
 pub type Vec3 = [f64; 3];
 
-/// What kind of entity this is. Particles are the first and simplest.
+/// What kind of entity this is.
 #[derive(Clone, Debug)]
 pub enum EntityKind {
     /// Short-lived visual effect: sparks, smoke, debris.
     Particle(ParticleState),
+    /// The player — continuous position, input-driven movement.
+    Player(PlayerState),
+}
+
+/// Per-player state. Movement and camera are driven by input, not physics.
+#[derive(Clone, Debug)]
+pub struct PlayerState {
+    /// Horizontal look angle (radians).
+    pub yaw: f64,
+    /// Vertical look angle (radians), clamped to ±π/2.
+    pub pitch: f64,
+    /// Material to place when right-clicking.
+    pub held_material: u16,
 }
 
 /// Per-particle state.
@@ -128,6 +141,15 @@ impl EntityStore {
             entity.pos[2] += entity.vel[2];
 
             match &mut entity.kind {
+                EntityKind::Player(_) => {
+                    // Player movement is input-driven (handled in main.rs),
+                    // not physics-driven. Skip velocity/gravity/collision here.
+                    // Undo the velocity applied above — player vel is zeroed
+                    // each frame after input processing.
+                    entity.pos[0] -= entity.vel[0];
+                    entity.pos[1] -= entity.vel[1];
+                    entity.pos[2] -= entity.vel[2];
+                }
                 EntityKind::Particle(state) => {
                     if state.ttl == 0 {
                         // Despawn: optionally write a cell.
