@@ -640,10 +640,14 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.svdag_buffer = Some(buffer);
-            self.svdag_buffer_cap = cap;
 
-            // Rebuild bind group
+            // Build the bind group against the local `buffer` before moving it
+            // into `self.svdag_buffer`. Prior form did `self.svdag_buffer =
+            // Some(buffer)` first and then reached back in via
+            // `self.svdag_buffer.as_ref().unwrap()`, a provably-safe but
+            // refactor-fragile pattern: a future reorder that moved the
+            // `Some(buffer)` assignment would silently break the unwrap site
+            // (hash-thing-8zl).
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("svdag_bg"),
                 layout: &self.svdag_bind_group_layout,
@@ -654,10 +658,12 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: self.svdag_buffer.as_ref().unwrap().as_entire_binding(),
+                        resource: buffer.as_entire_binding(),
                     },
                 ],
             });
+            self.svdag_buffer = Some(buffer);
+            self.svdag_buffer_cap = cap;
             self.svdag_bind_group = Some(bg);
         }
 
