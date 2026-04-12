@@ -321,7 +321,7 @@ impl ApplicationHandler for App {
                             let elapsed = start.elapsed();
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.legacy_gol_smoke = false;
+                            self.gol_smoke_scene = false;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
