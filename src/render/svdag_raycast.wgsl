@@ -2,13 +2,19 @@
 //
 // Iterative descent through a sparse voxel DAG, rendered via a fullscreen pass.
 //
-// Node layout (9 u32s per interior node):
+// Buffer layout (dag_nodes: array<u32>):
+//   [0]:     root_offset — absolute index of the current root node's slot
+//   [1..]:   append-only stream of 9-u32 interior-node slots
+//
+// Interior node slot (9 u32s):
 //   [0]: child_mask (low 8 bits = octant occupancy)
 //   [1..=8]: child entries, where each entry is:
 //     - bit 31 set → leaf, low 16 bits = material state
-//     - bit 31 clear → interior, value = offset of child node in buffer
+//     - bit 31 clear → interior, value = absolute offset of child node in buffer
 //
-// Root is at offset 0. Root bounds are the unit cube [0,1]^3.
+// Root lives at `dag_nodes[dag_nodes[0]]` — the root header updates every frame
+// while all other reachable slots stay stable, letting the CPU-side builder
+// serve incremental edits without rewriting the buffer. Root bounds are [0,1]^3.
 //
 // Traversal: explicit stack with depth capped at MAX_DEPTH (12 levels → 4096^3).
 // At each step we descend into the octant the ray is currently in. If empty,
@@ -108,7 +114,8 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     var stack_half: array<f32, MAX_DEPTH>;
     var depth: u32 = 0u;
 
-    stack_node[0] = 0u;
+    // Slot 0 of the buffer holds the current root offset; real slots start at 1.
+    stack_node[0] = dag_nodes[0];
     stack_min[0] = vec3<f32>(0.0);
     stack_half[0] = 0.5;
 

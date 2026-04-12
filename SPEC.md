@@ -222,12 +222,13 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ Main loop: keyboard controls (space pause, S step, R reset, 1-4 rule switch, V render-mode toggle, Esc exit)
 - ✅ Builds and runs on macOS with Metal backend
 - ✅ Pushed to `git@github.com:heated/ashfall.git`
-- ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3)**
-  - `Svdag::build` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker)
-  - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant
+- ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3, 5bb.5)**
+  - `Svdag::build` / `Svdag::update` serialize the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker). Buffer layout: `nodes[0]` = root offset header, `nodes[1..]` = append-only stream of interior slots.
+  - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant. Shader starts traversal from `dag_nodes[0]` so the root can move every frame while the rest of the buffer stays stable.
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
   - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) + 4 regression tests
   - Epsilon bug fixed: pop-check slack was beating step-past advance on multi-axis boundary crossings
+  - **5bb.5 incremental uploads:** `Svdag` keeps a persistent content-addressed cache (`offset_by_slot: FxHashMap<[u32; 9], u32>`) across calls. Identical subtrees across epochs (including cross-store, since `compacted()` rotates NodeIds every step) reuse old offsets, so `update` appends only genuinely new slots. `Renderer::upload_svdag` writes only the tail + the 4-byte root header. Renderer-side compaction (rebuild when stale-ratio crosses threshold) deferred as follow-up.
 - ✅ **Foundations pass (hash-thing-h34.1 + h34.2 + h34.3)**
   - `h34.1`: stateless `hash(position, generation, seed)` PRNG in `src/rng.rs`. Frozen vectors derived from an independent oracle, multi-stream API via `hash_cell_stream(..., stream)`, `#[must_use]` extractors, edge-case contracts pinned.
   - `h34.2`: determinism audit — no global PRNG, no scan-order dependence, all FxHashMap usages are point-lookup only. Fixed `World::seed_center` (was the one stateful stream). `NodeStore::step_cache` rule-blindness was flagged as a latent hazard and has since been given an interim answer by `hash-thing-88d` (cache lifetime ≡ store epoch, `debug_assert!(step_cache.is_empty())` at `compacted()` boundary; cross-epoch memoization deferred to `6gf.2`). Audit report at `.ship-notes/audit-h34.2.md`.

@@ -36,6 +36,11 @@ pub struct Renderer {
     svdag_bind_group: Option<wgpu::BindGroup>,
     svdag_buffer: Option<wgpu::Buffer>,
     svdag_buffer_cap: u64, // current allocation in bytes
+    /// Number of u32 slots in the `Svdag::nodes` vector that are already live
+    /// on the GPU. `upload_svdag` uses this to write only the newly-appended
+    /// tail (plus the root-offset header at slot 0, which changes every frame).
+    /// Reset to 0 when the GPU buffer is resized or freshly created.
+    svdag_uploaded_len: usize,
 
     // Shared
     uniform_buffer: wgpu::Buffer,
@@ -298,6 +303,7 @@ impl Renderer {
             svdag_bind_group: None,
             svdag_buffer: None,
             svdag_buffer_cap: 0,
+            svdag_uploaded_len: 0,
             uniform_buffer,
             volume_size,
             mode: RenderMode::Svdag,
@@ -308,14 +314,29 @@ impl Renderer {
         }
     }
 
-    /// Upload (or re-upload) a serialized SVDAG to the GPU.
+    /// Upload an `Svdag` to the GPU, writing only the slots that weren't
+    /// already uploaded in a previous call.
+    ///
+    /// Two things make this incremental:
+    /// 1. `Svdag` keeps its flat node array across frames (persistent content
+    ///    cache keyed by 9-u32 slot bytes), so the tail `nodes[old_len..new_len]`
+    ///    contains exactly the slots that are genuinely new this frame.
+    /// 2. Slot 0 holds the root-offset header, which the shader reads once per
+    ///    ray to start traversal. The root's slot changes almost every
+    ///    simulation step, so we always re-upload slot 0 (4 bytes) regardless
+    ///    of the tail length.
+    ///
+    /// When the buffer cap grows or the first call happens, we fall back to a
+    /// full re-upload.
     pub fn upload_svdag(&mut self, dag: &super::Svdag) {
         let bytes: &[u8] = bytemuck::cast_slice(&dag.nodes);
         let needed = bytes.len() as u64;
 
-        // Allocate a larger buffer if necessary (grow-only)
+        // Grow the GPU buffer if we can't fit `bytes`. This is a one-way reset
+        // of the upload watermark — the fresh buffer has nothing on it, so the
+        // next write below must cover every slot.
+        let mut require_full = false;
         if self.svdag_buffer.is_none() || needed > self.svdag_buffer_cap {
-            // Grow to next power of 2 with a floor of 64KB
             let mut cap = self.svdag_buffer_cap.max(65536);
             while cap < needed {
                 cap *= 2;
@@ -328,6 +349,8 @@ impl Renderer {
             });
             self.svdag_buffer = Some(buffer);
             self.svdag_buffer_cap = cap;
+            self.svdag_uploaded_len = 0;
+            require_full = true;
 
             // Rebuild bind group
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -347,8 +370,32 @@ impl Renderer {
             self.svdag_bind_group = Some(bg);
         }
 
-        if let Some(buf) = &self.svdag_buffer {
+        let Some(buf) = &self.svdag_buffer else {
+            return;
+        };
+
+        if require_full || self.svdag_uploaded_len > dag.nodes.len() {
+            // Fresh buffer or `dag.nodes` shrank (e.g. builder was recreated).
+            // Full re-upload.
             self.queue.write_buffer(buf, 0, bytes);
+            self.svdag_uploaded_len = dag.nodes.len();
+            return;
+        }
+
+        // Slot 0 is the root-offset header and changes almost every frame.
+        // Always re-upload it (4 bytes, effectively free).
+        self.queue
+            .write_buffer(buf, 0, bytemuck::cast_slice(&dag.nodes[0..1]));
+
+        // Tail: append-only growth since the last upload.
+        if self.svdag_uploaded_len < dag.nodes.len() {
+            let tail = &dag.nodes[self.svdag_uploaded_len..];
+            self.queue.write_buffer(
+                buf,
+                (self.svdag_uploaded_len as u64) * 4,
+                bytemuck::cast_slice(tail),
+            );
+            self.svdag_uploaded_len = dag.nodes.len();
         }
     }
 

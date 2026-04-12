@@ -79,6 +79,10 @@ struct App {
     renderer: Option<render::Renderer>,
     world: sim::World,
     rule: sim::GameOfLife3D,
+    /// Persistent serialized DAG. Kept across frames so that its content-
+    /// addressed cache (`Svdag::offset_by_slot`) lets us upload only the
+    /// nodes whose content is genuinely new each step. See hash-thing-5bb.5.
+    svdag: render::Svdag,
     paused: bool,
     step_timer: std::time::Instant,
     /// When to next emit an auto perf summary. Reset on each emission.
@@ -129,6 +133,7 @@ impl App {
             renderer: None,
             world,
             rule: sim::GameOfLife3D::amoeba(),
+            svdag: render::Svdag::new(),
             paused: true,
             step_timer: std::time::Instant::now(),
             perf_log_timer: std::time::Instant::now(),
@@ -149,20 +154,25 @@ impl App {
             // counter rather than being hidden inside `svdag[...]`.
             let data = self.world.flatten();
             renderer.upload_volume(&data);
+            // Incremental rebuild: the persistent `svdag` reuses offsets for
+            // any content that's already in its buffer, so this call only
+            // appends the slots whose content is genuinely new this frame.
             // Measure just the rebuild — the GPU upload is wgpu's problem.
-            let (dag, elapsed) = perf::time(|| {
-                render::Svdag::build(&self.world.store, self.world.root, self.world.level)
+            let (_, elapsed) = perf::time(|| {
+                self.svdag
+                    .update(&self.world.store, self.world.root, self.world.level)
             });
             self.perf.record_svdag(elapsed, self.world.store.stats());
             if self.world.generation.is_multiple_of(10) {
                 log::info!(
-                    "SVDAG: {} nodes, {} bytes, root_level={}",
-                    dag.node_count,
-                    dag.byte_size(),
-                    dag.root_level,
+                    "SVDAG: {} reachable, {} total cached, {} bytes, root_level={}",
+                    self.svdag.node_count,
+                    self.svdag.total_slot_count(),
+                    self.svdag.byte_size(),
+                    self.svdag.root_level,
                 );
             }
-            renderer.upload_svdag(&dag);
+            renderer.upload_svdag(&self.svdag);
         }
     }
 }
