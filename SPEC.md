@@ -299,8 +299,8 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - `1v0.1` 16-bit tagged cell: `Cell` packs 10-bit `material_id` + 6-bit `metadata` into `u16`. `METADATA_BITS=6` is pinned by drift guard in both shaders.
   - `1v0.2` `MaterialRegistry` with per-material rules, visual properties (label, base_color, texture_ref), physical properties (density, flammability, conductivity). `terrain_defaults()` registers air/stone/dirt/grass/fire/water. `gol_smoke()` bridges legacy GoL presets. GPU palette export via `color_palette_rgba()`.
   - `1v0.3` Per-material `CaRule` dispatch in `World::step`: `trait CaRule { fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell; }`. `NoopRule` for static materials, `FireRule` (spreads from fuel, quenched by water), `WaterRule` (reacts with fire → stone). No central interaction table.
-  - `1v0.4` Margolus 2×2×2 movement phase: `trait BlockRule { fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8]; }`. Alternating partition offset (even/odd gen). `GravityBlockRule` for density-based vertical swaps. Mass conservation enforced via debug_assert.
-  - `1v0.5` `FluidBlockRule`: 2-phase block rule — gravity (vertical swaps by density) then lateral spread (fluid↔air swaps). Hashlife-compatible determinism via `rng_hash`.
+  - `1v0.4` Margolus 2×2×2 movement phase: `trait BlockRule { fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8]; }`. Pure function of block contents (no position/generation context), enabling spatial memoization in hashlife. Alternating partition offset (even/odd gen). `GravityBlockRule` for density-based vertical swaps. Mass conservation enforced via debug_assert.
+  - `1v0.5` `FluidBlockRule`: 2-phase block rule — gravity (vertical swaps by density) then lateral spread (fluid↔air swaps). Axis selection via `content_hash(block)` for determinism.
   - `1v0.6` Entity system: `EntityStore` with `EntityKind::Particle` (continuous position, velocity, TTL, collision, gravity). Mutation queue integration.
   - `1v0.7` Burning room demo scene: stone room with grass walls (fuel), fire corner, water pool. Key binding: B.
   - `1v0.8` Cell/block granularity: `CELLS_PER_BLOCK_LOG2=3` (8³ cells per gameplay block), `World::set_block()` API with auto-grow.
@@ -335,11 +335,11 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
 - ✅ **SVDAG rendering** (epic `5bb`, 10/11): `5bb.1`–`5bb.5` serialization through incremental uploads, `bx7` stale-slot compaction, `5bb.7` palette sync, `5bb.8` zero-direction guard, `5bb.9` particle renderer, `5bb.10` HUD overlay. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 - ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
-- ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + cave CA + lazy terrain expansion + perf tracking. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`.
+- ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + cave CA + lazy terrain expansion + perf tracking. Sand biomes (`y2s`): low-freq noise selects sandy regions where grass/dirt → sand (gravity block rule). Sea-level water (`4t6`): `HeightmapField.sea_level` fills air below sea level with water; `classify_box` proof updated. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`.
 
 ### In progress (P0-P1, from bd)
 
-- ☐ **Core engine validation** (epic `m1f`, 1/12): proving the full loop — stepping + rendering + interaction — works at scale. `m1f.12` landed (stable NodeIds). Open P1: benchmarks (`m1f.1` hashlife, `m1f.2` SVDAG), edit propagation (`m1f.3`), infinite world growth (`m1f.4`), SVDAG arbitrary depth (`m1f.8`), content-only Margolus rewrite (`m1f.9`), incremental cache invalidation (`m1f.11`). Open P2: SVDAG edit sync (`m1f.5`), new CA rules (`m1f.6`), end-to-end demo (`m1f.7`).
+- ☐ **Core engine validation** (epic `m1f`, 7/12): proving the full loop — stepping + rendering + interaction — works at scale. Landed: `m1f.12` stable NodeIds across compaction, `m1f.11` incremental cache invalidation, `m1f.9` pure BlockRule (content-only, no position context), `m1f.8` SVDAG depth 24 (16M³), `m1f.4` infinite world growth (already working), `m1f.1` hashlife benchmarks. Open P1: `m1f.2` SVDAG framerate bench, `m1f.3` edit propagation measurement. Open P2: `m1f.5` SVDAG edit sync, `m1f.6` new CA rules, `m1f.7` end-to-end demo.
 
 ### Later (P2+, from bd)
 
