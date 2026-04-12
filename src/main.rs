@@ -16,7 +16,7 @@ use winit::{
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
 
-const VOLUME_SIZE: u32 = 64;
+const VOLUME_SIZE: u32 = 2048;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused

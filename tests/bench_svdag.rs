@@ -89,15 +89,3 @@ fn bench_svdag_512() {
 fn bench_svdag_1024() {
     bench_svdag_build("1024³", 10);
 }
-
-#[test]
-#[ignore]
-fn bench_svdag_2048() {
-    bench_svdag_build("2048³", 11);
-}
-
-#[test]
-#[ignore]
-fn bench_svdag_4096() {
-    bench_svdag_build("4096³", 12);
-}

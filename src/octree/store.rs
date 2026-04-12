@@ -6,6 +6,12 @@ use rustc_hash::FxHashMap;
 /// Every unique node exists exactly once. Identical subtrees are shared.
 /// This gives us Hashlife's spatial compression: a 4096³ world that's
 /// mostly empty costs almost nothing.
+///
+/// Node indices are `u32`, limiting the store to ~4 billion unique nodes.
+/// In practice, hash-consing keeps the count far below this: a 4096³
+/// world with terrain + active water typically produces ~200K nodes.
+/// The `intern_node` path panics with a diagnostic message if this limit
+/// is ever reached.
 pub struct NodeStore {
     /// All canonical nodes, indexed by NodeId.
     nodes: Vec<Node>,
@@ -37,9 +43,15 @@ impl NodeStore {
         if let Some(&id) = self.intern.get(&node) {
             return id;
         }
-        let id = NodeId(
-            u32::try_from(self.nodes.len()).expect("NodeStore overflow: exceeded 2^32 nodes"),
-        );
+        let len = self.nodes.len();
+        let id = NodeId(u32::try_from(len).unwrap_or_else(|_| {
+            panic!(
+                "NodeStore overflow: {len} nodes exceeds u32::MAX ({}). \
+                 This means the world has more unique subtrees than 2^32 — \
+                 consider compacting more aggressively or widening NodeId to u64.",
+                u32::MAX
+            )
+        }));
         self.intern.insert(node.clone(), id);
         self.nodes.push(node);
         id
@@ -448,6 +460,12 @@ impl NodeStore {
         self.nodes.len()
     }
 
+    /// Number of unique nodes in the store. Alias for `stats()` with a
+    /// clearer name; use this for capacity checks and diagnostics.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Return a fresh `NodeStore` containing only the nodes reachable from
     /// `root`, together with the remapped root id.
     ///
@@ -479,29 +497,15 @@ impl NodeStore {
         &self,
         root: NodeId,
     ) -> (NodeStore, NodeId, FxHashMap<NodeId, NodeId>) {
-        let (store, roots, remap) = self.compacted_with_remap_roots(&[root]);
-        (store, roots, remap)
-    }
-
-    /// Like [`compacted_with_remap`], but preserves multiple root trees.
-    /// Returns the new NodeId of the *first* root. All roots' subtrees
-    /// are included in the remap table, so caches keyed on nodes from
-    /// any preserved tree can be remapped.
-    pub fn compacted_with_remap_roots(
-        &self,
-        roots: &[NodeId],
-    ) -> (NodeStore, NodeId, FxHashMap<NodeId, NodeId>) {
         let mut dst = NodeStore::new();
         let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        // Pre-seed EMPTY as a perf short-circuit. Note: this is NOT
+        // semantically load-bearing — `dst.leaf(0)` already dedups to
+        // `NodeId::EMPTY` via the hash-cons path — but it skips the
+        // recursive walk whenever we hit an empty subtree.
         remap.insert(NodeId::EMPTY, NodeId::EMPTY);
-        let mut new_first = NodeId::EMPTY;
-        for (i, &root) in roots.iter().enumerate() {
-            let new_root = clone_reachable(self, &mut dst, &mut remap, root);
-            if i == 0 {
-                new_first = new_root;
-            }
-        }
-        (dst, new_first, remap)
+        let new_root = clone_reachable(self, &mut dst, &mut remap, root);
+        (dst, new_root, remap)
     }
 }
 

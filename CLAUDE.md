@@ -13,6 +13,10 @@ soft-max-command-seconds: 60
 
 Prefer commands that finish in under ~60s. Benchmarks, large builds, long test suites: run the smallest representative scale first. Only go bigger if explicitly asked or the small run was inconclusive. Background long runs rather than blocking.
 
+## Build profiles
+
+Default to dev. `--profile bench` for perf work. `--release` only for distributable artifacts. sccache is the rustc wrapper (`.cargo/config.toml`) — per-worktree `target/`, no lock contention, cached artifacts shared across worktrees.
+
 ## Agent surface — where project skills and commands live
 
 This project is designed to work with **any of three CLI agents**: Claude Code (the primary seat), Codex Exec, and Gemini CLI. To keep the three in sync:
@@ -171,6 +175,10 @@ Commit at every natural boundary — plan file written, first test green, helper
 **What this does NOT mean:** We're not adopting GitLab/GitHub PR review as a gate. The `/ship` review tiers (dual/triple/trident) still run; the crew still cross-reviews. The difference is that "push passes" → "land on main" is one step, not two.
 
 The prior divergence backlog (18 commits on `worktree-vast-leaping-allen`, 9 on `worktree-sleepy-wiggling-fountain`, both ahead of main) was a bug, not a feature. 52b-A is the cleanup for that specific instance.
+
+## Benchmarking convention
+
+Measure warm frames only (skip cold startup generations). Cold frame cost is one-time; interactive feel depends on steady-state.
 
 ## Quick Reference
 
