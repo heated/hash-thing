@@ -114,12 +114,20 @@ pub fn carve_dungeons(
     params.validate().expect("invalid DungeonParams");
     let side = 1usize << side_log2;
     let mut grid = store.flatten(root, side);
-    carve_dungeons_grid(&mut grid, side, params);
+    carve_dungeons_grid(&mut grid, side, [0, 0, 0], params);
     store.from_flat(&grid, side)
 }
 
-/// In-place dungeon carving on a flat grid.
-pub fn carve_dungeons_grid(grid: &mut [CellState], side: usize, params: &DungeonParams) {
+/// In-place dungeon carving on a flat grid. `origin` is the world-coordinate
+/// offset of the grid's `[0,0,0]` corner, threaded into the RNG so the same
+/// sub-volume produces identical dungeons regardless of which chunk contains
+/// it (lazy-root-expansion friendly, same contract as `carve_caves_grid`).
+pub fn carve_dungeons_grid(
+    grid: &mut [CellState],
+    side: usize,
+    origin: [i64; 3],
+    params: &DungeonParams,
+) {
     let expected_len = side
         .checked_mul(side)
         .and_then(|n| n.checked_mul(side))
@@ -138,33 +146,43 @@ pub fn carve_dungeons_grid(grid: &mut [CellState], side: usize, params: &Dungeon
     let mut rooms: Vec<Room> = Vec::new();
 
     for attempt in 0..params.max_rooms {
-        // Deterministic dimensions and position from seed + attempt index.
-        // Using cell_rand_range with generation=attempt, treating each
-        // room attempt as a "generation" for RNG purposes.
+        // Deterministic dimensions and position from seed + attempt index +
+        // origin. The origin enters via the x/y/z coordinates of
+        // cell_rand_range so that two chunks with different origins produce
+        // different room layouts (lazy-root-expansion friendly).
         let gen = attempt as u64;
         let seed = params.seed;
+        let ox = origin[0];
+        let oy = origin[1];
+        let oz = origin[2];
 
         let range = (params.room_max - params.room_min + 1) as u64;
         let wx = params.room_min as usize
-            + rng::cell_rand_range(0, 0, 0, gen, seed.wrapping_add(1), range) as usize;
+            + rng::cell_rand_range(ox, oy, oz, gen, seed.wrapping_add(1), range) as usize;
         let wy = params.room_min as usize
-            + rng::cell_rand_range(1, 0, 0, gen, seed.wrapping_add(2), range) as usize;
+            + rng::cell_rand_range(ox + 1, oy, oz, gen, seed.wrapping_add(2), range) as usize;
         let wz = params.room_min as usize
-            + rng::cell_rand_range(2, 0, 0, gen, seed.wrapping_add(3), range) as usize;
+            + rng::cell_rand_range(ox, oy + 1, oz, gen, seed.wrapping_add(3), range) as usize;
 
         if wx >= side || wy >= side || wz >= side {
             continue;
         }
 
         let min_y = params.min_y as usize;
-        let x0 =
-            rng::cell_rand_range(3, 0, 0, gen, seed.wrapping_add(4), (side - wx) as u64) as usize;
+        let x0 = rng::cell_rand_range(
+            ox,
+            oy,
+            oz + 1,
+            gen,
+            seed.wrapping_add(4),
+            (side - wx) as u64,
+        ) as usize;
         let y0 = if side - wy > min_y {
             min_y
                 + rng::cell_rand_range(
-                    4,
-                    0,
-                    0,
+                    ox + 1,
+                    oy + 1,
+                    oz,
                     gen,
                     seed.wrapping_add(5),
                     (side - wy - min_y) as u64,
@@ -172,8 +190,14 @@ pub fn carve_dungeons_grid(grid: &mut [CellState], side: usize, params: &Dungeon
         } else {
             continue;
         };
-        let z0 =
-            rng::cell_rand_range(5, 0, 0, gen, seed.wrapping_add(6), (side - wz) as u64) as usize;
+        let z0 = rng::cell_rand_range(
+            ox + 1,
+            oy,
+            oz + 1,
+            gen,
+            seed.wrapping_add(6),
+            (side - wz) as u64,
+        ) as usize;
 
         let room = Room {
             x0,
@@ -236,7 +260,11 @@ pub fn carve_dungeons_grid(grid: &mut [CellState], side: usize, params: &Dungeon
 }
 
 /// Carve an L-shaped corridor: X first, then Y, then Z. Only carves cells
-/// that are currently STONE.
+/// that are currently STONE. If the corridor path crosses non-stone cells
+/// (AIR from a prior cave pass, or DIRT/GRASS near the surface), those
+/// cells are left untouched — AIR gaps are passable, and solid non-stone
+/// gaps are prevented by the all-stone room placement check which keeps
+/// rooms deep in the stone layer.
 fn carve_corridor(grid: &mut [CellState], side: usize, from: [usize; 3], to: [usize; 3]) {
     let [x0, y0, z0] = from;
     let [x1, y1, z1] = to;
@@ -453,7 +481,7 @@ mod tests {
         let mut grid = vec![AIR; side * side * side];
         let params = DungeonParams::default();
         let original = grid.clone();
-        carve_dungeons_grid(&mut grid, side, &params);
+        carve_dungeons_grid(&mut grid, side, [0, 0, 0], &params);
         assert_eq!(grid, original);
     }
 
@@ -499,12 +527,86 @@ mod tests {
             room_max: 3,
             min_y: 0,
         };
-        carve_dungeons_grid(&mut grid, side, &params);
+        carve_dungeons_grid(&mut grid, side, [0, 0, 0], &params);
         let air_count = grid.iter().filter(|&&c| c == AIR).count();
         // With rooms + corridors, we must have carved at least something.
         assert!(
             air_count > 0,
             "dungeons on an all-stone grid must carve at least one cell"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "grid is not side^3")]
+    fn carve_dungeons_grid_rejects_mismatched_grid_len() {
+        let side = 2usize;
+        let mut grid = vec![AIR; 7];
+        let params = DungeonParams::default();
+        carve_dungeons_grid(&mut grid, side, [0, 0, 0], &params);
+    }
+
+    #[test]
+    #[should_panic(expected = "carve_dungeons_grid: invalid DungeonParams")]
+    fn carve_dungeons_grid_rejects_invalid_params() {
+        let side = 2usize;
+        let mut grid = vec![STONE; side * side * side];
+        let params = DungeonParams {
+            room_min: 0,
+            ..Default::default()
+        };
+        carve_dungeons_grid(&mut grid, side, [0, 0, 0], &params);
+    }
+
+    /// Rooms respect min_y: no carved cell has y < min_y.
+    #[test]
+    fn rooms_respect_min_y() {
+        let side = 16usize;
+        let mut grid = vec![STONE; side * side * side];
+        let min_y = 8u32;
+        let params = DungeonParams {
+            seed: 42,
+            max_rooms: 20,
+            room_min: 2,
+            room_max: 3,
+            min_y,
+        };
+        let original = grid.clone();
+        carve_dungeons_grid(&mut grid, side, [0, 0, 0], &params);
+
+        for z in 0..side {
+            for y in 0..min_y as usize {
+                for x in 0..side {
+                    let i = x + y * side + z * side * side;
+                    assert_eq!(
+                        grid[i], original[i],
+                        "cell ({x},{y},{z}) below min_y was modified"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Different origins produce different layouts (origin is threaded into RNG).
+    #[test]
+    fn different_origins_produce_different_dungeons() {
+        let side = 16usize;
+        let params = DungeonParams {
+            seed: 42,
+            max_rooms: 20,
+            room_min: 2,
+            room_max: 3,
+            min_y: 0,
+        };
+
+        let mut g1 = vec![STONE; side * side * side];
+        carve_dungeons_grid(&mut g1, side, [0, 0, 0], &params);
+
+        let mut g2 = vec![STONE; side * side * side];
+        carve_dungeons_grid(&mut g2, side, [100, 200, 300], &params);
+
+        assert_ne!(
+            g1, g2,
+            "different origins must produce different dungeon layouts"
         );
     }
 }
