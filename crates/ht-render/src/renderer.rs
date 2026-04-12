@@ -297,6 +297,10 @@ pub struct Renderer {
 
     /// Debug render mode. 0 = normal, 1 = step-count heatmap.
     pub debug_mode: u32,
+    /// LOD bias multiplier. 1.0 = default, higher = more aggressive LOD.
+    pub lod_bias: f32,
+    /// Render resolution scale. 0.5 = half-res (4x fewer pixels), 1.0 = full.
+    pub render_scale: f32,
 
     // GPU-timestamp instrumentation. `None` on adapters without
     // `Features::TIMESTAMP_QUERY` — all timing falls back to the CPU
@@ -375,11 +379,14 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        // Default render_scale = 0.5: render at half physical resolution
+        // for 4x fewer pixels. Trade sharpness for framerate.
+        let render_scale: f32 = 0.5;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: ((size.width as f32 * render_scale) as u32).max(1),
+            height: ((size.height as f32 * render_scale) as u32).max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -777,6 +784,8 @@ impl Renderer {
             camera_dist: 2.0,
             camera_target: [0.5, 0.5, 0.5],
             debug_mode: 0,
+            lod_bias: 1.0,
+            render_scale: 0.5,
             gpu_timing,
             last_gpu_frame_time: None,
         }
@@ -1062,8 +1071,9 @@ impl Renderer {
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
+            let s = self.render_scale;
+            self.config.width = ((width as f32 * s) as u32).max(1);
+            self.config.height = ((height as f32 * s) as u32).max(1);
             self.surface.configure(&self.device, &self.config);
         }
     }
@@ -1151,7 +1161,7 @@ impl Renderer {
                 fov_tan,
                 self.config.height as f32,
             ],
-            debug: [self.debug_mode as f32, 0.0, 0.0, 0.0],
+            debug: [self.debug_mode as f32, self.lod_bias, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));

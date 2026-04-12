@@ -1103,9 +1103,13 @@ mod tests {
         assert_eq!(dag.nodes.len(), 10, "header + one interior node = 10 u32s");
         let root_off = dag.nodes[0] as usize;
         assert_eq!(root_off, 1, "root offset points past header");
+        // m1f.7.3: child_mask word = low 8 bits occupancy | bits 8-23 rep material.
+        // Leaf root with mat3 → rep_mat = mat3's packed CellState = 3 << 6 = 192.
+        let rep_mat = mat3 as u32;
         assert_eq!(
-            dag.nodes[root_off], 0xffu32,
-            "all 8 octants populated for a nonzero leaf root"
+            dag.nodes[root_off],
+            0xffu32 | (rep_mat << 8),
+            "all 8 octants populated + representative material for a nonzero leaf root"
         );
         for i in 0..8 {
             assert_eq!(

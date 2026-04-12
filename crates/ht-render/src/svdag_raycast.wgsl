@@ -277,8 +277,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
             // LOD cutoff (x5w): if this voxel is sub-pixel, use the
             // representative material packed in bits 8-23 of child_mask
             // (m1f.7.3.2). No child scan needed — 0 buffer reads.
+            // LOD bias (m1f.7.3.3): multiply threshold by debug.y (default 1.0)
+            // to allow runtime LOD tuning. Higher = more aggressive = faster.
+            let lod_bias = max(u.debug.y, 1.0);
             let t_dist = max(t + entry, 1e-4);
-            if pixel_world > 0.0 && half < pixel_world * t_dist {
+            if pixel_world > 0.0 && half < pixel_world * t_dist * lod_bias {
                 let lod_mat = (cmask >> 8u) & 0xFFFFu;
                 if lod_mat > 0u {
                     // Shade as a flat-color hit at node center.

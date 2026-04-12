@@ -229,6 +229,7 @@ impl App {
                 "",
                 "  C/T/B/R/G   Load scene",
                 "  H           Step heatmap",
+                "  +/-         Render scale",
                 "  F5          Pause",
                 "  F1          Toggle help",
                 "  Esc         Quit",
@@ -245,6 +246,7 @@ impl App {
                 "",
                 "  C/T/B/R/G   Load scene",
                 "  H           Step heatmap",
+                "  +/-         Render scale",
                 "  F5          Pause",
                 "  F1          Toggle help",
                 "  Esc         Quit",
@@ -670,6 +672,38 @@ impl ApplicationHandler for App {
                                         "normal"
                                     }
                                 );
+                            }
+                        }
+                        winit::keyboard::Key::Character("l") => {
+                            // Cycle LOD bias: 1 → 2 → 4 → 8 → 1.
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.lod_bias = if renderer.lod_bias >= 8.0 {
+                                    1.0
+                                } else {
+                                    renderer.lod_bias * 2.0
+                                };
+                                log::info!("LOD bias: {}x", renderer.lod_bias);
+                            }
+                        }
+                        winit::keyboard::Key::Character("=")
+                        | winit::keyboard::Key::Character("+") => {
+                            // Increase render scale (sharper, slower).
+                            if let Some(renderer) = &mut self.renderer {
+                                let w = self.window.as_ref().unwrap();
+                                let size = w.inner_size();
+                                renderer.render_scale = (renderer.render_scale + 0.25).min(1.0);
+                                renderer.resize(size.width, size.height);
+                                log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
+                            }
+                        }
+                        winit::keyboard::Key::Character("-") => {
+                            // Decrease render scale (blurrier, faster).
+                            if let Some(renderer) = &mut self.renderer {
+                                let w = self.window.as_ref().unwrap();
+                                let size = w.inner_size();
+                                renderer.render_scale = (renderer.render_scale - 0.25).max(0.25);
+                                renderer.resize(size.width, size.height);
+                                log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
                         }
                         // hash-thing-hso: on-demand dump of the full perf +
