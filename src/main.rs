@@ -24,8 +24,8 @@ enum CameraMode {
     FirstPerson,
 }
 
-/// Player movement speed in cells per frame.
-const PLAYER_SPEED: f64 = 0.15;
+/// Player movement speed in cells per second (at 60fps baseline: 0.15 * 60 = 9).
+const PLAYER_SPEED: f64 = 9.0;
 /// Sprint multiplier.
 const PLAYER_SPRINT: f64 = 2.5;
 /// Player bounding box half-width on X/Z (cells).
@@ -129,6 +129,9 @@ struct App {
     /// Used to estimate noise fraction of each gen pass (hash-thing-3fq.5).
     /// Refreshed on terrain reset so a wildly different param set reprobes.
     noise_ns_per_sample: f64,
+    /// Last frame timestamp for delta-time computation. Player movement
+    /// is multiplied by dt so speed is frame-rate-independent (xa7).
+    last_frame: std::time::Instant,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -167,6 +170,7 @@ impl App {
             last_svdag_stats: (0, 0, 0),
             occluded: false,
             noise_ns_per_sample: 0.0,
+            last_frame: std::time::Instant::now(),
             entities: sim::EntityStore::new(),
         };
 
@@ -748,6 +752,10 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                // Frame delta time for frame-rate-independent movement (xa7).
+                let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
+                self.last_frame = std::time::Instant::now();
+
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
                     // Time the step. `perf.start` returns a Timer that
@@ -877,14 +885,14 @@ impl ApplicationHandler for App {
                             + move_dir[2] * move_dir[2])
                             .sqrt();
                         if len > 1e-9 {
-                            let speed = if self.keys_held.contains(&KeyCode::ControlLeft)
+                            let base_speed = if self.keys_held.contains(&KeyCode::ControlLeft)
                                 || self.keys_held.contains(&KeyCode::ControlRight)
                             {
                                 PLAYER_SPEED * PLAYER_SPRINT
                             } else {
                                 PLAYER_SPEED
                             };
-                            let inv_len = speed / len;
+                            let inv_len = (base_speed * dt) / len;
                             let delta = [
                                 move_dir[0] * inv_len,
                                 move_dir[1] * inv_len,
