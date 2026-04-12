@@ -141,6 +141,8 @@ Commit at every natural boundary — plan file written, first test green, helper
 
 ## Landing to main — don't let feature branches accumulate
 
+**Never `cd` into the main repo checkout to commit.** Work in your worktree; land via `git push origin HEAD:main`.
+
 **Feature branches are not a staging area.** Per edward 2026-04-11: "are you just not merging to main? you should be." Any work that's tested and ready belongs on `origin/main`, not parked on a long-lived `worktree-*` or crew branch.
 
 **The default lifecycle for any seat:**

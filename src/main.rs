@@ -104,37 +104,15 @@ struct App {
 impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-
-        // Seed with terrain instead of a GoL sphere.
-        let params = terrain::TerrainParams::default();
-        let nodes_before = world.store.stats().0;
-        let start = std::time::Instant::now();
-        let stats = world.seed_terrain(&params);
-        let elapsed = start.elapsed();
-
-        // Noise-bottleneck probe. One-time microbench of `sample()`
-        // called outside the timed gen region so it does not pollute
-        // the gen measurement. See hash-thing-3fq.5.
-        let noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+        world.seed_burning_room();
         let material_palette_len = world.materials.color_palette_rgba().len();
 
-        let (nodes_after, _) = world.store.stats();
-        let nodes_delta = nodes_after.saturating_sub(nodes_before);
-        log_gen_stats(
-            "Initial terrain",
-            world.side(),
-            world.population(),
-            nodes_after,
-            nodes_delta,
-            &stats,
-            elapsed,
-            noise_ns_per_sample,
-        );
+        log::info!("Initial CA demo: burning room pop={}", world.population());
         log::debug!("Material registry palette slots={material_palette_len}");
 
-        // Start paused so the user opts into stepping explicitly. Terrain
-        // defaults are mostly static, but the reactive material rules are
-        // now live and should not advance until requested.
+        // Start paused so the user opts into stepping explicitly. The
+        // default scene is now a CA/materials showcase and should not
+        // start evolving until requested.
         Self {
             window: None,
             renderer: None,
@@ -151,7 +129,7 @@ impl App {
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
-            noise_ns_per_sample,
+            noise_ns_per_sample: 0.0,
         }
     }
 
@@ -193,6 +171,56 @@ impl App {
             }
         }
         log::info!("Rule: {label}");
+    }
+
+    fn load_burning_room_demo(&mut self, label: &str) {
+        self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+        self.world.seed_burning_room();
+        self.gol_smoke_scene = false;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        log::info!("{label}: pop={}", self.world.population());
+    }
+
+    fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
+        let nodes_before = self.world.store.stats().0;
+        let start = std::time::Instant::now();
+        let stats = self.world.seed_terrain(&params);
+        let elapsed = start.elapsed();
+        self.noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+        self.gol_smoke_scene = false;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        Self::upload_volume(
+            &mut self.renderer,
+            &self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        let (nodes_after, _) = self.world.store.stats();
+        let nodes_delta = nodes_after.saturating_sub(nodes_before);
+        log_gen_stats(
+            label,
+            self.world.side(),
+            self.world.population(),
+            nodes_after,
+            nodes_delta,
+            &stats,
+            elapsed,
+            self.noise_ns_per_sample,
+        );
     }
 }
 
@@ -287,110 +315,37 @@ impl ApplicationHandler for App {
                             // hash-thing-3fq.2: drives the cave-CA post-pass
                             // end-to-end so the effect is visible without
                             // editing source.
-                            let params = terrain::TerrainParams {
-                                caves: Some(terrain::CaveParams::default()),
-                                ..Default::default()
-                            };
-                            let nodes_before = self.world.store.stats().0;
-                            let start = std::time::Instant::now();
-                            let stats = self.world.seed_terrain(&params);
-                            let elapsed = start.elapsed();
-                            self.noise_ns_per_sample =
-                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.gol_smoke_scene = false;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            let (nodes_after, _) = self.world.store.stats();
-                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
-                            log_gen_stats(
+                            self.load_terrain_scene(
                                 "Caves terrain",
-                                self.world.side(),
-                                self.world.population(),
-                                nodes_after,
-                                nodes_delta,
-                                &stats,
-                                elapsed,
-                                self.noise_ns_per_sample,
+                                terrain::TerrainParams {
+                                    caves: Some(terrain::CaveParams::default()),
+                                    ..Default::default()
+                                },
                             );
                         }
                         winit::keyboard::Key::Character("d") => {
                             // Re-seed terrain with caves + dungeons. Stays paused.
                             // hash-thing-3fq.8: drives the dungeon carving
                             // post-pass end-to-end.
-                            let params = terrain::TerrainParams {
-                                caves: Some(terrain::CaveParams::default()),
-                                dungeons: Some(terrain::DungeonParams::default()),
-                                ..Default::default()
-                            };
-                            let nodes_before = self.world.store.stats().0;
-                            let start = std::time::Instant::now();
-                            let stats = self.world.seed_terrain(&params);
-                            let elapsed = start.elapsed();
-                            self.noise_ns_per_sample =
-                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.gol_smoke_scene = false;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            let (nodes_after, _) = self.world.store.stats();
-                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
-                            log_gen_stats(
+                            self.load_terrain_scene(
                                 "Dungeon terrain",
-                                self.world.side(),
-                                self.world.population(),
-                                nodes_after,
-                                nodes_delta,
-                                &stats,
-                                elapsed,
-                                self.noise_ns_per_sample,
+                                terrain::TerrainParams {
+                                    caves: Some(terrain::CaveParams::default()),
+                                    dungeons: Some(terrain::DungeonParams::default()),
+                                    ..Default::default()
+                                },
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Re-seed terrain. Stays paused. Clear perf/mem
-                            // so post-reset stats aren't poisoned by stale
-                            // pre-reset values.
-                            let params = terrain::TerrainParams::default();
-                            let nodes_before = self.world.store.stats().0;
-                            let start = std::time::Instant::now();
-                            let stats = self.world.seed_terrain(&params);
-                            let elapsed = start.elapsed();
-                            // Re-probe in case params drifted. Cheap (~1ms).
-                            self.noise_ns_per_sample =
-                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.gol_smoke_scene = false;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            let (nodes_after, _) = self.world.store.stats();
-                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
-                            log_gen_stats(
+                            // Reset the default CA/materials demo.
+                            self.load_burning_room_demo("Reset burning room demo");
+                        }
+                        winit::keyboard::Key::Character("t") => {
+                            // Plain terrain remains available as an explicit
+                            // toggle, but is no longer the default scene.
+                            self.load_terrain_scene(
                                 "Reset terrain",
-                                self.world.side(),
-                                self.world.population(),
-                                nodes_after,
-                                nodes_delta,
-                                &stats,
-                                elapsed,
-                                self.noise_ns_per_sample,
+                                terrain::TerrainParams::default(),
                             );
                         }
                         winit::keyboard::Key::Character("g") => {
@@ -427,22 +382,7 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("b") => {
                             // Burning room demo: fire + water + grass walls.
-                            self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-                            self.world.seed_burning_room();
-                            self.gol_smoke_scene = false;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.upload_palette(&self.world.materials.color_palette_rgba());
-                            }
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            log::info!("Reset burning room demo: pop={}", self.world.population());
+                            self.load_burning_room_demo("Reset burning room demo");
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
