@@ -6,6 +6,7 @@ use hash_thing::terrain;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
@@ -116,6 +117,14 @@ struct App {
     /// applied at the start of the next tick.
     entities: sim::EntityStore,
     volume_size: u32,
+    /// Background sim step thread (x5w). While `Some`, `self.world` is a
+    /// tiny placeholder — all world reads must use `render_origin` /
+    /// `render_inv_size` or be guarded by `is_stepping()`.
+    step_handle: Option<JoinHandle<sim::World>>,
+    /// Cached world origin for rendering during background step.
+    render_origin: [i64; 3],
+    /// Cached 1/side for coordinate normalization during background step.
+    render_inv_size: f32,
 }
 
 impl App {
@@ -140,6 +149,8 @@ impl App {
 
         // Start running so materials interact immediately (powder-game feel).
         // F5 or Space (orbit mode) toggles pause.
+        let render_inv_size = 1.0 / world.side() as f32;
+        let render_origin = world.origin;
         let mut app = Self {
             window: None,
             renderer: None,
@@ -163,6 +174,9 @@ impl App {
             last_frame: std::time::Instant::now(),
             entities: sim::EntityStore::new(),
             volume_size,
+            step_handle: None,
+            render_origin,
+            render_inv_size,
         };
 
         // Spawn the player entity at the world center, looking forward.
@@ -183,6 +197,17 @@ impl App {
         app
     }
 
+    /// True while the sim step is running on a background thread.
+    fn is_stepping(&self) -> bool {
+        self.step_handle.is_some()
+    }
+
+    /// Update cached render-side world geometry after world changes.
+    fn sync_render_cache(&mut self) {
+        self.render_origin = self.world.origin;
+        self.render_inv_size = 1.0 / self.world.side() as f32;
+    }
+
     /// Get the player's eye position and look direction.
     fn player_eye_ray(&self) -> Option<([f64; 3], [f64; 3])> {
         let pid = self.player_id?;
@@ -196,6 +221,9 @@ impl App {
 
     /// Break the block the player is looking at.
     fn break_block(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
         let Some((eye, dir)) = self.player_eye_ray() else {
             return;
         };
@@ -218,6 +246,9 @@ impl App {
 
     /// Place a block on the face the player is looking at.
     fn place_block(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
         let pid = self.player_id;
         let held_material = pid
             .and_then(|id| self.entities.iter().find(|e| e.id == id))
@@ -283,6 +314,9 @@ impl App {
 
     fn select_rule(&mut self, rule: sim::GameOfLife3D, label: &str) {
         self.gol_smoke_rule = rule;
+        if self.is_stepping() {
+            return;
+        }
         self.world.invalidate_rule_caches();
         if self.gol_smoke_scene {
             self.world.set_gol_smoke_rule(self.gol_smoke_rule);
@@ -315,6 +349,9 @@ impl App {
     }
 
     fn load_burning_room_demo(&mut self, label: &str) {
+        if self.is_stepping() {
+            return;
+        }
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.seed_burning_room();
         self.gol_smoke_scene = false;
@@ -331,10 +368,14 @@ impl App {
             &mut self.svdag,
             &mut self.last_svdag_stats,
         );
+        self.sync_render_cache();
         log::info!("{label}: pop={}", self.world.population());
     }
 
     fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
+        if self.is_stepping() {
+            return;
+        }
         let nodes_before = self.world.store.stats();
         let start = std::time::Instant::now();
         let stats = self.world.seed_terrain(&params);
@@ -362,6 +403,7 @@ impl App {
             elapsed,
             self.noise_ns_per_sample,
         );
+        self.sync_render_cache();
     }
 }
 
@@ -461,7 +503,7 @@ impl ApplicationHandler for App {
                             };
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
-                        winit::keyboard::Key::Character("s") => {
+                        winit::keyboard::Key::Character("s") if !self.is_stepping() => {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
@@ -509,7 +551,7 @@ impl ApplicationHandler for App {
                                 terrain::TerrainParams::default(),
                             );
                         }
-                        winit::keyboard::Key::Character("g") => {
+                        winit::keyboard::Key::Character("g") if !self.is_stepping() => {
                             // Swap to the single retained GoL smoke seed.
                             self.world = sim::World::new(self.volume_size.trailing_zeros());
                             self.world.set_gol_smoke_rule(self.gol_smoke_rule);
@@ -527,6 +569,7 @@ impl ApplicationHandler for App {
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
+                            self.sync_render_cache();
                             log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
                         winit::keyboard::Key::Character(
@@ -559,7 +602,7 @@ impl ApplicationHandler for App {
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
                         // cadence.
-                        winit::keyboard::Key::Character("p") => {
+                        winit::keyboard::Key::Character("p") if !self.is_stepping() => {
                             let nodes = self.world.store.stats();
                             self.mem_stats.update(nodes);
                             let (svdag_nodes, svdag_bytes, svdag_root_level) =
@@ -671,58 +714,69 @@ impl ApplicationHandler for App {
                 let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
                 self.last_frame = std::time::Instant::now();
 
-                // Step simulation
-                if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
-                    // Time the step. `perf.start` returns a Timer that
-                    // borrows only self.perf; self.world is disjoint, so
-                    // the borrow checker lets the step proceed while the
-                    // Timer is alive.
-                    {
-                        let _t = self.perf.start("step");
-                        self.world.apply_mutations();
-                        self.world.step_recursive();
+                // --- Background step: collect completed result (x5w) ---
+                if let Some(ref handle) = self.step_handle {
+                    if handle.is_finished() {
+                        let handle = self.step_handle.take().unwrap();
+                        self.world = handle.join().expect("step thread panicked");
+                        // Entity update runs on the main thread (needs
+                        // both &World and &mut EntityStore).
                         let mut queue = std::mem::take(&mut self.world.queue);
                         self.entities.update(&self.world, &mut queue);
                         self.world.queue = queue;
-                    }
-                    // Time SVDAG rebuild + GPU upload. CPU-side submit
-                    // only — wgpu queue writes are async. upload_volume
-                    // takes explicit field references (not &mut self)
-                    // precisely so the Timer can coexist with the call.
-                    {
-                        let _t = self.perf.start("upload_cpu");
-                        Self::upload_volume(
-                            &mut self.renderer,
-                            &self.world,
-                            &mut self.svdag,
-                            &mut self.last_svdag_stats,
-                        );
-                        // Upload particle billboard data. Positions are in
-                        // world coords — subtract origin and normalize to [0,1]³.
-                        if let Some(renderer) = &mut self.renderer {
-                            let inv_size = 1.0 / self.world.side() as f32;
-                            let wo = self.world.origin;
-                            let particle_data: Vec<[f32; 4]> = self
-                                .entities
-                                .iter()
-                                .filter_map(|e| {
-                                    let mat = match &e.kind {
-                                        sim::EntityKind::Particle(p) => p.material as u32,
-                                        sim::EntityKind::Player(_) => return None,
-                                    };
-                                    Some([
-                                        (e.pos[0] - wo[0] as f64) as f32 * inv_size,
-                                        (e.pos[1] - wo[1] as f64) as f32 * inv_size,
-                                        (e.pos[2] - wo[2] as f64) as f32 * inv_size,
-                                        f32::from_bits(mat),
-                                    ])
-                                })
-                                .collect();
-                            renderer.upload_particles(&particle_data);
+                        self.sync_render_cache();
+                        // SVDAG rebuild + GPU upload now that world is back.
+                        {
+                            let _t = self.perf.start("upload_cpu");
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.svdag,
+                                &mut self.last_svdag_stats,
+                            );
+                            if let Some(renderer) = &mut self.renderer {
+                                let inv_size = self.render_inv_size;
+                                let wo = self.render_origin;
+                                let particle_data: Vec<[f32; 4]> = self
+                                    .entities
+                                    .iter()
+                                    .filter_map(|e| {
+                                        let mat = match &e.kind {
+                                            sim::EntityKind::Particle(p) => p.material as u32,
+                                            sim::EntityKind::Player(_) => return None,
+                                        };
+                                        Some([
+                                            (e.pos[0] - wo[0] as f64) as f32 * inv_size,
+                                            (e.pos[1] - wo[1] as f64) as f32 * inv_size,
+                                            (e.pos[2] - wo[2] as f64) as f32 * inv_size,
+                                            f32::from_bits(mat),
+                                        ])
+                                    })
+                                    .collect();
+                                renderer.upload_particles(&particle_data);
+                            }
                         }
+                        self.step_timer = std::time::Instant::now();
                     }
+                }
 
-                    self.step_timer = std::time::Instant::now();
+                // --- Kick off background step if due (x5w) ---
+                if !self.paused
+                    && self.step_timer.elapsed().as_millis() > 200
+                    && !self.is_stepping()
+                {
+                    let _t = self.perf.start("step");
+                    // Move world to background thread; replace with tiny
+                    // placeholder so self.world remains valid (but inert).
+                    let mut world = std::mem::replace(
+                        &mut self.world,
+                        sim::World::new(1),
+                    );
+                    self.step_handle = Some(std::thread::spawn(move || {
+                        world.apply_mutations();
+                        world.step_recursive();
+                        world
+                    }));
                 }
 
                 // Wall-clock perf summary (hash-thing-q63). Sits outside the
@@ -731,19 +785,25 @@ impl ApplicationHandler for App {
                 // Gen repeatedly is intentional: it tells the user the app
                 // is still alive.
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
-                    let nodes = self.world.store.stats();
-                    self.mem_stats.update(nodes);
-                    let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
-                    log::info!(
-                        "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
-                        self.world.generation,
-                        self.world.population(),
-                        svdag_nodes,
-                        svdag_bytes / 1024,
-                        svdag_root_level,
-                        self.mem_stats.summary(),
-                        self.perf.summary(),
-                    );
+                    if self.is_stepping() {
+                        // World is on the background thread — just show perf.
+                        log::info!("(stepping) | {}", self.perf.summary());
+                    } else {
+                        let nodes = self.world.store.stats();
+                        self.mem_stats.update(nodes);
+                        let (svdag_nodes, svdag_bytes, svdag_root_level) =
+                            self.last_svdag_stats;
+                        log::info!(
+                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
+                            self.world.generation,
+                            self.world.population(),
+                            svdag_nodes,
+                            svdag_bytes / 1024,
+                            svdag_root_level,
+                            self.mem_stats.summary(),
+                            self.perf.summary(),
+                        );
+                    }
                     self.log_timer = std::time::Instant::now();
                 }
 
@@ -799,61 +859,77 @@ impl ApplicationHandler for App {
 
                         let delta = player::compute_move_delta(yaw, [fwd, right, up], speed, dt);
 
+                        let stepping = self.is_stepping();
                         if let Some(p) = self.entities.get_mut(pid) {
-                            p.pos = player::apply_movement(&self.world, &p.pos, &delta);
+                            if stepping {
+                                // Free-fly: no collision while world is on
+                                // the background thread (x5w).
+                                p.pos[0] += delta[0];
+                                p.pos[1] += delta[1];
+                                p.pos[2] += delta[2];
+                            } else {
+                                p.pos =
+                                    player::apply_movement(&self.world, &p.pos, &delta);
+                            }
                         }
 
                         // hash-thing-m1f.4 / 37r: grow the world when the
                         // player approaches any boundary (positive or negative).
-                        if let Some(p) = self.entities.get_mut(pid) {
-                            const GROWTH_MARGIN: f64 = 8.0;
-                            let origin = self.world.origin;
-                            let side = self.world.side() as f64;
-                            let pos = p.pos;
-                            let margin = GROWTH_MARGIN as i64;
-                            let near_pos_edge = pos
-                                .iter()
-                                .enumerate()
-                                .any(|(i, &c)| c > origin[i] as f64 + side - GROWTH_MARGIN);
-                            let near_neg_edge = pos
-                                .iter()
-                                .enumerate()
-                                .any(|(i, &c)| c < origin[i] as f64 + GROWTH_MARGIN);
-                            if near_pos_edge || near_neg_edge {
-                                let min = [
-                                    sim::WorldCoord(pos[0] as i64 - margin),
-                                    sim::WorldCoord(pos[1] as i64 - margin),
-                                    sim::WorldCoord(pos[2] as i64 - margin),
-                                ];
-                                let max = [
-                                    sim::WorldCoord(pos[0] as i64 + margin),
-                                    sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
-                                    sim::WorldCoord(pos[2] as i64 + margin),
-                                ];
-                                let old_level = self.world.level;
-                                self.world.ensure_region(min, max);
-                                if self.world.level != old_level {
-                                    log::info!(
-                                        "World grew: level {} → {} (side {}, origin {:?})",
-                                        old_level,
-                                        self.world.level,
-                                        self.world.side(),
-                                        self.world.origin,
-                                    );
-                                    Self::upload_volume(
-                                        &mut self.renderer,
-                                        &self.world,
-                                        &mut self.svdag,
-                                        &mut self.last_svdag_stats,
-                                    );
+                        // Skipped during background step — world is placeholder.
+                        if !self.is_stepping() {
+                            if let Some(p) = self.entities.get_mut(pid) {
+                                const GROWTH_MARGIN: f64 = 8.0;
+                                let origin = self.world.origin;
+                                let side = self.world.side() as f64;
+                                let pos = p.pos;
+                                let margin = GROWTH_MARGIN as i64;
+                                let near_pos_edge = pos.iter().enumerate().any(|(i, &c)| {
+                                    c > origin[i] as f64 + side - GROWTH_MARGIN
+                                });
+                                let near_neg_edge = pos.iter().enumerate().any(|(i, &c)| {
+                                    c < origin[i] as f64 + GROWTH_MARGIN
+                                });
+                                if near_pos_edge || near_neg_edge {
+                                    let min = [
+                                        sim::WorldCoord(pos[0] as i64 - margin),
+                                        sim::WorldCoord(pos[1] as i64 - margin),
+                                        sim::WorldCoord(pos[2] as i64 - margin),
+                                    ];
+                                    let max = [
+                                        sim::WorldCoord(pos[0] as i64 + margin),
+                                        sim::WorldCoord(
+                                            (pos[1] + PLAYER_HEIGHT) as i64 + margin,
+                                        ),
+                                        sim::WorldCoord(pos[2] as i64 + margin),
+                                    ];
+                                    let old_level = self.world.level;
+                                    self.world.ensure_region(min, max);
+                                    if self.world.level != old_level {
+                                        log::info!(
+                                            "World grew: level {} → {} (side {}, origin {:?})",
+                                            old_level,
+                                            self.world.level,
+                                            self.world.side(),
+                                            self.world.origin,
+                                        );
+                                        Self::upload_volume(
+                                            &mut self.renderer,
+                                            &self.world,
+                                            &mut self.svdag,
+                                            &mut self.last_svdag_stats,
+                                        );
+                                        self.sync_render_cache();
+                                    }
                                 }
                             }
                         }
 
                         // Sync camera to player position and orientation.
+                        // Uses cached render_origin / render_inv_size so this
+                        // works even while world is on the step thread (x5w).
+                        let inv_size = self.render_inv_size as f64;
+                        let wo = self.render_origin;
                         if let Some(player) = self.entities.get_mut(pid) {
-                            let inv_size = 1.0 / self.world.side() as f64;
-                            let wo = self.world.origin;
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.camera_target = [
                                     (player.pos[0] - wo[0] as f64) as f32 * inv_size as f32,
@@ -864,11 +940,13 @@ impl ApplicationHandler for App {
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
-                                    // Update HUD material color from palette.
-                                    let palette = self.world.materials.color_palette_rgba();
-                                    let mat = ps.held_material as usize;
-                                    if mat < palette.len() {
-                                        renderer.hud_material_color = palette[mat];
+                                    if !stepping {
+                                        let palette =
+                                            self.world.materials.color_palette_rgba();
+                                        let mat = ps.held_material as usize;
+                                        if mat < palette.len() {
+                                            renderer.hud_material_color = palette[mat];
+                                        }
                                     }
                                 }
                                 renderer.camera_dist = 0.0;

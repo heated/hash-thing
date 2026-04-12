@@ -83,8 +83,8 @@ pub struct MaterialEntry {
 
 pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
-    rules: Vec<Box<dyn CaRule>>,
-    block_rules: Vec<Box<dyn BlockRule>>,
+    rules: Vec<Box<dyn CaRule + Send>>,
+    block_rules: Vec<Box<dyn BlockRule + Send>>,
 }
 
 impl fmt::Debug for MaterialRegistry {
@@ -328,7 +328,7 @@ impl MaterialRegistry {
 
     fn register_rule<R>(&mut self, rule: R) -> RuleId
     where
-        R: CaRule + 'static,
+        R: CaRule + Send + 'static,
     {
         let rule_id = RuleId(self.rules.len());
         self.rules.push(Box::new(rule));
@@ -337,7 +337,7 @@ impl MaterialRegistry {
 
     pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
     where
-        R: BlockRule + 'static,
+        R: BlockRule + Send + 'static,
     {
         let id = BlockRuleId(self.block_rules.len());
         self.block_rules.push(Box::new(rule));
