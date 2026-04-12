@@ -1,4 +1,5 @@
 /target
+/web/pkg/
 .claude/
 .ship-notes/*
 !.ship-notes/design-ledger.md

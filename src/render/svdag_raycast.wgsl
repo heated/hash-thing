@@ -57,7 +57,7 @@ fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
 // Material color palette. Input is the packed 16-bit cell word:
 //   bits 15..6 material_id (10 bits)
 //   bits  5..0 metadata    ( 6 bits)
-// We index by material_id; metadata is ignored until 1v0.2 lands the registry.
+// We index by material_id; metadata is reserved for future per-cell variation.
 //
 // DRIFT GUARD: the shift amount `6u` below mirrors `Cell::METADATA_BITS`
 // in src/octree/node.rs. If that constant ever changes, update this
@@ -65,12 +65,16 @@ fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
 // test in src/render/mod.rs (test `wgsl_metadata_shift_matches_rust`).
 fn material_color(packed: u32) -> vec3<f32> {
     let mat_id = packed >> 6u;
+    // Synced with MaterialRegistry::terrain_defaults() in src/terrain/materials.rs.
+    // DRIFT GUARD: test `wgsl_material_palette_matches_registry` in
+    // src/render/mod.rs pins these values to the Rust registry.
     switch mat_id {
-        case 1u: { return vec3<f32>(0.4, 0.8, 0.3); }
-        case 2u: { return vec3<f32>(0.8, 0.3, 0.2); }
-        case 3u: { return vec3<f32>(0.2, 0.4, 0.9); }
-        case 4u: { return vec3<f32>(0.9, 0.8, 0.2); }
-        default: { return vec3<f32>(0.6, 0.7, 0.8); }
+        case 1u: { return vec3<f32>(0.45, 0.45, 0.48); }  // stone
+        case 2u: { return vec3<f32>(0.45, 0.29, 0.15); }  // dirt
+        case 3u: { return vec3<f32>(0.22, 0.57, 0.19); }  // grass
+        case 4u: { return vec3<f32>(0.98, 0.43, 0.05); }  // fire
+        case 5u: { return vec3<f32>(0.12, 0.35, 0.84); }  // water
+        default: { return vec3<f32>(0.6, 0.7, 0.8); }     // unknown / air fallback
     }
 }
 
