@@ -16,14 +16,11 @@
 # Disable daemon for RPC communication (forces direct database access)
 # no-daemon: false
 
-# Disable auto-flush of database to JSONL after mutations
-# ENABLED: with 9 concurrent agents, auto-flush races to write issues.jsonl.
-# Use `bd export` explicitly when a JSONL snapshot is needed.
-no-auto-flush: true
+# Auto-flush: DB -> JSONL after mutations. Safe in server mode.
+# no-auto-flush: false
 
-# Disable auto-import from JSONL when it's newer than database
-# ENABLED: auto-import was wiping the shared Dolt DB when stale JSONL
-# arrived via branch switches / git pull. Dolt DB is the source of truth.
+# Auto-import: DISABLED. Dolt server is the source of truth.
+# Stale JSONL from branch switches must never overwrite the live DB.
 no-auto-import: true
 
 # Enable JSON output by default
