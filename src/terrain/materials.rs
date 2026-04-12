@@ -238,6 +238,26 @@ impl Default for MaterialRegistry {
     }
 }
 
+impl std::fmt::Display for MaterialRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let populated: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(id, e)| e.as_ref().map(|e| (id, e)))
+            .collect();
+        write!(f, "MaterialRegistry({} materials: ", populated.len())?;
+        for (i, (id, entry)) in populated.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}={}", id, entry.visual.label)?;
+            write!(f, "[rule={}]", entry.rule_id.0)?;
+        }
+        write!(f, ")")
+    }
+}
+
 /// Map "depth below the surface y" to a material.
 ///
 /// `depth` is `surface_y - cell_y`. Above the surface (`depth < 0`) is `AIR`.
@@ -430,5 +450,22 @@ mod tests {
                 .step_cell(Cell::pack(GRASS_MATERIAL_ID, 7), &fire_neighbors),
             Cell::pack(GRASS_MATERIAL_ID, 7),
         );
+    }
+
+    #[test]
+    fn display_terrain_defaults() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let s = format!("{registry}");
+        assert!(s.starts_with("MaterialRegistry(6 materials: "));
+        assert!(s.contains("0=air"));
+        assert!(s.contains("1=stone"));
+        assert!(s.contains("5=water"));
+        assert!(s.contains("[rule="));
+    }
+
+    #[test]
+    fn display_empty_registry() {
+        let registry = MaterialRegistry::new();
+        assert_eq!(format!("{registry}"), "MaterialRegistry(0 materials: )");
     }
 }
