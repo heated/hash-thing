@@ -247,6 +247,62 @@ impl Svdag {
 }
 
 // ----------------------------------------------------------------------------
+// Point-query traversal for validation tests.
+//
+// Walks the serialized SVDAG buffer to look up the material at integer
+// coordinates (x, y, z), exactly as the GPU would. Returns the raw
+// CellState (0 = empty, nonzero = material).
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+impl Svdag {
+    /// Look up a single voxel in the serialized SVDAG buffer by integer coords.
+    ///
+    /// Descends from the root, using octant indexing at each level, reading
+    /// the child mask and child entries from the flat `nodes` array. Returns
+    /// the raw leaf value (material-packed `CellState`) or 0 for empty.
+    pub fn lookup_voxel(&self, x: u64, y: u64, z: u64) -> u16 {
+        let side = 1u64 << self.root_level;
+        if x >= side || y >= side || z >= side {
+            return 0;
+        }
+        let mut offset = self.nodes[0] as usize;
+        let mut lx = x;
+        let mut ly = y;
+        let mut lz = z;
+        for level in (1..=self.root_level).rev() {
+            let half = 1u64 << (level - 1);
+            let ox = if lx >= half { 1usize } else { 0 };
+            let oy = if ly >= half { 1usize } else { 0 };
+            let oz = if lz >= half { 1usize } else { 0 };
+            let octant = ox | (oy << 1) | (oz << 2);
+
+            let mask = self.nodes[offset];
+            let child_word = self.nodes[offset + 1 + octant];
+
+            if mask & (1 << octant) == 0 {
+                // Empty octant.
+                return 0;
+            }
+
+            if child_word & LEAF_BIT != 0 {
+                // Inline leaf — extract the material.
+                return (child_word & !LEAF_BIT) as u16;
+            }
+
+            // Interior child — descend.
+            offset = child_word as usize;
+            if ox == 1 { lx -= half; }
+            if oy == 1 { ly -= half; }
+            if oz == 1 { lz -= half; }
+        }
+        // Reached level 0 without hitting a leaf — shouldn't happen in
+        // a well-formed SVDAG, but return 0 defensively.
+        0
+    }
+}
+
+// ----------------------------------------------------------------------------
 // CPU-side replica of svdag_raycast.wgsl for debugging.
 //
 // This deliberately mirrors the WGSL shader line-for-line so that any bug in
@@ -2349,5 +2405,142 @@ mod tests {
             mask > 0,
             "root mask should be nonzero for a non-empty world"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // m1f.5: SVDAG ↔ octree content sync validation
+    // ---------------------------------------------------------------
+
+    /// Helper: verify every cell in the octree matches the SVDAG lookup.
+    /// Samples all cells in the side³ cube.
+    fn assert_svdag_matches_octree(
+        svdag: &Svdag,
+        store: &NodeStore,
+        root: NodeId,
+        level: u32,
+        label: &str,
+    ) {
+        let side = 1u64 << level;
+        let mut mismatches = 0;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let octree_val = store.get_cell(root, x, y, z);
+                    let svdag_val = svdag.lookup_voxel(x, y, z) as CellState;
+                    if octree_val != svdag_val {
+                        if mismatches < 5 {
+                            eprintln!(
+                                "  MISMATCH at ({x},{y},{z}): octree={octree_val} svdag={svdag_val} [{label}]"
+                            );
+                        }
+                        mismatches += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(mismatches, 0, "{label}: {mismatches} voxel mismatches between octree and SVDAG");
+    }
+
+    #[test]
+    fn svdag_matches_octree_after_build() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4); // 16³ — small enough to exhaustively check
+        root = store.set_cell(root, 3, 7, 11, mat(1));
+        root = store.set_cell(root, 0, 0, 0, mat(2));
+        root = store.set_cell(root, 15, 15, 15, mat(3));
+
+        let svdag = Svdag::build(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "fresh build");
+    }
+
+    #[test]
+    fn svdag_matches_octree_after_incremental_edits() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        root = store.set_cell(root, 5, 5, 5, mat(1));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "initial");
+
+        // Edit 1: add a voxel
+        root = store.set_cell(root, 10, 2, 14, mat(2));
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "after add");
+
+        // Edit 2: overwrite existing voxel with different material
+        root = store.set_cell(root, 5, 5, 5, mat(3));
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "after overwrite");
+
+        // Edit 3: erase a voxel
+        root = store.set_cell(root, 10, 2, 14, 0);
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "after erase");
+    }
+
+    #[test]
+    fn svdag_matches_octree_after_compact() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+
+        let mut svdag = Svdag::new();
+
+        // Fill scattered voxels, updating incrementally each time.
+        for i in 0..12u64 {
+            root = store.set_cell(root, i, i % 8, (i * 3) % 16, mat((i as u16) + 1));
+            svdag.update(&store, root, 4);
+        }
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "pre-compact");
+
+        svdag.compact(&store, root);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "post-compact");
+    }
+
+    #[test]
+    fn svdag_matches_octree_cross_epoch() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        root = store.set_cell(root, 7, 3, 12, mat(1));
+        root = store.set_cell(root, 1, 1, 1, mat(2));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "epoch 1");
+
+        // Compact the store — NodeIds change, content stays the same.
+        let (store2, root2) = store.compacted(root);
+        svdag.update(&store2, root2, 4);
+        assert_svdag_matches_octree(&svdag, &store2, root2, 4, "epoch 2 (after compaction)");
+
+        // Edit in the new epoch and validate.
+        let mut store2 = store2;
+        let mut root2 = root2;
+        root2 = store2.set_cell(root2, 0, 15, 0, mat(4));
+        svdag.update(&store2, root2, 4);
+        assert_svdag_matches_octree(&svdag, &store2, root2, 4, "epoch 2 after edit");
+    }
+
+    #[test]
+    fn svdag_matches_octree_empty_world() {
+        let mut store = NodeStore::new();
+        let root = store.empty(4);
+        let svdag = Svdag::build(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "empty world");
+    }
+
+    #[test]
+    fn svdag_matches_octree_uniform_world() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3); // 8³ — fill all cells
+        for z in 0..8u64 {
+            for y in 0..8u64 {
+                for x in 0..8u64 {
+                    root = store.set_cell(root, x, y, z, mat(1));
+                }
+            }
+        }
+        let svdag = Svdag::build(&store, root, 3);
+        assert_svdag_matches_octree(&svdag, &store, root, 3, "fully filled 8³");
     }
 }
