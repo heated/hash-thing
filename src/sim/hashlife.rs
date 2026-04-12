@@ -18,8 +18,10 @@
 //!      (each level n-1), recursively step each → 8 results at level n-2.
 //!      Assemble into the level-(n-1) output.
 //!
-//! This is the correctness-first implementation. Memoization (6gf.2) and
-//! exponential time-skip come later.
+//! Step results are memoized by (NodeId, origin) so identical subtrees at
+//! the same world-space position are computed only once per generation.
+//! The cache is cleared after each step (generation changes affect BlockRule
+//! rng_hash, and compaction remaps NodeIds).
 
 use super::rule::BlockContext;
 use super::world::World;
@@ -45,6 +47,7 @@ impl World {
         self.root = result;
         self.generation += 1;
 
+        self.hashlife_cache.clear();
         self.store.clear_step_cache();
         let (new_store, new_root) = self.store.compacted(self.root);
         self.store = new_store;
@@ -71,11 +74,19 @@ impl World {
     fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3]) -> NodeId {
         debug_assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
-        if level == 3 {
+        let key = (node, origin);
+        if let Some(&cached) = self.hashlife_cache.get(&key) {
+            return cached;
+        }
+
+        let result = if level == 3 {
             self.step_base_case(node, origin)
         } else {
             self.step_recursive_case(node, level, origin)
-        }
+        };
+
+        self.hashlife_cache.insert(key, result);
+        result
     }
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,

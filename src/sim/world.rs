@@ -5,6 +5,7 @@ use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
+use rustc_hash::FxHashMap;
 
 /// The axis-aligned cube of world-space that the octree currently covers.
 ///
@@ -74,6 +75,10 @@ pub struct World {
     pub generation: u64,
     pub simulation_seed: u64,
     pub materials: MaterialRegistry,
+    /// Memoization cache for the recursive Hashlife stepper (6gf.2).
+    /// Key: (NodeId, world-space origin). Value: stepped result NodeId.
+    /// Cleared after each generation and on rule changes.
+    pub(crate) hashlife_cache: FxHashMap<(NodeId, [i64; 3]), NodeId>,
 }
 
 impl World {
@@ -101,6 +106,7 @@ impl World {
             generation: 0,
             simulation_seed: 0,
             materials,
+            hashlife_cache: FxHashMap::default(),
         }
     }
 
@@ -123,6 +129,7 @@ impl World {
     /// memoized stepping cannot reuse results from a different ruleset.
     pub fn invalidate_rule_caches(&mut self) {
         self.store.clear_step_cache();
+        self.hashlife_cache.clear();
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
