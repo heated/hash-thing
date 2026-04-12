@@ -245,18 +245,35 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     // axes at entry, and the axis holding that max is the
                     // last face the ray crossed to get inside the voxel.
                     //
-                    // Assumes the ray origin is outside the leaf. Inside-leaf
-                    // origins produce an inward-facing normal (all `tmin_v`
-                    // negative → picker returns the nearest back face); the
-                    // orbit camera can reach this case on deep zoom. Tracked
-                    // as a follow-up to hash-thing-rv4. The cascade below
-                    // uses `>=` on both comparators so ties break identically
-                    // to the CPU oracle in svdag.rs — do NOT flip to `>`.
+                    // hash-thing-2nd: inside-leaf fallback. When the ray
+                    // origin sits inside the filled voxel, every `tmin_v`
+                    // component is negative — the entry-face picker then
+                    // returns the nearest back face and the normal flips
+                    // inward, shading the voxel as if lit from behind. The
+                    // orbit camera reaches this case on deep zoom. Fallback:
+                    // pick the nearest exit face (argmin of `tmax_v`) and
+                    // flip the sign so the normal points in the direction
+                    // the ray is heading — the "about to emerge" convention.
+                    // The outer cascade uses `>=` on both comparators so
+                    // entry-face ties break identically to the CPU oracle
+                    // in svdag.rs — do NOT flip to `>`. The inner (inside)
+                    // cascade uses `<=` for the same reason: CPU/GPU must
+                    // break exit-face ties identically.
                     let lt1 = (leaf_min - ro_local) * inv_rd;
                     let lt2 = (leaf_max - ro_local) * inv_rd;
                     let tmin_v = min(lt1, lt2);
+                    let tmax_v = max(lt1, lt2);
                     var normal = vec3<f32>(0.0);
-                    if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
+                    let inside = tmin_v.x < 0.0 && tmin_v.y < 0.0 && tmin_v.z < 0.0;
+                    if inside {
+                        if tmax_v.x <= tmax_v.y && tmax_v.x <= tmax_v.z {
+                            normal = vec3<f32>(sign(rd.x), 0.0, 0.0);
+                        } else if tmax_v.y <= tmax_v.z {
+                            normal = vec3<f32>(0.0, sign(rd.y), 0.0);
+                        } else {
+                            normal = vec3<f32>(0.0, 0.0, sign(rd.z));
+                        }
+                    } else if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
                         normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);
                     } else if tmin_v.y >= tmin_v.z {
                         normal = vec3<f32>(0.0, -sign(rd.y), 0.0);

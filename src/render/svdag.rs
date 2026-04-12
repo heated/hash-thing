@@ -515,14 +515,31 @@ pub mod cpu_trace {
                             (leaf_max[2] - ro_local[2]) * inv_rd[2],
                         ];
                         let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
-                        // Assumes ray origin is outside the leaf. Inside-leaf
-                        // origins pick the nearest back face (all `tmin_v`
-                        // negative → argmax is the least-negative axis);
-                        // tracked as a follow-up to hash-thing-rv4. The
-                        // cascade uses `>=` on both comparators so ties
-                        // break identically to the shader in
-                        // `svdag_raycast.wgsl` — do NOT flip to `>`.
-                        let normal = if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
+                        let tmax_v = [lt1[0].max(lt2[0]), lt1[1].max(lt2[1]), lt1[2].max(lt2[2])];
+                        // hash-thing-2nd: inside-leaf fallback. When the ray
+                        // origin sits inside the filled voxel, every `tmin_v`
+                        // component is negative — the entry-face picker (argmax
+                        // of `tmin_v`) then returns the nearest BACK face and
+                        // the normal flips inward, shading the voxel as if lit
+                        // from behind. Reachable via deep-zoom orbit camera.
+                        // Fallback: pick the nearest EXIT face (argmin of
+                        // `tmax_v`) and flip the sign so the normal points in
+                        // the direction the ray is heading — the "about to
+                        // emerge" convention. The outer cascade uses `>=` on
+                        // both comparators so ties break identically to the
+                        // shader in `svdag_raycast.wgsl` — do NOT flip to `>`.
+                        // The inner (inside) cascade uses `<=` for the same
+                        // reason: CPU/GPU must break exit-face ties identically.
+                        let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
+                        let normal = if inside {
+                            if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
+                                [rd[0].signum(), 0.0, 0.0]
+                            } else if tmax_v[1] <= tmax_v[2] {
+                                [0.0, rd[1].signum(), 0.0]
+                            } else {
+                                [0.0, 0.0, rd[2].signum()]
+                            }
+                        } else if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
                             [-rd[0].signum(), 0.0, 0.0]
                         } else if tmin_v[1] >= tmin_v[2] {
                             [0.0, -rd[1].signum(), 0.0]
@@ -1687,6 +1704,53 @@ mod tests {
             [-1.0, 0.0, 0.0],
             "xy-edge tie-break must pick x (x-first cascade with `>=`), got {normal:?}",
         );
+    }
+
+    /// hash-thing-2nd: inside-filled-leaf ray origins (reachable via deep-zoom
+    /// orbit camera) must produce an EXIT-face normal pointing in the direction
+    /// of travel — not the inward back-face normal the pre-2nd code returned.
+    /// Plants the ray origin at the exact center of a single filled voxel at
+    /// (32,32,32) in a level-6 grid and fires along each of the six axes. The
+    /// exit face on each is the one the ray is heading toward, so the normal
+    /// should equal `sign(rd)` (aligned with the direction of travel).
+    #[test]
+    fn leaf_hit_normal_inside_origin_picks_exit_face() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        let mat1 = mat(1);
+        root = store.set_cell(root, 32, 32, 32, mat1);
+        let dag = Svdag::build(&store, root, 6);
+
+        // Exact center of the filled voxel at (32,32,32) — world-space
+        // AABB [0.5, 0.515625]^3, center at 32.5/64 on every axis.
+        let center = [32.5_f32 / 64.0, 32.5 / 64.0, 32.5 / 64.0];
+
+        // (name, rd, expected exit-face normal = sign(rd) on the exit axis).
+        let cases: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("+x exit", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ("-x exit", [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            ("+y exit", [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            ("-y exit", [0.0, -1.0, 0.0], [0.0, -1.0, 0.0]),
+            ("+z exit", [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]),
+            ("-z exit", [0.0, 0.0, -1.0], [0.0, 0.0, -1.0]),
+        ];
+
+        for (name, rd, expected_normal) in cases {
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, center, *rd, false);
+            assert_eq!(
+                result.hit_material,
+                Some(mat1 as u32),
+                "{name}: expected inside-leaf hit, got miss (exhausted={})",
+                result.exhausted,
+            );
+            let normal = result.hit_normal.expect("hit must carry a normal");
+            assert_eq!(
+                normal, *expected_normal,
+                "{name}: inside-leaf origin with rd {rd:?} must yield exit-face \
+                 normal {expected_normal:?}, got {normal:?} (pre-2nd returned \
+                 the inward back-face)",
+            );
+        }
     }
 
     /// hash-thing-rv4: `hit_normal` must be `None` on every non-hit return
