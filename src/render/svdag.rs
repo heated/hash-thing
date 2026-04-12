@@ -90,6 +90,7 @@ impl Svdag {
     /// Convenience wrapper for tests and single-snapshot paths. Production code
     /// should construct once with `new()` and call `update()` each frame so the
     /// content cache persists across calls.
+    #[cfg(test)]
     pub fn build(store: &NodeStore, root: NodeId, root_level: u32) -> Self {
         let mut svdag = Self::new();
         svdag.update(store, root, root_level);
@@ -204,11 +205,13 @@ impl Svdag {
     }
 
     /// Absolute offset of the current root node in `nodes`. Mirrors `nodes[0]`.
+    #[cfg(test)]
     pub fn root_offset(&self) -> u32 {
         self.nodes[0]
     }
 
     /// Cumulative count of distinct slots interned over this builder's lifetime.
+    #[cfg(test)]
     pub fn total_slot_count(&self) -> usize {
         self.offset_by_slot.len()
     }
@@ -2165,7 +2168,7 @@ mod tests {
         let appended_slots = appended_u32 / 9;
 
         assert!(
-            appended_u32 % 9 == 0,
+            appended_u32.is_multiple_of(9),
             "appended u32 count must be a multiple of 9 (whole slots), got {appended_u32}"
         );
         assert!(
