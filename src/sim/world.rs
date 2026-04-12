@@ -1742,6 +1742,34 @@ mod tests {
     }
 
     #[test]
+    fn expand_terrain_matches_direct_gen() {
+        // A world grown by expansion should produce the same terrain
+        // as one generated at the larger size from the start. This
+        // verifies there are no seams at expansion boundaries.
+        let params = TerrainParams::default();
+
+        // Path A: generate at level 3, then expand to level 4.
+        let mut grown = World::new(3);
+        grown.seed_terrain(&params);
+        grown.ensure_contains(wc(10), wc(0), wc(0)); // grows to level 4
+
+        // Path B: generate at level 4 directly.
+        let mut direct = World::new(4);
+        direct.seed_terrain(&params);
+
+        // Spot-check cells across the expansion boundary (x=8 is the seam).
+        for x in 0..16u64 {
+            for yz in [0u64, 3, 7] {
+                assert_eq!(
+                    grown.get(wc(x), wc(yz), wc(yz)),
+                    direct.get(wc(x), wc(yz), wc(yz)),
+                    "seam mismatch at ({x}, {yz}, {yz})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gol_world_expand_stays_empty() {
         // GoL smoke worlds don't set terrain_params, so expansion is empty.
         let mut world = World::new(3);
