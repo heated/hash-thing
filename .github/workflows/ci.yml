@@ -1,16 +1,21 @@
-# hash-thing-xb7.1 — cross-platform CI matrix.
+# hash-thing CI: cross-platform build, test, and release packaging.
 #
 # Build and test on Mac/Linux/Windows runners so OS-specific breakage (wgpu
 # backends, winit platform bindings, target-triple-only code paths) surfaces
-# before it lands on main. Unblocks xb7.2 (macOS notarization), xb7.3 (Linux
-# AppImage), xb7.4 (Windows .exe) — each needs a working `cargo build --release`
-# on its target platform as a precondition.
+# before it lands on main. Originally landed as xb7.1; xb7.3 added the Linux
+# AppImage wrapper and xb7.4 added per-platform binary artifact upload.
 #
 # What this runs per platform:
 #   1. cargo fmt --check    (fast, catches format drift)
 #   2. cargo clippy -D warn (catches lints)
 #   3. cargo build --release
 #   4. cargo test --release
+#   5. upload bare release binary (xb7.4)
+#   6. Linux-only: wrap binary in an AppImage and upload that too (xb7.3)
+#
+# Still open in xb7: macOS notarization (xb7.2 — needs Apple Developer ID
+# cert as a repo secret), WASM/WebGPU build (xb7.5 — needs distribution
+# story), Steam (xb7.6 — deferred).
 #
 # Tests don't initialize a GPU — they're all pure octree/store/terrain/sim
 # logic — so a headless Linux runner works fine. The renderer code still has
@@ -85,6 +90,12 @@ jobs:
       # links against when building with the default features. Installing
       # them keeps the workflow target-agnostic (no need to disable winit
       # features just to pass CI).
+      #
+      # libfuse2 is for the AppImage build step (xb7.3): linuxdeploy and
+      # appimagetool are themselves AppImages and require libfuse2 to run.
+      # ubuntu-22.04+ stopped shipping libfuse2 by default; the alternative
+      # is `--appimage-extract-and-run`, but installing the lib is simpler
+      # and shaves a few seconds off each invocation.
       - name: Install Linux winit deps
         if: runner.os == 'Linux'
         run: |
@@ -95,7 +106,8 @@ jobs:
             libx11-dev \
             libxcursor-dev \
             libxi-dev \
-            libxrandr-dev
+            libxrandr-dev \
+            libfuse2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -133,4 +145,42 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+
+      # AppImage wrapping (xb7.3). Linux-only. Pulls linuxdeploy from its
+      # rolling-release channel (linuxdeploy doesn't tag), stages an AppDir
+      # with the freshly built binary plus the .desktop file + placeholder
+      # icon from packaging/linux/, and produces a single-file .AppImage.
+      #
+      # `OUTPUT` env var pins the output filename so the upload step has a
+      # stable glob to grab. Without it linuxdeploy derives the name from
+      # the .desktop file's `Name=` and the host arch, which is fine but
+      # changes if anyone renames the app — better to be explicit.
+      #
+      # The bundled libraries are whatever linuxdeploy autodetects from the
+      # binary's ELF deps. For a winit + wgpu app this typically pulls in
+      # libwayland, libxkbcommon, libX11, etc. — the same libs the
+      # `Install Linux winit deps` step installed at build time. The
+      # AppImage will fall back to system libs at run time if available
+      # (the standard AppImage rpath behavior).
+      - name: Build AppImage
+        if: runner.os == 'Linux'
+        env:
+          OUTPUT: hash-thing-x86_64.AppImage
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable target/release/hash-thing \
+            --desktop-file packaging/linux/hash-thing.desktop \
+            --icon-file packaging/linux/hash-thing.svg \
+            --output appimage
+
+      - name: Upload AppImage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hash-thing-linux-x86_64.AppImage
+          path: hash-thing-x86_64.AppImage
           if-no-files-found: error
