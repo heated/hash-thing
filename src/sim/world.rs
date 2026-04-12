@@ -99,6 +99,9 @@ pub struct World {
     pub spatial_memo: bool,
     /// Hashlife cache statistics from the most recent step.
     pub hashlife_stats: HashlifeStats,
+    /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
+    /// Avoids O(n³) flatten-and-scan on every `step_recursive_pow2` call.
+    pub(crate) block_rule_present: Option<bool>,
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
@@ -147,6 +150,7 @@ impl World {
             hashlife_spatial_cache: FxHashMap::default(),
             spatial_memo: false,
             hashlife_stats: HashlifeStats::default(),
+            block_rule_present: None,
             queue: MutationQueue::new(),
             origin: [0, 0, 0],
         }
@@ -204,6 +208,7 @@ impl World {
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
         self.root = self.store.set_cell(self.root, x.0, y.0, z.0, state);
+        self.block_rule_present = None; // invalidate cache
     }
 
     fn get_local(&self, x: LocalCoord, y: LocalCoord, z: LocalCoord) -> CellState {
@@ -684,6 +689,7 @@ impl World {
     fn commit_step(&mut self, next: &[CellState], side: usize) {
         self.root = self.store.from_flat(next, side);
         self.generation += 1;
+        self.block_rule_present = None;
 
         // Fresh-store compaction: `from_flat` interned a brand new generation
         // into the append-only store, leaving the previous generation's
@@ -735,6 +741,7 @@ impl World {
         self.root = root;
         self.generation = 0;
         self.terrain_params = Some(*params);
+        self.block_rule_present = None;
         stats
     }
 }

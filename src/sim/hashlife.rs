@@ -84,6 +84,7 @@ impl World {
             for _ in 0..steps {
                 self.step();
             }
+            self.block_rule_present = None; // brute-force may have consumed block-rule cells
             return;
         }
         let padded_root = self.pad_root();
@@ -100,12 +101,17 @@ impl World {
         self.remap_caches(&remap);
     }
 
-    fn has_block_rule_cells(&self) -> bool {
-        self.flatten().into_iter().any(|state| {
+    fn has_block_rule_cells(&mut self) -> bool {
+        if let Some(cached) = self.block_rule_present {
+            return cached;
+        }
+        let result = self.flatten().into_iter().any(|state| {
             self.materials
                 .block_rule_id_for_cell(Cell::from_raw(state))
                 .is_some()
-        })
+        });
+        self.block_rule_present = Some(result);
+        result
     }
 
     /// Remap hashlife cache keys and values through a compaction remap table.
