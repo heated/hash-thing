@@ -207,13 +207,13 @@ impl Svdag {
         if let Some(&existing) = self.offset_by_slot.get(&slot) {
             return existing;
         }
-        let new_offset = self.nodes.len() as u32;
+        let len = self.nodes.len();
         assert!(
-            new_offset < LEAF_BIT,
-            "SVDAG interior node count exceeded 31 bits ({}); \
+            len < LEAF_BIT as usize,
+            "SVDAG interior node count exceeded 31 bits ({len}); \
              widen the encoding (hash-thing-x9r follow-up)",
-            self.nodes.len()
         );
+        let new_offset = len as u32;
         self.nodes.extend_from_slice(&slot);
         self.offset_by_slot.insert(slot, new_offset);
         new_offset

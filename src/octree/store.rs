@@ -6,6 +6,12 @@ use rustc_hash::FxHashMap;
 /// Every unique node exists exactly once. Identical subtrees are shared.
 /// This gives us Hashlife's spatial compression: a 4096³ world that's
 /// mostly empty costs almost nothing.
+///
+/// Node indices are `u32`, limiting the store to ~4 billion unique nodes.
+/// In practice, hash-consing keeps the count far below this: a 4096³
+/// world with terrain + active water typically produces ~200K nodes.
+/// The `intern_node` path panics with a diagnostic message if this limit
+/// is ever reached.
 pub struct NodeStore {
     /// All canonical nodes, indexed by NodeId.
     nodes: Vec<Node>,
@@ -37,9 +43,15 @@ impl NodeStore {
         if let Some(&id) = self.intern.get(&node) {
             return id;
         }
-        let id = NodeId(
-            u32::try_from(self.nodes.len()).expect("NodeStore overflow: exceeded 2^32 nodes"),
-        );
+        let len = self.nodes.len();
+        let id = NodeId(u32::try_from(len).unwrap_or_else(|_| {
+            panic!(
+                "NodeStore overflow: {len} nodes exceeds u32::MAX ({}). \
+                 This means the world has more unique subtrees than 2^32 — \
+                 consider compacting more aggressively or widening NodeId to u64.",
+                u32::MAX
+            )
+        }));
         self.intern.insert(node.clone(), id);
         self.nodes.push(node);
         id
@@ -445,6 +457,12 @@ impl NodeStore {
 
     /// Stats for debugging.
     pub fn stats(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Number of unique nodes in the store. Alias for `stats()` with a
+    /// clearer name; use this for capacity checks and diagnostics.
+    pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
