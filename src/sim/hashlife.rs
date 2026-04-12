@@ -129,7 +129,10 @@ impl World {
         let result = match self.store.get(node).clone() {
             Node::Leaf(state) => {
                 // Empty cells (air) and inert materials are both fixed points
-                state == 0 || self.materials.cell_is_inert_fixed_point(Cell::from_raw(state))
+                state == 0
+                    || self
+                        .materials
+                        .cell_is_inert_fixed_point(Cell::from_raw(state))
             }
             Node::Interior { children, .. } => children.into_iter().all(|c| self.is_all_inert(c)),
         };
