@@ -5,8 +5,8 @@
 //! transition surface, so the builder must actually recurse into the
 //! straddling box and short-circuit on the boxes that are fully on one side.
 
-// Test-only fixture today; will become a real consumer when caves / dungeons
-// land in 3fq.2+.
+// Test-only fixture today; will become a real consumer when caves (3fq.2)
+// land as a post-pass.
 #![allow(dead_code)]
 
 use super::RegionField;

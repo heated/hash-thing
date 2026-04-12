@@ -3,7 +3,7 @@
 //! Recurses against any `&impl RegionField`, short-circuits on proof-based
 //! uniform classification, and interns through `NodeStore`. The recursion
 //! shape is the load-bearing pattern for every future direct-octree generator
-//! in this codebase (caves 3fq.2, dungeons 3fq.3, infinite worlds 3fq.4,
+//! in this codebase (caves 3fq.2, infinite worlds 3fq.4,
 //! HashDAG edits) — keep it small and uniform.
 //!
 //! There is exactly one short-circuit path: `RegionField::classify_box`. No
