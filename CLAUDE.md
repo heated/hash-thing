@@ -13,6 +13,16 @@ soft-max-command-seconds: 60
 
 Prefer commands that finish in under ~60s. Benchmarks, large builds, long test suites: run the smallest representative scale first. Only go bigger if explicitly asked or the small run was inconclusive. Background long runs rather than blocking.
 
+## Build profiles
+
+| Profile | Command | Compile | Runtime | Use when |
+|---------|---------|---------|---------|----------|
+| dev | `cargo run` / `cargo test` | ~13s | Debug-slow | Day-to-day iteration |
+| bench | `cargo run --profile bench` | ~30s | Fast (no LTO) | Perf benchmarks, profiling |
+| release | `cargo run --release` | ~60s+ | Fastest (LTO) | Final builds only |
+
+**Default to dev.** Use `--profile bench` for benchmark beads (m1f series). Never use `--release` unless building a distributable artifact. All worktrees share one target dir (`.cargo/config.toml`) so deps compile once.
+
 ## Agent surface — where project skills and commands live
 
 This project is designed to work with **any of three CLI agents**: Claude Code (the primary seat), Codex Exec, and Gemini CLI. To keep the three in sync:
