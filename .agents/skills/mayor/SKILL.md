@@ -1,3 +1,8 @@
+---
+name: mayor
+description: Singular design-observer seat for priority visibility and design gate commentary
+---
+
 # Mayor Skill
 
 `mayor` is a singular, mostly-passive design-observer seat. Comments on design gates, re-tiers misfiled work, surfaces decisions for edward. Does not claim drafting, planning, bead-restructure, `.ship-notes`, or `src/` work. Not in the auto-assign pool — only invoked explicitly.
