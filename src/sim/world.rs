@@ -68,13 +68,52 @@ impl World {
         self.invalidate_rule_caches();
     }
 
+    /// Grow the root octree until `(x, y, z)` is in-bounds.
+    ///
+    /// Wraps the current root in successively bigger parent nodes. The
+    /// existing root becomes octant 0 (the −x,−y,−z corner child) of
+    /// each new parent; the other 7 children are canonical empty nodes.
+    /// This preserves all existing cell coordinates — the world grows
+    /// in the +x, +y, +z direction only.
+    ///
+    /// No-op when the coordinate is already in-bounds.
+    ///
+    /// **Step cache:** existing cached results survive expansion because
+    /// they are keyed by `NodeId`, and the old root's `NodeId` is still
+    /// valid and still steps to the same result. The new parent has no
+    /// cached entry yet and will be computed fresh on first step.
+    pub fn ensure_contains(&mut self, x: u64, y: u64, z: u64) {
+        loop {
+            let side = 1u64 << self.level;
+            if x < side && y < side && z < side {
+                return;
+            }
+            // Wrap: old root → octant 0, 7 empty siblings at the old level.
+            let empty_sibling = self.store.empty(self.level);
+            let new_level = self.level + 1;
+            let new_root = self.store.interior(
+                new_level,
+                [
+                    self.root,
+                    empty_sibling,
+                    empty_sibling,
+                    empty_sibling,
+                    empty_sibling,
+                    empty_sibling,
+                    empty_sibling,
+                    empty_sibling,
+                ],
+            );
+            self.root = new_root;
+            self.level = new_level;
+        }
+    }
+
     /// Set a cell.
     ///
-    /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). Silent data
-    /// loss is unacceptable; once `World::ensure_contains` (hash-thing-819
-    /// contract half) and lazy root expansion (hash-thing-e9h) land, callers
-    /// will route OOB writes through explicit realization — for now the
-    /// primitive defends itself.
+    /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). For
+    /// writes to coordinates outside the current root, call
+    /// `ensure_contains` first to grow the tree.
     #[track_caller]
     pub fn set(&mut self, x: u64, y: u64, z: u64, state: CellState) {
         let side = self.side() as u64;
@@ -672,7 +711,7 @@ mod tests {
         w.seed_burning_room();
         assert!(w.population() > 0);
         let grid = w.flatten();
-        let has = |mat: CellState| grid.iter().any(|&c| c == mat);
+        let has = |mat: CellState| grid.contains(&mat);
         assert!(has(STONE), "room must have stone ceiling");
         assert!(has(DIRT), "room must have dirt floor");
         assert!(has(GRASS), "room must have grass walls");
@@ -1133,5 +1172,76 @@ mod tests {
         let params = TerrainParams::default();
         let stats = world.seed_terrain(&params);
         assert_eq!(stats.dungeon_us, 0);
+    }
+
+    // ---- ensure_contains (hash-thing-e9h) ----
+
+    #[test]
+    fn ensure_contains_noop_when_in_bounds() {
+        let mut world = World::new(3); // 8x8x8
+        let level_before = world.level;
+        let root_before = world.root;
+        world.ensure_contains(7, 7, 7);
+        assert_eq!(world.level, level_before);
+        assert_eq!(world.root, root_before);
+    }
+
+    #[test]
+    fn ensure_contains_grows_root_once() {
+        let mut world = World::new(3); // 8x8x8, side=8
+        world.set(5, 3, 2, STONE);
+        world.ensure_contains(8, 0, 0); // just past the edge
+        assert_eq!(world.level, 4); // grew once: side=16
+        assert_eq!(world.side(), 16);
+        // Original cell survives at its original coordinate.
+        assert_eq!(world.get(5, 3, 2), STONE);
+        // The newly accessible region is empty.
+        assert_eq!(world.get(8, 0, 0), 0);
+        assert_eq!(world.get(15, 15, 15), 0);
+    }
+
+    #[test]
+    fn ensure_contains_grows_multiple_levels() {
+        let mut world = World::new(2); // 4x4x4
+        world.set(1, 2, 3, FIRE);
+        // Coordinate 100 requires level >= 7 (side=128).
+        world.ensure_contains(100, 0, 0);
+        assert!(world.level >= 7);
+        assert!(world.side() > 100);
+        // Original cell survives.
+        assert_eq!(world.get(1, 2, 3), FIRE);
+    }
+
+    #[test]
+    fn ensure_contains_works_on_all_axes() {
+        let mut world = World::new(3); // 8x8x8
+                                       // Grow for Y axis.
+        world.ensure_contains(0, 10, 0);
+        assert!(world.side() > 10);
+        let level_after_y = world.level;
+        // Grow for Z axis (further).
+        world.ensure_contains(0, 0, 100);
+        assert!(world.level > level_after_y);
+        assert!(world.side() > 100);
+    }
+
+    #[test]
+    fn ensure_contains_then_set_roundtrips() {
+        let mut world = World::new(3); // 8x8x8
+        world.ensure_contains(20, 20, 20);
+        world.set(20, 20, 20, WATER);
+        assert_eq!(world.get(20, 20, 20), WATER);
+        // Other cells in the expanded region remain empty.
+        assert_eq!(world.get(19, 20, 20), 0);
+    }
+
+    #[test]
+    fn ensure_contains_preserves_population() {
+        let mut world = World::new(3);
+        world.set(0, 0, 0, STONE);
+        world.set(7, 7, 7, FIRE);
+        let pop_before = world.population();
+        world.ensure_contains(100, 100, 100);
+        assert_eq!(world.population(), pop_before);
     }
 }
