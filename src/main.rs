@@ -154,8 +154,17 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                         winit::keyboard::Key::Character("s") => {
-                            // Single step
-                            self.world.step_flat(&self.rule);
+                            // Single step. Instrument with the same
+                            // perf.time("step", ...) wrap as the auto-step
+                            // path (hash-thing-5qh) so `perf summary` has a
+                            // latency signal when the sim is paused and the
+                            // user drives stepping manually.
+                            {
+                                let world = &mut self.world;
+                                let perf = &mut self.perf;
+                                let rule = &self.rule;
+                                perf.time("step", || world.step_flat(rule));
+                            }
                             self.upload_volume();
                             log::info!(
                                 "Gen {}: pop={}",
