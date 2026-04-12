@@ -99,6 +99,9 @@ pub struct World {
     pub spatial_memo: bool,
     /// Hashlife cache statistics from the most recent step.
     pub hashlife_stats: HashlifeStats,
+    /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
+    /// Avoids O(n³) flatten-and-scan on every `step_recursive_pow2` call.
+    pub(crate) block_rule_present: Option<bool>,
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
@@ -147,6 +150,7 @@ impl World {
             hashlife_spatial_cache: FxHashMap::default(),
             spatial_memo: false,
             hashlife_stats: HashlifeStats::default(),
+            block_rule_present: None,
             queue: MutationQueue::new(),
             origin: [0, 0, 0],
         }
@@ -201,7 +205,10 @@ impl World {
             y.0,
             z.0,
         );
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         self.root = self.store.set_cell(self.root, x.0, y.0, z.0, state);
+        self.block_rule_present = None; // invalidate cache
     }
 
     fn get_local(&self, x: LocalCoord, y: LocalCoord, z: LocalCoord) -> CellState {
@@ -682,6 +689,7 @@ impl World {
     fn commit_step(&mut self, next: &[CellState], side: usize) {
         self.root = self.store.from_flat(next, side);
         self.generation += 1;
+        self.block_rule_present = None;
 
         // Fresh-store compaction: `from_flat` interned a brand new generation
         // into the append-only store, leaving the previous generation's
@@ -733,6 +741,7 @@ impl World {
         self.root = root;
         self.generation = 0;
         self.terrain_params = Some(*params);
+        self.block_rule_present = None;
         stats
     }
 }
@@ -1876,6 +1885,57 @@ mod tests {
         assert!(world.queue.is_empty());
         assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
         assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    #[test]
+    fn direct_set_clears_hashlife_caches() {
+        let mut world = World::new(3);
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+
+        world.set(wc(3), wc(3), wc(3), STONE);
+
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "direct edits must drop stale recursive cache entries"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "direct edits must drop stale macro-step cache entries"
+        );
+    }
+
+    #[test]
+    fn apply_mutations_clears_hashlife_caches() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(2),
+            y: wc(2),
+            z: wc(2),
+            state: STONE,
+        });
+
+        world.apply_mutations();
+
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "mutation flush must clear stale recursive cache entries"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "mutation flush must clear stale macro-step cache entries"
+        );
     }
 
     #[test]

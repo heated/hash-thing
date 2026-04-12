@@ -299,8 +299,8 @@ git diff origin/master...HEAD
 **Build prompt files:**
 ```bash
 mkdir -p notes/.tmp/ship-{BRANCH_ID}
-cat ~/.claude/commands/code_review.md > notes/.tmp/ship-{BRANCH_ID}/review-standard.md
-cat ~/.claude/commands/code_review_critical.md > notes/.tmp/ship-{BRANCH_ID}/review-critical.md
+cat .agents/commands/code_review.md > notes/.tmp/ship-{BRANCH_ID}/review-standard.md
+cat .agents/commands/code_review_critical.md > notes/.tmp/ship-{BRANCH_ID}/review-critical.md
 echo -e "\n\n---\n\n# CONTEXT\n\nBranch: ...\nCommits: ...\nDiff: ..." >> notes/.tmp/ship-{BRANCH_ID}/review-standard.md
 echo -e "\n\n---\n\n# CONTEXT\n\nBranch: ...\nCommits: ...\nDiff: ..." >> notes/.tmp/ship-{BRANCH_ID}/review-critical.md
 cp notes/.tmp/ship-{BRANCH_ID}/review-standard.md notes/.tmp/ship-{BRANCH_ID}/review-standard-gemini.md  # Gemini needs workspace-local file

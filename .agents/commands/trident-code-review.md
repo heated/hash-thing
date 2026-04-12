@@ -181,12 +181,12 @@ First, concatenate the canonical review prompts with the context document:
 
 ```bash
 # Standard prompt
-cat ~/.claude/commands/code_review.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
+cat .agents/commands/code_review.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 
 # Critical prompt
-cat ~/.claude/commands/code_review_critical.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
+cat .agents/commands/code_review_critical.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 
@@ -216,8 +216,8 @@ PROMPT_EOF
 
 For Gemini, also copy the prompt framework files into the workspace (Gemini sandboxes reads to the workspace):
 ```bash
-cp ~/.claude/commands/code_review.md notes/.tmp/trident-{REVIEW_ID}/
-cp ~/.claude/commands/code_review_critical.md notes/.tmp/trident-{REVIEW_ID}/
+cp .agents/commands/code_review.md notes/.tmp/trident-{REVIEW_ID}/
+cp .agents/commands/code_review_critical.md notes/.tmp/trident-{REVIEW_ID}/
 cp ~/.claude/agents/CodeReview-Evolutionary.md notes/.tmp/trident-{REVIEW_ID}/
 ```
 
