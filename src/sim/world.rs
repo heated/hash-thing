@@ -1,6 +1,7 @@
-use super::rule::ALIVE;
+use super::rule::{block_index, BlockContext, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
-use crate::terrain::materials::{MaterialRegistry, FIRE, WATER};
+use crate::rng::cell_hash;
+use crate::terrain::materials::{BlockRuleId, MaterialRegistry, FIRE, WATER};
 use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
@@ -13,6 +14,7 @@ pub struct World {
     pub root: NodeId,
     pub level: u32, // root level — grid is 2^level per side
     pub generation: u64,
+    pub simulation_seed: u64,
     pub materials: MaterialRegistry,
 }
 
@@ -39,6 +41,7 @@ impl World {
             root,
             level,
             generation: 0,
+            simulation_seed: 0,
             materials,
         }
     }
@@ -79,13 +82,17 @@ impl World {
         self.store.flatten(self.root, self.side())
     }
 
-    /// Step the simulation forward one generation using per-material rule dispatch.
-    /// This is the simple brute-force path — true Hashlife stepping replaces it later.
+    /// Step the simulation forward one generation.
+    ///
+    /// Pipeline: flatten → cell-wise CaRule pass → block-wise BlockRule pass → rebuild.
+    /// Single flatten/rebuild per tick. This is the brute-force path — true Hashlife
+    /// recursive stepping replaces it later.
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
         let mut next = vec![0 as CellState; side * side * side];
 
+        // Phase 1: cell-wise CaRule pass (Moore neighborhood).
         for z in 0..side {
             for y in 0..side {
                 for x in 0..side {
@@ -99,7 +106,102 @@ impl World {
             }
         }
 
+        // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
+        self.step_blocks(&mut next, side);
+
         self.commit_step(&next, side);
+    }
+
+    /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
+    ///
+    /// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
+    /// Blocks at the edges that would extend past the grid boundary are skipped.
+    ///
+    /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
+    /// distinct rule exists, run it. If zero or multiple: skip (identity).
+    fn step_blocks(&self, grid: &mut [CellState], side: usize) {
+        let offset = if self.generation % 2 == 0 { 0 } else { 1 };
+
+        let mut bz = offset;
+        while bz + 1 < side {
+            let mut by = offset;
+            while by + 1 < side {
+                let mut bx = offset;
+                while bx + 1 < side {
+                    self.apply_block(grid, side, bx, by, bz);
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+    }
+
+    /// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
+    fn apply_block(&self, grid: &mut [CellState], side: usize, bx: usize, by: usize, bz: usize) {
+        // Read the 8 cells.
+        let mut block = [Cell::EMPTY; 8];
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                    block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
+                }
+            }
+        }
+
+        // Skip all-empty blocks (optimization).
+        if block.iter().all(|c| c.is_empty()) {
+            return;
+        }
+
+        // Dispatch: find the unique block rule across all cells.
+        let rule_id = match self.unique_block_rule(&block) {
+            Some(id) => id,
+            None => return, // zero or multiple distinct rules → skip
+        };
+
+        let rule = self.materials.block_rule(rule_id);
+        let ctx = BlockContext {
+            block_origin: [bx as i64, by as i64, bz as i64],
+            generation: self.generation,
+            world_seed: self.simulation_seed,
+            rng_hash: cell_hash(
+                bx as i64,
+                by as i64,
+                bz as i64,
+                self.generation,
+                self.simulation_seed,
+            ),
+        };
+
+        let result = rule.step_block(&block, &ctx);
+
+        // Write back the 8 cells.
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                    grid[idx] = result[block_index(dx, dy, dz)].raw();
+                }
+            }
+        }
+    }
+
+    /// Find the unique BlockRuleId across all non-empty cells in a block.
+    /// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
+    fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
+        let mut found: Option<BlockRuleId> = None;
+        for cell in block {
+            if let Some(id) = self.materials.block_rule_id_for_cell(*cell) {
+                match found {
+                    None => found = Some(id),
+                    Some(existing) if existing == id => {}
+                    Some(_) => return None, // multiple distinct rules → skip
+                }
+            }
+        }
+        found
     }
 
     /// Place a random seed pattern in the center of the world.
