@@ -296,7 +296,8 @@ impl World {
     /// Block coordinate `(bx, by, bz)` maps to cell region
     /// `[bx*K .. bx*K+K-1]` on each axis, where `K = CELLS_PER_BLOCK`.
     ///
-    /// Queues a `FillRegion` mutation — call `apply_mutations` to flush.
+    /// Auto-grows the world to fit, then queues a `FillRegion` mutation —
+    /// call `apply_mutations` to flush.
     pub fn set_block(&mut self, bx: i64, by: i64, bz: i64, state: CellState) {
         let k = CELLS_PER_BLOCK as i64;
         let min = [WorldCoord(bx * k), WorldCoord(by * k), WorldCoord(bz * k)];
@@ -305,6 +306,7 @@ impl World {
             WorldCoord(by * k + k - 1),
             WorldCoord(bz * k + k - 1),
         ];
+        self.ensure_region(min, max);
         self.queue
             .push(WorldMutation::FillRegion { min, max, state });
     }
@@ -1999,6 +2001,31 @@ mod tests {
                         DIRT,
                         "cell ({x},{y},{z}) should be DIRT"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_block_auto_grows_world() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // Start with a level-3 world (side=8). Block at (1,0,0) needs cells [8..15],
+        // which is out of bounds. set_block should auto-grow to fit.
+        let mut world = World::new(3);
+        world.set_block(1, 0, 0, STONE);
+        world.apply_mutations();
+
+        // World must have grown to at least level 4 (side=16).
+        assert!(
+            world.level >= 4,
+            "world should auto-grow for out-of-bounds block"
+        );
+
+        let k = CELLS_PER_BLOCK as u64;
+        for z in 0..k {
+            for y in 0..k {
+                for x in k..(2 * k) {
+                    assert_eq!(world.get(wc(x), wc(y), wc(z)), STONE);
                 }
             }
         }
