@@ -201,6 +201,8 @@ impl World {
             y.0,
             z.0,
         );
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         self.root = self.store.set_cell(self.root, x.0, y.0, z.0, state);
     }
 
@@ -1876,6 +1878,57 @@ mod tests {
         assert!(world.queue.is_empty());
         assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
         assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    #[test]
+    fn direct_set_clears_hashlife_caches() {
+        let mut world = World::new(3);
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+
+        world.set(wc(3), wc(3), wc(3), STONE);
+
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "direct edits must drop stale recursive cache entries"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "direct edits must drop stale macro-step cache entries"
+        );
+    }
+
+    #[test]
+    fn apply_mutations_clears_hashlife_caches() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(2),
+            y: wc(2),
+            z: wc(2),
+            state: STONE,
+        });
+
+        world.apply_mutations();
+
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "mutation flush must clear stale recursive cache entries"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "mutation flush must clear stale macro-step cache entries"
+        );
     }
 
     #[test]
