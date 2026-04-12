@@ -31,6 +31,41 @@ mod wgsl_drift_guard {
         );
     }
 
+    /// hash-thing-2nd: pins the inside-leaf face-normal fallback in the
+    /// SVDAG shader to the CPU oracle in `src/render/svdag.rs`. When the
+    /// ray origin sits inside a filled voxel, the entry-face picker
+    /// (`argmax(tmin_v)`) returns an inward-facing normal (all `tmin_v`
+    /// components are negative → argmax is the least-negative axis → the
+    /// nearest back face). Both sides must detect this via
+    /// `all(tmin_v < 0)` and fall back to the nearest exit face
+    /// (`argmin(tmax_v)`) with `+sign(rd)` on that axis. Reachable via
+    /// deep-zoom orbit camera. This guard catches the case where a
+    /// future edit drifts ONLY the shader.
+    #[test]
+    fn wgsl_svdag_inside_leaf_normal_fallback_matches_rust() {
+        let expected_lines = [
+            "let tmax_v = max(lt1, lt2);",
+            "let inside = tmin_v.x < 0.0 && tmin_v.y < 0.0 && tmin_v.z < 0.0;",
+            "if tmax_v.x <= tmax_v.y && tmax_v.x <= tmax_v.z {",
+            "normal = vec3<f32>(sign(rd.x), 0.0, 0.0);",
+            "} else if tmax_v.y <= tmax_v.z {",
+            "normal = vec3<f32>(0.0, sign(rd.y), 0.0);",
+            "normal = vec3<f32>(0.0, 0.0, sign(rd.z));",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` verbatim — \
+                 the inside-leaf exit-face fallback drifted from the CPU \
+                 oracle in svdag.rs::cpu_trace::raycast_with_budget. Both \
+                 sides must detect inside-leaf via `all(tmin_v < 0)` and \
+                 pick the nearest exit face with `sign(rd)` on that axis \
+                 (hash-thing-2nd). Update whichever side is wrong so they \
+                 stay byte-equivalent."
+            );
+        }
+    }
+
     /// hash-thing-6hd: pins the `octant_of` midpoint tiebreak rule in the
     /// SVDAG shader to the CPU oracle in `src/render/svdag.rs`. Both sides
     /// must use strict `>` with `rd >= 0.0` as the tiebreaker on exact

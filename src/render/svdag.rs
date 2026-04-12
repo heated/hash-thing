@@ -1751,6 +1751,28 @@ mod tests {
                  the inward back-face)",
             );
         }
+
+        // Off-axis diagonal inside-origin ray — all three `tmax_v`
+        // components are finite, so the cascade picks the true `argmin`
+        // rather than relying on `+inf` on non-moving axes. For a ray
+        // starting at the voxel center with `rd = (1, 2, 3)`, the per-axis
+        // exit distances from center are `half / |rd_axis|`; z has the
+        // largest `|rd|`, so z exits first → normal = `[0, 0, +1]`.
+        let rd = normalize([1.0, 2.0, 3.0]);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, center, rd, false);
+        assert_eq!(
+            result.hit_material,
+            Some(mat1 as u32),
+            "diagonal: expected inside-leaf hit, got miss (exhausted={})",
+            result.exhausted,
+        );
+        let normal = result.hit_normal.expect("hit must carry a normal");
+        assert_eq!(
+            normal,
+            [0.0, 0.0, 1.0],
+            "diagonal rd {rd:?} from voxel center must exit through +z \
+             (largest |rd_axis|) → normal [0,0,+1], got {normal:?}",
+        );
     }
 
     /// hash-thing-rv4: `hit_normal` must be `None` on every non-hit return
