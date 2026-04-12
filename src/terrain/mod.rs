@@ -25,6 +25,8 @@ pub struct TerrainParams {
     pub amplitude: f32,
     pub wavelength: f32,
     pub octaves: u32,
+    /// Sea level. Air cells below this y become water. `None` disables water.
+    pub sea_level: Option<f32>,
     /// When `Some`, run the cave-CA post-pass with these params after
     /// heightmap generation. Default `None` keeps the baseline terrain
     /// path unchanged — tests and perf baselines don't see caves unless
@@ -42,6 +44,7 @@ impl Default for TerrainParams {
             amplitude: 8.0,
             wavelength: 24.0,
             octaves: 4,
+            sea_level: Some(28.0),
             caves: None,
         }
     }
@@ -71,6 +74,7 @@ impl TerrainParams {
             amplitude: self.amplitude,
             wavelength: self.wavelength,
             octaves: self.octaves,
+            sea_level: self.sea_level,
         }
     }
 }

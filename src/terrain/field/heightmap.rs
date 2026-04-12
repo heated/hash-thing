@@ -9,8 +9,8 @@
 
 use super::RegionField;
 use crate::octree::CellState;
-use crate::terrain::materials::{material_from_depth, AIR, STONE};
-use crate::terrain::noise::fractal_2d;
+use crate::terrain::materials::{material_from_depth, AIR, SAND, STONE, WATER};
+use crate::terrain::noise::{biome_2d, fractal_2d};
 
 /// Cells above the maximum possible surface before we trust the AIR
 /// short-circuit. The margin absorbs a few ulps of FP rounding in
@@ -35,6 +35,8 @@ pub struct HeightmapField {
     pub amplitude: f32,
     pub wavelength: f32,
     pub octaves: u32,
+    /// Sea level: air cells below this y become water. `None` disables.
+    pub sea_level: Option<f32>,
 }
 
 impl HeightmapField {
@@ -54,11 +56,39 @@ impl HeightmapField {
     }
 }
 
+/// Biome noise threshold: below this value → sandy biome.
+const SAND_BIOME_THRESHOLD: f32 = 0.3;
+
+/// Wavelength for biome noise (cells). Large value → big biome regions.
+const BIOME_WAVELENGTH: f32 = 64.0;
+
 impl RegionField for HeightmapField {
     fn sample(&self, p: [i64; 3]) -> CellState {
         let surface = self.surface_y(p[0] as f32, p[2] as f32);
         let depth = surface - p[1] as f32;
-        material_from_depth(depth)
+        let base = material_from_depth(depth);
+        // Sea level: fill air below sea_level with water.
+        if base == AIR {
+            if let Some(sl) = self.sea_level {
+                if (p[1] as f32) < sl {
+                    return WATER;
+                }
+            }
+            return AIR;
+        }
+        // In sandy biomes, replace grass and dirt with sand so the terrain
+        // has natural sand regions that fall and settle under gravity.
+        if base != STONE && depth < 4.0 {
+            let biome = biome_2d(
+                p[0] as f32 / BIOME_WAVELENGTH,
+                p[2] as f32 / BIOME_WAVELENGTH,
+                self.seed,
+            );
+            if biome < SAND_BIOME_THRESHOLD {
+                return SAND;
+            }
+        }
+        base
     }
 
     fn classify_box(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
@@ -71,8 +101,17 @@ impl RegionField for HeightmapField {
         let surface_min = self.base_y - self.amplitude;
 
         // Box fully above the highest possible surface (plus a margin):
-        // every cell is at depth < 0, hence AIR.
+        // every cell is at depth < 0. If also above sea level, all AIR;
+        // if also fully below sea level, all WATER. Otherwise can't collapse.
         if y_min >= surface_max + SURFACE_MARGIN {
+            if let Some(sl) = self.sea_level {
+                if y_max <= sl {
+                    return Some(WATER);
+                }
+                if y_min < sl {
+                    return None; // straddles sea level
+                }
+            }
             return Some(AIR);
         }
         // Box fully below the lowest possible surface, with at least
@@ -103,6 +142,7 @@ mod tests {
             amplitude: 8.0,
             wavelength: 16.0,
             octaves: 2,
+            sea_level: None,
         }
     }
 
@@ -233,5 +273,62 @@ mod tests {
                 "surface_y({x}, {z}) = {surface} fell outside [{min}, {max}]",
             );
         }
+    }
+
+    #[test]
+    fn biome_produces_sand_in_some_surface_cells() {
+        let f = test_field();
+        let mut sand_count = 0u32;
+        let mut surface_count = 0u32;
+        // Scan a 128×128 grid at the surface level.
+        for x in 0..128 {
+            for z in 0..128 {
+                let surface = f.surface_y(x as f32, z as f32);
+                let y = surface.floor() as i64;
+                let cell = f.sample([x, y, z]);
+                if cell != AIR {
+                    surface_count += 1;
+                    if cell == SAND {
+                        sand_count += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            sand_count > 0,
+            "expected some sand in 128×128 terrain grid, got 0 out of {surface_count} surface cells"
+        );
+        assert!(
+            sand_count < surface_count,
+            "expected mixed biomes, not all sand ({sand_count}/{surface_count})"
+        );
+    }
+
+    #[test]
+    fn sea_level_fills_low_air_with_water() {
+        let mut f = test_field();
+        // Surface range [24, 40]. Set sea level above surface_max so that
+        // air cells above the surface but below sea_level become water.
+        f.sea_level = Some(45.0);
+        // A point well above sea level → AIR
+        assert_eq!(f.sample([10, 50, 10]), AIR);
+        // A point above the surface (y=41 > surface_max=40) but below sea level (45) → WATER
+        assert_eq!(f.sample([10, 41, 10]), WATER);
+        // A point deep underground → still STONE
+        assert_eq!(f.sample([10, 0, 10]), STONE);
+    }
+
+    #[test]
+    fn classify_box_water_above_surface_below_sea() {
+        let mut f = test_field();
+        f.sea_level = Some(28.0);
+        // Box fully above surface_max (42) and above sea level → AIR
+        assert_eq!(f.classify_box([0, 42, 0], 2), Some(AIR));
+        // Box fully above surface_max but fully below sea level:
+        // surface_max + margin = 42. If we had sea_level = 50 (above the box),
+        // and the box is above the surface, it should be WATER.
+        let mut f2 = test_field();
+        f2.sea_level = Some(50.0);
+        assert_eq!(f2.classify_box([0, 42, 0], 2), Some(WATER));
     }
 }

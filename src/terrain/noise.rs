@@ -83,6 +83,12 @@ pub fn fractal_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
     (sum / total).clamp(0.0, 1.0)
 }
 
+/// Low-frequency biome noise. Single-octave value noise with a distinct seed
+/// offset so it's independent of the heightmap. Output in `[0, 1]`.
+pub fn biome_2d(x: f32, z: f32, seed: u64) -> f32 {
+    value_2d(x, z, seed.wrapping_add(0xA1B2C3D4E5F60718))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -472,9 +472,9 @@ impl NodeStore {
         (store, root)
     }
 
-    /// Like [`compacted`](Self::compacted) but also returns the old→new NodeId
-    /// remap table. Callers can use this to translate external references
-    /// (e.g. cache entries) instead of discarding them.
+    /// Like [`compacted`], but also returns the old→new NodeId remap table.
+    /// Callers that maintain caches keyed on NodeId can remap their keys
+    /// instead of invalidating the entire cache.
     pub fn compacted_with_remap(
         &self,
         root: NodeId,

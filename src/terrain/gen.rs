@@ -294,6 +294,7 @@ mod tests {
             amplitude: 8.0,
             wavelength: 24.0,
             octaves: 4,
+            sea_level: None,
         }
     }
 

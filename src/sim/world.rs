@@ -25,30 +25,26 @@ impl RealizedRegion {
         1u64 << self.level
     }
 
-    /// True if the unsigned coordinate `(x, y, z)` is inside the region.
-    ///
-    /// Assumes origin is non-negative (current invariant). Once signed
-    /// coords land, this will subtract origin before comparing.
-    pub fn contains(&self, x: u64, y: u64, z: u64) -> bool {
-        let s = self.side();
-        let ox = self.origin[0] as u64;
-        let oy = self.origin[1] as u64;
-        let oz = self.origin[2] as u64;
-        x >= ox && x < ox + s && y >= oy && y < oy + s && z >= oz && z < oz + s
+    /// True if the world-space coordinate `(x, y, z)` is inside the region.
+    pub fn contains(&self, x: i64, y: i64, z: i64) -> bool {
+        let s = self.side() as i64;
+        x >= self.origin[0]
+            && x < self.origin[0] + s
+            && y >= self.origin[1]
+            && y < self.origin[1] + s
+            && z >= self.origin[2]
+            && z < self.origin[2] + s
     }
 
     /// Map a world-space point to the octant index (0–7) within the root node.
     ///
     /// Panics if the point is outside the region.
-    pub fn octant_of(&self, x: u64, y: u64, z: u64) -> usize {
+    pub fn octant_of(&self, x: i64, y: i64, z: i64) -> usize {
         assert!(self.contains(x, y, z), "point outside realized region");
-        let half = self.side() / 2;
-        let ox = self.origin[0] as u64;
-        let oy = self.origin[1] as u64;
-        let oz = self.origin[2] as u64;
-        let dx = if x - ox >= half { 1 } else { 0 };
-        let dy = if y - oy >= half { 1 } else { 0 };
-        let dz = if z - oz >= half { 1 } else { 0 };
+        let half = self.side() as i64 / 2;
+        let dx = if x - self.origin[0] >= half { 1 } else { 0 };
+        let dy = if y - self.origin[1] >= half { 1 } else { 0 };
+        let dz = if z - self.origin[2] >= half { 1 } else { 0 };
         dx + dy * 2 + dz * 4
     }
 }
@@ -94,9 +90,31 @@ pub struct World {
     /// Key: (NodeId, world-space origin, starting generation).
     /// Cleared after each macro-step and on rule changes.
     pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, [i64; 3], u64), NodeId>,
+    /// Spatial memoization cache for CaRule-only worlds (m1f.1).
+    /// Key: (NodeId, parity) — no origin, so identical subtrees anywhere
+    /// in the world share a single cache entry.
+    pub(crate) hashlife_spatial_cache: FxHashMap<(NodeId, u32), NodeId>,
+    /// When true, `step_recursive` uses spatial memoization (origin-free
+    /// cache key). Only correct for CaRule-only worlds — BlockRule depends
+    /// on world-space coordinates for RNG. Defaults to false.
+    pub spatial_memo: bool,
+    /// Hashlife cache statistics from the most recent step.
+    pub hashlife_stats: HashlifeStats,
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
+    /// World-space origin of local coordinate (0,0,0). When the world
+    /// grows in the negative direction, origin shifts to keep the old
+    /// root's cells at the same world-space positions.
+    pub origin: [i64; 3],
+}
+
+/// Cache performance statistics from a single hashlife step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HashlifeStats {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub empty_skips: u64,
 }
 
 impl World {
@@ -127,7 +145,11 @@ impl World {
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
+            hashlife_spatial_cache: FxHashMap::default(),
+            spatial_memo: false,
+            hashlife_stats: HashlifeStats::default(),
             queue: MutationQueue::new(),
+            origin: [0, 0, 0],
         }
     }
 
@@ -138,7 +160,7 @@ impl World {
     /// The realized region as a value type.
     pub fn region(&self) -> RealizedRegion {
         RealizedRegion {
-            origin: [0, 0, 0],
+            origin: self.origin,
             level: self.level,
         }
     }
@@ -158,17 +180,17 @@ impl World {
         self.invalidate_rule_caches();
     }
 
-    fn require_local_world_coord(axis: &str, coord: WorldCoord) -> u64 {
-        u64::try_from(coord.0).unwrap_or_else(|_| {
+    /// Convert world coordinate to local on a specific axis index (0=x, 1=y, 2=z).
+    /// Panics if the result is negative (coordinate is below the world origin).
+    fn local_from_world(&self, axis: usize, coord: WorldCoord) -> LocalCoord {
+        let local = coord.0 - self.origin[axis];
+        LocalCoord(u64::try_from(local).unwrap_or_else(|_| {
             panic!(
-                "World::{axis}: negative world coord {} is not yet realizable by the current +xyz-only root growth",
-                coord.0
+                "World: world coord {} maps to negative local coord {} \
+                 (origin[{axis}]={})",
+                coord.0, local, self.origin[axis]
             )
-        })
-    }
-
-    fn local_from_world(axis: &str, coord: WorldCoord) -> LocalCoord {
-        LocalCoord(Self::require_local_world_coord(axis, coord))
+        }))
     }
 
     fn set_local(&mut self, x: LocalCoord, y: LocalCoord, z: LocalCoord, state: CellState) {
@@ -189,18 +211,10 @@ impl World {
 
     /// Grow the root octree until `(x, y, z)` is in-bounds.
     ///
-    /// Wraps the current root in successively bigger parent nodes. The
-    /// existing root becomes octant 0 (the −x,−y,−z corner child) of
-    /// each new parent; the other 7 children are canonical empty nodes.
-    /// This preserves all existing cell coordinates — the world grows
-    /// in the +x, +y, +z direction only.
+    /// Supports growth in all directions — negative coordinates shift
+    /// the origin while preserving existing cell positions.
     ///
     /// No-op when the coordinate is already in-bounds.
-    ///
-    /// Negative coordinates are representable at the type level but are not
-    /// realizable yet by the current +x/+y/+z-only root growth strategy.
-    /// Those calls panic with a coordinate-contract message instead of
-    /// silently aliasing them to huge unsigned values.
     ///
     /// **Step cache:** existing cached results survive expansion because
     /// they are keyed by `NodeId`, and the old root's `NodeId` is still
@@ -213,36 +227,71 @@ impl World {
     /// Grow the root octree until the axis-aligned box `[min, max]` is
     /// fully in-bounds (inclusive on both ends).
     ///
-    /// Since growth only extends in the +x, +y, +z direction (the existing
-    /// root stays at octant 0), it is sufficient to grow until `max` is
-    /// contained — `min` is automatically in-bounds once `max` is.
+    /// Supports growth in all directions. For each axis needing negative
+    /// growth, the old root is placed in the positive half of the new
+    /// parent and origin shifts by −half. For positive growth, the old
+    /// root stays in the negative half.
     ///
     /// No-op when the region is already in-bounds.
-    pub fn ensure_region(&mut self, _min: [WorldCoord; 3], max: [WorldCoord; 3]) {
-        let max = [
-            Self::local_from_world("ensure_region", max[0]),
-            Self::local_from_world("ensure_region", max[1]),
-            Self::local_from_world("ensure_region", max[2]),
-        ];
+    pub fn ensure_region(&mut self, min: [WorldCoord; 3], max: [WorldCoord; 3]) {
         loop {
-            let side = 1u64 << self.level;
-            if max[0].0 < side && max[1].0 < side && max[2].0 < side {
-                return;
+            let side = 1i64 << self.level;
+            let origin = self.origin;
+
+            // Check which axes need growth and in which direction.
+            let need_neg = [
+                min[0].0 < origin[0],
+                min[1].0 < origin[1],
+                min[2].0 < origin[2],
+            ];
+            let need_pos = [
+                max[0].0 >= origin[0] + side,
+                max[1].0 >= origin[1] + side,
+                max[2].0 >= origin[2] + side,
+            ];
+
+            if !need_neg.iter().any(|&b| b) && !need_pos.iter().any(|&b| b) {
+                return; // everything fits
             }
+
+            // Determine which octant the old root goes into.
+            // Negative growth on axis → old root in + half (bit=1), origin shifts.
+            // Positive growth → old root in - half (bit=0).
+            let old_octant = (if need_neg[0] { 1 } else { 0 })
+                + (if need_neg[1] { 2 } else { 0 })
+                + (if need_neg[2] { 4 } else { 0 });
+
+            let half = side; // half of the NEW size = old side
             let sibling_level = self.level;
-            let half = 1i64 << sibling_level;
             let new_level = self.level + 1;
-            let mut children = [NodeId::EMPTY; 8];
-            children[0] = self.root;
-            for (oct, child) in children.iter_mut().enumerate().skip(1) {
-                let (cx, cy, cz) = crate::octree::node::octant_coords(oct);
-                *child = self.gen_sibling(
-                    sibling_level,
-                    [cx as i64 * half, cy as i64 * half, cz as i64 * half],
-                );
+
+            // Compute new origin — shift negative on axes that need it.
+            let mut new_origin = origin;
+            for axis in 0..3 {
+                if need_neg[axis] {
+                    new_origin[axis] -= half;
+                }
             }
+
+            // Build children array.
+            let mut children = [NodeId::EMPTY; 8];
+            children[old_octant] = self.root;
+            for (oct, child) in children.iter_mut().enumerate() {
+                if oct == old_octant {
+                    continue;
+                }
+                let (cx, cy, cz) = crate::octree::node::octant_coords(oct);
+                let sibling_origin = [
+                    new_origin[0] + cx as i64 * half,
+                    new_origin[1] + cy as i64 * half,
+                    new_origin[2] + cz as i64 * half,
+                ];
+                *child = self.gen_sibling(sibling_level, sibling_origin);
+            }
+
             self.root = self.store.interior(new_level, children);
             self.level = new_level;
+            self.origin = new_origin;
         }
     }
 
@@ -270,17 +319,12 @@ impl World {
     /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). For writes to
     /// coordinates outside the current realized root, call `ensure_contains`
     /// first to grow the tree.
-    ///
-    /// Negative world coordinates are a typed, explicit input now, but the
-    /// current realization strategy still only grows in +x/+y/+z. Negative
-    /// writes therefore panic with a contract error instead of silently
-    /// reinterpreting the bits as `u64`.
     #[track_caller]
     pub fn set(&mut self, x: WorldCoord, y: WorldCoord, z: WorldCoord, state: CellState) {
         self.set_local(
-            Self::local_from_world("set", x),
-            Self::local_from_world("set", y),
-            Self::local_from_world("set", z),
+            self.local_from_world(0, x),
+            self.local_from_world(1, y),
+            self.local_from_world(2, z),
             state,
         );
     }
@@ -313,16 +357,18 @@ impl World {
     /// conceptually unrealized empty space. This includes negative world
     /// coordinates until signed-region realization lands.
     pub fn get(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
-        let Ok(x) = u64::try_from(x.0) else {
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = self.side() as i64;
+        if lx < 0 || ly < 0 || lz < 0 || lx >= side || ly >= side || lz >= side {
             return 0;
-        };
-        let Ok(y) = u64::try_from(y.0) else {
-            return 0;
-        };
-        let Ok(z) = u64::try_from(z.0) else {
-            return 0;
-        };
-        self.get_local(LocalCoord(x), LocalCoord(y), LocalCoord(z))
+        }
+        self.get_local(
+            LocalCoord(lx as u64),
+            LocalCoord(ly as u64),
+            LocalCoord(lz as u64),
+        )
     }
 
     /// Stepper-oriented read: "what is this cell right now?"
@@ -347,11 +393,11 @@ impl World {
     /// when distinguishing "realized empty" from "unrealized" matters
     /// (e.g. debug overlays rendering the region boundary).
     pub fn is_realized(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> bool {
-        let (Ok(ux), Ok(uy), Ok(uz)) = (u64::try_from(x.0), u64::try_from(y.0), u64::try_from(z.0))
-        else {
-            return false;
-        };
-        self.region().contains(ux, uy, uz)
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = self.side() as i64;
+        lx >= 0 && ly >= 0 && lz >= 0 && lx < side && ly < side && lz < side
     }
 
     /// Flatten to a 3D grid for rendering.
@@ -411,11 +457,10 @@ impl World {
     ///
     /// This is an intentional "react then move" physics model.
     ///
-    /// **Boundary asymmetry:** CaRule wraps toroidally (`rem_euclid`); BlockRule
-    /// skips partial blocks at world edges (clipping). This is deliberate — Margolus
-    /// blocks must not straddle the world boundary. Cells at the boundary participate
-    /// in CaRule every tick but only in BlockRule on generations where the partition
-    /// offset aligns them away from the edge.
+    /// **Boundary conditions:** Both CaRule and BlockRule use absorbing boundaries
+    /// (out-of-bounds = empty), matching hashlife's infinite-world semantics.
+    /// BlockRule additionally skips partial blocks at world edges (clipping) —
+    /// Margolus blocks must not straddle the world boundary.
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
@@ -706,20 +751,29 @@ impl World {
     }
 }
 
-/// Get the 26 Moore neighbors of a cell, wrapping at boundaries.
+/// Get the 26 Moore neighbors of a cell. Out-of-bounds neighbors are
+/// `Cell::EMPTY` (absorbing boundary), matching hashlife's infinite-world
+/// semantics.
 fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [Cell; 26] {
     let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;
+    let s = side as i32;
     for dz in [-1i32, 0, 1] {
         for dy in [-1i32, 0, 1] {
             for dx in [-1i32, 0, 1] {
                 if dx == 0 && dy == 0 && dz == 0 {
                     continue;
                 }
-                let nx = (x as i32 + dx).rem_euclid(side as i32) as usize;
-                let ny = (y as i32 + dy).rem_euclid(side as i32) as usize;
-                let nz = (z as i32 + dz).rem_euclid(side as i32) as usize;
-                neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                let nz = z as i32 + dz;
+                if nx >= 0 && nx < s && ny >= 0 && ny < s && nz >= 0 && nz < s {
+                    let nx = nx as usize;
+                    let ny = ny as usize;
+                    let nz = nz as usize;
+                    neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                }
+                // else: stays Cell::EMPTY (absorbing boundary)
                 idx += 1;
             }
         }
@@ -2041,8 +2095,6 @@ mod tests {
     #[test]
     fn sand_falls_under_gravity() {
         let mut world = World::new(3);
-        // Sand is already registered with gravity_block_rule in terrain_defaults.
-        // Place sand at y=3, air below at y=2. Block-aligned at (2,2,2).
         world.set(wc(2), wc(3), wc(2), SAND);
         assert_eq!(world.get(wc(2), wc(2), wc(2)), 0);
 
@@ -2055,7 +2107,6 @@ mod tests {
     #[test]
     fn sand_conserves_population() {
         let mut world = World::new(3);
-        // Scatter sand cells at various positions.
         world.set(wc(2), wc(3), wc(2), SAND);
         world.set(wc(4), wc(5), wc(4), SAND);
         world.set(wc(0), wc(1), wc(0), SAND);
@@ -2075,16 +2126,11 @@ mod tests {
     #[test]
     fn lava_solidifies_on_water_contact() {
         let mut world = World::new(3);
-        // Place lava and water adjacent.
         world.set(wc(3), wc(3), wc(3), LAVA);
         world.set(wc(4), wc(3), wc(3), WATER);
 
         world.step();
 
-        // Lava should have solidified to stone (its reaction product).
-        // Water should have also solidified (water reacts to... wait,
-        // water's reactive_material is FIRE, not LAVA). Water stays water
-        // unless fire-adjacent. Only lava solidifies.
         assert_eq!(
             world.get(wc(3), wc(3), wc(3)),
             STONE,
@@ -2099,9 +2145,90 @@ mod tests {
 
         world.step();
 
-        // Lava without water should persist (LavaRule returns center).
-        // It may also move due to FluidBlockRule, but shouldn't disappear.
         let pop = world.population();
         assert!(pop > 0, "lava should not disappear without water");
+    }
+
+    // -----------------------------------------------------------------
+    // Negative-direction world growth (hash-thing-37r).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ensure_contains_negative_shifts_origin() {
+        let mut world = World::new(3);
+        world.set(wc(4), wc(4), wc(4), STONE);
+        world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
+        assert!(
+            world.origin[0] < 0,
+            "origin[0] should be negative after negative growth"
+        );
+        assert_eq!(world.get(wc(4), wc(4), wc(4)), STONE);
+    }
+
+    #[test]
+    fn ensure_contains_negative_preserves_population() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(5), STONE);
+        world.set(wc(6), wc(1), wc(7), WATER);
+        let pop_before = world.population();
+        world.ensure_contains(WorldCoord(-10), WorldCoord(-10), WorldCoord(-10));
+        assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn ensure_contains_negative_then_set_roundtrips() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5));
+        world.set(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5), STONE);
+        assert_eq!(
+            world.get(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5)),
+            STONE
+        );
+    }
+
+    #[test]
+    fn ensure_region_negative_min_grows_correctly() {
+        let mut world = World::new(3);
+        world.ensure_region(
+            [WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)],
+            [WorldCoord(7), WorldCoord(7), WorldCoord(7)],
+        );
+        assert!(world.is_realized(WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
+    }
+
+    #[test]
+    fn negative_growth_origin_tracks_correctly() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
+        let o = world.origin;
+        let side = world.side() as i64;
+        assert!(o[0] <= 0);
+        assert!(o[0] + side >= 8);
+    }
+
+    #[test]
+    fn get_returns_zero_below_origin() {
+        let world = World::new(3);
+        assert_eq!(world.get(WorldCoord(-1), wc(0), wc(0)), 0);
+    }
+
+    #[test]
+    fn mixed_direction_growth_preserves_cells() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(4), STONE);
+        world.set(wc(6), wc(1), wc(7), WATER);
+        world.ensure_region([WorldCoord(-5), wc(0), wc(0)], [wc(0), wc(0), wc(20)]);
+        assert_eq!(world.get(wc(2), wc(3), wc(4)), STONE);
+        assert_eq!(world.get(wc(6), wc(1), wc(7)), WATER);
+    }
+
+    #[test]
+    fn is_realized_works_after_negative_growth() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3));
+        assert!(world.is_realized(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3)));
+        assert!(world.is_realized(wc(0), wc(0), wc(0)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 }

@@ -297,10 +297,12 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     let base = material_color(mat);
                     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
                     let diffuse = max(dot(normal, light_dir), 0.0);
-                    let ambient = 0.25;
+                    let ambient = 0.3;
+                    let lit = base * (ambient + diffuse * 0.7);
                     let t_world = t + entry;
                     let fog = exp(-t_world * 1.5);
-                    return vec4<f32>(base * (ambient + diffuse * 0.75) * fog, 1.0);
+                    let fog_color = vec3<f32>(0.55, 0.70, 0.90);
+                    return vec4<f32>(mix(fog_color, lit, fog), 1.0);
                 }
                 // Empty leaf — break to step ray
                 break;
@@ -395,8 +397,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return hit;
     }
 
-    // Background gradient
+    // Sky gradient: lighter blue at top, desaturated at horizon.
     let t = in.uv.y * 0.5 + 0.5;
-    let bg = mix(vec3<f32>(0.05, 0.05, 0.08), vec3<f32>(0.1, 0.1, 0.15), t);
+    let sky_top = vec3<f32>(0.35, 0.55, 0.90);
+    let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
+    let bg = mix(sky_bot, sky_top, t);
     return vec4<f32>(bg, 1.0);
 }

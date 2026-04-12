@@ -1279,14 +1279,16 @@ mod tests {
     /// exact — this test fires.
     #[test]
     fn integer_dda_exact_representation() {
-        assert!(
-            MAX_DEPTH <= 24,
-            "integer DDA invariant: MAX_DEPTH={MAX_DEPTH} exceeds 24, \
-             so RESOLUTION=2^{MAX_DEPTH} doesn't fit in f32's 24-bit \
-             mantissa. Cell positions would lose precision, breaking \
-             the exact boundary computation that guarantees forward \
-             progress (hash-thing-pck)."
-        );
+        const {
+            assert!(
+                MAX_DEPTH <= 24,
+                "integer DDA invariant: MAX_DEPTH exceeds 24, \
+                 so RESOLUTION doesn't fit in f32's 24-bit \
+                 mantissa. Cell positions would lose precision, breaking \
+                 the exact boundary computation that guarantees forward \
+                 progress (hash-thing-pck)."
+            );
+        }
         // Verify the boundary float round-trips exactly for the worst case.
         let res: u32 = 1 << MAX_DEPTH as u32;
         let inv_res: f32 = 1.0 / res as f32;

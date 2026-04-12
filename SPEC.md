@@ -314,14 +314,14 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - `h34.4` Retired GoL3D scaffolding: legacy presets removed, `set_gol_smoke_rule` replaces old rule API
 - ✅ **NodeStore hash-cons unit tests (`1lq`, `6gf.5`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths, uniform collapse, metadata, overwrite, accessor coverage
 - ✅ **Octree extraction primitives (`6gf.6`)**: `extract_neighborhood` (26 Moore neighbors, toroidal wrap), `extract_block_2x2x2` (Margolus partition extraction), `flatten_region` (arbitrary AABB sub-box). Foundation for recursive Hashlife step.
-- ✅ **Lazy root expansion (`e9h`, `5qp`)**: `World::ensure_contains(x,y,z)` grows root octree by wrapping in bigger parent nodes. `ensure_region([min],[max])` is the batch form. OOB bounds checking on set_cell/get_cell (`819`) also landed.
+- ✅ **Lazy root expansion (`e9h`, `5qp`, `37r`)**: `World::ensure_contains(x,y,z)` grows root octree by wrapping in bigger parent nodes. `ensure_region([min],[max])` is the batch form. OOB bounds checking on set_cell/get_cell (`819`) also landed. Bidirectional growth (`37r`): `World.origin` tracks world-space offset; negative-direction growth places old root at appropriate octant and shifts origin.
 - ✅ **Out-of-bounds coordinate safety (`819`, `fb5`)**: `set_cell` panics on OOB with `#[track_caller]`; `get_cell` silently returns 0 for OOB (no storage growth). 7 boundary tests. `probe()` stepper-oriented read with OOB-empty promise (`90w`). `is_realized()` for boundary detection.
-- ✅ **Terrain generation (epic `3fq`, complete 10/10)**
+- ✅ **Terrain generation (epic `3fq`)**
   - Heightmap-based recursive octree gen with proof-based collapse (sky/deep-stone short-circuit)
   - Cave CA post-pass (B13/S13 majority-vote, stone-only mask, surface-preserving)
-  - Dungeon carving (3fq.3): room placement + L-shaped corridors in deep stone, `DungeonParams` wired through `TerrainParams` and `seed_terrain`. Key binding: D (caves + dungeons)
-  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, dungeon_us, node counts, noise bottleneck estimate (3fq.5)
-  - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap + caves + dungeons for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
+  - ⚠️ Dungeon carving (3fq.3): was built and landed, then **reverted** from main (hash-thing-t2n.1 — landed without design gate). Code lives on `feature/dungeons` branch pending edward's design approval.
+  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, node counts, noise bottleneck estimate (3fq.5)
+  - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap + caves for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
 - ✅ **RealizedRegion value type (`ica`)**: `RealizedRegion { origin: [i64; 3], level: u32 }` encapsulates the world's spatial extent. `contains()`, `side()`, `octant_of()`, `Display` impl. `World::region()` returns a derived view.
 - ✅ **WorldCoord/LocalCoord newtypes (`7zc`)**: `WorldCoord(i64)` for world-space, `LocalCoord(u64)` for octree-internal. Compiler-enforced separation prevents the coordinate-mixing bug class that 819 fixed. All World API methods migrated.
 - ✅ **CI + release (epic `xb7`, 3/6)**
@@ -329,19 +329,21 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - `xb7.3` Linux AppImage via linuxdeploy (packaging/linux/ desktop entry + placeholder icon)
   - `xb7.4` tag-triggered release workflow producing Windows `hash-thing.exe` via `gh release` CLI (no new third-party action deps). Sibling jobs for Mac (`xb7.2` notarization) extend as they land
 
-### Next up (P1, from bd)
+### Completed epics
 
-- ✅ **Recursive Hashlife stepping** (epic `6gf`, complete): all 13 beads landed including `6gf.8` main loop switchover, `6gf.10` defensive hardening, `6gf.11` deep recursion tests, `6gf.13` vestigial step_cache removal.
+- ✅ **Recursive Hashlife stepping** (epic `6gf`, complete): all 13 beads landed including `6gf.8` main loop switchover, `6gf.10` defensive hardening, `6gf.11` deep recursion tests, `6gf.13` vestigial step_cache removal. `018` brute-force stepper absorbing boundary fix (CaRule matches hashlife). `m1f.12` stable NodeIds across compaction (cache key remapping instead of clearing).
 - ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
-- ✅ **SVDAG continuation**: `5bb.4` per-leaf material attributes, `5bb.5` incremental edit uploads, `bx7` stale-slot compaction, `ll6` GPU palette buffer. Remaining: `5bb.6` SSVDAG/LOD research (P4).
+- ✅ **SVDAG rendering** (epic `5bb`, 10/11): `5bb.1`–`5bb.5` serialization through incremental uploads, `bx7` stale-slot compaction, `5bb.7` palette sync, `5bb.8` zero-direction guard, `5bb.9` particle renderer, `5bb.10` HUD overlay. Remaining: `5bb.6` SSVDAG/LOD research (P4).
+- ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
+- ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + cave CA + lazy terrain expansion + perf tracking. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`.
 
-- ☐ **Core engine validation** (epic `m1f`): ✅ `m1f.2` SVDAG benchmark, ✅ `m1f.3` edit propagation measurement, ✅ `m1f.4` infinite world growth (player-triggered boundary expansion), ✅ `m1f.8` SVDAG depth 14→20 (1M^3 leaf grid). Remaining: `m1f.5` incremental SVDAG validation (in progress), `m1f.6` new CA rules, `m1f.7` end-to-end demo polish.
+### In progress (P0-P1, from bd)
+
+- ☐ **Core engine validation** (epic `m1f`, 1/12): proving the full loop — stepping + rendering + interaction — works at scale. `m1f.12` landed (stable NodeIds). Open P1: benchmarks (`m1f.1` hashlife, `m1f.2` SVDAG), edit propagation (`m1f.3`), infinite world growth (`m1f.4`), SVDAG arbitrary depth (`m1f.8`), content-only Margolus rewrite (`m1f.9`), incremental cache invalidation (`m1f.11`). Open P2: SVDAG edit sync (`m1f.5`), new CA rules (`m1f.6`), end-to-end demo (`m1f.7`).
 
 ### Later (P2+, from bd)
 
-- ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
-- ✅ Terrain generation & infinite worlds (`3fq`): complete (10/10). Heightmap gen + cave CA + dungeon carving + lazy terrain expansion + perf tracking.
-- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), ✅ Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, in progress), Steam (`xb7.6`, P4 deferred)
+- ☐ Cross-platform distribution (`xb7`, 5/7): ✅ CI matrix (`xb7.1`), ✅ macOS notarization (`xb7.2`), ✅ Linux AppImage (`xb7.3`), ✅ Windows exe (`xb7.4`), ✅ WASM/WebGPU (`xb7.5`). Remaining: `brt` AppImage branding (P4), `xb7.6` Steam (P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 
 ---

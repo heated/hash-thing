@@ -263,6 +263,13 @@ pub struct Renderer {
     particle_buffer_cap: u64,
     particle_count: u32,
 
+    // HUD overlay (hash-thing-5bb.10)
+    hud_pipeline: wgpu::RenderPipeline,
+    hud_bind_group: wgpu::BindGroup,
+    hud_uniform_buffer: wgpu::Buffer,
+    pub hud_material_color: [f32; 4],
+    pub hud_visible: bool,
+
     // Material palette (shared by all pipelines)
     palette_buffer: wgpu::Buffer,
 
@@ -541,6 +548,78 @@ impl Renderer {
             cache: None,
         });
 
+        // HUD overlay (hash-thing-5bb.10)
+        let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hud shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("hud.wgsl").into()),
+        });
+
+        let hud_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hud_uniforms"),
+            size: 32, // 2 × vec4<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let hud_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hud_bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let hud_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hud_bg"),
+            layout: &hud_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: hud_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let hud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hud_pl"),
+            bind_group_layouts: &[Some(&hud_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hud_rp"),
+            layout: Some(&hud_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hud_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hud_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let gpu_timing = if timestamp_supported {
             let period_ns = queue.get_timestamp_period();
             Some(GpuTiming::new(&device, period_ns))
@@ -565,6 +644,11 @@ impl Renderer {
             particle_buffer: None,
             particle_buffer_cap: 0,
             particle_count: 0,
+            hud_pipeline,
+            hud_bind_group,
+            hud_uniform_buffer,
+            hud_material_color: [1.0, 1.0, 1.0, 1.0],
+            hud_visible: false,
             palette_buffer,
             uniform_buffer,
             volume_size,
@@ -900,9 +984,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
+                            r: 0.53,
+                            g: 0.72,
+                            b: 0.92,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -929,6 +1013,30 @@ impl Renderer {
                     // 6 vertices per quad, one instance per particle.
                     render_pass.draw(0..6, 0..self.particle_count);
                 }
+            }
+
+            // HUD overlay — crosshair + material indicator (5bb.10).
+            if self.hud_visible {
+                let aspect = self.config.width as f32 / self.config.height as f32;
+                let hud_data: [f32; 8] = [
+                    self.hud_material_color[0],
+                    self.hud_material_color[1],
+                    self.hud_material_color[2],
+                    self.hud_material_color[3],
+                    aspect,
+                    1.0,
+                    0.0,
+                    0.0,
+                ];
+                self.queue.write_buffer(
+                    &self.hud_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&hud_data),
+                );
+                render_pass.set_pipeline(&self.hud_pipeline);
+                render_pass.set_bind_group(0, &self.hud_bind_group, &[]);
+                // 5 quads × 6 vertices = 30 vertices.
+                render_pass.draw(0..30, 0..1);
             }
         }
 
