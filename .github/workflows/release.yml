@@ -42,6 +42,7 @@ env:
   # gating lives in [lints.rust] in Cargo.toml, not workflow RUSTFLAGS,
   # so the release cache fingerprint stays clean.
   CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: ""
 
 jobs:
   actionlint:

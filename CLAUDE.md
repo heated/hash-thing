@@ -17,8 +17,6 @@ Prefer commands that finish in under ~60s. Benchmarks, large builds, long test s
 
 Default to dev. `--profile bench` for perf work. `--release` only for distributable artifacts.
 
-**At session start, run:** `export RUSTC_WRAPPER=sccache` — enables cross-worktree compile caching. Each worktree has its own `target/`, no lock contention. Also pull main to stay current.
-
 ## Agent surface — where project skills and commands live
 
 This project is designed to work with **any of three CLI agents**: Claude Code (the primary seat), Codex Exec, and Gemini CLI. To keep the three in sync:
