@@ -118,7 +118,7 @@ impl World {
     /// Recursively step a node. Input level n (≥ 3), output level n-1.
     /// `origin` is the world-space coordinate of the node's (0,0,0) corner.
     fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
-        debug_assert!(level >= 3, "step_node requires level >= 3, got {level}");
+        assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
@@ -465,7 +465,7 @@ impl World {
 
     /// Extract the center (level n-1) of a level-n node.
     fn center_node(&mut self, node: NodeId, level: u32) -> NodeId {
-        debug_assert!(level >= 2, "center_node requires level >= 2");
+        assert!(level >= 2, "center_node requires level >= 2");
         let children = self.store.children(node);
         let mut center_children = [NodeId::EMPTY; 8];
         for oct in 0..8usize {
@@ -958,5 +958,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn source_index_all_valid_pairs() {
+        assert_eq!(source_index(0, 0), (0, 0));
+        assert_eq!(source_index(0, 1), (0, 1));
+        assert_eq!(source_index(1, 0), (0, 1));
+        assert_eq!(source_index(1, 1), (1, 0));
+        assert_eq!(source_index(2, 0), (1, 0));
+        assert_eq!(source_index(2, 1), (1, 1));
+    }
+
+    #[test]
+    #[should_panic]
+    fn source_index_out_of_range_panics() {
+        source_index(3, 0);
     }
 }
