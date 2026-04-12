@@ -503,7 +503,8 @@ impl World {
     /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
     ///
     /// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
-    /// Blocks at the edges that would extend past the grid boundary are skipped.
+    /// Blocks at edges use absorbing boundary conditions: out-of-bounds cells
+    /// are treated as empty, matching hashlife's pad-with-empty semantics.
     ///
     /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
     /// distinct rule exists, run it. If zero or multiple: skip (identity).
@@ -515,11 +516,11 @@ impl World {
         };
 
         let mut bz = offset;
-        while bz + 1 < side {
+        while bz < side {
             let mut by = offset;
-            while by + 1 < side {
+            while by < side {
                 let mut bx = offset;
-                while bx + 1 < side {
+                while bx < side {
                     self.apply_block(grid, side, bx, by, bz);
                     bx += 2;
                 }
@@ -530,14 +531,21 @@ impl World {
     }
 
     /// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
+    ///
+    /// Cells outside the grid boundary are treated as empty (absorbing BC).
     fn apply_block(&self, grid: &mut [CellState], side: usize, bx: usize, by: usize, bz: usize) {
-        // Read the 8 cells.
+        // Read the 8 cells. OOB → empty (absorbing boundary).
         let mut block = [Cell::EMPTY; 8];
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
+                    let x = bx + dx;
+                    let y = by + dy;
+                    let z = bz + dz;
+                    if x < side && y < side && z < side {
+                        let idx = x + y * side + z * side * side;
+                        block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
+                    }
                 }
             }
         }
@@ -571,13 +579,20 @@ impl World {
         // Write back, but anchor cells that didn't opt into this block rule.
         // A cell with block_rule_id == None is immovable — it stays in its
         // original position even if the rule tried to swap it elsewhere.
+        // OOB positions are silently skipped (absorbing boundary).
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
+                    let x = bx + dx;
+                    let y = by + dy;
+                    let z = bz + dz;
+                    if x >= side || y >= side || z >= side {
+                        continue;
+                    }
                     let i = block_index(dx, dy, dz);
                     let original = block[i];
                     let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                    let idx = x + y * side + z * side * side;
                     if has_rule || original.is_empty() {
                         // Opted-in cells and empty cells can be moved by the rule.
                         grid[idx] = result[i].raw();
@@ -1383,9 +1398,11 @@ mod tests {
 
     #[test]
     fn fluid_conserves_population() {
-        let mut world = World::new(3);
-        world.set(wc(2), wc(3), wc(2), Cell::pack(WATER_MATERIAL_ID, 0).raw());
-        world.set(wc(4), wc(5), wc(4), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        // Level 4 (16³) keeps cells well inside the absorbing boundary
+        // over 6 steps so mass conservation holds.
+        let mut world = World::new(4);
+        world.set(wc(5), wc(6), wc(5), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.set(wc(8), wc(9), wc(8), Cell::pack(WATER_MATERIAL_ID, 0).raw());
         let pop_before = world.population();
 
         for _ in 0..6 {

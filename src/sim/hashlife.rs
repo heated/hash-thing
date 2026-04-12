@@ -765,10 +765,9 @@ mod tests {
 
     #[test]
     fn recursive_matches_brute_force_multiple_steps() {
-        // Level 4 (16³) so cells stay well inside the boundary over 4 steps.
-        // Level 3 (8³) would let water drift to the edge where brute-force
-        // clips blocks and hashlife pads with empty — different boundary
-        // semantics that aren't the thing under test.
+        // Level 4 (16³) so cells stay well inside the absorbing boundary
+        // over 4 steps. Both brute-force and hashlife now use absorbing BC
+        // (OOB = empty), but level 4 gives more room for cells to move.
         let mut brute = World::new(4);
         let mut recur = World::new(4);
         for &(x, y, z, mat) in &[
