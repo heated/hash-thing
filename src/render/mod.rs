@@ -128,6 +128,51 @@ mod wgsl_drift_guard {
         }
     }
 
+    /// hash-thing-xev: pins the hardcoded material_color palette in both
+    /// shaders to `MaterialRegistry::terrain_defaults().color_palette_rgba()`.
+    /// Each non-air material must appear as a `case <id>u:` with the exact
+    /// RGB values from the registry. If you add a material to the registry,
+    /// add the corresponding case to BOTH shaders and extend this test.
+    #[test]
+    fn wgsl_material_palette_matches_registry() {
+        use crate::terrain::materials::{
+            MaterialRegistry, DIRT_MATERIAL_ID, FIRE_MATERIAL_ID, GRASS_MATERIAL_ID,
+            STONE_MATERIAL_ID, WATER_MATERIAL_ID,
+        };
+
+        let registry = MaterialRegistry::terrain_defaults();
+        let palette = registry.color_palette_rgba();
+
+        // (material_id, label) pairs for every non-air material.
+        let materials: &[(u16, &str)] = &[
+            (STONE_MATERIAL_ID, "stone"),
+            (DIRT_MATERIAL_ID, "dirt"),
+            (GRASS_MATERIAL_ID, "grass"),
+            (FIRE_MATERIAL_ID, "fire"),
+            (WATER_MATERIAL_ID, "water"),
+        ];
+
+        for &(mat_id, label) in materials {
+            let [r, g, b, _a] = palette[mat_id as usize];
+            let expected = format!(
+                "case {}u: {{ return vec3<f32>({:.2}, {:.2}, {:.2}); }}",
+                mat_id, r, g, b
+            );
+            assert!(
+                RAYCAST_WGSL.contains(&expected),
+                "raycast.wgsl must contain `{expected}` for {label} — \
+                 material palette drifted from MaterialRegistry::terrain_defaults(). \
+                 Update the shader (hash-thing-xev)."
+            );
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(&expected),
+                "svdag_raycast.wgsl must contain `{expected}` for {label} — \
+                 material palette drifted from MaterialRegistry::terrain_defaults(). \
+                 Update the shader (hash-thing-xev)."
+            );
+        }
+    }
+
     /// hash-thing-2w5 retroactive scout: pins the traversal constants in
     /// the SVDAG shader to the CPU oracle in `src/render/svdag.rs`. Both
     /// sides must agree on `MAX_DEPTH`, `MIN_STEP_BUDGET`, and
