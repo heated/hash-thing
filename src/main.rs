@@ -65,8 +65,7 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
     world: sim::World,
-    rule: sim::GameOfLife3D,
-    legacy_gol_smoke: bool,
+    gol_smoke_scene: bool,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -137,8 +136,7 @@ impl App {
             window: None,
             renderer: None,
             world,
-            rule: sim::GameOfLife3D::amoeba(),
-            legacy_gol_smoke: false,
+            gol_smoke_scene: false,
             svdag: render::Svdag::new(),
             paused: true,
             step_timer: std::time::Instant::now(),
@@ -283,7 +281,7 @@ impl ApplicationHandler for App {
                             let elapsed = start.elapsed();
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.legacy_gol_smoke = false;
+                            self.gol_smoke_scene = false;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -318,7 +316,7 @@ impl ApplicationHandler for App {
                             // Re-probe in case params drifted. Cheap (~1ms).
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.legacy_gol_smoke = false;
+                            self.gol_smoke_scene = false;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -342,12 +340,12 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("g") => {
-                            // Swap to legacy GoL sphere seed (kept for CA scaffold demos).
+                            // Swap to the single retained GoL smoke seed.
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
                             self.world.materials =
-                                terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                terrain::materials::MaterialRegistry::gol_smoke();
                             self.world.seed_center(12, 0.35);
-                            self.legacy_gol_smoke = true;
+                            self.gol_smoke_scene = true;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -360,62 +358,7 @@ impl ApplicationHandler for App {
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
-                            log::info!("Reset GoL sphere: pop={}", self.world.population());
-                        }
-                        // TODO(hash-thing-6gf.1): call self.world.store.clear_step_cache() here
-                        // once memoized stepping lands. See store.rs `step_cache` field doc for
-                        // the contract — the cache key is NodeId only, so swapping the rule
-                        // without clearing yields stale results from the previous rule.
-                        winit::keyboard::Key::Character("1") => {
-                            self.rule = sim::GameOfLife3D::amoeba();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Amoeba ({})", self.rule);
-                        }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
-                        winit::keyboard::Key::Character("2") => {
-                            self.rule = sim::GameOfLife3D::crystal();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Crystal ({})", self.rule);
-                        }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
-                        winit::keyboard::Key::Character("3") => {
-                            self.rule = sim::GameOfLife3D::rule445();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: 445 ({})", self.rule);
-                        }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
-                        winit::keyboard::Key::Character("4") => {
-                            self.rule = sim::GameOfLife3D::pyroclastic();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Pyroclastic ({})", self.rule);
+                            log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
