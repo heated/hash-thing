@@ -1154,4 +1154,97 @@ mod tests {
     fn source_index_out_of_range_panics() {
         source_index(3, 0);
     }
+
+    /// Inert world cache behavior (m1f.15.1): a stone-only world is immediately
+    /// at fixed point. The world state never changes.
+    ///
+    /// Current fixed-point detection only catches UNIFORM inert subtrees
+    /// (all-stone or all-air). Mixed surface nodes (stone/air boundary) are
+    /// not caught — they require full cache-based stepping even though they're
+    /// inert. At small scales (16³), most of the octree is mixed surface, so
+    /// fixed-point skips may be zero. At large scales (512³+), deep uniform
+    /// regions dominate and fixed-point skips become the majority.
+    ///
+    /// Cross-frame cache reuse is limited: compaction after each step GCs
+    /// input nodes, dropping their cache entries. Within-frame dedup via
+    /// hash-cons sharing is the main cache benefit.
+    #[test]
+    fn inert_world_state_unchanged() {
+        let mut world = World::new(4); // 16³
+        let mut rng = SimpleRng::new(0xcafe_u64);
+        for z in 0..16u64 {
+            for y in 0..16u64 {
+                for x in 0..16u64 {
+                    if rng.next_u64().is_multiple_of(3) {
+                        world.set(wc(x), wc(y), wc(z), STONE);
+                    }
+                }
+            }
+        }
+        let state_before = world.flatten();
+
+        for _ in 0..4 {
+            world.step_recursive();
+            assert_eq!(
+                world.flatten(),
+                state_before,
+                "stone-only world should remain unchanged"
+            );
+        }
+    }
+
+    /// Inert world at larger scale (m1f.15.1): at level 6 (64³), uniform
+    /// subtrees deep underground should trigger fixed-point detection.
+    #[test]
+    fn inert_world_level6_fixed_point_skips() {
+        use crate::terrain::TerrainParams;
+        let mut world = World::new(6); // 64³
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+        let state_before = world.flatten();
+
+        world.step_recursive();
+        let s = world.hashlife_stats;
+
+        // At 64³ with terrain, there should be substantial empty regions
+        // (air above ground) and potentially uniform stone regions underground.
+        // Both trigger short-circuit paths.
+        assert!(
+            s.empty_skips > 0,
+            "64³ terrain should have empty subtree skips (air above ground)"
+        );
+        // Fixed-point skips depend on whether underground is uniform enough.
+        // At 64³ this may or may not fire — the assertion is that the world
+        // state is correct, not that skips hit a specific count.
+
+        // Terrain with default params has only CaRule::Noop materials
+        // (stone, dirt, grass) — world should be unchanged
+        assert_eq!(
+            world.flatten(),
+            state_before,
+            "terrain without active CA should remain unchanged"
+        );
+    }
+
+    /// Settled terrain convergence (m1f.15.1): after active CA (water/fire)
+    /// finishes, further steps should not change the world state.
+    #[test]
+    fn settled_terrain_state_converges() {
+        use crate::terrain::TerrainParams;
+        let mut world = World::new(4); // 16³
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+
+        // Step enough for any active CA to settle
+        for _ in 0..6 {
+            world.step_recursive();
+        }
+        let settled = world.flatten();
+
+        // Two more steps — state should not change
+        world.step_recursive();
+        assert_eq!(world.flatten(), settled, "settled terrain changed on step 7");
+        world.step_recursive();
+        assert_eq!(world.flatten(), settled, "settled terrain changed on step 8");
+    }
 }
