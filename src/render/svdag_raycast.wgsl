@@ -227,6 +227,14 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     // Per-axis slab entry times. `tmin_v` is the max-across
                     // axes at entry, and the axis holding that max is the
                     // last face the ray crossed to get inside the voxel.
+                    //
+                    // Assumes the ray origin is outside the leaf. Inside-leaf
+                    // origins produce an inward-facing normal (all `tmin_v`
+                    // negative → picker returns the nearest back face); the
+                    // orbit camera can reach this case on deep zoom. Tracked
+                    // as a follow-up to hash-thing-rv4. The cascade below
+                    // uses `>=` on both comparators so ties break identically
+                    // to the CPU oracle in svdag.rs — do NOT flip to `>`.
                     let lt1 = (leaf_min - ro_local) * inv_rd;
                     let lt2 = (leaf_max - ro_local) * inv_rd;
                     let tmin_v = min(lt1, lt2);

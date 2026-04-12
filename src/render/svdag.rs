@@ -496,6 +496,13 @@ pub mod cpu_trace {
                             (leaf_max[2] - ro_local[2]) * inv_rd[2],
                         ];
                         let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
+                        // Assumes ray origin is outside the leaf. Inside-leaf
+                        // origins pick the nearest back face (all `tmin_v`
+                        // negative → argmax is the least-negative axis);
+                        // tracked as a follow-up to hash-thing-rv4. The
+                        // cascade uses `>=` on both comparators so ties
+                        // break identically to the shader in
+                        // `svdag_raycast.wgsl` — do NOT flip to `>`.
                         let normal = if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
                             [-rd[0].signum(), 0.0, 0.0]
                         } else if tmin_v[1] >= tmin_v[2] {
@@ -1493,6 +1500,10 @@ mod tests {
         // below would be vacuously satisfied.
         let natural = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
         assert_eq!(natural.hit_material, None);
+        assert_eq!(
+            natural.hit_normal, None,
+            "clean miss must carry no normal (hash-thing-rv4 invariant)"
+        );
         assert!(
             !natural.exhausted,
             "natural diagonal miss must not exhaust at budget=32768"
@@ -1520,6 +1531,11 @@ mod tests {
             result.hit_material, None,
             "exhausted traversal must report no hit (CPU path must match \
              shader behavior where the magenta sentinel replaces any hit)",
+        );
+        assert_eq!(
+            result.hit_normal, None,
+            "exhausted traversal must carry no normal — guards the \
+             post-loop fall-through (hash-thing-rv4 invariant)",
         );
         assert_eq!(
             result.steps, budget,
@@ -1641,20 +1657,16 @@ mod tests {
         );
 
         let normal = result.hit_normal.expect("hit must carry a normal");
-        // Normal must be a unit face vector. Any of the six is acceptable
-        // — the specific one is tie-breaker detail that this test does not
-        // pin. What it DOES pin: we never return the zero vector, which
-        // would silently break Lambertian shading in the shader.
-        let len_sq = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
-        assert!(
-            (len_sq - 1.0).abs() < 1e-6,
-            "corner-hit normal must be unit length, got {normal:?} (len²={len_sq})",
-        );
-        // And exactly one component must be ±1, the other two zero.
-        let nonzero = normal.iter().filter(|c| c.abs() > 0.0).count();
+        // The cascade's first comparator is `tmin_v[0] >= tmin_v[1]`, so on
+        // an exact xy tie x wins and the ray (coming from -x,-y) gives the
+        // -x face normal. Pinning the specific axis here is the whole point
+        // of the CPU oracle: if someone flips the cascade to `>` instead of
+        // `>=`, CPU would pick y while the shader (also `>=`) still picks x,
+        // and this assertion will catch the drift before it hits the GPU.
         assert_eq!(
-            nonzero, 1,
-            "corner-hit normal must be axis-aligned face normal, got {normal:?}",
+            normal,
+            [-1.0, 0.0, 0.0],
+            "xy-edge tie-break must pick x (x-first cascade with `>=`), got {normal:?}",
         );
     }
 
