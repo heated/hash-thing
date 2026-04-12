@@ -100,6 +100,8 @@ pub struct World {
     pub(crate) hashlife_all_inert_cache: FxHashMap<NodeId, bool>,
     /// Hashlife cache statistics from the most recent step.
     pub hashlife_stats: HashlifeStats,
+    /// Store size after the last compaction, used to trigger periodic GC.
+    pub(crate) store_size_at_last_compact: usize,
     /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
     /// Avoids O(n³) flatten-and-scan on every `step_recursive_pow2` call.
     pub(crate) block_rule_present: Option<bool>,
@@ -152,6 +154,7 @@ impl World {
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
+            store_size_at_last_compact: 0,
             block_rule_present: None,
             queue: MutationQueue::new(),
             origin: [0, 0, 0],

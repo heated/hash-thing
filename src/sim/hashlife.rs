@@ -19,10 +19,11 @@
 //!      Assemble into the level-(n-1) output.
 //!
 //! Step results are memoized by (NodeId, parity) so identical subtrees anywhere
-//! in the world share a single cache entry per generation.
-//! After each step, compaction remaps NodeIds; the cache entries are translated
-//! through the remap table rather than cleared. Entries for GC'd nodes are
-//! dropped automatically. Since parity alternates 0/1, cache hits occur every
+//! in the world share a single cache entry per generation. Compaction is deferred
+//! (m1f.14): intermediate nodes from recursive descent survive across frames,
+//! enabling cache hits at every recursion level. Periodic compaction runs when
+//! the store exceeds 2× its post-compaction size, remapping cache keys through
+//! the compaction table. Since parity alternates 0/1, cache hits occur every
 //! OTHER frame for stable subtrees (parity match on frame N+2, not N+1).
 
 use super::world::World;
@@ -45,7 +46,6 @@ impl World {
             self.level
         );
         self.hashlife_stats = super::world::HashlifeStats::default();
-        let old_root = self.root;
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         let parity = (self.generation % 2) as u32;
@@ -53,18 +53,7 @@ impl World {
         self.root = result;
         self.generation += 1;
 
-        // Skip compaction when the world is unchanged (m1f.15.5). For inert
-        // frames, the store is already stable and cache entries remain valid.
-        // When the world changes, compact but preserve the padded root so
-        // cache entries keyed by input NodeIds survive (m1f.15.2).
-        if result != old_root {
-            let (new_store, new_root, remap) = self
-                .store
-                .compacted_with_remap_roots(&[self.root, padded_root]);
-            self.store = new_store;
-            self.root = new_root;
-            self.remap_caches(&remap);
-        }
+        self.maybe_compact();
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -88,21 +77,34 @@ impl World {
             self.block_rule_present = None; // brute-force may have consumed block-rule cells
             return;
         }
-        let old_root = self.root;
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         let result = self.step_node_macro(padded_root, padded_level, self.generation);
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
+        self.maybe_compact();
+    }
 
-        if result != old_root {
-            let (new_store, new_root, remap) = self
-                .store
-                .compacted_with_remap_roots(&[self.root, padded_root]);
-            self.store = new_store;
-            self.root = new_root;
-            self.remap_caches(&remap);
+    /// Compact the store when it has grown past 2× its post-compaction size.
+    /// This bounds memory growth from deferred compaction while preserving
+    /// most intermediate nodes across frames for cache hits. The 2× threshold
+    /// means compaction runs rarely — only when the store has doubled from
+    /// dead intermediate nodes accumulating.
+    fn maybe_compact(&mut self) {
+        let current_size = self.store.stats();
+        // On first call, store_size_at_last_compact is 0 — set baseline
+        if self.store_size_at_last_compact == 0 {
+            self.store_size_at_last_compact = current_size;
+            return;
         }
+        if current_size <= self.store_size_at_last_compact * 2 {
+            return;
+        }
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
+        self.store = new_store;
+        self.root = new_root;
+        self.remap_caches(&remap);
+        self.store_size_at_last_compact = self.store.stats();
     }
 
     fn has_block_rule_cells(&mut self) -> bool {
