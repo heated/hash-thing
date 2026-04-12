@@ -21,11 +21,13 @@ pub fn wasm_main() {
     log::info!("hash-thing: WASM/WebGPU mode");
 
     use winit::event_loop::EventLoop;
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
     let mut app = WasmApp { window: None };
-    event_loop.run_app(&mut app).unwrap();
+    event_loop
+        .run_app(&mut app)
+        .expect("event loop terminated with error");
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -46,17 +48,26 @@ impl winit::application::ApplicationHandler for WasmApp {
             .with_title("hash-thing | WebGPU")
             .with_inner_size(winit::dpi::LogicalSize::new(960, 540));
 
-        let window = std::sync::Arc::new(event_loop.create_window(attrs).unwrap());
+        let window = std::sync::Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("failed to create WASM window"),
+        );
 
         // Insert canvas into the DOM
         {
             use winit::platform::web::WindowExtWebSys;
             let canvas = window.canvas().expect("winit should have a canvas on WASM");
-            let web_window = web_sys::window().unwrap();
-            let document = web_window.document().unwrap();
+            let web_window = web_sys::window().expect("no global window object");
+            let document = web_window.document().expect("window has no document");
             let container = document
                 .get_element_by_id("hash-thing-canvas")
-                .unwrap_or_else(|| document.body().unwrap().into());
+                .unwrap_or_else(|| {
+                    document
+                        .body()
+                        .expect("document has no body element")
+                        .into()
+                });
             container
                 .append_child(&canvas)
                 .expect("failed to append canvas to DOM");

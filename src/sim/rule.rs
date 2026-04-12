@@ -12,7 +12,48 @@ pub trait CaRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
 }
 
+/// Context passed to block rules for deterministic RNG and position awareness.
+///
+/// All fields are pure functions of position + generation + seed, so block rules
+/// remain Hashlife-compatible (no global mutable state).
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub struct BlockContext {
+    /// World-space origin of the block's (0,0,0) corner.
+    pub block_origin: [i64; 3],
+    /// Current simulation generation.
+    pub generation: u64,
+    /// Per-world seed for deterministic randomness.
+    pub world_seed: u64,
+    /// Pre-computed RNG hash from `rng::cell_hash(origin, generation, seed)`.
+    pub rng_hash: u64,
+}
+
+/// A block-based CA rule operating on 2x2x2 cell blocks.
+///
+/// Block rules implement mass-conserving permutations: the output must be a
+/// rearrangement of the input cells (multiset equality). This invariant enables
+/// Margolus-style movement (sand falling, fluid flow) without creating or
+/// destroying matter.
+///
+/// Cell ordering within the block follows octant convention:
+///   `block_index(dx, dy, dz) = dx + dy*2 + dz*4`
+/// matching `octant_index` in `src/octree/node.rs`.
+pub trait BlockRule {
+    fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8];
+}
+
+/// Map local (dx, dy, dz) offsets (each 0 or 1) to an index in `[Cell; 8]`.
+///
+/// Matches `octant_index` in `src/octree/node.rs` — this is a load-bearing
+/// invariant. Do not change one without the other.
+#[inline]
+pub const fn block_index(dx: usize, dy: usize, dz: usize) -> usize {
+    dx + dy * 2 + dz * 4
+}
+
 /// Identity rule for static materials. Returns the center cell unchanged.
+#[derive(Debug)]
 pub struct NoopRule;
 
 impl CaRule for NoopRule {
@@ -22,6 +63,7 @@ impl CaRule for NoopRule {
 }
 
 /// Fire persists while fuel is adjacent, and is quenched by water.
+#[derive(Debug)]
 pub struct FireRule {
     pub fuel_material: u16,
     pub quencher_material: u16,
@@ -47,6 +89,7 @@ impl CaRule for FireRule {
 }
 
 /// Water solidifies into a configured product when the reactive material is adjacent.
+#[derive(Debug)]
 pub struct WaterRule {
     pub reactive_material: u16,
     pub reaction_product: Cell,
@@ -74,17 +117,13 @@ impl CaRule for WaterRule {
 /// (`Amoeba`, `Crystal`, `445`, `Pyroclastic`) are ambiguous between
 /// different rule families in the literature, so always log both.
 ///
-/// Constructor presets (numerics are the source of truth, names are mnemonic):
-///   - [`amoeba`]      → `S9-26/B5-7`  (organic spreading growth)
-///   - [`crystal`]     → `S0-6/B1-3`   (structured geometric growth)
-///   - [`rule445`]     → `S4-4/B4-4`   (the canonical "4/4" crystals rule)
-///   - [`pyroclastic`] → `S4-7/B6-8`   (chaotic, fire-like)
+/// The only retained named preset is [`rule445`], which backs the runtime
+/// smoke-scene shortcut in `main.rs`. Other historical presets are expressed
+/// directly with [`GameOfLife3D::new`] in tests instead of being part of the
+/// public scaffold.
 ///
-/// [`amoeba`]: GameOfLife3D::amoeba
-/// [`crystal`]: GameOfLife3D::crystal
 /// [`rule445`]: GameOfLife3D::rule445
-/// [`pyroclastic`]: GameOfLife3D::pyroclastic
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct GameOfLife3D {
     /// survive_min..=survive_max: cell stays alive if neighbor count is in this range
     pub survive_min: u8,
@@ -104,24 +143,9 @@ impl GameOfLife3D {
         }
     }
 
-    /// "Amoeba" preset — `S9-26/B5-7`. Organic spreading growth.
-    pub fn amoeba() -> Self {
-        Self::new(9, 26, 5, 7)
-    }
-
-    /// "Crystal" preset — `S0-6/B1-3`. Structured geometric growth.
-    pub fn crystal() -> Self {
-        Self::new(0, 6, 1, 3)
-    }
-
     /// "445" preset — `S4-4/B4-4`. The canonical 4/4 crystals rule.
     pub fn rule445() -> Self {
         Self::new(4, 4, 4, 4)
-    }
-
-    /// "Pyroclastic" preset — `S4-7/B6-8`. Chaotic, fire-like.
-    pub fn pyroclastic() -> Self {
-        Self::new(4, 7, 6, 8)
     }
 }
 
@@ -177,63 +201,41 @@ mod tests {
     }
 
     /// Lock in the numeric ranges of every preset. This test is the source
-    /// of truth for hash-thing-pbx — if you change a preset's numbers, this
-    /// test fails and you must also update the doc comments above the
-    /// constructors and any caller (main.rs) that displays them.
+    /// of truth for the retained runtime smoke preset.
     #[test]
-    fn preset_ranges_match_doc() {
-        let amoeba = GameOfLife3D::amoeba();
-        assert_eq!((amoeba.survive_min, amoeba.survive_max), (9, 26));
-        assert_eq!((amoeba.birth_min, amoeba.birth_max), (5, 7));
-        assert_eq!(format!("{}", amoeba), "S9-26/B5-7");
-
-        let crystal = GameOfLife3D::crystal();
-        assert_eq!((crystal.survive_min, crystal.survive_max), (0, 6));
-        assert_eq!((crystal.birth_min, crystal.birth_max), (1, 3));
-        assert_eq!(format!("{}", crystal), "S0-6/B1-3");
-
+    fn rule445_range_matches_doc() {
         let r445 = GameOfLife3D::rule445();
         assert_eq!((r445.survive_min, r445.survive_max), (4, 4));
         assert_eq!((r445.birth_min, r445.birth_max), (4, 4));
         assert_eq!(format!("{}", r445), "S4-4/B4-4");
-
-        let pyro = GameOfLife3D::pyroclastic();
-        assert_eq!((pyro.survive_min, pyro.survive_max), (4, 7));
-        assert_eq!((pyro.birth_min, pyro.birth_max), (6, 8));
-        assert_eq!(format!("{}", pyro), "S4-7/B6-8");
     }
 
     #[test]
-    fn dead_with_zero_neighbors_stays_dead_all_presets() {
+    fn dead_with_zero_neighbors_stays_dead_across_reference_rules() {
         let zero = neighbors_with_alive(0);
-        assert_eq!(
-            GameOfLife3D::amoeba().step_cell(Cell::EMPTY, &zero),
-            Cell::EMPTY
-        );
-        assert_eq!(
-            GameOfLife3D::crystal().step_cell(Cell::EMPTY, &zero),
-            Cell::EMPTY
-        );
-        assert_eq!(
-            GameOfLife3D::rule445().step_cell(Cell::EMPTY, &zero),
-            Cell::EMPTY
-        );
-        assert_eq!(
-            GameOfLife3D::pyroclastic().step_cell(Cell::EMPTY, &zero),
-            Cell::EMPTY
-        );
+        for rule in [
+            GameOfLife3D::new(9, 26, 5, 7),
+            GameOfLife3D::new(0, 6, 1, 3),
+            GameOfLife3D::rule445(),
+            GameOfLife3D::new(4, 7, 6, 8),
+        ] {
+            assert_eq!(rule.step_cell(Cell::EMPTY, &zero), Cell::EMPTY);
+        }
     }
 
     #[test]
     fn crystal_isolated_live_cell_survives() {
         let zero = neighbors_with_alive(0);
-        assert_eq!(GameOfLife3D::crystal().step_cell(ALIVE, &zero), ALIVE);
+        assert_eq!(GameOfLife3D::new(0, 6, 1, 3).step_cell(ALIVE, &zero), ALIVE);
     }
 
     #[test]
     fn amoeba_isolated_live_cell_dies() {
         let zero = neighbors_with_alive(0);
-        assert_eq!(GameOfLife3D::amoeba().step_cell(ALIVE, &zero), Cell::EMPTY);
+        assert_eq!(
+            GameOfLife3D::new(9, 26, 5, 7).step_cell(ALIVE, &zero),
+            Cell::EMPTY
+        );
     }
 
     #[test]
@@ -260,7 +262,7 @@ mod tests {
 
     #[test]
     fn survival_preserves_center_payload() {
-        let rule = GameOfLife3D::crystal();
+        let rule = GameOfLife3D::new(0, 6, 1, 3);
         let zero = neighbors_with_alive(0);
         let tagged = Cell::pack(5, 42);
         assert_eq!(rule.step_cell(tagged, &zero), tagged);
@@ -395,14 +397,52 @@ mod tests {
     }
 
     #[test]
-    fn all_26_neighbors_alive_survival_by_preset() {
+    fn all_26_neighbors_alive_survival_by_reference_rule() {
         let full = neighbors_with_alive(26);
-        assert_eq!(GameOfLife3D::amoeba().step_cell(ALIVE, &full), ALIVE);
-        assert_eq!(GameOfLife3D::crystal().step_cell(ALIVE, &full), Cell::EMPTY);
-        assert_eq!(GameOfLife3D::rule445().step_cell(ALIVE, &full), Cell::EMPTY);
         assert_eq!(
-            GameOfLife3D::pyroclastic().step_cell(ALIVE, &full),
+            GameOfLife3D::new(9, 26, 5, 7).step_cell(ALIVE, &full),
+            ALIVE
+        );
+        assert_eq!(
+            GameOfLife3D::new(0, 6, 1, 3).step_cell(ALIVE, &full),
             Cell::EMPTY
         );
+        assert_eq!(GameOfLife3D::rule445().step_cell(ALIVE, &full), Cell::EMPTY);
+        assert_eq!(
+            GameOfLife3D::new(4, 7, 6, 8).step_cell(ALIVE, &full),
+            Cell::EMPTY
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // BlockRule / BlockContext / block_index tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn block_index_matches_octant_convention() {
+        // dx + dy*2 + dz*4
+        assert_eq!(block_index(0, 0, 0), 0);
+        assert_eq!(block_index(1, 0, 0), 1);
+        assert_eq!(block_index(0, 1, 0), 2);
+        assert_eq!(block_index(1, 1, 0), 3);
+        assert_eq!(block_index(0, 0, 1), 4);
+        assert_eq!(block_index(1, 0, 1), 5);
+        assert_eq!(block_index(0, 1, 1), 6);
+        assert_eq!(block_index(1, 1, 1), 7);
+    }
+
+    #[test]
+    fn block_index_covers_all_8() {
+        let mut seen = [false; 8];
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let idx = block_index(dx, dy, dz);
+                    assert!(!seen[idx], "duplicate index {idx}");
+                    seen[idx] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s));
     }
 }
