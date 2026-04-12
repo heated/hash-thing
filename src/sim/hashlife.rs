@@ -50,7 +50,6 @@ impl World {
 
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
-        self.store.clear_step_cache();
         let (new_store, new_root) = self.store.compacted(self.root);
         self.store = new_store;
         self.root = new_root;
@@ -86,7 +85,6 @@ impl World {
 
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
-        self.store.clear_step_cache();
         let (new_store, new_root) = self.store.compacted(self.root);
         self.store = new_store;
         self.root = new_root;

@@ -144,12 +144,7 @@ impl World {
     }
 
     /// Invalidate caches whose keys depend on the active CA rule.
-    ///
-    /// Today this only clears `NodeStore::step_cache`, whose key is `NodeId`
-    /// only. Call this before or immediately after any rule swap so future
-    /// memoized stepping cannot reuse results from a different ruleset.
     pub fn invalidate_rule_caches(&mut self) {
-        self.store.clear_step_cache();
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
     }
@@ -667,14 +662,13 @@ impl World {
     pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
         params.validate().expect("invalid TerrainParams");
         self.store = NodeStore::new();
-        self.store.clear_step_cache();
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
         let field = params.to_heightmap();
         let gen_start = std::time::Instant::now();
         let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
         stats.gen_region_us = gen_start.elapsed().as_micros() as u64;
-        stats.nodes_after_gen = self.store.stats().0;
+        stats.nodes_after_gen = self.store.stats();
         // Opt-in cave-CA post-pass. Runs as a separate stage after the
         // heightmap recursion so the baseline perf path (and every
         // pre-caves test) sees identical work when `params.caves` is
@@ -684,7 +678,7 @@ impl World {
             root = carve_caves(&mut self.store, root, self.level, &cave_params);
             stats.cave_us = cave_start.elapsed().as_micros() as u64;
         }
-        stats.nodes_after_caves = self.store.stats().0;
+        stats.nodes_after_caves = self.store.stats();
         // Opt-in dungeon carving post-pass. Runs after caves so dungeons
         // carve through already-opened cave networks.
         if let Some(dungeon_params) = &params.dungeons {
@@ -692,7 +686,7 @@ impl World {
             root = carve_dungeons(&mut self.store, root, self.level, dungeon_params);
             stats.dungeon_us = dungeon_start.elapsed().as_micros() as u64;
         }
-        stats.nodes_after_dungeons = self.store.stats().0;
+        stats.nodes_after_dungeons = self.store.stats();
         self.root = root;
         self.generation = 0;
         self.terrain_params = Some(*params);
@@ -1020,10 +1014,10 @@ mod tests {
         let params = TerrainParams::default();
 
         let _ = world.seed_terrain(&params);
-        let nodes_after_first = world.store.stats().0;
+        let nodes_after_first = world.store.stats();
 
         let _ = world.seed_terrain(&params);
-        let nodes_after_second = world.store.stats().0;
+        let nodes_after_second = world.store.stats();
 
         assert_eq!(
             nodes_after_first, nodes_after_second,
@@ -1287,19 +1281,6 @@ mod tests {
             b.flatten(),
             "block stepping must be deterministic"
         );
-    }
-
-    #[test]
-    fn invalidate_rule_caches_clears_step_cache() {
-        let mut world = World::new(3);
-        let input = world.store.leaf(Cell::pack(DIRT_MATERIAL_ID, 0).raw());
-        let output = world.store.leaf(Cell::pack(WATER_MATERIAL_ID, 0).raw());
-        world.store.cache_step(input, output);
-        assert_eq!(world.store.get_cached_step(input), Some(output));
-
-        world.invalidate_rule_caches();
-
-        assert_eq!(world.store.get_cached_step(input), None);
     }
 
     // -----------------------------------------------------------------

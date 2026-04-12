@@ -11,24 +11,6 @@ pub struct NodeStore {
     nodes: Vec<Node>,
     /// Reverse lookup: node -> its canonical id.
     intern: FxHashMap<Node, NodeId>,
-    /// Memoized step results: `node_id -> result_node_id`.
-    ///
-    /// The result of a level-n node is the center (level n-1) cube after
-    /// 2^(n-2) steps.
-    ///
-    /// **Caller contract — read this before adding a memoized stepper:**
-    ///
-    /// The key is `NodeId` only. Rule identity is *not* part of the key.
-    /// Callers must invoke [`Self::clear_step_cache`] whenever the active
-    /// rule changes, or the cache will return stale results from the
-    /// previous rule. The brute-force `World::step` path bypasses this
-    /// cache entirely, so today the contract is dormant — but the moment
-    /// hash-thing-6gf.1 lands a memoized recursive stepper, every code path
-    /// that swaps rules must clear the cache.
-    ///
-    /// hash-thing-6gf.2 will widen the key to a struct that includes rule
-    /// identity (and the recursion phase), retiring this contract.
-    step_cache: FxHashMap<NodeId, NodeId>,
 }
 
 impl Default for NodeStore {
@@ -42,7 +24,6 @@ impl NodeStore {
         let mut store = Self {
             nodes: Vec::new(),
             intern: FxHashMap::default(),
-            step_cache: FxHashMap::default(),
         };
         // Reserve NodeId(0) as the canonical empty leaf.
         let empty = store.intern_node(Node::Leaf(0));
@@ -363,27 +344,6 @@ impl NodeStore {
         self.interior(level, children)
     }
 
-    /// Cache a step result.
-    pub fn cache_step(&mut self, input: NodeId, result: NodeId) {
-        self.step_cache.insert(input, result);
-    }
-
-    /// Look up a cached step result.
-    pub fn get_cached_step(&self, input: NodeId) -> Option<NodeId> {
-        self.step_cache.get(&input).copied()
-    }
-
-    /// Clear the step cache.
-    ///
-    /// **Must be called whenever the active rule changes.** The cache key is
-    /// `NodeId` only — see the `step_cache` field doc for the full contract.
-    /// Failure to clear after a rule swap will silently return stale results
-    /// from the previous rule once a memoized stepper is in place
-    /// (hash-thing-6gf.1).
-    pub fn clear_step_cache(&mut self) {
-        self.step_cache.clear();
-    }
-
     // ---- Extraction primitives (hash-thing-6gf.6) ----
 
     /// Extract the 26 Moore neighbors of a cell, wrapping toroidally.
@@ -484,8 +444,8 @@ impl NodeStore {
     }
 
     /// Stats for debugging.
-    pub fn stats(&self) -> (usize, usize) {
-        (self.nodes.len(), self.step_cache.len())
+    pub fn stats(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Return a fresh `NodeStore` containing only the nodes reachable from
@@ -507,19 +467,7 @@ impl NodeStore {
     /// lives at slot 0. All other NodeIds from `self` are invalid against
     /// the returned store and must not be mixed.
     ///
-    /// ## Cache lifetime
-    ///
-    /// `compacted` cannot currently preserve `step_cache`: the cache is
-    /// keyed on `NodeId`, and the new store uses a fresh id space. The
-    /// `debug_assert!` below enforces "cache lifetime == store epoch" —
-    /// callers must clear the step cache before compacting (or, once
-    /// hash-thing-6gf.2 lands, the memoization layer must live outside
-    /// `NodeStore` or remap across compaction).
     pub fn compacted(&self, root: NodeId) -> (NodeStore, NodeId) {
-        debug_assert!(
-            self.step_cache.is_empty(),
-            "compacted() cannot preserve step_cache yet — see hash-thing-6gf.2"
-        );
         let mut dst = NodeStore::new();
         let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
         // Pre-seed EMPTY as a perf short-circuit. Note: this is NOT
@@ -933,39 +881,19 @@ mod tests {
         let grid = vec![0 as CellState; side * side * side];
         let mut store = NodeStore::new();
         let _root = store.from_flat(&grid, side);
-        let (nodes, _) = store.stats();
+        let nodes = store.stats();
         // 7 levels (leaf through level 6), one canonical node per level.
         assert_eq!(nodes, 7, "expected 7 nodes for an empty 64^3, got {nodes}");
     }
 
-    /// Step cache round-trip. Not exercising Hashlife yet — just that
-    /// insert / lookup / clear behave.
+    /// `stats()` reports node count.
     #[test]
-    fn step_cache_insert_lookup_clear() {
+    fn stats_tracks_nodes() {
         let mut store = NodeStore::new();
-        let a = store.leaf(mat(1));
-        let b = store.leaf(mat(2));
-        assert_eq!(store.get_cached_step(a), None);
-        store.cache_step(a, b);
-        assert_eq!(store.get_cached_step(a), Some(b));
-        store.clear_step_cache();
-        assert_eq!(store.get_cached_step(a), None);
-    }
-
-    /// `stats()` reports (nodes, cache_len).
-    #[test]
-    fn stats_tracks_nodes_and_cache() {
-        let mut store = NodeStore::new();
-        let (n0, c0) = store.stats();
-        assert_eq!(n0, 1); // just the empty leaf
-        assert_eq!(c0, 0);
-        let a = store.leaf(mat(1));
-        let b = store.leaf(mat(2));
-        let (n1, _) = store.stats();
-        assert_eq!(n1, 3);
-        store.cache_step(a, b);
-        let (_, c1) = store.stats();
-        assert_eq!(c1, 1);
+        assert_eq!(store.stats(), 1); // just the empty leaf
+        store.leaf(mat(1));
+        store.leaf(mat(2));
+        assert_eq!(store.stats(), 3);
     }
 
     /// Regression for hash-thing-7rq: when an Interior's child is a Leaf that
@@ -1073,12 +1001,10 @@ mod tests {
         let store = NodeStore::new();
         let (compacted, new_root) = store.compacted(NodeId::EMPTY);
         assert_eq!(new_root, NodeId::EMPTY);
-        let (nodes, cache) = compacted.stats();
         assert_eq!(
-            nodes, 1,
+            compacted.stats(), 1,
             "empty compaction should yield only the canonical empty leaf"
         );
-        assert_eq!(cache, 0);
     }
 
     /// T2: after one `set_cell`, compaction's node count matches a
@@ -1090,7 +1016,7 @@ mod tests {
         let mut a = NodeStore::new();
         let mut root_a = a.empty(6);
         root_a = a.set_cell(root_a, 10, 20, 30, mat(7));
-        let pre_nodes = a.stats().0;
+        let pre_nodes = a.stats();
         let (compacted_a, new_root_a) = a.compacted(root_a);
 
         // Build store B: a fresh one-cell world — empty(6), set the same cell.
@@ -1101,15 +1027,15 @@ mod tests {
         let (compacted_b, _new_root_b) = b.compacted(root_b);
 
         assert_eq!(
-            compacted_a.stats().0,
-            compacted_b.stats().0,
+            compacted_a.stats(),
+            compacted_b.stats(),
             "compacted one-cell world should match fresh one-cell world node count"
         );
         assert!(
-            compacted_a.stats().0 < pre_nodes,
+            compacted_a.stats() < pre_nodes,
             "compaction should drop dead clone-path nodes ({} → {})",
             pre_nodes,
-            compacted_a.stats().0
+            compacted_a.stats()
         );
         // Cell round-trip.
         assert_eq!(compacted_a.get_cell(new_root_a, 10, 20, 30), mat(7));
@@ -1138,13 +1064,13 @@ mod tests {
             }
             root = store.from_flat(&grid, side);
         }
-        let pre_nodes = store.stats().0;
+        let pre_nodes = store.stats();
         let (compacted, new_root) = store.compacted(root);
         assert!(
-            compacted.stats().0 <= pre_nodes,
+            compacted.stats() <= pre_nodes,
             "compaction should not grow the store ({} → {})",
             pre_nodes,
-            compacted.stats().0
+            compacted.stats()
         );
         // Every cell under the final root must match.
         for z in 0..side {
@@ -1324,11 +1250,11 @@ mod tests {
         let (once, root_once) = dirty.compacted(root);
         let (twice, root_twice) = once.compacted(root_once);
         assert_eq!(
-            once.stats().0,
-            twice.stats().0,
+            once.stats(),
+            twice.stats(),
             "compaction is not idempotent ({} → {})",
-            once.stats().0,
-            twice.stats().0
+            once.stats(),
+            twice.stats()
         );
         // Cell-by-cell equality across the two compactions.
         for z in 0..side {

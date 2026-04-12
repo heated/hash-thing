@@ -199,7 +199,7 @@ impl App {
     }
 
     fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
-        let nodes_before = self.world.store.stats().0;
+        let nodes_before = self.world.store.stats();
         let start = std::time::Instant::now();
         let stats = self.world.seed_terrain(&params);
         let elapsed = start.elapsed();
@@ -214,7 +214,7 @@ impl App {
             &mut self.svdag,
             &mut self.last_svdag_stats,
         );
-        let (nodes_after, _) = self.world.store.stats();
+        let nodes_after = self.world.store.stats();
         let nodes_delta = nodes_after.saturating_sub(nodes_before);
         log_gen_stats(
             label,
@@ -405,8 +405,8 @@ impl ApplicationHandler for App {
                         // memory summary, independent of the wall-clock log
                         // cadence.
                         winit::keyboard::Key::Character("p") => {
-                            let (nodes, cache) = self.world.store.stats();
-                            self.mem_stats.update(nodes, cache);
+                            let nodes = self.world.store.stats();
+                            self.mem_stats.update(nodes);
                             let (svdag_nodes, svdag_bytes, svdag_root_level) =
                                 self.last_svdag_stats;
                             log::info!(
@@ -506,8 +506,8 @@ impl ApplicationHandler for App {
                 // Gen repeatedly is intentional: it tells the user the app
                 // is still alive.
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
-                    let (nodes, cache) = self.world.store.stats();
-                    self.mem_stats.update(nodes, cache);
+                    let nodes = self.world.store.stats();
+                    self.mem_stats.update(nodes);
                     let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                     log::info!(
                         "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
@@ -593,21 +593,3 @@ fn main() {
         .expect("event loop terminated with error");
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hash_thing::octree::Cell;
-
-    #[test]
-    fn select_rule_clears_world_step_cache() {
-        let mut app = App::new();
-        let input = app.world.store.leaf(Cell::pack(1, 0).raw());
-        let output = app.world.store.leaf(Cell::pack(2, 0).raw());
-        app.world.store.cache_step(input, output);
-        assert_eq!(app.world.store.get_cached_step(input), Some(output));
-
-        app.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
-
-        assert_eq!(app.world.store.get_cached_step(input), None);
-    }
-}
