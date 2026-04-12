@@ -1,6 +1,6 @@
-use super::rule::{CaRule, ALIVE};
-use crate::octree::{CellState, NodeId, NodeStore};
-use crate::terrain::materials::MaterialRegistry;
+use super::rule::ALIVE;
+use crate::octree::{Cell, CellState, NodeId, NodeStore};
+use crate::terrain::materials::{MaterialRegistry, FIRE, WATER};
 use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
@@ -23,8 +23,16 @@ impl World {
         let root = store.empty(level);
         let materials = MaterialRegistry::terrain_defaults();
         assert!(
-            materials.rule_for_state(ALIVE).is_some(),
+            materials.rule_for_cell(ALIVE).is_some(),
             "default material registry must define the legacy ALIVE payload",
+        );
+        assert!(
+            materials.rule_for_cell(Cell::from_raw(FIRE)).is_some(),
+            "default material registry must define the fire material",
+        );
+        assert!(
+            materials.rule_for_cell(Cell::from_raw(WATER)).is_some(),
+            "default material registry must define the water material",
         );
         Self {
             store,
@@ -71,9 +79,9 @@ impl World {
         self.store.flatten(self.root, self.side())
     }
 
-    /// Step the simulation forward one generation using brute-force grid evaluation.
-    /// This is the simple path — true Hashlife stepping replaces this later.
-    pub fn step_flat(&mut self, rule: &dyn CaRule) {
+    /// Step the simulation forward one generation using per-material rule dispatch.
+    /// This is the simple brute-force path — true Hashlife stepping replaces it later.
+    pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
         let mut next = vec![0 as CellState; side * side * side];
@@ -81,24 +89,17 @@ impl World {
         for z in 0..side {
             for y in 0..side {
                 for x in 0..side {
-                    let center = grid[x + y * side + z * side * side];
+                    let center = Cell::from_raw(grid[x + y * side + z * side * side]);
                     let neighbors = get_neighbors(&grid, side, x, y, z);
-                    next[x + y * side + z * side * side] = rule.step_cell(center, &neighbors);
+                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
+                        panic!("missing CaRule for material {}", center.material())
+                    });
+                    next[x + y * side + z * side * side] = rule.step_cell(center, &neighbors).raw();
                 }
             }
         }
 
-        self.root = self.store.from_flat(&next, side);
-        self.generation += 1;
-
-        // Fresh-store compaction: `from_flat` interned a brand new generation
-        // into the append-only store, leaving the previous generation's
-        // subtrees unreachable but still present. Rebuild into a fresh store
-        // so memory tracks live-scene size, not cumulative history.
-        // See hash-thing-88d.
-        let (new_store, new_root) = self.store.compacted(self.root);
-        self.store = new_store;
-        self.root = new_root;
+        self.commit_step(&next, side);
     }
 
     /// Place a random seed pattern in the center of the world.
@@ -122,7 +123,7 @@ impl World {
                     if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
                         && rng.next_f64() < density
                     {
-                        self.set(x, y, z, ALIVE);
+                        self.set(x, y, z, ALIVE.raw());
                     }
                 }
             }
@@ -131,6 +132,20 @@ impl World {
 
     pub fn population(&self) -> u64 {
         self.store.population(self.root)
+    }
+
+    fn commit_step(&mut self, next: &[CellState], side: usize) {
+        self.root = self.store.from_flat(next, side);
+        self.generation += 1;
+
+        // Fresh-store compaction: `from_flat` interned a brand new generation
+        // into the append-only store, leaving the previous generation's
+        // subtrees unreachable but still present. Rebuild into a fresh store
+        // so memory tracks live-scene size, not cumulative history.
+        // See hash-thing-88d.
+        let (new_store, new_root) = self.store.compacted(self.root);
+        self.store = new_store;
+        self.root = new_root;
     }
 
     /// Replace the world with terrain generated from `params`. Uses
@@ -172,8 +187,8 @@ impl World {
 }
 
 /// Get the 26 Moore neighbors of a cell, wrapping at boundaries.
-fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [CellState; 26] {
-    let mut neighbors = [0 as CellState; 26];
+fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [Cell; 26] {
+    let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;
     for dz in [-1i32, 0, 1] {
         for dy in [-1i32, 0, 1] {
@@ -184,7 +199,7 @@ fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) 
                 let nx = (x as i32 + dx).rem_euclid(side as i32) as usize;
                 let ny = (y as i32 + dy).rem_euclid(side as i32) as usize;
                 let nz = (z as i32 + dz).rem_euclid(side as i32) as usize;
-                neighbors[idx] = grid[nx + ny * side + nz * side * side];
+                neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
                 idx += 1;
             }
         }
@@ -214,15 +229,21 @@ impl SimpleRng {
 
 #[cfg(test)]
 mod tests {
-    //! Reference tests for the brute-force step_flat.
+    //! Reference tests for the brute-force dispatch step.
 
     use super::*;
-    use crate::octree::Cell;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
+    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, STONE, WATER};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
         World::new(3)
+    }
+
+    fn gol_world(rule: GameOfLife3D) -> World {
+        let mut world = empty_world();
+        world.materials = MaterialRegistry::gol_smoke(rule);
+        world
     }
 
     // -----------------------------------------------------------------
@@ -230,10 +251,8 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn empty_world_stays_empty_under_amoeba() {
-        let mut world = empty_world();
-        let rule = GameOfLife3D::amoeba();
-
-        world.step_flat(&rule);
+        let mut world = gol_world(GameOfLife3D::amoeba());
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -251,12 +270,10 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn single_cell_dies_under_amoeba() {
-        let mut world = empty_world();
-        world.set(4, 4, 4, ALIVE);
+        let mut world = gol_world(GameOfLife3D::amoeba());
+        world.set(4, 4, 4, ALIVE.raw());
         assert_eq!(world.population(), 1);
-
-        let rule = GameOfLife3D::amoeba();
-        world.step_flat(&rule);
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -270,11 +287,9 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn single_cell_grows_to_3x3x3_cube_under_crystal() {
-        let mut world = empty_world();
-        world.set(4, 4, 4, ALIVE);
-
-        let rule = GameOfLife3D::crystal();
-        world.step_flat(&rule);
+        let mut world = gol_world(GameOfLife3D::crystal());
+        world.set(4, 4, 4, ALIVE.raw());
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -287,7 +302,7 @@ mod tests {
                 for x in 3..=5u64 {
                     assert_eq!(
                         world.get(x, y, z),
-                        ALIVE,
+                        ALIVE.raw(),
                         "cell ({},{},{}) must be alive inside the expected 3x3x3 cube",
                         x,
                         y,
@@ -311,20 +326,18 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn cube_2x2x2_is_still_life_under_s7_b3() {
-        let rule = GameOfLife3D::new(7, 7, 3, 3);
-
-        let mut world = empty_world();
+        let mut world = gol_world(GameOfLife3D::new(7, 7, 3, 3));
         for z in 3..=4u64 {
             for y in 3..=4u64 {
                 for x in 3..=4u64 {
-                    world.set(x, y, z, ALIVE);
+                    world.set(x, y, z, ALIVE.raw());
                 }
             }
         }
         assert_eq!(world.population(), 8, "initial cube must have 8 cells");
 
         for gen in 1..=5 {
-            world.step_flat(&rule);
+            world.step();
             assert_eq!(
                 world.population(),
                 8,
@@ -338,7 +351,7 @@ mod tests {
                         let expected =
                             if (3..=4).contains(&x) && (3..=4).contains(&y) && (3..=4).contains(&z)
                             {
-                                ALIVE
+                                ALIVE.raw()
                             } else {
                                 0
                             };
@@ -361,28 +374,26 @@ mod tests {
     // 5. Determinism: same initial state + same rule -> byte-equal result.
     // -----------------------------------------------------------------
     #[test]
-    fn step_flat_is_deterministic() {
-        let rule = GameOfLife3D::crystal();
-
-        let mut world_a = empty_world();
-        let mut world_b = empty_world();
+    fn step_is_deterministic() {
+        let mut world_a = gol_world(GameOfLife3D::crystal());
+        let mut world_b = gol_world(GameOfLife3D::crystal());
 
         let seeds: &[(u64, u64, u64)] = &[(4, 4, 4), (3, 4, 5), (5, 2, 4)];
         for &(x, y, z) in seeds {
-            world_a.set(x, y, z, ALIVE);
-            world_b.set(x, y, z, ALIVE);
+            world_a.set(x, y, z, ALIVE.raw());
+            world_b.set(x, y, z, ALIVE.raw());
         }
 
         for _ in 0..3 {
-            world_a.step_flat(&rule);
-            world_b.step_flat(&rule);
+            world_a.step();
+            world_b.step();
         }
 
         let flat_a = world_a.flatten();
         let flat_b = world_b.flatten();
         assert_eq!(
             flat_a, flat_b,
-            "step_flat must produce identical output for identical input"
+            "step must produce identical output for identical input"
         );
         assert_eq!(
             world_a.population(),
@@ -396,13 +407,11 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn corner_single_cell_dies_under_amoeba() {
-        let mut world = empty_world();
+        let mut world = gol_world(GameOfLife3D::amoeba());
         let side = world.side() as u64;
-        world.set(side - 1, side - 1, side - 1, ALIVE);
+        world.set(side - 1, side - 1, side - 1, ALIVE.raw());
         assert_eq!(world.population(), 1);
-
-        let rule = GameOfLife3D::amoeba();
-        world.step_flat(&rule);
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -442,14 +451,14 @@ mod tests {
     #[should_panic(expected = "out of bounds")]
     fn world_set_panics_oob() {
         let mut w = World::new(2); // side 4
-        w.set(4, 0, 0, ALIVE);
+        w.set(4, 0, 0, ALIVE.raw());
     }
 
     #[test]
     fn world_set_in_bounds_at_max_corner() {
         let mut w = World::new(2); // side 4
-        w.set(3, 3, 3, ALIVE);
-        assert_eq!(w.get(3, 3, 3), ALIVE);
+        w.set(3, 3, 3, ALIVE.raw());
+        assert_eq!(w.get(3, 3, 3), ALIVE.raw());
         // And the complementary corner — distinct material id 2, metadata 0.
         let mat2 = Cell::pack(2, 0).raw();
         w.set(0, 0, 0, mat2);
@@ -485,5 +494,38 @@ mod tests {
              from {nodes_after_first} to {nodes_after_second} across a \
              deterministic re-seed",
         );
+    }
+
+    #[test]
+    fn water_turns_to_stone_when_fire_is_adjacent() {
+        let mut world = empty_world();
+        world.set(4, 4, 4, WATER);
+        world.set(5, 4, 4, FIRE);
+
+        world.step();
+
+        assert_eq!(world.get(4, 4, 4), STONE);
+    }
+
+    #[test]
+    fn isolated_fire_burns_out() {
+        let mut world = empty_world();
+        world.set(4, 4, 4, FIRE);
+
+        world.step();
+
+        assert_eq!(world.get(4, 4, 4), 0);
+    }
+
+    #[test]
+    fn fire_persists_next_to_grass_fuel() {
+        let mut world = empty_world();
+        world.set(4, 4, 4, FIRE);
+        world.set(5, 4, 4, GRASS);
+
+        world.step();
+
+        assert_eq!(world.get(4, 4, 4), FIRE);
+        assert_eq!(world.get(5, 4, 4), GRASS);
     }
 }

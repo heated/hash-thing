@@ -5,7 +5,7 @@
 //! cell, and every other material ID maps to a validated `CellState`.
 
 use crate::octree::{Cell, CellState};
-use crate::sim::rule::{CaRule, NoopRule};
+use crate::sim::rule::{CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
 
 pub type MaterialId = u16;
 
@@ -15,14 +15,15 @@ pub const AIR_MATERIAL_ID: MaterialId = 0;
 pub const STONE_MATERIAL_ID: MaterialId = 1;
 pub const DIRT_MATERIAL_ID: MaterialId = 2;
 pub const GRASS_MATERIAL_ID: MaterialId = 3;
+pub const FIRE_MATERIAL_ID: MaterialId = 4;
+pub const WATER_MATERIAL_ID: MaterialId = 5;
 
-pub const AIR: CellState = 0;
-/// Material 1, metadata 0 — encoded via `Cell::pack(1, 0)`.
+pub const AIR: CellState = Cell::EMPTY.raw();
 pub const STONE: CellState = Cell::pack(STONE_MATERIAL_ID, 0).raw();
-/// Material 2, metadata 0.
 pub const DIRT: CellState = Cell::pack(DIRT_MATERIAL_ID, 0).raw();
-/// Material 3, metadata 0.
 pub const GRASS: CellState = Cell::pack(GRASS_MATERIAL_ID, 0).raw();
+pub const FIRE: CellState = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
+pub const WATER: CellState = Cell::pack(WATER_MATERIAL_ID, 0).raw();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleId(pub usize);
@@ -67,6 +68,14 @@ impl MaterialRegistry {
     pub fn terrain_defaults() -> Self {
         let mut registry = Self::new();
         let static_rule = registry.register_rule(NoopRule);
+        let fire_rule = registry.register_rule(FireRule {
+            fuel_material: GRASS_MATERIAL_ID,
+            quencher_material: WATER_MATERIAL_ID,
+        });
+        let water_rule = registry.register_rule(WaterRule {
+            reactive_material: FIRE_MATERIAL_ID,
+            reaction_product: Cell::pack(STONE_MATERIAL_ID, 0),
+        });
 
         registry.insert(
             AIR_MATERIAL_ID,
@@ -132,7 +141,47 @@ impl MaterialRegistry {
                 rule_id: static_rule,
             },
         );
+        registry.insert(
+            FIRE_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "fire",
+                    base_color: [0.98, 0.43, 0.05, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 0.05,
+                    flammability: 0.0,
+                    conductivity: 0.0,
+                },
+                rule_id: fire_rule,
+            },
+        );
+        registry.insert(
+            WATER_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "water",
+                    base_color: [0.12, 0.35, 0.84, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 1.0,
+                    flammability: 0.0,
+                    conductivity: 0.6,
+                },
+                rule_id: water_rule,
+            },
+        );
 
+        registry
+    }
+
+    pub fn gol_smoke(rule: GameOfLife3D) -> Self {
+        let mut registry = Self::terrain_defaults();
+        let rule_id = registry.register_rule(rule);
+        registry.assign_rule(AIR_MATERIAL_ID, rule_id);
+        registry.assign_rule(STONE_MATERIAL_ID, rule_id);
         registry
     }
 
@@ -142,9 +191,8 @@ impl MaterialRegistry {
             .and_then(Option::as_ref)
     }
 
-    pub fn rule_for_state(&self, state: CellState) -> Option<&dyn CaRule> {
-        let material_id = Cell::from_raw(state).material();
-        let entry = self.entry(material_id)?;
+    pub fn rule_for_cell(&self, cell: Cell) -> Option<&dyn CaRule> {
+        let entry = self.entry(cell.material())?;
         Some(self.rules[entry.rule_id.0].as_ref())
     }
 
@@ -174,6 +222,13 @@ impl MaterialRegistry {
             self.entries.resize(material_id + 1, None);
         }
         self.entries[material_id] = Some(entry);
+    }
+
+    fn assign_rule(&mut self, material_id: MaterialId, rule_id: RuleId) {
+        self.entries[material_id as usize]
+            .as_mut()
+            .expect("material must exist before assigning a rule")
+            .rule_id = rule_id;
     }
 }
 
@@ -228,7 +283,7 @@ mod tests {
 
     #[test]
     fn materials_are_distinct() {
-        let mats = [AIR, STONE, DIRT, GRASS];
+        let mats = [AIR, STONE, DIRT, GRASS, FIRE, WATER];
         for (i, &a) in mats.iter().enumerate() {
             for (j, &b) in mats.iter().enumerate() {
                 if i != j {
@@ -250,16 +305,20 @@ mod tests {
     }
 
     #[test]
-    fn terrain_defaults_share_static_rule() {
+    fn terrain_defaults_share_static_rule_for_terrain_solids() {
         let registry = MaterialRegistry::terrain_defaults();
         let air = registry.entry(AIR_MATERIAL_ID).unwrap();
         let stone = registry.entry(STONE_MATERIAL_ID).unwrap();
         let dirt = registry.entry(DIRT_MATERIAL_ID).unwrap();
         let grass = registry.entry(GRASS_MATERIAL_ID).unwrap();
+        let fire = registry.entry(FIRE_MATERIAL_ID).unwrap();
+        let water = registry.entry(WATER_MATERIAL_ID).unwrap();
 
         assert_eq!(air.rule_id, stone.rule_id);
         assert_eq!(stone.rule_id, dirt.rule_id);
         assert_eq!(dirt.rule_id, grass.rule_id);
+        assert_ne!(grass.rule_id, fire.rule_id);
+        assert_ne!(fire.rule_id, water.rule_id);
         assert_eq!(stone.visual.label, "stone");
         assert!(stone.physical.density > dirt.physical.density);
     }
@@ -274,6 +333,8 @@ mod tests {
         assert_eq!(palette[STONE_MATERIAL_ID as usize], [0.45, 0.45, 0.48, 1.0]);
         assert_eq!(palette[DIRT_MATERIAL_ID as usize], [0.45, 0.29, 0.15, 1.0]);
         assert_eq!(palette[GRASS_MATERIAL_ID as usize], [0.22, 0.57, 0.19, 1.0]);
+        assert_eq!(palette[FIRE_MATERIAL_ID as usize], [0.98, 0.43, 0.05, 1.0]);
+        assert_eq!(palette[WATER_MATERIAL_ID as usize], [0.12, 0.35, 0.84, 1.0]);
     }
 
     #[test]
@@ -287,23 +348,44 @@ mod tests {
     }
 
     #[test]
-    fn rule_lookup_dispatches_to_registered_rule() {
+    fn terrain_defaults_dispatch_registered_rules() {
         let registry = MaterialRegistry::terrain_defaults();
-        let neighbors = [GRASS; 26];
+        let neighbors = [Cell::pack(FIRE_MATERIAL_ID, 0); 26];
 
         assert_eq!(
             registry
-                .rule_for_state(STONE)
+                .rule_for_cell(Cell::pack(WATER_MATERIAL_ID, 0))
                 .unwrap()
-                .step_cell(DIRT, &neighbors),
-            DIRT
+                .step_cell(Cell::pack(WATER_MATERIAL_ID, 0), &neighbors),
+            Cell::pack(STONE_MATERIAL_ID, 0),
         );
         assert_eq!(
             registry
-                .rule_for_state(AIR)
+                .rule_for_cell(Cell::pack(STONE_MATERIAL_ID, 0))
                 .unwrap()
-                .step_cell(AIR, &neighbors),
-            AIR
+                .step_cell(Cell::pack(STONE_MATERIAL_ID, 0), &neighbors),
+            Cell::pack(STONE_MATERIAL_ID, 0),
+        );
+    }
+
+    #[test]
+    fn gol_smoke_overrides_air_and_alive_dispatch() {
+        let registry = MaterialRegistry::gol_smoke(GameOfLife3D::rule445());
+        let neighbors = [Cell::pack(STONE_MATERIAL_ID, 0); 26];
+
+        assert_eq!(
+            registry
+                .rule_for_cell(Cell::EMPTY)
+                .unwrap()
+                .step_cell(Cell::EMPTY, &neighbors),
+            Cell::EMPTY,
+        );
+        assert_eq!(
+            registry
+                .rule_for_cell(Cell::pack(STONE_MATERIAL_ID, 0))
+                .unwrap()
+                .step_cell(Cell::pack(STONE_MATERIAL_ID, 0), &neighbors),
+            Cell::EMPTY,
         );
     }
 }
