@@ -62,7 +62,7 @@ fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
 //
 // DRIFT GUARD: the shift amount `6u` below mirrors `Cell::METADATA_BITS`
 // in src/octree/node.rs. If that constant ever changes, update this
-// shader AND src/render/raycast.wgsl together. There is a pinning
+// shader accordingly. There is a pinning
 // test in src/render/mod.rs (test `wgsl_metadata_shift_matches_rust`).
 fn material_color(packed: u32) -> vec3<f32> {
     let mat_id = packed >> 6u;
@@ -247,9 +247,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     // flat." This block derives the true surface normal
                     // from which axis of the leaf AABB the ray entered
                     // through (textbook voxel raycaster normal), then
-                    // applies Lambertian shading that matches `raycast.wgsl`
-                    // (Flat3D) 1:1 so both renderers look identical on
-                    // the same scene.
+                    // applies Lambertian shading.
                     let leaf_min = vec3<f32>(
                         node_min.x + f32(oct & 1u) * half,
                         node_min.y + f32((oct >> 1u) & 1u) * half,
@@ -295,9 +293,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     } else {
                         normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
                     }
-                    // Lambertian + ambient + fog — MATCHES raycast.wgsl
-                    // lighting model exactly. Fog uses world-space distance
-                    // (entry + local t) so near/far falloff matches Flat3D.
+                    // Lambertian + ambient + fog.
                     let base = material_color(mat);
                     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
                     let diffuse = max(dot(normal, light_dir), 0.0);

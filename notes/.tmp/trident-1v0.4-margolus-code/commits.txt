@@ -1,0 +1,6 @@
+202b26b fmt: cargo fmt
+749df98 world: integration tests for block stepping pipeline
+9cea4b5 world: add simulation_seed and block-wise stepping pass
+5650f76 materials: extend MaterialRegistry with block rule storage
+8d989d1 sim: add BlockRule trait, BlockContext, and Margolus transforms
+bce9600 plan: 1v0.4 Margolus 2x2x2 movement phase

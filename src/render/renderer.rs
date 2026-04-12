@@ -37,20 +37,6 @@ fn ticks_to_duration(start_ticks: u64, end_ticks: u64, period_ns: f32) -> Durati
     Duration::from_nanos(ns as u64)
 }
 
-/// wgpu requires `bytes_per_row` on multi-row texture copies to be a multiple
-/// of `COPY_BYTES_PER_ROW_ALIGNMENT` (256). For a 64³ R8Uint volume the natural
-/// row length is 64 bytes, which is not aligned — spec-violating even if it
-/// happens to work on most backends today. When the format widens to R16Uint
-/// (hash-thing-1v0.1) the same row becomes 128 bytes, still not aligned. This
-/// helper returns the padded row stride in bytes; callers use it as the upload
-/// `bytes_per_row` and pad rows in a staging buffer if the padded value
-/// differs from the unpadded one.
-fn padded_bytes_per_row(width: u32, bytes_per_texel: u32) -> u32 {
-    let unpadded = width * bytes_per_texel;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    unpadded.div_ceil(align) * align
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -60,12 +46,6 @@ struct Uniforms {
     camera_right: [f32; 4],
     /// x: volume_size, y: aspect_ratio, z: fov_tan, w: time
     params: [f32; 4],
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RenderMode {
-    Flat3D,
-    Svdag,
 }
 
 /// Outcome of a single `Renderer::render` call. Replaces an earlier `bool`
@@ -264,13 +244,6 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
 
-    // Flat 3D texture path
-    flat_pipeline: wgpu::RenderPipeline,
-    flat_bind_group_layout: wgpu::BindGroupLayout,
-    flat_bind_group: wgpu::BindGroup,
-    volume_texture: wgpu::Texture,
-    volume_view: wgpu::TextureView,
-
     // SVDAG path
     svdag_pipeline: wgpu::RenderPipeline,
     svdag_bind_group_layout: wgpu::BindGroupLayout,
@@ -296,15 +269,6 @@ pub struct Renderer {
     // Shared
     uniform_buffer: wgpu::Buffer,
     volume_size: u32,
-    /// Fixed 3D texture side length (set at creation, never resized).
-    /// After world growth `volume_size` may exceed this; `upload_volume`
-    /// skips the write when the grid outgrows the texture.
-    volume_texture_size: u32,
-    /// Bytes-per-texel for the volume format. R8Uint = 1, R16Uint = 2. Stored
-    /// alongside `volume_size` so `upload_volume` can compute row padding
-    /// without re-deriving it from the texture format enum.
-    volume_bytes_per_texel: u32,
-    pub mode: RenderMode,
     pub camera_yaw: f32,
     pub camera_pitch: f32,
     pub camera_dist: f32,
@@ -399,23 +363,6 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let volume_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("volume"),
-            size: wgpu::Extent3d {
-                width: volume_size,
-                height: volume_size,
-                depth_or_array_layers: volume_size,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R16Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let volume_view = volume_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         let uniforms = Uniforms {
             camera_pos: [0.0; 4],
             camera_dir: [0.0; 4],
@@ -451,95 +398,6 @@ impl Renderer {
             },
             count: None,
         };
-
-        // === Flat 3D texture pipeline ===
-
-        let flat_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("flat_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Uint,
-                            view_dimension: wgpu::TextureViewDimension::D3,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    palette_bgl_entry,
-                ],
-            });
-
-        let flat_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("flat_bg"),
-            layout: &flat_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&volume_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: palette_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let flat_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("flat raycast shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("raycast.wgsl").into()),
-        });
-
-        let flat_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("flat_pl"),
-            bind_group_layouts: &[Some(&flat_bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let flat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("flat_rp"),
-            layout: Some(&flat_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &flat_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &flat_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
 
         // === SVDAG pipeline ===
 
@@ -695,11 +553,6 @@ impl Renderer {
             device,
             queue,
             config,
-            flat_pipeline,
-            flat_bind_group_layout,
-            flat_bind_group,
-            volume_texture,
-            volume_view,
             svdag_pipeline,
             svdag_bind_group_layout,
             svdag_bind_group: None,
@@ -715,11 +568,6 @@ impl Renderer {
             palette_buffer,
             uniform_buffer,
             volume_size,
-            volume_texture_size: volume_size,
-            // R16Uint: 2 bytes per texel. Update alongside the `format:` line
-            // above if the texture format ever widens again.
-            volume_bytes_per_texel: 2,
-            mode: RenderMode::Svdag,
             camera_yaw: std::f32::consts::FRAC_PI_4,
             camera_pitch: 0.4,
             camera_dist: 2.0,
@@ -840,26 +688,6 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             });
 
-        // Rebuild flat bind group (it references the palette buffer).
-        self.flat_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("flat_bg"),
-            layout: &self.flat_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.volume_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.palette_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
         // Rebuild particle bind group if it exists (it references palette).
         if let Some(particle_buf) = &self.particle_buffer {
             self.particle_bind_group =
@@ -962,69 +790,6 @@ impl Renderer {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
         }
-    }
-
-    /// Upload a full `volume_size³` cell grid to the R16Uint 3D texture.
-    /// `data` is one `u16` per voxel in x-major, y-stride, z-slice order.
-    /// Row strides are padded up to `COPY_BYTES_PER_ROW_ALIGNMENT` via
-    /// `padded_bytes_per_row` — see that helper for the full story.
-    ///
-    /// WARNING (hash-thing-m1f.4): the 3D texture is allocated at
-    /// `Renderer::new()` time with the initial `volume_size`. After world
-    /// growth, `volume_size` tracks the SVDAG root but the texture stays
-    /// the old size. Skip the upload if the grid outgrew the texture.
-    pub fn upload_volume(&self, data: &[u16]) {
-        // After world growth, the grid is larger than the fixed 3D texture.
-        // The SVDAG path is the primary renderer; skip the legacy upload.
-        if self.volume_size > self.volume_texture_size {
-            return;
-        }
-        let w = self.volume_size;
-        let bpt = self.volume_bytes_per_texel;
-        let unpadded = w * bpt;
-        let padded = padded_bytes_per_row(w, bpt);
-        let data_bytes: &[u8] = bytemuck::cast_slice(data);
-
-        // Fast path: row length already aligned, pass the caller's slice
-        // straight through. Slow path: copy row-by-row into a padded staging
-        // buffer. Per-upload allocation is fine — uploads are infrequent
-        // (once per generation tick) and ~128KiB for 64³ R16Uint.
-        let staging: Vec<u8>;
-        let (rows_data, row_stride) = if padded == unpadded {
-            (data_bytes, unpadded)
-        } else {
-            let total_rows = (w * w) as usize; // height × depth
-            let mut buf = vec![0u8; total_rows * padded as usize];
-            let unpadded_usize = unpadded as usize;
-            let padded_usize = padded as usize;
-            for row in 0..total_rows {
-                let src = &data_bytes[row * unpadded_usize..][..unpadded_usize];
-                let dst = &mut buf[row * padded_usize..][..unpadded_usize];
-                dst.copy_from_slice(src);
-            }
-            staging = buf;
-            (staging.as_slice(), padded)
-        };
-
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.volume_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rows_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row_stride),
-                rows_per_image: Some(w),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: w,
-                depth_or_array_layers: w,
-            },
-        );
     }
 
     pub fn render(&mut self) -> FrameOutcome {
@@ -1149,25 +914,12 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            match self.mode {
-                RenderMode::Flat3D => {
-                    render_pass.set_pipeline(&self.flat_pipeline);
-                    render_pass.set_bind_group(0, &self.flat_bind_group, &[]);
-                    render_pass.draw(0..6, 0..1);
-                }
-                RenderMode::Svdag => {
-                    if let Some(bg) = &self.svdag_bind_group {
-                        render_pass.set_pipeline(&self.svdag_pipeline);
-                        render_pass.set_bind_group(0, bg, &[]);
-                        render_pass.draw(0..6, 0..1);
-                    } else {
-                        // No SVDAG uploaded yet — fall back to flat path.
-                        render_pass.set_pipeline(&self.flat_pipeline);
-                        render_pass.set_bind_group(0, &self.flat_bind_group, &[]);
-                        render_pass.draw(0..6, 0..1);
-                    }
-                }
+            if let Some(bg) = &self.svdag_bind_group {
+                render_pass.set_pipeline(&self.svdag_pipeline);
+                render_pass.set_bind_group(0, bg, &[]);
+                render_pass.draw(0..6, 0..1);
             }
+            // If SVDAG hasn't been uploaded yet, the clear color is shown.
 
             // Particle overlay — drawn after voxels with alpha blending.
             if self.particle_count > 0 {
@@ -1201,10 +953,8 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{padded_bytes_per_row, ticks_to_duration, FrameOutcome};
+    use super::{ticks_to_duration, FrameOutcome};
     use std::time::Duration;
-
-    const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
     #[test]
     fn ticks_to_duration_period_one_is_identity() {
@@ -1258,33 +1008,5 @@ mod tests {
                 assert_eq!(a == b, i == j, "{a:?} vs {b:?}");
             }
         }
-    }
-
-    #[test]
-    fn padded_row_rounds_up_to_alignment() {
-        // 64 R8Uint texels = 64 bytes; rounds up to the 256-byte alignment.
-        assert_eq!(padded_bytes_per_row(64, 1), ALIGN);
-    }
-
-    #[test]
-    fn padded_row_respects_bytes_per_texel() {
-        // 64 R16Uint texels = 128 bytes; still under ALIGN, still rounds up.
-        assert_eq!(padded_bytes_per_row(64, 2), ALIGN);
-    }
-
-    #[test]
-    fn padded_row_passes_through_already_aligned() {
-        // 256 R8Uint texels = 256 bytes exactly: one alignment unit, no padding.
-        assert_eq!(padded_bytes_per_row(ALIGN, 1), ALIGN);
-        // 128 R16Uint texels = 256 bytes: same story.
-        assert_eq!(padded_bytes_per_row(ALIGN / 2, 2), ALIGN);
-    }
-
-    #[test]
-    fn padded_row_rounds_up_beyond_single_unit() {
-        // 300 R8Uint texels = 300 bytes; rounds up to 512 (next alignment unit).
-        assert_eq!(padded_bytes_per_row(300, 1), 2 * ALIGN);
-        // 300 R16Uint texels = 600 bytes; rounds up to 768 (3 alignment units).
-        assert_eq!(padded_bytes_per_row(300, 2), 3 * ALIGN);
     }
 }

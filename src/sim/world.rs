@@ -778,7 +778,7 @@ mod tests {
 
     use super::*;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
-    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, STONE, WATER};
+    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, WATER};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -2063,21 +2063,76 @@ mod tests {
         world.step_ca(); // should panic
     }
 
+    #[test]
+    fn sand_falls_under_gravity() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(2), SAND);
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), 0);
+
+        world.step();
+
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), SAND, "sand should fall");
+        assert_eq!(world.get(wc(2), wc(3), wc(2)), 0, "top should be air");
+    }
+
+    #[test]
+    fn sand_conserves_population() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(2), SAND);
+        world.set(wc(4), wc(5), wc(4), SAND);
+        world.set(wc(0), wc(1), wc(0), SAND);
+        let pop_before = world.population();
+
+        for _ in 0..4 {
+            world.step();
+        }
+
+        assert_eq!(
+            world.population(),
+            pop_before,
+            "sand gravity must conserve population"
+        );
+    }
+
+    #[test]
+    fn lava_solidifies_on_water_contact() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), LAVA);
+        world.set(wc(4), wc(3), wc(3), WATER);
+
+        world.step();
+
+        assert_eq!(
+            world.get(wc(3), wc(3), wc(3)),
+            STONE,
+            "lava adjacent to water should solidify into stone"
+        );
+    }
+
+    #[test]
+    fn lava_persists_without_water() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), LAVA);
+
+        world.step();
+
+        let pop = world.population();
+        assert!(pop > 0, "lava should not disappear without water");
+    }
+
     // -----------------------------------------------------------------
     // Negative-direction world growth (hash-thing-37r).
     // -----------------------------------------------------------------
 
     #[test]
     fn ensure_contains_negative_shifts_origin() {
-        let mut world = World::new(3); // side=8, origin=[0,0,0]
+        let mut world = World::new(3);
         world.set(wc(4), wc(4), wc(4), STONE);
         world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
-        // Origin must have shifted negative on x.
         assert!(
             world.origin[0] < 0,
             "origin[0] should be negative after negative growth"
         );
-        // The old cell at world coord (4,4,4) must still be readable.
         assert_eq!(world.get(wc(4), wc(4), wc(4)), STONE);
     }
 
@@ -2109,35 +2164,31 @@ mod tests {
             [WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)],
             [WorldCoord(7), WorldCoord(7), WorldCoord(7)],
         );
-        // Both the negative and positive corners should be in-bounds.
         assert!(world.is_realized(WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)));
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 
     #[test]
     fn negative_growth_origin_tracks_correctly() {
-        let mut world = World::new(3); // side=8, origin=[0,0,0]
+        let mut world = World::new(3);
         world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
         let o = world.origin;
         let side = world.side() as i64;
-        // The entire old region [0..8) must still be valid.
         assert!(o[0] <= 0);
         assert!(o[0] + side >= 8);
     }
 
     #[test]
     fn get_returns_zero_below_origin() {
-        let world = World::new(3); // origin=[0,0,0], side=8
-                                   // Don't grow — coord -1 is below origin.
+        let world = World::new(3);
         assert_eq!(world.get(WorldCoord(-1), wc(0), wc(0)), 0);
     }
 
     #[test]
     fn mixed_direction_growth_preserves_cells() {
-        let mut world = World::new(3); // side=8
+        let mut world = World::new(3);
         world.set(wc(2), wc(3), wc(4), STONE);
         world.set(wc(6), wc(1), wc(7), WATER);
-        // Grow negative on x, positive on z.
         world.ensure_region([WorldCoord(-5), wc(0), wc(0)], [wc(0), wc(0), wc(20)]);
         assert_eq!(world.get(wc(2), wc(3), wc(4)), STONE);
         assert_eq!(world.get(wc(6), wc(1), wc(7)), WATER);

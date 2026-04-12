@@ -16,9 +16,9 @@
 /// simulation kernel and renderer unpack as needed.
 ///
 /// **Rust↔WGSL drift guard:** `METADATA_BITS = 6` is duplicated in
-/// `src/render/raycast.wgsl` and `src/render/svdag_raycast.wgsl` as the
-/// hardcoded `packed >> 6u` material decode. If `METADATA_BITS` changes
-/// here, both shaders must be updated to match. A unit test in
+/// `src/render/svdag_raycast.wgsl` as the hardcoded `packed >> 6u`
+/// material decode. If `METADATA_BITS` changes here, the shader must
+/// be updated to match. A unit test in
 /// `src/render/mod.rs` (or equivalent) should pin these together.
 pub type CellState = u16;
 

@@ -108,6 +108,33 @@ impl CaRule for WaterRule {
     }
 }
 
+/// Lava converts adjacent water to stone and adjacent grass to fire.
+///
+/// If any neighbor is water, this cell becomes stone (lava solidifies).
+/// Otherwise the lava persists, and any adjacent grass/flammable material
+/// is expected to catch fire via the terrain's FireRule on the next tick.
+/// The CaRule only transforms the center cell — neighbor ignition is a
+/// side-effect of the fire rule's fuel check seeing lava-heated grass.
+#[derive(Debug)]
+pub struct LavaRule {
+    pub water_material: u16,
+    pub solidify_product: Cell,
+}
+
+impl CaRule for LavaRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "LavaRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|neighbor| neighbor.material() == self.water_material)
+        {
+            self.solidify_product
+        } else {
+            center
+        }
+    }
+}
+
 /// 3D Game of Life (outer totalistic).
 ///
 /// Parameterized by survival and birth ranges over the 26-neighbor Moore
@@ -393,6 +420,49 @@ mod tests {
             rule.step_cell(Cell::pack(5, 2), &neighbors),
             Cell::pack(8, 13)
         );
+    }
+
+    #[test]
+    fn lava_rule_solidifies_on_water_contact() {
+        let rule = LavaRule {
+            water_material: 5,
+            solidify_product: mat(1),
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[3] = mat(5); // water neighbor
+        assert_eq!(
+            rule.step_cell(mat(7), &neighbors),
+            mat(1),
+            "lava adjacent to water should solidify into stone"
+        );
+    }
+
+    #[test]
+    fn lava_rule_persists_without_water() {
+        let rule = LavaRule {
+            water_material: 5,
+            solidify_product: mat(1),
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(3); // grass, not water
+        let lava = Cell::pack(7, 4);
+        assert_eq!(
+            rule.step_cell(lava, &neighbors),
+            lava,
+            "lava without water neighbors should persist unchanged"
+        );
+    }
+
+    #[test]
+    fn lava_rule_solidifies_to_configured_product() {
+        let product = Cell::pack(2, 5);
+        let rule = LavaRule {
+            water_material: 5,
+            solidify_product: product,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(5);
+        assert_eq!(rule.step_cell(mat(7), &neighbors), product);
     }
 
     #[test]
