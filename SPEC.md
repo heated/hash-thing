@@ -314,7 +314,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - `h34.4` Retired GoL3D scaffolding: legacy presets removed, `set_gol_smoke_rule` replaces old rule API
 - ✅ **NodeStore hash-cons unit tests (`1lq`, `6gf.5`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths, uniform collapse, metadata, overwrite, accessor coverage
 - ✅ **Octree extraction primitives (`6gf.6`)**: `extract_neighborhood` (26 Moore neighbors, toroidal wrap), `extract_block_2x2x2` (Margolus partition extraction), `flatten_region` (arbitrary AABB sub-box). Foundation for recursive Hashlife step.
-- ✅ **Lazy root expansion (`e9h`, `5qp`)**: `World::ensure_contains(x,y,z)` grows root octree by wrapping in bigger parent nodes. `ensure_region([min],[max])` is the batch form. OOB bounds checking on set_cell/get_cell (`819`) also landed.
+- ✅ **Lazy root expansion (`e9h`, `5qp`, `37r`)**: `World::ensure_contains(x,y,z)` grows root octree by wrapping in bigger parent nodes. `ensure_region([min],[max])` is the batch form. OOB bounds checking on set_cell/get_cell (`819`) also landed. Bidirectional growth (`37r`): `World.origin` tracks world-space offset; negative-direction growth places old root at appropriate octant and shifts origin.
 - ✅ **Out-of-bounds coordinate safety (`819`, `fb5`)**: `set_cell` panics on OOB with `#[track_caller]`; `get_cell` silently returns 0 for OOB (no storage growth). 7 boundary tests. `probe()` stepper-oriented read with OOB-empty promise (`90w`). `is_realized()` for boundary detection.
 - ✅ **Terrain generation (epic `3fq`, complete 10/10)**
   - Heightmap-based recursive octree gen with proof-based collapse (sky/deep-stone short-circuit)
@@ -335,7 +335,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
 - ✅ **SVDAG continuation**: `5bb.4` per-leaf material attributes, `5bb.5` incremental edit uploads, `bx7` stale-slot compaction, `ll6` GPU palette buffer. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
-- ☐ **Core engine validation** (epic `m1f`, 7/8): ✅ `m1f.1` hashlife benchmarks, ✅ `m1f.2` SVDAG benchmark, ✅ `m1f.3` edit propagation measurement, ✅ `m1f.4` infinite world growth, ✅ `m1f.5` incremental SVDAG validation, ✅ `m1f.6` new CA rules, ✅ `m1f.8` SVDAG depth 14→20 (1M^3 leaf grid). Remaining: `m1f.7` end-to-end demo polish.
+- ✅ **Core engine validation** (epic `m1f`, complete): all 8 beads landed including `m1f.4` infinite world growth, `m1f.8` SVDAG depth 14→20, `m1f.7` end-to-end demo (material selection, auto-running sim, scroll-wheel material cycling).
 
 ### Later (P2+, from bd)
 
