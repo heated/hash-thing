@@ -4,8 +4,10 @@
 //! layers. The registry mirrors that encoding: material ID 0 is the empty
 //! cell, and every other material ID maps to a validated `CellState`.
 
+use std::fmt;
+
 use crate::octree::{Cell, CellState};
-use crate::sim::rule::{CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
+use crate::sim::rule::{BlockRule, CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
 
 pub type MaterialId = u16;
 
@@ -27,6 +29,9 @@ pub const WATER: CellState = Cell::pack(WATER_MATERIAL_ID, 0).raw();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleId(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockRuleId(pub usize);
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,11 +55,13 @@ pub struct MaterialEntry {
     pub visual: MaterialVisualProperties,
     pub physical: MaterialPhysicalProperties,
     pub rule_id: RuleId,
+    pub block_rule_id: Option<BlockRuleId>,
 }
 
 pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
     rules: Vec<Box<dyn CaRule>>,
+    block_rules: Vec<Box<dyn BlockRule>>,
 }
 
 impl MaterialRegistry {
@@ -62,6 +69,7 @@ impl MaterialRegistry {
         Self {
             entries: Vec::with_capacity(INITIAL_MATERIAL_SLOTS),
             rules: Vec::new(),
+            block_rules: Vec::new(),
         }
     }
 
@@ -91,6 +99,7 @@ impl MaterialRegistry {
                     conductivity: 0.0,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -107,6 +116,7 @@ impl MaterialRegistry {
                     conductivity: 0.2,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -123,6 +133,7 @@ impl MaterialRegistry {
                     conductivity: 0.08,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -139,6 +150,7 @@ impl MaterialRegistry {
                     conductivity: 0.04,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -155,6 +167,7 @@ impl MaterialRegistry {
                     conductivity: 0.0,
                 },
                 rule_id: fire_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -171,6 +184,7 @@ impl MaterialRegistry {
                     conductivity: 0.6,
                 },
                 rule_id: water_rule,
+                block_rule_id: None,
             },
         );
 
@@ -196,6 +210,17 @@ impl MaterialRegistry {
         Some(self.rules[entry.rule_id.0].as_ref())
     }
 
+    #[allow(dead_code)]
+    pub fn block_rule_for_cell(&self, cell: Cell) -> Option<&dyn BlockRule> {
+        let entry = self.entry(cell.material())?;
+        let block_rule_id = entry.block_rule_id?;
+        Some(self.block_rules[block_rule_id.0].as_ref())
+    }
+
+    pub fn block_rule_id_for_cell(&self, cell: Cell) -> Option<BlockRuleId> {
+        self.entry(cell.material())?.block_rule_id
+    }
+
     pub fn color_palette_rgba(&self) -> Vec<[f32; 4]> {
         let mut palette =
             vec![[0.0, 0.0, 0.0, 0.0]; self.entries.len().max(INITIAL_MATERIAL_SLOTS)];
@@ -216,6 +241,31 @@ impl MaterialRegistry {
         rule_id
     }
 
+    #[allow(dead_code)]
+    pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
+    where
+        R: BlockRule + 'static,
+    {
+        let id = BlockRuleId(self.block_rules.len());
+        self.block_rules.push(Box::new(rule));
+        id
+    }
+
+    #[allow(dead_code)]
+    pub fn assign_block_rule(&mut self, material_id: MaterialId, block_rule_id: BlockRuleId) {
+        self.entries[material_id as usize]
+            .as_mut()
+            .unwrap_or_else(|| {
+                panic!("material {material_id} must exist before assigning a block rule")
+            })
+            .block_rule_id = Some(block_rule_id);
+    }
+
+    /// Look up a block rule by ID. Used by `World::step_blocks()`.
+    pub fn block_rule(&self, id: BlockRuleId) -> &dyn BlockRule {
+        self.block_rules[id.0].as_ref()
+    }
+
     fn insert(&mut self, material_id: MaterialId, entry: MaterialEntry) {
         let material_id = material_id as usize;
         if self.entries.len() <= material_id {
@@ -230,11 +280,99 @@ impl MaterialRegistry {
             .expect("material must exist before assigning a rule")
             .rule_id = rule_id;
     }
+
+    /// Validate the registry for internal consistency. Returns a list of
+    /// human-readable diagnostic strings; empty means valid.
+    ///
+    /// Checks:
+    /// - Material ID 0 (AIR) must be present.
+    /// - No gaps in the material ID space (None slots between populated entries).
+    /// - Every entry's `rule_id` refers to a registered rule.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // AIR (material 0) must exist.
+        if self.entry(AIR_MATERIAL_ID).is_none() {
+            errors.push("material 0 (AIR) is not registered".into());
+        }
+
+        // Check for gaps and invalid rule references.
+        let mut last_populated: Option<usize> = None;
+        for (id, slot) in self.entries.iter().enumerate() {
+            match slot {
+                Some(entry) => {
+                    if entry.rule_id.0 >= self.rules.len() {
+                        errors.push(format!(
+                            "material {id} ({}) references rule_id {} but only {} rules registered",
+                            entry.visual.label,
+                            entry.rule_id.0,
+                            self.rules.len()
+                        ));
+                    }
+                    last_populated = Some(id);
+                }
+                None => {
+                    if let Some(prev) = last_populated {
+                        // Only flag as a gap if there's a populated entry
+                        // after this None slot. Check lazily: if we see a
+                        // populated entry later, this gap matters.
+                        // We'll do a second pass for gaps to keep it simple.
+                        let _ = prev;
+                    }
+                }
+            }
+        }
+
+        // Gap detection: find None slots that have populated entries on both sides.
+        let mut in_gap = false;
+        let mut gap_start = 0usize;
+        for (id, slot) in self.entries.iter().enumerate() {
+            if slot.is_none() && last_populated.is_some_and(|last| id < last) {
+                if !in_gap {
+                    gap_start = id;
+                    in_gap = true;
+                }
+            } else if slot.is_some() && in_gap {
+                errors.push(format!(
+                    "gap in material ID space: slots {gap_start}..{id} are empty"
+                ));
+                in_gap = false;
+            }
+        }
+
+        errors
+    }
 }
 
 impl Default for MaterialRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Display for MaterialRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "MaterialRegistry ({} slots, {} rules):",
+            self.entries.len(),
+            self.rules.len()
+        )?;
+        for (id, slot) in self.entries.iter().enumerate() {
+            match slot {
+                Some(entry) => {
+                    writeln!(
+                        f,
+                        "  [{id:>3}] {} (rule {})",
+                        entry.visual.label, entry.rule_id.0
+                    )?;
+                }
+                None => {
+                    writeln!(f, "  [{id:>3}] <empty>")?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -273,6 +411,7 @@ mod tests {
                 conductivity: 0.8,
             },
             rule_id,
+            block_rule_id: None,
         }
     }
 
@@ -430,5 +569,69 @@ mod tests {
                 .step_cell(Cell::pack(GRASS_MATERIAL_ID, 7), &fire_neighbors),
             Cell::pack(GRASS_MATERIAL_ID, 7),
         );
+    }
+
+    #[test]
+    fn terrain_defaults_validates_clean() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let errors = registry.validate();
+        assert!(
+            errors.is_empty(),
+            "terrain_defaults must validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_catches_missing_air() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        // Insert material 1 without material 0 (AIR).
+        registry.insert(1, entry_with(rule_id, [1.0, 0.0, 0.0, 1.0]));
+        let errors = registry.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("AIR")),
+            "should flag missing AIR: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_catches_gap() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        registry.insert(0, entry_with(rule_id, [0.0; 4]));
+        // Skip material 1, insert material 2.
+        registry.insert(2, entry_with(rule_id, [1.0, 0.0, 0.0, 1.0]));
+        let errors = registry.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("gap")),
+            "should flag gap at slot 1: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_catches_invalid_rule_id() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        registry.insert(
+            0,
+            MaterialEntry {
+                rule_id: RuleId(99), // bogus
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        let errors = registry.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("rule_id")),
+            "should flag invalid rule_id: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn display_lists_materials() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let s = format!("{registry}");
+        assert!(s.contains("stone"), "Display must list stone");
+        assert!(s.contains("fire"), "Display must list fire");
+        assert!(s.contains("MaterialRegistry"), "Display must have header");
     }
 }

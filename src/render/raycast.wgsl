@@ -8,6 +8,7 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var volume: texture_3d<u32>;
+@group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -60,17 +61,13 @@ fn decode_material(packed: u32) -> u32 {
 
 fn material_color(packed: u32) -> vec3<f32> {
     let mat_id = decode_material(packed);
-    // Synced with MaterialRegistry::terrain_defaults() in src/terrain/materials.rs.
-    // DRIFT GUARD: test `wgsl_material_palette_matches_registry` in
-    // src/render/mod.rs pins these values to the Rust registry.
-    switch mat_id {
-        case 1u: { return vec3<f32>(0.45, 0.45, 0.48); }  // stone
-        case 2u: { return vec3<f32>(0.45, 0.29, 0.15); }  // dirt
-        case 3u: { return vec3<f32>(0.22, 0.57, 0.19); }  // grass
-        case 4u: { return vec3<f32>(0.98, 0.43, 0.05); }  // fire
-        case 5u: { return vec3<f32>(0.12, 0.35, 0.84); }  // water
-        default: { return vec3<f32>(0.6, 0.7, 0.8); }     // unknown / air fallback
+    // Look up from GPU palette buffer uploaded by Renderer::upload_palette
+    // from MaterialRegistry::color_palette_rgba(). No more hardcoded switch —
+    // palette is always in sync with the Rust registry (hash-thing-5bb.7).
+    if mat_id < arrayLength(&palette) {
+        return palette[mat_id].xyz;
     }
+    return vec3<f32>(0.6, 0.7, 0.8); // fallback for out-of-range mat_id
 }
 
 @fragment

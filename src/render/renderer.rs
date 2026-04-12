@@ -258,8 +258,10 @@ pub struct Renderer {
 
     // Flat 3D texture path
     flat_pipeline: wgpu::RenderPipeline,
+    flat_bind_group_layout: wgpu::BindGroupLayout,
     flat_bind_group: wgpu::BindGroup,
     volume_texture: wgpu::Texture,
+    volume_view: wgpu::TextureView,
 
     // SVDAG path
     svdag_pipeline: wgpu::RenderPipeline,
@@ -271,6 +273,9 @@ pub struct Renderer {
     /// Only the tail past this watermark (plus the root-offset header at slot 0)
     /// needs re-uploading each frame. Reset to 0 on buffer reallocation.
     svdag_uploaded_len: usize,
+
+    // Material palette (shared by both pipelines)
+    palette_buffer: wgpu::Buffer,
 
     // Shared
     uniform_buffer: wgpu::Buffer,
@@ -403,6 +408,28 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // === Material palette buffer (shared by both pipelines) ===
+        // Initialized with a minimal fallback palette; the real palette is
+        // uploaded by main.rs via upload_palette() after creation.
+        let initial_palette: [[f32; 4]; 1] = [[0.6, 0.7, 0.8, 1.0]];
+        let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette"),
+            contents: bytemuck::cast_slice(&initial_palette),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Palette binding entry shared by both pipeline layouts (binding 2).
+        let palette_bgl_entry = wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
         // === Flat 3D texture pipeline ===
 
         let flat_bind_group_layout =
@@ -429,6 +456,7 @@ impl Renderer {
                         },
                         count: None,
                     },
+                    palette_bgl_entry,
                 ],
             });
 
@@ -443,6 +471,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&volume_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: palette_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -513,6 +545,7 @@ impl Renderer {
                         },
                         count: None,
                     },
+                    palette_bgl_entry,
                 ],
             });
 
@@ -570,14 +603,17 @@ impl Renderer {
             queue,
             config,
             flat_pipeline,
+            flat_bind_group_layout,
             flat_bind_group,
             volume_texture,
+            volume_view,
             svdag_pipeline,
             svdag_bind_group_layout,
             svdag_bind_group: None,
             svdag_buffer: None,
             svdag_buffer_cap: 0,
             svdag_uploaded_len: 0,
+            palette_buffer,
             uniform_buffer,
             volume_size,
             // R16Uint: 2 bytes per texel. Update alongside the `format:` line
@@ -658,6 +694,10 @@ impl Renderer {
                         binding: 1,
                         resource: buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.palette_buffer.as_entire_binding(),
+                    },
                 ],
             });
             self.svdag_buffer = Some(buffer);
@@ -688,6 +728,63 @@ impl Renderer {
             let tail_bytes: &[u8] = bytemuck::cast_slice(&dag.nodes[self.svdag_uploaded_len..]);
             self.queue.write_buffer(buf, tail_byte_offset, tail_bytes);
             self.svdag_uploaded_len = dag.nodes.len();
+        }
+    }
+
+    /// Upload the material color palette to the GPU. Called once after init
+    /// and whenever the palette changes (e.g. terrain reset with different
+    /// materials). Recreates the palette buffer and both bind groups since
+    /// wgpu bind groups are immutable (hash-thing-5bb.7 / hash-thing-ll6).
+    pub fn upload_palette(&mut self, palette: &[[f32; 4]]) {
+        self.palette_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("palette"),
+                contents: bytemuck::cast_slice(palette),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+
+        // Rebuild flat bind group (it references the palette buffer).
+        self.flat_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flat_bg"),
+            layout: &self.flat_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.volume_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.palette_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Rebuild SVDAG bind group if it exists (it also references palette).
+        if let Some(svdag_buf) = &self.svdag_buffer {
+            self.svdag_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("svdag_bg"),
+                    layout: &self.svdag_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: svdag_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.palette_buffer.as_entire_binding(),
+                        },
+                    ],
+                }));
         }
     }
 
