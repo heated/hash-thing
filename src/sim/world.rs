@@ -1,5 +1,5 @@
 use super::rule::CaRule;
-use crate::octree::{CellState, NodeId, NodeStore};
+use crate::octree::{Cell, CellState, NodeId, NodeStore};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -70,7 +70,7 @@ impl World {
     pub fn step_flat(&mut self, rule: &dyn CaRule) {
         let side = self.side();
         let grid = self.flatten();
-        let mut next = vec![0u8; side * side * side];
+        let mut next = vec![0 as CellState; side * side * side];
 
         for z in 0..side {
             for y in 0..side {
@@ -116,7 +116,7 @@ impl World {
                     if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
                         && rng.next_f64() < density
                     {
-                        self.set(x, y, z, 1);
+                        self.set(x, y, z, Cell::pack(1, 0).raw());
                     }
                 }
             }
@@ -130,7 +130,7 @@ impl World {
 
 /// Get the 26 Moore neighbors of a cell, wrapping at boundaries.
 fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [CellState; 26] {
-    let mut neighbors = [0u8; 26];
+    let mut neighbors = [0 as CellState; 26];
     let mut idx = 0;
     for dz in [-1i32, 0, 1] {
         for dy in [-1i32, 0, 1] {
@@ -198,7 +198,7 @@ mod tests {
     //! whether or not wraparound is enabled.
 
     use super::*;
-    use crate::sim::rule::GameOfLife3D;
+    use crate::sim::rule::{GameOfLife3D, ALIVE};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn single_cell_dies_under_amoeba() {
         let mut world = empty_world();
-        world.set(4, 4, 4, 1);
+        world.set(4, 4, 4, ALIVE);
         assert_eq!(world.population(), 1);
 
         let rule = GameOfLife3D::amoeba();
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn single_cell_grows_to_3x3x3_cube_under_crystal() {
         let mut world = empty_world();
-        world.set(4, 4, 4, 1);
+        world.set(4, 4, 4, ALIVE);
 
         let rule = GameOfLife3D::crystal();
         world.step_flat(&rule);
@@ -281,7 +281,7 @@ mod tests {
                 for x in 3..=5u64 {
                     assert_eq!(
                         world.get(x, y, z),
-                        1,
+                        ALIVE,
                         "cell ({},{},{}) must be alive inside the expected 3x3x3 cube",
                         x,
                         y,
@@ -326,7 +326,7 @@ mod tests {
         for z in 3..=4u64 {
             for y in 3..=4u64 {
                 for x in 3..=4u64 {
-                    world.set(x, y, z, 1);
+                    world.set(x, y, z, ALIVE);
                 }
             }
         }
@@ -349,7 +349,7 @@ mod tests {
                         let expected =
                             if (3..=4).contains(&x) && (3..=4).contains(&y) && (3..=4).contains(&z)
                             {
-                                1
+                                ALIVE
                             } else {
                                 0
                             };
@@ -387,8 +387,8 @@ mod tests {
         // coupling to wraparound semantics.
         let seeds: &[(u64, u64, u64)] = &[(4, 4, 4), (3, 4, 5), (5, 2, 4)];
         for &(x, y, z) in seeds {
-            world_a.set(x, y, z, 1);
-            world_b.set(x, y, z, 1);
+            world_a.set(x, y, z, ALIVE);
+            world_b.set(x, y, z, ALIVE);
         }
 
         for _ in 0..3 {
@@ -427,7 +427,7 @@ mod tests {
     fn corner_single_cell_dies_under_amoeba() {
         let mut world = empty_world();
         let side = world.side() as u64;
-        world.set(side - 1, side - 1, side - 1, 1);
+        world.set(side - 1, side - 1, side - 1, ALIVE);
         assert_eq!(world.population(), 1);
 
         let rule = GameOfLife3D::amoeba();
@@ -483,17 +483,18 @@ mod tests {
     #[should_panic(expected = "out of bounds")]
     fn world_set_panics_oob() {
         let mut w = World::new(2); // side 4
-        w.set(4, 0, 0, 1);
+        w.set(4, 0, 0, ALIVE);
     }
 
     #[test]
     fn world_set_in_bounds_at_max_corner() {
         let mut w = World::new(2); // side 4
-        w.set(3, 3, 3, 1);
-        assert_eq!(w.get(3, 3, 3), 1);
-        // And the complementary corner.
-        w.set(0, 0, 0, 2);
-        assert_eq!(w.get(0, 0, 0), 2);
+        w.set(3, 3, 3, ALIVE);
+        assert_eq!(w.get(3, 3, 3), ALIVE);
+        // And the complementary corner — distinct material id 2, metadata 0.
+        let mat2 = Cell::pack(2, 0).raw();
+        w.set(0, 0, 0, mat2);
+        assert_eq!(w.get(0, 0, 0), mat2);
     }
 
     #[test]

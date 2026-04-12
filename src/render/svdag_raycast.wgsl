@@ -48,8 +48,18 @@ fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
     return out;
 }
 
-fn material_color(mat: u32) -> vec3<f32> {
-    switch mat {
+// Material color palette. Input is the packed 16-bit cell word:
+//   bits 15..6 material_id (10 bits)
+//   bits  5..0 metadata    ( 6 bits)
+// We index by material_id; metadata is ignored until 1v0.2 lands the registry.
+//
+// DRIFT GUARD: the shift amount `6u` below mirrors `Cell::METADATA_BITS`
+// in src/octree/node.rs. If that constant ever changes, update this
+// shader AND src/render/raycast.wgsl together. There is a pinning
+// test in src/render/mod.rs (test `wgsl_metadata_shift_matches_rust`).
+fn material_color(packed: u32) -> vec3<f32> {
+    let mat_id = packed >> 6u;
+    switch mat_id {
         case 1u: { return vec3<f32>(0.4, 0.8, 0.3); }
         case 2u: { return vec3<f32>(0.8, 0.3, 0.2); }
         case 3u: { return vec3<f32>(0.2, 0.4, 0.9); }

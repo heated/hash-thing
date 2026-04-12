@@ -168,8 +168,16 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                         winit::keyboard::Key::Character("s") => {
-                            // Single step
-                            self.world.step_flat(&self.rule);
+                            // Single step. Instrumented with the same
+                            // `perf.start("step")` Timer as the auto-step
+                            // path (hash-thing-5qh + hash-thing-yri) so
+                            // `perf summary` has a latency signal when
+                            // the sim is paused and the user drives
+                            // stepping manually.
+                            {
+                                let _t = self.perf.start("step");
+                                self.world.step_flat(&self.rule);
+                            }
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &self.world,
