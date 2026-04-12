@@ -238,12 +238,7 @@ impl World {
         self.center_level3_grid_to_node(&next)
     }
 
-    fn step_node_macro(
-        &mut self,
-        node: NodeId,
-        level: u32,
-        generation: u64,
-    ) -> NodeId {
+    fn step_node_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
         debug_assert!(
             level >= 3,
             "step_node_macro requires level >= 3, got {level}"
@@ -448,12 +443,7 @@ impl World {
         self.store.interior(level - 1, result_children)
     }
 
-    fn step_recursive_case_macro(
-        &mut self,
-        node: NodeId,
-        level: u32,
-        generation: u64,
-    ) -> NodeId {
+    fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
         debug_assert!(level > 3, "macro recursive case requires level > 3");
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
