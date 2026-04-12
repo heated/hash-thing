@@ -72,7 +72,8 @@
 //! | `birth_threshold`   | 13      | 3D majority of 26 neighbors          |
 //! | `survive_threshold` | 13      | Same, for already-wall cells         |
 
-use crate::octree::{CellState, NodeId, NodeStore};
+use crate::octree::node::octant_coords;
+use crate::octree::{CellState, Node, NodeId, NodeStore};
 use crate::rng::cell_rand_bool;
 use crate::terrain::materials::{AIR, STONE};
 
@@ -140,6 +141,10 @@ impl CaveParams {
 ///
 /// `side_log2` is the log2 of the grid side length for the region rooted at
 /// `root`; at 64³ that's 6.
+/// Maximum chunk level for chunked cave carving. Each chunk is
+/// (2^CHUNK_LEVEL)³ cells. Level 7 = 128³ = ~2MB per chunk.
+const CHUNK_LEVEL: u32 = 7;
+
 pub fn carve_caves(
     store: &mut NodeStore,
     root: NodeId,
@@ -147,10 +152,52 @@ pub fn carve_caves(
     params: &CaveParams,
 ) -> NodeId {
     params.validate().expect("invalid CaveParams");
-    let side = 1usize << side_log2;
-    let mut grid = store.flatten(root, side);
-    carve_caves_grid(&mut grid, side, [0, 0, 0], params);
-    store.from_flat(&grid, side)
+    carve_caves_recursive(store, root, side_log2, [0, 0, 0], params)
+}
+
+/// Recursively subdivide the world into chunks at `CHUNK_LEVEL` and carve
+/// each one independently. Peak memory is O(chunk³) instead of O(world³).
+/// Chunk boundaries treat out-of-bounds cells as wall (same as world edges),
+/// so cave patterns near chunk boundaries may have slightly thicker walls —
+/// visually indistinguishable for random cave geometry (3cp).
+fn carve_caves_recursive(
+    store: &mut NodeStore,
+    node: NodeId,
+    level: u32,
+    origin: [i64; 3],
+    params: &CaveParams,
+) -> NodeId {
+    // Empty subtrees have no STONE — nothing to carve.
+    if store.population(node) == 0 {
+        return node;
+    }
+
+    if level <= CHUNK_LEVEL {
+        // Small enough: flatten, carve, re-intern.
+        let side = 1usize << level;
+        let mut grid = store.flatten(node, side);
+        carve_caves_grid(&mut grid, side, origin, params);
+        return store.from_flat(&grid, side);
+    }
+
+    // Recurse into children.
+    let children = match store.get(node).clone() {
+        Node::Interior { children, .. } => children,
+        Node::Leaf(_) => unreachable!("level > CHUNK_LEVEL but node is a leaf"),
+    };
+    let half = 1i64 << (level - 1);
+    let mut new_children = [NodeId::EMPTY; 8];
+    for (oct, child) in children.iter().enumerate() {
+        let (cx, cy, cz) = octant_coords(oct);
+        let child_origin = [
+            origin[0] + cx as i64 * half,
+            origin[1] + cy as i64 * half,
+            origin[2] + cz as i64 * half,
+        ];
+        new_children[oct] =
+            carve_caves_recursive(store, *child, level - 1, child_origin, params);
+    }
+    store.interior(level, new_children)
 }
 
 /// In-place cave CA on a flat grid. World origin is used for the per-cell
