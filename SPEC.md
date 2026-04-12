@@ -331,17 +331,17 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Next up (P1, from bd)
 
-- ✅ **Recursive Hashlife stepping** (epic `6gf`, complete): all 13 beads landed including `6gf.8` main loop switchover, `6gf.10` defensive hardening, `6gf.11` deep recursion tests, `6gf.13` vestigial step_cache removal.
+- ✅ **Recursive Hashlife stepping** (epic `6gf`, complete): all 13 beads landed including `6gf.8` main loop switchover, `6gf.10` defensive hardening, `6gf.11` deep recursion tests, `6gf.13` vestigial step_cache removal. `018` brute-force stepper absorbing boundary fix (CaRule matches hashlife).
 - ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
 - ✅ **SVDAG continuation**: `5bb.4` per-leaf material attributes, `5bb.5` incremental edit uploads, `bx7` stale-slot compaction, `ll6` GPU palette buffer. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
-- ☐ **Core engine validation** (epic `m1f`): ✅ `m1f.2` SVDAG benchmark, ✅ `m1f.3` edit propagation measurement, ✅ `m1f.4` infinite world growth (player-triggered boundary expansion), ✅ `m1f.8` SVDAG depth 14→20 (1M^3 leaf grid). Remaining: `m1f.5` incremental SVDAG validation (in progress), `m1f.6` new CA rules, `m1f.7` end-to-end demo polish.
+- ☐ **Core engine validation** (epic `m1f`, 7/8): ✅ `m1f.1` hashlife benchmarks, ✅ `m1f.2` SVDAG benchmark, ✅ `m1f.3` edit propagation measurement, ✅ `m1f.4` infinite world growth, ✅ `m1f.5` incremental SVDAG validation, ✅ `m1f.6` new CA rules, ✅ `m1f.8` SVDAG depth 14→20 (1M^3 leaf grid). Remaining: `m1f.7` end-to-end demo polish.
 
 ### Later (P2+, from bd)
 
 - ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
 - ✅ Terrain generation & infinite worlds (`3fq`): complete (10/10). Heightmap gen + cave CA + dungeon carving + lazy terrain expansion + perf tracking.
-- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), ✅ Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, in progress), Steam (`xb7.6`, P4 deferred)
+- ☐ Cross-platform distribution (`xb7`, 4/7): ✅ CI matrix (`xb7.1`), ✅ macOS notarization (`xb7.2`), ✅ Linux AppImage (`xb7.3`), ✅ Windows exe (`xb7.4`), ✅ WASM/WebGPU (`xb7.5`). Remaining: `brt` AppImage branding (P4), `xb7.6` Steam (P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 
 ---
