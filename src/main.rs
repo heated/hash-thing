@@ -134,7 +134,7 @@ impl App {
         let mut world = sim::World::new(volume_size.trailing_zeros());
         let terrain_params = terrain::TerrainParams {
             caves: Some(terrain::CaveParams::default()),
-            ..Default::default()
+            ..terrain::TerrainParams::for_level(volume_size.trailing_zeros())
         };
         let stats = world.seed_terrain(&terrain_params);
         let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
@@ -538,7 +538,9 @@ impl ApplicationHandler for App {
                                 "Caves terrain",
                                 terrain::TerrainParams {
                                     caves: Some(terrain::CaveParams::default()),
-                                    ..Default::default()
+                                    ..terrain::TerrainParams::for_level(
+                                        self.volume_size.trailing_zeros(),
+                                    )
                                 },
                             );
                         }
@@ -551,7 +553,9 @@ impl ApplicationHandler for App {
                             // toggle, but is no longer the default scene.
                             self.load_terrain_scene(
                                 "Reset terrain",
-                                terrain::TerrainParams::default(),
+                                terrain::TerrainParams::for_level(
+                                    self.volume_size.trailing_zeros(),
+                                ),
                             );
                         }
                         winit::keyboard::Key::Character("g") if !self.is_stepping() => {
@@ -772,10 +776,7 @@ impl ApplicationHandler for App {
                     self.step_start = std::time::Instant::now();
                     // Move world to background thread; replace with tiny
                     // placeholder so self.world remains valid (but inert).
-                    let mut world = std::mem::replace(
-                        &mut self.world,
-                        sim::World::placeholder(),
-                    );
+                    let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
                     self.step_handle = Some(std::thread::spawn(move || {
                         world.apply_mutations();
                         world.step_recursive();
@@ -795,8 +796,7 @@ impl ApplicationHandler for App {
                     } else {
                         let nodes = self.world.store.stats();
                         self.mem_stats.update(nodes);
-                        let (svdag_nodes, svdag_bytes, svdag_root_level) =
-                            self.last_svdag_stats;
+                        let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                         log::info!(
                             "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
                             self.world.generation,
@@ -872,8 +872,7 @@ impl ApplicationHandler for App {
                                 p.pos[1] += delta[1];
                                 p.pos[2] += delta[2];
                             } else {
-                                p.pos =
-                                    player::apply_movement(&self.world, &p.pos, &delta);
+                                p.pos = player::apply_movement(&self.world, &p.pos, &delta);
                             }
                         }
 
@@ -887,12 +886,14 @@ impl ApplicationHandler for App {
                                 let side = self.world.side() as f64;
                                 let pos = p.pos;
                                 let margin = GROWTH_MARGIN as i64;
-                                let near_pos_edge = pos.iter().enumerate().any(|(i, &c)| {
-                                    c > origin[i] as f64 + side - GROWTH_MARGIN
-                                });
-                                let near_neg_edge = pos.iter().enumerate().any(|(i, &c)| {
-                                    c < origin[i] as f64 + GROWTH_MARGIN
-                                });
+                                let near_pos_edge = pos
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(i, &c)| c > origin[i] as f64 + side - GROWTH_MARGIN);
+                                let near_neg_edge = pos
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(i, &c)| c < origin[i] as f64 + GROWTH_MARGIN);
                                 if near_pos_edge || near_neg_edge {
                                     let min = [
                                         sim::WorldCoord(pos[0] as i64 - margin),
@@ -901,9 +902,7 @@ impl ApplicationHandler for App {
                                     ];
                                     let max = [
                                         sim::WorldCoord(pos[0] as i64 + margin),
-                                        sim::WorldCoord(
-                                            (pos[1] + PLAYER_HEIGHT) as i64 + margin,
-                                        ),
+                                        sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
                                         sim::WorldCoord(pos[2] as i64 + margin),
                                     ];
                                     let old_level = self.world.level;
@@ -945,8 +944,7 @@ impl ApplicationHandler for App {
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
                                     if !stepping {
-                                        let palette =
-                                            self.world.materials.color_palette_rgba();
+                                        let palette = self.world.materials.color_palette_rgba();
                                         let mat = ps.held_material as usize;
                                         if mat < palette.len() {
                                             renderer.hud_material_color = palette[mat];

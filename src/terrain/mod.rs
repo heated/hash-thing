@@ -67,6 +67,24 @@ impl TerrainParams {
         Ok(())
     }
 
+    /// Scale-aware defaults: terrain params proportional to the world size.
+    /// At level 6 (64³) this matches `Default`; at larger levels, surface
+    /// height, amplitude, wavelength, and sea level scale so the terrain
+    /// fills the world naturally.
+    pub fn for_level(level: u32) -> Self {
+        let side = (1u64 << level) as f32;
+        let scale = side / 64.0;
+        Self {
+            seed: 1,
+            base_y: 32.0 * scale,
+            amplitude: 8.0 * scale,
+            wavelength: 24.0 * scale,
+            octaves: 4,
+            sea_level: Some(28.0 * scale),
+            caves: None,
+        }
+    }
+
     pub fn to_heightmap(self) -> HeightmapField {
         HeightmapField {
             seed: self.seed,
@@ -75,6 +93,39 @@ impl TerrainParams {
             wavelength: self.wavelength,
             octaves: self.octaves,
             sea_level: self.sea_level,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn for_level_matches_default_at_level_6() {
+        let scaled = TerrainParams::for_level(6);
+        let default = TerrainParams::default();
+        assert_eq!(scaled.base_y, default.base_y);
+        assert_eq!(scaled.amplitude, default.amplitude);
+        assert_eq!(scaled.wavelength, default.wavelength);
+        assert_eq!(scaled.sea_level, default.sea_level);
+        assert_eq!(scaled.octaves, default.octaves);
+    }
+
+    #[test]
+    fn for_level_scales_proportionally() {
+        let l6 = TerrainParams::for_level(6);
+        let l12 = TerrainParams::for_level(12);
+        let ratio = (1u64 << 12) as f32 / (1u64 << 6) as f32; // 64x
+        assert!((l12.base_y - l6.base_y * ratio).abs() < 0.01);
+        assert!((l12.amplitude - l6.amplitude * ratio).abs() < 0.01);
+        assert!((l12.wavelength - l6.wavelength * ratio).abs() < 0.01);
+    }
+
+    #[test]
+    fn for_level_validates() {
+        for level in [3, 6, 9, 12, 16] {
+            assert!(TerrainParams::for_level(level).validate().is_ok());
         }
     }
 }
