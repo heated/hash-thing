@@ -74,6 +74,10 @@ pub struct World {
     pub generation: u64,
     pub simulation_seed: u64,
     pub materials: MaterialRegistry,
+    /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
+    /// `ensure_region` generates terrain (heightmap + caves + dungeons)
+    /// for newly-created sibling octants instead of leaving them empty.
+    terrain_params: Option<TerrainParams>,
 }
 
 impl World {
@@ -101,6 +105,7 @@ impl World {
             generation: 0,
             simulation_seed: 0,
             materials,
+            terrain_params: None,
         }
     }
 
@@ -166,24 +171,45 @@ impl World {
             if max[0] < side && max[1] < side && max[2] < side {
                 return;
             }
-            let empty_sibling = self.store.empty(self.level);
+            let sibling_level = self.level;
+            let half = 1i64 << sibling_level;
             let new_level = self.level + 1;
-            let new_root = self.store.interior(
-                new_level,
-                [
-                    self.root,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                ],
-            );
-            self.root = new_root;
+            let mut children = [NodeId::EMPTY; 8];
+            children[0] = self.root;
+            for (oct, child) in children.iter_mut().enumerate().skip(1) {
+                let (cx, cy, cz) = crate::octree::node::octant_coords(oct);
+                *child = self.gen_sibling(
+                    sibling_level,
+                    [cx as i64 * half, cy as i64 * half, cz as i64 * half],
+                );
+            }
+            self.root = self.store.interior(new_level, children);
             self.level = new_level;
         }
+    }
+
+    /// Generate a sibling octant for lazy expansion. If `terrain_params` is
+    /// set, produces terrain (heightmap + caves + dungeons) at the given
+    /// world-space origin. Otherwise returns a canonical empty node.
+    fn gen_sibling(&mut self, level: u32, origin: [i64; 3]) -> NodeId {
+        let params = match &self.terrain_params {
+            Some(p) => *p,
+            None => return self.store.empty(level),
+        };
+        let field = params.to_heightmap();
+        let (mut node, _stats) = gen_region(&mut self.store, &field, origin, level);
+        let side = 1usize << level;
+        if let Some(cave_params) = &params.caves {
+            let mut grid = self.store.flatten(node, side);
+            crate::terrain::caves::carve_caves_grid(&mut grid, side, origin, cave_params);
+            node = self.store.from_flat(&grid, side);
+        }
+        if let Some(dungeon_params) = &params.dungeons {
+            let mut grid = self.store.flatten(node, side);
+            crate::terrain::dungeons::carve_dungeons_grid(&mut grid, side, origin, dungeon_params);
+            node = self.store.from_flat(&grid, side);
+        }
+        node
     }
 
     /// Set a cell.
@@ -520,6 +546,7 @@ impl World {
         stats.nodes_after_dungeons = self.store.stats().0;
         self.root = root;
         self.generation = 0;
+        self.terrain_params = Some(*params);
         stats
     }
 }
@@ -1493,5 +1520,111 @@ mod tests {
         world.ensure_contains(20, 0, 0);
         assert!(world.region().side() > 20);
         assert_eq!(world.region().level, world.level);
+    }
+
+    // ── Lazy terrain expansion (3fq.4) ────────────────────────────
+
+    #[test]
+    fn expand_without_terrain_produces_empty_siblings() {
+        let mut world = World::new(3); // side=8
+        world.set(0, 0, 0, ALIVE.raw());
+        let pop_before = world.population();
+        world.ensure_contains(10, 0, 0);
+        // Only the original cell survives — new octants are empty.
+        assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn expand_with_terrain_populates_new_octants() {
+        let mut world = World::new(3); // side=8
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+        let pop_initial = world.population();
+        assert!(pop_initial > 0, "terrain should produce non-empty world");
+
+        // Expand into +x. The new octant at (8..16, 0..8, 0..8) should
+        // have generated terrain, not empty space.
+        world.ensure_contains(10, 0, 0);
+        let pop_after = world.population();
+        assert!(
+            pop_after > pop_initial,
+            "expansion should add terrain: before={pop_initial}, after={pop_after}"
+        );
+    }
+
+    #[test]
+    fn expand_terrain_is_deterministic() {
+        let params = TerrainParams::default();
+
+        let mut w1 = World::new(3);
+        w1.seed_terrain(&params);
+        w1.ensure_contains(10, 0, 0);
+
+        let mut w2 = World::new(3);
+        w2.seed_terrain(&params);
+        w2.ensure_contains(10, 0, 0);
+
+        // Same params + same expansion → same world.
+        assert_eq!(w1.level, w2.level);
+        assert_eq!(w1.population(), w2.population());
+        // Spot-check a cell in the expanded region.
+        assert_eq!(w1.get(10, 3, 3), w2.get(10, 3, 3));
+    }
+
+    #[test]
+    fn expand_terrain_preserves_original_cells() {
+        let mut world = World::new(3);
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+
+        // Record some cells from the original region.
+        let cells_before: Vec<_> = (0..8u64).map(|x| world.get(x, 3, 3)).collect();
+
+        world.ensure_contains(10, 0, 0);
+
+        // Original region cells are unchanged.
+        for (x, &expected) in cells_before.iter().enumerate() {
+            assert_eq!(
+                world.get(x as u64, 3, 3),
+                expected,
+                "cell at ({x}, 3, 3) changed after expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_terrain_with_caves() {
+        use crate::terrain::CaveParams;
+        let params = TerrainParams {
+            caves: Some(CaveParams::default()),
+            ..Default::default()
+        };
+
+        let mut w_caves = World::new(3);
+        w_caves.seed_terrain(&params);
+        w_caves.ensure_contains(10, 0, 0);
+
+        let mut w_plain = World::new(3);
+        w_plain.seed_terrain(&TerrainParams::default());
+        w_plain.ensure_contains(10, 0, 0);
+
+        // Caves should carve out some material — fewer populated cells.
+        assert!(
+            w_caves.population() < w_plain.population(),
+            "caves should reduce population: caves={}, plain={}",
+            w_caves.population(),
+            w_plain.population()
+        );
+    }
+
+    #[test]
+    fn gol_world_expand_stays_empty() {
+        // GoL smoke worlds don't set terrain_params, so expansion is empty.
+        let mut world = World::new(3);
+        world.set(4, 4, 4, ALIVE.raw());
+        assert!(world.terrain_params.is_none());
+        world.ensure_contains(20, 0, 0);
+        // Only the single cell we placed.
+        assert_eq!(world.population(), 1);
     }
 }
