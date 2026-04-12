@@ -99,6 +99,10 @@ struct App {
     /// Used to estimate noise fraction of each gen pass (hash-thing-3fq.5).
     /// Refreshed on terrain reset so a wildly different param set reprobes.
     noise_ns_per_sample: f64,
+    /// Entity store: particles, projectiles, etc. Updated after each
+    /// sim step. Entities push mutations onto `world.queue`; those are
+    /// applied at the start of the next tick.
+    entities: sim::EntityStore,
 }
 
 impl App {
@@ -130,6 +134,7 @@ impl App {
             last_svdag_stats: (0, 0, 0),
             occluded: false,
             noise_ns_per_sample: 0.0,
+            entities: sim::EntityStore::new(),
         }
     }
 
@@ -296,7 +301,11 @@ impl ApplicationHandler for App {
                             // path (hash-thing-5qh + hash-thing-yri).
                             {
                                 let _t = self.perf.start("step");
+                                self.world.apply_mutations();
                                 self.world.step();
+                                let mut queue = std::mem::take(&mut self.world.queue);
+                                self.entities.update(&self.world, &mut queue);
+                                self.world.queue = queue;
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
@@ -468,7 +477,11 @@ impl ApplicationHandler for App {
                     // Timer is alive.
                     {
                         let _t = self.perf.start("step");
-                        self.world.step_recursive();
+                        self.world.apply_mutations();
+                        self.world.step();
+                        let mut queue = std::mem::take(&mut self.world.queue);
+                        self.entities.update(&self.world, &mut queue);
+                        self.world.queue = queue;
                     }
                     // Time upload as one aggregate (flatten + Svdag::build +
                     // upload_volume + upload_svdag). CPU-side submit only —
