@@ -2,6 +2,8 @@
 
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
+**Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper at `.bin/bd` retries on embedded Dolt lock contention (hash-thing-eg3) with exponential backoff. Without it, concurrent worktree agents hit `another process holds the exclusive lock` errors that require manual sleep-and-retry. The wrapper handles up to 5 retries transparently.
+
 Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` under "Gate Tiers." Default sensitivity applies here; amend the line below if the bar should move project-wide.
 
 ```
