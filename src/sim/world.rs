@@ -90,6 +90,16 @@ pub struct World {
     /// Key: (NodeId, world-space origin, starting generation).
     /// Cleared after each macro-step and on rule changes.
     pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, [i64; 3], u64), NodeId>,
+    /// Spatial memoization cache for CaRule-only worlds (m1f.1).
+    /// Key: (NodeId, parity) — no origin, so identical subtrees anywhere
+    /// in the world share a single cache entry.
+    pub(crate) hashlife_spatial_cache: FxHashMap<(NodeId, u32), NodeId>,
+    /// When true, `step_recursive` uses spatial memoization (origin-free
+    /// cache key). Only correct for CaRule-only worlds — BlockRule depends
+    /// on world-space coordinates for RNG. Defaults to false.
+    pub spatial_memo: bool,
+    /// Hashlife cache statistics from the most recent step.
+    pub hashlife_stats: HashlifeStats,
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
@@ -97,6 +107,14 @@ pub struct World {
     /// grows in the negative direction, origin shifts to keep the old
     /// root's cells at the same world-space positions.
     pub origin: [i64; 3],
+}
+
+/// Cache performance statistics from a single hashlife step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HashlifeStats {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub empty_skips: u64,
 }
 
 impl World {
@@ -127,6 +145,9 @@ impl World {
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
+            hashlife_spatial_cache: FxHashMap::default(),
+            spatial_memo: false,
+            hashlife_stats: HashlifeStats::default(),
             queue: MutationQueue::new(),
             origin: [0, 0, 0],
         }

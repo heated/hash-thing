@@ -44,6 +44,7 @@ impl World {
             "step_recursive requires level >= 3, got {}",
             self.level
         );
+        self.hashlife_stats = super::world::HashlifeStats::default();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         // World-space origin of the padded root: the original world is
@@ -150,13 +151,37 @@ impl World {
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
         // (NoopRule is identity; GoL-family rules have birth_min >= 1). No BlockRule on air.
         if self.store.population(node) == 0 {
+            self.hashlife_stats.empty_skips += 1;
             return self.store.empty(level - 1);
+        }
+
+        // Spatial memoization: for CaRule-only worlds, identical subtrees at
+        // different positions produce the same result. Use (NodeId, parity)
+        // as cache key instead of (NodeId, origin, parity).
+        if self.spatial_memo {
+            let spatial_key = (node, parity);
+            if let Some(&cached) = self.hashlife_spatial_cache.get(&spatial_key) {
+                self.hashlife_stats.cache_hits += 1;
+                return cached;
+            }
+            self.hashlife_stats.cache_misses += 1;
+
+            let result = if level == 3 {
+                self.step_base_case(node, origin, parity)
+            } else {
+                self.step_recursive_case(node, level, origin, parity)
+            };
+
+            self.hashlife_spatial_cache.insert(spatial_key, result);
+            return result;
         }
 
         let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
+            self.hashlife_stats.cache_hits += 1;
             return cached;
         }
+        self.hashlife_stats.cache_misses += 1;
 
         let result = if level == 3 {
             self.step_base_case(node, origin, parity)
