@@ -733,7 +733,7 @@ pub mod cpu_trace {
             }
             int_pos[exit_axis] = boundary_cell;
             // Derive t from the exact exit-axis boundary. boundary_cell
-            // is integer * 2^-14, so the boundary float is exact. The
+            // is integer * INV_RES (= 2^-MAX_DEPTH), so the boundary float is exact. The
             // slab time `(boundary - ro_local) * inv_rd` is the canonical
             // exit time — same as t2[exit_axis] but computed from the
             // integer boundary instead of float child_max. Guaranteed
