@@ -15,13 +15,7 @@ Prefer commands that finish in under ~60s. Benchmarks, large builds, long test s
 
 ## Build profiles
 
-| Profile | Command | Compile | Runtime | Use when |
-|---------|---------|---------|---------|----------|
-| dev | `cargo run` / `cargo test` | ~13s | Debug-slow | Day-to-day iteration |
-| bench | `cargo run --profile bench` | ~30s | Fast (no LTO) | Perf benchmarks, profiling |
-| release | `cargo run --release` | ~60s+ | Fastest (LTO) | Final builds only |
-
-**Default to dev.** Use `--profile bench` for benchmark beads (m1f series). Never use `--release` unless building a distributable artifact. All worktrees share one target dir (`.cargo/config.toml`) so deps compile once.
+Default to dev (`cargo run/test`, ~13s). Use `--profile bench` for perf work (no LTO, ~30s). `--release` only for final artifacts. Shared target dir across worktrees.
 
 ## Agent surface — where project skills and commands live
 
