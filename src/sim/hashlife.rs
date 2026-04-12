@@ -45,6 +45,10 @@ impl World {
             self.level
         );
         self.hashlife_stats = super::world::HashlifeStats::default();
+        // Auto-enable spatial memoization for CaRule-only worlds.
+        // BlockRule partition alignment depends on world-space origin, so
+        // origin must remain in the cache key when block rules are present.
+        self.spatial_memo = !self.materials.has_any_block_rules();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         // World-space origin of the padded root: the original world is

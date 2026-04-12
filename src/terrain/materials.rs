@@ -279,6 +279,13 @@ impl MaterialRegistry {
         registry
     }
 
+    /// True if any registered material has a BlockRule. O(materials), not O(volume).
+    pub fn has_any_block_rules(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.as_ref().is_some_and(|e| e.block_rule_id.is_some()))
+    }
+
     pub fn entry(&self, material_id: MaterialId) -> Option<&MaterialEntry> {
         self.entries
             .get(material_id as usize)
