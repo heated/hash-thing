@@ -1,8 +1,63 @@
+use std::fmt;
+
 use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
+
+/// The realized region of the simulation world — the axis-aligned cube
+/// within which the octree has allocated cells.
+///
+/// Currently origin is always (0,0,0). When signed-coordinate support
+/// lands (see hash-thing-7zc), origin will shift to allow negative
+/// world positions after recentering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealizedRegion {
+    /// Anchor position in world coordinates.
+    pub origin: (i64, i64, i64),
+    /// Octree depth — the region covers a cube of side length 2^level.
+    pub level: u32,
+}
+
+impl RealizedRegion {
+    /// Side length in cells.
+    pub fn side(&self) -> u64 {
+        1u64 << self.level
+    }
+
+    /// Check whether a world coordinate falls within this region.
+    pub fn contains(&self, x: i64, y: i64, z: i64) -> bool {
+        let s = self.side() as i64;
+        x >= self.origin.0
+            && x < self.origin.0 + s
+            && y >= self.origin.1
+            && y < self.origin.1 + s
+            && z >= self.origin.2
+            && z < self.origin.2 + s
+    }
+
+    /// Which octant (0..7) a point falls into, assuming it's in-bounds.
+    /// Layout matches `octree::node::octant_index`: x + y*2 + z*4.
+    pub fn octant_of(&self, x: i64, y: i64, z: i64) -> u8 {
+        let half = (self.side() / 2) as i64;
+        let ox = if x - self.origin.0 >= half { 1u8 } else { 0 };
+        let oy = if y - self.origin.1 >= half { 1u8 } else { 0 };
+        let oz = if z - self.origin.2 >= half { 1u8 } else { 0 };
+        ox + oy * 2 + oz * 4
+    }
+}
+
+impl fmt::Display for RealizedRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.side();
+        write!(
+            f,
+            "realized: origin=({},{},{}) level={} ({s}^3)",
+            self.origin.0, self.origin.1, self.origin.2, self.level
+        )
+    }
+}
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -48,6 +103,14 @@ impl World {
 
     pub fn side(&self) -> usize {
         1 << self.level
+    }
+
+    /// The realized region — typed value describing the world's spatial extent.
+    pub fn region(&self) -> RealizedRegion {
+        RealizedRegion {
+            origin: (0, 0, 0),
+            level: self.level,
+        }
     }
 
     /// Invalidate caches whose keys depend on the active CA rule.
@@ -1344,5 +1407,95 @@ mod tests {
             world.population() > 0,
             "world should still have cells after stepping"
         );
+    }
+
+    // ── RealizedRegion tests ──────────────────────────────────────
+
+    #[test]
+    fn region_side() {
+        let r = RealizedRegion {
+            origin: (0, 0, 0),
+            level: 6,
+        };
+        assert_eq!(r.side(), 64);
+    }
+
+    #[test]
+    fn region_contains_origin() {
+        let r = RealizedRegion {
+            origin: (0, 0, 0),
+            level: 4,
+        };
+        assert!(r.contains(0, 0, 0));
+        assert!(r.contains(15, 15, 15));
+        assert!(!r.contains(16, 0, 0));
+        assert!(!r.contains(-1, 0, 0));
+    }
+
+    #[test]
+    fn region_contains_nonzero_origin() {
+        let r = RealizedRegion {
+            origin: (-8, -8, -8),
+            level: 4,
+        };
+        assert!(r.contains(-8, -8, -8));
+        assert!(r.contains(7, 7, 7));
+        assert!(!r.contains(8, 0, 0));
+        assert!(!r.contains(-9, 0, 0));
+    }
+
+    #[test]
+    fn region_octant_of_matches_node_octant_index() {
+        use crate::octree::node::octant_index;
+        let r = RealizedRegion {
+            origin: (0, 0, 0),
+            level: 4,
+        };
+        // Check all 8 octant corners
+        for z in 0..2u32 {
+            for y in 0..2u32 {
+                for x in 0..2u32 {
+                    let wx = (x as i64) * 8; // half = 8 for level 4
+                    let wy = (y as i64) * 8;
+                    let wz = (z as i64) * 8;
+                    assert_eq!(
+                        r.octant_of(wx, wy, wz) as usize,
+                        octant_index(x, y, z),
+                        "octant mismatch at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn region_display() {
+        let r = RealizedRegion {
+            origin: (-1024, 0, 0),
+            level: 12,
+        };
+        let s = format!("{r}");
+        assert!(s.contains("origin=(-1024,0,0)"));
+        assert!(s.contains("level=12"));
+        assert!(s.contains("4096^3"));
+    }
+
+    #[test]
+    fn world_region_matches_fields() {
+        let w = World::new(6);
+        let r = w.region();
+        assert_eq!(r.level, w.level);
+        assert_eq!(r.origin, (0, 0, 0));
+        assert_eq!(r.side() as usize, w.side());
+    }
+
+    #[test]
+    fn world_region_after_ensure_contains() {
+        let mut w = World::new(3);
+        w.ensure_contains(100, 100, 100);
+        let r = w.region();
+        assert_eq!(r.level, w.level);
+        assert!(r.contains(100, 100, 100));
+        assert!(r.contains(0, 0, 0));
     }
 }
