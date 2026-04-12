@@ -80,11 +80,24 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
 
 // Octant index from a point relative to the node center.
 // Returns bit-packed index 0..7 with bit 0 = x, bit 1 = y, bit 2 = z.
-fn octant_of(pos: vec3<f32>, node_min: vec3<f32>, half: f32) -> u32 {
+//
+// hash-thing-6hd: uses STRICT `>` for the HIGH half with `rd >= 0` as a
+// tiebreaker on exact-midpoint positions. The pre-6hd code used `>=` which
+// biased midpoint-exact positions to the HIGH half regardless of ray
+// direction; on simultaneous two-axis exits, the step-past nudge on a
+// non-dominant axis can underflow to sub-ULP (dt * |rd_axis| < ULP(pos)),
+// leaving pos EXACTLY on the boundary. The `>=` bias then picked the
+// wrong sibling whenever `rd_axis < 0`. Codex reproducer (float32):
+// rd = (1.0, -1e-6, 0.0). Post-step pos.x = 0.50000995, pos.y = 0.5
+// (unchanged by the sub-ULP nudge on y), pos.z = 0.25 — old code returned
+// oct 3 (x-HIGH, y-HIGH), physically correct is oct 1 (x-HIGH, y-LOW)
+// because rd.y < 0.
+fn octant_of(pos: vec3<f32>, rd: vec3<f32>, node_min: vec3<f32>, half: f32) -> u32 {
     var idx: u32 = 0u;
-    if pos.x >= node_min.x + half { idx |= 1u; }
-    if pos.y >= node_min.y + half { idx |= 2u; }
-    if pos.z >= node_min.z + half { idx |= 4u; }
+    let mid = node_min + vec3<f32>(half);
+    if pos.x > mid.x || (pos.x == mid.x && rd.x >= 0.0) { idx |= 1u; }
+    if pos.y > mid.y || (pos.y == mid.y && rd.y >= 0.0) { idx |= 2u; }
+    if pos.z > mid.z || (pos.z == mid.z && rd.z >= 0.0) { idx |= 4u; }
     return idx;
 }
 
@@ -199,7 +212,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let node_offset = stack_node[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
-            let oct = octant_of(pos, node_min, half);
+            let oct = octant_of(pos, rd, node_min, half);
             let child_slot = dag_nodes[node_offset + 1u + oct];
 
             if (child_slot & LEAF_BIT) != 0u {
@@ -283,7 +296,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // resulting per-axis pos advance was sub-ULP near pos ~ 0.5.
         let node_min = stack_min[depth];
         let half = stack_half[depth];
-        let oct = octant_of(pos, node_min, half);
+        let oct = octant_of(pos, rd, node_min, half);
         let child_min = vec3<f32>(
             node_min.x + f32(oct & 1u) * half,
             node_min.y + f32((oct >> 1u) & 1u) * half,

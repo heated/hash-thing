@@ -287,15 +287,28 @@ pub mod cpu_trace {
         pub hit_normal: Option<[f32; 3]>,
     }
 
-    fn octant_of(pos: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
+    /// Octant index from a point relative to the node center.
+    /// Returns bit-packed index 0..7 with bit 0 = x, bit 1 = y, bit 2 = z.
+    ///
+    /// hash-thing-6hd: uses STRICT `>` for the HIGH half with `rd >= 0` as a
+    /// tiebreaker on exact-midpoint positions. The pre-6hd code used `>=`
+    /// which biased midpoint-exact positions to the HIGH half regardless of
+    /// ray direction; on simultaneous two-axis exits, the step-past nudge on
+    /// a non-dominant axis can underflow to sub-ULP (`dt * |rd_axis|` below
+    /// `ULP(pos)`), leaving pos EXACTLY on the boundary. The `>=` bias then
+    /// picked the wrong sibling whenever `rd_axis < 0`. Mirrors the shader
+    /// fix in `svdag_raycast.wgsl` 1:1 — both sides use `>` + rd tiebreak
+    /// and the SAME tiebreak direction so CPU/GPU stay byte-aligned.
+    pub(super) fn octant_of(pos: [f32; 3], rd: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
         let mut idx = 0u32;
-        if pos[0] >= node_min[0] + half {
+        let mid = [node_min[0] + half, node_min[1] + half, node_min[2] + half];
+        if pos[0] > mid[0] || (pos[0] == mid[0] && rd[0] >= 0.0) {
             idx |= 1;
         }
-        if pos[1] >= node_min[1] + half {
+        if pos[1] > mid[1] || (pos[1] == mid[1] && rd[1] >= 0.0) {
             idx |= 2;
         }
-        if pos[2] >= node_min[2] + half {
+        if pos[2] > mid[2] || (pos[2] == mid[2] && rd[2] >= 0.0) {
             idx |= 4;
         }
         idx
@@ -462,7 +475,7 @@ pub mod cpu_trace {
                 let node_offset = stack_node[depth] as usize;
                 let node_min = stack_min[depth];
                 let half = stack_half[depth];
-                let oct = octant_of(pos, node_min, half);
+                let oct = octant_of(pos, rd, node_min, half);
                 let child_slot = dag[node_offset + 1 + oct as usize];
 
                 if child_slot & LEAF_BIT != 0 {
@@ -559,7 +572,7 @@ pub mod cpu_trace {
             // fastest axis never crosses more than one child span.
             let node_min = stack_min[depth];
             let half = stack_half[depth];
-            let oct = octant_of(pos, node_min, half);
+            let oct = octant_of(pos, rd, node_min, half);
             let child_min = [
                 node_min[0] + (oct & 1) as f32 * half,
                 node_min[1] + ((oct >> 1) & 1) as f32 * half,
@@ -1704,5 +1717,113 @@ mod tests {
         );
         assert_eq!(result.hit_normal, None, "in-root miss must carry no normal");
         assert!(!result.exhausted, "clean miss must not trip budget");
+    }
+
+    /// hash-thing-6hd: `octant_of` must use `rd` sign as a tiebreaker on
+    /// exact-midpoint positions. Pre-6hd used `>=` which biased midpoint
+    /// positions to the HIGH half regardless of ray direction, producing
+    /// wrong-sibling selection on simultaneous two-axis exits where the
+    /// step-past nudge on a non-dominant axis underflows to sub-ULP.
+    ///
+    /// These direct unit tests pin the fix at the call point and exercise
+    /// the exact f32 values that the Codex 27m-trident reproducer lands
+    /// on in the running shader — the integration path is numerically
+    /// fragile to reproduce end-to-end, but the bit-level behavior of
+    /// `octant_of` is fully controllable here.
+    #[test]
+    fn octant_of_midpoint_biases_on_rd_sign() {
+        let node_min = [0.0_f32, 0.0, 0.0];
+        let half = 0.5_f32;
+        // mid = (0.5, 0.5, 0.5) exactly — all three axes representable.
+        let mid_pos = [0.5_f32, 0.5, 0.5];
+
+        // --- x axis ---
+        // rd.x > 0 → HIGH, rd.x < 0 → LOW. rd.y/z zero; tiebreak for them
+        // defaults to HIGH (rd >= 0.0).
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [1.0, 0.0, 0.0], node_min, half),
+            1 | 2 | 4,
+            "rd.x > 0 at xyz midpoint: x HIGH (target), y HIGH (rd.y==0 tiebreak), z HIGH",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [-1.0, 0.0, 0.0], node_min, half),
+            2 | 4,
+            "rd.x < 0 at xyz midpoint: x LOW (target), y HIGH, z HIGH",
+        );
+
+        // --- y axis ---
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, 1.0, 0.0], node_min, half),
+            1 | 2 | 4,
+            "rd.y > 0 at xyz midpoint: all HIGH",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, -1.0, 0.0], node_min, half),
+            1 | 4,
+            "rd.y < 0 at xyz midpoint: y LOW, x+z HIGH",
+        );
+
+        // --- z axis ---
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, 0.0, 1.0], node_min, half),
+            1 | 2 | 4,
+            "rd.z > 0 at xyz midpoint: all HIGH",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, 0.0, -1.0], node_min, half),
+            1 | 2,
+            "rd.z < 0 at xyz midpoint: z LOW, x+y HIGH",
+        );
+
+        // --- the actual Codex reproducer: rd = (1.0, -1e-6, 0.0) ---
+        // Pre-6hd, this returned oct 3 (x-HIGH, y-HIGH, z-LOW) because
+        // pos.x=0.50000995 >= 0.5 → HIGH, pos.y=0.5 >= 0.5 → HIGH (wrong
+        // under `>=` bias), pos.z=0.25 < 0.5 → LOW. Post-6hd, it returns
+        // oct 1 (x-HIGH, y-LOW, z-LOW) because the y tiebreak consults
+        // rd.y < 0 → LOW.
+        let codex_pos = [0.50000995_f32, 0.5, 0.25];
+        let codex_rd = [1.0_f32, -1e-6, 0.0];
+        assert_eq!(
+            cpu_trace::octant_of(codex_pos, codex_rd, node_min, half),
+            1,
+            "Codex reproducer: x-HIGH + y-LOW + z-LOW = oct 1 (pre-6hd gave 3)",
+        );
+    }
+
+    /// hash-thing-6hd: off-midpoint positions must still classify purely
+    /// on `pos` (no rd consultation). Away from exact equality the new
+    /// `>` predicate and the old `>=` predicate agree by construction.
+    #[test]
+    fn octant_of_off_midpoint_ignores_rd() {
+        let node_min = [0.0_f32, 0.0, 0.0];
+        let half = 0.5_f32;
+
+        // 1 ULP above midpoint on x — must be HIGH regardless of rd sign.
+        let ulp = f32::from_bits(0.5_f32.to_bits() + 1); // next float up
+        let above = [ulp, 0.25, 0.25];
+        assert_eq!(
+            cpu_trace::octant_of(above, [1.0, 1.0, 1.0], node_min, half),
+            1,
+            "pos.x just above mid → HIGH-x with rd.x > 0",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(above, [-1.0, -1.0, -1.0], node_min, half),
+            1,
+            "pos.x just above mid → HIGH-x even with rd.x < 0 (rd ignored off-mid)",
+        );
+
+        // 1 ULP below midpoint on x — must be LOW regardless of rd sign.
+        let below_x = f32::from_bits(0.5_f32.to_bits() - 1); // next float down
+        let below = [below_x, 0.25, 0.25];
+        assert_eq!(
+            cpu_trace::octant_of(below, [1.0, 1.0, 1.0], node_min, half),
+            0,
+            "pos.x just below mid → LOW-x even with rd.x > 0",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(below, [-1.0, -1.0, -1.0], node_min, half),
+            0,
+            "pos.x just below mid → LOW-x with rd.x < 0",
+        );
     }
 }
