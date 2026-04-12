@@ -81,6 +81,10 @@ pub struct World {
     pub generation: u64,
     pub simulation_seed: u64,
     pub materials: MaterialRegistry,
+    /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
+    /// `ensure_region` generates terrain (heightmap + caves + dungeons)
+    /// for newly-created sibling octants instead of leaving them empty.
+    terrain_params: Option<TerrainParams>,
     /// Memoization cache for the recursive Hashlife stepper (6gf.2).
     /// Key: (NodeId, world-space origin). Value: stepped result NodeId.
     /// Cleared after each generation and on rule changes.
@@ -112,6 +116,7 @@ impl World {
             generation: 0,
             simulation_seed: 0,
             materials,
+            terrain_params: None,
             hashlife_cache: FxHashMap::default(),
         }
     }
@@ -218,24 +223,45 @@ impl World {
             if max[0].0 < side && max[1].0 < side && max[2].0 < side {
                 return;
             }
-            let empty_sibling = self.store.empty(self.level);
+            let sibling_level = self.level;
+            let half = 1i64 << sibling_level;
             let new_level = self.level + 1;
-            let new_root = self.store.interior(
-                new_level,
-                [
-                    self.root,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                ],
-            );
-            self.root = new_root;
+            let mut children = [NodeId::EMPTY; 8];
+            children[0] = self.root;
+            for (oct, child) in children.iter_mut().enumerate().skip(1) {
+                let (cx, cy, cz) = crate::octree::node::octant_coords(oct);
+                *child = self.gen_sibling(
+                    sibling_level,
+                    [cx as i64 * half, cy as i64 * half, cz as i64 * half],
+                );
+            }
+            self.root = self.store.interior(new_level, children);
             self.level = new_level;
         }
+    }
+
+    /// Generate a sibling octant for lazy expansion. If `terrain_params` is
+    /// set, produces terrain (heightmap + caves + dungeons) at the given
+    /// world-space origin. Otherwise returns a canonical empty node.
+    fn gen_sibling(&mut self, level: u32, origin: [i64; 3]) -> NodeId {
+        let params = match &self.terrain_params {
+            Some(p) => *p,
+            None => return self.store.empty(level),
+        };
+        let field = params.to_heightmap();
+        let (mut node, _stats) = gen_region(&mut self.store, &field, origin, level);
+        let side = 1usize << level;
+        if let Some(cave_params) = &params.caves {
+            let mut grid = self.store.flatten(node, side);
+            crate::terrain::caves::carve_caves_grid(&mut grid, side, origin, cave_params);
+            node = self.store.from_flat(&grid, side);
+        }
+        if let Some(dungeon_params) = &params.dungeons {
+            let mut grid = self.store.flatten(node, side);
+            crate::terrain::dungeons::carve_dungeons_grid(&mut grid, side, origin, dungeon_params);
+            node = self.store.from_flat(&grid, side);
+        }
+        node
     }
 
     /// Set a cell.
@@ -275,6 +301,35 @@ impl World {
             return 0;
         };
         self.get_local(LocalCoord(x), LocalCoord(y), LocalCoord(z))
+    }
+
+    /// Stepper-oriented read: "what is this cell right now?"
+    ///
+    /// Semantic alias for [`get`](Self::get) that signals the caller accepts
+    /// OOB-empty semantics without reservation. Hashlife steppers reading a
+    /// 3×3×3 neighborhood call `probe` — the unrealized world *is* empty
+    /// from the stepper's perspective, so returning 0 for out-of-bounds is
+    /// the correct physical answer, not a lossy fallback.
+    ///
+    /// Use [`is_realized`](Self::is_realized) when you need to distinguish
+    /// "genuinely empty" from "outside the realized region."
+    #[inline]
+    pub fn probe(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        self.get(x, y, z)
+    }
+
+    /// Is the coordinate inside the realized region?
+    ///
+    /// Returns `false` for negative coordinates and for positions beyond
+    /// the current octree extent. Use this alongside [`get`](Self::get)
+    /// when distinguishing "realized empty" from "unrealized" matters
+    /// (e.g. debug overlays rendering the region boundary).
+    pub fn is_realized(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> bool {
+        let (Ok(ux), Ok(uy), Ok(uz)) = (u64::try_from(x.0), u64::try_from(y.0), u64::try_from(z.0))
+        else {
+            return false;
+        };
+        self.region().contains(ux, uy, uz)
     }
 
     /// Flatten to a 3D grid for rendering.
@@ -587,6 +642,7 @@ impl World {
         stats.nodes_after_dungeons = self.store.stats().0;
         self.root = root;
         self.generation = 0;
+        self.terrain_params = Some(*params);
         stats
     }
 }
@@ -1588,5 +1644,141 @@ mod tests {
         world.ensure_contains(wc(20), wc(0), wc(0));
         assert!(world.region().side() > 20);
         assert_eq!(world.region().level, world.level);
+    }
+
+    // ── Lazy terrain expansion (3fq.4) ────────────────────────────
+
+    #[test]
+    fn expand_without_terrain_produces_empty_siblings() {
+        let mut world = World::new(3); // side=8
+        world.set(wc(0), wc(0), wc(0), ALIVE.raw());
+        let pop_before = world.population();
+        world.ensure_contains(wc(10), wc(0), wc(0));
+        // Only the original cell survives — new octants are empty.
+        assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn expand_with_terrain_populates_new_octants() {
+        let mut world = World::new(3); // side=8
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+        let pop_initial = world.population();
+        assert!(pop_initial > 0, "terrain should produce non-empty world");
+
+        // Expand into +x. The new octant at (8..16, 0..8, 0..8) should
+        // have generated terrain, not empty space.
+        world.ensure_contains(wc(10), wc(0), wc(0));
+        let pop_after = world.population();
+        assert!(
+            pop_after > pop_initial,
+            "expansion should add terrain: before={pop_initial}, after={pop_after}"
+        );
+    }
+
+    #[test]
+    fn expand_terrain_is_deterministic() {
+        let params = TerrainParams::default();
+
+        let mut w1 = World::new(3);
+        w1.seed_terrain(&params);
+        w1.ensure_contains(wc(10), wc(0), wc(0));
+
+        let mut w2 = World::new(3);
+        w2.seed_terrain(&params);
+        w2.ensure_contains(wc(10), wc(0), wc(0));
+
+        // Same params + same expansion → same world.
+        assert_eq!(w1.level, w2.level);
+        assert_eq!(w1.population(), w2.population());
+        // Spot-check a cell in the expanded region.
+        assert_eq!(w1.get(wc(10), wc(3), wc(3)), w2.get(wc(10), wc(3), wc(3)));
+    }
+
+    #[test]
+    fn expand_terrain_preserves_original_cells() {
+        let mut world = World::new(3);
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+
+        // Record some cells from the original region.
+        let cells_before: Vec<_> = (0..8u64).map(|x| world.get(wc(x), wc(3), wc(3))).collect();
+
+        world.ensure_contains(wc(10), wc(0), wc(0));
+
+        // Original region cells are unchanged.
+        for (x, &expected) in cells_before.iter().enumerate() {
+            assert_eq!(
+                world.get(wc(x as u64), wc(3), wc(3)),
+                expected,
+                "cell at ({x}, 3, 3) changed after expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_terrain_with_caves() {
+        use crate::terrain::CaveParams;
+        let params = TerrainParams {
+            caves: Some(CaveParams::default()),
+            ..Default::default()
+        };
+
+        let mut w_caves = World::new(3);
+        w_caves.seed_terrain(&params);
+        w_caves.ensure_contains(wc(10), wc(0), wc(0));
+
+        let mut w_plain = World::new(3);
+        w_plain.seed_terrain(&TerrainParams::default());
+        w_plain.ensure_contains(wc(10), wc(0), wc(0));
+
+        // Caves should carve out some material — fewer populated cells.
+        assert!(
+            w_caves.population() < w_plain.population(),
+            "caves should reduce population: caves={}, plain={}",
+            w_caves.population(),
+            w_plain.population()
+        );
+    }
+
+    #[test]
+    fn gol_world_expand_stays_empty() {
+        // GoL smoke worlds don't set terrain_params, so expansion is empty.
+        let mut world = World::new(3);
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        assert!(world.terrain_params.is_none());
+        world.ensure_contains(wc(20), wc(0), wc(0));
+        // Only the single cell we placed.
+        assert_eq!(world.population(), 1);
+    }
+
+    #[test]
+    fn probe_matches_get() {
+        let mut world = World::new(3);
+        let stone = crate::terrain::materials::STONE;
+        world.set(wc(1), wc(2), wc(3), stone);
+        assert_eq!(
+            world.probe(wc(1), wc(2), wc(3)),
+            world.get(wc(1), wc(2), wc(3))
+        );
+        // OOB returns 0 from both
+        assert_eq!(world.probe(WorldCoord(-1), wc(0), wc(0)), 0);
+        assert_eq!(world.probe(wc(100), wc(0), wc(0)), 0);
+    }
+
+    #[test]
+    fn is_realized_inside() {
+        let world = World::new(3); // side=8
+        assert!(world.is_realized(wc(0), wc(0), wc(0)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
+        assert!(world.is_realized(wc(4), wc(2), wc(6)));
+    }
+
+    #[test]
+    fn is_realized_outside() {
+        let world = World::new(3); // side=8
+        assert!(!world.is_realized(WorldCoord(-1), wc(0), wc(0)));
+        assert!(!world.is_realized(wc(8), wc(0), wc(0)));
+        assert!(!world.is_realized(wc(0), wc(100), wc(0)));
     }
 }
