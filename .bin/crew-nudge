@@ -22,7 +22,6 @@ STATE_DIR="/tmp/crew-nudge-state"
 LOCKFILE="/tmp/crew-nudge.lock"
 LOG="${REPO_ROOT}/.ship-notes/crew-nudge.log"
 PLIST_NAME="com.hash-thing.crew-nudge"
-PLIST_SRC="${REPO_ROOT}/.bin/${PLIST_NAME}.plist"
 PLIST_DST="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
 
 # Cooldowns (seconds)
@@ -47,15 +46,41 @@ done
 # --- Install / Uninstall ---
 
 do_install() {
-    if [ ! -f "$PLIST_SRC" ]; then
-        echo "Error: plist not found at $PLIST_SRC"
-        echo "Generate it first (it should be committed alongside this script)."
-        exit 1
-    fi
-    cp "$PLIST_SRC" "$PLIST_DST"
+    mkdir -p "$(dirname "$LOG")" "$HOME/Library/LaunchAgents"
+    # Generate plist with current REPO_ROOT (not hardcoded)
+    cat > "$PLIST_DST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${REPO_ROOT}/.bin/crew-nudge</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${REPO_ROOT}</string>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${REPO_ROOT}/.ship-notes/crew-nudge-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>${REPO_ROOT}/.ship-notes/crew-nudge-launchd.log</string>
+</dict>
+</plist>
+PLIST
     launchctl bootout "gui/$(id -u)/${PLIST_NAME}" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
-    echo "Installed and loaded ${PLIST_NAME}"
+    echo "Installed and loaded ${PLIST_NAME} (repo: ${REPO_ROOT})"
 }
 
 do_uninstall() {
@@ -197,7 +222,7 @@ for seat in "${SEATS[@]}"; do
 
     # --- Cooldown / Dedupe ---
     state_file="${STATE_DIR}/${seat}.state"
-    current_hash=$(screen_hash "$screen")
+    current_hash=$(screen_hash "$(last_lines "$screen")")
 
     if [ -f "$state_file" ]; then
         last_nudge_time=$(sed -n '1p' "$state_file")
@@ -236,6 +261,21 @@ for seat in "${SEATS[@]}"; do
     fi
 
     # --- Nudge ---
+    # Rate-limited sessions get cooldown only, no nudge (nudging causes re-limiting)
+    if [ "$IS_RATELIMITED" = true ]; then
+        log_msg "RATELIMIT $seat ($surface): detected rate limit, setting ${RATELIMIT_COOLDOWN}s cooldown"
+        printf '%s\n%s\n%s\n' "$now" "$current_hash" "$consecutive" > "$state_file"
+        continue
+    fi
+
+    # Shell prompt means agent exited — `go\n` would be garbage at a shell.
+    # Log it but don't nudge; needs manual restart.
+    if [ "$IDLE_REASON" = "shell-prompt" ]; then
+        log_msg "DEAD $seat ($surface): agent exited to shell — needs manual restart"
+        printf '%s\n%s\n%s\n' "$now" "$current_hash" "$consecutive" > "$state_file"
+        continue
+    fi
+
     nudge_count=$((nudge_count + 1))
 
     if [ "$DRY_RUN" = true ]; then
@@ -243,10 +283,9 @@ for seat in "${SEATS[@]}"; do
     else
         cmux send --surface "$surface" $'go\n'
         log_msg "NUDGE $seat ($surface): reason=$IDLE_REASON consecutive=$consecutive"
+        # Persist state only on actual nudge (not dry-run)
+        printf '%s\n%s\n%s\n' "$now" "$current_hash" "$consecutive" > "$state_file"
     fi
-
-    # Persist state
-    printf '%s\n%s\n%s\n' "$now" "$current_hash" "$((consecutive + 1))" > "$state_file"
 done
 
 if [ "$nudge_count" -eq 0 ] && [ "$DRY_RUN" = true ]; then
