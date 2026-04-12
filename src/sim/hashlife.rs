@@ -961,6 +961,49 @@ mod tests {
     }
 
     #[test]
+    fn recursive_matches_brute_force_level5_stone_only() {
+        // Level 5 = 32³ with inert stone only (no BlockRule).
+        // Exercises deep recursion without Margolus complexity.
+        let mut brute = World::new(5);
+        let mut recur = World::new(5);
+        let mut rng = SimpleRng::new(0xdee5_u64);
+        for z in 0..32u64 {
+            for y in 0..32u64 {
+                for x in 0..32u64 {
+                    if rng.next_u64().is_multiple_of(4) {
+                        brute.set(wc(x), wc(y), wc(z), STONE);
+                        recur.set(wc(x), wc(y), wc(z), STONE);
+                    }
+                }
+            }
+        }
+        assert_recursive_matches_bruteforce(brute, recur, 2, "level5-stone");
+    }
+
+    /// Known bug: BlockRule (Margolus) diverges at level >= 5 (hash-thing-6gf.12).
+    /// Passes at step 0, fails at step 1 — parity/coordinate issue in deep recursion.
+    #[test]
+    #[ignore]
+    fn recursive_matches_brute_force_level5_materials() {
+        let mut brute = World::new(5);
+        let mut recur = World::new(5);
+        seed_random_material_cells(&mut brute, 0xdee5_u64);
+        seed_random_material_cells(&mut recur, 0xdee5_u64);
+        assert_recursive_matches_bruteforce(brute, recur, 2, "level5-materials");
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_level5_gol() {
+        // GoL at level 5 — the CaRule-only path through deep recursion
+        let rule = GameOfLife3D::rule445();
+        let mut brute = gol_world(5, rule, 0xd33f_u64);
+        let mut recur = gol_world(5, rule, 0xd33f_u64);
+        seed_random_alive_cells(&mut brute, 0xd33f_u64 ^ 0xa11ce, 4);
+        seed_random_alive_cells(&mut recur, 0xd33f_u64 ^ 0xa11ce, 4);
+        assert_recursive_matches_bruteforce(brute, recur, 2, "level5-gol-445");
+    }
+
+    #[test]
     fn source_index_all_valid_pairs() {
         assert_eq!(source_index(0, 0), (0, 0));
         assert_eq!(source_index(0, 1), (0, 1));
