@@ -98,22 +98,16 @@ jobs:
         if: matrix.run-tests
         run: cargo test --locked
 
-      # Warn-only until hash-thing-k5r closes out the fmt drift backlog
-      # (store.rs / renderer.rs / svdag.rs / rule.rs / world.rs). rustfmt
+      # Gating: fmt drift backlog is clear (hash-thing-k5r closed). rustfmt
       # output is deterministic across platforms, so running on the ubuntu
-      # leg only is sufficient — no point burning mac+windows minutes on
-      # the same diff. Flip to gating once drift clears.
-      - name: Cargo fmt (warn-only until hash-thing-k5r)
+      # leg only is sufficient.
+      - name: Cargo fmt
         if: matrix.os == 'ubuntu-24.04'
         run: cargo fmt --check
-        continue-on-error: true
 
-      # Warn-only until hash-thing-00f closes out the existing clippy backlog.
-      # Compile errors will already have been caught above by `cargo check`,
-      # so leaving this step at continue-on-error doesn't hide build breakage.
-      - name: Clippy (warn-only until hash-thing-00f)
-        run: cargo clippy --all-targets --locked
-        continue-on-error: true
+      # Gating: clippy backlog is clear (hash-thing-00f closed).
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       # Build release binary for artifact upload (xb7.4).
       - name: Build release binary

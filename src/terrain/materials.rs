@@ -24,6 +24,24 @@ pub const DIRT: CellState = Cell::pack(2, 0).raw();
 /// Material 3, metadata 0.
 pub const GRASS: CellState = Cell::pack(3, 0).raw();
 
+/// Map "depth below the surface y" to a material.
+///
+/// `depth` is `surface_y - cell_y`. Above the surface (`depth < 0`) is `AIR`.
+/// At the surface (`depth == 0`) is `GRASS`. Within `DEPTH_MARGIN` is `DIRT`.
+/// Deeper than that is `STONE`.
+#[inline]
+pub fn material_from_depth(depth: f32) -> CellState {
+    if depth < 0.0 {
+        AIR
+    } else if depth < 1.0 {
+        GRASS
+    } else if depth < 4.0 {
+        DIRT
+    } else {
+        STONE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,23 +72,5 @@ mod tests {
         assert_eq!(material_from_depth(3.9), DIRT);
         assert_eq!(material_from_depth(4.0), STONE);
         assert_eq!(material_from_depth(100.0), STONE);
-    }
-}
-
-/// Map "depth below the surface y" to a material.
-///
-/// `depth` is `surface_y - cell_y`. Above the surface (`depth < 0`) is `AIR`.
-/// At the surface (`depth == 0`) is `GRASS`. Within `DEPTH_MARGIN` is `DIRT`.
-/// Deeper than that is `STONE`.
-#[inline]
-pub fn material_from_depth(depth: f32) -> CellState {
-    if depth < 0.0 {
-        AIR
-    } else if depth < 1.0 {
-        GRASS
-    } else if depth < 4.0 {
-        DIRT
-    } else {
-        STONE
     }
 }
