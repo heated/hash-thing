@@ -120,10 +120,21 @@ struct App {
 impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-        world.seed_burning_room();
+        let terrain_params = terrain::TerrainParams {
+            caves: Some(terrain::CaveParams::default()),
+            ..Default::default()
+        };
+        let stats = world.seed_terrain(&terrain_params);
+        let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
         let material_palette_len = world.materials.color_palette_rgba().len();
 
-        log::info!("Initial CA demo: burning room pop={}", world.population());
+        log::info!(
+            "Initial scene: terrain+caves pop={} nodes={} gen={}µs cave={}µs",
+            world.population(),
+            world.store.stats(),
+            stats.gen_region_us,
+            stats.cave_us,
+        );
         log::debug!("Material registry palette slots={material_palette_len}");
 
         // Start running so materials interact immediately (powder-game feel).
@@ -147,7 +158,7 @@ impl App {
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
-            noise_ns_per_sample: 0.0,
+            noise_ns_per_sample: noise_ns,
             last_frame: std::time::Instant::now(),
             entities: sim::EntityStore::new(),
         };
