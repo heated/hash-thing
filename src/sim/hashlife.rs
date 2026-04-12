@@ -27,7 +27,7 @@
 
 use super::world::World;
 use crate::octree::node::octant_index;
-use crate::octree::{Cell, CellState, NodeId};
+use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 
 const LEVEL3_SIDE: usize = 8;
@@ -105,13 +105,26 @@ impl World {
         if let Some(cached) = self.block_rule_present {
             return cached;
         }
-        let result = self.flatten().into_iter().any(|state| {
-            self.materials
-                .block_rule_id_for_cell(Cell::from_raw(state))
-                .is_some()
-        });
+        let result = self.has_block_rule_in_subtree(self.root);
         self.block_rule_present = Some(result);
         result
+    }
+
+    /// Walk the octree for any cell with a BlockRule. Short-circuits on empty
+    /// nodes — avoids O(n³) flatten for worlds that are mostly empty/inert.
+    fn has_block_rule_in_subtree(&self, node: NodeId) -> bool {
+        if node == NodeId::EMPTY {
+            return false;
+        }
+        match self.store.get(node) {
+            Node::Leaf(state) => self
+                .materials
+                .block_rule_id_for_cell(Cell::from_raw(*state))
+                .is_some(),
+            Node::Interior { children, .. } => {
+                children.iter().any(|&c| self.has_block_rule_in_subtree(c))
+            }
+        }
     }
 
     /// Remap hashlife cache keys and values through a compaction remap table.
