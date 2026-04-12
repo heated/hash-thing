@@ -1,5 +1,6 @@
 use std::fmt;
 
+use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
@@ -89,6 +90,9 @@ pub struct World {
     /// Key: (NodeId, world-space origin). Value: stepped result NodeId.
     /// Cleared after each generation and on rule changes.
     pub(crate) hashlife_cache: FxHashMap<(NodeId, [i64; 3], u32), NodeId>,
+    /// Pending world mutations. Entities push here; `apply_mutations`
+    /// drains and applies in arrival order at tick boundary.
+    pub queue: MutationQueue,
 }
 
 impl World {
@@ -118,6 +122,7 @@ impl World {
             materials,
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
+            queue: MutationQueue::new(),
         }
     }
 
@@ -335,6 +340,46 @@ impl World {
     /// Flatten to a 3D grid for rendering.
     pub fn flatten(&self) -> Vec<CellState> {
         self.store.flatten(self.root, self.side())
+    }
+
+    /// Drain the mutation queue and apply every pending mutation to the
+    /// octree in arrival order. This is the only path for entity-produced
+    /// edits to reach the world (closed-world invariant, hash-thing-1v0.9).
+    pub fn apply_mutations(&mut self) {
+        for m in self.queue.take() {
+            match m {
+                WorldMutation::SetCell { x, y, z, state } => {
+                    self.set(x, y, z, state);
+                }
+                WorldMutation::FillRegion { min, max, state } => {
+                    debug_assert!(
+                        min[0].0 <= max[0].0 && min[1].0 <= max[1].0 && min[2].0 <= max[2].0,
+                        "FillRegion: min must be <= max on every axis"
+                    );
+                    for z in min[2].0..=max[2].0 {
+                        for y in min[1].0..=max[1].0 {
+                            for x in min[0].0..=max[0].0 {
+                                self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Advance the CA by one generation with mutation-queue guard.
+    ///
+    /// Debug-asserts that the queue is empty on entry — if it isn't,
+    /// the caller forgot `apply_mutations` and the step cache would
+    /// see stale world state.
+    pub fn step_ca(&mut self) {
+        debug_assert!(
+            self.queue.is_empty(),
+            "step_ca called with {} pending mutations — call apply_mutations first",
+            self.queue.len()
+        );
+        self.step();
     }
 
     /// Step the simulation forward one generation.
@@ -1780,5 +1825,100 @@ mod tests {
         assert!(!world.is_realized(WorldCoord(-1), wc(0), wc(0)));
         assert!(!world.is_realized(wc(8), wc(0), wc(0)));
         assert!(!world.is_realized(wc(0), wc(100), wc(0)));
+    }
+
+    // --- Mutation channel tests (hash-thing-1v0.9) ---
+
+    #[test]
+    fn apply_mutations_drains_and_applies() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(1),
+            y: wc(2),
+            z: wc(3),
+            state: STONE,
+        });
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(4),
+            y: wc(5),
+            z: wc(6),
+            state: STONE,
+        });
+        assert_eq!(world.queue.len(), 2);
+        world.apply_mutations();
+        assert!(world.queue.is_empty());
+        assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
+        assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    #[test]
+    fn apply_mutations_last_write_wins() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(3),
+            y: wc(3),
+            z: wc(3),
+            state: STONE,
+        });
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(3),
+            y: wc(3),
+            z: wc(3),
+            state: Cell::pack(WATER_MATERIAL_ID, 0).raw(),
+        });
+        world.apply_mutations();
+        assert_eq!(
+            world.get(wc(3), wc(3), wc(3)),
+            Cell::pack(WATER_MATERIAL_ID, 0).raw()
+        );
+    }
+
+    #[test]
+    fn fill_region_covers_inclusive_box() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::FillRegion {
+            min: [wc(1), wc(1), wc(1)],
+            max: [wc(3), wc(3), wc(3)],
+            state: STONE,
+        });
+        world.apply_mutations();
+        // All 27 cells (3×3×3) should be stone.
+        let mut count = 0;
+        for z in 1..=3 {
+            for y in 1..=3 {
+                for x in 1..=3 {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 27);
+    }
+
+    #[test]
+    fn step_ca_runs_clean_on_empty_queue() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), STONE);
+        world.step_ca(); // should not panic
+        assert_eq!(world.generation, 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pending mutations")]
+    fn step_ca_panics_with_pending_mutations() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(1),
+            y: wc(1),
+            z: wc(1),
+            state: STONE,
+        });
+        world.step_ca(); // should panic
     }
 }
