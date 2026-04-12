@@ -67,6 +67,7 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
     world: sim::World,
+    gol_smoke_rule: sim::GameOfLife3D,
     gol_smoke_scene: bool,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
@@ -138,6 +139,7 @@ impl App {
             window: None,
             renderer: None,
             world,
+            gol_smoke_rule: sim::GameOfLife3D::rule445(),
             gol_smoke_scene: false,
             svdag: render::Svdag::new(),
             paused: true,
@@ -179,6 +181,18 @@ impl App {
             *last_svdag_stats = (svdag.node_count, svdag.byte_size(), svdag.root_level);
             renderer.upload_svdag(svdag);
         }
+    }
+
+    fn select_rule(&mut self, rule: sim::GameOfLife3D, label: &str) {
+        self.gol_smoke_rule = rule;
+        self.world.invalidate_rule_caches();
+        if self.gol_smoke_scene {
+            self.world.set_gol_smoke_rule(self.gol_smoke_rule);
+            if let Some(renderer) = &mut self.renderer {
+                renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            }
+        }
+        log::info!("Rule: {label}");
     }
 }
 
@@ -382,8 +396,7 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("g") => {
                             // Swap to the single retained GoL smoke seed.
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-                            self.world.materials =
-                                terrain::materials::MaterialRegistry::gol_smoke();
+                            self.world.set_gol_smoke_rule(self.gol_smoke_rule);
                             self.world.seed_center(12, 0.35);
                             self.gol_smoke_scene = true;
                             self.paused = true;
@@ -399,6 +412,18 @@ impl ApplicationHandler for App {
                                 &mut self.last_svdag_stats,
                             );
                             log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
+                        }
+                        winit::keyboard::Key::Character("1") => {
+                            self.select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba");
+                        }
+                        winit::keyboard::Key::Character("2") => {
+                            self.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
+                        }
+                        winit::keyboard::Key::Character("3") => {
+                            self.select_rule(sim::GameOfLife3D::rule445(), "445");
+                        }
+                        winit::keyboard::Key::Character("4") => {
+                            self.select_rule(sim::GameOfLife3D::new(4, 7, 6, 8), "Pyroclastic");
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
@@ -595,4 +620,23 @@ fn main() {
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hash_thing::octree::Cell;
+
+    #[test]
+    fn select_rule_clears_world_step_cache() {
+        let mut app = App::new();
+        let input = app.world.store.leaf(Cell::pack(1, 0).raw());
+        let output = app.world.store.leaf(Cell::pack(2, 0).raw());
+        app.world.store.cache_step(input, output);
+        assert_eq!(app.world.store.get_cached_step(input), Some(output));
+
+        app.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
+
+        assert_eq!(app.world.store.get_cached_step(input), None);
+    }
 }
