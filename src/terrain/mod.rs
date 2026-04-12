@@ -34,6 +34,9 @@ pub struct TerrainParams {
     /// path unchanged — tests and perf baselines don't see caves unless
     /// a caller opts in.
     pub caves: Option<CaveParams>,
+    /// When `Some`, carve dungeons (rooms + corridors in deep stone)
+    /// after caves. Default `None` skips the pass.
+    pub dungeons: Option<DungeonParams>,
 }
 
 impl Default for TerrainParams {
@@ -47,6 +50,7 @@ impl Default for TerrainParams {
             wavelength: 24.0,
             octaves: 4,
             caves: None,
+            dungeons: None,
         }
     }
 }
