@@ -7,6 +7,7 @@
 use std::fmt;
 
 use crate::octree::{Cell, CellState};
+use crate::sim::margolus::FluidBlockRule;
 use crate::sim::rule::{BlockRule, CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
 
 pub type MaterialId = u16;
@@ -27,13 +28,30 @@ pub const GRASS: CellState = Cell::pack(GRASS_MATERIAL_ID, 0).raw();
 pub const FIRE: CellState = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
 pub const WATER: CellState = Cell::pack(WATER_MATERIAL_ID, 0).raw();
 
+/// Density lookup for block rules (gravity, fluid). Maps material ID → density.
+///
+/// Values here must match `MaterialPhysicalProperties::density` in `terrain_defaults()`.
+/// If a material is missing, it gets density 0.0 (floats like air).
+pub fn material_density(cell: Cell) -> f32 {
+    if cell.is_empty() {
+        return 0.0;
+    }
+    match cell.material() {
+        STONE_MATERIAL_ID => 5.0,
+        DIRT_MATERIAL_ID => 2.0,
+        GRASS_MATERIAL_ID => 1.2,
+        WATER_MATERIAL_ID => 1.0,
+        FIRE_MATERIAL_ID => 0.05,
+        _ => 0.0,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockRuleId(pub usize);
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaterialVisualProperties {
     pub label: &'static str,
@@ -41,7 +59,6 @@ pub struct MaterialVisualProperties {
     pub texture_ref: Option<u32>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaterialPhysicalProperties {
     pub density: f32,
@@ -49,7 +66,6 @@ pub struct MaterialPhysicalProperties {
     pub conductivity: f32,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaterialEntry {
     pub visual: MaterialVisualProperties,
@@ -93,6 +109,8 @@ impl MaterialRegistry {
             reactive_material: FIRE_MATERIAL_ID,
             reaction_product: Cell::pack(STONE_MATERIAL_ID, 0),
         });
+        let fluid_block_rule =
+            registry.register_block_rule(FluidBlockRule::new(material_density, WATER_MATERIAL_ID));
 
         registry.insert(
             AIR_MATERIAL_ID,
@@ -193,14 +211,18 @@ impl MaterialRegistry {
                     conductivity: 0.6,
                 },
                 rule_id: water_rule,
-                block_rule_id: None,
+                block_rule_id: Some(fluid_block_rule),
             },
         );
 
         registry
     }
 
-    pub fn gol_smoke(rule: GameOfLife3D) -> Self {
+    pub fn gol_smoke() -> Self {
+        Self::gol_smoke_with_rule(GameOfLife3D::rule445())
+    }
+
+    pub(crate) fn gol_smoke_with_rule(rule: GameOfLife3D) -> Self {
         let mut registry = Self::terrain_defaults();
         let rule_id = registry.register_rule(rule);
         registry.assign_rule(AIR_MATERIAL_ID, rule_id);
@@ -219,7 +241,6 @@ impl MaterialRegistry {
         Some(self.rules[entry.rule_id.0].as_ref())
     }
 
-    #[allow(dead_code)]
     pub fn block_rule_for_cell(&self, cell: Cell) -> Option<&dyn BlockRule> {
         let entry = self.entry(cell.material())?;
         let block_rule_id = entry.block_rule_id?;
@@ -250,7 +271,6 @@ impl MaterialRegistry {
         rule_id
     }
 
-    #[allow(dead_code)]
     pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
     where
         R: BlockRule + 'static,
@@ -260,7 +280,6 @@ impl MaterialRegistry {
         id
     }
 
-    #[allow(dead_code)]
     pub fn assign_block_rule(&mut self, material_id: MaterialId, block_rule_id: BlockRuleId) {
         self.entries[material_id as usize]
             .as_mut()
@@ -540,7 +559,7 @@ mod tests {
 
     #[test]
     fn gol_smoke_overrides_air_and_alive_dispatch() {
-        let registry = MaterialRegistry::gol_smoke(GameOfLife3D::rule445());
+        let registry = MaterialRegistry::gol_smoke();
         let neighbors = [Cell::pack(STONE_MATERIAL_ID, 0); 26];
 
         assert_eq!(
@@ -561,7 +580,7 @@ mod tests {
 
     #[test]
     fn gol_smoke_preserves_non_overridden_material_dispatch() {
-        let registry = MaterialRegistry::gol_smoke(GameOfLife3D::rule445());
+        let registry = MaterialRegistry::gol_smoke();
         let fire_neighbors = [Cell::pack(FIRE_MATERIAL_ID, 0); 26];
 
         assert_eq!(
@@ -642,5 +661,63 @@ mod tests {
         assert!(s.contains("stone"), "Display must list stone");
         assert!(s.contains("fire"), "Display must list fire");
         assert!(s.contains("MaterialRegistry"), "Display must have header");
+    }
+
+    #[test]
+    fn material_density_matches_registry() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let ids = [
+            AIR_MATERIAL_ID,
+            STONE_MATERIAL_ID,
+            DIRT_MATERIAL_ID,
+            GRASS_MATERIAL_ID,
+            FIRE_MATERIAL_ID,
+            WATER_MATERIAL_ID,
+        ];
+        for &id in &ids {
+            let cell = if id == AIR_MATERIAL_ID {
+                Cell::EMPTY
+            } else {
+                Cell::pack(id, 0)
+            };
+            let fn_density = material_density(cell);
+            let reg_density = registry.entry(id).unwrap().physical.density;
+            assert!(
+                (fn_density - reg_density).abs() < f32::EPSILON,
+                "material_density({}) = {fn_density}, registry = {reg_density}",
+                registry.entry(id).unwrap().visual.label
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_defaults_water_has_block_rule() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let water = registry.entry(WATER_MATERIAL_ID).unwrap();
+        assert!(
+            water.block_rule_id.is_some(),
+            "water must have a block rule for fluid flow"
+        );
+    }
+
+    #[test]
+    fn terrain_defaults_stone_grass_no_block_rule() {
+        let registry = MaterialRegistry::terrain_defaults();
+        assert!(
+            registry
+                .entry(STONE_MATERIAL_ID)
+                .unwrap()
+                .block_rule_id
+                .is_none(),
+            "stone should not have a block rule"
+        );
+        assert!(
+            registry
+                .entry(GRASS_MATERIAL_ID)
+                .unwrap()
+                .block_rule_id
+                .is_none(),
+            "grass should not have a block rule"
+        );
     }
 }

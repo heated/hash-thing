@@ -11,24 +11,6 @@ pub struct NodeStore {
     nodes: Vec<Node>,
     /// Reverse lookup: node -> its canonical id.
     intern: FxHashMap<Node, NodeId>,
-    /// Memoized step results: `node_id -> result_node_id`.
-    ///
-    /// The result of a level-n node is the center (level n-1) cube after
-    /// 2^(n-2) steps.
-    ///
-    /// **Caller contract — read this before adding a memoized stepper:**
-    ///
-    /// The key is `NodeId` only. Rule identity is *not* part of the key.
-    /// Callers must invoke [`Self::clear_step_cache`] whenever the active
-    /// rule changes, or the cache will return stale results from the
-    /// previous rule. The brute-force `World::step` path bypasses this
-    /// cache entirely, so today the contract is dormant — but the moment
-    /// hash-thing-6gf.1 lands a memoized recursive stepper, every code path
-    /// that swaps rules must clear the cache.
-    ///
-    /// hash-thing-6gf.2 will widen the key to a struct that includes rule
-    /// identity (and the recursion phase), retiring this contract.
-    step_cache: FxHashMap<NodeId, NodeId>,
 }
 
 impl Default for NodeStore {
@@ -42,7 +24,6 @@ impl NodeStore {
         let mut store = Self {
             nodes: Vec::new(),
             intern: FxHashMap::default(),
-            step_cache: FxHashMap::default(),
         };
         // Reserve NodeId(0) as the canonical empty leaf.
         let empty = store.intern_node(Node::Leaf(0));
@@ -56,7 +37,9 @@ impl NodeStore {
         if let Some(&id) = self.intern.get(&node) {
             return id;
         }
-        let id = NodeId(self.nodes.len() as u32);
+        let id = NodeId(
+            u32::try_from(self.nodes.len()).expect("NodeStore overflow: exceeded 2^32 nodes"),
+        );
         self.intern.insert(node.clone(), id);
         self.nodes.push(node);
         id
@@ -110,7 +93,6 @@ impl NodeStore {
     }
 
     /// Get children of an interior node. Panics if called on a leaf.
-    #[allow(dead_code)]
     pub fn children(&self, id: NodeId) -> [NodeId; 8] {
         match self.get(id) {
             Node::Interior { children, .. } => *children,
@@ -119,7 +101,6 @@ impl NodeStore {
     }
 
     /// Get a specific child by octant index.
-    #[allow(dead_code)]
     pub fn child(&self, id: NodeId, octant: usize) -> NodeId {
         self.children(id)[octant]
     }
@@ -219,7 +200,6 @@ impl NodeStore {
     ///
     /// Footgun: `root` must be a real world root. `NodeId::EMPTY` has level
     /// 0, so every non-origin coordinate reflects to 0 via the OOB branch.
-    #[allow(dead_code)]
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         let level = self.get(root).level();
         let side = 1u64 << level;
@@ -364,33 +344,108 @@ impl NodeStore {
         self.interior(level, children)
     }
 
-    /// Cache a step result.
-    #[allow(dead_code)]
-    pub fn cache_step(&mut self, input: NodeId, result: NodeId) {
-        self.step_cache.insert(input, result);
-    }
+    // ---- Extraction primitives (hash-thing-6gf.6) ----
 
-    /// Look up a cached step result.
-    #[allow(dead_code)]
-    pub fn get_cached_step(&self, input: NodeId) -> Option<NodeId> {
-        self.step_cache.get(&input).copied()
-    }
-
-    /// Clear the step cache.
+    /// Extract the 26 Moore neighbors of a cell, wrapping toroidally.
     ///
-    /// **Must be called whenever the active rule changes.** The cache key is
-    /// `NodeId` only — see the `step_cache` field doc for the full contract.
-    /// Failure to clear after a rule swap will silently return stale results
-    /// from the previous rule once a memoized stepper is in place
-    /// (hash-thing-6gf.1).
-    #[allow(dead_code)]
-    pub fn clear_step_cache(&mut self) {
-        self.step_cache.clear();
+    /// Returns `[Cell; 26]` in the same order as `sim::world::get_neighbors`:
+    /// all (dx, dy, dz) offsets in {-1, 0, +1}³ excluding (0,0,0), iterated
+    /// z-outer / y-middle / x-inner, skipping the center.
+    ///
+    /// Coordinates wrap via `rem_euclid(side)` so this is a torus — matching
+    /// the CaRule boundary semantics established in the brute-force stepper.
+    ///
+    /// **Performance note:** calls `get_cell` 26 times, each walking the tree
+    /// from root. For bulk extraction over an entire grid this is worse than
+    /// `flatten()` + grid indexing. The intended use is the recursive Hashlife
+    /// stepper's base case, where the neighborhood is extracted from a small
+    /// (level-2 or level-3) subtree with context, not the full world root.
+    pub fn extract_neighborhood(
+        &self,
+        root: NodeId,
+        side: i64,
+        x: i64,
+        y: i64,
+        z: i64,
+    ) -> [Cell; 26] {
+        let mut neighbors = [Cell::EMPTY; 26];
+        let mut idx = 0;
+        for dz in [-1i64, 0, 1] {
+            for dy in [-1i64, 0, 1] {
+                for dx in [-1i64, 0, 1] {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nx = (x + dx).rem_euclid(side) as u64;
+                    let ny = (y + dy).rem_euclid(side) as u64;
+                    let nz = (z + dz).rem_euclid(side) as u64;
+                    neighbors[idx] = Cell::from_raw(self.get_cell(root, nx, ny, nz));
+                    idx += 1;
+                }
+            }
+        }
+        neighbors
+    }
+
+    /// Extract an axis-aligned 2×2×2 block starting at `(bx, by, bz)`.
+    ///
+    /// Returns `[Cell; 8]` indexed by `block_index(dx, dy, dz)` — the same
+    /// convention as `sim::rule::block_index`. Coordinates are absolute
+    /// world-space; no wrapping (cells outside the tree return empty via
+    /// `get_cell`'s OOB contract).
+    ///
+    /// Useful for Margolus-partition extraction in the recursive stepper.
+    pub fn extract_block_2x2x2(&self, root: NodeId, bx: u64, by: u64, bz: u64) -> [Cell; 8] {
+        let mut block = [Cell::EMPTY; 8];
+        for dz in 0..2u64 {
+            for dy in 0..2u64 {
+                for dx in 0..2u64 {
+                    let idx = super::node::octant_index(dx as u32, dy as u32, dz as u32);
+                    block[idx] = Cell::from_raw(self.get_cell(root, bx + dx, by + dy, bz + dz));
+                }
+            }
+        }
+        block
+    }
+
+    /// Flatten an arbitrary axis-aligned sub-box of the octree into a flat
+    /// 3D array.
+    ///
+    /// Returns a `Vec<CellState>` of size `w * h * d`, indexed as
+    /// `[lx + ly * w + lz * w * h]` where `(lx, ly, lz)` are local
+    /// coordinates within the box.
+    ///
+    /// Coordinates outside the tree silently return 0 (via `get_cell`'s OOB
+    /// contract). This lets callers request a region that extends past the
+    /// tree boundary to capture border context for the recursive stepper.
+    ///
+    /// **Performance note:** calls `get_cell` once per voxel. For large
+    /// regions, `flatten()` + sub-indexing is faster. This is designed for
+    /// small regions (e.g. a level-2 subtree + 1-cell border = 6×6×6 = 216
+    /// cells) where the setup cost of a full flatten dominates.
+    pub fn flatten_region(
+        &self,
+        root: NodeId,
+        origin: [u64; 3],
+        extent: [usize; 3],
+    ) -> Vec<CellState> {
+        let [w, h, d] = extent;
+        let [x0, y0, z0] = origin;
+        let mut grid = vec![0 as CellState; w * h * d];
+        for lz in 0..d {
+            for ly in 0..h {
+                for lx in 0..w {
+                    grid[lx + ly * w + lz * w * h] =
+                        self.get_cell(root, x0 + lx as u64, y0 + ly as u64, z0 + lz as u64);
+                }
+            }
+        }
+        grid
     }
 
     /// Stats for debugging.
-    pub fn stats(&self) -> (usize, usize) {
-        (self.nodes.len(), self.step_cache.len())
+    pub fn stats(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Return a fresh `NodeStore` containing only the nodes reachable from
@@ -412,19 +467,7 @@ impl NodeStore {
     /// lives at slot 0. All other NodeIds from `self` are invalid against
     /// the returned store and must not be mixed.
     ///
-    /// ## Cache lifetime
-    ///
-    /// `compacted` cannot currently preserve `step_cache`: the cache is
-    /// keyed on `NodeId`, and the new store uses a fresh id space. The
-    /// `debug_assert!` below enforces "cache lifetime == store epoch" —
-    /// callers must clear the step cache before compacting (or, once
-    /// hash-thing-6gf.2 lands, the memoization layer must live outside
-    /// `NodeStore` or remap across compaction).
     pub fn compacted(&self, root: NodeId) -> (NodeStore, NodeId) {
-        debug_assert!(
-            self.step_cache.is_empty(),
-            "compacted() cannot preserve step_cache yet — see hash-thing-6gf.2"
-        );
         let mut dst = NodeStore::new();
         let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
         // Pre-seed EMPTY as a perf short-circuit. Note: this is NOT
@@ -838,39 +881,19 @@ mod tests {
         let grid = vec![0 as CellState; side * side * side];
         let mut store = NodeStore::new();
         let _root = store.from_flat(&grid, side);
-        let (nodes, _) = store.stats();
+        let nodes = store.stats();
         // 7 levels (leaf through level 6), one canonical node per level.
         assert_eq!(nodes, 7, "expected 7 nodes for an empty 64^3, got {nodes}");
     }
 
-    /// Step cache round-trip. Not exercising Hashlife yet — just that
-    /// insert / lookup / clear behave.
+    /// `stats()` reports node count.
     #[test]
-    fn step_cache_insert_lookup_clear() {
+    fn stats_tracks_nodes() {
         let mut store = NodeStore::new();
-        let a = store.leaf(mat(1));
-        let b = store.leaf(mat(2));
-        assert_eq!(store.get_cached_step(a), None);
-        store.cache_step(a, b);
-        assert_eq!(store.get_cached_step(a), Some(b));
-        store.clear_step_cache();
-        assert_eq!(store.get_cached_step(a), None);
-    }
-
-    /// `stats()` reports (nodes, cache_len).
-    #[test]
-    fn stats_tracks_nodes_and_cache() {
-        let mut store = NodeStore::new();
-        let (n0, c0) = store.stats();
-        assert_eq!(n0, 1); // just the empty leaf
-        assert_eq!(c0, 0);
-        let a = store.leaf(mat(1));
-        let b = store.leaf(mat(2));
-        let (n1, _) = store.stats();
-        assert_eq!(n1, 3);
-        store.cache_step(a, b);
-        let (_, c1) = store.stats();
-        assert_eq!(c1, 1);
+        assert_eq!(store.stats(), 1); // just the empty leaf
+        store.leaf(mat(1));
+        store.leaf(mat(2));
+        assert_eq!(store.stats(), 3);
     }
 
     /// Regression for hash-thing-7rq: when an Interior's child is a Leaf that
@@ -978,12 +1001,11 @@ mod tests {
         let store = NodeStore::new();
         let (compacted, new_root) = store.compacted(NodeId::EMPTY);
         assert_eq!(new_root, NodeId::EMPTY);
-        let (nodes, cache) = compacted.stats();
         assert_eq!(
-            nodes, 1,
+            compacted.stats(),
+            1,
             "empty compaction should yield only the canonical empty leaf"
         );
-        assert_eq!(cache, 0);
     }
 
     /// T2: after one `set_cell`, compaction's node count matches a
@@ -995,7 +1017,7 @@ mod tests {
         let mut a = NodeStore::new();
         let mut root_a = a.empty(6);
         root_a = a.set_cell(root_a, 10, 20, 30, mat(7));
-        let pre_nodes = a.stats().0;
+        let pre_nodes = a.stats();
         let (compacted_a, new_root_a) = a.compacted(root_a);
 
         // Build store B: a fresh one-cell world — empty(6), set the same cell.
@@ -1006,15 +1028,15 @@ mod tests {
         let (compacted_b, _new_root_b) = b.compacted(root_b);
 
         assert_eq!(
-            compacted_a.stats().0,
-            compacted_b.stats().0,
+            compacted_a.stats(),
+            compacted_b.stats(),
             "compacted one-cell world should match fresh one-cell world node count"
         );
         assert!(
-            compacted_a.stats().0 < pre_nodes,
+            compacted_a.stats() < pre_nodes,
             "compaction should drop dead clone-path nodes ({} → {})",
             pre_nodes,
-            compacted_a.stats().0
+            compacted_a.stats()
         );
         // Cell round-trip.
         assert_eq!(compacted_a.get_cell(new_root_a, 10, 20, 30), mat(7));
@@ -1043,13 +1065,13 @@ mod tests {
             }
             root = store.from_flat(&grid, side);
         }
-        let pre_nodes = store.stats().0;
+        let pre_nodes = store.stats();
         let (compacted, new_root) = store.compacted(root);
         assert!(
-            compacted.stats().0 <= pre_nodes,
+            compacted.stats() <= pre_nodes,
             "compaction should not grow the store ({} → {})",
             pre_nodes,
-            compacted.stats().0
+            compacted.stats()
         );
         // Every cell under the final root must match.
         for z in 0..side {
@@ -1229,11 +1251,11 @@ mod tests {
         let (once, root_once) = dirty.compacted(root);
         let (twice, root_twice) = once.compacted(root_once);
         assert_eq!(
-            once.stats().0,
-            twice.stats().0,
+            once.stats(),
+            twice.stats(),
             "compaction is not idempotent ({} → {})",
-            once.stats().0,
-            twice.stats().0
+            once.stats(),
+            twice.stats()
         );
         // Cell-by-cell equality across the two compactions.
         for z in 0..side {
@@ -1341,6 +1363,126 @@ mod tests {
     }
 
     // ===========================================================================
+    // Targeted gap-fills (hash-thing-6gf.5).
+    // ===========================================================================
+
+    /// `uniform()` with a nonzero state builds a tree where every cell
+    /// reads back as that state. Distinct from `empty()` which only
+    /// exercises `uniform(level, 0)`.
+    #[test]
+    fn uniform_nonzero_fills_all_cells() {
+        let mut store = NodeStore::new();
+        let root = store.uniform(3, mat(4)); // 8x8x8 all material 4
+        for z in 0..8u64 {
+            for y in 0..8u64 {
+                for x in 0..8u64 {
+                    assert_eq!(
+                        store.get_cell(root, x, y, z),
+                        mat(4),
+                        "cell ({x},{y},{z}) should be mat(4)",
+                    );
+                }
+            }
+        }
+        // Population = 512 (all cells live).
+        assert_eq!(store.population(root), 512);
+    }
+
+    /// Two `uniform()` calls with the same (level, state) return the
+    /// same NodeId — the dedup invariant applies to uniform trees too.
+    #[test]
+    fn uniform_dedup() {
+        let mut store = NodeStore::new();
+        let a = store.uniform(4, mat(3));
+        let b = store.uniform(4, mat(3));
+        assert_eq!(a, b);
+        // Different state → different id.
+        let c = store.uniform(4, mat(5));
+        assert_ne!(a, c);
+    }
+
+    /// `children()` and `child()` return the correct sub-nodes.
+    #[test]
+    fn children_and_child_accessors() {
+        let mut store = NodeStore::new();
+        let l0 = store.leaf(0);
+        let l1 = store.leaf(mat(1));
+        let l2 = store.leaf(mat(2));
+        let kids = [l0, l1, l2, l0, l1, l2, l0, l1];
+        let parent = store.interior(1, kids);
+        assert_eq!(store.children(parent), kids);
+        for (i, &expected) in kids.iter().enumerate() {
+            assert_eq!(store.child(parent, i), expected, "child({i})");
+        }
+    }
+
+    /// `children()` panics on a leaf node.
+    #[test]
+    #[should_panic(expected = "children()")]
+    fn children_panics_on_leaf() {
+        let store = NodeStore::new();
+        store.children(NodeId::EMPTY);
+    }
+
+    /// `Default::default()` produces the same store as `new()`.
+    #[test]
+    fn default_matches_new() {
+        let a = NodeStore::new();
+        let b = NodeStore::default();
+        assert_eq!(a.stats(), b.stats());
+        assert!(matches!(a.get(NodeId::EMPTY), Node::Leaf(0)));
+        assert!(matches!(b.get(NodeId::EMPTY), Node::Leaf(0)));
+    }
+
+    /// Nonzero metadata survives set/get roundtrip. Previous tests all
+    /// use `mat()` which packs metadata=0; this verifies the full 16-bit
+    /// `CellState` word is preserved.
+    #[test]
+    fn metadata_survives_roundtrip() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3);
+        // material=5, metadata=42
+        let cell = Cell::pack(5, 42).raw();
+        root = store.set_cell(root, 3, 3, 3, cell);
+        let got = store.get_cell(root, 3, 3, 3);
+        assert_eq!(got, cell);
+        let decoded = Cell::from_raw(got);
+        assert_eq!(decoded.material(), 5);
+        assert_eq!(decoded.metadata(), 42);
+    }
+
+    /// Writing the same cell twice replaces the first value.
+    #[test]
+    fn set_cell_overwrites_previous() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3);
+        root = store.set_cell(root, 2, 2, 2, mat(7));
+        assert_eq!(store.get_cell(root, 2, 2, 2), mat(7));
+        root = store.set_cell(root, 2, 2, 2, mat(11));
+        assert_eq!(store.get_cell(root, 2, 2, 2), mat(11));
+        // Overwriting with 0 (empty) also works.
+        root = store.set_cell(root, 2, 2, 2, 0);
+        assert_eq!(store.get_cell(root, 2, 2, 2), 0);
+    }
+
+    /// `from_flat` / `flatten` roundtrip preserves nonzero metadata.
+    #[test]
+    fn from_flat_flatten_preserves_metadata() {
+        let side = 4usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        // Pack (material=3, metadata=17) at a few cells.
+        let cell_a = Cell::pack(3, 17).raw();
+        let cell_b = Cell::pack(7, 63).raw(); // max metadata
+        grid[0] = cell_a;
+        grid[side * side * side - 1] = cell_b;
+
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+        let out = store.flatten(root, side);
+        assert_eq!(out, grid);
+    }
+
+    // ===========================================================================
     // Bounds-check tests (hash-thing-fb5 / 819 bug-fix half).
     //
     // set_cell panics on OOB writes; get_cell silently returns 0 on OOB reads.
@@ -1430,5 +1572,216 @@ mod tests {
         let _ = store.get_cell(root, 0, 4, 0);
         let _ = store.get_cell(root, 0, 0, 4);
         let _ = store.get_cell(root, u64::MAX, u64::MAX, u64::MAX);
+    }
+
+    // ---- Extraction primitives (hash-thing-6gf.6) ----
+
+    /// `extract_neighborhood` returns the correct 26 Moore neighbors for
+    /// a cell in the interior of a small world, matching the flat-grid
+    /// `get_neighbors` used by the brute-force stepper.
+    #[test]
+    fn extract_neighborhood_interior_cell() {
+        let side = 4usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        // Place distinct materials at each cell so we can verify neighbor order.
+        // Only use material ids 1..=7 to stay within a small set.
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let id = ((x + y * 4 + z * 16) % 7 + 1) as u16;
+                    grid[x + y * side + z * side * side] = mat(id);
+                }
+            }
+        }
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+
+        // Check cell (1,1,1) — all neighbors are in-bounds, no wrapping.
+        let neighbors = store.extract_neighborhood(root, side as i64, 1, 1, 1);
+        let mut expected = [Cell::EMPTY; 26];
+        let mut idx = 0;
+        for dz in [-1i64, 0, 1] {
+            for dy in [-1i64, 0, 1] {
+                for dx in [-1i64, 0, 1] {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nx = (1 + dx) as usize;
+                    let ny = (1 + dy) as usize;
+                    let nz = (1 + dz) as usize;
+                    expected[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                    idx += 1;
+                }
+            }
+        }
+        assert_eq!(neighbors, expected);
+    }
+
+    /// `extract_neighborhood` wraps toroidally: neighbors of a corner
+    /// cell pull from the opposite side of the world.
+    #[test]
+    fn extract_neighborhood_wraps_toroidally() {
+        let side = 4usize;
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // 4x4x4
+                                       // Place a marker at (3,3,3) — the far corner.
+        root = store.set_cell(root, 3, 3, 3, mat(5));
+        // Neighbor of (0,0,0) in direction (-1,-1,-1) should wrap to (3,3,3).
+        let neighbors = store.extract_neighborhood(root, side as i64, 0, 0, 0);
+        // Direction (-1,-1,-1) is the first element in the iteration order
+        // (dz=-1, dy=-1, dx=-1, idx=0).
+        assert_eq!(neighbors[0], Cell::from_raw(mat(5)));
+    }
+
+    /// `extract_block_2x2x2` returns the correct 8 cells for an
+    /// axis-aligned block.
+    #[test]
+    fn extract_block_2x2x2_matches_cells() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3); // 8x8x8
+                                       // Place materials in a 2x2x2 block at (2,4,6).
+        let coords = [
+            (2, 4, 6),
+            (3, 4, 6),
+            (2, 5, 6),
+            (3, 5, 6),
+            (2, 4, 7),
+            (3, 4, 7),
+            (2, 5, 7),
+            (3, 5, 7),
+        ];
+        for (i, &(x, y, z)) in coords.iter().enumerate() {
+            root = store.set_cell(root, x, y, z, mat((i + 1) as u16));
+        }
+
+        let block = store.extract_block_2x2x2(root, 2, 4, 6);
+        for dz in 0..2u64 {
+            for dy in 0..2u64 {
+                for dx in 0..2u64 {
+                    let idx = super::super::node::octant_index(dx as u32, dy as u32, dz as u32);
+                    let expected = mat((dx + dy * 2 + dz * 4 + 1) as u16);
+                    assert_eq!(
+                        block[idx],
+                        Cell::from_raw(expected),
+                        "block[{idx}] at offset ({dx},{dy},{dz})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `extract_block_2x2x2` returns empty cells for OOB coordinates.
+    #[test]
+    fn extract_block_2x2x2_oob_returns_empty() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2); // 4x4x4
+                                   // Block starting at (3,3,3) extends to (4,4,4) — half OOB.
+        let block = store.extract_block_2x2x2(root, 3, 3, 3);
+        // Only (3,3,3) is in-bounds; the rest are OOB → empty.
+        // All should be empty since the tree is empty.
+        for cell in &block {
+            assert_eq!(*cell, Cell::EMPTY);
+        }
+    }
+
+    /// `flatten_region` matches cell-by-cell `get_cell` reads.
+    #[test]
+    fn flatten_region_matches_get_cell() {
+        let side = 8usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let id = ((x ^ y ^ z) & 0x7) as u16;
+                    grid[x + y * side + z * side * side] = if id == 0 { 0 } else { mat(id) };
+                }
+            }
+        }
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+
+        // Extract a 3x3x3 sub-box at (2,3,4).
+        let region = store.flatten_region(root, [2, 3, 4], [3, 3, 3]);
+        assert_eq!(region.len(), 27);
+        for lz in 0..3usize {
+            for ly in 0..3usize {
+                for lx in 0..3usize {
+                    let expected =
+                        store.get_cell(root, 2 + lx as u64, 3 + ly as u64, 4 + lz as u64);
+                    assert_eq!(
+                        region[lx + ly * 3 + lz * 3 * 3],
+                        expected,
+                        "region({lx},{ly},{lz})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `flatten_region` silently returns 0 for coordinates past the tree.
+    #[test]
+    fn flatten_region_oob_returns_zero() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // 4x4x4
+        root = store.set_cell(root, 3, 3, 3, mat(1));
+
+        // Region (3,3,3) to (4,4,4) — extends 1 cell past the tree edge.
+        let region = store.flatten_region(root, [3, 3, 3], [2, 2, 2]);
+        assert_eq!(region.len(), 8);
+        // (0,0,0) in local coords = (3,3,3) world → mat(1)
+        assert_eq!(region[0], mat(1));
+        // All others are OOB → 0
+        for (i, &val) in region.iter().enumerate().skip(1) {
+            assert_eq!(val, 0, "region[{i}] should be 0 (OOB)");
+        }
+    }
+
+    /// `extract_neighborhood` and `flatten` produce consistent results:
+    /// for every interior cell, the 26 neighbors from `extract_neighborhood`
+    /// match what you'd read from the flat grid.
+    #[test]
+    fn extract_neighborhood_consistent_with_flatten() {
+        let side = 8usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let id = ((x * 3 + y * 7 + z * 11) % 5 + 1) as u16;
+                    grid[x + y * side + z * side * side] = mat(id);
+                }
+            }
+        }
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+
+        // Check all interior cells (1..7 on each axis to avoid wrap edge cases).
+        for z in 1..7 {
+            for y in 1..7 {
+                for x in 1..7 {
+                    let neighbors =
+                        store.extract_neighborhood(root, side as i64, x as i64, y as i64, z as i64);
+                    let mut idx = 0;
+                    for dz in [-1i64, 0, 1] {
+                        for dy in [-1i64, 0, 1] {
+                            for dx in [-1i64, 0, 1] {
+                                if dx == 0 && dy == 0 && dz == 0 {
+                                    continue;
+                                }
+                                let nx = (x as i64 + dx) as usize;
+                                let ny = (y as i64 + dy) as usize;
+                                let nz = (z as i64 + dz) as usize;
+                                let expected =
+                                    Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                                assert_eq!(
+                                    neighbors[idx], expected,
+                                    "mismatch at ({x},{y},{z}) neighbor ({dx},{dy},{dz})",
+                                );
+                                idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

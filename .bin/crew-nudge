@@ -29,8 +29,19 @@ DEFAULT_COOLDOWN=300    # 5 min between nudges to same surface
 RATELIMIT_COOLDOWN=900  # 15 min if rate-limited
 MAX_CONSECUTIVE=5       # suppress after N consecutive nudges with no screen change
 
-# Crew seats to check
-SEATS=(flint cairn onyx ember spark codex)
+# Discover crew workspaces dynamically from cmux.
+# Matches any workspace with "(hash)" or "hash" in the name.
+discover_crew() {
+    cmux list-workspaces 2>/dev/null | grep -i 'hash' | while IFS= read -r line; do
+        local ws seat
+        ws=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i ~ /^workspace:/) {print $i; exit}}')
+        # Extract seat name: last word, or word before [selected]
+        seat=$(echo "$line" | sed 's/\[selected\]//' | awk '{print $NF}')
+        # Skip mayor (passive observer seat)
+        if [ "$seat" = "mayor" ]; then continue; fi
+        [ -n "$ws" ] && echo "${ws}|${seat}"
+    done
+}
 
 DRY_RUN=false
 ACTION="nudge"
@@ -101,10 +112,10 @@ mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
 
 # Lockfile — prevent concurrent runs (macOS-compatible)
 # Clean stale locks older than 5 minutes (script should finish in <30s)
-if [ -d "$LOCKFILE" ]; then
+if [ -e "$LOCKFILE" ]; then
     lock_age=$(( now - $(stat -f %m "$LOCKFILE" 2>/dev/null || echo "$now") ))
     if [ "$lock_age" -gt 300 ]; then
-        rmdir "$LOCKFILE" 2>/dev/null || true
+        rm -rf "$LOCKFILE" 2>/dev/null || true
     fi
 fi
 if ! mkdir "$LOCKFILE" 2>/dev/null; then
@@ -188,18 +199,20 @@ classify_screen() {
         return 0
     fi
 
+    # Codex session finished (codex exec returns to shell with exit code)
+    if echo "$tail_lines" | grep -qiE 'codex.*exit|codex.*done|codex.*completed'; then
+        IDLE_REASON="codex-finished"
+        return 0
+    fi
+
     return 1  # appears active
 }
 
-for seat in "${SEATS[@]}"; do
+while IFS='|' read -r ws seat; do
+    [ -z "$ws" ] && continue
+
     # Per-seat pause check
     if [ -f "${REPO_ROOT}/.crew-paused-${seat}" ]; then
-        continue
-    fi
-
-    # Find workspace for this seat (strip leading whitespace and * indicator)
-    ws=$(cmux list-workspaces 2>/dev/null | grep -i "$seat" | head -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^workspace:/) {print $i; exit}}')
-    if [ -z "$ws" ]; then
         continue
     fi
 
@@ -286,7 +299,7 @@ for seat in "${SEATS[@]}"; do
         # Persist state only on actual nudge (not dry-run)
         printf '%s\n%s\n%s\n' "$now" "$current_hash" "$consecutive" > "$state_file"
     fi
-done
+done < <(discover_crew)
 
 if [ "$nudge_count" -eq 0 ] && [ "$DRY_RUN" = true ]; then
     echo "All crew surfaces appear active (or paused/cooled-down)."

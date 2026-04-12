@@ -141,6 +141,8 @@ Commit at every natural boundary — plan file written, first test green, helper
 
 ## Landing to main — don't let feature branches accumulate
 
+**Never `cd` into the main repo checkout to commit.** Work in your worktree; land via `git push origin HEAD:main`.
+
 **Feature branches are not a staging area.** Per edward 2026-04-11: "are you just not merging to main? you should be." Any work that's tested and ready belongs on `origin/main`, not parked on a long-lived `worktree-*` or crew branch.
 
 **The default lifecycle for any seat:**
@@ -176,6 +178,20 @@ bd update <id> --status in_progress  # Claim work
 bd close <id>         # Complete work
 bd sync               # Sync with git
 ```
+
+## CI ownership — you break it, you fix it
+
+After every `git push origin HEAD:main`, check CI:
+
+```bash
+gh run list --branch main --limit 1 --json conclusion -q '.[0].conclusion'
+```
+
+- **If `failure`:** you own the fix. Read `gh run view <id> --log-failed`, diagnose, fix, push. Don't leave a red main for the next seat.
+- **If `in_progress`:** wait ~2min and re-check, or move on and let the next push-to-main seat catch it.
+- **If another seat's push broke CI** and they're offline: first-to-notice owns the fix. File a bead if the fix is non-trivial.
+
+CI failures on main are P1 — they block every other seat's validation step.
 
 ## Landing the Plane (Session Completion)
 

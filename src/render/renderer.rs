@@ -282,7 +282,15 @@ pub struct Renderer {
     /// needs re-uploading each frame. Reset to 0 on buffer reallocation.
     svdag_uploaded_len: usize,
 
-    // Material palette (shared by both pipelines)
+    // Particle billboard pass (hash-thing-5bb.9)
+    particle_pipeline: wgpu::RenderPipeline,
+    particle_bind_group_layout: wgpu::BindGroupLayout,
+    particle_bind_group: Option<wgpu::BindGroup>,
+    particle_buffer: Option<wgpu::Buffer>,
+    particle_buffer_cap: u64,
+    particle_count: u32,
+
+    // Material palette (shared by all pipelines)
     palette_buffer: wgpu::Buffer,
 
     // Shared
@@ -600,6 +608,77 @@ impl Renderer {
             cache: None,
         });
 
+        // === Particle billboard pipeline (hash-thing-5bb.9) ===
+
+        let particle_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("particle_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    palette_bgl_entry,
+                ],
+            });
+
+        let particle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("particle billboard shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("particle.wgsl").into()),
+        });
+
+        let particle_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("particle_pl"),
+                bind_group_layouts: &[Some(&particle_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let particle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("particle_rp"),
+            layout: Some(&particle_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &particle_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &particle_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let gpu_timing = if timestamp_supported {
             let period_ns = queue.get_timestamp_period();
             Some(GpuTiming::new(&device, period_ns))
@@ -623,6 +702,12 @@ impl Renderer {
             svdag_buffer: None,
             svdag_buffer_cap: 0,
             svdag_uploaded_len: 0,
+            particle_pipeline,
+            particle_bind_group_layout,
+            particle_bind_group: None,
+            particle_buffer: None,
+            particle_buffer_cap: 0,
+            particle_count: 0,
             palette_buffer,
             uniform_buffer,
             volume_size,
@@ -734,7 +819,7 @@ impl Renderer {
 
         // Tail: append-only growth since the last upload.
         if self.svdag_uploaded_len < dag.nodes.len() {
-            let tail_byte_offset = (self.svdag_uploaded_len * 4) as u64;
+            let tail_byte_offset = self.svdag_uploaded_len as u64 * 4;
             let tail_bytes: &[u8] = bytemuck::cast_slice(&dag.nodes[self.svdag_uploaded_len..]);
             self.queue.write_buffer(buf, tail_byte_offset, tail_bytes);
             self.svdag_uploaded_len = dag.nodes.len();
@@ -774,6 +859,29 @@ impl Renderer {
             ],
         });
 
+        // Rebuild particle bind group if it exists (it references palette).
+        if let Some(particle_buf) = &self.particle_buffer {
+            self.particle_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("particle_bg"),
+                    layout: &self.particle_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: particle_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.palette_buffer.as_entire_binding(),
+                        },
+                    ],
+                }));
+        }
+
         // Rebuild SVDAG bind group if it exists (it also references palette).
         if let Some(svdag_buf) = &self.svdag_buffer {
             self.svdag_bind_group =
@@ -788,6 +896,55 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 1,
                             resource: svdag_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.palette_buffer.as_entire_binding(),
+                        },
+                    ],
+                }));
+        }
+    }
+
+    /// Upload particle positions/materials for billboard rendering.
+    /// Each particle is a `[f32; 4]`: `[x, y, z, bitcast(material_u32)]`.
+    /// Called each frame from the app loop after entity update.
+    pub fn upload_particles(&mut self, data: &[[f32; 4]]) {
+        self.particle_count = data.len() as u32;
+        if data.is_empty() {
+            self.particle_bind_group = None;
+            return;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        let needed = bytes.len() as u64;
+
+        if needed > self.particle_buffer_cap {
+            // Grow with headroom.
+            let cap = needed.next_power_of_two().max(256);
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle_buf"),
+                size: cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.particle_buffer = Some(buf);
+            self.particle_buffer_cap = cap;
+        }
+
+        if let Some(buf) = &self.particle_buffer {
+            self.queue.write_buffer(buf, 0, bytes);
+            self.particle_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("particle_bg"),
+                    layout: &self.particle_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: buf.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -998,6 +1155,16 @@ impl Renderer {
                         render_pass.set_bind_group(0, &self.flat_bind_group, &[]);
                         render_pass.draw(0..6, 0..1);
                     }
+                }
+            }
+
+            // Particle overlay — drawn after voxels with alpha blending.
+            if self.particle_count > 0 {
+                if let Some(bg) = &self.particle_bind_group {
+                    render_pass.set_pipeline(&self.particle_pipeline);
+                    render_pass.set_bind_group(0, bg, &[]);
+                    // 6 vertices per quad, one instance per particle.
+                    render_pass.draw(0..6, 0..self.particle_count);
                 }
             }
         }

@@ -3,15 +3,39 @@ use hash_thing::render;
 use hash_thing::sim;
 use hash_thing::terrain;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::EventLoop,
+    keyboard::KeyCode,
     window::{Window, WindowAttributes},
 };
 
 const VOLUME_SIZE: u32 = 64;
+
+/// Camera mode: orbit around a target point, or first-person at the player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CameraMode {
+    /// Debug orbit camera (original). Mouse drag rotates, scroll zooms.
+    Orbit,
+    /// First-person: eye at player position, mouse look, WASD movement.
+    FirstPerson,
+}
+
+/// Player movement speed in cells per second (at 60fps baseline: 0.15 * 60 = 9).
+const PLAYER_SPEED: f64 = 9.0;
+/// Sprint multiplier.
+const PLAYER_SPRINT: f64 = 2.5;
+/// Player bounding box half-width on X/Z (cells).
+const PLAYER_HALF_W: f64 = 0.3;
+/// Player height (cells).
+const PLAYER_HEIGHT: f64 = 1.6;
+/// Mouse look sensitivity (radians per pixel).
+const LOOK_SENSITIVITY: f64 = 0.003;
+/// Maximum raycast range for block place/break (in cells).
+const INTERACT_RANGE: f64 = 40.0;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -65,8 +89,8 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
     world: sim::World,
-    rule: sim::GameOfLife3D,
-    legacy_gol_smoke: bool,
+    gol_smoke_rule: sim::GameOfLife3D,
+    gol_smoke_scene: bool,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -79,6 +103,12 @@ struct App {
     // Mouse interaction state
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
+    /// Currently held keyboard keys (for per-frame movement polling).
+    keys_held: HashSet<KeyCode>,
+    /// Camera mode: orbit (debug) or first-person (gameplay).
+    camera_mode: CameraMode,
+    /// The player entity, if spawned.
+    player_id: Option<sim::EntityId>,
     perf: perf::Perf,
     /// Memory-watchdog metric family — node-count + step-cache ratcheting
     /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
@@ -97,59 +127,235 @@ struct App {
     /// Used to estimate noise fraction of each gen pass (hash-thing-3fq.5).
     /// Refreshed on terrain reset so a wildly different param set reprobes.
     noise_ns_per_sample: f64,
+    /// Last frame timestamp for delta-time computation. Player movement
+    /// is multiplied by dt so speed is frame-rate-independent (xa7).
+    last_frame: std::time::Instant,
+    /// Entity store: particles, projectiles, etc. Updated after each
+    /// sim step. Entities push mutations onto `world.queue`; those are
+    /// applied at the start of the next tick.
+    entities: sim::EntityStore,
 }
 
 impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-
-        // Seed with terrain instead of a GoL sphere.
-        let params = terrain::TerrainParams::default();
-        let nodes_before = world.store.stats().0;
-        let start = std::time::Instant::now();
-        let stats = world.seed_terrain(&params);
-        let elapsed = start.elapsed();
-
-        // Noise-bottleneck probe. One-time microbench of `sample()`
-        // called outside the timed gen region so it does not pollute
-        // the gen measurement. See hash-thing-3fq.5.
-        let noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+        world.seed_burning_room();
         let material_palette_len = world.materials.color_palette_rgba().len();
 
-        let (nodes_after, _) = world.store.stats();
-        let nodes_delta = nodes_after.saturating_sub(nodes_before);
-        log_gen_stats(
-            "Initial terrain",
-            world.side(),
-            world.population(),
-            nodes_after,
-            nodes_delta,
-            &stats,
-            elapsed,
-            noise_ns_per_sample,
-        );
+        log::info!("Initial CA demo: burning room pop={}", world.population());
         log::debug!("Material registry palette slots={material_palette_len}");
 
-        // Start paused so the user opts into stepping explicitly. Terrain
-        // defaults are mostly static, but the reactive material rules are
-        // now live and should not advance until requested.
-        Self {
+        // Start paused so the user opts into stepping explicitly. The
+        // default scene is now a CA/materials showcase and should not
+        // start evolving until requested.
+        let mut app = Self {
             window: None,
             renderer: None,
             world,
-            rule: sim::GameOfLife3D::amoeba(),
-            legacy_gol_smoke: false,
+            gol_smoke_rule: sim::GameOfLife3D::rule445(),
+            gol_smoke_scene: false,
             svdag: render::Svdag::new(),
             paused: true,
             step_timer: std::time::Instant::now(),
             log_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
+            keys_held: HashSet::new(),
+            camera_mode: CameraMode::FirstPerson,
+            player_id: None,
             perf: perf::Perf::new(),
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
-            noise_ns_per_sample,
+            noise_ns_per_sample: 0.0,
+            last_frame: std::time::Instant::now(),
+            entities: sim::EntityStore::new(),
+        };
+
+        // Spawn the player entity at the world center, looking forward.
+        let center = VOLUME_SIZE as f64 / 2.0;
+        let player_id = app.entities.add(
+            [center, center + 2.0, center],
+            [0.0; 3],
+            sim::EntityKind::Player(sim::PlayerState {
+                yaw: std::f64::consts::FRAC_PI_4,
+                pitch: 0.0,
+                held_material: 1, // stone
+            }),
+        );
+        app.player_id = Some(player_id);
+        log::info!("Player spawned at ({center}, {}, {center})", center + 2.0);
+
+        app
+    }
+
+    /// Check if the player's AABB at `pos` overlaps any solid cell.
+    fn player_collides(world: &sim::World, pos: &[f64; 3]) -> bool {
+        let hw = PLAYER_HALF_W;
+        // Check every cell the player AABB overlaps — not just corners.
+        // This prevents tunneling through 1-cell-thick walls diagonally (9zr).
+        let x_min = (pos[0] - hw).floor() as i64;
+        let x_max = (pos[0] + hw).floor() as i64;
+        let y_min = pos[1].floor() as i64;
+        let y_max = (pos[1] + PLAYER_HEIGHT).floor() as i64;
+        let z_min = (pos[2] - hw).floor() as i64;
+        let z_max = (pos[2] + hw).floor() as i64;
+        for cx in x_min..=x_max {
+            for cy in y_min..=y_max {
+                for cz in z_min..=z_max {
+                    let cell = world.get(
+                        sim::WorldCoord(cx),
+                        sim::WorldCoord(cy),
+                        sim::WorldCoord(cz),
+                    );
+                    if cell != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
+    /// `hit_cell` is the first solid cell along the ray, `prev_cell` is the
+    /// empty cell just before it (for block placement).
+    fn raycast_cells(&self, origin: [f64; 3], dir: [f64; 3]) -> Option<([i64; 3], [i64; 3])> {
+        let mut pos = [
+            origin[0].floor() as i64,
+            origin[1].floor() as i64,
+            origin[2].floor() as i64,
+        ];
+        let step = [
+            if dir[0] >= 0.0 { 1i64 } else { -1 },
+            if dir[1] >= 0.0 { 1i64 } else { -1 },
+            if dir[2] >= 0.0 { 1i64 } else { -1 },
+        ];
+        // Distance along ray to the next cell boundary on each axis.
+        let mut t_max = [0.0f64; 3];
+        let mut t_delta = [0.0f64; 3];
+        for i in 0..3 {
+            if dir[i].abs() < 1e-12 {
+                t_max[i] = f64::INFINITY;
+                t_delta[i] = f64::INFINITY;
+            } else {
+                let boundary = if dir[i] > 0.0 {
+                    (pos[i] + 1) as f64
+                } else {
+                    pos[i] as f64
+                };
+                t_max[i] = (boundary - origin[i]) / dir[i];
+                t_delta[i] = (step[i] as f64) / dir[i];
+            }
+        }
+
+        let max_steps = (INTERACT_RANGE * 2.0) as usize;
+        let mut prev = pos;
+        for _ in 0..max_steps {
+            // Check current cell.
+            let cell = self.world.get(
+                sim::WorldCoord(pos[0]),
+                sim::WorldCoord(pos[1]),
+                sim::WorldCoord(pos[2]),
+            );
+            if cell != 0 {
+                return Some((pos, prev));
+            }
+            prev = pos;
+
+            // Advance to next cell boundary.
+            if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
+                pos[0] += step[0];
+                t_max[0] += t_delta[0];
+            } else if t_max[1] < t_max[2] {
+                pos[1] += step[1];
+                t_max[1] += t_delta[1];
+            } else {
+                pos[2] += step[2];
+                t_max[2] += t_delta[2];
+            }
+        }
+        None
+    }
+
+    /// Get the player's eye position and look direction.
+    fn player_eye_ray(&self) -> Option<([f64; 3], [f64; 3])> {
+        let pid = self.player_id?;
+        let player = self.entities.iter().find(|e| e.id == pid)?;
+        let (yaw, pitch) = if let sim::EntityKind::Player(ref ps) = player.kind {
+            (ps.yaw, ps.pitch)
+        } else {
+            return None;
+        };
+        let eye = [
+            player.pos[0],
+            player.pos[1] + PLAYER_HEIGHT * 0.85,
+            player.pos[2],
+        ];
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = pitch.sin_cos();
+        let dir = [-cos_pitch * sin_yaw, sin_pitch, -cos_pitch * cos_yaw];
+        Some((eye, dir))
+    }
+
+    /// Break the block the player is looking at.
+    fn break_block(&mut self) {
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((hit, _prev)) = self.raycast_cells(eye, dir) {
+            self.world.set(
+                sim::WorldCoord(hit[0]),
+                sim::WorldCoord(hit[1]),
+                sim::WorldCoord(hit[2]),
+                hash_thing::octree::Cell::EMPTY.raw(),
+            );
+            // Re-upload volume since we modified the world directly.
+            Self::upload_volume(
+                &mut self.renderer,
+                &self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
+        }
+    }
+
+    /// Place a block on the face the player is looking at.
+    fn place_block(&mut self) {
+        let pid = self.player_id;
+        let held_material = pid
+            .and_then(|id| self.entities.iter().find(|e| e.id == id))
+            .and_then(|e| {
+                if let sim::EntityKind::Player(ref ps) = e.kind {
+                    Some(ps.held_material)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1);
+
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((hit, prev)) = self.raycast_cells(eye, dir) {
+            // Skip if origin is inside a solid cell (prev == hit on first step).
+            if prev == hit {
+                return;
+            }
+            // Place at the empty cell just before the hit.
+            let state = hash_thing::octree::Cell::pack(held_material, 0).raw();
+            self.world.set(
+                sim::WorldCoord(prev[0]),
+                sim::WorldCoord(prev[1]),
+                sim::WorldCoord(prev[2]),
+                state,
+            );
+            Self::upload_volume(
+                &mut self.renderer,
+                &self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
         }
     }
 
@@ -179,6 +385,68 @@ impl App {
             *last_svdag_stats = (svdag.node_count, svdag.byte_size(), svdag.root_level);
             renderer.upload_svdag(svdag);
         }
+    }
+
+    fn select_rule(&mut self, rule: sim::GameOfLife3D, label: &str) {
+        self.gol_smoke_rule = rule;
+        self.world.invalidate_rule_caches();
+        if self.gol_smoke_scene {
+            self.world.set_gol_smoke_rule(self.gol_smoke_rule);
+            if let Some(renderer) = &mut self.renderer {
+                renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            }
+        }
+        log::info!("Rule: {label}");
+    }
+
+    fn load_burning_room_demo(&mut self, label: &str) {
+        self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+        self.world.seed_burning_room();
+        self.gol_smoke_scene = false;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        log::info!("{label}: pop={}", self.world.population());
+    }
+
+    fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
+        let nodes_before = self.world.store.stats();
+        let start = std::time::Instant::now();
+        let stats = self.world.seed_terrain(&params);
+        let elapsed = start.elapsed();
+        self.noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+        self.gol_smoke_scene = false;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        Self::upload_volume(
+            &mut self.renderer,
+            &self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        let nodes_after = self.world.store.stats();
+        let nodes_delta = nodes_after.saturating_sub(nodes_before);
+        log_gen_stats(
+            label,
+            self.world.side(),
+            self.world.population(),
+            nodes_after,
+            nodes_delta,
+            &stats,
+            elapsed,
+            self.noise_ns_per_sample,
+        );
     }
 }
 
@@ -238,23 +506,56 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::Focused(false) => {
+                self.keys_held.clear();
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
+                // Track physical key state for per-frame movement polling.
+                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            self.keys_held.insert(code);
+                        }
+                        ElementState::Released => {
+                            self.keys_held.remove(&code);
+                        }
+                    }
+                }
                 if event.state == ElementState::Pressed {
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
-                            self.paused = !self.paused;
-                            log::info!("Paused: {}", self.paused);
+                            // In orbit mode, Space toggles pause.
+                            // In FPS mode, Space is fly-up (handled per-frame).
+                            if self.camera_mode == CameraMode::Orbit {
+                                self.paused = !self.paused;
+                                log::info!("Paused: {}", self.paused);
+                            }
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
                             event_loop.exit();
                         }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F5) => {
+                            self.paused = !self.paused;
+                            log::info!("Paused: {}", self.paused);
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                            self.camera_mode = match self.camera_mode {
+                                CameraMode::Orbit => CameraMode::FirstPerson,
+                                CameraMode::FirstPerson => CameraMode::Orbit,
+                            };
+                            log::info!("Camera mode: {:?}", self.camera_mode);
+                        }
                         winit::keyboard::Key::Character("s") => {
-                            // Single step. Instrumented with the same
-                            // `perf.start("step")` Timer as the auto-step
-                            // path (hash-thing-5qh + hash-thing-yri).
+                            // Single step via recursive Hashlife path, matching
+                            // the auto-step loop (hash-thing-6gf.8).
                             {
                                 let _t = self.perf.start("step");
-                                self.world.step();
+                                self.world.apply_mutations();
+                                self.world.step_recursive();
+                                let mut queue = std::mem::take(&mut self.world.queue);
+                                self.entities.update(&self.world, &mut queue);
+                                self.world.queue = queue;
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
@@ -273,81 +574,32 @@ impl ApplicationHandler for App {
                             // hash-thing-3fq.2: drives the cave-CA post-pass
                             // end-to-end so the effect is visible without
                             // editing source.
-                            let params = terrain::TerrainParams {
-                                caves: Some(terrain::CaveParams::default()),
-                                ..Default::default()
-                            };
-                            let nodes_before = self.world.store.stats().0;
-                            let start = std::time::Instant::now();
-                            let stats = self.world.seed_terrain(&params);
-                            let elapsed = start.elapsed();
-                            self.noise_ns_per_sample =
-                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.legacy_gol_smoke = false;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            let (nodes_after, _) = self.world.store.stats();
-                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
-                            log_gen_stats(
+                            self.load_terrain_scene(
                                 "Caves terrain",
-                                self.world.side(),
-                                self.world.population(),
-                                nodes_after,
-                                nodes_delta,
-                                &stats,
-                                elapsed,
-                                self.noise_ns_per_sample,
+                                terrain::TerrainParams {
+                                    caves: Some(terrain::CaveParams::default()),
+                                    ..Default::default()
+                                },
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Re-seed terrain. Stays paused. Clear perf/mem
-                            // so post-reset stats aren't poisoned by stale
-                            // pre-reset values.
-                            let params = terrain::TerrainParams::default();
-                            let nodes_before = self.world.store.stats().0;
-                            let start = std::time::Instant::now();
-                            let stats = self.world.seed_terrain(&params);
-                            let elapsed = start.elapsed();
-                            // Re-probe in case params drifted. Cheap (~1ms).
-                            self.noise_ns_per_sample =
-                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.legacy_gol_smoke = false;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            let (nodes_after, _) = self.world.store.stats();
-                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
-                            log_gen_stats(
+                            // Reset the default CA/materials demo.
+                            self.load_burning_room_demo("Reset burning room demo");
+                        }
+                        winit::keyboard::Key::Character("t") => {
+                            // Plain terrain remains available as an explicit
+                            // toggle, but is no longer the default scene.
+                            self.load_terrain_scene(
                                 "Reset terrain",
-                                self.world.side(),
-                                self.world.population(),
-                                nodes_after,
-                                nodes_delta,
-                                &stats,
-                                elapsed,
-                                self.noise_ns_per_sample,
+                                terrain::TerrainParams::default(),
                             );
                         }
                         winit::keyboard::Key::Character("g") => {
-                            // Swap to legacy GoL sphere seed (kept for CA scaffold demos).
+                            // Swap to the single retained GoL smoke seed.
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-                            self.world.materials =
-                                terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                            self.world.set_gol_smoke_rule(self.gol_smoke_rule);
                             self.world.seed_center(12, 0.35);
-                            self.legacy_gol_smoke = true;
+                            self.gol_smoke_scene = true;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -360,62 +612,23 @@ impl ApplicationHandler for App {
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
-                            log::info!("Reset GoL sphere: pop={}", self.world.population());
+                            log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
-                        // TODO(hash-thing-6gf.1): call self.world.store.clear_step_cache() here
-                        // once memoized stepping lands. See store.rs `step_cache` field doc for
-                        // the contract — the cache key is NodeId only, so swapping the rule
-                        // without clearing yields stale results from the previous rule.
                         winit::keyboard::Key::Character("1") => {
-                            self.rule = sim::GameOfLife3D::amoeba();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Amoeba ({})", self.rule);
+                            self.select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba");
                         }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("2") => {
-                            self.rule = sim::GameOfLife3D::crystal();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Crystal ({})", self.rule);
+                            self.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
                         }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("3") => {
-                            self.rule = sim::GameOfLife3D::rule445();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: 445 ({})", self.rule);
+                            self.select_rule(sim::GameOfLife3D::rule445(), "445");
                         }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("4") => {
-                            self.rule = sim::GameOfLife3D::pyroclastic();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Pyroclastic ({})", self.rule);
+                            self.select_rule(sim::GameOfLife3D::new(4, 7, 6, 8), "Pyroclastic");
+                        }
+                        winit::keyboard::Key::Character("b") => {
+                            // Burning room demo: fire + water + grass walls.
+                            self.load_burning_room_demo("Reset burning room demo");
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
@@ -430,8 +643,8 @@ impl ApplicationHandler for App {
                         // memory summary, independent of the wall-clock log
                         // cadence.
                         winit::keyboard::Key::Character("p") => {
-                            let (nodes, cache) = self.world.store.stats();
-                            self.mem_stats.update(nodes, cache);
+                            let nodes = self.world.store.stats();
+                            self.mem_stats.update(nodes);
                             let (svdag_nodes, svdag_bytes, svdag_root_level) =
                                 self.last_svdag_stats;
                             log::info!(
@@ -452,22 +665,48 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
-                    self.mouse_pressed = state == ElementState::Pressed;
-                    if !self.mouse_pressed {
-                        self.last_mouse = None;
+                    if self.camera_mode == CameraMode::Orbit {
+                        self.mouse_pressed = state == ElementState::Pressed;
+                        if !self.mouse_pressed {
+                            self.last_mouse = None;
+                        }
+                    } else if state == ElementState::Pressed {
+                        // FPS mode: left click = break block.
+                        self.break_block();
                     }
+                }
+                if button == MouseButton::Right
+                    && state == ElementState::Pressed
+                    && self.camera_mode == CameraMode::FirstPerson
+                {
+                    self.place_block();
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                if self.mouse_pressed {
+                let should_look = match self.camera_mode {
+                    CameraMode::Orbit => self.mouse_pressed,
+                    CameraMode::FirstPerson => true, // always look in FPS
+                };
+                if should_look {
                     if let Some((lx, ly)) = self.last_mouse {
-                        let dx = (position.x - lx) as f32;
-                        let dy = (position.y - ly) as f32;
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.camera_yaw += dx * 0.005;
+                        let dx = position.x - lx;
+                        let dy = position.y - ly;
+                        if self.camera_mode == CameraMode::FirstPerson {
+                            // Update player yaw/pitch directly.
+                            if let Some(pid) = self.player_id {
+                                if let Some(player) = self.entities.get_mut(pid) {
+                                    if let sim::EntityKind::Player(ref mut ps) = player.kind {
+                                        ps.yaw += dx * LOOK_SENSITIVITY;
+                                        ps.pitch =
+                                            (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
+                                    }
+                                }
+                            }
+                        } else if let Some(renderer) = &mut self.renderer {
+                            renderer.camera_yaw += dx as f32 * 0.005;
                             renderer.camera_pitch =
-                                (renderer.camera_pitch + dy * 0.005).clamp(-1.4, 1.4);
+                                (renderer.camera_pitch + dy as f32 * 0.005).clamp(-1.4, 1.4);
                         }
                     }
                     self.last_mouse = Some((position.x, position.y));
@@ -475,12 +714,15 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
-                };
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.camera_dist = (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
+                if self.camera_mode == CameraMode::Orbit {
+                    let scroll = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
+                    };
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.camera_dist =
+                            (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
+                    }
                 }
             }
 
@@ -493,6 +735,10 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                // Frame delta time for frame-rate-independent movement (xa7).
+                let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
+                self.last_frame = std::time::Instant::now();
+
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
                     // Time the step. `perf.start` returns a Timer that
@@ -501,7 +747,11 @@ impl ApplicationHandler for App {
                     // Timer is alive.
                     {
                         let _t = self.perf.start("step");
-                        self.world.step();
+                        self.world.apply_mutations();
+                        self.world.step_recursive();
+                        let mut queue = std::mem::take(&mut self.world.queue);
+                        self.entities.update(&self.world, &mut queue);
+                        self.world.queue = queue;
                     }
                     // Time upload as one aggregate (flatten + Svdag::build +
                     // upload_volume + upload_svdag). CPU-side submit only —
@@ -516,6 +766,28 @@ impl ApplicationHandler for App {
                             &mut self.svdag,
                             &mut self.last_svdag_stats,
                         );
+                        // Upload particle billboard data. Positions are in
+                        // world coords — normalize to [0,1]³ for the renderer.
+                        if let Some(renderer) = &mut self.renderer {
+                            let inv_size = 1.0 / VOLUME_SIZE as f32;
+                            let particle_data: Vec<[f32; 4]> = self
+                                .entities
+                                .iter()
+                                .filter_map(|e| {
+                                    let mat = match &e.kind {
+                                        sim::EntityKind::Particle(p) => p.material as u32,
+                                        sim::EntityKind::Player(_) => return None,
+                                    };
+                                    Some([
+                                        e.pos[0] as f32 * inv_size,
+                                        e.pos[1] as f32 * inv_size,
+                                        e.pos[2] as f32 * inv_size,
+                                        f32::from_bits(mat),
+                                    ])
+                                })
+                                .collect();
+                            renderer.upload_particles(&particle_data);
+                        }
                     }
 
                     self.step_timer = std::time::Instant::now();
@@ -527,8 +799,8 @@ impl ApplicationHandler for App {
                 // Gen repeatedly is intentional: it tells the user the app
                 // is still alive.
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
-                    let (nodes, cache) = self.world.store.stats();
-                    self.mem_stats.update(nodes, cache);
+                    let nodes = self.world.store.stats();
+                    self.mem_stats.update(nodes);
                     let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                     log::info!(
                         "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
@@ -541,6 +813,106 @@ impl ApplicationHandler for App {
                         self.perf.summary(),
                     );
                     self.log_timer = std::time::Instant::now();
+                }
+
+                // Player movement (per-frame, not per-tick) and camera sync.
+                if self.camera_mode == CameraMode::FirstPerson {
+                    if let Some(pid) = self.player_id {
+                        // Read player state for movement computation.
+                        let (yaw, _pitch) = if let Some(player) = self.entities.get_mut(pid) {
+                            if let sim::EntityKind::Player(ref ps) = player.kind {
+                                (ps.yaw, ps.pitch)
+                            } else {
+                                (0.0, 0.0)
+                            }
+                        } else {
+                            (0.0, 0.0)
+                        };
+
+                        // Compute movement from held keys relative to yaw.
+                        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+                        // Forward is along -Z in local space, rotated by yaw.
+                        let fwd = [-sin_yaw, 0.0, -cos_yaw];
+                        let right = [cos_yaw, 0.0, -sin_yaw];
+
+                        let mut move_dir = [0.0f64; 3];
+                        if self.keys_held.contains(&KeyCode::KeyW) {
+                            move_dir[0] += fwd[0];
+                            move_dir[2] += fwd[2];
+                        }
+                        if self.keys_held.contains(&KeyCode::KeyS) {
+                            move_dir[0] -= fwd[0];
+                            move_dir[2] -= fwd[2];
+                        }
+                        if self.keys_held.contains(&KeyCode::KeyA) {
+                            move_dir[0] -= right[0];
+                            move_dir[2] -= right[2];
+                        }
+                        if self.keys_held.contains(&KeyCode::KeyD) {
+                            move_dir[0] += right[0];
+                            move_dir[2] += right[2];
+                        }
+                        // Vertical movement (creative fly mode).
+                        if self.keys_held.contains(&KeyCode::Space) {
+                            move_dir[1] += 1.0;
+                        }
+                        if self.keys_held.contains(&KeyCode::ShiftLeft)
+                            || self.keys_held.contains(&KeyCode::ShiftRight)
+                        {
+                            move_dir[1] -= 1.0;
+                        }
+
+                        // Normalize and apply speed.
+                        let len = (move_dir[0] * move_dir[0]
+                            + move_dir[1] * move_dir[1]
+                            + move_dir[2] * move_dir[2])
+                            .sqrt();
+                        if len > 1e-9 {
+                            let base_speed = if self.keys_held.contains(&KeyCode::ControlLeft)
+                                || self.keys_held.contains(&KeyCode::ControlRight)
+                            {
+                                PLAYER_SPEED * PLAYER_SPRINT
+                            } else {
+                                PLAYER_SPEED
+                            };
+                            let inv_len = (base_speed * dt) / len;
+                            let delta = [
+                                move_dir[0] * inv_len,
+                                move_dir[1] * inv_len,
+                                move_dir[2] * inv_len,
+                            ];
+
+                            // Apply movement with per-axis collision.
+                            if let Some(player) = self.entities.get_mut(pid) {
+                                for (axis, &d) in delta.iter().enumerate() {
+                                    let old = player.pos[axis];
+                                    player.pos[axis] += d;
+
+                                    // AABB collision check: sample corners.
+                                    if Self::player_collides(&self.world, &player.pos) {
+                                        player.pos[axis] = old; // reject this axis
+                                    }
+                                }
+                            }
+                        }
+
+                        // Sync camera to player position and orientation.
+                        if let Some(player) = self.entities.get_mut(pid) {
+                            let inv_size = 1.0 / VOLUME_SIZE as f64;
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.camera_target = [
+                                    player.pos[0] as f32 * inv_size as f32,
+                                    (player.pos[1] + PLAYER_HEIGHT * 0.85) as f32 * inv_size as f32,
+                                    player.pos[2] as f32 * inv_size as f32,
+                                ];
+                                if let sim::EntityKind::Player(ref ps) = player.kind {
+                                    renderer.camera_yaw = ps.yaw as f32;
+                                    renderer.camera_pitch = ps.pitch as f32;
+                                }
+                                renderer.camera_dist = 0.0;
+                            }
+                        }
+                    }
                 }
 
                 // Time render. Disjoint-field borrows: the Timer holds
@@ -593,9 +965,19 @@ fn main() {
 
     log::info!("hash-thing: 3D Hashlife Engine");
     log::info!("Controls:");
+    log::info!("  Tab: toggle orbit / first-person camera");
+    log::info!("  --- Orbit mode ---");
     log::info!("  Mouse drag: orbit camera");
     log::info!("  Scroll: zoom");
     log::info!("  Space: pause/resume");
+    log::info!("  --- First-person mode ---");
+    log::info!("  WASD: move (relative to look direction)");
+    log::info!("  Mouse: look around");
+    log::info!("  Space: fly up   Shift: fly down");
+    log::info!("  Ctrl: sprint");
+    log::info!("  Left click: break block   Right click: place block");
+    log::info!("  --- Shared ---");
+    log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  C: reset terrain with caves (CA post-pass)");

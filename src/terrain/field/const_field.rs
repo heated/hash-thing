@@ -3,7 +3,6 @@
 //! exactly `store.uniform(level, AIR)`.
 
 // Test-only fixture — the trivial RegionField for builder regression tests.
-#![allow(dead_code)]
 
 use super::RegionField;
 use crate::octree::CellState;

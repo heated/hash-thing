@@ -12,7 +12,6 @@ pub mod gen;
 pub mod materials;
 pub mod noise;
 
-#[allow(unused_imports)]
 pub use caves::{carve_caves, carve_caves_grid, CaveParams};
 pub use field::HeightmapField;
 pub use gen::{gen_region, probe_sample_ns, GenStats};
