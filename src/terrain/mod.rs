@@ -15,7 +15,6 @@ pub mod noise;
 
 #[allow(unused_imports)]
 pub use caves::{carve_caves, carve_caves_grid, CaveParams};
-#[allow(unused_imports)]
 pub use dungeons::{carve_dungeons, carve_dungeons_grid, DungeonParams};
 pub use field::HeightmapField;
 pub use gen::{gen_region, probe_sample_ns, GenStats};
@@ -34,8 +33,9 @@ pub struct TerrainParams {
     /// path unchanged — tests and perf baselines don't see caves unless
     /// a caller opts in.
     pub caves: Option<CaveParams>,
-    /// When `Some`, carve dungeons (rooms + corridors in deep stone)
-    /// after caves. Default `None` skips the pass.
+    /// When `Some`, run the dungeon carving post-pass after caves (or
+    /// after heightmap if caves are `None`). Dungeons carve rectangular
+    /// rooms and corridors into stone. Default `None`.
     pub dungeons: Option<DungeonParams>,
 }
 

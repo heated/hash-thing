@@ -319,12 +319,12 @@ impl World {
             stats.cave_us = cave_start.elapsed().as_micros() as u64;
         }
         stats.nodes_after_caves = self.store.stats().0;
-        // Opt-in dungeon carving. Runs after caves so rooms carve
-        // through cave openings if they overlap.
-        if let Some(ref dungeon_params) = params.dungeons {
-            let dg_start = std::time::Instant::now();
+        // Opt-in dungeon carving post-pass. Runs after caves so dungeons
+        // carve through already-opened cave networks.
+        if let Some(dungeon_params) = &params.dungeons {
+            let dungeon_start = std::time::Instant::now();
             root = carve_dungeons(&mut self.store, root, self.level, dungeon_params);
-            stats.dungeon_us = dg_start.elapsed().as_micros() as u64;
+            stats.dungeon_us = dungeon_start.elapsed().as_micros() as u64;
         }
         stats.nodes_after_dungeons = self.store.stats().0;
         self.root = root;

@@ -307,7 +307,9 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("d") => {
-                            // Re-seed terrain with caves + dungeons.
+                            // Re-seed terrain with caves + dungeons. Stays paused.
+                            // hash-thing-3fq.8: drives the dungeon carving
+                            // post-pass end-to-end.
                             let params = terrain::TerrainParams {
                                 caves: Some(terrain::CaveParams::default()),
                                 dungeons: Some(terrain::DungeonParams::default()),
