@@ -205,15 +205,49 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             if (child_slot & LEAF_BIT) != 0u {
                 let mat = child_slot & 0xFFFFu;
                 if mat > 0u {
-                    // HIT
+                    // HIT — analytical face normal from the leaf AABB.
+                    //
+                    // hash-thing-rv4: pre-rv4 the shade was
+                    //   `0.35 + 0.65 * abs(rd.y)`
+                    // which depends only on ray direction, not surface
+                    // orientation — every cube face got the same shade,
+                    // collapsing all depth cues. Edward: "it's like weirdly
+                    // flat." This block derives the true surface normal
+                    // from which axis of the leaf AABB the ray entered
+                    // through (textbook voxel raycaster normal), then
+                    // applies Lambertian shading that matches `raycast.wgsl`
+                    // (Flat3D) 1:1 so both renderers look identical on
+                    // the same scene.
+                    let leaf_min = vec3<f32>(
+                        node_min.x + f32(oct & 1u) * half,
+                        node_min.y + f32((oct >> 1u) & 1u) * half,
+                        node_min.z + f32((oct >> 2u) & 1u) * half,
+                    );
+                    let leaf_max = leaf_min + vec3<f32>(half);
+                    // Per-axis slab entry times. `tmin_v` is the max-across
+                    // axes at entry, and the axis holding that max is the
+                    // last face the ray crossed to get inside the voxel.
+                    let lt1 = (leaf_min - ro_local) * inv_rd;
+                    let lt2 = (leaf_max - ro_local) * inv_rd;
+                    let tmin_v = min(lt1, lt2);
+                    var normal = vec3<f32>(0.0);
+                    if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
+                        normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);
+                    } else if tmin_v.y >= tmin_v.z {
+                        normal = vec3<f32>(0.0, -sign(rd.y), 0.0);
+                    } else {
+                        normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
+                    }
+                    // Lambertian + ambient + fog — MATCHES raycast.wgsl
+                    // lighting model exactly. Fog uses world-space distance
+                    // (entry + local t) so near/far falloff matches Flat3D.
                     let base = material_color(mat);
-                    // Cheap lighting: distance fog + flat shading based on ray dir.
-                    // Fog uses world-space distance (entry + local t) so it
-                    // matches the pre-27m-v2 visual output.
+                    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+                    let diffuse = max(dot(normal, light_dir), 0.0);
+                    let ambient = 0.25;
                     let t_world = t + entry;
-                    let fog = exp(-t_world * 1.2);
-                    let shade = 0.35 + 0.65 * abs(rd.y);
-                    return vec4<f32>(base * shade * fog, 1.0);
+                    let fog = exp(-t_world * 1.5);
+                    return vec4<f32>(base * (ambient + diffuse * 0.75) * fog, 1.0);
                 }
                 // Empty leaf — break to step ray
                 break;
