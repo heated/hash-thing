@@ -3,6 +3,7 @@ use std::fmt;
 use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
+use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -748,9 +749,13 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
-        let field = params.to_heightmap();
+        let heightmap = params.to_heightmap();
+        let precompute_start = std::time::Instant::now();
+        let field = PrecomputedHeightmapField::new(heightmap, self.level);
+        let precompute_us = precompute_start.elapsed().as_micros() as u64;
         let gen_start = std::time::Instant::now();
         let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        stats.precompute_us = precompute_us;
         stats.gen_region_us = gen_start.elapsed().as_micros() as u64;
         stats.nodes_after_gen = self.store.stats();
         // Opt-in cave-CA post-pass. Runs as a separate stage after the

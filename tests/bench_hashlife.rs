@@ -23,9 +23,10 @@ fn bench_step(label: &str, level: u32, generations: usize) {
     let stats = world.seed_terrain(&params);
     let seed_ms = t0.elapsed().as_millis();
     eprintln!(
-        "  seed: {seed_ms}ms, population: {}, gen_region: {}µs",
-        world.population(),
+        "  seed: {seed_ms}ms (precompute: {}µs, gen: {}µs), population: {}",
+        stats.precompute_us,
         stats.gen_region_us,
+        world.population(),
     );
 
     let mut times_us = Vec::with_capacity(generations);
