@@ -13,6 +13,10 @@ soft-max-command-seconds: 60
 
 Prefer commands that finish in under ~60s. Benchmarks, large builds, long test suites: run the smallest representative scale first. Only go bigger if explicitly asked or the small run was inconclusive. Background long runs rather than blocking.
 
+## GPU / visual validation
+
+Mac integrated GPU works — wgpu/Metal renders fine. Agents can launch the app, take screenshots, read perf logs. Only gate on human for interactive feel (WASD, mouse look). Don't self-block on "needs GPU."
+
 ## Build profiles
 
 Default to dev. `--profile bench` for perf work. `--release` only for distributable artifacts.
