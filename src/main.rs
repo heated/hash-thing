@@ -16,7 +16,7 @@ use winit::{
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
 
-const VOLUME_SIZE: u32 = 2048;
+const DEFAULT_VOLUME_SIZE: u32 = 2048;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -115,11 +115,12 @@ struct App {
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
     entities: sim::EntityStore,
+    volume_size: u32,
 }
 
 impl App {
-    fn new() -> Self {
-        let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+    fn new(volume_size: u32) -> Self {
+        let mut world = sim::World::new(volume_size.trailing_zeros());
         let terrain_params = terrain::TerrainParams {
             caves: Some(terrain::CaveParams::default()),
             ..Default::default()
@@ -161,10 +162,11 @@ impl App {
             noise_ns_per_sample: noise_ns,
             last_frame: std::time::Instant::now(),
             entities: sim::EntityStore::new(),
+            volume_size,
         };
 
         // Spawn the player entity at the world center, looking forward.
-        let center = VOLUME_SIZE as f64 / 2.0;
+        let center = volume_size as f64 / 2.0;
         let player_id = app.entities.add(
             [center, center + 2.0, center],
             [0.0; 3],
@@ -313,7 +315,7 @@ impl App {
     }
 
     fn load_burning_room_demo(&mut self, label: &str) {
-        self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.seed_burning_room();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
@@ -377,7 +379,7 @@ impl ApplicationHandler for App {
             self.window = Some(window.clone());
 
             let mut renderer =
-                pollster::block_on(render::Renderer::new(window.clone(), VOLUME_SIZE));
+                pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
@@ -509,7 +511,7 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("g") => {
                             // Swap to the single retained GoL smoke seed.
-                            self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+                            self.world = sim::World::new(self.volume_size.trailing_zeros());
                             self.world.set_gol_smoke_rule(self.gol_smoke_rule);
                             self.world.seed_center(12, 0.35);
                             self.gol_smoke_scene = true;
@@ -947,9 +949,19 @@ fn main() {
     log::info!("  P: dump perf + memory summary (on demand)");
     log::info!("  Esc: quit");
 
+    let volume_size = std::env::args()
+        .nth(1)
+        .map(|s| {
+            let n: u32 = s.parse().expect("usage: hash-thing [SIZE]  (SIZE must be a power of 2)");
+            assert!(n.is_power_of_two(), "volume size must be a power of 2 (got {n})");
+            n
+        })
+        .unwrap_or(DEFAULT_VOLUME_SIZE);
+    log::info!("Volume: {volume_size}^3 (level {})", volume_size.trailing_zeros());
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let mut app = App::new();
+    let mut app = App::new(volume_size);
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
