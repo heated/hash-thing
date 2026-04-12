@@ -126,9 +126,8 @@ impl App {
         log::info!("Initial CA demo: burning room pop={}", world.population());
         log::debug!("Material registry palette slots={material_palette_len}");
 
-        // Start paused so the user opts into stepping explicitly. The
-        // default scene is now a CA/materials showcase and should not
-        // start evolving until requested.
+        // Start running so materials interact immediately (powder-game feel).
+        // F5 or Space (orbit mode) toggles pause.
         let mut app = Self {
             window: None,
             renderer: None,
@@ -136,7 +135,7 @@ impl App {
             gol_smoke_rule: sim::GameOfLife3D::rule445(),
             gol_smoke_scene: false,
             svdag: render::Svdag::new(),
-            paused: true,
+            paused: false,
             step_timer: std::time::Instant::now(),
             log_timer: std::time::Instant::now(),
             mouse_pressed: false,
@@ -166,6 +165,7 @@ impl App {
         );
         app.player_id = Some(player_id);
         log::info!("Player spawned at ({center}, {}, {center})", center + 2.0);
+        log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-7=material, F5=pause, Tab=orbit");
 
         app
     }
@@ -278,6 +278,27 @@ impl App {
             }
         }
         log::info!("Rule: {label}");
+    }
+
+    fn select_held_material(&mut self, material_id: u16) {
+        let name = match material_id {
+            1 => "Stone",
+            2 => "Dirt",
+            3 => "Grass",
+            4 => "Fire",
+            5 => "Water",
+            6 => "Sand",
+            7 => "Lava",
+            _ => return,
+        };
+        if let Some(pid) = self.player_id {
+            if let Some(entity) = self.entities.get_mut(pid) {
+                if let sim::EntityKind::Player(ref mut ps) = entity.kind {
+                    ps.held_material = material_id;
+                    log::info!("Held: {name} ({material_id})");
+                }
+            }
+        }
     }
 
     fn load_burning_room_demo(&mut self, label: &str) {
@@ -495,17 +516,28 @@ impl ApplicationHandler for App {
                             );
                             log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
-                        winit::keyboard::Key::Character("1") => {
-                            self.select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba");
-                        }
-                        winit::keyboard::Key::Character("2") => {
-                            self.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
-                        }
-                        winit::keyboard::Key::Character("3") => {
-                            self.select_rule(sim::GameOfLife3D::rule445(), "445");
-                        }
-                        winit::keyboard::Key::Character("4") => {
-                            self.select_rule(sim::GameOfLife3D::new(4, 7, 6, 8), "Pyroclastic");
+                        winit::keyboard::Key::Character(
+                            n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7"),
+                        ) => {
+                            let digit: u16 = n.parse().unwrap();
+                            if self.camera_mode == CameraMode::FirstPerson {
+                                // FPS mode: select held material.
+                                self.select_held_material(digit);
+                            } else {
+                                // Orbit mode: select CA rule (1-4 only).
+                                match digit {
+                                    1 => self
+                                        .select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba"),
+                                    2 => self
+                                        .select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal"),
+                                    3 => self.select_rule(sim::GameOfLife3D::rule445(), "445"),
+                                    4 => self.select_rule(
+                                        sim::GameOfLife3D::new(4, 7, 6, 8),
+                                        "Pyroclastic",
+                                    ),
+                                    _ => {}
+                                }
+                            }
                         }
                         winit::keyboard::Key::Character("b") => {
                             // Burning room demo: fire + water + grass walls.
@@ -586,14 +618,29 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
+                };
                 if self.camera_mode == CameraMode::Orbit {
-                    let scroll = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
-                    };
                     if let Some(renderer) = &mut self.renderer {
                         renderer.camera_dist =
                             (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
+                    }
+                } else if scroll.abs() > 0.01 {
+                    // FPS mode: scroll cycles held material (1-7).
+                    let next = self.player_id.and_then(|pid| {
+                        let entity = self.entities.get_mut(pid)?;
+                        if let sim::EntityKind::Player(ref ps) = entity.kind {
+                            let dir = if scroll > 0.0 { 1i16 } else { -1 };
+                            let cur = ps.held_material as i16;
+                            Some(((cur - 1 + dir).rem_euclid(7) + 1) as u16)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(mat) = next {
+                        self.select_held_material(mat);
                     }
                 }
             }
