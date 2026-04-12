@@ -278,14 +278,33 @@ mod tests {
     }
 
     #[test]
-    fn noop_rule_preserves_center_exactly() {
+    fn noop_rule_is_identity_for_varied_cells() {
         let rule = NoopRule;
-        let neighbors = [ALIVE; 26];
-        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::EMPTY);
-        assert_eq!(
-            rule.step_cell(Cell::pack(11, 1), &neighbors),
-            Cell::pack(11, 1)
-        );
+        let neighbor_sets = [[Cell::EMPTY; 26], [ALIVE; 26], neighbors_with_alive(7), {
+            let mut mixed = [Cell::EMPTY; 26];
+            mixed[0] = Cell::pack(2, 5);
+            mixed[1] = Cell::pack(9, 1);
+            mixed[2] = Cell::pack(Cell::MAX_MATERIAL, Cell::MAX_METADATA);
+            mixed
+        }];
+
+        let centers = [
+            Cell::EMPTY,
+            ALIVE,
+            Cell::pack(11, 1),
+            Cell::pack(27, 42),
+            Cell::pack(Cell::MAX_MATERIAL, Cell::MAX_METADATA),
+        ];
+
+        for neighbors in neighbor_sets {
+            for center in centers {
+                assert_eq!(
+                    rule.step_cell(center, &neighbors),
+                    center,
+                    "NoopRule must leave {center:?} unchanged"
+                );
+            }
+        }
     }
 
     #[test]
