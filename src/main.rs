@@ -768,10 +768,7 @@ impl ApplicationHandler for App {
                     let _t = self.perf.start("step");
                     // Move world to background thread; replace with tiny
                     // placeholder so self.world remains valid (but inert).
-                    let mut world = std::mem::replace(
-                        &mut self.world,
-                        sim::World::new(1),
-                    );
+                    let mut world = std::mem::replace(&mut self.world, sim::World::new(1));
                     self.step_handle = Some(std::thread::spawn(move || {
                         world.apply_mutations();
                         world.step_recursive();
@@ -791,8 +788,7 @@ impl ApplicationHandler for App {
                     } else {
                         let nodes = self.world.store.stats();
                         self.mem_stats.update(nodes);
-                        let (svdag_nodes, svdag_bytes, svdag_root_level) =
-                            self.last_svdag_stats;
+                        let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                         log::info!(
                             "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
                             self.world.generation,
@@ -868,8 +864,7 @@ impl ApplicationHandler for App {
                                 p.pos[1] += delta[1];
                                 p.pos[2] += delta[2];
                             } else {
-                                p.pos =
-                                    player::apply_movement(&self.world, &p.pos, &delta);
+                                p.pos = player::apply_movement(&self.world, &p.pos, &delta);
                             }
                         }
 
@@ -883,12 +878,14 @@ impl ApplicationHandler for App {
                                 let side = self.world.side() as f64;
                                 let pos = p.pos;
                                 let margin = GROWTH_MARGIN as i64;
-                                let near_pos_edge = pos.iter().enumerate().any(|(i, &c)| {
-                                    c > origin[i] as f64 + side - GROWTH_MARGIN
-                                });
-                                let near_neg_edge = pos.iter().enumerate().any(|(i, &c)| {
-                                    c < origin[i] as f64 + GROWTH_MARGIN
-                                });
+                                let near_pos_edge = pos
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(i, &c)| c > origin[i] as f64 + side - GROWTH_MARGIN);
+                                let near_neg_edge = pos
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(i, &c)| c < origin[i] as f64 + GROWTH_MARGIN);
                                 if near_pos_edge || near_neg_edge {
                                     let min = [
                                         sim::WorldCoord(pos[0] as i64 - margin),
@@ -897,9 +894,7 @@ impl ApplicationHandler for App {
                                     ];
                                     let max = [
                                         sim::WorldCoord(pos[0] as i64 + margin),
-                                        sim::WorldCoord(
-                                            (pos[1] + PLAYER_HEIGHT) as i64 + margin,
-                                        ),
+                                        sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
                                         sim::WorldCoord(pos[2] as i64 + margin),
                                     ];
                                     let old_level = self.world.level;
@@ -941,8 +936,7 @@ impl ApplicationHandler for App {
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
                                     if !stepping {
-                                        let palette =
-                                            self.world.materials.color_palette_rgba();
+                                        let palette = self.world.materials.color_palette_rgba();
                                         let mat = ps.held_material as usize;
                                         if mat < palette.len() {
                                             renderer.hud_material_color = palette[mat];
@@ -1030,12 +1024,20 @@ fn main() {
     let volume_size = std::env::args()
         .nth(1)
         .map(|s| {
-            let n: u32 = s.parse().expect("usage: hash-thing [SIZE]  (SIZE must be a power of 2)");
-            assert!(n.is_power_of_two(), "volume size must be a power of 2 (got {n})");
+            let n: u32 = s
+                .parse()
+                .expect("usage: hash-thing [SIZE]  (SIZE must be a power of 2)");
+            assert!(
+                n.is_power_of_two(),
+                "volume size must be a power of 2 (got {n})"
+            );
             n
         })
         .unwrap_or(DEFAULT_VOLUME_SIZE);
-    log::info!("Volume: {volume_size}^3 (level {})", volume_size.trailing_zeros());
+    log::info!(
+        "Volume: {volume_size}^3 (level {})",
+        volume_size.trailing_zeros()
+    );
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
