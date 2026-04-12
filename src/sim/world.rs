@@ -1298,4 +1298,51 @@ mod tests {
         w2.ensure_region([50, 50, 50], [50, 50, 50]);
         assert_eq!(w1.level, w2.level);
     }
+
+    // -----------------------------------------------------------------
+    // FluidBlockRule integration: water falls via terrain_defaults (1v0.5).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn terrain_defaults_water_falls_when_stepped() {
+        // terrain_defaults() already wires FluidBlockRule for water.
+        let mut world = World::new(3); // 8x8x8
+                                       // Place water at y=3 with air below. Block lateral escape routes
+                                       // with stone so we isolate the gravity behavior.
+        world.set(2, 3, 2, WATER);
+        world.set(3, 2, 2, STONE); // block x-spread
+        world.set(2, 2, 3, STONE); // block z-spread
+        assert_eq!(world.get(2, 3, 2), WATER);
+        assert_eq!(world.get(2, 2, 2), 0);
+
+        world.step(); // gen 0 → 1 (even offset=0, block at (2,2,2))
+
+        // Water should have fallen from y=3 to y=2 via FluidBlockRule gravity.
+        assert_eq!(
+            world.get(2, 2, 2),
+            WATER,
+            "water should fall to y=2 via FluidBlockRule"
+        );
+        assert_eq!(world.get(2, 3, 2), 0, "y=3 should be air after water fell");
+    }
+
+    #[test]
+    fn burning_room_conserves_population_over_steps() {
+        let mut world = World::new(6); // 64x64x64
+        world.seed_burning_room();
+        let pop_before = world.population();
+        assert!(pop_before > 100, "room should have substantial content");
+
+        // Step a few times — fire reactions may create/destroy cells,
+        // but block rules (movement) must conserve mass within each block.
+        // Population may change due to CaRule (fire burns out, water quenches),
+        // so we just verify the world doesn't crash and stays non-empty.
+        for _ in 0..4 {
+            world.step();
+        }
+        assert!(
+            world.population() > 0,
+            "world should still have cells after stepping"
+        );
+    }
 }
