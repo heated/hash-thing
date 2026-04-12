@@ -1,9 +1,10 @@
 //! Hashlife step benchmarks at multiple world scales (m1f.1).
 //!
-//! Run with: `cargo test --release -p hash-thing --test bench_hashlife -- --ignored --nocapture`
+//! Run with: `cargo test --profile bench --test bench_hashlife -- --ignored --nocapture`
+//! (or `--release` for full LTO builds; bench profile is faster to compile)
 //!
 //! These are `#[ignore]` tests, not criterion benchmarks, to avoid adding
-//! dependencies. The `--release` flag is critical — debug builds are 10-50x
+//! dependencies. Optimized builds are critical — debug builds are 10-50x
 //! slower and not representative of real performance.
 
 use hash_thing::octree::Cell;
