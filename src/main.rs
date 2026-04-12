@@ -1030,12 +1030,20 @@ fn main() {
     let volume_size = std::env::args()
         .nth(1)
         .map(|s| {
-            let n: u32 = s.parse().expect("usage: hash-thing [SIZE]  (SIZE must be a power of 2)");
-            assert!(n.is_power_of_two(), "volume size must be a power of 2 (got {n})");
+            let n: u32 = s
+                .parse()
+                .expect("usage: hash-thing [SIZE]  (SIZE must be a power of 2)");
+            assert!(
+                n.is_power_of_two(),
+                "volume size must be a power of 2 (got {n})"
+            );
             n
         })
         .unwrap_or(DEFAULT_VOLUME_SIZE);
-    log::info!("Volume: {volume_size}^3 (level {})", volume_size.trailing_zeros());
+    log::info!(
+        "Volume: {volume_size}^3 (level {})",
+        volume_size.trailing_zeros()
+    );
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
