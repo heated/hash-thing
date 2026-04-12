@@ -28,15 +28,7 @@ Named agents working on this repo. `BEADS_ACTOR` draws from a small pool of natu
 Auto-assign pool (used by the `claude -w` seat hook): `flint · cairn · onyx · ember · spark`
 Explicit-only seat: `mayor` — singular, never auto-assigned, see the mayor skill
 
-Current seats:
-- **flint** — simulation / octree / physics / CA rules
-- **onyx** — SVDAG rendering / GPU / shaders
-- **cairn** — foundations / bug fixes
-- **ember** — generalist / floating worker
-- **spark** — terrain generation / infinite worlds
-- **mayor** — design observer / policy (see below)
-
-Reuse a name when an agent comes back to the same lane; otherwise pull the next free name. Don't rewrite historical assignees on closed issues.
+Seats are worktree labels, not specializations. Any non-mayor seat picks any ready bead. Reuse a name for the same worktree; don't rewrite historical assignees.
 
 ### Peer autonomy — no central orchestrator
 
@@ -69,6 +61,18 @@ If `.beads/actor` is missing, the worktree hasn't been assigned — ask edward o
 
 **Edward is never at the yoke.** The crew never waits for him at any gate, ever. Don't ask him to approve plans, don't wait for him to respond, don't idle.
 
+### Work cadence — short chunks, frequent re-consult
+
+Crew works in **5–30 minute chunks**. Reach a natural stopping point often (phase boundary, test green, helper extracted, commit boundary) and **reconsult `bd ready` before picking the next thing**. Do not grind on one task for hours without checking if something more urgent arrived. If you're heads-down on a 4-hour refactor without ever re-checking the queue, you're doing it wrong — break the refactor into smaller commits and re-poll between them.
+
+This is how mayor's reordering (bumping a P0 in front) actually reaches the crew: by the next stopping point, the bumped bead is on top of `bd ready`, and you pick it instead of continuing your previous trajectory.
+
+### Priority bands
+
+bd ranks ready beads by `(priority asc, created_at desc)`. Take the top item unless you're mid-chunk — then finish the chunk and re-poll.
+
+**P0 is reserved for mayor / edward** — moving a bead to P0 is a deliberate "jump the queue" signal. Workers file new beads at P1 or lower. bd priority *is* the queue; no separate queue file needed.
+
 At every gate (including design gates):
 
 1. `bd update <id> --status blocked`
@@ -84,7 +88,7 @@ Design-gate tasks stack up silently in the `blocked` queue for whenever edward n
 
 ### When `bd ready` is dry — **do not stop**
 
-Running out of ember-safe ready beads is not a rotation stop; it's a prompt to do scout-tier work. The crew only stops for pull-the-plug reasons (the remote is down, the tree won't compile, edward says "that's enough"). Never stop just because the ready queue ran dry.
+Running out of ready beads is not a rotation stop; it's a prompt to do scout-tier work. The crew only stops for pull-the-plug reasons (the remote is down, the tree won't compile, edward says "that's enough"). Never stop just because the ready queue ran dry.
 
 Scout-tier moves in priority order:
 
@@ -96,7 +100,7 @@ Scout-tier moves in priority order:
 6. **Transcript review (yls).** When the session has accumulated enough action that transcripts are interesting — read `~/.claude/projects/-Users-edward-projects-hash-thing*/*.jsonl` and file beads for patterns worth fixing. This is one of only a few meta-beads ember can actually advance.
 7. **Only after all of the above come up empty** in the same session: write a `.ship-notes/session-summary.md` (gitignored, local) and finish. This should be rare.
 
-**Do not poach other crews' lanes** to stay busy — that's the one move that isn't allowed. Lane discipline still applies. But scout work is cheap, wide, and always available.
+Scout work is cheap, wide, and always available. There are no lanes to stay out of — every ready bead is fair game for every non-mayor seat.
 
 ### Drift-unparking autonomy
 
