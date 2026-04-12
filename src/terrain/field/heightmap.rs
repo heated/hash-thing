@@ -196,4 +196,42 @@ mod tests {
         let deep = f.sample([10, 0, 10]);
         assert_eq!(deep, STONE, "point at y=0 must be STONE");
     }
+
+    #[test]
+    fn surface_y_is_deterministic_for_same_input() {
+        let f = test_field();
+        let samples = [(0.0, 0.0), (3.5, -9.25), (128.0, 64.0), (-17.0, 41.0)];
+
+        for (x, z) in samples {
+            let first = f.surface_y(x, z).to_bits();
+            let second = f.surface_y(x, z).to_bits();
+            assert_eq!(
+                first, second,
+                "surface_y must be bitwise deterministic for ({x}, {z})",
+            );
+        }
+    }
+
+    #[test]
+    fn surface_y_stays_within_configured_bounds() {
+        let f = test_field();
+        let min = f.base_y - f.amplitude;
+        let max = f.base_y + f.amplitude;
+        let samples = [
+            (-256.0, -256.0),
+            (-32.5, 48.25),
+            (0.0, 0.0),
+            (17.0, -9.0),
+            (64.0, 64.0),
+            (512.0, -128.0),
+        ];
+
+        for (x, z) in samples {
+            let surface = f.surface_y(x, z);
+            assert!(
+                surface >= min && surface <= max,
+                "surface_y({x}, {z}) = {surface} fell outside [{min}, {max}]",
+            );
+        }
+    }
 }
