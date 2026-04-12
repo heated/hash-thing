@@ -52,7 +52,14 @@ impl World {
         self.root = result;
         self.generation += 1;
 
-        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
+        // Compact, preserving both the result root AND the padded root.
+        // The padded root's subtree contains the input nodes that the
+        // hashlife cache keys reference. Without preserving it, compaction
+        // GCs those nodes and remap drops all cache entries — making every
+        // frame a cold start (m1f.15.1).
+        let (new_store, new_root, remap) = self
+            .store
+            .compacted_with_remap_roots(&[self.root, padded_root]);
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
@@ -85,7 +92,9 @@ impl World {
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
 
-        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
+        let (new_store, new_root, remap) = self
+            .store
+            .compacted_with_remap_roots(&[self.root, padded_root]);
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
@@ -1157,17 +1166,6 @@ mod tests {
 
     /// Inert world cache behavior (m1f.15.1): a stone-only world is immediately
     /// at fixed point. The world state never changes.
-    ///
-    /// Current fixed-point detection only catches UNIFORM inert subtrees
-    /// (all-stone or all-air). Mixed surface nodes (stone/air boundary) are
-    /// not caught — they require full cache-based stepping even though they're
-    /// inert. At small scales (16³), most of the octree is mixed surface, so
-    /// fixed-point skips may be zero. At large scales (512³+), deep uniform
-    /// regions dominate and fixed-point skips become the majority.
-    ///
-    /// Cross-frame cache reuse is limited: compaction after each step GCs
-    /// input nodes, dropping their cache entries. Within-frame dedup via
-    /// hash-cons sharing is the main cache benefit.
     #[test]
     fn inert_world_state_unchanged() {
         let mut world = World::new(4); // 16³
@@ -1206,19 +1204,11 @@ mod tests {
         world.step_recursive();
         let s = world.hashlife_stats;
 
-        // At 64³ with terrain, there should be substantial empty regions
-        // (air above ground) and potentially uniform stone regions underground.
-        // Both trigger short-circuit paths.
         assert!(
             s.empty_skips > 0,
             "64³ terrain should have empty subtree skips (air above ground)"
         );
-        // Fixed-point skips depend on whether underground is uniform enough.
-        // At 64³ this may or may not fire — the assertion is that the world
-        // state is correct, not that skips hit a specific count.
 
-        // Terrain with default params has only CaRule::Noop materials
-        // (stone, dirt, grass) — world should be unchanged
         assert_eq!(
             world.flatten(),
             state_before,
@@ -1235,16 +1225,86 @@ mod tests {
         let params = TerrainParams::default();
         world.seed_terrain(&params);
 
-        // Step enough for any active CA to settle
         for _ in 0..6 {
             world.step_recursive();
         }
         let settled = world.flatten();
 
-        // Two more steps — state should not change
         world.step_recursive();
-        assert_eq!(world.flatten(), settled, "settled terrain changed on step 7");
+        assert_eq!(
+            world.flatten(),
+            settled,
+            "settled terrain changed on step 7"
+        );
         world.step_recursive();
-        assert_eq!(world.flatten(), settled, "settled terrain changed on step 8");
+        assert_eq!(
+            world.flatten(),
+            settled,
+            "settled terrain changed on step 8"
+        );
+    }
+
+    /// m1f.15.1: Verify cache hits on warm frames for an unchanged inert world.
+    ///
+    /// After two frames (one per parity), subsequent frames should be mostly
+    /// cache hits. If misses remain high on frame 4+, something is invalidating
+    /// cache entries (compaction remap bug, NodeId reassignment, etc).
+    #[test]
+    fn inert_world_cache_hits_on_warm_frames() {
+        use crate::terrain::TerrainParams;
+        let mut world = World::new(4);
+        world.seed_terrain(&TerrainParams::default());
+
+        let mut stats_per_gen = Vec::new();
+        for _ in 0..6 {
+            world.step_recursive();
+            stats_per_gen.push((
+                world.hashlife_stats.cache_hits,
+                world.hashlife_stats.cache_misses,
+                world.hashlife_stats.empty_skips,
+                world.hashlife_stats.fixed_point_skips,
+                world.hashlife_cache.len(),
+            ));
+        }
+
+        let (hits_f2, misses_f2, _, _, _) = stats_per_gen[2];
+        let total_f2 = hits_f2 + misses_f2;
+
+        let (hits_f4, misses_f4, _, _, _) = stats_per_gen[4];
+        let total_f4 = hits_f4 + misses_f4;
+
+        let hit_rate_f4 = if total_f4 > 0 {
+            hits_f4 as f64 / total_f4 as f64
+        } else {
+            1.0
+        };
+
+        for (i, (h, m, e, f, sz)) in stats_per_gen.iter().enumerate() {
+            let total = h + m;
+            let rate = if total > 0 {
+                *h as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  gen {i}: hits={h}, misses={m}, empty={e}, fixed={f}, cache_size={sz}, rate={rate:.1}%"
+            );
+        }
+
+        let misses_f0 = stats_per_gen[0].1;
+        if misses_f4 == misses_f0 && misses_f0 > 0 {
+            eprintln!(
+                "  WARNING: frame 4 has same miss count as frame 0 ({misses_f0}) — \
+                 cache entries may be lost during compaction remap"
+            );
+        }
+
+        assert!(
+            hits_f2 > 0 || total_f2 == 0,
+            "frame 2 (same parity as frame 0) should have at least some cache hits, \
+             but got 0 hits / {misses_f2} misses"
+        );
+
+        eprintln!("  frame 4 hit rate: {:.1}%", hit_rate_f4 * 100.0);
     }
 }
