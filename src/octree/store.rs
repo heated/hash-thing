@@ -110,7 +110,6 @@ impl NodeStore {
     }
 
     /// Get children of an interior node. Panics if called on a leaf.
-    #[allow(dead_code)]
     pub fn children(&self, id: NodeId) -> [NodeId; 8] {
         match self.get(id) {
             Node::Interior { children, .. } => *children,
@@ -119,7 +118,6 @@ impl NodeStore {
     }
 
     /// Get a specific child by octant index.
-    #[allow(dead_code)]
     pub fn child(&self, id: NodeId, octant: usize) -> NodeId {
         self.children(id)[octant]
     }
@@ -219,7 +217,6 @@ impl NodeStore {
     ///
     /// Footgun: `root` must be a real world root. `NodeId::EMPTY` has level
     /// 0, so every non-origin coordinate reflects to 0 via the OOB branch.
-    #[allow(dead_code)]
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         let level = self.get(root).level();
         let side = 1u64 << level;
@@ -365,13 +362,11 @@ impl NodeStore {
     }
 
     /// Cache a step result.
-    #[allow(dead_code)]
     pub fn cache_step(&mut self, input: NodeId, result: NodeId) {
         self.step_cache.insert(input, result);
     }
 
     /// Look up a cached step result.
-    #[allow(dead_code)]
     pub fn get_cached_step(&self, input: NodeId) -> Option<NodeId> {
         self.step_cache.get(&input).copied()
     }
@@ -383,7 +378,6 @@ impl NodeStore {
     /// Failure to clear after a rule swap will silently return stale results
     /// from the previous rule once a memoized stepper is in place
     /// (hash-thing-6gf.1).
-    #[allow(dead_code)]
     pub fn clear_step_cache(&mut self) {
         self.step_cache.clear();
     }
@@ -1437,6 +1431,126 @@ mod tests {
         assert_eq!(compacted.get_cell(new_root, 1_000_000, 0, 0), 0);
         // Population is exactly the two set cells.
         assert_eq!(compacted.population(new_root), 2);
+    }
+
+    // ===========================================================================
+    // Targeted gap-fills (hash-thing-6gf.5).
+    // ===========================================================================
+
+    /// `uniform()` with a nonzero state builds a tree where every cell
+    /// reads back as that state. Distinct from `empty()` which only
+    /// exercises `uniform(level, 0)`.
+    #[test]
+    fn uniform_nonzero_fills_all_cells() {
+        let mut store = NodeStore::new();
+        let root = store.uniform(3, mat(4)); // 8x8x8 all material 4
+        for z in 0..8u64 {
+            for y in 0..8u64 {
+                for x in 0..8u64 {
+                    assert_eq!(
+                        store.get_cell(root, x, y, z),
+                        mat(4),
+                        "cell ({x},{y},{z}) should be mat(4)",
+                    );
+                }
+            }
+        }
+        // Population = 512 (all cells live).
+        assert_eq!(store.population(root), 512);
+    }
+
+    /// Two `uniform()` calls with the same (level, state) return the
+    /// same NodeId — the dedup invariant applies to uniform trees too.
+    #[test]
+    fn uniform_dedup() {
+        let mut store = NodeStore::new();
+        let a = store.uniform(4, mat(3));
+        let b = store.uniform(4, mat(3));
+        assert_eq!(a, b);
+        // Different state → different id.
+        let c = store.uniform(4, mat(5));
+        assert_ne!(a, c);
+    }
+
+    /// `children()` and `child()` return the correct sub-nodes.
+    #[test]
+    fn children_and_child_accessors() {
+        let mut store = NodeStore::new();
+        let l0 = store.leaf(0);
+        let l1 = store.leaf(mat(1));
+        let l2 = store.leaf(mat(2));
+        let kids = [l0, l1, l2, l0, l1, l2, l0, l1];
+        let parent = store.interior(1, kids);
+        assert_eq!(store.children(parent), kids);
+        for (i, &expected) in kids.iter().enumerate() {
+            assert_eq!(store.child(parent, i), expected, "child({i})");
+        }
+    }
+
+    /// `children()` panics on a leaf node.
+    #[test]
+    #[should_panic(expected = "children()")]
+    fn children_panics_on_leaf() {
+        let store = NodeStore::new();
+        store.children(NodeId::EMPTY);
+    }
+
+    /// `Default::default()` produces the same store as `new()`.
+    #[test]
+    fn default_matches_new() {
+        let a = NodeStore::new();
+        let b = NodeStore::default();
+        assert_eq!(a.stats(), b.stats());
+        assert!(matches!(a.get(NodeId::EMPTY), Node::Leaf(0)));
+        assert!(matches!(b.get(NodeId::EMPTY), Node::Leaf(0)));
+    }
+
+    /// Nonzero metadata survives set/get roundtrip. Previous tests all
+    /// use `mat()` which packs metadata=0; this verifies the full 16-bit
+    /// `CellState` word is preserved.
+    #[test]
+    fn metadata_survives_roundtrip() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3);
+        // material=5, metadata=42
+        let cell = Cell::pack(5, 42).raw();
+        root = store.set_cell(root, 3, 3, 3, cell);
+        let got = store.get_cell(root, 3, 3, 3);
+        assert_eq!(got, cell);
+        let decoded = Cell::from_raw(got);
+        assert_eq!(decoded.material(), 5);
+        assert_eq!(decoded.metadata(), 42);
+    }
+
+    /// Writing the same cell twice replaces the first value.
+    #[test]
+    fn set_cell_overwrites_previous() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3);
+        root = store.set_cell(root, 2, 2, 2, mat(7));
+        assert_eq!(store.get_cell(root, 2, 2, 2), mat(7));
+        root = store.set_cell(root, 2, 2, 2, mat(11));
+        assert_eq!(store.get_cell(root, 2, 2, 2), mat(11));
+        // Overwriting with 0 (empty) also works.
+        root = store.set_cell(root, 2, 2, 2, 0);
+        assert_eq!(store.get_cell(root, 2, 2, 2), 0);
+    }
+
+    /// `from_flat` / `flatten` roundtrip preserves nonzero metadata.
+    #[test]
+    fn from_flat_flatten_preserves_metadata() {
+        let side = 4usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        // Pack (material=3, metadata=17) at a few cells.
+        let cell_a = Cell::pack(3, 17).raw();
+        let cell_b = Cell::pack(7, 63).raw(); // max metadata
+        grid[0] = cell_a;
+        grid[side * side * side - 1] = cell_b;
+
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+        let out = store.flatten(root, side);
+        assert_eq!(out, grid);
     }
 
     // ===========================================================================

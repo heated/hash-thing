@@ -126,6 +126,7 @@ jobs:
             "$keychain_path"
 
           existing_keychains=$(security list-keychains -d user | tr -d '"')
+          # shellcheck disable=SC2086 -- intentional word splitting for multiple keychain paths
           security list-keychains -d user -s "$keychain_path" $existing_keychains
           security default-keychain -d user -s "$keychain_path"
 

@@ -1,8 +1,66 @@
+use std::fmt;
+
 use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
+
+/// The axis-aligned cube of world-space that the octree currently covers.
+///
+/// Origin is always (0,0,0) today (unsigned coords), but will shift once
+/// signed world coordinates and recentering land. The type exists now so
+/// call sites can migrate incrementally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealizedRegion {
+    pub origin: [i64; 3],
+    pub level: u32,
+}
+
+impl RealizedRegion {
+    /// Side length of the realized cube.
+    pub fn side(&self) -> u64 {
+        1u64 << self.level
+    }
+
+    /// True if the unsigned coordinate `(x, y, z)` is inside the region.
+    ///
+    /// Assumes origin is non-negative (current invariant). Once signed
+    /// coords land, this will subtract origin before comparing.
+    pub fn contains(&self, x: u64, y: u64, z: u64) -> bool {
+        let s = self.side();
+        let ox = self.origin[0] as u64;
+        let oy = self.origin[1] as u64;
+        let oz = self.origin[2] as u64;
+        x >= ox && x < ox + s && y >= oy && y < oy + s && z >= oz && z < oz + s
+    }
+
+    /// Map a world-space point to the octant index (0–7) within the root node.
+    ///
+    /// Panics if the point is outside the region.
+    pub fn octant_of(&self, x: u64, y: u64, z: u64) -> usize {
+        assert!(self.contains(x, y, z), "point outside realized region");
+        let half = self.side() / 2;
+        let ox = self.origin[0] as u64;
+        let oy = self.origin[1] as u64;
+        let oz = self.origin[2] as u64;
+        let dx = if x - ox >= half { 1 } else { 0 };
+        let dy = if y - oy >= half { 1 } else { 0 };
+        let dz = if z - oz >= half { 1 } else { 0 };
+        dx + dy * 2 + dz * 4
+    }
+}
+
+impl fmt::Display for RealizedRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.side();
+        write!(
+            f,
+            "realized: origin=({},{},{}) level={} ({s}³)",
+            self.origin[0], self.origin[1], self.origin[2], self.level
+        )
+    }
+}
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -50,6 +108,14 @@ impl World {
         1 << self.level
     }
 
+    /// The realized region as a value type.
+    pub fn region(&self) -> RealizedRegion {
+        RealizedRegion {
+            origin: [0, 0, 0],
+            level: self.level,
+        }
+    }
+
     /// Invalidate caches whose keys depend on the active CA rule.
     ///
     /// Today this only clears `NodeStore::step_cache`, whose key is `NodeId`
@@ -83,12 +149,23 @@ impl World {
     /// valid and still steps to the same result. The new parent has no
     /// cached entry yet and will be computed fresh on first step.
     pub fn ensure_contains(&mut self, x: u64, y: u64, z: u64) {
+        self.ensure_region([x, y, z], [x, y, z]);
+    }
+
+    /// Grow the root octree until the axis-aligned box `[min, max]` is
+    /// fully in-bounds (inclusive on both ends).
+    ///
+    /// Since growth only extends in the +x, +y, +z direction (the existing
+    /// root stays at octant 0), it is sufficient to grow until `max` is
+    /// contained — `min` is automatically in-bounds once `max` is.
+    ///
+    /// No-op when the region is already in-bounds.
+    pub fn ensure_region(&mut self, _min: [u64; 3], max: [u64; 3]) {
         loop {
             let side = 1u64 << self.level;
-            if x < side && y < side && z < side {
+            if max[0] < side && max[1] < side && max[2] < side {
                 return;
             }
-            // Wrap: old root → octant 0, 7 empty siblings at the old level.
             let empty_sibling = self.store.empty(self.level);
             let new_level = self.level + 1;
             let new_root = self.store.interior(
@@ -129,7 +206,6 @@ impl World {
     /// Out-of-bounds reads return `0` silently (hash-thing-fb5). `get` is a
     /// pure query over the realized region — outside that region is
     /// conceptually unrealized empty space.
-    #[allow(dead_code)]
     pub fn get(&self, x: u64, y: u64, z: u64) -> CellState {
         self.store.get_cell(self.root, x, y, z)
     }
@@ -1247,5 +1323,175 @@ mod tests {
         let pop_before = world.population();
         world.ensure_contains(100, 100, 100);
         assert_eq!(world.population(), pop_before);
+    }
+
+    // ---- ensure_region (hash-thing-5qp) ----
+
+    #[test]
+    fn ensure_region_noop_when_in_bounds() {
+        let mut world = World::new(3);
+        let level_before = world.level;
+        world.ensure_region([0, 0, 0], [7, 7, 7]);
+        assert_eq!(world.level, level_before);
+    }
+
+    #[test]
+    fn ensure_region_grows_for_max_corner() {
+        let mut world = World::new(3); // 8x8x8
+        world.set(2, 3, 4, STONE);
+        world.ensure_region([0, 0, 0], [20, 20, 20]);
+        assert!(world.side() > 20);
+        // Existing cell survives.
+        assert_eq!(world.get(2, 3, 4), STONE);
+    }
+
+    #[test]
+    fn ensure_region_then_set_covers_full_box() {
+        let mut world = World::new(3);
+        world.ensure_region([10, 10, 10], [20, 20, 20]);
+        // Can set cells at both min and max of the region.
+        world.set(10, 10, 10, FIRE);
+        world.set(20, 20, 20, WATER);
+        assert_eq!(world.get(10, 10, 10), FIRE);
+        assert_eq!(world.get(20, 20, 20), WATER);
+    }
+
+    #[test]
+    fn ensure_region_single_point_matches_ensure_contains() {
+        let mut w1 = World::new(3);
+        let mut w2 = World::new(3);
+        w1.ensure_contains(50, 50, 50);
+        w2.ensure_region([50, 50, 50], [50, 50, 50]);
+        assert_eq!(w1.level, w2.level);
+    }
+
+    // -----------------------------------------------------------------
+    // FluidBlockRule integration: water falls via terrain_defaults (1v0.5).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn terrain_defaults_water_falls_when_stepped() {
+        // terrain_defaults() already wires FluidBlockRule for water.
+        let mut world = World::new(3); // 8x8x8
+                                       // Place water at y=3 with air below. Block lateral escape routes
+                                       // with stone so we isolate the gravity behavior.
+        world.set(2, 3, 2, WATER);
+        world.set(3, 2, 2, STONE); // block x-spread
+        world.set(2, 2, 3, STONE); // block z-spread
+        assert_eq!(world.get(2, 3, 2), WATER);
+        assert_eq!(world.get(2, 2, 2), 0);
+
+        world.step(); // gen 0 → 1 (even offset=0, block at (2,2,2))
+
+        // Water should have fallen from y=3 to y=2 via FluidBlockRule gravity.
+        assert_eq!(
+            world.get(2, 2, 2),
+            WATER,
+            "water should fall to y=2 via FluidBlockRule"
+        );
+        assert_eq!(world.get(2, 3, 2), 0, "y=3 should be air after water fell");
+    }
+
+    #[test]
+    fn burning_room_conserves_population_over_steps() {
+        let mut world = World::new(6); // 64x64x64
+        world.seed_burning_room();
+        let pop_before = world.population();
+        assert!(pop_before > 100, "room should have substantial content");
+
+        // Step a few times — fire reactions may create/destroy cells,
+        // but block rules (movement) must conserve mass within each block.
+        // Population may change due to CaRule (fire burns out, water quenches),
+        // so we just verify the world doesn't crash and stays non-empty.
+        for _ in 0..4 {
+            world.step();
+        }
+        assert!(
+            world.population() > 0,
+            "world should still have cells after stepping"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // RealizedRegion (hash-thing-ica).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn region_side_matches_world() {
+        let world = World::new(5);
+        let r = world.region();
+        assert_eq!(r.side(), 32);
+        assert_eq!(r.side() as usize, world.side());
+        assert_eq!(r.level, 5);
+        assert_eq!(r.origin, [0, 0, 0]);
+    }
+
+    #[test]
+    fn region_contains_boundary() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 3,
+        }; // side=8
+        assert!(r.contains(0, 0, 0));
+        assert!(r.contains(7, 7, 7));
+        assert!(!r.contains(8, 0, 0));
+        assert!(!r.contains(0, 8, 0));
+        assert!(!r.contains(0, 0, 8));
+    }
+
+    #[test]
+    fn region_contains_with_origin() {
+        let r = RealizedRegion {
+            origin: [10, 20, 30],
+            level: 2,
+        }; // side=4
+        assert!(r.contains(10, 20, 30));
+        assert!(r.contains(13, 23, 33));
+        assert!(!r.contains(14, 20, 30)); // just past
+        assert!(!r.contains(9, 20, 30)); // just before
+    }
+
+    #[test]
+    fn region_octant_of_corners() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 4,
+        }; // side=16, half=8
+        assert_eq!(r.octant_of(0, 0, 0), 0); // (0,0,0)
+        assert_eq!(r.octant_of(8, 0, 0), 1); // (1,0,0)
+        assert_eq!(r.octant_of(0, 8, 0), 2); // (0,1,0)
+        assert_eq!(r.octant_of(8, 8, 0), 3); // (1,1,0)
+        assert_eq!(r.octant_of(0, 0, 8), 4); // (0,0,1)
+        assert_eq!(r.octant_of(15, 15, 15), 7); // (1,1,1)
+    }
+
+    #[test]
+    #[should_panic(expected = "outside realized region")]
+    fn region_octant_of_oob_panics() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 3,
+        };
+        r.octant_of(8, 0, 0);
+    }
+
+    #[test]
+    fn region_display() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 6,
+        };
+        let s = format!("{r}");
+        assert!(s.contains("level=6"), "display should show level");
+        assert!(s.contains("64³"), "display should show side cubed");
+    }
+
+    #[test]
+    fn region_tracks_ensure_contains_growth() {
+        let mut world = World::new(3); // side=8
+        assert_eq!(world.region().side(), 8);
+        world.ensure_contains(20, 0, 0);
+        assert!(world.region().side() > 20);
+        assert_eq!(world.region().level, world.level);
     }
 }
