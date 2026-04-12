@@ -367,6 +367,20 @@ impl ApplicationHandler for App {
                     None
                 };
 
+                // hash-thing-6x3: if the renderer resolved a GPU-side
+                // render-pass timing this frame (i.e. the previous
+                // frame's `map_async` readback landed), record it into
+                // `perf` as `render_gpu`. `take_last_gpu_frame_time`
+                // consumes the value so we don't double-record the same
+                // sample across frames. Adapters without TIMESTAMP_QUERY
+                // always return `None` here — `render_cpu` stays the
+                // only render metric on those machines.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    if let Some(d) = renderer.take_last_gpu_frame_time() {
+                        self.perf.record("render_gpu", d);
+                    }
+                }
+
                 // Belt-and-suspenders: if the surface reports Occluded
                 // before winit fires `WindowEvent::Occluded(true)` (some
                 // platforms are lazy about that event), latch the flag here
