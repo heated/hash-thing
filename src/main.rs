@@ -194,28 +194,26 @@ impl App {
     /// Check if the player's AABB at `pos` overlaps any solid cell.
     fn player_collides(world: &sim::World, pos: &[f64; 3]) -> bool {
         let hw = PLAYER_HALF_W;
-        // Sample the 8 corners of the player AABB.
-        let corners = [
-            [pos[0] - hw, pos[1], pos[2] - hw],
-            [pos[0] + hw, pos[1], pos[2] - hw],
-            [pos[0] - hw, pos[1], pos[2] + hw],
-            [pos[0] + hw, pos[1], pos[2] + hw],
-            [pos[0] - hw, pos[1] + PLAYER_HEIGHT, pos[2] - hw],
-            [pos[0] + hw, pos[1] + PLAYER_HEIGHT, pos[2] - hw],
-            [pos[0] - hw, pos[1] + PLAYER_HEIGHT, pos[2] + hw],
-            [pos[0] + hw, pos[1] + PLAYER_HEIGHT, pos[2] + hw],
-        ];
-        for c in &corners {
-            let cx = c[0].floor() as i64;
-            let cy = c[1].floor() as i64;
-            let cz = c[2].floor() as i64;
-            let cell = world.get(
-                sim::WorldCoord(cx),
-                sim::WorldCoord(cy),
-                sim::WorldCoord(cz),
-            );
-            if cell != 0 {
-                return true;
+        // Check every cell the player AABB overlaps — not just corners.
+        // This prevents tunneling through 1-cell-thick walls diagonally (9zr).
+        let x_min = (pos[0] - hw).floor() as i64;
+        let x_max = (pos[0] + hw).floor() as i64;
+        let y_min = pos[1].floor() as i64;
+        let y_max = (pos[1] + PLAYER_HEIGHT).floor() as i64;
+        let z_min = (pos[2] - hw).floor() as i64;
+        let z_max = (pos[2] + hw).floor() as i64;
+        for cx in x_min..=x_max {
+            for cy in y_min..=y_max {
+                for cz in z_min..=z_max {
+                    let cell = world.get(
+                        sim::WorldCoord(cx),
+                        sim::WorldCoord(cy),
+                        sim::WorldCoord(cz),
+                    );
+                    if cell != 0 {
+                        return true;
+                    }
+                }
             }
         }
         false
