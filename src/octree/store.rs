@@ -431,8 +431,8 @@ impl NodeStore {
     }
 }
 
-/// Recursively clone the subtree rooted at `old` from `src` into `dst`,
-/// populating `remap` with old-id → new-id entries.
+/// Clone the subtree rooted at `old` from `src` into `dst`, populating
+/// `remap` with old-id → new-id entries.
 ///
 /// ## Post-order ordering is load-bearing
 ///
@@ -447,31 +447,94 @@ impl NodeStore {
 /// hash-cons dedup, population folding, and NodeId identity all come out
 /// right in a single pass.
 ///
-/// TODO: this is recursive. At level 6 (our current root) that's 7
-/// stack frames, which is fine. At level 20+ it would need iteration.
+/// ## Iterative post-order (hash-thing-8m7)
+///
+/// Originally recursive. At level 6 (current root) that's 7 stack
+/// frames; at level 20+ or once chunk-ingest can graft arbitrary
+/// subtrees under a high root, the native stack is not a safe place to
+/// recurse. Rewritten as an explicit two-phase `Visit`/`Emit` stack:
+///
+/// - `Visit(old)` dispatches on the node. Leaves intern immediately;
+///   interiors push an `Emit(old)` marker, then push `Visit(child)` for
+///   each child (in reverse so index 0 pops first — not strictly
+///   required for correctness, but keeps the walk left-to-right for
+///   anyone reading a debugger).
+/// - `Emit(old)` runs after every child has been interned into `dst`
+///   and remapped. It reads `children` from `src`, translates them
+///   through `remap`, and calls `dst.interior(level, new_children)` —
+///   the same single-pass build the recursive version did, just
+///   scheduled by the explicit stack instead of the native one.
+///
+/// Hash-cons sharing (same `NodeId` appearing as multiple children) is
+/// still handled at `Visit` pop time: if `remap` already has the id,
+/// the visit is a no-op. That keeps the work bounded by the number of
+/// *distinct* reachable nodes, not the number of child edges.
 fn clone_reachable(
     src: &NodeStore,
     dst: &mut NodeStore,
     remap: &mut FxHashMap<NodeId, NodeId>,
-    old: NodeId,
+    root: NodeId,
 ) -> NodeId {
-    if let Some(&new_id) = remap.get(&old) {
-        return new_id;
+    enum Frame {
+        Visit(NodeId),
+        Emit(NodeId),
     }
-    let new_id = match src.get(old).clone() {
-        Node::Leaf(state) => dst.leaf(state),
-        Node::Interior {
-            level, children, ..
-        } => {
-            let mut new_children = [NodeId::EMPTY; 8];
-            for (i, &child) in children.iter().enumerate() {
-                new_children[i] = clone_reachable(src, dst, remap, child);
+
+    let mut stack: Vec<Frame> = Vec::new();
+    stack.push(Frame::Visit(root));
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(old) => {
+                if remap.contains_key(&old) {
+                    continue;
+                }
+                match src.get(old) {
+                    Node::Leaf(state) => {
+                        let new_id = dst.leaf(*state);
+                        remap.insert(old, new_id);
+                    }
+                    Node::Interior { children, .. } => {
+                        let children = *children;
+                        stack.push(Frame::Emit(old));
+                        // Push children in reverse so index 0 pops (and
+                        // is visited) first. Not load-bearing — the
+                        // remap/hash-cons contract is index-invariant —
+                        // but it makes stack traces read left-to-right.
+                        for &child in children.iter().rev() {
+                            if !remap.contains_key(&child) {
+                                stack.push(Frame::Visit(child));
+                            }
+                        }
+                    }
+                }
             }
-            dst.interior(level, new_children)
+            Frame::Emit(old) => {
+                // By the time we pop Emit, every child has been
+                // visited-and-interned (or was already in remap). Read
+                // the original children from `src`, translate through
+                // `remap`, and intern the parent.
+                let (level, children) = match src.get(old) {
+                    Node::Interior {
+                        level, children, ..
+                    } => (*level, *children),
+                    Node::Leaf(_) => {
+                        // Unreachable: we only push Emit from the
+                        // Interior arm above.
+                        unreachable!("Emit frame for a leaf node")
+                    }
+                };
+                let mut new_children = [NodeId::EMPTY; 8];
+                for (i, &child) in children.iter().enumerate() {
+                    new_children[i] = remap[&child];
+                }
+                let new_id = dst.interior(level, new_children);
+                remap.insert(old, new_id);
+            }
         }
-    };
-    remap.insert(old, new_id);
-    new_id
+    }
+
+    remap[&root]
 }
 
 #[cfg(test)]
@@ -1239,6 +1302,36 @@ mod tests {
         assert_eq!(NodeId::EMPTY, NodeId(0));
         assert!(matches!(compacted.get(NodeId::EMPTY), Node::Leaf(0)));
         assert_eq!(compacted.population(NodeId::EMPTY), 0);
+    }
+
+    /// T10 (hash-thing-8m7): deep-tree clone_reachable. The iterative
+    /// `clone_reachable` drives the walk from an explicit heap stack;
+    /// this test builds a level-30 tree with two distinct set cells and
+    /// compacts it, exercising a full-depth chain of interior nodes plus
+    /// a fork where the two cells diverge. Correctness bar is unchanged
+    /// from the recursive version (set cells preserved, empty frontier
+    /// still zero, shared empty subtrees still dedup through hash-cons)
+    /// — the test is here to pin the iterative path specifically.
+    #[test]
+    fn compact_deep_tree_iterative_clone_reachable() {
+        let mut store = NodeStore::new();
+        // Level 30 = side 2^30, which keeps coordinates in u64 range and
+        // produces a 30-frame chain down each set-cell path. Deeper than
+        // the current world root (level 6) by a wide margin.
+        let mut root = store.empty(30);
+        root = store.set_cell(root, 0, 0, 0, mat(7));
+        root = store.set_cell(root, 1, 2, 3, mat(11));
+
+        let (compacted, new_root) = store.compacted(root);
+
+        // Both set cells survive.
+        assert_eq!(compacted.get_cell(new_root, 0, 0, 0), mat(7));
+        assert_eq!(compacted.get_cell(new_root, 1, 2, 3), mat(11));
+        // Frontier cells (still inside-bounds for level 30) read zero.
+        assert_eq!(compacted.get_cell(new_root, 100, 200, 300), 0);
+        assert_eq!(compacted.get_cell(new_root, 1_000_000, 0, 0), 0);
+        // Population is exactly the two set cells.
+        assert_eq!(compacted.population(new_root), 2);
     }
 
     // ===========================================================================
