@@ -7,7 +7,7 @@
 //   [1..]:   append-only stream of 9-u32 interior-node slots
 //
 // Interior node slot (9 u32s):
-//   [0]: child_mask (low 8 bits = octant occupancy)
+//   [0]: child_mask (low 8 bits = octant occupancy, bits 8-23 = representative material)
 //   [1..=8]: child entries, where each entry is:
 //     - bit 31 set → leaf, low 16 bits = material state
 //     - bit 31 clear → interior, value = absolute offset of child node in buffer
@@ -257,32 +257,12 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let half = stack_half[depth];
             let cmask = stack_cmask[depth];
 
-            // LOD cutoff (x5w): if this voxel is sub-pixel, scan children
-            // for the first non-empty leaf and treat the whole octant as
-            // a solid hit at that color. Dramatically cuts step count for
-            // distant or complex geometry.
-            // m1f.7.3: only iterate non-empty children (skip empty via cmask).
+            // LOD cutoff (x5w): if this voxel is sub-pixel, use the
+            // representative material packed in bits 8-23 of child_mask
+            // (m1f.7.3.2). No child scan needed — 0 buffer reads.
             let t_dist = max(t + entry, 1e-4);
             if pixel_world > 0.0 && half < pixel_world * t_dist {
-                // Find any non-empty child in this node.
-                var lod_mat: u32 = 0u;
-                for (var c = 0u; c < 8u; c = c + 1u) {
-                    if (cmask & (1u << c)) == 0u { continue; }
-                    let cs = dag_nodes[node_offset + 1u + c];
-                    if (cs & LEAF_BIT) != 0u {
-                        let m = cs & 0xFFFFu;
-                        if m > 0u { lod_mat = m; break; }
-                    } else if cs != 0u {
-                        // Interior child — pick its first leaf recursively
-                        // would be expensive; just use the first child of
-                        // the interior node as an approximation.
-                        let inner_first = dag_nodes[cs + 1u];
-                        if (inner_first & LEAF_BIT) != 0u {
-                            let m = inner_first & 0xFFFFu;
-                            if m > 0u { lod_mat = m; break; }
-                        }
-                    }
-                }
+                let lod_mat = (cmask >> 8u) & 0xFFFFu;
                 if lod_mat > 0u {
                     // Shade as a flat-color hit at node center.
                     let base = material_color(lod_mat);

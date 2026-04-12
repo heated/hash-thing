@@ -194,8 +194,7 @@ fn carve_caves_recursive(
             origin[1] + cy as i64 * half,
             origin[2] + cz as i64 * half,
         ];
-        new_children[oct] =
-            carve_caves_recursive(store, *child, level - 1, child_origin, params);
+        new_children[oct] = carve_caves_recursive(store, *child, level - 1, child_origin, params);
     }
     store.interior(level, new_children)
 }

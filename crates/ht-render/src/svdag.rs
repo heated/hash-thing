@@ -19,7 +19,7 @@
 //!   [1..]:      concatenated 9-u32 interior-node slots, append-only
 //!
 //! Interior node slot (9 u32s = 36 bytes):
-//!   [0]:        child_mask (low 8 bits: which octants are non-empty)
+//!   [0]:        child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
 //!   [1..=8]:    child entries — packed as (is_leaf << 31) | payload_bits
 //!     - is_leaf: payload is the 16-bit material state in low bits
 //!     - else:    payload is the absolute offset of the child node in this buffer
@@ -116,7 +116,9 @@ impl Svdag {
         if let Node::Leaf(state) = store.get(root) {
             // Degenerate single-node DAG: all 8 children point at the same
             // inline leaf. Build the slot and cache it normally.
-            let mask = if *state != 0 { 0xffu32 } else { 0u32 };
+            let occ = if *state != 0 { 0xffu32 } else { 0u32 };
+            let rep = (*state as u32) & 0xFFFF;
+            let mask = occ | (rep << 8);
             let leaf_slot = LEAF_BIT | (*state as u32);
             let mut slot = [0u32; 9];
             slot[0] = mask;
@@ -160,11 +162,15 @@ impl Svdag {
                 let children = *children;
                 let mut slot = [0u32; 9];
                 let mut mask: u32 = 0;
+                let mut rep_mat: u32 = 0;
                 for (i, &child_id) in children.iter().enumerate() {
                     match store.get(child_id) {
                         Node::Leaf(state) => {
                             if *state != 0 {
                                 mask |= 1 << i;
+                                if rep_mat == 0 {
+                                    rep_mat = *state as u32;
+                                }
                             }
                             slot[1 + i] = LEAF_BIT | (*state as u32);
                         }
@@ -173,13 +179,22 @@ impl Svdag {
                                 mask |= 1 << i;
                                 let child_offset = self.visit(store, child_id, id_to_offset);
                                 slot[1 + i] = child_offset;
+                                // Propagate representative material from child
+                                // (m1f.7.3.2: packed into bits 8-23 of child_mask).
+                                if rep_mat == 0 {
+                                    let child_cmask = self.nodes[child_offset as usize];
+                                    rep_mat = (child_cmask >> 8) & 0xFFFF;
+                                }
                             } else {
                                 slot[1 + i] = LEAF_BIT;
                             }
                         }
                     }
                 }
-                slot[0] = mask;
+                // Pack representative material into bits 8-23 of child_mask.
+                // Shader LOD reads `(cmask >> 8) & 0xFFFF` to get the material
+                // without scanning children (hash-thing-m1f.7.3.2).
+                slot[0] = mask | ((rep_mat & 0xFFFF) << 8);
 
                 let offset = self.intern_slot(slot);
                 id_to_offset.insert(id, offset);
