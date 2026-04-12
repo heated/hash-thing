@@ -297,10 +297,12 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     let base = material_color(mat);
                     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
                     let diffuse = max(dot(normal, light_dir), 0.0);
-                    let ambient = 0.25;
+                    let ambient = 0.3;
+                    let lit = base * (ambient + diffuse * 0.7);
                     let t_world = t + entry;
                     let fog = exp(-t_world * 1.5);
-                    return vec4<f32>(base * (ambient + diffuse * 0.75) * fog, 1.0);
+                    let fog_color = vec3<f32>(0.55, 0.70, 0.90);
+                    return vec4<f32>(mix(fog_color, lit, fog), 1.0);
                 }
                 // Empty leaf — break to step ray
                 break;
