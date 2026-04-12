@@ -7,7 +7,7 @@
 use std::fmt;
 
 use crate::octree::{Cell, CellState};
-use crate::sim::rule::{CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
+use crate::sim::rule::{BlockRule, CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
 
 pub type MaterialId = u16;
 
@@ -29,6 +29,9 @@ pub const WATER: CellState = Cell::pack(WATER_MATERIAL_ID, 0).raw();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleId(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockRuleId(pub usize);
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,11 +55,13 @@ pub struct MaterialEntry {
     pub visual: MaterialVisualProperties,
     pub physical: MaterialPhysicalProperties,
     pub rule_id: RuleId,
+    pub block_rule_id: Option<BlockRuleId>,
 }
 
 pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
     rules: Vec<Box<dyn CaRule>>,
+    block_rules: Vec<Box<dyn BlockRule>>,
 }
 
 impl fmt::Debug for MaterialRegistry {
@@ -73,6 +78,7 @@ impl MaterialRegistry {
         Self {
             entries: Vec::with_capacity(INITIAL_MATERIAL_SLOTS),
             rules: Vec::new(),
+            block_rules: Vec::new(),
         }
     }
 
@@ -102,6 +108,7 @@ impl MaterialRegistry {
                     conductivity: 0.0,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -118,6 +125,7 @@ impl MaterialRegistry {
                     conductivity: 0.2,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -134,6 +142,7 @@ impl MaterialRegistry {
                     conductivity: 0.08,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -150,6 +159,7 @@ impl MaterialRegistry {
                     conductivity: 0.04,
                 },
                 rule_id: static_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -166,6 +176,7 @@ impl MaterialRegistry {
                     conductivity: 0.0,
                 },
                 rule_id: fire_rule,
+                block_rule_id: None,
             },
         );
         registry.insert(
@@ -182,6 +193,7 @@ impl MaterialRegistry {
                     conductivity: 0.6,
                 },
                 rule_id: water_rule,
+                block_rule_id: None,
             },
         );
 
@@ -207,6 +219,17 @@ impl MaterialRegistry {
         Some(self.rules[entry.rule_id.0].as_ref())
     }
 
+    #[allow(dead_code)]
+    pub fn block_rule_for_cell(&self, cell: Cell) -> Option<&dyn BlockRule> {
+        let entry = self.entry(cell.material())?;
+        let block_rule_id = entry.block_rule_id?;
+        Some(self.block_rules[block_rule_id.0].as_ref())
+    }
+
+    pub fn block_rule_id_for_cell(&self, cell: Cell) -> Option<BlockRuleId> {
+        self.entry(cell.material())?.block_rule_id
+    }
+
     pub fn color_palette_rgba(&self) -> Vec<[f32; 4]> {
         let mut palette =
             vec![[0.0, 0.0, 0.0, 0.0]; self.entries.len().max(INITIAL_MATERIAL_SLOTS)];
@@ -225,6 +248,31 @@ impl MaterialRegistry {
         let rule_id = RuleId(self.rules.len());
         self.rules.push(Box::new(rule));
         rule_id
+    }
+
+    #[allow(dead_code)]
+    pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
+    where
+        R: BlockRule + 'static,
+    {
+        let id = BlockRuleId(self.block_rules.len());
+        self.block_rules.push(Box::new(rule));
+        id
+    }
+
+    #[allow(dead_code)]
+    pub fn assign_block_rule(&mut self, material_id: MaterialId, block_rule_id: BlockRuleId) {
+        self.entries[material_id as usize]
+            .as_mut()
+            .unwrap_or_else(|| {
+                panic!("material {material_id} must exist before assigning a block rule")
+            })
+            .block_rule_id = Some(block_rule_id);
+    }
+
+    /// Look up a block rule by ID. Used by `World::step_blocks()`.
+    pub fn block_rule(&self, id: BlockRuleId) -> &dyn BlockRule {
+        self.block_rules[id.0].as_ref()
     }
 
     fn insert(&mut self, material_id: MaterialId, entry: MaterialEntry) {
@@ -372,6 +420,7 @@ mod tests {
                 conductivity: 0.8,
             },
             rule_id,
+            block_rule_id: None,
         }
     }
 
