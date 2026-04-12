@@ -735,6 +735,10 @@ impl ApplicationHandler for App {
                 }
 
                 // Player movement (per-frame, not per-tick) and camera sync.
+                // Reset HUD each frame — FPS block below sets it true.
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.hud_visible = false;
+                }
                 if self.camera_mode == CameraMode::FirstPerson {
                     if let Some(pid) = self.player_id {
                         // Read player yaw for movement direction.
@@ -847,8 +851,15 @@ impl ApplicationHandler for App {
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
+                                    // Update HUD material color from palette.
+                                    let palette = self.world.materials.color_palette_rgba();
+                                    let mat = ps.held_material as usize;
+                                    if mat < palette.len() {
+                                        renderer.hud_material_color = palette[mat];
+                                    }
                                 }
                                 renderer.camera_dist = 0.0;
+                                renderer.hud_visible = true;
                             }
                         }
                     }
