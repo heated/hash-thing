@@ -267,7 +267,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Next up (P1, from bd)
 
-- ☐ **Recursive Hashlife stepping** (epic `6gf`, 3/6): ✅ `6gf.1` recursive step landed (spark), ✅ `6gf.5` store gap-fill tests, ✅ `6gf.6` extraction primitives. Next: `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading. Memoization is the biggest single perf unlock.
+- ☐ **Recursive Hashlife stepping** (epic `6gf`, 7/9): ✅ `6gf.1` recursive step, ✅ `6gf.2` memoization, ✅ `6gf.3` correctness harness, ✅ `6gf.4` Margolus parity, ✅ `6gf.5`-`6gf.6` tests + primitives, ✅ `6gf.8` main loop switchover. In progress: `6gf.7` exponential time-skip (cedar), `6gf.9` timing comparison (edward).
 - ☐ **Material-type CA continuation** (epic `1v0`, 15/18): ✅ `1v0.1`-`1v0.5`, `1v0.7`, `1v0.9` landed. Remaining: `1v0.6` entity system (unblocked), `1v0.8` cell/block granularity (design gate), `1v0.10` player entity (blocked on 1v0.6 + 1v0.8).
 - ☐ **SVDAG continuation**: ✅ `5bb.4` per-leaf material attributes. ✅ `5bb.5` incremental edit uploads. ✅ `bx7` stale-slot compaction. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
