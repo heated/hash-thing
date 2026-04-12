@@ -323,12 +323,13 @@ impl Svdag {
 pub mod cpu_trace {
     use super::*;
 
-    pub const MAX_DEPTH: usize = 20;
+    pub const MAX_DEPTH: usize = 24;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
     /// Leaf-resolution grid size for integer DDA (hash-thing-pck).
-    /// Each axis has `2^MAX_DEPTH = 1048576` cells at the finest level.
+    /// Each axis has `2^MAX_DEPTH` cells at the finest level.
+    /// At MAX_DEPTH=24: 2^24 = 16M, exact in f32's 24-bit mantissa.
     const RESOLUTION: u32 = 1 << MAX_DEPTH as u32;
     const INV_RES: f32 = 1.0 / RESOLUTION as f32;
 

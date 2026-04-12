@@ -16,7 +16,7 @@
 // while all other reachable slots stay stable, letting the CPU-side builder
 // serve incremental edits without rewriting the buffer. Root bounds are [0,1]^3.
 //
-// Traversal: explicit stack with depth capped at MAX_DEPTH (20 levels → 1M^3).
+// Traversal: explicit stack with depth capped at MAX_DEPTH (24 levels → 16M^3).
 // At each step we descend into the octant the ray is currently in. If empty,
 // we step the ray to the next octant boundary using DDA on the current level's
 // cell size. If leaf, shade it. If interior, push and descend.
@@ -112,9 +112,12 @@ fn octant_of(pos: vec3<f32>, rd: vec3<f32>, node_min: vec3<f32>, half: f32) -> u
     return idx;
 }
 
-const MAX_DEPTH: u32 = 20u;
+const MAX_DEPTH: u32 = 24u;
 const LEAF_BIT: u32 = 0x80000000u;
 // Integer DDA (hash-thing-pck): leaf-resolution grid.
+// At MAX_DEPTH=24, RESOLUTION = 2^24 = 16M. Exact in f32 (24-bit mantissa),
+// so DDA boundary computation stays precise. Supports 16M^3 worlds — enough
+// for any practical hashlife scale. Pinned by cpu_trace::integer_dda_exact.
 const RESOLUTION: u32 = 1u << MAX_DEPTH;
 const INV_RES: f32 = 1.0 / f32(RESOLUTION);
 
