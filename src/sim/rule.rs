@@ -13,6 +13,7 @@ pub trait CaRule {
 }
 
 /// Identity rule for static materials. Returns the center cell unchanged.
+#[derive(Debug)]
 pub struct NoopRule;
 
 impl CaRule for NoopRule {
@@ -22,6 +23,7 @@ impl CaRule for NoopRule {
 }
 
 /// Fire persists while fuel is adjacent, and is quenched by water.
+#[derive(Debug)]
 pub struct FireRule {
     pub fuel_material: u16,
     pub quencher_material: u16,
@@ -47,6 +49,7 @@ impl CaRule for FireRule {
 }
 
 /// Water solidifies into a configured product when the reactive material is adjacent.
+#[derive(Debug)]
 pub struct WaterRule {
     pub reactive_material: u16,
     pub reaction_product: Cell,
@@ -84,7 +87,7 @@ impl CaRule for WaterRule {
 /// [`crystal`]: GameOfLife3D::crystal
 /// [`rule445`]: GameOfLife3D::rule445
 /// [`pyroclastic`]: GameOfLife3D::pyroclastic
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct GameOfLife3D {
     /// survive_min..=survive_max: cell stays alive if neighbor count is in this range
     pub survive_min: u8,
