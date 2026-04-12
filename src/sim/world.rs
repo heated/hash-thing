@@ -1,5 +1,6 @@
 use super::rule::{CaRule, ALIVE};
 use crate::octree::{CellState, NodeId, NodeStore};
+use crate::terrain::materials::MaterialRegistry;
 use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
@@ -12,6 +13,7 @@ pub struct World {
     pub root: NodeId,
     pub level: u32, // root level — grid is 2^level per side
     pub generation: u64,
+    pub materials: MaterialRegistry,
 }
 
 impl World {
@@ -19,11 +21,17 @@ impl World {
     pub fn new(level: u32) -> Self {
         let mut store = NodeStore::new();
         let root = store.empty(level);
+        let materials = MaterialRegistry::terrain_defaults();
+        assert!(
+            materials.rule_for_state(ALIVE).is_some(),
+            "default material registry must define the legacy ALIVE payload",
+        );
         Self {
             store,
             root,
             level,
             generation: 0,
+            materials,
         }
     }
 

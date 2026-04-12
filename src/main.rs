@@ -115,6 +115,7 @@ impl App {
         // called outside the timed gen region so it does not pollute
         // the gen measurement. See hash-thing-3fq.5.
         let noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+        let material_palette_len = world.materials.color_palette_rgba().len();
 
         let (nodes_after, _) = world.store.stats();
         let nodes_delta = nodes_after.saturating_sub(nodes_before);
@@ -128,6 +129,7 @@ impl App {
             elapsed,
             noise_ns_per_sample,
         );
+        log::debug!("Material registry palette slots={material_palette_len}");
 
         // Start paused so the active CA rule (legacy GoL) does not
         // immediately treat solid terrain as alive and destroy it. Press

@@ -14,6 +14,15 @@ pub trait CaRule {
     fn step_cell(&self, center: CellState, neighbors: &[CellState; 26]) -> CellState;
 }
 
+/// Identity rule for static materials. Returns the center cell unchanged.
+pub struct NoopRule;
+
+impl CaRule for NoopRule {
+    fn step_cell(&self, center: CellState, _neighbors: &[CellState; 26]) -> CellState {
+        center
+    }
+}
+
 /// 3D Game of Life (outer totalistic).
 ///
 /// Parameterized by survival and birth ranges over the 26-neighbor Moore
@@ -233,6 +242,14 @@ mod tests {
         n[3] = 255;
         let rule = GameOfLife3D::rule445();
         assert_eq!(rule.step_cell(0, &n), ALIVE);
+    }
+
+    #[test]
+    fn noop_rule_preserves_center_exactly() {
+        let rule = NoopRule;
+        let neighbors = [ALIVE; 26];
+        assert_eq!(rule.step_cell(0, &neighbors), 0);
+        assert_eq!(rule.step_cell(0x02c1, &neighbors), 0x02c1);
     }
 
     /// With all 26 neighbors alive: amoeba (S 9..=26) survives; the other

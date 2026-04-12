@@ -137,8 +137,8 @@ mod tests {
         assert_eq!(f.sample([4, 0, 0]), 42);
         assert_eq!(f.sample([5, 0, 0]), 0);
         assert_eq!(f.classify_box([0, 0, 0], 2), Some(42)); // x ∈ [0, 4) < 5
-        assert_eq!(f.classify_box([8, 0, 0], 2), Some(0));  // x ∈ [8, 12) ≥ 5
-        assert_eq!(f.classify_box([4, 0, 0], 2), None);     // x ∈ [4, 8) straddles 5
+        assert_eq!(f.classify_box([8, 0, 0], 2), Some(0)); // x ∈ [8, 12) ≥ 5
+        assert_eq!(f.classify_box([4, 0, 0], 2), None); // x ∈ [4, 8) straddles 5
     }
 
     #[test]
