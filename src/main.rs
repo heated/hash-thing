@@ -237,6 +237,28 @@ impl ApplicationHandler for App {
                                 log::info!("Render mode: {:?}", renderer.mode);
                             }
                         }
+                        // hash-thing-hso: on-demand dump of the full perf +
+                        // memory summary, independent of the wall-clock log
+                        // cadence. Useful when the cadence is slow (or
+                        // paused) and you want to read the latest numbers
+                        // right now instead of waiting `LOG_INTERVAL_SECS`
+                        // for the next automatic line.
+                        winit::keyboard::Key::Character("p") => {
+                            let (nodes, cache) = self.world.store.stats();
+                            self.mem_stats.update(nodes, cache);
+                            let (svdag_nodes, svdag_bytes, svdag_root_level) =
+                                self.last_svdag_stats;
+                            log::info!(
+                                "Gen {} (on demand): pop={} svdag={}/{}KB(L{}) | {} | {}",
+                                self.world.generation,
+                                self.world.population(),
+                                svdag_nodes,
+                                svdag_bytes / 1024,
+                                svdag_root_level,
+                                self.mem_stats.summary(),
+                                self.perf.summary(),
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -377,6 +399,7 @@ fn main() {
     log::info!("  R: reset");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");
+    log::info!("  P: dump perf + memory summary (on demand)");
     log::info!("  Esc: quit");
 
     let event_loop = EventLoop::new().unwrap();
