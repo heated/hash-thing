@@ -777,10 +777,10 @@ mod tests {
             ("445", GameOfLife3D::rule445()),
             ("pyroclastic", GameOfLife3D::new(4, 7, 6, 8)),
         ];
-        let cases = [(3_u32, 1_usize, 2_u64), (4_u32, 3_usize, 4_u64)];
+        let cases = [(3_u32, 1_usize), (4_u32, 3_usize)];
 
         for (preset_idx, &(label, rule)) in presets.iter().enumerate() {
-            for (level, steps, margin) in cases {
+            for (level, steps) in cases {
                 for case_seed in 0..4_u64 {
                     let simulation_seed = 0x6f03_u64
                         ^ ((preset_idx as u64) << 16)
@@ -789,8 +789,8 @@ mod tests {
                     let initial_seed = simulation_seed ^ 0xa11ce_u64;
                     let mut brute = gol_world(level, rule, simulation_seed);
                     let mut recur = gol_world(level, rule, simulation_seed);
-                    seed_random_alive_cells(&mut brute, initial_seed, margin);
-                    seed_random_alive_cells(&mut recur, initial_seed, margin);
+                    seed_random_alive_cells(&mut brute, initial_seed, 0);
+                    seed_random_alive_cells(&mut recur, initial_seed, 0);
 
                     let case =
                         format!("{label} level={level} steps={steps} seed={simulation_seed:#x}");
@@ -990,9 +990,10 @@ mod tests {
         assert_recursive_matches_bruteforce(brute, recur, 2, "level5-stone");
     }
 
-    /// Seed water and stone with a margin to avoid boundary discrepancy.
-    /// Brute-force wraps toroidally at edges; hashlife pads with empty (absorbing).
-    /// Both agree on interior cells when the boundary ring is empty.
+    /// Seed water and stone with a margin. CaRule boundaries now match
+    /// (both absorbing), but BlockRule still differs: brute-force clips
+    /// partial blocks at edges, hashlife processes them via overlapping
+    /// sub-cubes. Margins keep block-rule-bearing cells away from edges.
     fn seed_random_material_cells_margined(world: &mut World, seed: u64, margin: u64) {
         let mut rng = SimpleRng::new(seed);
         let side = world.side() as u64;
@@ -1018,7 +1019,6 @@ mod tests {
     fn recursive_matches_brute_force_level4_materials() {
         let mut brute = World::new(4);
         let mut recur = World::new(4);
-        // Margin of 2 avoids boundary discrepancy between toroidal and absorbing BCs
         seed_random_material_cells_margined(&mut brute, 0xdee4_u64, 2);
         seed_random_material_cells_margined(&mut recur, 0xdee4_u64, 2);
         assert_recursive_matches_bruteforce(brute, recur, 3, "level4-materials");
@@ -1039,8 +1039,8 @@ mod tests {
         let rule = GameOfLife3D::rule445();
         let mut brute = gol_world(5, rule, 0xd33f_u64);
         let mut recur = gol_world(5, rule, 0xd33f_u64);
-        seed_random_alive_cells(&mut brute, 0xd33f_u64 ^ 0xa11ce, 4);
-        seed_random_alive_cells(&mut recur, 0xd33f_u64 ^ 0xa11ce, 4);
+        seed_random_alive_cells(&mut brute, 0xd33f_u64 ^ 0xa11ce, 0);
+        seed_random_alive_cells(&mut recur, 0xd33f_u64 ^ 0xa11ce, 0);
         assert_recursive_matches_bruteforce(brute, recur, 2, "level5-gol-445");
     }
 
