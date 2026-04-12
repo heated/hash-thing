@@ -25,30 +25,26 @@ impl RealizedRegion {
         1u64 << self.level
     }
 
-    /// True if the unsigned coordinate `(x, y, z)` is inside the region.
-    ///
-    /// Assumes origin is non-negative (current invariant). Once signed
-    /// coords land, this will subtract origin before comparing.
-    pub fn contains(&self, x: u64, y: u64, z: u64) -> bool {
-        let s = self.side();
-        let ox = self.origin[0] as u64;
-        let oy = self.origin[1] as u64;
-        let oz = self.origin[2] as u64;
-        x >= ox && x < ox + s && y >= oy && y < oy + s && z >= oz && z < oz + s
+    /// True if the world-space coordinate `(x, y, z)` is inside the region.
+    pub fn contains(&self, x: i64, y: i64, z: i64) -> bool {
+        let s = self.side() as i64;
+        x >= self.origin[0]
+            && x < self.origin[0] + s
+            && y >= self.origin[1]
+            && y < self.origin[1] + s
+            && z >= self.origin[2]
+            && z < self.origin[2] + s
     }
 
     /// Map a world-space point to the octant index (0–7) within the root node.
     ///
     /// Panics if the point is outside the region.
-    pub fn octant_of(&self, x: u64, y: u64, z: u64) -> usize {
+    pub fn octant_of(&self, x: i64, y: i64, z: i64) -> usize {
         assert!(self.contains(x, y, z), "point outside realized region");
-        let half = self.side() / 2;
-        let ox = self.origin[0] as u64;
-        let oy = self.origin[1] as u64;
-        let oz = self.origin[2] as u64;
-        let dx = if x - ox >= half { 1 } else { 0 };
-        let dy = if y - oy >= half { 1 } else { 0 };
-        let dz = if z - oz >= half { 1 } else { 0 };
+        let half = self.side() as i64 / 2;
+        let dx = if x - self.origin[0] >= half { 1 } else { 0 };
+        let dy = if y - self.origin[1] >= half { 1 } else { 0 };
+        let dz = if z - self.origin[2] >= half { 1 } else { 0 };
         dx + dy * 2 + dz * 4
     }
 }
