@@ -29,3 +29,29 @@ impl RegionField for ConstField {
         Some(self.state)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_returns_constant() {
+        let f = ConstField::new(42);
+        assert_eq!(f.sample([0, 0, 0]), 42);
+        assert_eq!(f.sample([100, -50, 999]), 42);
+    }
+
+    #[test]
+    fn classify_always_returns_some() {
+        let f = ConstField::new(7);
+        assert_eq!(f.classify_box([0, 0, 0], 0), Some(7));
+        assert_eq!(f.classify_box([-100, 50, 0], 10), Some(7));
+    }
+
+    #[test]
+    fn empty_field_is_zero() {
+        let f = ConstField::new(0);
+        assert_eq!(f.sample([0, 0, 0]), 0);
+        assert_eq!(f.classify_box([0, 0, 0], 5), Some(0));
+    }
+}

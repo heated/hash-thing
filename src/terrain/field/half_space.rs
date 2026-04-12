@@ -63,3 +63,95 @@ impl RegionField for HalfSpaceField {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn y_split(threshold: i64) -> HalfSpaceField {
+        HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold,
+            below: 100, // "solid"
+            above: 0,   // "air"
+        }
+    }
+
+    #[test]
+    fn sample_below_threshold() {
+        let f = y_split(10);
+        assert_eq!(f.sample([0, 9, 0]), 100);
+        assert_eq!(f.sample([5, -1, 3]), 100);
+    }
+
+    #[test]
+    fn sample_at_and_above_threshold() {
+        let f = y_split(10);
+        assert_eq!(f.sample([0, 10, 0]), 0);
+        assert_eq!(f.sample([0, 11, 0]), 0);
+    }
+
+    #[test]
+    fn classify_fully_below() {
+        let f = y_split(10);
+        // Box [0, 0, 0] size=8 → y ∈ [0, 8). Threshold 10 → hi=8 ≤ 10 → below.
+        assert_eq!(f.classify_box([0, 0, 0], 3), Some(100));
+    }
+
+    #[test]
+    fn classify_fully_above() {
+        let f = y_split(10);
+        // Box [0, 16, 0] size=8 → y ∈ [16, 24). lo=16 ≥ 10 → above.
+        assert_eq!(f.classify_box([0, 16, 0], 3), Some(0));
+    }
+
+    #[test]
+    fn classify_straddle_returns_none() {
+        let f = y_split(10);
+        // Box [0, 8, 0] size=8 → y ∈ [8, 16). lo=8 < 10 and hi=16 > 10 → mixed.
+        assert_eq!(f.classify_box([0, 8, 0], 3), None);
+    }
+
+    #[test]
+    fn classify_boundary_exact_hi_equals_threshold() {
+        let f = y_split(8);
+        // Box [0, 0, 0] size=8 → hi=8, threshold=8 → hi ≤ threshold → fully below.
+        assert_eq!(f.classify_box([0, 0, 0], 3), Some(100));
+    }
+
+    #[test]
+    fn classify_boundary_lo_equals_threshold() {
+        let f = y_split(8);
+        // Box [0, 8, 0] size=4 → lo=8 ≥ 8 → fully above.
+        assert_eq!(f.classify_box([0, 8, 0], 2), Some(0));
+    }
+
+    #[test]
+    fn x_axis_split() {
+        let f = HalfSpaceField {
+            axis: HalfSpaceAxis::X,
+            threshold: 5,
+            below: 42,
+            above: 0,
+        };
+        assert_eq!(f.sample([4, 0, 0]), 42);
+        assert_eq!(f.sample([5, 0, 0]), 0);
+        assert_eq!(f.classify_box([0, 0, 0], 2), Some(42)); // x ∈ [0, 4) < 5
+        assert_eq!(f.classify_box([8, 0, 0], 2), Some(0));  // x ∈ [8, 12) ≥ 5
+        assert_eq!(f.classify_box([4, 0, 0], 2), None);     // x ∈ [4, 8) straddles 5
+    }
+
+    #[test]
+    fn z_axis_split() {
+        let f = HalfSpaceField {
+            axis: HalfSpaceAxis::Z,
+            threshold: 16,
+            below: 77,
+            above: 0,
+        };
+        assert_eq!(f.sample([0, 0, 15]), 77);
+        assert_eq!(f.sample([0, 0, 16]), 0);
+        assert_eq!(f.classify_box([0, 0, 0], 4), Some(77)); // z ∈ [0, 16) → hi=16 ≤ 16
+        assert_eq!(f.classify_box([0, 0, 16], 3), Some(0)); // z ∈ [16, 24) ≥ 16
+    }
+}
