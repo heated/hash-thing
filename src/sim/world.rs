@@ -93,6 +93,11 @@ pub struct World {
     /// Key: NodeId. Value: `Some(state)` iff the subtree is uniform and
     /// guaranteed to step to itself under both CaRule and BlockRule.
     pub(crate) hashlife_inert_cache: FxHashMap<NodeId, Option<CellState>>,
+    /// All-inert detection cache (m1f.15.7). True iff every leaf in the
+    /// subtree has CaRule::Noop and no BlockRule — the subtree is a fixed
+    /// point under stepping. Unlike `hashlife_inert_cache`, this catches
+    /// mixed-material subtrees (e.g. stone/air boundaries).
+    pub(crate) hashlife_all_inert_cache: FxHashMap<NodeId, bool>,
     /// Hashlife cache statistics from the most recent step.
     pub hashlife_stats: HashlifeStats,
     /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
@@ -145,6 +150,7 @@ impl World {
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_inert_cache: FxHashMap::default(),
+            hashlife_all_inert_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
@@ -169,6 +175,7 @@ impl World {
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
     }
 
     /// Invalidate caches whose keys depend on the active CA rule.

@@ -118,6 +118,25 @@ impl World {
         result
     }
 
+    /// Check if every leaf in the subtree is inert (CaRule::Noop, no BlockRule).
+    /// Unlike `inert_uniform_state`, this catches mixed-material subtrees
+    /// (e.g. stone/air boundaries at terrain surfaces). For all-inert nodes,
+    /// stepping produces the center extraction — no CA computation needed.
+    fn is_all_inert(&mut self, node: NodeId) -> bool {
+        if let Some(&cached) = self.hashlife_all_inert_cache.get(&node) {
+            return cached;
+        }
+        let result = match self.store.get(node).clone() {
+            Node::Leaf(state) => {
+                // Empty cells (air) and inert materials are both fixed points
+                state == 0 || self.materials.cell_is_inert_fixed_point(Cell::from_raw(state))
+            }
+            Node::Interior { children, .. } => children.into_iter().all(|c| self.is_all_inert(c)),
+        };
+        self.hashlife_all_inert_cache.insert(node, result);
+        result
+    }
+
     fn inert_uniform_state(&mut self, node: NodeId) -> Option<CellState> {
         if let Some(&cached) = self.hashlife_inert_cache.get(&node) {
             return cached;
@@ -174,6 +193,15 @@ impl World {
                 self.hashlife_inert_cache.insert(new_node, state);
             }
         }
+
+        // Remap hashlife_all_inert_cache: NodeId → bool
+        let old_all_inert = std::mem::take(&mut self.hashlife_all_inert_cache);
+        self.hashlife_all_inert_cache.reserve(old_all_inert.len());
+        for (node, inert) in old_all_inert {
+            if let Some(&new_node) = remap.get(&node) {
+                self.hashlife_all_inert_cache.insert(new_node, inert);
+            }
+        }
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -208,6 +236,15 @@ impl World {
         if let Some(state) = self.inert_uniform_state(node) {
             self.hashlife_stats.fixed_point_skips += 1;
             return self.store.uniform(level - 1, state);
+        }
+
+        // All-inert check (m1f.15.7): if every leaf is CaRule::Noop with no
+        // BlockRule, the step result is the center extraction. This catches
+        // mixed-material terrain surfaces (stone/air/dirt/grass) that the
+        // uniform-inert check above misses.
+        if self.is_all_inert(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return self.center_node(node, level);
         }
 
         let key = (node, parity);
@@ -250,6 +287,11 @@ impl World {
         if let Some(state) = self.inert_uniform_state(node) {
             self.hashlife_stats.fixed_point_skips += 1;
             return self.store.uniform(level - 1, state);
+        }
+
+        if self.is_all_inert(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return self.center_node(node, level);
         }
 
         let key = (node, generation);
@@ -1319,12 +1361,11 @@ mod tests {
         eprintln!("  frame 4 hit rate: {:.1}%", hit_rate_f4 * 100.0);
     }
 
-    /// Deferred compaction enables cross-frame cache hits (m1f.15.5).
-    /// When the world is inert, compaction is skipped, preserving cache
-    /// entries. The second same-parity frame should get cache hits instead
-    /// of all misses.
+    /// All-inert detection (m1f.15.7) + deferred compaction (m1f.15.5):
+    /// a stone-only world should be fully handled by fixed-point + all-inert
+    /// short-circuits, with zero cache misses from the very first step.
     #[test]
-    fn deferred_compaction_enables_cross_frame_cache_hits() {
+    fn inert_world_zero_cache_lookups() {
         let mut world = World::new(4); // 16³
         let mut rng = SimpleRng::new(0xd1ce_u64);
         for z in 0..16u64 {
@@ -1336,37 +1377,30 @@ mod tests {
                 }
             }
         }
+        let state_before = world.flatten();
 
-        // Gen 0 (parity 0): cold start, all misses
-        world.step_recursive();
-        let gen0 = world.hashlife_stats;
-        assert!(gen0.cache_misses > 0, "gen 0 should have cache misses");
+        for gen in 0..4 {
+            world.step_recursive();
+            let s = world.hashlife_stats;
+            // All work should be short-circuited by fixed-point detection
+            // and all-inert detection — no cache lookups needed.
+            let total_skips = s.empty_skips + s.fixed_point_skips;
+            assert!(
+                total_skips > 0,
+                "gen {gen}: should have short-circuit skips"
+            );
+            assert_eq!(
+                s.cache_misses, 0,
+                "gen {gen}: stone-only world should have zero cache misses \
+                 (all caught by inert detection), got {} misses",
+                s.cache_misses,
+            );
+        }
 
-        // Gen 1 (parity 1): different parity, cache entries don't match
-        world.step_recursive();
-
-        // Gen 2 (parity 0): same parity as gen 0. With deferred compaction,
-        // the cache entries from gen 0 are still alive (no compaction ran
-        // on an inert world). We should see cache hits.
-        world.step_recursive();
-        let gen2 = world.hashlife_stats;
-
-        // The key assertion: gen 2 should have MORE cache hits than gen 0
-        // (gen 0 had 0 hits because the cache was empty).
-        assert!(
-            gen2.cache_hits > gen0.cache_hits,
-            "gen 2 should have cross-frame cache hits (got {} vs gen0's {}). \
-             Deferred compaction should preserve cache entries for inert frames.",
-            gen2.cache_hits,
-            gen0.cache_hits,
-        );
-
-        // And fewer misses than gen 0 (some entries are served from cache)
-        assert!(
-            gen2.cache_misses < gen0.cache_misses,
-            "gen 2 should have fewer misses ({}) than gen 0 ({})",
-            gen2.cache_misses,
-            gen0.cache_misses,
+        assert_eq!(
+            world.flatten(),
+            state_before,
+            "stone-only world should remain unchanged"
         );
     }
 }
