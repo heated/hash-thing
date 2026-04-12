@@ -14,5 +14,6 @@
 {"id":"int-40139d6e","kind":"field_change","created_at":"2026-04-12T02:22:58.644604Z","actor":"spark","issue_id":"hash-thing-bx7","extra":{"field":"status","new_value":"open","old_value":"in_progress"}}
 {"id":"int-534a2a3c","kind":"field_change","created_at":"2026-04-12T02:22:58.645145Z","actor":"spark","issue_id":"hash-thing-bx7","extra":{"field":"assignee","new_value":"","old_value":"spark"}}
 {"id":"int-7964bc34","kind":"field_change","created_at":"2026-04-12T02:45:36.074121Z","actor":"Edward Swernofsky","issue_id":"hash-thing-eg3","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
-{"id":"int-667a1ded","kind":"field_change","created_at":"2026-04-12T02:58:22.531261Z","actor":"Edward Swernofsky","issue_id":"hash-thing-1v0.1","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
-{"id":"int-1821f839","kind":"field_change","created_at":"2026-04-12T03:03:32.509893Z","actor":"Edward Swernofsky","issue_id":"hash-thing-69z","extra":{"field":"status","new_value":"open","old_value":"blocked"}}
+{"id":"int-cb350ba0","kind":"field_change","created_at":"2026-04-12T02:53:16.064492Z","actor":"spark","issue_id":"hash-thing-5bb.5","extra":{"field":"status","new_value":"open","old_value":"closed"}}
+{"id":"int-0518baee","kind":"field_change","created_at":"2026-04-12T02:56:27.307671Z","actor":"spark","issue_id":"hash-thing-5bb.5","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
+{"id":"int-5482cb2d","kind":"field_change","created_at":"2026-04-12T02:56:27.308546Z","actor":"spark","issue_id":"hash-thing-5bb.5","extra":{"field":"assignee","new_value":"spark","old_value":"Edward Swernofsky"}}
