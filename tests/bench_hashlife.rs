@@ -7,6 +7,7 @@
 //! slower and not representative of real performance.
 
 use hash_thing::sim::World;
+use hash_thing::terrain::materials::STONE;
 use hash_thing::terrain::TerrainParams;
 use std::time::Instant;
 
@@ -96,4 +97,109 @@ fn bench_hashlife_1024() {
 fn bench_hashlife_4096() {
     bench_step("4096³ origin-keyed", 12, 2, false);
     bench_step("4096³ spatial-memo", 12, 2, true);
+}
+
+/// Measure edit propagation: seed → warm step → place block → re-step.
+/// Reports how much of the cache survives a single-cell edit.
+fn bench_edit_propagation(label: &str, level: u32, edits: usize) {
+    let side = 1u64 << level;
+    eprintln!("--- {label} (level={level}, side={side}³, {edits} edits) ---");
+
+    let mut world = World::new(level);
+    let params = TerrainParams::default();
+    world.seed_terrain(&params);
+    world.spatial_memo = true;
+
+    // Warm step — populate cache
+    let t = Instant::now();
+    world.step_recursive();
+    let warm_ms = t.elapsed().as_millis();
+    let warm_stats = world.hashlife_stats;
+    eprintln!(
+        "  warm step: {warm_ms}ms, hits={}, misses={}, empty={}",
+        warm_stats.cache_hits, warm_stats.cache_misses, warm_stats.empty_skips,
+    );
+
+    // Place block(s) in the middle of the world, then re-step
+    let center = side / 2;
+    for i in 0..edits {
+        world.set(
+            hash_thing::sim::world::WorldCoord(center as i64 + i as i64),
+            hash_thing::sim::world::WorldCoord(center as i64),
+            hash_thing::sim::world::WorldCoord(center as i64),
+            STONE,
+        );
+    }
+
+    let t = Instant::now();
+    world.step_recursive();
+    let edit_ms = t.elapsed().as_millis();
+    let edit_stats = world.hashlife_stats;
+    let total = edit_stats.cache_hits + edit_stats.cache_misses;
+    let hit_rate = if total > 0 {
+        edit_stats.cache_hits as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let speedup = if edit_ms > 0 {
+        warm_ms as f64 / edit_ms as f64
+    } else {
+        f64::INFINITY
+    };
+    eprintln!(
+        "  post-edit step: {edit_ms}ms ({speedup:.1}x vs warm), hits={}, misses={}, empty={}, rate={hit_rate:.1}%",
+        edit_stats.cache_hits, edit_stats.cache_misses, edit_stats.empty_skips,
+    );
+    eprintln!();
+}
+
+#[test]
+#[ignore]
+fn bench_edit_64() {
+    bench_edit_propagation("64³ single edit", 6, 1);
+    bench_edit_propagation("64³ 10 edits", 6, 10);
+}
+
+#[test]
+#[ignore]
+fn bench_edit_256() {
+    bench_edit_propagation("256³ single edit", 8, 1);
+    bench_edit_propagation("256³ 10 edits", 8, 10);
+}
+
+#[test]
+#[ignore]
+fn bench_edit_512() {
+    bench_edit_propagation("512³ single edit", 9, 1);
+    bench_edit_propagation("512³ 10 edits", 9, 10);
+}
+
+#[test]
+#[ignore]
+fn bench_edit_cache_impact_64() {
+    // Tiny world to see exact cache invalidation numbers
+    let mut world = World::new(6);
+    let params = TerrainParams::default();
+    world.seed_terrain(&params);
+    world.spatial_memo = true;
+
+    world.step_recursive();
+    let warm = world.hashlife_stats;
+    eprintln!("warm:      hits={}, misses={}, empty={}", warm.cache_hits, warm.cache_misses, warm.empty_skips);
+
+    // No edit — re-step same world (all cache hits)
+    world.step_recursive();
+    let cached = world.hashlife_stats;
+    eprintln!("no-edit:   hits={}, misses={}, empty={}", cached.cache_hits, cached.cache_misses, cached.empty_skips);
+
+    // One edit — measure cache survival
+    world.set(
+        hash_thing::sim::world::WorldCoord(32),
+        hash_thing::sim::world::WorldCoord(32),
+        hash_thing::sim::world::WorldCoord(32),
+        STONE,
+    );
+    world.step_recursive();
+    let edited = world.hashlife_stats;
+    eprintln!("one-edit:  hits={}, misses={}, empty={}", edited.cache_hits, edited.cache_misses, edited.empty_skips);
 }
