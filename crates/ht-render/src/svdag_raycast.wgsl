@@ -28,6 +28,8 @@ struct Uniforms {
     camera_right: vec4<f32>,
     // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: screen_height
     params: vec4<f32>,
+    // x: debug_mode (0=normal, 1=step-count heatmap), y/z/w: reserved
+    debug: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -137,6 +139,21 @@ const MAX_STACK: u32 = 16u;
 const MIN_STEP_BUDGET: u32 = 1024u;
 const STEP_BUDGET_FUDGE: u32 = 8u;
 
+struct RayResult {
+    color: vec4<f32>,
+    steps: u32,
+    max_steps: u32,
+};
+
+// Step-count heatmap: green (0%) → yellow (50%) → red (100%).
+fn heatmap_color(ratio: f32) -> vec3<f32> {
+    let t = clamp(ratio, 0.0, 1.0);
+    if t < 0.5 {
+        return mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), t * 2.0);
+    }
+    return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+}
+
 // Iterative DAG descent.
 //
 // Strategy: for each ray, start at root. At each level, compute which octant
@@ -148,7 +165,7 @@ const STEP_BUDGET_FUDGE: u32 = 8u;
 // but correct enough to prove the pipeline works and reserve the complexity
 // budget. Optimizations (ray-octant mirroring, ancestor memoization, bitmask
 // coalescing) can be layered on later.
-fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     // Laine-Karras Stage 2: mirror ray so rd is componentwise non-negative.
     // Octant child indices are XORed with mirror_mask during DAG lookup.
     let neg = rd < vec3<f32>(0.0);
@@ -176,7 +193,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // Intersect mirrored ray with root cube [0,1]^3
     let root_hit = intersect_aabb(ro_m, inv_rd, vec3<f32>(0.0), vec3<f32>(1.0));
     if root_hit.x > root_hit.y || root_hit.y < 0.0 {
-        return vec4<f32>(0.0);
+        return RayResult(vec4<f32>(0.0), 0u, 1u);
     }
 
     // hash-thing-27m v2: clamp ro to the root-cube entry (Laine-Karras).
@@ -226,7 +243,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // explicit background return, NOT a `break` — the post-loop
         // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
         // so any `break` here would render every clean root-exit as magenta.
-        if t > t_exit { return vec4<f32>(0.0); }
+        if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
         // Integer DDA (hash-thing-pck): pos from integer cell center.
         var pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
 
@@ -243,7 +260,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             }
             if top == 0u {
                 // Exited root
-                return vec4<f32>(0.0);
+                return RayResult(vec4<f32>(0.0), step, max_steps);
             }
             top = top - 1u;
         }
@@ -283,7 +300,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     }
                     let diffuse = max(dot(normal, light_dir), 0.0);
                     let lit = base * (0.3 + diffuse * 0.7);
-                    return vec4<f32>(lit, 1.0);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // All children empty — step past this node
                 break;
@@ -366,7 +383,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     let diffuse = max(dot(normal, light_dir), 0.0);
                     let ambient = 0.3;
                     let lit = base * (ambient + diffuse * 0.7);
-                    return vec4<f32>(lit, 1.0);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // Empty leaf — break to step ray
                 break;
@@ -422,7 +439,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let octant_base = u32(cmin_exit * f32(RESOLUTION));
             let boundary_cell = octant_base + step_cells;
             if boundary_cell >= RESOLUTION {
-                return vec4<f32>(0.0); // exited volume
+                return RayResult(vec4<f32>(0.0), step, max_steps); // exited volume
             }
             if exit_axis == 0u { int_pos.x = boundary_cell; }
             else if exit_axis == 1u { int_pos.y = boundary_cell; }
@@ -446,7 +463,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             // still inside the same parent. If so, skip it without going
             // through the outer loop's pop+descend overhead.
             if step >= max_steps { break; }
-            if t > t_exit { return vec4<f32>(0.0); }
+            if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
             pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
             let h2_s = half_s * 2.0;
             if !(all(pos >= node_min_s) && all(pos < node_min_s + h2_s)) {
@@ -468,7 +485,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // is impossible to miss on screen. The CPU replica sets
     // `TraceResult.exhausted = true` for the same condition so tests can
     // assert on it directly.
-    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    return RayResult(vec4<f32>(1.0, 0.0, 1.0, 1.0), step, max_steps);
 }
 
 @fragment
@@ -483,9 +500,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     );
     let ro = u.camera_pos.xyz;
 
-    let hit = raycast(ro, rd);
-    if hit.a > 0.0 {
-        return hit;
+    let result = raycast(ro, rd);
+    let debug_mode = u32(u.debug.x);
+
+    // Debug mode 1: step-count heatmap. Shows traversal cost per pixel.
+    if debug_mode == 1u {
+        let ratio = f32(result.steps) / f32(result.max_steps);
+        let hm = heatmap_color(ratio);
+        // Dim background rays (no hit) to distinguish sky from geometry.
+        if result.color.a == 0.0 {
+            return vec4<f32>(hm * 0.3, 1.0);
+        }
+        return vec4<f32>(hm, 1.0);
+    }
+
+    if result.color.a > 0.0 {
+        return result.color;
     }
 
     // Sky gradient: lighter blue at top, desaturated at horizon.

@@ -228,6 +228,7 @@ impl App {
                 "  Tab         Orbit mode",
                 "",
                 "  C/T/B/R/G   Load scene",
+                "  H           Step heatmap",
                 "  F5          Pause",
                 "  F1          Toggle help",
                 "  Esc         Quit",
@@ -243,6 +244,7 @@ impl App {
                 "  Tab         FPS mode",
                 "",
                 "  C/T/B/R/G   Load scene",
+                "  H           Step heatmap",
                 "  F5          Pause",
                 "  F1          Toggle help",
                 "  Esc         Quit",
@@ -655,6 +657,20 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("b") => {
                             // Burning room demo: fire + water + grass walls.
                             self.load_burning_room_demo("Reset burning room demo");
+                        }
+                        winit::keyboard::Key::Character("h") => {
+                            // Toggle step-count heatmap debug mode.
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.debug_mode = if renderer.debug_mode == 1 { 0 } else { 1 };
+                                log::info!(
+                                    "Debug mode: {}",
+                                    if renderer.debug_mode == 1 {
+                                        "step heatmap"
+                                    } else {
+                                        "normal"
+                                    }
+                                );
+                            }
                         }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log

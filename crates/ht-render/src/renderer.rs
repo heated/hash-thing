@@ -46,6 +46,8 @@ struct Uniforms {
     camera_right: [f32; 4],
     /// x: volume_size, y: aspect_ratio, z: fov_tan, w: screen_height
     params: [f32; 4],
+    /// x: debug_mode (0=normal, 1=step-count heatmap), y/z/w: reserved
+    debug: [f32; 4],
 }
 
 /// Outcome of a single `Renderer::render` call. Replaces an earlier `bool`
@@ -293,6 +295,9 @@ pub struct Renderer {
     pub camera_dist: f32,
     pub camera_target: [f32; 3],
 
+    /// Debug render mode. 0 = normal, 1 = step-count heatmap.
+    pub debug_mode: u32,
+
     // GPU-timestamp instrumentation. `None` on adapters without
     // `Features::TIMESTAMP_QUERY` — all timing falls back to the CPU
     // ring in that case (see `hash-thing-6x3`).
@@ -388,6 +393,7 @@ impl Renderer {
             camera_up: [0.0, 1.0, 0.0, 0.0],
             camera_right: [1.0, 0.0, 0.0, 0.0],
             params: [volume_size as f32, 1.0, 1.0, 0.0],
+            debug: [0.0; 4],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -770,6 +776,7 @@ impl Renderer {
             camera_pitch: 0.4,
             camera_dist: 2.0,
             camera_target: [0.5, 0.5, 0.5],
+            debug_mode: 0,
             gpu_timing,
             last_gpu_frame_time: None,
         }
@@ -1144,6 +1151,7 @@ impl Renderer {
                 fov_tan,
                 self.config.height as f32,
             ],
+            debug: [self.debug_mode as f32, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
