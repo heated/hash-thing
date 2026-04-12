@@ -83,6 +83,15 @@ pub struct MaterialRegistry {
     block_rules: Vec<Box<dyn BlockRule>>,
 }
 
+impl fmt::Debug for MaterialRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaterialRegistry")
+            .field("entries", &self.entries)
+            .field("rules_count", &self.rules.len())
+            .finish()
+    }
+}
+
 impl MaterialRegistry {
     pub fn new() -> Self {
         Self {
@@ -212,7 +221,11 @@ impl MaterialRegistry {
         registry
     }
 
-    pub fn gol_smoke(rule: GameOfLife3D) -> Self {
+    pub fn gol_smoke() -> Self {
+        Self::gol_smoke_with_rule(GameOfLife3D::rule445())
+    }
+
+    pub(crate) fn gol_smoke_with_rule(rule: GameOfLife3D) -> Self {
         let mut registry = Self::terrain_defaults();
         let rule_id = registry.register_rule(rule);
         registry.assign_rule(AIR_MATERIAL_ID, rule_id);
@@ -552,7 +565,7 @@ mod tests {
 
     #[test]
     fn gol_smoke_overrides_air_and_alive_dispatch() {
-        let registry = MaterialRegistry::gol_smoke(GameOfLife3D::rule445());
+        let registry = MaterialRegistry::gol_smoke();
         let neighbors = [Cell::pack(STONE_MATERIAL_ID, 0); 26];
 
         assert_eq!(
@@ -573,7 +586,7 @@ mod tests {
 
     #[test]
     fn gol_smoke_preserves_non_overridden_material_dispatch() {
-        let registry = MaterialRegistry::gol_smoke(GameOfLife3D::rule445());
+        let registry = MaterialRegistry::gol_smoke();
         let fire_neighbors = [Cell::pack(FIRE_MATERIAL_ID, 0); 26];
 
         assert_eq!(

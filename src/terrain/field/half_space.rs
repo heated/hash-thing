@@ -19,6 +19,7 @@ pub enum HalfSpaceAxis {
     Z,
 }
 
+#[derive(Debug)]
 pub struct HalfSpaceField {
     pub axis: HalfSpaceAxis,
     pub threshold: i64,

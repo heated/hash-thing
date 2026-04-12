@@ -2,7 +2,7 @@ use super::rule::{block_index, BlockContext, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, FIRE, WATER};
-use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
+use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -319,6 +319,14 @@ impl World {
             stats.cave_us = cave_start.elapsed().as_micros() as u64;
         }
         stats.nodes_after_caves = self.store.stats().0;
+        // Opt-in dungeon carving post-pass. Runs after caves so dungeons
+        // carve through already-opened cave networks.
+        if let Some(dungeon_params) = &params.dungeons {
+            let dungeon_start = std::time::Instant::now();
+            root = carve_dungeons(&mut self.store, root, self.level, dungeon_params);
+            stats.dungeon_us = dungeon_start.elapsed().as_micros() as u64;
+        }
+        stats.nodes_after_dungeons = self.store.stats().0;
         self.root = root;
         self.generation = 0;
         stats
@@ -381,7 +389,7 @@ mod tests {
 
     fn gol_world(rule: GameOfLife3D) -> World {
         let mut world = empty_world();
-        world.materials = MaterialRegistry::gol_smoke(rule);
+        world.materials = MaterialRegistry::gol_smoke_with_rule(rule);
         world
     }
 
@@ -390,7 +398,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn empty_world_stays_empty_under_amoeba() {
-        let mut world = gol_world(GameOfLife3D::amoeba());
+        let mut world = gol_world(GameOfLife3D::new(9, 26, 5, 7));
         world.step();
 
         assert_eq!(
@@ -409,7 +417,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn single_cell_dies_under_amoeba() {
-        let mut world = gol_world(GameOfLife3D::amoeba());
+        let mut world = gol_world(GameOfLife3D::new(9, 26, 5, 7));
         world.set(4, 4, 4, ALIVE.raw());
         assert_eq!(world.population(), 1);
         world.step();
@@ -426,7 +434,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn single_cell_grows_to_3x3x3_cube_under_crystal() {
-        let mut world = gol_world(GameOfLife3D::crystal());
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
         world.set(4, 4, 4, ALIVE.raw());
         world.step();
 
@@ -514,8 +522,8 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn step_is_deterministic() {
-        let mut world_a = gol_world(GameOfLife3D::crystal());
-        let mut world_b = gol_world(GameOfLife3D::crystal());
+        let mut world_a = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        let mut world_b = gol_world(GameOfLife3D::new(0, 6, 1, 3));
 
         let seeds: &[(u64, u64, u64)] = &[(4, 4, 4), (3, 4, 5), (5, 2, 4)];
         for &(x, y, z) in seeds {
@@ -546,7 +554,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn corner_single_cell_dies_under_amoeba() {
-        let mut world = gol_world(GameOfLife3D::amoeba());
+        let mut world = gol_world(GameOfLife3D::new(9, 26, 5, 7));
         let side = world.side() as u64;
         world.set(side - 1, side - 1, side - 1, ALIVE.raw());
         assert_eq!(world.population(), 1);

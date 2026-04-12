@@ -43,11 +43,12 @@ fn log_gen_stats(
     };
     let gen_region_ms = stats.gen_region_us as f64 / 1_000.0;
     let cave_ms = stats.cave_us as f64 / 1_000.0;
+    let dungeon_ms = stats.dungeon_us as f64 / 1_000.0;
     log::info!(
         "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
          gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
-         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms) \
-         nodes_after_gen={nag} nodes_after_caves={nac} | \
+         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms dungeon={dungeon_ms:.2}ms) \
+         nodes_after_gen={nag} nodes_after_caves={nac} nodes_after_dungeons={nad} | \
          noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
         pop = population,
         delta = nodes_delta,
@@ -57,6 +58,7 @@ fn log_gen_stats(
         collapses = stats.total_collapses(),
         nag = stats.nodes_after_gen,
         nac = stats.nodes_after_caves,
+        nad = stats.nodes_after_dungeons,
         ns = noise_ns_per_sample,
     );
 }
@@ -65,8 +67,7 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
     world: sim::World,
-    rule: sim::GameOfLife3D,
-    legacy_gol_smoke: bool,
+    gol_smoke_scene: bool,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -137,8 +138,7 @@ impl App {
             window: None,
             renderer: None,
             world,
-            rule: sim::GameOfLife3D::amoeba(),
-            legacy_gol_smoke: false,
+            gol_smoke_scene: false,
             svdag: render::Svdag::new(),
             paused: true,
             step_timer: std::time::Instant::now(),
@@ -188,7 +188,11 @@ impl ApplicationHandler for App {
             let attrs = WindowAttributes::default()
                 .with_title("hash-thing | 3D Hashlife Engine")
                 .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
-            let window = Arc::new(event_loop.create_window(attrs).unwrap());
+            let window = Arc::new(
+                event_loop
+                    .create_window(attrs)
+                    .expect("failed to create main window"),
+            );
             self.window = Some(window.clone());
 
             let mut renderer =
@@ -279,7 +283,7 @@ impl ApplicationHandler for App {
                             let elapsed = start.elapsed();
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.legacy_gol_smoke = false;
+                            self.gol_smoke_scene = false;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -302,6 +306,44 @@ impl ApplicationHandler for App {
                                 self.noise_ns_per_sample,
                             );
                         }
+                        winit::keyboard::Key::Character("d") => {
+                            // Re-seed terrain with caves + dungeons. Stays paused.
+                            // hash-thing-3fq.8: drives the dungeon carving
+                            // post-pass end-to-end.
+                            let params = terrain::TerrainParams {
+                                caves: Some(terrain::CaveParams::default()),
+                                dungeons: Some(terrain::DungeonParams::default()),
+                                ..Default::default()
+                            };
+                            let nodes_before = self.world.store.stats().0;
+                            let start = std::time::Instant::now();
+                            let stats = self.world.seed_terrain(&params);
+                            let elapsed = start.elapsed();
+                            self.noise_ns_per_sample =
+                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+                            self.gol_smoke_scene = false;
+                            self.paused = true;
+                            self.perf.clear();
+                            self.mem_stats.reset_peaks();
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.svdag,
+                                &mut self.last_svdag_stats,
+                            );
+                            let (nodes_after, _) = self.world.store.stats();
+                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
+                            log_gen_stats(
+                                "Dungeon terrain",
+                                self.world.side(),
+                                self.world.population(),
+                                nodes_after,
+                                nodes_delta,
+                                &stats,
+                                elapsed,
+                                self.noise_ns_per_sample,
+                            );
+                        }
                         winit::keyboard::Key::Character("r") => {
                             // Re-seed terrain. Stays paused. Clear perf/mem
                             // so post-reset stats aren't poisoned by stale
@@ -314,7 +356,7 @@ impl ApplicationHandler for App {
                             // Re-probe in case params drifted. Cheap (~1ms).
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
-                            self.legacy_gol_smoke = false;
+                            self.gol_smoke_scene = false;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -338,12 +380,12 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("g") => {
-                            // Swap to legacy GoL sphere seed (kept for CA scaffold demos).
+                            // Swap to the single retained GoL smoke seed.
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
                             self.world.materials =
-                                terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                terrain::materials::MaterialRegistry::gol_smoke();
                             self.world.seed_center(12, 0.35);
-                            self.legacy_gol_smoke = true;
+                            self.gol_smoke_scene = true;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -356,62 +398,7 @@ impl ApplicationHandler for App {
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
-                            log::info!("Reset GoL sphere: pop={}", self.world.population());
-                        }
-                        // TODO(hash-thing-6gf.1): call self.world.store.clear_step_cache() here
-                        // once memoized stepping lands. See store.rs `step_cache` field doc for
-                        // the contract — the cache key is NodeId only, so swapping the rule
-                        // without clearing yields stale results from the previous rule.
-                        winit::keyboard::Key::Character("1") => {
-                            self.rule = sim::GameOfLife3D::amoeba();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Amoeba ({})", self.rule);
-                        }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
-                        winit::keyboard::Key::Character("2") => {
-                            self.rule = sim::GameOfLife3D::crystal();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Crystal ({})", self.rule);
-                        }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
-                        winit::keyboard::Key::Character("3") => {
-                            self.rule = sim::GameOfLife3D::rule445();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: 445 ({})", self.rule);
-                        }
-                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
-                        winit::keyboard::Key::Character("4") => {
-                            self.rule = sim::GameOfLife3D::pyroclastic();
-                            if self.legacy_gol_smoke {
-                                self.world.materials =
-                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                            }
-                            log::info!("Rule: Pyroclastic ({})", self.rule);
+                            log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
@@ -595,14 +582,17 @@ fn main() {
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  C: reset terrain with caves (CA post-pass)");
+    log::info!("  D: reset terrain with caves + dungeons");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");
     log::info!("  P: dump perf + memory summary (on demand)");
     log::info!("  Esc: quit");
 
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new();
-    event_loop.run_app(&mut app).unwrap();
+    event_loop
+        .run_app(&mut app)
+        .expect("event loop terminated with error");
 }

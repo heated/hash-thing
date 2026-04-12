@@ -8,6 +8,7 @@
 use super::RegionField;
 use crate::octree::CellState;
 
+#[derive(Debug)]
 pub struct ConstField {
     pub state: CellState,
 }

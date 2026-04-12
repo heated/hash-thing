@@ -50,6 +50,18 @@ export BEADS_ACTOR=$(cat .beads/actor)
 
 If `.beads/actor` is missing, the worktree hasn't been assigned — ask edward or drop a file yourself before touching bd.
 
+## File ownership across in-flight branches
+
+When you claim a bead, the files you touch are implicitly locked by your branch until it merges to main. Before claiming, derive the current lock map:
+
+1. `bd list --status in_progress` — active claims (check plan files for touched-file lists)
+2. `git worktree list` + `git log origin/main..<worktree-branch> --stat` per worktree — shipped-but-unmerged branches
+3. `ls .ship-notes/plan-*.md` — drafted plans may list files in their header
+
+If you find overlap with an in-flight branch, pick a different task or coordinate via `bd comments add` on both beads before claiming. Leave a note even if you proceed — that's the discoverable audit trail.
+
+**Plan file header convention:** when writing a plan file, include a `files-touched:` line listing the files you expect to modify. This makes lock discovery a grep instead of a git-log parse.
+
 ## The mayor
 
 `mayor` is a **singular, mostly-passive design-observer seat.** Comments on design gates, re-tiers misfiled work, surfaces decisions for edward. Does not claim drafting, planning, bead-restructure, `.ship-notes`, or `src/` work. Not in the auto-assign pool — only invoked explicitly.

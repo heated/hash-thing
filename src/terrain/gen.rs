@@ -45,10 +45,14 @@ pub struct GenStats {
     pub gen_region_us: u64,
     /// Wall-clock time for the cave CA post-pass, 0 if caves disabled.
     pub cave_us: u64,
+    /// Wall-clock time for the dungeon carving post-pass, 0 if dungeons disabled.
+    pub dungeon_us: u64,
     /// Node count in the store after gen_region (before caves).
     pub nodes_after_gen: usize,
     /// Node count after cave carving (or same as nodes_after_gen if no caves).
     pub nodes_after_caves: usize,
+    /// Node count after dungeon carving.
+    pub nodes_after_dungeons: usize,
 }
 
 impl GenStats {
