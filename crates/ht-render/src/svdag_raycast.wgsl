@@ -303,10 +303,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     }
                     let diffuse = max(dot(normal, light_dir), 0.0);
                     let lit = base * (0.3 + diffuse * 0.7);
-                    let t_world = t + entry;
-                    let fog = exp(-t_world * 1.5);
-                    let fog_color = vec3<f32>(0.55, 0.70, 0.90);
-                    return vec4<f32>(mix(fog_color, lit, fog), 1.0);
+                    return vec4<f32>(lit, 1.0);
                 }
                 // All children empty — step past this node
                 break;
@@ -389,10 +386,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     let diffuse = max(dot(normal, light_dir), 0.0);
                     let ambient = 0.3;
                     let lit = base * (ambient + diffuse * 0.7);
-                    let t_world = t + entry;
-                    let fog = exp(-t_world * 1.5);
-                    let fog_color = vec3<f32>(0.55, 0.70, 0.90);
-                    return vec4<f32>(mix(fog_color, lit, fog), 1.0);
+                    return vec4<f32>(lit, 1.0);
                 }
                 // Empty leaf — break to step ray
                 break;
