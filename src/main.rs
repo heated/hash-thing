@@ -48,11 +48,12 @@ fn log_gen_stats(
     };
     let gen_region_ms = stats.gen_region_us as f64 / 1_000.0;
     let cave_ms = stats.cave_us as f64 / 1_000.0;
+    let dungeon_ms = stats.dungeon_us as f64 / 1_000.0;
     log::info!(
         "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
          gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
-         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms) \
-         nodes_after_gen={nag} nodes_after_caves={nac} | \
+         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms dungeon={dungeon_ms:.2}ms) \
+         nodes_after_gen={nag} nodes_after_caves={nac} nodes_after_dungeons={nad} | \
          noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
         pop = population,
         delta = nodes_delta,
@@ -62,6 +63,7 @@ fn log_gen_stats(
         collapses = stats.total_collapses(),
         nag = stats.nodes_after_gen,
         nac = stats.nodes_after_caves,
+        nad = stats.nodes_after_dungeons,
         ns = noise_ns_per_sample,
     );
 }
@@ -469,6 +471,17 @@ impl ApplicationHandler for App {
                             // Reset the default CA/materials demo.
                             self.load_burning_room_demo("Reset burning room demo");
                         }
+                        winit::keyboard::Key::Character("d") => {
+                            // Re-seed terrain with caves + dungeons. Stays paused.
+                            self.load_terrain_scene(
+                                "Dungeon terrain",
+                                terrain::TerrainParams {
+                                    caves: Some(terrain::CaveParams::default()),
+                                    dungeons: Some(terrain::DungeonParams::default()),
+                                    ..Default::default()
+                                },
+                            );
+                        }
                         winit::keyboard::Key::Character("t") => {
                             // Plain terrain remains available as an explicit
                             // toggle, but is no longer the default scene.
@@ -835,6 +848,7 @@ fn main() {
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  C: reset terrain with caves (CA post-pass)");
+    log::info!("  D: reset terrain with caves + dungeons");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");

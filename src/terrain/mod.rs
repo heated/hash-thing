@@ -7,12 +7,14 @@
 //! `terrain::gen`.
 
 pub mod caves;
+pub mod dungeons;
 pub mod field;
 pub mod gen;
 pub mod materials;
 pub mod noise;
 
 pub use caves::{carve_caves, carve_caves_grid, CaveParams};
+pub use dungeons::{carve_dungeons, carve_dungeons_grid, DungeonParams};
 pub use field::HeightmapField;
 pub use gen::{gen_region, probe_sample_ns, GenStats};
 
@@ -30,6 +32,10 @@ pub struct TerrainParams {
     /// path unchanged — tests and perf baselines don't see caves unless
     /// a caller opts in.
     pub caves: Option<CaveParams>,
+    /// When `Some`, run the dungeon carving post-pass after caves (or
+    /// after heightmap if caves are `None`). Dungeons carve rectangular
+    /// rooms and corridors into stone. Default `None`.
+    pub dungeons: Option<DungeonParams>,
 }
 
 impl Default for TerrainParams {
@@ -43,6 +49,7 @@ impl Default for TerrainParams {
             wavelength: 24.0,
             octaves: 4,
             caves: None,
+            dungeons: None,
         }
     }
 }
