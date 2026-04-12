@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::mem::size_of;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::octree::{Node, NodeId};
 
@@ -106,12 +106,38 @@ impl Perf {
         self.rings.entry(name).or_insert_with(Ring::new).push(d);
     }
 
-    /// Convenience: time a closure and record its duration.
-    pub fn time<R>(&mut self, name: &'static str, f: impl FnOnce() -> R) -> R {
-        let t = std::time::Instant::now();
-        let r = f();
-        self.record(name, t.elapsed());
-        r
+    /// Start a scope-bound timer that records its elapsed duration into
+    /// the named metric when the returned [`Timer`] is dropped.
+    ///
+    /// This is the single supported "time a region of code" idiom. A
+    /// prior closure-form `time<R>(name, FnOnce)` helper was removed in
+    /// `hash-thing-yri` because it couldn't nest when the closure body
+    /// needed `&mut self` on the parent struct (`time` already held
+    /// `&mut self.perf`, and closures over `&mut self` don't partial-
+    /// borrow). The guard pattern side-steps that entirely: the
+    /// returned `Timer` only borrows `self.perf`, so the rest of the
+    /// parent's fields remain freely accessible under Rust's disjoint-
+    /// field borrow rules:
+    ///
+    /// ```ignore
+    /// let _t = self.perf.start("render_cpu");
+    /// if let Some(r) = self.renderer.as_mut() {
+    ///     r.render();            // &mut self.renderer — disjoint from self.perf
+    /// }
+    /// // _t drops here → perf.record("render_cpu", elapsed)
+    /// ```
+    ///
+    /// There is one case the guard pattern still can't rescue: methods
+    /// on the parent that take `&mut self` by whole-self reference. At
+    /// those sites, either refactor the method to accept explicit field
+    /// references (preferred — see `App::upload_volume` in `main.rs`),
+    /// or fall back to the inline `Instant::now` + `perf.record` pattern.
+    pub fn start(&mut self, name: &'static str) -> Timer<'_> {
+        Timer {
+            perf: self,
+            name,
+            start: Instant::now(),
+        }
     }
 
     /// Drop all samples from all rings. Call on world reset so post-reset
@@ -148,6 +174,32 @@ impl Perf {
     #[cfg(test)]
     pub fn sample_count(&self, name: &'static str) -> usize {
         self.rings.get(name).map(|r| r.len).unwrap_or(0)
+    }
+}
+
+/// Scope-bound timer returned by [`Perf::start`].
+///
+/// Records its elapsed duration into `perf` under `name` when dropped.
+/// Holds `&mut Perf`, so the metric `name` is chosen at scope entry and
+/// the record happens at scope exit — there's no way to silently skip
+/// the recording (short of `std::mem::forget`, which is beside the
+/// point for a debug instrument).
+///
+/// The `#[must_use]` is intentional: binding to `_` would drop
+/// immediately and record a ~0ns sample, which is almost never what
+/// the caller wants. Binding to `_name` (with any non-`_` prefix) keeps
+/// the value alive until end-of-scope as expected.
+#[must_use = "Timer records when dropped; bind it to a named variable to keep \
+              the timed region alive, e.g. `let _t = perf.start(\"render_cpu\")`"]
+pub struct Timer<'a> {
+    perf: &'a mut Perf,
+    name: &'static str,
+    start: Instant,
+}
+
+impl Drop for Timer<'_> {
+    fn drop(&mut self) {
+        self.perf.record(self.name, self.start.elapsed());
     }
 }
 
@@ -327,13 +379,26 @@ mod tests {
     }
 
     #[test]
-    fn perf_time_records_a_sample_without_sleeping() {
-        // Don't rely on thread::sleep granularity (flaky on CI). Just check
-        // that calling .time() actually inserts into the ring.
+    fn perf_start_guard_records_on_drop() {
+        // Timer must actually record when it drops, not before.
         let mut perf = Perf::new();
-        let result = perf.time("op", || 42u32);
-        assert_eq!(result, 42);
-        assert_eq!(perf.sample_count("op"), 1);
+        {
+            let _t = perf.start("scoped");
+            // inside scope: sample not yet recorded because Drop hasn't fired
+            // (we can't observe perf here — _t borrows &mut perf — but the
+            // post-scope count proves the Drop path).
+        }
+        assert_eq!(perf.sample_count("scoped"), 1);
+    }
+
+    #[test]
+    fn perf_start_guard_accumulates_multiple_scopes() {
+        // Repeated scopes against the same name feed the same ring.
+        let mut perf = Perf::new();
+        for _ in 0..5 {
+            let _t = perf.start("scoped");
+        }
+        assert_eq!(perf.sample_count("scoped"), 5);
     }
 
     #[test]

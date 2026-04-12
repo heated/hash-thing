@@ -83,15 +83,27 @@ impl App {
         }
     }
 
-    fn upload_volume(&mut self) {
-        if let Some(renderer) = &mut self.renderer {
-            let data = self.world.flatten();
+    /// Refresh both GPU uploads (flat3D volume + SVDAG) and cache the
+    /// DAG stats for the wall-clock log path.
+    ///
+    /// Takes explicit field references rather than `&mut self` so
+    /// callers can wrap the call in a [`perf::Timer`] via
+    /// [`perf::Perf::start`]. A whole-self borrow would conflict with
+    /// the timer's borrow on `self.perf`; disjoint field borrows do
+    /// not — this is precisely the `hash-thing-yri` fix.
+    fn upload_volume(
+        renderer: &mut Option<render::Renderer>,
+        world: &sim::World,
+        last_svdag_stats: &mut (usize, usize, u32),
+    ) {
+        if let Some(renderer) = renderer {
+            let data = world.flatten();
             renderer.upload_volume(&data);
             // Also rebuild the SVDAG so the other render path stays in sync.
-            let dag = render::Svdag::build(&self.world.store, self.world.root, self.world.level);
+            let dag = render::Svdag::build(&world.store, world.root, world.level);
             // Capture stats here so the wall-clock log path (fb6) reads
             // them without triggering a second build.
-            self.last_svdag_stats = (dag.node_count, dag.byte_size(), dag.root_level);
+            *last_svdag_stats = (dag.node_count, dag.byte_size(), dag.root_level);
             renderer.upload_svdag(&dag);
         }
     }
@@ -108,7 +120,9 @@ impl ApplicationHandler for App {
 
             let renderer = pollster::block_on(render::Renderer::new(window.clone(), VOLUME_SIZE));
             self.renderer = Some(renderer);
-            self.upload_volume();
+            // Initial upload — untimed; we haven't started the render
+            // loop yet and there's no perf summary to feed.
+            Self::upload_volume(&mut self.renderer, &self.world, &mut self.last_svdag_stats);
         }
     }
 
@@ -156,7 +170,11 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("s") => {
                             // Single step
                             self.world.step_flat(&self.rule);
-                            self.upload_volume();
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.last_svdag_stats,
+                            );
                             log::info!(
                                 "Gen {}: pop={}",
                                 self.world.generation,
@@ -172,7 +190,11 @@ impl ApplicationHandler for App {
                             self.world.seed_center(12, 0.35);
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
-                            self.upload_volume();
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.last_svdag_stats,
+                            );
                             log::info!("Reset");
                         }
                         // TODO(hash-thing-6gf.1): call self.world.store.clear_step_cache() here
@@ -257,21 +279,27 @@ impl ApplicationHandler for App {
 
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
-                    // Time the step. Bind both world+perf as locals before the
-                    // closure so the borrow split is unambiguous (the closure
-                    // captures locals, not `self`).
+                    // Time the step. `perf.start` returns a Timer that
+                    // borrows only self.perf; self.world and self.rule
+                    // are disjoint fields, so the borrow checker lets
+                    // step_flat proceed while the Timer is alive.
                     {
-                        let world = &mut self.world;
-                        let perf = &mut self.perf;
-                        let rule = &self.rule;
-                        perf.time("step", || world.step_flat(rule));
+                        let _t = self.perf.start("step");
+                        self.world.step_flat(&self.rule);
                     }
                     // Time upload as one aggregate (flatten + Svdag::build +
                     // upload_volume + upload_svdag). CPU-side submit only —
-                    // wgpu queue writes are async.
-                    let upload_start = std::time::Instant::now();
-                    self.upload_volume();
-                    self.perf.record("upload_cpu", upload_start.elapsed());
+                    // wgpu queue writes are async. upload_volume takes
+                    // explicit field references (not &mut self) precisely
+                    // so the Timer can coexist with the call.
+                    {
+                        let _t = self.perf.start("upload_cpu");
+                        Self::upload_volume(
+                            &mut self.renderer,
+                            &self.world,
+                            &mut self.last_svdag_stats,
+                        );
+                    }
 
                     self.step_timer = std::time::Instant::now();
                 }
@@ -298,14 +326,13 @@ impl ApplicationHandler for App {
                     self.log_timer = std::time::Instant::now();
                 }
 
-                // Time render. NLL lets us split-borrow self.renderer and
-                // self.perf because the renderer borrow ends at `.render()`,
-                // before `self.perf.record` reaches for &mut self again.
+                // Time render. Disjoint-field borrows: the Timer holds
+                // self.perf, renderer borrows self.renderer — orthogonal.
+                // Timer drops at the end of the `if let` arm so the
+                // borrow ends before we inspect `outcome` below.
                 let outcome = if let Some(renderer) = self.renderer.as_mut() {
-                    let render_start = std::time::Instant::now();
-                    let outcome = renderer.render();
-                    self.perf.record("render_cpu", render_start.elapsed());
-                    Some(outcome)
+                    let _t = self.perf.start("render_cpu");
+                    Some(renderer.render())
                 } else {
                     None
                 };
