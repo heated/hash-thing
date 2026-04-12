@@ -127,6 +127,10 @@ struct App {
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
     render_inv_size: f32,
+    /// Legend (keybindings help) overlay toggle (m1f.7.2).
+    legend_visible: bool,
+    /// True when the legend texture needs re-upload (mode change or toggle).
+    legend_dirty: bool,
 }
 
 impl App {
@@ -180,6 +184,8 @@ impl App {
             step_start: std::time::Instant::now(),
             render_origin,
             render_inv_size,
+            legend_visible: true,
+            legend_dirty: true,
         };
 
         // Spawn the player entity at the world center, looking forward.
@@ -203,6 +209,45 @@ impl App {
     /// True while the sim step is running on a background thread.
     fn is_stepping(&self) -> bool {
         self.step_handle.is_some()
+    }
+
+    /// Legend text lines for the current camera mode.
+    fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
+        match mode {
+            CameraMode::FirstPerson => vec![
+                "  FIRST-PERSON MODE",
+                "",
+                "  WASD        Move",
+                "  Mouse       Look",
+                "  Space       Fly up",
+                "  Shift       Fly down",
+                "  Ctrl        Sprint",
+                "  LClick      Break block",
+                "  RClick      Place block",
+                "  1-7         Material",
+                "  Tab         Orbit mode",
+                "",
+                "  C/T/B/R/G   Load scene",
+                "  F5          Pause",
+                "  F1          Toggle help",
+                "  Esc         Quit",
+            ],
+            CameraMode::Orbit => vec![
+                "  ORBIT MODE",
+                "",
+                "  LClick+Drag Orbit camera",
+                "  Scroll      Zoom",
+                "  Space       Pause",
+                "  S           Single step",
+                "  1-4         CA rule",
+                "  Tab         FPS mode",
+                "",
+                "  C/T/B/R/G   Load scene",
+                "  F5          Pause",
+                "  F1          Toggle help",
+                "  Esc         Quit",
+            ],
+        }
     }
 
     /// Update cached render-side world geometry after world changes.
@@ -499,11 +544,16 @@ impl ApplicationHandler for App {
                             self.paused = !self.paused;
                             log::info!("Paused: {}", self.paused);
                         }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F1) => {
+                            self.legend_visible = !self.legend_visible;
+                            self.legend_dirty = true;
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
                             self.camera_mode = match self.camera_mode {
                                 CameraMode::Orbit => CameraMode::FirstPerson,
                                 CameraMode::FirstPerson => CameraMode::Orbit,
                             };
+                            self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
                         winit::keyboard::Key::Character("s") if !self.is_stepping() => {
@@ -839,6 +889,15 @@ impl ApplicationHandler for App {
                 // Reset HUD each frame — FPS block below sets it true.
                 if let Some(renderer) = &mut self.renderer {
                     renderer.hud_visible = false;
+
+                    // Legend overlay (m1f.7.2): upload text when dirty.
+                    if self.legend_dirty {
+                        self.legend_dirty = false;
+                        renderer.legend_visible = self.legend_visible;
+                        if self.legend_visible {
+                            renderer.set_legend_text(&Self::legend_lines(self.camera_mode));
+                        }
+                    }
                 }
                 if self.camera_mode == CameraMode::FirstPerson {
                     if let Some(pid) = self.player_id {

@@ -270,6 +270,18 @@ pub struct Renderer {
     pub hud_material_color: [f32; 4],
     pub hud_visible: bool,
 
+    // Legend overlay (hash-thing-m1f.7.2)
+    legend_pipeline: wgpu::RenderPipeline,
+    legend_bind_group_layout: wgpu::BindGroupLayout,
+    legend_bind_group: Option<wgpu::BindGroup>,
+    legend_uniform_buffer: wgpu::Buffer,
+    legend_texture: Option<wgpu::Texture>,
+    legend_texture_view: Option<wgpu::TextureView>,
+    legend_sampler: wgpu::Sampler,
+    legend_tex_w: u32,
+    legend_tex_h: u32,
+    pub legend_visible: bool,
+
     // Material palette (shared by all pipelines)
     palette_buffer: wgpu::Buffer,
 
@@ -623,6 +635,95 @@ impl Renderer {
             cache: None,
         });
 
+        // Legend overlay (hash-thing-m1f.7.2)
+        let legend_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("legend shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("legend.wgsl").into()),
+        });
+
+        let legend_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("legend_uniforms"),
+            size: 16, // vec4<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let legend_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("legend_sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let legend_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("legend_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let legend_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("legend_pl"),
+                bind_group_layouts: &[Some(&legend_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let legend_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("legend_rp"),
+            layout: Some(&legend_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &legend_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &legend_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let gpu_timing = if timestamp_supported {
             let period_ns = queue.get_timestamp_period();
             Some(GpuTiming::new(&device, period_ns))
@@ -652,6 +753,16 @@ impl Renderer {
             hud_uniform_buffer,
             hud_material_color: [1.0, 1.0, 1.0, 1.0],
             hud_visible: false,
+            legend_pipeline,
+            legend_bind_group_layout,
+            legend_bind_group: None,
+            legend_uniform_buffer,
+            legend_texture: None,
+            legend_texture_view: None,
+            legend_sampler,
+            legend_tex_w: 0,
+            legend_tex_h: 0,
+            legend_visible: false,
             palette_buffer,
             uniform_buffer,
             volume_size,
@@ -871,6 +982,77 @@ impl Renderer {
         }
     }
 
+    /// Upload legend text rendered as a bitmap texture. Call when the
+    /// legend content changes (e.g., camera mode switch). Pass empty
+    /// slice to clear.
+    pub fn set_legend_text(&mut self, lines: &[&str]) {
+        if lines.is_empty() {
+            self.legend_bind_group = None;
+            self.legend_texture = None;
+            self.legend_texture_view = None;
+            return;
+        }
+
+        let scale = 2u32;
+        let (pixels, w, h) = super::font::render_text_rgba(lines, scale);
+        self.legend_tex_w = w;
+        self.legend_tex_h = h;
+
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("legend_tex"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            size,
+        );
+        let view = texture.create_view(&Default::default());
+
+        self.legend_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("legend_bg"),
+            layout: &self.legend_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.legend_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.legend_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        }));
+
+        self.legend_texture_view = Some(view);
+        self.legend_texture = Some(texture);
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -1045,6 +1227,34 @@ impl Renderer {
                 render_pass.set_bind_group(0, &self.hud_bind_group, &[]);
                 // 5 quads × 6 vertices = 30 vertices.
                 render_pass.draw(0..30, 0..1);
+            }
+
+            // Legend overlay — keybindings text (m1f.7.2).
+            if self.legend_visible {
+                if let Some(bg) = &self.legend_bind_group {
+                    // Position the legend in the bottom-left corner.
+                    let aspect = self.config.width as f32 / self.config.height as f32;
+                    let tex_aspect = if self.legend_tex_h > 0 {
+                        self.legend_tex_w as f32 / self.legend_tex_h as f32
+                    } else {
+                        1.0
+                    };
+                    // Legend height = 40% of screen height, width from aspect.
+                    let quad_h = 0.8;
+                    let quad_w = quad_h * tex_aspect / aspect;
+                    let margin = 0.02;
+                    let quad_left = -1.0 + margin;
+                    let quad_bottom = -1.0 + margin;
+                    let legend_params: [f32; 4] = [quad_left, quad_bottom, quad_w, quad_h];
+                    self.queue.write_buffer(
+                        &self.legend_uniform_buffer,
+                        0,
+                        bytemuck::cast_slice(&legend_params),
+                    );
+                    render_pass.set_pipeline(&self.legend_pipeline);
+                    render_pass.set_bind_group(0, bg, &[]);
+                    render_pass.draw(0..6, 0..1);
+                }
             }
         }
 

@@ -1,3 +1,4 @@
+pub(crate) mod font;
 mod renderer;
 mod svdag;
 
