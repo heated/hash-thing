@@ -26,6 +26,7 @@
 use super::world::World;
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, NodeId};
+use rustc_hash::FxHashMap;
 
 const LEVEL3_SIDE: usize = 8;
 const LEVEL3_CELL_COUNT: usize = LEVEL3_SIDE * LEVEL3_SIDE * LEVEL3_SIDE;
@@ -41,6 +42,7 @@ impl World {
             "step_recursive requires level >= 3, got {}",
             self.level
         );
+        self.hashlife_stats = super::world::HashlifeStats::default();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         // World-space origin of the padded root: the original world is
@@ -52,11 +54,10 @@ impl World {
         self.root = result;
         self.generation += 1;
 
-        self.hashlife_cache.clear();
-        self.hashlife_macro_cache.clear();
-        let (new_store, new_root) = self.store.compacted(self.root);
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.remap_caches(&remap);
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -87,11 +88,10 @@ impl World {
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
 
-        self.hashlife_cache.clear();
-        self.hashlife_macro_cache.clear();
-        let (new_store, new_root) = self.store.compacted(self.root);
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.remap_caches(&remap);
     }
 
     fn has_block_rule_cells(&self) -> bool {
@@ -100,6 +100,30 @@ impl World {
                 .block_rule_id_for_cell(Cell::from_raw(state))
                 .is_some()
         })
+    }
+
+    /// Remap hashlife cache keys and values through a compaction remap table.
+    /// Entries referencing unreachable nodes (not in remap) are dropped.
+    fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
+        // Remap hashlife_cache: (NodeId, origin, parity) → NodeId
+        let old_cache = std::mem::take(&mut self.hashlife_cache);
+        self.hashlife_cache.reserve(old_cache.len());
+        for ((node, origin, parity), result) in old_cache {
+            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+                self.hashlife_cache
+                    .insert((new_node, origin, parity), new_result);
+            }
+        }
+
+        // Remap hashlife_macro_cache: (NodeId, origin, generation) → NodeId
+        let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
+        self.hashlife_macro_cache.reserve(old_macro.len());
+        for ((node, origin, gen), result) in old_macro {
+            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+                self.hashlife_macro_cache
+                    .insert((new_node, origin, gen), new_result);
+            }
+        }
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -125,13 +149,37 @@ impl World {
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
         // (NoopRule is identity; GoL-family rules have birth_min >= 1). No BlockRule on air.
         if self.store.population(node) == 0 {
+            self.hashlife_stats.empty_skips += 1;
             return self.store.empty(level - 1);
+        }
+
+        // Spatial memoization: for CaRule-only worlds, identical subtrees at
+        // different positions produce the same result. Use (NodeId, parity)
+        // as cache key instead of (NodeId, origin, parity).
+        if self.spatial_memo {
+            let spatial_key = (node, parity);
+            if let Some(&cached) = self.hashlife_spatial_cache.get(&spatial_key) {
+                self.hashlife_stats.cache_hits += 1;
+                return cached;
+            }
+            self.hashlife_stats.cache_misses += 1;
+
+            let result = if level == 3 {
+                self.step_base_case(node, origin, parity)
+            } else {
+                self.step_recursive_case(node, level, origin, parity)
+            };
+
+            self.hashlife_spatial_cache.insert(spatial_key, result);
+            return result;
         }
 
         let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
+            self.hashlife_stats.cache_hits += 1;
             return cached;
         }
+        self.hashlife_stats.cache_misses += 1;
 
         let result = if level == 3 {
             self.step_base_case(node, origin, parity)
