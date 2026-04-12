@@ -31,6 +31,12 @@ pub struct NodeStore {
     step_cache: FxHashMap<NodeId, NodeId>,
 }
 
+impl Default for NodeStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodeStore {
     pub fn new() -> Self {
         let mut store = Self {
