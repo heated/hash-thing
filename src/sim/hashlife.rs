@@ -344,13 +344,77 @@ fn get_neighbors_from_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::world::WorldCoord;
+    use crate::sim::rule::ALIVE;
+    use crate::sim::{GameOfLife3D, WorldCoord};
     use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
 
     fn wc(coord: u64) -> WorldCoord {
         WorldCoord(coord as i64)
     }
 
+    struct SimpleRng(u64);
+
+    impl SimpleRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn gol_world(level: u32, rule: GameOfLife3D, simulation_seed: u64) -> World {
+        let mut world = World::new(level);
+        world.simulation_seed = simulation_seed;
+        world.set_gol_smoke_rule(rule);
+        world
+    }
+
+    fn seed_random_alive_cells(world: &mut World, seed: u64, margin: u64) {
+        let mut rng = SimpleRng::new(seed);
+        let side = world.side() as u64;
+        for z in margin..(side - margin) {
+            for y in margin..(side - margin) {
+                for x in margin..(side - margin) {
+                    if rng.next_u64().is_multiple_of(5) {
+                        world.set(wc(x), wc(y), wc(z), ALIVE.raw());
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_recursive_matches_bruteforce(
+        mut brute: World,
+        mut recur: World,
+        steps: usize,
+        label: &str,
+    ) {
+        assert_eq!(
+            brute.flatten(),
+            recur.flatten(),
+            "{label}: initial state mismatch"
+        );
+        for step in 0..steps {
+            brute.step();
+            recur.step_recursive();
+            assert_eq!(
+                brute.flatten(),
+                recur.flatten(),
+                "{label}: mismatch at generation {} (step {})",
+                brute.generation,
+                step
+            );
+            assert_eq!(
+                brute.generation, recur.generation,
+                "{label}: generation counter diverged"
+            );
+        }
+    }
     #[test]
     fn recursive_matches_brute_force_empty() {
         let mut brute = World::new(3);
@@ -453,6 +517,37 @@ mod tests {
                 "mismatch at generation {}",
                 brute.generation
             );
+        }
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_randomized_gol_presets() {
+        let presets = [
+            ("amoeba", GameOfLife3D::new(9, 26, 5, 7)),
+            ("crystal", GameOfLife3D::new(0, 6, 1, 3)),
+            ("445", GameOfLife3D::rule445()),
+            ("pyroclastic", GameOfLife3D::new(4, 7, 6, 8)),
+        ];
+        let cases = [(3_u32, 1_usize, 2_u64), (4_u32, 3_usize, 4_u64)];
+
+        for (preset_idx, &(label, rule)) in presets.iter().enumerate() {
+            for (level, steps, margin) in cases {
+                for case_seed in 0..4_u64 {
+                    let simulation_seed = 0x6f03_u64
+                        ^ ((preset_idx as u64) << 16)
+                        ^ ((level as u64) << 8)
+                        ^ case_seed;
+                    let initial_seed = simulation_seed ^ 0xa11ce_u64;
+                    let mut brute = gol_world(level, rule, simulation_seed);
+                    let mut recur = gol_world(level, rule, simulation_seed);
+                    seed_random_alive_cells(&mut brute, initial_seed, margin);
+                    seed_random_alive_cells(&mut recur, initial_seed, margin);
+
+                    let case =
+                        format!("{label} level={level} steps={steps} seed={simulation_seed:#x}");
+                    assert_recursive_matches_bruteforce(brute, recur, steps, &case);
+                }
+            }
         }
     }
 
