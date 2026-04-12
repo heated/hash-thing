@@ -5,7 +5,7 @@ use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
-use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
+use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
 
 /// The axis-aligned cube of world-space that the octree currently covers.
@@ -83,7 +83,7 @@ pub struct World {
     pub simulation_seed: u64,
     pub materials: MaterialRegistry,
     /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
-    /// `ensure_region` generates terrain (heightmap + caves + dungeons)
+    /// `ensure_region` generates terrain (heightmap + caves)
     /// for newly-created sibling octants instead of leaving them empty.
     terrain_params: Option<TerrainParams>,
     /// Memoization cache for the recursive Hashlife stepper (6gf.2).
@@ -247,7 +247,7 @@ impl World {
     }
 
     /// Generate a sibling octant for lazy expansion. If `terrain_params` is
-    /// set, produces terrain (heightmap + caves + dungeons) at the given
+    /// set, produces terrain (heightmap + caves) at the given
     /// world-space origin. Otherwise returns a canonical empty node.
     fn gen_sibling(&mut self, level: u32, origin: [i64; 3]) -> NodeId {
         let params = match &self.terrain_params {
@@ -260,11 +260,6 @@ impl World {
         if let Some(cave_params) = &params.caves {
             let mut grid = self.store.flatten(node, side);
             crate::terrain::caves::carve_caves_grid(&mut grid, side, origin, cave_params);
-            node = self.store.from_flat(&grid, side);
-        }
-        if let Some(dungeon_params) = &params.dungeons {
-            let mut grid = self.store.flatten(node, side);
-            crate::terrain::dungeons::carve_dungeons_grid(&mut grid, side, origin, dungeon_params);
             node = self.store.from_flat(&grid, side);
         }
         node
@@ -700,14 +695,6 @@ impl World {
             stats.cave_us = cave_start.elapsed().as_micros() as u64;
         }
         stats.nodes_after_caves = self.store.stats();
-        // Opt-in dungeon carving post-pass. Runs after caves so dungeons
-        // carve through already-opened cave networks.
-        if let Some(dungeon_params) = &params.dungeons {
-            let dungeon_start = std::time::Instant::now();
-            root = carve_dungeons(&mut self.store, root, self.level, dungeon_params);
-            stats.dungeon_us = dungeon_start.elapsed().as_micros() as u64;
-        }
-        stats.nodes_after_dungeons = self.store.stats();
         self.root = root;
         self.generation = 0;
         self.terrain_params = Some(*params);
@@ -1399,49 +1386,6 @@ mod tests {
             b.flatten(),
             "fluid stepping must be deterministic (Hashlife-compatible)"
         );
-    }
-
-    // -----------------------------------------------------------------
-    // seed_terrain with dungeons integration test (hash-thing-3fq.10).
-    // -----------------------------------------------------------------
-
-    use crate::terrain::DungeonParams;
-
-    #[test]
-    fn seed_terrain_with_dungeons_reduces_stone() {
-        let mut world_no_dungeons = World::new(6);
-        let params_no = TerrainParams::default();
-        let _ = world_no_dungeons.seed_terrain(&params_no);
-        let pop_no = world_no_dungeons.population();
-
-        let mut world_dungeons = World::new(6);
-        let params_yes = TerrainParams {
-            dungeons: Some(DungeonParams::default()),
-            ..Default::default()
-        };
-        let stats = world_dungeons.seed_terrain(&params_yes);
-        let pop_yes = world_dungeons.population();
-
-        assert!(
-            pop_yes < pop_no,
-            "dungeons must carve some stone: pop_no={pop_no}, pop_yes={pop_yes}",
-        );
-        assert!(
-            stats.dungeon_us > 0,
-            "dungeon_us must be populated when dungeons are enabled",
-        );
-        assert!(
-            stats.nodes_after_dungeons > 0,
-            "nodes_after_dungeons must be populated",
-        );
-    }
-
-    #[test]
-    fn seed_terrain_without_dungeons_has_zero_dungeon_stats() {
-        let mut world = World::new(6);
-        let params = TerrainParams::default();
-        let stats = world.seed_terrain(&params);
-        assert_eq!(stats.dungeon_us, 0);
     }
 
     // ---- ensure_contains (hash-thing-e9h) ----
