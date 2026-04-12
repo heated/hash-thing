@@ -173,7 +173,7 @@ impl HeadlessRenderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("svdag raycast"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../src/render/svdag_raycast.wgsl").into(),
+                include_str!("../crates/ht-render/src/svdag_raycast.wgsl").into(),
             ),
         });
 

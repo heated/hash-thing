@@ -185,12 +185,18 @@ fn bench_edit_cache_impact_64() {
 
     world.step_recursive();
     let warm = world.hashlife_stats;
-    eprintln!("warm:      hits={}, misses={}, empty={}", warm.cache_hits, warm.cache_misses, warm.empty_skips);
+    eprintln!(
+        "warm:      hits={}, misses={}, empty={}",
+        warm.cache_hits, warm.cache_misses, warm.empty_skips
+    );
 
     // No edit — re-step same world (all cache hits)
     world.step_recursive();
     let cached = world.hashlife_stats;
-    eprintln!("no-edit:   hits={}, misses={}, empty={}", cached.cache_hits, cached.cache_misses, cached.empty_skips);
+    eprintln!(
+        "no-edit:   hits={}, misses={}, empty={}",
+        cached.cache_hits, cached.cache_misses, cached.empty_skips
+    );
 
     // One edit — measure cache survival
     world.set(
@@ -201,5 +207,8 @@ fn bench_edit_cache_impact_64() {
     );
     world.step_recursive();
     let edited = world.hashlife_stats;
-    eprintln!("one-edit:  hits={}, misses={}, empty={}", edited.cache_hits, edited.cache_misses, edited.empty_skips);
+    eprintln!(
+        "one-edit:  hits={}, misses={}, empty={}",
+        edited.cache_hits, edited.cache_misses, edited.empty_skips
+    );
 }

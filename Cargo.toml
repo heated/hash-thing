@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/ht-octree", "crates/ht-render"]
+
 [package]
 name = "hash-thing"
 version = "0.1.0"
@@ -7,6 +10,8 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+ht-octree = { path = "crates/ht-octree" }
+ht-render = { path = "crates/ht-render" }
 wgpu = "29"
 winit = "0.30"
 pollster = "0.4"

@@ -1,8 +1,10 @@
-pub mod octree;
+// Workspace crate re-exports — external API unchanged.
+pub use ht_octree as octree;
+pub use ht_octree::rng;
+pub use ht_render as render;
+
 pub mod perf;
 pub mod player;
-pub mod render;
-pub mod rng;
 pub mod sim;
 pub mod terrain;
 

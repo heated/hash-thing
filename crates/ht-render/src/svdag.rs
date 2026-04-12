@@ -44,7 +44,7 @@
 //! renderer tracks an upload watermark and writes only the appended tail (plus slot
 //! 0 for the root header). See `Renderer::upload_svdag`.
 
-use crate::octree::{Node, NodeId, NodeStore};
+use ht_octree::{Node, NodeId, NodeStore};
 use rustc_hash::FxHashMap;
 
 /// High bit of a child slot marks it as an inline leaf. Interior-node offsets
@@ -833,8 +833,8 @@ pub mod cpu_trace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::octree::{Cell, CellState, NodeStore};
     use cpu_trace::MAX_DEPTH;
+    use ht_octree::{Cell, CellState, NodeStore};
 
     fn normalize(v: [f32; 3]) -> [f32; 3] {
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();

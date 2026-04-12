@@ -1,0 +1,11 @@
+[package]
+name = "ht-octree"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustc-hash = "2"
+
+[lints.rust]
+unused = { level = "deny", priority = -1 }
+dead_code = "warn"
