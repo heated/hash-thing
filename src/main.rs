@@ -43,16 +43,22 @@ fn log_gen_stats(
     } else {
         0.0
     };
+    let gen_region_ms = stats.gen_region_us as f64 / 1_000.0;
+    let cave_ms = stats.cave_us as f64 / 1_000.0;
     log::info!(
         "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
          gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
-         gen_time={gen_ms:.2}ms | noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
+         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms) \
+         nodes_after_gen={nag} nodes_after_caves={nac} | \
+         noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
         pop = population,
         delta = nodes_delta,
         calls = stats.calls_total,
         samples = stats.leaves,
         classifies = stats.classify_calls,
         collapses = stats.total_collapses(),
+        nag = stats.nodes_after_gen,
+        nac = stats.nodes_after_caves,
         ns = noise_ns_per_sample,
     );
 }

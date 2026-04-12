@@ -143,14 +143,20 @@ impl World {
         self.store = NodeStore::new();
         self.store.clear_step_cache();
         let field = params.to_heightmap();
-        let (mut root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        let gen_start = std::time::Instant::now();
+        let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        stats.gen_region_us = gen_start.elapsed().as_micros() as u64;
+        stats.nodes_after_gen = self.store.stats().0;
         // Opt-in cave-CA post-pass. Runs as a separate stage after the
         // heightmap recursion so the baseline perf path (and every
         // pre-caves test) sees identical work when `params.caves` is
         // `None`.
         if let Some(cave_params) = params.caves {
+            let cave_start = std::time::Instant::now();
             root = carve_caves(&mut self.store, root, self.level, &cave_params);
+            stats.cave_us = cave_start.elapsed().as_micros() as u64;
         }
+        stats.nodes_after_caves = self.store.stats().0;
         self.root = root;
         self.generation = 0;
         stats
