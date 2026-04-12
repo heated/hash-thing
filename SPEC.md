@@ -75,6 +75,18 @@ Repo: `git@github.com:heated/ashfall.git`
 >
 > If it's clear from what my vision is, the answer to whatever downstream design question pops up — don't require a human gate. Only gate if it's not obvious from the spec.
 
+### World ideas (2026-04-12, to workshop further)
+
+> **Infinite 3D dungeon.** Infinite in all directions. You don't see much of it yet but it opens into big spaces periodically.
+>
+> **Natural megastructures.** Much more open space by default. Showcases big movement and the alive CA environment. Something that looks more natural and outdoorsy but with lots of 3D structure. The ground forms crazy 3D megastructures you can see up — maybe a world tree? Fine with it looking a little alien, but we'll have to workshop it. Worry: stuff that comes to mind might not look great.
+>
+> **Minecraft-style.** But might be strictly worse than the megastructure world. Talk more.
+>
+> **Tiny scale.** You are very small in a normal-sized world. Lots of stuff that's sized for you as well. Normal objects are huge terrain features.
+
+These are terrain/world presets — each would be a different terrain stack + material set + generation parameters. Still needs workshopping; don't build any of these without design conversation first.
+
 ---
 
 ## Extracted requirements (derived from the user's words above)
