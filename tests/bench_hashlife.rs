@@ -19,14 +19,19 @@ fn bench_step(label: &str, level: u32, generations: usize) {
 
     let t0 = Instant::now();
     let mut world = World::new(level);
-    let params = TerrainParams::default();
+    let params = TerrainParams::for_level(level);
     let stats = world.seed_terrain(&params);
     let seed_ms = t0.elapsed().as_millis();
     eprintln!(
-        "  seed: {seed_ms}ms (precompute: {}µs, gen: {}µs), population: {}",
+        "  seed: {seed_ms}ms (precompute: {}µs, gen: {}µs), pop: {}, \
+         leaves: {}, interiors: {}, collapses: {}, nodes: {}",
         stats.precompute_us,
         stats.gen_region_us,
         world.population(),
+        stats.leaves,
+        stats.interiors_interned,
+        stats.total_collapses(),
+        stats.nodes_after_gen,
     );
 
     let mut times_us = Vec::with_capacity(generations);
@@ -101,7 +106,7 @@ fn bench_edit_propagation(label: &str, level: u32, edits: usize) {
     eprintln!("--- {label} (level={level}, side={side}³, {edits} edits) ---");
 
     let mut world = World::new(level);
-    let params = TerrainParams::default();
+    let params = TerrainParams::for_level(level);
     world.seed_terrain(&params);
 
     // Warm step — populate cache
@@ -173,7 +178,7 @@ fn bench_edit_512() {
 fn bench_edit_cache_impact_64() {
     // Tiny world to see exact cache invalidation numbers
     let mut world = World::new(6);
-    let params = TerrainParams::default();
+    let params = TerrainParams::for_level(6);
     world.seed_terrain(&params);
 
     world.step_recursive();
