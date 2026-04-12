@@ -199,14 +199,16 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // already sits on the root face, so we nudge forward by EPS.
     var t = 1e-5;
 
-    for (var step = 0u; step < max_steps; step = step + 1u) {
+    var step = 0u;
+    loop {
+        if step >= max_steps { break; }
         // Normal miss path: walked past the root exit cleanly. Must be an
         // explicit background return, NOT a `break` — the post-loop
         // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
         // so any `break` here would render every clean root-exit as magenta.
         if t > t_exit { return vec4<f32>(0.0); }
         // Integer DDA (hash-thing-pck): pos from integer cell center.
-        let pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
+        var pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
 
         // If the current top-of-stack no longer contains `pos`, pop.
         // NOTE: STRICT bounds (no EPS slack). Integer DDA (hash-thing-pck)
@@ -325,50 +327,74 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             }
         }
 
-        // Step past the current (empty) octant.
-        // hash-thing-pck: integer DDA. Advance int_pos on exit axis, then
-        // derive t as max of all three axes' boundary times.
-        let node_min = stack_min[depth];
-        let half = stack_half[depth];
-        let oct = octant_of(pos, rd_m, node_min, half);
-        let child_min = vec3<f32>(
-            node_min.x + f32(oct & 1u) * half,
-            node_min.y + f32((oct >> 1u) & 1u) * half,
-            node_min.z + f32((oct >> 2u) & 1u) * half,
-        );
-        let child_max = child_min + vec3<f32>(half);
-        // Stage 2: rd_m is all non-negative, so t2 > t1 on every axis.
-        let t2 = (child_max - ro_local) * inv_rd;
-        // Find exit axis (smallest exit time).
-        var exit_axis: u32 = 0u;
-        if t2.y < t2.x {
-            exit_axis = 1u;
-        }
-        if t2.z < select(t2.x, t2.y, exit_axis == 1u) {
-            exit_axis = 2u;
-        }
-        // Integer DDA: advance int_pos on exit axis.
-        let step_cells = 1u << (MAX_DEPTH - 1u - depth);
-        let cmin_exit = select(select(child_min.x, child_min.y, exit_axis == 1u), child_min.z, exit_axis == 2u);
-        let octant_base = u32(cmin_exit * f32(RESOLUTION));
-        let boundary_cell = octant_base + step_cells;
-        if boundary_cell >= RESOLUTION {
-            return vec4<f32>(0.0); // exited volume
-        }
-        if exit_axis == 0u { int_pos.x = boundary_cell; }
-        else if exit_axis == 1u { int_pos.y = boundary_cell; }
-        else { int_pos.z = boundary_cell; }
-        // Derive t from exact exit-axis boundary. Monotonicity
-        // guaranteed: if boundary t doesn't advance (rare corner case),
-        // nudge by 1 ULP via bitcast. Safe because pos comes from int_pos.
-        let boundary = f32(boundary_cell) * INV_RES;
-        let ro_exit = select(select(ro_local.x, ro_local.y, exit_axis == 1u), ro_local.z, exit_axis == 2u);
-        let inv_rd_exit = select(select(inv_rd.x, inv_rd.y, exit_axis == 1u), inv_rd.z, exit_axis == 2u);
-        let t_boundary = (boundary - ro_exit) * inv_rd_exit;
-        if t_boundary > t {
-            t = t_boundary;
-        } else {
-            t = bitcast<f32>(bitcast<u32>(t) + 1u);
+        // Step past the current (empty) octant, then skip consecutive empty
+        // siblings using the parent's child_mask (hash-thing-x5w.1). Without
+        // this inner loop, each empty sibling costs a full outer-loop
+        // iteration (pop + descend + DDA). With it, the ray jumps across all
+        // empty children of a node in one pass — major win for sparse scenes.
+        loop {
+            let node_min_s = stack_min[depth];
+            let half_s = stack_half[depth];
+            let pos_s = (vec3<f32>(int_pos) + 0.5) * INV_RES;
+            let oct_s = octant_of(pos_s, rd_m, node_min_s, half_s);
+            let child_min_s = vec3<f32>(
+                node_min_s.x + f32(oct_s & 1u) * half_s,
+                node_min_s.y + f32((oct_s >> 1u) & 1u) * half_s,
+                node_min_s.z + f32((oct_s >> 2u) & 1u) * half_s,
+            );
+            let child_max_s = child_min_s + vec3<f32>(half_s);
+            // Stage 2: rd_m is all non-negative, so t2 > t1 on every axis.
+            let t2_s = (child_max_s - ro_local) * inv_rd;
+            // Find exit axis (smallest exit time).
+            var exit_axis: u32 = 0u;
+            if t2_s.y < t2_s.x {
+                exit_axis = 1u;
+            }
+            if t2_s.z < select(t2_s.x, t2_s.y, exit_axis == 1u) {
+                exit_axis = 2u;
+            }
+            // Integer DDA: advance int_pos on exit axis.
+            let step_cells = 1u << (MAX_DEPTH - 1u - depth);
+            let cmin_exit = select(select(child_min_s.x, child_min_s.y, exit_axis == 1u), child_min_s.z, exit_axis == 2u);
+            let octant_base = u32(cmin_exit * f32(RESOLUTION));
+            let boundary_cell = octant_base + step_cells;
+            if boundary_cell >= RESOLUTION {
+                return vec4<f32>(0.0); // exited volume
+            }
+            if exit_axis == 0u { int_pos.x = boundary_cell; }
+            else if exit_axis == 1u { int_pos.y = boundary_cell; }
+            else { int_pos.z = boundary_cell; }
+            // Derive t from exact exit-axis boundary. Monotonicity
+            // guaranteed: if boundary t doesn't advance (rare corner case),
+            // nudge by 1 ULP via bitcast. Safe because pos comes from int_pos.
+            let boundary = f32(boundary_cell) * INV_RES;
+            let ro_exit = select(select(ro_local.x, ro_local.y, exit_axis == 1u), ro_local.z, exit_axis == 2u);
+            let inv_rd_exit = select(select(inv_rd.x, inv_rd.y, exit_axis == 1u), inv_rd.z, exit_axis == 2u);
+            let t_boundary = (boundary - ro_exit) * inv_rd_exit;
+            if t_boundary > t {
+                t = t_boundary;
+            } else {
+                t = bitcast<f32>(bitcast<u32>(t) + 1u);
+            }
+
+            step += 1u;
+
+            // hash-thing-x5w.1: check if the next octant is also empty and
+            // still inside the same parent. If so, skip it without going
+            // through the outer loop's pop+descend overhead.
+            if step >= max_steps { break; }
+            if t > t_exit { return vec4<f32>(0.0); }
+            pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
+            let h2_s = half_s * 2.0;
+            if !(all(pos >= node_min_s) && all(pos < node_min_s + h2_s)) {
+                break; // exited parent — outer loop will pop
+            }
+            let next_oct = octant_of(pos, rd_m, node_min_s, half_s);
+            let mask = dag_nodes[stack_node[depth]];
+            if (mask & (1u << (next_oct ^ mirror_mask))) != 0u {
+                break; // next octant is occupied — outer loop will descend
+            }
+            // Next octant is empty — continue inner DDA loop to skip it
         }
     }
 

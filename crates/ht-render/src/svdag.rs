@@ -570,7 +570,8 @@ pub mod cpu_trace {
         // already on the root face.
         let mut t = EPS;
 
-        for step in 0..max_steps {
+        let mut step = 0usize;
+        while step < max_steps {
             if t > t_exit {
                 return TraceResult {
                     hit_cell: None,
@@ -582,7 +583,7 @@ pub mod cpu_trace {
             }
             // Integer DDA (hash-thing-pck): derive pos from integer cell
             // center — no accumulated float error.
-            let pos = [
+            let mut pos = [
                 (int_pos[0] as f32 + 0.5) * INV_RES,
                 (int_pos[1] as f32 + 0.5) * INV_RES,
                 (int_pos[2] as f32 + 0.5) * INV_RES,
@@ -669,24 +670,8 @@ pub mod cpu_trace {
                         ];
                         let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
                         let tmax_v = [lt1[0].max(lt2[0]), lt1[1].max(lt2[1]), lt1[2].max(lt2[2])];
-                        // hash-thing-2nd: inside-leaf fallback. When the ray
-                        // origin sits inside the filled voxel, every `tmin_v`
-                        // component is negative — the entry-face picker (argmax
-                        // of `tmin_v`) then returns the nearest BACK face and
-                        // the normal flips inward, shading the voxel as if lit
-                        // from behind. Reachable via deep-zoom orbit camera.
-                        // Fallback: pick the nearest EXIT face (argmin of
-                        // `tmax_v`) and flip the sign so the normal points in
-                        // the direction the ray is heading — the "about to
-                        // emerge" convention. The outer cascade uses `>=` on
-                        // both comparators so ties break identically to the
-                        // shader in `svdag_raycast.wgsl` — do NOT flip to `>`.
-                        // The inner (inside) cascade uses `<=` for the same
-                        // reason: CPU/GPU must break exit-face ties identically.
+                        // hash-thing-2nd: inside-leaf fallback.
                         let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
-                        // Use original `rd` (not mirrored) for normal direction
-                        // — axis selection from slab test is valid in either
-                        // space, but the sign must match the physical ray.
                         let normal = if inside {
                             if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
                                 [rd[0].signum(), 0.0, 0.0]
@@ -737,81 +722,113 @@ pub mod cpu_trace {
                 }
             }
 
-            // Step past the current (empty) octant.
-            // hash-thing-pck: integer DDA replaces the float nudge from 27m.
-            // Advance int_pos on the exit axis by the octant width in leaf
-            // cells, then derive t as the max of all three axes' boundary
-            // times. The max ensures strict monotonicity even when the exit
-            // axis switches between iterations.
-            let node_min = stack_min[depth];
-            let half = stack_half[depth];
-            let oct = octant_of(pos, rd_m, node_min, half);
-            let child_min = [
-                node_min[0] + (oct & 1) as f32 * half,
-                node_min[1] + ((oct >> 1) & 1) as f32 * half,
-                node_min[2] + ((oct >> 2) & 1) as f32 * half,
-            ];
-            let child_max = [
-                child_min[0] + half,
-                child_min[1] + half,
-                child_min[2] + half,
-            ];
-            // Per-axis exit times. Stage 2: rd_m is all-positive so t2 > t1
-            // on every axis; tmax_v = t2 directly.
-            let t2 = [
-                (child_max[0] - ro_local[0]) * inv_rd[0],
-                (child_max[1] - ro_local[1]) * inv_rd[1],
-                (child_max[2] - ro_local[2]) * inv_rd[2],
-            ];
-            // Find exit axis (smallest exit time = first face crossed).
-            let mut exit_axis: usize = 0;
-            if t2[1] < t2[exit_axis] {
-                exit_axis = 1;
-            }
-            if t2[2] < t2[exit_axis] {
-                exit_axis = 2;
-            }
-            // Integer DDA: advance int_pos on exit axis to the next
-            // boundary at this depth's granularity. child_min is always
-            // an exact multiple of half (power-of-2 fractions), so
-            // child_min * RESOLUTION is exact in u32.
-            let step_cells = 1u32 << (MAX_DEPTH as u32 - 1 - depth as u32);
-            let octant_base = (child_min[exit_axis] * RESOLUTION as f32) as u32;
-            let boundary_cell = octant_base + step_cells;
-            let t_old = t;
-            if boundary_cell >= RESOLUTION {
+            // Step past the current (empty) octant, then skip consecutive
+            // empty siblings using the parent's child_mask (hash-thing-x5w.1).
+            loop {
+                let node_min = stack_min[depth];
+                let half = stack_half[depth];
+                let pos_s = [
+                    (int_pos[0] as f32 + 0.5) * INV_RES,
+                    (int_pos[1] as f32 + 0.5) * INV_RES,
+                    (int_pos[2] as f32 + 0.5) * INV_RES,
+                ];
+                let oct = octant_of(pos_s, rd_m, node_min, half);
+                let child_min = [
+                    node_min[0] + (oct & 1) as f32 * half,
+                    node_min[1] + ((oct >> 1) & 1) as f32 * half,
+                    node_min[2] + ((oct >> 2) & 1) as f32 * half,
+                ];
+                let child_max = [
+                    child_min[0] + half,
+                    child_min[1] + half,
+                    child_min[2] + half,
+                ];
+                let t2 = [
+                    (child_max[0] - ro_local[0]) * inv_rd[0],
+                    (child_max[1] - ro_local[1]) * inv_rd[1],
+                    (child_max[2] - ro_local[2]) * inv_rd[2],
+                ];
+                let mut exit_axis: usize = 0;
+                if t2[1] < t2[exit_axis] {
+                    exit_axis = 1;
+                }
+                if t2[2] < t2[exit_axis] {
+                    exit_axis = 2;
+                }
+                let step_cells = 1u32 << (MAX_DEPTH as u32 - 1 - depth as u32);
+                let octant_base = (child_min[exit_axis] * RESOLUTION as f32) as u32;
+                let boundary_cell = octant_base + step_cells;
+                let t_old = t;
+                if boundary_cell >= RESOLUTION {
+                    if record {
+                        events.push(TraceEvent::StepPast {
+                            t_old,
+                            t_new: t_exit,
+                        });
+                    }
+                    return TraceResult {
+                        hit_cell: None,
+                        steps: step,
+                        events,
+                        exhausted: false,
+                        hit_normal: None,
+                    };
+                }
+                int_pos[exit_axis] = boundary_cell;
+                let boundary = boundary_cell as f32 * INV_RES;
+                let t_boundary = (boundary - ro_local[exit_axis]) * inv_rd[exit_axis];
+                t = if t_boundary > t_old {
+                    t_boundary
+                } else {
+                    f32::from_bits(t_old.to_bits() + 1)
+                };
                 if record {
-                    events.push(TraceEvent::StepPast {
-                        t_old,
-                        t_new: t_exit,
+                    events.push(TraceEvent::StepPast { t_old, t_new: t });
+                }
+
+                step += 1;
+
+                // hash-thing-x5w.1: check if the next octant is also empty
+                // and still inside the same parent.
+                if step >= max_steps {
+                    break;
+                }
+                if t > t_exit {
+                    return TraceResult {
+                        hit_cell: None,
+                        steps: step,
+                        events,
+                        exhausted: false,
+                        hit_normal: None,
+                    };
+                }
+                pos = [
+                    (int_pos[0] as f32 + 0.5) * INV_RES,
+                    (int_pos[1] as f32 + 0.5) * INV_RES,
+                    (int_pos[2] as f32 + 0.5) * INV_RES,
+                ];
+                let h2 = half * 2.0;
+                let in_parent = pos[0] >= node_min[0]
+                    && pos[1] >= node_min[1]
+                    && pos[2] >= node_min[2]
+                    && pos[0] < node_min[0] + h2
+                    && pos[1] < node_min[1] + h2
+                    && pos[2] < node_min[2] + h2;
+                if !in_parent {
+                    break;
+                }
+                let next_oct = octant_of(pos, rd_m, node_min, half);
+                let mask = dag[stack_node[depth] as usize];
+                if mask & (1 << ((next_oct ^ mirror_mask) as u32)) != 0 {
+                    break; // next octant is occupied
+                }
+                if record {
+                    events.push(TraceEvent::EmptyLeaf {
+                        depth,
+                        oct: next_oct,
                     });
                 }
-                return TraceResult {
-                    hit_cell: None,
-                    steps: step,
-                    events,
-                    exhausted: false,
-                    hit_normal: None,
-                };
-            }
-            int_pos[exit_axis] = boundary_cell;
-            // Derive t from the exact exit-axis boundary. boundary_cell
-            // is integer * INV_RES (= 2^-MAX_DEPTH), so the boundary float is exact. The
-            // slab time `(boundary - ro_local) * inv_rd` is the canonical
-            // exit time — same as t2[exit_axis] but computed from the
-            // integer boundary instead of float child_max. Guaranteed
-            // monotonicity: if the boundary t doesn't advance (rare edge
-            // case at multi-axis octant corners), nudge by 1 ULP. Safe
-            // because pos is derived from int_pos center (always advances).
-            let boundary = boundary_cell as f32 * INV_RES;
-            let t_boundary = (boundary - ro_local[exit_axis]) * inv_rd[exit_axis];
-            t = if t_boundary > t_old {
-                t_boundary
-            } else {
-                f32::from_bits(t_old.to_bits() + 1)
-            };
-            if record {
-                events.push(TraceEvent::StepPast { t_old, t_new: t });
+                // Next octant is empty — continue inner DDA loop
             }
         }
 
