@@ -980,9 +980,19 @@ fn main() {
 
     log::info!("hash-thing: 3D Hashlife Engine");
     log::info!("Controls:");
+    log::info!("  Tab: toggle orbit / first-person camera");
+    log::info!("  --- Orbit mode ---");
     log::info!("  Mouse drag: orbit camera");
     log::info!("  Scroll: zoom");
     log::info!("  Space: pause/resume");
+    log::info!("  --- First-person mode ---");
+    log::info!("  WASD: move (relative to look direction)");
+    log::info!("  Mouse: look around");
+    log::info!("  Space: fly up   Shift: fly down");
+    log::info!("  Ctrl: sprint");
+    log::info!("  Left click: break block   Right click: place block");
+    log::info!("  --- Shared ---");
+    log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  C: reset terrain with caves (CA post-pass)");
