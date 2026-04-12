@@ -1,4 +1,5 @@
 use hash_thing::perf;
+use hash_thing::player;
 use hash_thing::render;
 use hash_thing::sim;
 use hash_thing::terrain;
@@ -13,29 +14,9 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
+use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
+
 const VOLUME_SIZE: u32 = 64;
-
-/// Camera mode: orbit around a target point, or first-person at the player.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CameraMode {
-    /// Debug orbit camera (original). Mouse drag rotates, scroll zooms.
-    Orbit,
-    /// First-person: eye at player position, mouse look, WASD movement.
-    FirstPerson,
-}
-
-/// Player movement speed in cells per second (at 60fps baseline: 0.15 * 60 = 9).
-const PLAYER_SPEED: f64 = 9.0;
-/// Sprint multiplier.
-const PLAYER_SPRINT: f64 = 2.5;
-/// Player bounding box half-width on X/Z (cells).
-const PLAYER_HALF_W: f64 = 0.3;
-/// Player height (cells).
-const PLAYER_HEIGHT: f64 = 1.6;
-/// Mouse look sensitivity (radians per pixel).
-const LOOK_SENSITIVITY: f64 = 0.003;
-/// Maximum raycast range for block place/break (in cells).
-const INTERACT_RANGE: f64 = 40.0;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -189,113 +170,15 @@ impl App {
         app
     }
 
-    /// Check if the player's AABB at `pos` overlaps any solid cell.
-    fn player_collides(world: &sim::World, pos: &[f64; 3]) -> bool {
-        let hw = PLAYER_HALF_W;
-        // Check every cell the player AABB overlaps — not just corners.
-        // This prevents tunneling through 1-cell-thick walls diagonally (9zr).
-        let x_min = (pos[0] - hw).floor() as i64;
-        let x_max = (pos[0] + hw).floor() as i64;
-        let y_min = pos[1].floor() as i64;
-        let y_max = (pos[1] + PLAYER_HEIGHT).floor() as i64;
-        let z_min = (pos[2] - hw).floor() as i64;
-        let z_max = (pos[2] + hw).floor() as i64;
-        for cx in x_min..=x_max {
-            for cy in y_min..=y_max {
-                for cz in z_min..=z_max {
-                    let cell = world.get(
-                        sim::WorldCoord(cx),
-                        sim::WorldCoord(cy),
-                        sim::WorldCoord(cz),
-                    );
-                    if cell != 0 {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
-    /// `hit_cell` is the first solid cell along the ray, `prev_cell` is the
-    /// empty cell just before it (for block placement).
-    fn raycast_cells(&self, origin: [f64; 3], dir: [f64; 3]) -> Option<([i64; 3], [i64; 3])> {
-        let mut pos = [
-            origin[0].floor() as i64,
-            origin[1].floor() as i64,
-            origin[2].floor() as i64,
-        ];
-        let step = [
-            if dir[0] >= 0.0 { 1i64 } else { -1 },
-            if dir[1] >= 0.0 { 1i64 } else { -1 },
-            if dir[2] >= 0.0 { 1i64 } else { -1 },
-        ];
-        // Distance along ray to the next cell boundary on each axis.
-        let mut t_max = [0.0f64; 3];
-        let mut t_delta = [0.0f64; 3];
-        for i in 0..3 {
-            if dir[i].abs() < 1e-12 {
-                t_max[i] = f64::INFINITY;
-                t_delta[i] = f64::INFINITY;
-            } else {
-                let boundary = if dir[i] > 0.0 {
-                    (pos[i] + 1) as f64
-                } else {
-                    pos[i] as f64
-                };
-                t_max[i] = (boundary - origin[i]) / dir[i];
-                t_delta[i] = (step[i] as f64) / dir[i];
-            }
-        }
-
-        let max_steps = (INTERACT_RANGE * 2.0) as usize;
-        let mut prev = pos;
-        for _ in 0..max_steps {
-            // Check current cell.
-            let cell = self.world.get(
-                sim::WorldCoord(pos[0]),
-                sim::WorldCoord(pos[1]),
-                sim::WorldCoord(pos[2]),
-            );
-            if cell != 0 {
-                return Some((pos, prev));
-            }
-            prev = pos;
-
-            // Advance to next cell boundary.
-            if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
-                pos[0] += step[0];
-                t_max[0] += t_delta[0];
-            } else if t_max[1] < t_max[2] {
-                pos[1] += step[1];
-                t_max[1] += t_delta[1];
-            } else {
-                pos[2] += step[2];
-                t_max[2] += t_delta[2];
-            }
-        }
-        None
-    }
-
     /// Get the player's eye position and look direction.
     fn player_eye_ray(&self) -> Option<([f64; 3], [f64; 3])> {
         let pid = self.player_id?;
-        let player = self.entities.iter().find(|e| e.id == pid)?;
-        let (yaw, pitch) = if let sim::EntityKind::Player(ref ps) = player.kind {
-            (ps.yaw, ps.pitch)
+        let p = self.entities.iter().find(|e| e.id == pid)?;
+        if let sim::EntityKind::Player(ref ps) = p.kind {
+            Some(player::eye_ray(&p.pos, ps.yaw, ps.pitch))
         } else {
-            return None;
-        };
-        let eye = [
-            player.pos[0],
-            player.pos[1] + PLAYER_HEIGHT * 0.85,
-            player.pos[2],
-        ];
-        let (sin_yaw, cos_yaw) = yaw.sin_cos();
-        let (sin_pitch, cos_pitch) = pitch.sin_cos();
-        let dir = [-cos_pitch * sin_yaw, sin_pitch, -cos_pitch * cos_yaw];
-        Some((eye, dir))
+            None
+        }
     }
 
     /// Break the block the player is looking at.
@@ -303,7 +186,7 @@ impl App {
         let Some((eye, dir)) = self.player_eye_ray() else {
             return;
         };
-        if let Some((hit, _prev)) = self.raycast_cells(eye, dir) {
+        if let Some((hit, _prev)) = player::raycast_cells(&self.world, eye, dir) {
             self.world.set(
                 sim::WorldCoord(hit[0]),
                 sim::WorldCoord(hit[1]),
@@ -337,7 +220,7 @@ impl App {
         let Some((eye, dir)) = self.player_eye_ray() else {
             return;
         };
-        if let Some((hit, prev)) = self.raycast_cells(eye, dir) {
+        if let Some((hit, prev)) = player::raycast_cells(&self.world, eye, dir) {
             // Skip if origin is inside a solid cell (prev == hit on first step).
             if prev == hit {
                 return;
@@ -818,82 +701,53 @@ impl ApplicationHandler for App {
                 // Player movement (per-frame, not per-tick) and camera sync.
                 if self.camera_mode == CameraMode::FirstPerson {
                     if let Some(pid) = self.player_id {
-                        // Read player state for movement computation.
-                        let (yaw, _pitch) = if let Some(player) = self.entities.get_mut(pid) {
-                            if let sim::EntityKind::Player(ref ps) = player.kind {
-                                (ps.yaw, ps.pitch)
-                            } else {
-                                (0.0, 0.0)
-                            }
+                        // Read player yaw for movement direction.
+                        let yaw = self
+                            .entities
+                            .get_mut(pid)
+                            .and_then(|e| match &e.kind {
+                                sim::EntityKind::Player(ps) => Some(ps.yaw),
+                                _ => None,
+                            })
+                            .unwrap_or(0.0);
+
+                        // Gather input axes from held keys.
+                        let fwd = if self.keys_held.contains(&KeyCode::KeyW) {
+                            1.0
+                        } else if self.keys_held.contains(&KeyCode::KeyS) {
+                            -1.0
                         } else {
-                            (0.0, 0.0)
+                            0.0
                         };
-
-                        // Compute movement from held keys relative to yaw.
-                        let (sin_yaw, cos_yaw) = yaw.sin_cos();
-                        // Forward is along -Z in local space, rotated by yaw.
-                        let fwd = [-sin_yaw, 0.0, -cos_yaw];
-                        let right = [cos_yaw, 0.0, -sin_yaw];
-
-                        let mut move_dir = [0.0f64; 3];
-                        if self.keys_held.contains(&KeyCode::KeyW) {
-                            move_dir[0] += fwd[0];
-                            move_dir[2] += fwd[2];
-                        }
-                        if self.keys_held.contains(&KeyCode::KeyS) {
-                            move_dir[0] -= fwd[0];
-                            move_dir[2] -= fwd[2];
-                        }
-                        if self.keys_held.contains(&KeyCode::KeyA) {
-                            move_dir[0] -= right[0];
-                            move_dir[2] -= right[2];
-                        }
-                        if self.keys_held.contains(&KeyCode::KeyD) {
-                            move_dir[0] += right[0];
-                            move_dir[2] += right[2];
-                        }
-                        // Vertical movement (creative fly mode).
-                        if self.keys_held.contains(&KeyCode::Space) {
-                            move_dir[1] += 1.0;
-                        }
-                        if self.keys_held.contains(&KeyCode::ShiftLeft)
+                        let right = if self.keys_held.contains(&KeyCode::KeyD) {
+                            1.0
+                        } else if self.keys_held.contains(&KeyCode::KeyA) {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+                        let up = if self.keys_held.contains(&KeyCode::Space) {
+                            1.0
+                        } else if self.keys_held.contains(&KeyCode::ShiftLeft)
                             || self.keys_held.contains(&KeyCode::ShiftRight)
                         {
-                            move_dir[1] -= 1.0;
-                        }
+                            -1.0
+                        } else {
+                            0.0
+                        };
 
-                        // Normalize and apply speed.
-                        let len = (move_dir[0] * move_dir[0]
-                            + move_dir[1] * move_dir[1]
-                            + move_dir[2] * move_dir[2])
-                            .sqrt();
-                        if len > 1e-9 {
-                            let base_speed = if self.keys_held.contains(&KeyCode::ControlLeft)
-                                || self.keys_held.contains(&KeyCode::ControlRight)
-                            {
-                                PLAYER_SPEED * PLAYER_SPRINT
-                            } else {
-                                PLAYER_SPEED
-                            };
-                            let inv_len = (base_speed * dt) / len;
-                            let delta = [
-                                move_dir[0] * inv_len,
-                                move_dir[1] * inv_len,
-                                move_dir[2] * inv_len,
-                            ];
+                        let speed = if self.keys_held.contains(&KeyCode::ControlLeft)
+                            || self.keys_held.contains(&KeyCode::ControlRight)
+                        {
+                            PLAYER_SPEED * PLAYER_SPRINT
+                        } else {
+                            PLAYER_SPEED
+                        };
 
-                            // Apply movement with per-axis collision.
-                            if let Some(player) = self.entities.get_mut(pid) {
-                                for (axis, &d) in delta.iter().enumerate() {
-                                    let old = player.pos[axis];
-                                    player.pos[axis] += d;
+                        let delta = player::compute_move_delta(yaw, [fwd, right, up], speed, dt);
 
-                                    // AABB collision check: sample corners.
-                                    if Self::player_collides(&self.world, &player.pos) {
-                                        player.pos[axis] = old; // reject this axis
-                                    }
-                                }
-                            }
+                        if let Some(p) = self.entities.get_mut(pid) {
+                            p.pos = player::apply_movement(&self.world, &p.pos, &delta);
                         }
 
                         // Sync camera to player position and orientation.
