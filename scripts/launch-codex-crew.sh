@@ -88,28 +88,28 @@ PROMPT="You are crew seat '$SEAT' on the hash-thing project (a 3D voxel engine i
 CRITICAL SETUP — run these first:
   export BEADS_ACTOR=$SEAT
 
-IMPORTANT: Use the system 'bd' command (at /usr/local/bin/bd), NOT .bin/bd.
-The .bin/bd wrapper is legacy and may not work in sandboxed environments.
+IMPORTANT: Use the project '.bin/bd' wrapper, NOT bare 'bd'.
+The wrapper retries Dolt lock contention and carries project-local close checks.
 
-  bd ready -n 10
+  .bin/bd ready -n 10
 
 WORKFLOW — for each bead you pick:
-  1. bd update <id> --claim
-  2. Read the bead description: bd show <id>
+  1. .bin/bd update <id> --claim
+  2. Read the bead description: .bin/bd show <id>
   3. Implement the fix/feature in Rust
   4. Validate: cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
   5. If cargo fmt --check fails, run cargo fmt
   6. Commit (use git commit, match recent commit style from git log --oneline -5)
   7. Land on main: git fetch origin && git rebase origin/main && git push origin HEAD:main
-  8. bd close <id>
-  9. Pick the next bead from bd ready
+  8. .bin/bd close <id>
+  9. Pick the next bead from .bin/bd ready
 
 RULES:
 - Read AGENTS.md for full project instructions
 - Never pick beads with status 'blocked' or type 'epic'
 - If a bead requires a design decision (user-visible behavior change), park it:
-    bd update <id> --status blocked
-    bd comments add <id> 'Design gate: <reason>'
+    .bin/bd update <id> --status blocked
+    .bin/bd comments add <id> 'Design gate: <reason>'
   Then pick the next bead.
 - Always run cargo test before committing
 - Land every completed bead on origin/main before moving to the next one"
