@@ -84,7 +84,7 @@ pub struct World {
     /// Memoization cache for the recursive Hashlife stepper (6gf.2).
     /// Key: (NodeId, world-space origin). Value: stepped result NodeId.
     /// Cleared after each generation and on rule changes.
-    pub(crate) hashlife_cache: FxHashMap<(NodeId, [i64; 3]), NodeId>,
+    pub(crate) hashlife_cache: FxHashMap<(NodeId, [i64; 3], u32), NodeId>,
 }
 
 impl World {

@@ -43,7 +43,8 @@ impl World {
         // centered, so it starts at 2^(level-1) from the padded root's origin.
         let quarter = 1u64 << (self.level - 1);
         let origin = [-(quarter as i64); 3];
-        let result = self.step_node(padded_root, padded_level, origin);
+        let parity = (self.generation % 2) as u32;
+        let result = self.step_node(padded_root, padded_level, origin, parity);
         self.root = result;
         self.generation += 1;
 
@@ -71,18 +72,18 @@ impl World {
 
     /// Recursively step a node. Input level n (≥ 3), output level n-1.
     /// `origin` is the world-space coordinate of the node's (0,0,0) corner.
-    fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3]) -> NodeId {
+    fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
         debug_assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
-        let key = (node, origin);
+        let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
             return cached;
         }
 
         let result = if level == 3 {
-            self.step_base_case(node, origin)
+            self.step_base_case(node, origin, parity)
         } else {
-            self.step_recursive_case(node, level, origin)
+            self.step_recursive_case(node, level, origin, parity)
         };
 
         self.hashlife_cache.insert(key, result);
@@ -91,7 +92,7 @@ impl World {
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
-    fn step_base_case(&mut self, node: NodeId, origin: [i64; 3]) -> NodeId {
+    fn step_base_case(&mut self, node: NodeId, origin: [i64; 3], parity: u32) -> NodeId {
         let side = 8usize;
         let grid = self.store.flatten(node, side);
 
@@ -115,11 +116,7 @@ impl World {
         }
 
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
-        let offset = if self.generation.is_multiple_of(2) {
-            0usize
-        } else {
-            1
-        };
+        let offset = parity as usize;
         // Iterate blocks whose origins are in [1, side-2] so they stay within
         // the CaRule-valid interior.
         let start = offset;
@@ -220,7 +217,7 @@ impl World {
     }
 
     /// Recursive case: level ≥ 3.
-    fn step_recursive_case(&mut self, node: NodeId, level: u32, origin: [i64; 3]) -> NodeId {
+    fn step_recursive_case(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
@@ -281,7 +278,7 @@ impl World {
                         origin[2] + half_quarter + (oz as i64) * quarter,
                     ];
                     result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node(sub_root, level - 1, sub_origin);
+                        self.step_node(sub_root, level - 1, sub_origin, parity);
                 }
             }
         }
