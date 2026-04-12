@@ -64,11 +64,6 @@ impl Ring {
         }
     }
 
-    fn clear(&mut self) {
-        self.head = 0;
-        self.len = 0;
-    }
-
     /// Iterate over the live samples in arbitrary order. Used by aggregation,
     /// not by callers that care about insertion order.
     fn samples(&self) -> &[Duration] {
@@ -151,10 +146,15 @@ impl Perf {
 
     /// Drop all samples from all rings. Call on world reset so post-reset
     /// stats aren't poisoned by stale pre-reset samples.
+    ///
+    /// Drops the keys themselves, not just their contents. Per fb6 retro
+    /// (hash-thing-qen): per-ring `clear()` left empty rings in the map,
+    /// so the next `summary()` rendered `step=0.00/0.00ms` — which reads
+    /// as "nothing measured" instead of "recently reset, no samples yet".
+    /// A cleared map prints as an empty string, which is the honest
+    /// signal.
     pub fn clear(&mut self) {
-        for ring in self.rings.values_mut() {
-            ring.clear();
-        }
+        self.rings.clear();
     }
 
     /// One-line summary of all metrics, sorted by name for stable output.
@@ -439,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_clear_resets_all_rings() {
+    fn perf_clear_drops_all_keys() {
         let mut perf = Perf::new();
         perf.record("a", ms(1));
         perf.record("b", ms(2));
@@ -447,10 +447,14 @@ mod tests {
         assert_eq!(perf.sample_count("a"), 2);
         assert_eq!(perf.sample_count("b"), 1);
         perf.clear();
+        // Keys themselves dropped — hash-thing-qen: a post-reset summary()
+        // must print empty, not `a=0.00/0.00ms b=0.00/0.00ms` (which reads
+        // as "nothing measured" — stale zero, not honest absence).
         assert_eq!(perf.sample_count("a"), 0);
         assert_eq!(perf.sample_count("b"), 0);
-        // Ring entries themselves still exist; only their content is wiped.
-        // After a fresh push, recording works normally.
+        assert_eq!(perf.summary(), "");
+        // After a fresh push, recording works normally and the key
+        // materializes again.
         perf.record("a", ms(7));
         assert_eq!(perf.sample_count("a"), 1);
     }
