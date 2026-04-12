@@ -324,6 +324,10 @@ pub mod cpu_trace {
     use super::*;
 
     pub const MAX_DEPTH: usize = 24;
+    /// Stack depth cap (hash-thing-m1f.7.3). Decoupled from MAX_DEPTH
+    /// so the stack arrays use fewer registers on the GPU. 16 levels
+    /// supports worlds up to 2^16 = 65536 cells/side.
+    pub const MAX_STACK: usize = 16;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
@@ -557,14 +561,17 @@ pub mod cpu_trace {
                 .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
         ];
 
-        let mut stack_node = [0u32; MAX_DEPTH];
-        let mut stack_min = [[0.0f32; 3]; MAX_DEPTH];
-        let mut stack_half = [0.0f32; MAX_DEPTH];
+        let mut stack_node = [0u32; MAX_STACK];
+        let mut stack_min = [[0.0f32; 3]; MAX_STACK];
+        let mut stack_half = [0.0f32; MAX_STACK];
+        let mut stack_cmask = [0u32; MAX_STACK];
         let mut depth: usize = 0;
 
-        stack_node[0] = dag[0];
+        let root_offset = dag[0];
+        stack_node[0] = root_offset;
         stack_min[0] = [0.0; 3];
         stack_half[0] = 0.5;
+        stack_cmask[0] = dag[root_offset as usize];
 
         // Local-frame starting t. Just past the root entry; `ro_local` is
         // already on the root face.
@@ -630,13 +637,24 @@ pub mod cpu_trace {
             depth = top;
 
             // Descend
-            for _d in 0..MAX_DEPTH {
+            for _d in 0..MAX_STACK {
                 let node_offset = stack_node[depth] as usize;
                 let node_min = stack_min[depth];
                 let half = stack_half[depth];
+                let cmask = stack_cmask[depth];
                 let oct = octant_of(pos, rd_m, node_min, half);
                 // Stage 2: XOR to un-mirror the octant for DAG lookup.
-                let child_slot = dag[node_offset + 1 + (oct ^ mirror_mask) as usize];
+                let mirrored_oct = (oct ^ mirror_mask) as usize;
+
+                // m1f.7.3: check cached child_mask before reading child_slot.
+                if cmask & (1 << mirrored_oct) == 0 {
+                    if record {
+                        events.push(TraceEvent::EmptyLeaf { depth, oct });
+                    }
+                    break;
+                }
+
+                let child_slot = dag[node_offset + 1 + mirrored_oct];
 
                 if child_slot & LEAF_BIT != 0 {
                     let mat = child_slot & 0xFFFF;
@@ -703,7 +721,7 @@ pub mod cpu_trace {
                     }
                     break;
                 } else {
-                    if depth + 1 >= MAX_DEPTH {
+                    if depth + 1 >= MAX_STACK {
                         break;
                     }
                     let child_min = [
@@ -715,6 +733,7 @@ pub mod cpu_trace {
                     stack_node[depth] = child_slot;
                     stack_min[depth] = child_min;
                     stack_half[depth] = half * 0.5;
+                    stack_cmask[depth] = dag[child_slot as usize];
                     if record {
                         events.push(TraceEvent::Descend {
                             depth,
@@ -728,7 +747,8 @@ pub mod cpu_trace {
             // Step past the current (empty) octant, then skip consecutive
             // empty siblings using the parent's child_mask (hash-thing-x5w.1).
             // Hoist invariants — depth doesn't change within the inner loop.
-            let skip_mask = dag[stack_node[depth] as usize];
+            // m1f.7.3: use cached child_mask instead of re-reading.
+            let skip_mask = stack_cmask[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
             loop {

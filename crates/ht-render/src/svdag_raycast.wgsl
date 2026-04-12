@@ -120,6 +120,13 @@ const LEAF_BIT: u32 = 0x80000000u;
 // for any practical hashlife scale. Pinned by cpu_trace::integer_dda_exact.
 const RESOLUTION: u32 = 1u << MAX_DEPTH;
 const INV_RES: f32 = 1.0 / f32(RESOLUTION);
+// hash-thing-m1f.7.3: stack depth is decoupled from DDA resolution.
+// MAX_DEPTH (24) drives RESOLUTION for DDA precision; MAX_STACK (16) caps
+// the actual descent depth and stack array size. Reducing from 24 to 16
+// saves ~160 bytes of per-thread register space (3 arrays × 8 fewer slots),
+// improving GPU occupancy and latency hiding. Supports worlds up to
+// 2^16 = 65536 cells/side — well beyond any practical Hashlife scale.
+const MAX_STACK: u32 = 16u;
 
 // hash-thing-2w5: step budget scales with root_level so deep scenes don't
 // silently black out on long sparse traversals. Must stay in lockstep with
@@ -192,16 +199,21 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         u32(clamp(floor(ro_local.z * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
     );
 
-    // Stack of (node_offset, node_min, half_size)
-    var stack_node: array<u32, MAX_DEPTH>;
-    var stack_min: array<vec3<f32>, MAX_DEPTH>;
-    var stack_half: array<f32, MAX_DEPTH>;
+    // Stack of (node_offset, node_min, half_size, child_mask).
+    // child_mask is cached on push to avoid re-reading the buffer during
+    // the skip loop and descent empty-checks (hash-thing-m1f.7.3).
+    var stack_node: array<u32, MAX_STACK>;
+    var stack_min: array<vec3<f32>, MAX_STACK>;
+    var stack_half: array<f32, MAX_STACK>;
+    var stack_cmask: array<u32, MAX_STACK>;
     var depth: u32 = 0u;
 
     // Slot 0 of the buffer holds the current root offset; real slots start at 1.
-    stack_node[0] = dag_nodes[0];
+    let root_offset = dag_nodes[0];
+    stack_node[0] = root_offset;
     stack_min[0] = vec3<f32>(0.0);
     stack_half[0] = 0.5;
+    stack_cmask[0] = dag_nodes[root_offset];
 
     // Local-frame starting t — just past the root entry. `ro_local`
     // already sits on the root face, so we nudge forward by EPS.
@@ -239,20 +251,23 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
 
         // Descend until leaf or empty
         var descended = false;
-        for (var d = 0u; d < MAX_DEPTH; d = d + 1u) {
+        for (var d = 0u; d < MAX_STACK; d = d + 1u) {
             let node_offset = stack_node[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
+            let cmask = stack_cmask[depth];
 
             // LOD cutoff (x5w): if this voxel is sub-pixel, scan children
             // for the first non-empty leaf and treat the whole octant as
             // a solid hit at that color. Dramatically cuts step count for
             // distant or complex geometry.
+            // m1f.7.3: only iterate non-empty children (skip empty via cmask).
             let t_dist = max(t + entry, 1e-4);
             if pixel_world > 0.0 && half < pixel_world * t_dist {
                 // Find any non-empty child in this node.
                 var lod_mat: u32 = 0u;
                 for (var c = 0u; c < 8u; c = c + 1u) {
+                    if (cmask & (1u << c)) == 0u { continue; }
                     let cs = dag_nodes[node_offset + 1u + c];
                     if (cs & LEAF_BIT) != 0u {
                         let m = cs & 0xFFFFu;
@@ -299,7 +314,15 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
 
             let oct = octant_of(pos, rd_m, node_min, half);
             // Stage 2: XOR to un-mirror the octant for DAG lookup.
-            let child_slot = dag_nodes[node_offset + 1u + (oct ^ mirror_mask)];
+            let mirrored_oct = oct ^ mirror_mask;
+
+            // m1f.7.3: check cached child_mask before reading child_slot.
+            // If the octant is empty, skip the buffer read entirely.
+            if (cmask & (1u << mirrored_oct)) == 0u {
+                break; // empty child — go to DDA
+            }
+
+            let child_slot = dag_nodes[node_offset + 1u + mirrored_oct];
 
             if (child_slot & LEAF_BIT) != 0u {
                 let mat = child_slot & 0xFFFFu;
@@ -375,7 +398,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                 break;
             } else {
                 // Interior node — descend
-                if depth + 1u >= MAX_DEPTH { break; }
+                if depth + 1u >= MAX_STACK { break; }
                 let child_min = vec3<f32>(
                     node_min.x + f32(oct & 1u) * half,
                     node_min.y + f32((oct >> 1u) & 1u) * half,
@@ -385,6 +408,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                 stack_node[depth] = child_slot;
                 stack_min[depth] = child_min;
                 stack_half[depth] = half * 0.5;
+                stack_cmask[depth] = dag_nodes[child_slot];
                 descended = true;
             }
         }
@@ -395,7 +419,8 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // iteration (pop + descend + DDA). With it, the ray jumps across all
         // empty children of a node in one pass — major win for sparse scenes.
         // Hoist invariants — depth doesn't change within the inner loop.
-        let skip_mask = dag_nodes[stack_node[depth]];
+        // m1f.7.3: use cached child_mask instead of re-reading from buffer.
+        let skip_mask = stack_cmask[depth];
         let node_min_s = stack_min[depth];
         let half_s = stack_half[depth];
         loop {
