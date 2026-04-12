@@ -144,6 +144,14 @@ impl From<Cell> for u16 {
     }
 }
 
+/// Number of octree levels a gameplay "block" spans above leaf cells.
+/// K=0 → 1×1×1 (cell = block), K=3 → 8×8×8 cells per block.
+/// This is the single configurable knob for cell/block granularity.
+pub const CELLS_PER_BLOCK_LOG2: u32 = 3;
+
+/// Cells per block edge: 2^K.
+pub const CELLS_PER_BLOCK: u32 = 1 << CELLS_PER_BLOCK_LOG2;
+
 /// Index into the canonical node store. u32 to keep nodes small.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId(pub u32);

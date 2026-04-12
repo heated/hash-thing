@@ -2,7 +2,7 @@ use std::fmt;
 
 use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
-use crate::octree::{Cell, CellState, NodeId, NodeStore};
+use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
@@ -288,6 +288,25 @@ impl World {
             Self::local_from_world("set", z),
             state,
         );
+    }
+
+    /// Place a gameplay block at block coordinates `(bx, by, bz)`.
+    ///
+    /// Fills a `CELLS_PER_BLOCK³` region of cells with the given state.
+    /// Block coordinate `(bx, by, bz)` maps to cell region
+    /// `[bx*K .. bx*K+K-1]` on each axis, where `K = CELLS_PER_BLOCK`.
+    ///
+    /// Queues a `FillRegion` mutation — call `apply_mutations` to flush.
+    pub fn set_block(&mut self, bx: i64, by: i64, bz: i64, state: CellState) {
+        let k = CELLS_PER_BLOCK as i64;
+        let min = [WorldCoord(bx * k), WorldCoord(by * k), WorldCoord(bz * k)];
+        let max = [
+            WorldCoord(bx * k + k - 1),
+            WorldCoord(by * k + k - 1),
+            WorldCoord(bz * k + k - 1),
+        ];
+        self.queue
+            .push(WorldMutation::FillRegion { min, max, state });
     }
 
     /// Get a cell.
@@ -1914,6 +1933,75 @@ mod tests {
             }
         }
         assert_eq!(count, 27);
+    }
+
+    #[test]
+    fn set_block_fills_cells_per_block_cubed() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // World needs to be large enough: block at (1,0,0) spans cells [8..15]
+        // on x, so we need level >= 4 (side 16).
+        let mut world = World::new(4);
+        world.set_block(1, 0, 0, STONE);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        let mut filled = 0u32;
+        for z in 0..k {
+            for y in 0..k {
+                for x in k..(2 * k) {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(filled, CELLS_PER_BLOCK.pow(3));
+
+        // Cells just outside the block should be empty.
+        assert_eq!(world.get(wc(k - 1), wc(0), wc(0)), 0); // cell 7, just before block
+        assert_eq!(world.get(wc(2 * k), wc(0), wc(0)), 0); // cell 16, just after block
+    }
+
+    #[test]
+    fn set_block_at_origin() {
+        use crate::octree::CELLS_PER_BLOCK;
+        let mut world = World::new(4);
+        world.set_block(0, 0, 0, STONE);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        let mut filled = 0u32;
+        for z in 0..k {
+            for y in 0..k {
+                for x in 0..k {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(filled, CELLS_PER_BLOCK.pow(3));
+    }
+
+    #[test]
+    fn set_block_roundtrip_individual_cells() {
+        use crate::octree::CELLS_PER_BLOCK;
+        let mut world = World::new(4);
+        world.set_block(0, 0, 0, DIRT);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        for z in 0..k {
+            for y in 0..k {
+                for x in 0..k {
+                    assert_eq!(
+                        world.get(wc(x), wc(y), wc(z)),
+                        DIRT,
+                        "cell ({x},{y},{z}) should be DIRT"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
