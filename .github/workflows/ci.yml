@@ -49,11 +49,11 @@ jobs:
             artifact_name: hash-thing-linux-x86_64
             binary_path: target/release/hash-thing
           - os: macos-15
-            run-tests: false
+            run-tests: true
             artifact_name: hash-thing-macos-aarch64
             binary_path: target/release/hash-thing
           - os: windows-2025
-            run-tests: false
+            run-tests: true
             artifact_name: hash-thing-windows-x86_64.exe
             binary_path: target/release/hash-thing.exe
     steps:
