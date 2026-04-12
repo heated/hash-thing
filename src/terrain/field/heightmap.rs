@@ -9,8 +9,8 @@
 
 use super::RegionField;
 use crate::octree::CellState;
-use crate::terrain::materials::{material_from_depth, AIR, STONE};
-use crate::terrain::noise::fractal_2d;
+use crate::terrain::materials::{material_from_depth, AIR, SAND, STONE};
+use crate::terrain::noise::{biome_2d, fractal_2d};
 
 /// Cells above the maximum possible surface before we trust the AIR
 /// short-circuit. The margin absorbs a few ulps of FP rounding in
@@ -54,11 +54,30 @@ impl HeightmapField {
     }
 }
 
+/// Biome noise threshold: below this value → sandy biome.
+const SAND_BIOME_THRESHOLD: f32 = 0.3;
+
+/// Wavelength for biome noise (cells). Large value → big biome regions.
+const BIOME_WAVELENGTH: f32 = 64.0;
+
 impl RegionField for HeightmapField {
     fn sample(&self, p: [i64; 3]) -> CellState {
         let surface = self.surface_y(p[0] as f32, p[2] as f32);
         let depth = surface - p[1] as f32;
-        material_from_depth(depth)
+        let base = material_from_depth(depth);
+        // In sandy biomes, replace grass and dirt with sand so the terrain
+        // has natural sand regions that fall and settle under gravity.
+        if base != AIR && base != STONE && depth < 4.0 {
+            let biome = biome_2d(
+                p[0] as f32 / BIOME_WAVELENGTH,
+                p[2] as f32 / BIOME_WAVELENGTH,
+                self.seed,
+            );
+            if biome < SAND_BIOME_THRESHOLD {
+                return SAND;
+            }
+        }
+        base
     }
 
     fn classify_box(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
@@ -233,5 +252,34 @@ mod tests {
                 "surface_y({x}, {z}) = {surface} fell outside [{min}, {max}]",
             );
         }
+    }
+
+    #[test]
+    fn biome_produces_sand_in_some_surface_cells() {
+        let f = test_field();
+        let mut sand_count = 0u32;
+        let mut surface_count = 0u32;
+        // Scan a 128×128 grid at the surface level.
+        for x in 0..128 {
+            for z in 0..128 {
+                let surface = f.surface_y(x as f32, z as f32);
+                let y = surface.floor() as i64;
+                let cell = f.sample([x, y, z]);
+                if cell != AIR {
+                    surface_count += 1;
+                    if cell == SAND {
+                        sand_count += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            sand_count > 0,
+            "expected some sand in 128×128 terrain grid, got 0 out of {surface_count} surface cells"
+        );
+        assert!(
+            sand_count < surface_count,
+            "expected mixed biomes, not all sand ({sand_count}/{surface_count})"
+        );
     }
 }

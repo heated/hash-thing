@@ -585,12 +585,11 @@ impl Renderer {
             }],
         });
 
-        let hud_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("hud_pl"),
-                bind_group_layouts: &[Some(&hud_bind_group_layout)],
-                immediate_size: 0,
-            });
+        let hud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hud_pl"),
+            bind_group_layouts: &[Some(&hud_bind_group_layout)],
+            immediate_size: 0,
+        });
 
         let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("hud_rp"),
@@ -1029,8 +1028,11 @@ impl Renderer {
                     0.0,
                     0.0,
                 ];
-                self.queue
-                    .write_buffer(&self.hud_uniform_buffer, 0, bytemuck::cast_slice(&hud_data));
+                self.queue.write_buffer(
+                    &self.hud_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&hud_data),
+                );
                 render_pass.set_pipeline(&self.hud_pipeline);
                 render_pass.set_bind_group(0, &self.hud_bind_group, &[]);
                 // 5 quads × 6 vertices = 30 vertices.
