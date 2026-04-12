@@ -497,29 +497,15 @@ impl NodeStore {
         &self,
         root: NodeId,
     ) -> (NodeStore, NodeId, FxHashMap<NodeId, NodeId>) {
-        let (store, roots, remap) = self.compacted_with_remap_roots(&[root]);
-        (store, roots, remap)
-    }
-
-    /// Like [`compacted_with_remap`], but preserves multiple root trees.
-    /// Returns the new NodeId of the *first* root. All roots' subtrees
-    /// are included in the remap table, so caches keyed on nodes from
-    /// any preserved tree can be remapped.
-    pub fn compacted_with_remap_roots(
-        &self,
-        roots: &[NodeId],
-    ) -> (NodeStore, NodeId, FxHashMap<NodeId, NodeId>) {
         let mut dst = NodeStore::new();
         let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        // Pre-seed EMPTY as a perf short-circuit. Note: this is NOT
+        // semantically load-bearing — `dst.leaf(0)` already dedups to
+        // `NodeId::EMPTY` via the hash-cons path — but it skips the
+        // recursive walk whenever we hit an empty subtree.
         remap.insert(NodeId::EMPTY, NodeId::EMPTY);
-        let mut new_first = NodeId::EMPTY;
-        for (i, &root) in roots.iter().enumerate() {
-            let new_root = clone_reachable(self, &mut dst, &mut remap, root);
-            if i == 0 {
-                new_first = new_root;
-            }
-        }
-        (dst, new_first, remap)
+        let new_root = clone_reachable(self, &mut dst, &mut remap, root);
+        (dst, new_root, remap)
     }
 }
 

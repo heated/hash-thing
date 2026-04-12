@@ -18,17 +18,16 @@
 //!      (each level n-1), recursively step each → 8 results at level n-2.
 //!      Assemble into the level-(n-1) output.
 //!
-//! Step results are memoized by (NodeId, parity) so identical subtrees anywhere
-//! in the world share a single cache entry per generation. Compaction is deferred
-//! (m1f.14): intermediate nodes from recursive descent survive across frames,
-//! enabling cache hits at every recursion level. Periodic compaction runs when
-//! the store exceeds 2× its post-compaction size, remapping cache keys through
-//! the compaction table. Since parity alternates 0/1, cache hits occur every
+//! Step results are memoized by (NodeId, origin, parity) so identical subtrees at
+//! the same world-space position are computed only once per generation.
+//! After each step, compaction remaps NodeIds; the cache entries are translated
+//! through the remap table rather than cleared. Entries for GC'd nodes are
+//! dropped automatically. Since parity alternates 0/1, cache hits occur every
 //! OTHER frame for stable subtrees (parity match on frame N+2, not N+1).
 
 use super::world::World;
 use crate::octree::node::octant_index;
-use crate::octree::{Cell, CellState, Node, NodeId};
+use crate::octree::{Cell, CellState, NodeId};
 use rustc_hash::FxHashMap;
 
 const LEVEL3_SIDE: usize = 8;
@@ -46,14 +45,25 @@ impl World {
             self.level
         );
         self.hashlife_stats = super::world::HashlifeStats::default();
+        // Auto-enable spatial memoization for CaRule-only worlds.
+        // BlockRule partition alignment depends on world-space origin, so
+        // origin must remain in the cache key when block rules are present.
+        self.spatial_memo = !self.materials.has_any_block_rules();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
+        // World-space origin of the padded root: the original world is
+        // centered, so it starts at 2^(level-1) from the padded root's origin.
+        let quarter = 1u64 << (self.level - 1);
+        let origin = [-(quarter as i64); 3];
         let parity = (self.generation % 2) as u32;
-        let result = self.step_node(padded_root, padded_level, parity);
+        let result = self.step_node(padded_root, padded_level, origin, parity);
         self.root = result;
         self.generation += 1;
 
-        self.maybe_compact();
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
+        self.store = new_store;
+        self.root = new_root;
+        self.remap_caches(&remap);
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -79,32 +89,16 @@ impl World {
         }
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
-        let result = self.step_node_macro(padded_root, padded_level, self.generation);
+        let quarter = 1u64 << (self.level - 1);
+        let origin = [-(quarter as i64); 3];
+        let result = self.step_node_macro(padded_root, padded_level, origin, self.generation);
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
-        self.maybe_compact();
-    }
 
-    /// Compact the store when it has grown past 2× its post-compaction size.
-    /// This bounds memory growth from deferred compaction while preserving
-    /// most intermediate nodes across frames for cache hits. The 2× threshold
-    /// means compaction runs rarely — only when the store has doubled from
-    /// dead intermediate nodes accumulating.
-    fn maybe_compact(&mut self) {
-        let current_size = self.store.stats();
-        // On first call, store_size_at_last_compact is 0 — set baseline
-        if self.store_size_at_last_compact == 0 {
-            self.store_size_at_last_compact = current_size;
-            return;
-        }
-        if current_size <= self.store_size_at_last_compact * 2 {
-            return;
-        }
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
-        self.store_size_at_last_compact = self.store.stats();
     }
 
     fn has_block_rule_cells(&mut self) -> bool {
@@ -120,91 +114,26 @@ impl World {
         result
     }
 
-    /// Check if every leaf in the subtree is inert (CaRule::Noop, no BlockRule).
-    /// Unlike `inert_uniform_state`, this catches mixed-material subtrees
-    /// (e.g. stone/air boundaries at terrain surfaces). For all-inert nodes,
-    /// stepping produces the center extraction — no CA computation needed.
-    fn is_all_inert(&mut self, node: NodeId) -> bool {
-        if let Some(&cached) = self.hashlife_all_inert_cache.get(&node) {
-            return cached;
-        }
-        let result = match self.store.get(node).clone() {
-            Node::Leaf(state) => {
-                // Empty cells (air) and inert materials are both fixed points
-                state == 0
-                    || self
-                        .materials
-                        .cell_is_inert_fixed_point(Cell::from_raw(state))
-            }
-            Node::Interior { children, .. } => children.into_iter().all(|c| self.is_all_inert(c)),
-        };
-        self.hashlife_all_inert_cache.insert(node, result);
-        result
-    }
-
-    fn inert_uniform_state(&mut self, node: NodeId) -> Option<CellState> {
-        if let Some(&cached) = self.hashlife_inert_cache.get(&node) {
-            return cached;
-        }
-
-        let result = match self.store.get(node).clone() {
-            Node::Leaf(state) => self
-                .materials
-                .cell_is_inert_fixed_point(Cell::from_raw(state))
-                .then_some(state),
-            Node::Interior { children, .. } => {
-                let state = self.inert_uniform_state(children[0])?;
-                for child in children.into_iter().skip(1) {
-                    if self.inert_uniform_state(child) != Some(state) {
-                        self.hashlife_inert_cache.insert(node, None);
-                        return None;
-                    }
-                }
-                Some(state)
-            }
-        };
-
-        self.hashlife_inert_cache.insert(node, result);
-        result
-    }
-
     /// Remap hashlife cache keys and values through a compaction remap table.
     /// Entries referencing unreachable nodes (not in remap) are dropped.
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
-        // Remap hashlife_cache: (NodeId, parity) → NodeId
+        // Remap hashlife_cache: (NodeId, origin, parity) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
         self.hashlife_cache.reserve(old_cache.len());
-        for ((node, parity), result) in old_cache {
+        for ((node, origin, parity), result) in old_cache {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
-                self.hashlife_cache.insert((new_node, parity), new_result);
+                self.hashlife_cache
+                    .insert((new_node, origin, parity), new_result);
             }
         }
 
-        // Remap hashlife_macro_cache: (NodeId, generation) → NodeId
+        // Remap hashlife_macro_cache: (NodeId, origin, generation) → NodeId
         let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
         self.hashlife_macro_cache.reserve(old_macro.len());
-        for ((node, gen), result) in old_macro {
+        for ((node, origin, gen), result) in old_macro {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
                 self.hashlife_macro_cache
-                    .insert((new_node, gen), new_result);
-            }
-        }
-
-        // Remap hashlife_inert_cache: NodeId → Option<CellState>
-        let old_inert = std::mem::take(&mut self.hashlife_inert_cache);
-        self.hashlife_inert_cache.reserve(old_inert.len());
-        for (node, state) in old_inert {
-            if let Some(&new_node) = remap.get(&node) {
-                self.hashlife_inert_cache.insert(new_node, state);
-            }
-        }
-
-        // Remap hashlife_all_inert_cache: NodeId → bool
-        let old_all_inert = std::mem::take(&mut self.hashlife_all_inert_cache);
-        self.hashlife_all_inert_cache.reserve(old_all_inert.len());
-        for (node, inert) in old_all_inert {
-            if let Some(&new_node) = remap.get(&node) {
-                self.hashlife_all_inert_cache.insert(new_node, inert);
+                    .insert((new_node, origin, gen), new_result);
             }
         }
     }
@@ -225,10 +154,8 @@ impl World {
     }
 
     /// Recursively step a node. Input level n (≥ 3), output level n-1.
-    /// Block-rule partition uses node-local alignment, so origin is not needed
-    /// and the cache key is just (NodeId, parity) — enabling spatial memoization
-    /// for all worlds, including those with block rules (9ww).
-    fn step_node(&mut self, node: NodeId, level: u32, parity: u32) -> NodeId {
+    /// `origin` is the world-space coordinate of the node's (0,0,0) corner.
+    fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
         assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
@@ -238,21 +165,28 @@ impl World {
             return self.store.empty(level - 1);
         }
 
-        if let Some(state) = self.inert_uniform_state(node) {
-            self.hashlife_stats.fixed_point_skips += 1;
-            return self.store.uniform(level - 1, state);
+        // Spatial memoization: for CaRule-only worlds, identical subtrees at
+        // different positions produce the same result. Use (NodeId, parity)
+        // as cache key instead of (NodeId, origin, parity).
+        if self.spatial_memo {
+            let spatial_key = (node, parity);
+            if let Some(&cached) = self.hashlife_spatial_cache.get(&spatial_key) {
+                self.hashlife_stats.cache_hits += 1;
+                return cached;
+            }
+            self.hashlife_stats.cache_misses += 1;
+
+            let result = if level == 3 {
+                self.step_base_case(node, origin, parity)
+            } else {
+                self.step_recursive_case(node, level, origin, parity)
+            };
+
+            self.hashlife_spatial_cache.insert(spatial_key, result);
+            return result;
         }
 
-        // All-inert check (m1f.15.7): if every leaf is CaRule::Noop with no
-        // BlockRule, the step result is the center extraction. This catches
-        // mixed-material terrain surfaces (stone/air/dirt/grass) that the
-        // uniform-inert check above misses.
-        if self.is_all_inert(node) {
-            self.hashlife_stats.fixed_point_skips += 1;
-            return self.center_node(node, level);
-        }
-
-        let key = (node, parity);
+        let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
@@ -260,9 +194,9 @@ impl World {
         self.hashlife_stats.cache_misses += 1;
 
         let result = if level == 3 {
-            self.step_base_case(node, parity)
+            self.step_base_case(node, origin, parity)
         } else {
-            self.step_recursive_case(node, level, parity)
+            self.step_recursive_case(node, level, origin, parity)
         };
 
         self.hashlife_cache.insert(key, result);
@@ -271,13 +205,19 @@ impl World {
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
-    fn step_base_case(&mut self, node: NodeId, _parity: u32) -> NodeId {
+    fn step_base_case(&mut self, node: NodeId, origin: [i64; 3], _parity: u32) -> NodeId {
         let grid = self.store.flatten(node, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, self.generation);
+        let next = self.step_grid_once(&grid, origin, self.generation);
         self.center_level3_grid_to_node(&next)
     }
 
-    fn step_node_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
+    fn step_node_macro(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        origin: [i64; 3],
+        generation: u64,
+    ) -> NodeId {
         debug_assert!(
             level >= 3,
             "step_node_macro requires level >= 3, got {level}"
@@ -289,41 +229,32 @@ impl World {
             return self.store.empty(level - 1);
         }
 
-        if let Some(state) = self.inert_uniform_state(node) {
-            self.hashlife_stats.fixed_point_skips += 1;
-            return self.store.uniform(level - 1, state);
-        }
-
-        if self.is_all_inert(node) {
-            self.hashlife_stats.fixed_point_skips += 1;
-            return self.center_node(node, level);
-        }
-
-        let key = (node, generation);
+        let key = (node, origin, generation);
         if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
             return cached;
         }
 
         let result = if level == 3 {
-            self.step_base_case_macro(node, generation)
+            self.step_base_case_macro(node, origin, generation)
         } else {
-            self.step_recursive_case_macro(node, level, generation)
+            self.step_recursive_case_macro(node, level, origin, generation)
         };
 
         self.hashlife_macro_cache.insert(key, result);
         result
     }
 
-    fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
+    fn step_base_case_macro(&mut self, node: NodeId, origin: [i64; 3], generation: u64) -> NodeId {
         let grid = self.store.flatten(node, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, generation);
-        let next = self.step_grid_once(&next, generation + 1);
+        let next = self.step_grid_once(&grid, origin, generation);
+        let next = self.step_grid_once(&next, origin, generation + 1);
         self.center_level3_grid_to_node(&next)
     }
 
     fn step_grid_once(
         &self,
         grid: &[CellState],
+        origin: [i64; 3],
         generation: u64,
     ) -> [CellState; LEVEL3_CELL_COUNT] {
         let side = LEVEL3_SIDE;
@@ -346,17 +277,23 @@ impl World {
         }
 
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
-        // Node-local alignment (9ww): partition is determined solely by
-        // generation parity within the 8×8×8 base-case grid. Identical nodes
-        // produce identical results regardless of world-space position.
         let offset = (generation % 2) as usize;
-        let mut bz = offset;
+        let start = offset;
+        let mut bz = start;
         while bz + 1 < side - 1 {
-            let mut by = offset;
+            let mut by = start;
             while by + 1 < side - 1 {
-                let mut bx = offset;
+                let mut bx = start;
                 while bx + 1 < side - 1 {
-                    self.apply_block_in_grid(&mut next, side, bx, by, bz);
+                    let wbx = origin[0] + bx as i64;
+                    let wby = origin[1] + by as i64;
+                    let wbz = origin[2] + bz as i64;
+                    if wbx.rem_euclid(2) == offset as i64
+                        && wby.rem_euclid(2) == offset as i64
+                        && wbz.rem_euclid(2) == offset as i64
+                    {
+                        self.apply_block_in_grid(&mut next, side, bx, by, bz);
+                    }
                     bx += 2;
                 }
                 by += 2;
@@ -430,7 +367,13 @@ impl World {
     }
 
     /// Recursive case: level ≥ 3.
-    fn step_recursive_case(&mut self, node: NodeId, level: u32, parity: u32) -> NodeId {
+    fn step_recursive_case(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        origin: [i64; 3],
+        parity: u32,
+    ) -> NodeId {
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
@@ -467,6 +410,8 @@ impl World {
         }
 
         // Group into 8 overlapping sub-cubes (level n-1) and recurse.
+        let quarter = 1i64 << (level - 2); // size of a level-(n-2) node
+        let half_quarter = quarter / 2; // = 2^(level-3)
         let mut result_children = [NodeId::EMPTY; 8];
         for oz in 0..2usize {
             for oy in 0..2usize {
@@ -481,8 +426,15 @@ impl World {
                         }
                     }
                     let sub_root = self.store.interior(level - 1, sub_cube);
+                    // World-space origin: centered[0] starts at origin + half_quarter.
+                    // Each subsequent centered node adds quarter.
+                    let sub_origin = [
+                        origin[0] + half_quarter + (ox as i64) * quarter,
+                        origin[1] + half_quarter + (oy as i64) * quarter,
+                        origin[2] + half_quarter + (oz as i64) * quarter,
+                    ];
                     result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node(sub_root, level - 1, parity);
+                        self.step_node(sub_root, level - 1, sub_origin, parity);
                 }
             }
         }
@@ -490,11 +442,19 @@ impl World {
         self.store.interior(level - 1, result_children)
     }
 
-    fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
+    fn step_recursive_case_macro(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        origin: [i64; 3],
+        generation: u64,
+    ) -> NodeId {
         debug_assert!(level > 3, "macro recursive case requires level > 3");
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
+        let quarter = 1i64 << (level - 2);
+        let half_quarter = quarter / 2;
         let half_skip = 1u64 << (level - 3);
 
         // Phase 1: compute each overlapping level-(n-1) intermediate node's
@@ -520,8 +480,13 @@ impl World {
                         }
                     }
                     let inter = self.store.interior(level - 1, octants);
+                    let inter_origin = [
+                        origin[0] + (px as i64) * quarter,
+                        origin[1] + (py as i64) * quarter,
+                        origin[2] + (pz as i64) * quarter,
+                    ];
                     phased[px + py * 3 + pz * 9] =
-                        self.step_node_macro(inter, level - 1, generation);
+                        self.step_node_macro(inter, level - 1, inter_origin, generation);
                 }
             }
         }
@@ -543,8 +508,13 @@ impl World {
                         }
                     }
                     let sub_root = self.store.interior(level - 1, sub_cube);
-                    result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node_macro(sub_root, level - 1, generation + half_skip);
+                    let sub_origin = [
+                        origin[0] + half_quarter + (ox as i64) * quarter,
+                        origin[1] + half_quarter + (oy as i64) * quarter,
+                        origin[2] + half_quarter + (oz as i64) * quarter,
+                    ];
+                    result_children[octant_index(ox as u32, oy as u32, oz as u32)] = self
+                        .step_node_macro(sub_root, level - 1, sub_origin, generation + half_skip);
                 }
             }
         }
@@ -580,7 +550,6 @@ fn source_index(p: usize, s: usize) -> (usize, usize) {
     }
 }
 
-#[inline]
 fn get_neighbors_from_grid(
     grid: &[CellState],
     side: usize,
@@ -954,78 +923,6 @@ mod tests {
     }
 
     #[test]
-    fn exposed_inert_stone_block_is_fixed_point() {
-        let mut brute = World::new(3);
-        let mut recur = World::new(3);
-        brute.set(wc(3), wc(3), wc(3), STONE);
-        recur.set(wc(3), wc(3), wc(3), STONE);
-        let before = brute.flatten();
-
-        brute.step();
-        recur.step_recursive();
-
-        assert_eq!(
-            brute.flatten(),
-            before,
-            "brute step should leave the stone fixed"
-        );
-        assert_eq!(
-            recur.flatten(),
-            before,
-            "recursive step should leave the stone fixed"
-        );
-        assert_eq!(
-            recur.flatten(),
-            brute.flatten(),
-            "recursive and brute-force stepping must agree on exposed inert blocks"
-        );
-    }
-
-    #[test]
-    fn inert_uniform_state_detects_static_uniform_subtrees() {
-        let mut world = World::new(3);
-        let stone = world.store.uniform(3, STONE);
-        let water = world
-            .store
-            .uniform(3, crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw());
-        let stone_leaf = world.store.leaf(STONE);
-        let empty_leaf = world.store.leaf(0);
-        let mixed = world.store.interior(
-            1,
-            [
-                stone_leaf, stone_leaf, stone_leaf, stone_leaf, stone_leaf, stone_leaf, stone_leaf,
-                empty_leaf,
-            ],
-        );
-
-        assert_eq!(world.inert_uniform_state(stone), Some(STONE));
-        assert_eq!(world.inert_uniform_state(water), None);
-        assert_eq!(world.inert_uniform_state(mixed), None);
-    }
-
-    #[test]
-    fn step_node_short_circuits_uniform_inert_subtrees() {
-        let mut world = World::new(3);
-        let stone = world.store.uniform(3, STONE);
-
-        let stepped = world.step_node(stone, 3, 0);
-
-        assert_eq!(stepped, world.store.uniform(2, STONE));
-        assert_eq!(world.hashlife_stats.fixed_point_skips, 1);
-    }
-
-    #[test]
-    fn step_node_macro_short_circuits_uniform_inert_subtrees() {
-        let mut world = World::new(3);
-        let stone = world.store.uniform(3, STONE);
-
-        let stepped = world.step_node_macro(stone, 3, 0);
-
-        assert_eq!(stepped, world.store.uniform(2, STONE));
-        assert_eq!(world.hashlife_stats.fixed_point_skips, 1);
-    }
-
-    #[test]
     fn pad_root_preserves_center() {
         let mut world = World::new(3);
         world.set(wc(2), wc(3), wc(4), STONE);
@@ -1214,264 +1111,5 @@ mod tests {
     #[should_panic]
     fn source_index_out_of_range_panics() {
         source_index(3, 0);
-    }
-
-    #[test]
-    fn remap_caches_preserves_reachable_entries_and_drops_unreachable_ones() {
-        let mut world = World::new(3);
-        world.set(wc(3), wc(3), wc(3), STONE);
-
-        let reachable = world.root;
-        let unreachable = world.store.uniform(1, STONE);
-        assert_ne!(
-            reachable, unreachable,
-            "fixture requires a non-reachable node distinct from the world root"
-        );
-
-        // Seed all four caches with one reachable and one unreachable entry
-        world.hashlife_cache.insert((reachable, 0), reachable);
-        world.hashlife_cache.insert((unreachable, 1), unreachable);
-        world
-            .hashlife_macro_cache
-            .insert((reachable, 11), reachable);
-        world
-            .hashlife_macro_cache
-            .insert((unreachable, 12), unreachable);
-        world.hashlife_inert_cache.insert(reachable, None);
-        world.hashlife_inert_cache.insert(unreachable, Some(STONE));
-        world.hashlife_all_inert_cache.insert(reachable, true);
-        world.hashlife_all_inert_cache.insert(unreachable, false);
-
-        let (new_store, new_root, remap) = world.store.compacted_with_remap(world.root);
-        let &new_reachable = remap
-            .get(&reachable)
-            .expect("reachable root must survive compaction");
-        assert_eq!(new_reachable, new_root);
-        assert!(
-            !remap.contains_key(&unreachable),
-            "unreachable cache fixture node should be dropped by compaction"
-        );
-
-        world.store = new_store;
-        world.root = new_root;
-        world.remap_caches(&remap);
-
-        // hashlife_cache: only reachable entry survives
-        assert_eq!(world.hashlife_cache.len(), 1);
-        assert_eq!(
-            world.hashlife_cache.get(&(new_reachable, 0)),
-            Some(&new_reachable)
-        );
-
-        // hashlife_macro_cache: only reachable entry survives
-        assert_eq!(world.hashlife_macro_cache.len(), 1);
-        assert_eq!(
-            world.hashlife_macro_cache.get(&(new_reachable, 11)),
-            Some(&new_reachable)
-        );
-
-        // hashlife_inert_cache: only reachable entry survives
-        assert_eq!(world.hashlife_inert_cache.len(), 1);
-        assert_eq!(world.hashlife_inert_cache.get(&new_reachable), Some(&None));
-
-        // hashlife_all_inert_cache: only reachable entry survives
-        assert_eq!(world.hashlife_all_inert_cache.len(), 1);
-        assert_eq!(
-            world.hashlife_all_inert_cache.get(&new_reachable),
-            Some(&true)
-        );
-    }
-
-    /// Inert world cache behavior (m1f.15.1): a stone-only world is immediately
-    /// at fixed point. The world state never changes.
-    ///
-    /// With deferred compaction (m1f.15.5), inert frames skip compaction,
-    /// preserving cache entries across frames. Combined with hash-cons dedup
-    /// (pad_root produces stable NodeIds), subsequent frames get cache hits
-    /// for every non-uniform surface node. Fixed-point detection catches
-    /// uniform subtrees even earlier (before cache lookup).
-    #[test]
-    fn inert_world_state_unchanged() {
-        let mut world = World::new(4); // 16³
-        let mut rng = SimpleRng::new(0xcafe_u64);
-        for z in 0..16u64 {
-            for y in 0..16u64 {
-                for x in 0..16u64 {
-                    if rng.next_u64().is_multiple_of(3) {
-                        world.set(wc(x), wc(y), wc(z), STONE);
-                    }
-                }
-            }
-        }
-        let state_before = world.flatten();
-
-        for _ in 0..4 {
-            world.step_recursive();
-            assert_eq!(
-                world.flatten(),
-                state_before,
-                "stone-only world should remain unchanged"
-            );
-        }
-    }
-
-    /// Inert world at larger scale (m1f.15.1): at level 6 (64³), uniform
-    /// subtrees deep underground should trigger fixed-point detection.
-    #[test]
-    fn inert_world_level6_fixed_point_skips() {
-        use crate::terrain::TerrainParams;
-        let mut world = World::new(6); // 64³
-        let params = TerrainParams::default();
-        world.seed_terrain(&params);
-        let state_before = world.flatten();
-
-        world.step_recursive();
-        let s = world.hashlife_stats;
-
-        assert!(
-            s.empty_skips > 0,
-            "64³ terrain should have empty subtree skips (air above ground)"
-        );
-
-        assert_eq!(
-            world.flatten(),
-            state_before,
-            "terrain without active CA should remain unchanged"
-        );
-    }
-
-    /// Settled terrain convergence (m1f.15.1): after active CA (water/fire)
-    /// finishes, further steps should not change the world state.
-    #[test]
-    fn settled_terrain_state_converges() {
-        use crate::terrain::TerrainParams;
-        let mut world = World::new(4); // 16³
-        let params = TerrainParams::default();
-        world.seed_terrain(&params);
-
-        for _ in 0..6 {
-            world.step_recursive();
-        }
-        let settled = world.flatten();
-
-        world.step_recursive();
-        assert_eq!(
-            world.flatten(),
-            settled,
-            "settled terrain changed on step 7"
-        );
-        world.step_recursive();
-        assert_eq!(
-            world.flatten(),
-            settled,
-            "settled terrain changed on step 8"
-        );
-    }
-
-    /// m1f.15.1: Verify cache hits on warm frames for an unchanged inert world.
-    ///
-    /// After two frames (one per parity), subsequent frames should be mostly
-    /// cache hits. If misses remain high on frame 4+, something is invalidating
-    /// cache entries (compaction remap bug, NodeId reassignment, etc).
-    #[test]
-    fn inert_world_cache_hits_on_warm_frames() {
-        use crate::terrain::TerrainParams;
-        let mut world = World::new(4);
-        world.seed_terrain(&TerrainParams::default());
-
-        let mut stats_per_gen = Vec::new();
-        for _ in 0..6 {
-            world.step_recursive();
-            stats_per_gen.push((
-                world.hashlife_stats.cache_hits,
-                world.hashlife_stats.cache_misses,
-                world.hashlife_stats.empty_skips,
-                world.hashlife_stats.fixed_point_skips,
-                world.hashlife_cache.len(),
-            ));
-        }
-
-        let (hits_f2, misses_f2, _, _, _) = stats_per_gen[2];
-        let total_f2 = hits_f2 + misses_f2;
-
-        let (hits_f4, misses_f4, _, _, _) = stats_per_gen[4];
-        let total_f4 = hits_f4 + misses_f4;
-
-        let hit_rate_f4 = if total_f4 > 0 {
-            hits_f4 as f64 / total_f4 as f64
-        } else {
-            1.0
-        };
-
-        for (i, (h, m, e, f, sz)) in stats_per_gen.iter().enumerate() {
-            let total = h + m;
-            let rate = if total > 0 {
-                *h as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            };
-            eprintln!(
-                "  gen {i}: hits={h}, misses={m}, empty={e}, fixed={f}, cache_size={sz}, rate={rate:.1}%"
-            );
-        }
-
-        let misses_f0 = stats_per_gen[0].1;
-        if misses_f4 == misses_f0 && misses_f0 > 0 {
-            eprintln!(
-                "  WARNING: frame 4 has same miss count as frame 0 ({misses_f0}) — \
-                 cache entries may be lost during compaction remap"
-            );
-        }
-
-        assert!(
-            hits_f2 > 0 || total_f2 == 0,
-            "frame 2 (same parity as frame 0) should have at least some cache hits, \
-             but got 0 hits / {misses_f2} misses"
-        );
-
-        eprintln!("  frame 4 hit rate: {:.1}%", hit_rate_f4 * 100.0);
-    }
-
-    /// All-inert detection (m1f.15.7) + deferred compaction (m1f.15.5):
-    /// a stone-only world should be fully handled by fixed-point + all-inert
-    /// short-circuits, with zero cache misses from the very first step.
-    #[test]
-    fn inert_world_zero_cache_lookups() {
-        let mut world = World::new(4); // 16³
-        let mut rng = SimpleRng::new(0xd1ce_u64);
-        for z in 0..16u64 {
-            for y in 0..16u64 {
-                for x in 0..16u64 {
-                    if rng.next_u64().is_multiple_of(3) {
-                        world.set(wc(x), wc(y), wc(z), STONE);
-                    }
-                }
-            }
-        }
-        let state_before = world.flatten();
-
-        for gen in 0..4 {
-            world.step_recursive();
-            let s = world.hashlife_stats;
-            // All work should be short-circuited by fixed-point detection
-            // and all-inert detection — no cache lookups needed.
-            let total_skips = s.empty_skips + s.fixed_point_skips;
-            assert!(
-                total_skips > 0,
-                "gen {gen}: should have short-circuit skips"
-            );
-            assert_eq!(
-                s.cache_misses, 0,
-                "gen {gen}: stone-only world should have zero cache misses \
-                 (all caught by inert detection), got {} misses",
-                s.cache_misses,
-            );
-        }
-
-        assert_eq!(
-            world.flatten(),
-            state_before,
-            "stone-only world should remain unchanged"
-        );
     }
 }

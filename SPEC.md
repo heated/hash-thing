@@ -1,8 +1,8 @@
-# Ashfall — Design Spec
+# Hash Thing — Design Spec
 
 > A 3D voxel cellular automaton engine with hash-consed octree storage, Hashlife-style simulation stepping, Margolus-block physics, material-type CA rules, and SVDAG rendering. Targeting infinitely explorable worlds with emergent physics and redstone-style computation.
 
-Repo: `git@github.com:heated/ashfall.git`
+Repo: `git@github.com:heated/hash-thing.git`
 
 ---
 
@@ -87,6 +87,77 @@ Repo: `git@github.com:heated/ashfall.git`
 
 These are terrain/world presets — each would be a different terrain stack + material set + generation parameters. Still needs workshopping; don't build any of these without design conversation first.
 
+### Interactions, identity, wow moment (2026-04-12 session 2)
+
+> **Materials:** Some materials should be static (stone, dirt). Some fall (sand). Some flow (water). Maybe fire. Not everything needs to move — it's okay for some to just sit there.
+>
+> **Voxel scale:** open question, depends on performance. Either roughly player-sized voxels or much smaller. TBD.
+>
+> **Game mode:** Far more sandbox than builder. Survival with possible roguelike layer. NOT structure-building focused — Minecraft already does that. Sandbox or survival/roguelike, possibly something else.
+>
+> **Interactions — direction:** Entities. Player places machines or entities that do things in the world. That's the interaction layer, not block-by-block construction. Also: Metroidvania-style progression — items unlock areas, movement upgrades (walking → breaking → swimming → flight). Macro-scale player presence — player has velocity, crashes into things, stuff shifts around them, every action is impactful and changes the world. The player is always physically affecting their surroundings just by moving through them.
+>
+> **The trailhead imagery:** A 3D sandbox where stuff is constantly moving, the player is always displacing and interacting with the material around them, everything the player does ripples outward. The player isn't placing blocks — they're a physical presence crashing through a living world.
+>
+> **First wow moment — 30-second version:** Something 3D and beyond normal simulation. Rain (3D particle field). Or a powder-game setup with lots of movement. Fireworks or explosions. A big sand pile collapsing. Water in the air.
+>
+> **First wow moment — aspirational:** Open space with floating islands, water flowing between them, stuff happening in the air. The megastructure world but with a LOT going on. Work toward this; simpler version first.
+>
+> **Material interactions for demo:** Water flowing, something airborne (rain/particles), a big sand collapse or avalanche, explosions/fireworks. These are the "prove it works" moments.
+>
+> **"Done enough to show someone":** Both a 30-second and a 5-minute experience. Each is foreplay building to the big wow reveal.
+>
+> **Game identity (still forming):** Not Minecraft's crafting/RPG stack. Materials will always struggle to be a perfect sandbox — lean into what's unique: 3D CA physics at scale, player-as-physical-presence, living world. Explore more. Play Noita for reference.
+>
+> **Clarification:** Sandbox is a MODE within the game, coexisting with other game mechanics. Door is open on roguelike combat. Other identities worth exploring — player-as-physical-presence is the starting trailhead, not the final answer.
+
+### Feature decisions (2026-04-12 session 3)
+
+> **Entities/machines — Powder Game inspiration:** Clone block (material source) is in. Entities are mobile creatures that interact with the CA world — like mobs but more physics-native. Not necessarily Minecraft mobs. Specifics TBD but direction is clear: things that move around and interact with materials.
+>
+> **Powder Game material candidates:** Clone (source), fan (wind/push), firework, magma/lava, ice (freezes water), acid (dissolves), oil (flammable), gunpowder, steam (rises), gas (explosive), metal (heat conductor), plant/vine (grows). Classic Powder Game set mapped to 3D CA.
+>
+> **Entity ideas to explore:** Physics creatures (water elemental, sand worm), automata-native entities (behavior IS CA rules), environmental entities (geysers, volcanos, whirlpools), critters (small scatter creatures that make world feel alive).
+>
+> **Roguelike:** Deferred. Get sandbox + metroidvania + destructible environment solid first. Rain World 2 as possible inspiration when the time comes. Don't build roguelike mechanics yet.
+>
+> **Metroidvania progression (concrete):**
+> - Start: walk only, navigate terrain puzzles
+> - Unlock 1: block-breaking (maybe limited to some materials first)
+> - Unlock 2: material creation abilities
+> - Unlock 3: swimming/traversal
+> - Unlock 4: flight — leaning Superman-style (powerful, fast), possibly a weaker tier before it
+> - Progression IS the tutorial — no explicit tutorial text, gated areas teach by doing
+> - Each unlock opens a new zone containing the next unlock
+>
+> **Inventory:** Hotbar yes, inventory yes, no crafting. Items auto-equip on pickup, hotbar to switch active tool. "Permanent equip with loadout swapping" worth exploring later but start with hotbar. Standard hotbar selection controls.
+>
+> **Demo world:** Megastructures. Player starts in a confined/tame environment, then it opens into the spectacle.
+
+### Material encoding idea (2026-04-12 session 3)
+
+> It would be great if our material system was tagged pointer-like. So one of the materials was special — special means go look up what this should be in another table. And special means it's destructible by the player but indestructible by explosions and stuff. The idea is these special blocks would be treated the same way by Hashlife all the time. Maybe a few types — hashlife would still interact with them differently but they'd just be breakable or unbreakable materials. Something to workshop — not married to it, but want to make space for it.
+
+### Demo world and progression (2026-04-12 session 3)
+
+> **World preset ranking:**
+> 1. **Lattice** — first demo target. Enormous repeating geometric structures with active materials flowing through gaps. Escher meets nature.
+> 2. **Inverted Mountains** — follow-up. Terrain hangs from above, open chasms below, waterfalls into mist.
+> 3. **World Tree + floating islands** or **Organic Towers** — third option, pick later.
+>
+> **Demo progression (5 minutes):**
+> The demo is a visual journey, not a gameplay tutorial. Minimal player interaction, maximum spectacle. Metroidvania unlocks happen over the full game (hours), not the demo. The key principle: scale is withheld until the final reveal — that's the wow moment.
+>
+> 1. ROOM — Small enclosed space. Quiet. Stone, water dripping. One exit. No sense of what's outside.
+> 2. CORRIDOR — Growing hints: water stream, sand sifting, light/sound changes. Still enclosed, can't see out.
+> 3. TEASES — Brief glimpses through cracks/gaps. Movement, color, something big. The lattice is felt before it's seen.
+> 4. THE WALK — Path weaves through lattice interiors. Chambers, tunnels within the geometry. Material interactions at local scale (water, fire, lava→steam). Player thinks "this is cool" but doesn't grasp scale. Maybe one interaction.
+> 5. THE REVEAL — Exit onto open vantage. Full lattice visible: infinite repeating geometry, every surface alive. THIS is when scale hits. Everything before was inside it.
+>
+> 30-second demo: compressed 1→5 or 3→5. Still needs the confined-to-open contrast to land the reveal — just faster.
+>
+> **Demo materials (Powder Game set):** Sand, water, lava, steam, fire, oil, gunpowder, ice, acid, clone, plant/vine, stone, dirt. Space reserved for non-powder mechanics later. Fan and metal are easy future adds.
+
 ---
 
 ## Extracted requirements (derived from the user's words above)
@@ -135,13 +206,42 @@ These are the operational specifications. If one of these ever disagrees with th
 - Player character movement and camera
 - Performance work, engine internals, octree ops
 - Material interactions that are obvious powder-game staples (sand falls, water flows, fire spreads)
+- Sandbox mode (free placement, observation, experimentation)
+- Player-as-physical-presence: velocity, collision displacement, world impact from movement
+- Metroidvania progression: walk → break (limited materials) → create materials → swim → fly (Superman-style). Progression-as-tutorial, no text prompts.
+- Entity/machine placement as the primary interaction model (not block-by-block construction)
+- Clone block and Powder Game material set (fan, firework, lava, ice, acid, oil, gunpowder, steam, gas, metal, vine)
+- Hotbar + inventory (no crafting). Items auto-equip, hotbar to switch.
+- Megastructures as first demo world (confined start → spectacle reveal)
+- Physics creatures, environmental entities (geysers, volcanos), critters as entity types to explore
+- Demo scenes: confined-space → big-reveal with visible CA activity at scale
+- 30-sec and 5-min demo experiences building to a wow moment
 
 **Requires human gate:**
-- Which specific features to build (crafting? inventory? RPG mechanics? building tools?)
-- What the game *is* beyond "walk around a living voxel world"
-- Specific material sets beyond the obvious powder-game baseline
-- Any user-visible interaction model beyond "walk + place materials + observe"
+- Roguelike layer specifics — deferred until sandbox + metroidvania are solid (Rain World 2 as reference when ready)
+- Voxel scale decision (player-sized vs much smaller) — awaiting perf data from m1f
+- Specific entity creature designs beyond the explored categories (physics creatures, environmental, critters)
 - Anything that makes it look/feel like a specific existing game (Minecraft clone, Terraria clone, etc.)
+- "Permanent equip with loadout swapping" as alternative to hotbar — explore later
+
+### Current game direction (crew reference — no gate needed to build toward this)
+
+**Identity:** Player-as-physical-presence in a living world. Sandbox + metroidvania + destructible environment first. Roguelike layered on later (Rain World 2 as reference). No crafting.
+
+**Interaction model:** Entities/machines, not block construction. Clone blocks (material sources). Mobile physics creatures. Environmental entities (geysers, volcanos). Player places things that DO things. Hotbar + inventory, no crafting. Movement progression: walk → break → create → swim → fly (Superman-style).
+
+**Progression:** Metroidvania-as-tutorial. Confined start, each unlock opens a new zone with the next unlock. No tutorial text — learn by doing. Hotbar fills as player progresses.
+
+**Demo target materials:** Sand (gravity/collapse), water (flow/fill), airborne particles (rain/gas), explosions/fireworks. Static materials (stone/dirt) as structural backdrop. Full Powder Game set: clone, fan, firework, lava, ice, acid, oil, gunpowder, steam, gas, metal, vine.
+
+**Demo world:** Lattice (repeating geometric megastructures). Confined start → corridor with hints → lattice interiors → panoramic reveal. Scale is withheld until the final vantage point. Follow-up worlds: Inverted Mountains, then World Tree or Organic Towers.
+
+**Wow moment ladder:**
+1. 30-sec: something visibly 3D and alive — rain, sand avalanche, explosion
+2. 5-min: confined start → big reveal with lots of CA activity
+3. Aspirational: floating islands, water cascading between them, particles in air, the whole world in motion
+
+**What to optimize for when making judgment calls:** Does it make the world feel more alive and responsive to the player? Does it showcase 3D CA physics doing something no other engine does? If yes, build it. If it's a Minecraft feature that doesn't leverage CA physics, skip it.
 
 ### Questions the user raised that are not yet resolved
 
@@ -183,6 +283,25 @@ The user explicitly granted autonomy: "the one level up is what we'll go for, fo
 - **Expand to 32 bits if we hit the wall.** Doubles memory but the DAG compression means we only pay for *distinct* configurations that actually appear, not the theoretical maximum.
 - **Rationale from user:** "Maybe we fold meta into the material, some sort of tagged pointer space?" — Yes, that's exactly this approach.
 
+#### Possible direction: structural material class (workshopping)
+
+Not committed — making space for this idea. The material ID space could reserve a range for **structural materials** that hashlife treats as fixed points (always return self). Two sub-classes:
+
+- **Structural-breakable:** player can mine, but CA rules and explosions treat them as inert walls. Terrain, dungeon walls, wood.
+- **Structural-unbreakable:** nothing breaks these. Bedrock, barriers, puzzle boundaries.
+
+Why this is interesting for hashlife: a subtree composed entirely of air + structural materials is **inert** — it memos on first touch and never recomputes. Since the megastructure demo world is mostly structural with active materials only on surfaces/edges, this could make the vast majority of the world free to step. Fixed-point detection (m1f.14) reduces to a range check on leaf IDs.
+
+Possible encoding (illustrative, not final):
+```
+0x0000              = AIR (inert)
+0x0001..0x7FFF      = active materials (CA rules apply)
+0x8000..0xBFFF      = structural-breakable (visual variety, hashlife inert)
+0xC000..0xFFFF      = structural-unbreakable (hashlife inert)
+```
+
+Open questions: whether the breakable/unbreakable distinction belongs in the cell ID or in a material property table. Whether "structural" should be a bit flag or a range. Whether indirection (cell points to extension table) is worth the hashlife-memo complexity.
+
 ### Simulation model
 
 **Hybrid Path D: reaction-phase (pure CA) + movement-phase (Margolus blocks).** Both phases operate directly on the octree via recursive Hashlife stepping; the flatten-to-grid path is a temporary testing scaffold only.
@@ -199,11 +318,13 @@ Gravity, fluid flow, particle displacement. The world is partitioned into non-ov
 - Margolus preserves mass, is deterministic, and is Hashlife-compatible because the partition offset is a function of generation parity.
 - Lineage: Norman Margolus (MIT, 1980s), used throughout CA research for physics-like simulations.
 
-**Why this is Hashlife-compatible:**
+**Why this is Hashlife-compatible (PARTIALLY INCORRECT — see below):**
 - Both phases are deterministic functions of local state.
 - No scan order dependency, no global state.
-- Memoization key is just the node contents + phase.
+- ~~Memoization key is just the node contents + phase.~~ **Wrong.** BlockRule uses `cell_hash(coord, generation)` for per-cell RNG, making step results position-dependent. Cache key must include world-space origin, which defeats spatial memoization. See `docs/hashlife-stepping-analysis.md` for the full analysis.
 - Margolus partition parity is implicit in the generation count, which maps cleanly onto tree levels in the Hashlife recursive step.
+
+**OPEN TENSION (2026-04-12):** Margolus as currently implemented kills hashlife's spatial compression — the core performance thesis of this project. Options: (1) drop Margolus, implement gravity via pure CaRule state machines; (2) make BlockRule RNG content-derived instead of coord-derived; (3) accept O(total nodes) cost and validate empirically; (4) hybrid approach. Decision tracked in hash-thing-m1f. Full analysis in `docs/hashlife-stepping-analysis.md`.
 
 **Material interactions: hand-authored.** Per-material-pair rules like "sand + air-below → swap," "fire + wood → fire," "water + lava → obsidian." The user explicitly endorsed hand-authored over emergent-only.
 
@@ -279,7 +400,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ Flat 3D-texture wgpu raycaster with orbit camera (mouse drag + scroll), fullscreen-quad fragment shader, DDA voxel traversal, directional lighting
 - ✅ Main loop: keyboard controls (space pause, S step, R reset, 1-4 rule switch, V render-mode toggle, Esc exit)
 - ✅ Builds and runs on macOS with Metal backend
-- ✅ Pushed to `git@github.com:heated/ashfall.git`
+- ✅ Pushed to `git@github.com:heated/hash-thing.git`
 - ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3)**
   - `Svdag` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker); handles leaf roots via degenerate single-node interior (nch)
   - **Incremental uploads (5bb.5)**: persistent `FxHashMap<[u32; 9], u32>` content cache across frames — `update()` reuses offsets for unchanged subtrees, only appends new slots. Buffer layout: `nodes[0]` = root-offset header, `nodes[1..]` = append-only slots. Renderer uploads only the tail past a watermark + root header each frame

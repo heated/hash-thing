@@ -2,6 +2,7 @@
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-fuse-ld=/usr/bin/ld"]
 
-# Shared target dir: set CARGO_TARGET_DIR=/Users/edward/projects/hash-thing/target
-# in your shell profile (not here — CI runners don't have this path).
-# Deps compile once; ~15GB of redundant per-worktree target/ dirs collapse to ~2GB.
+# sccache: each worktree keeps its own target/ (no lock contention)
+# but sccache caches compiled artifacts across all of them.
+[build]
+rustc-wrapper = "/usr/local/bin/sccache"
