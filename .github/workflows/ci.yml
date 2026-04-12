@@ -1,0 +1,106 @@
+# hash-thing-xb7.1 — cross-platform CI matrix.
+#
+# Build and test on Mac/Linux/Windows runners so OS-specific breakage (wgpu
+# backends, winit platform bindings, target-triple-only code paths) surfaces
+# before it lands on main. Unblocks xb7.2 (macOS notarization), xb7.3 (Linux
+# AppImage), xb7.4 (Windows .exe) — each needs a working `cargo build --release`
+# on its target platform as a precondition.
+#
+# What this runs per platform:
+#   1. cargo fmt --check    (fast, catches format drift)
+#   2. cargo clippy -D warn (catches lints)
+#   3. cargo build --release
+#   4. cargo test --release
+#
+# Tests don't initialize a GPU — they're all pure octree/store/terrain/sim
+# logic — so a headless Linux runner works fine. The renderer code still has
+# to *compile* against wgpu/winit, which is where platform-specific breakage
+# typically lives.
+#
+# Caching strategy: Swatinem/rust-cache handles `~/.cargo/registry`,
+# `~/.cargo/git`, and `target/` keyed on Cargo.lock + rustc version. Cache
+# is per-platform (separate keys), which is what we want — Linux wgpu objects
+# won't relink on Mac.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual reruns without needing a push (e.g. after a runner upgrade).
+  workflow_dispatch:
+
+# Cancel stale runs on the same ref so a rapid push sequence doesn't eat
+# runner minutes waiting for superseded commits.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deny warnings everywhere — clippy lines already do, but RUSTFLAGS catches
+  # plain `rustc` warnings during `cargo build` too.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing shouldn't cancel the others — we want the full
+      # matrix signal on every run, not a race to the first failure.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux runners ship without the wayland/xkbcommon headers that winit
+      # links against when building with the default features. Installing
+      # them keeps the workflow target-agnostic (no need to disable winit
+      # features just to pass CI).
+      - name: Install Linux winit deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Shared key segment lets all jobs on the same Cargo.lock reuse
+          # the same registry download; target/ stays per-OS automatically.
+          shared-key: hash-thing
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build (release)
+        run: cargo build --release
+
+      - name: cargo test (release)
+        run: cargo test --release

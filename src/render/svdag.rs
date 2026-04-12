@@ -770,7 +770,11 @@ mod tests {
         // Shader-equivalent traversal finds the first voxel.
         let target_a = [(10.5) / 64.0, (10.5) / 64.0, (10.5) / 64.0];
         let ro = [2.0, 2.0, 2.0];
-        let rd_a = normalize([target_a[0] - ro[0], target_a[1] - ro[1], target_a[2] - ro[2]]);
+        let rd_a = normalize([
+            target_a[0] - ro[0],
+            target_a[1] - ro[1],
+            target_a[2] - ro[2],
+        ]);
         let result_a = cpu_trace::raycast(&svdag.nodes, ro, rd_a, false);
         assert_eq!(
             result_a.hit_material,
