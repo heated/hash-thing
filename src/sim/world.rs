@@ -1,5 +1,5 @@
-use super::rule::CaRule;
-use crate::octree::{Cell, CellState, NodeId, NodeStore};
+use super::rule::{CaRule, ALIVE};
+use crate::octree::{CellState, NodeId, NodeStore};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -116,7 +116,7 @@ impl World {
                     if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
                         && rng.next_f64() < density
                     {
-                        self.set(x, y, z, Cell::pack(1, 0).raw());
+                        self.set(x, y, z, ALIVE);
                     }
                 }
             }
@@ -198,6 +198,7 @@ mod tests {
     //! whether or not wraparound is enabled.
 
     use super::*;
+    use crate::octree::Cell;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
 
     /// Helper: build an empty 8^3 world (level=3).

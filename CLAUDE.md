@@ -56,33 +56,14 @@ If `.beads/actor` is missing, the worktree hasn't been assigned — ask edward o
 
 ## The mayor
 
-`mayor` is **mostly passive.** Not a worker in the ordinary sense — not even for drafting, planning, or bead-restructure work. Mayor exists to observe and occasionally comment; that's it. Do not assign mayor most tasks, including ones that "look like mayor's lane" (design drafts, reframes, plan summaries). If a task needs owning, own it yourself or hand it to a working seat.
+`mayor` is a **singular, mostly-passive design-observer seat.** Comments on design gates, re-tiers misfiled work, surfaces decisions for edward. Does not claim drafting, planning, bead-restructure, `.ship-notes`, or `src/` work. Not in the auto-assign pool — only invoked explicitly.
 
-Mayor's actual job, narrowly:
+**What non-mayor workers need to know:**
+- Don't point tasks at mayor. If you think "mayor should own this," you are almost certainly wrong — own it yourself or hand it to a working seat.
+- If edward asks for a CLAUDE.md edit while you're mid-task, file it in the `claude-md-edit` queue and spawn a mayor background session to process it (see "Editing CLAUDE.md" below).
+- Never spawn a second mayor at the same time — singular seat.
 
-- Watch for design questions the worker crew is about to hit and flag them in a comment.
-- Write a one-line "what edward needs to decide" on beads parked at design gates, so edward can wake up to a decision list.
-- Re-tier work that smells design-heavy but was filed as technical.
-- Propose policy amendments on a branch, only when edward asks.
-
-Rules:
-
-- **Mayor is passive by default.** Don't claim work unless edward explicitly assigns it. "Work" includes drafting, planning, bead-restructure, and .ship-notes authorship — not just `src/` edits.
-- **If a crew member points a task at mayor, push back.** Mayor forwards it to edward or takes it on only with explicit direction.
-- **You may:** comment on beads, re-tier, file design-tier tasks when you spot a gap, update bead descriptions for clarity.
-- **You may not:** claim drafting work, own epics, close other workers' beads, ship code through `/ship`, or seat a second mayor. Singular seat.
-- Policy changes still ride `/ship` and wait for edward (design gate).
-
-### Registering as mayor
-
-```bash
-echo mayor > .beads/actor
-export BEADS_ACTOR=mayor
-```
-
-Then run `bd list --status blocked` — everything parked at a design gate is your queue. For each, read `.ship-notes/plan-*.md` and write a <30-second design summary in the bead comment.
-
-Mayor process detail (starter queue, `claude-md-edit` queue processing, wake triggers, pre-flight) lives in the mayor skill — tracked by `hash-thing-8wk`. This section is the minimum needed for a non-mayor worker reading `CLAUDE.md`.
+**All mayor process — starter queue, rules, pre-flight, drift-unparking, on-demand-only, anti-patterns — lives in `skills/mayor/SKILL.md`.** That skill is the authoritative source. This section is the minimum stub for non-mayor workers; if the two disagree, the skill wins.
 
 ## How the crew runs
 

@@ -278,6 +278,13 @@ pub mod cpu_trace {
         /// shader surfaces it as a magenta sentinel and the CPU replica
         /// exposes it here for test assertions.
         pub exhausted: bool,
+        /// Analytical surface normal at the hit point, or `None` on miss /
+        /// exhausted / empty-leaf. Computed from which axis of the leaf
+        /// AABB the ray entered through — the textbook voxel-raycaster
+        /// face normal. Mirrors the analytical path in `svdag_raycast.wgsl`
+        /// 1:1 (hash-thing-rv4) so tests can pin face normals for
+        /// axis-aligned rays and catch any shader/CPU drift.
+        pub hit_normal: Option<[f32; 3]>,
     }
 
     fn octant_of(pos: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
@@ -351,6 +358,7 @@ pub mod cpu_trace {
                 steps: 0,
                 events,
                 exhausted: false,
+                hit_normal: None,
             };
         }
 
@@ -390,6 +398,7 @@ pub mod cpu_trace {
                     steps: step,
                     events,
                     exhausted: false,
+                    hit_normal: None,
                 };
             }
             let pos = [
@@ -435,6 +444,7 @@ pub mod cpu_trace {
                         steps: step,
                         events,
                         exhausted: false,
+                        hit_normal: None,
                     };
                 }
                 top -= 1;
@@ -461,11 +471,51 @@ pub mod cpu_trace {
                         if record {
                             events.push(TraceEvent::Hit { depth, mat, t });
                         }
+                        // hash-thing-rv4: analytical face normal for the
+                        // leaf AABB. Same math as `svdag_raycast.wgsl` —
+                        // the axis with the max `tmin_v` is the last face
+                        // the ray crossed to enter the voxel; normal
+                        // points opposite `rd` on that axis. This is the
+                        // CPU oracle half of the shader fix; tests pin
+                        // expected face normals for axis-aligned rays to
+                        // catch any shader/CPU drift.
+                        let leaf_min = [
+                            node_min[0] + (oct & 1) as f32 * half,
+                            node_min[1] + ((oct >> 1) & 1) as f32 * half,
+                            node_min[2] + ((oct >> 2) & 1) as f32 * half,
+                        ];
+                        let leaf_max = [leaf_min[0] + half, leaf_min[1] + half, leaf_min[2] + half];
+                        let lt1 = [
+                            (leaf_min[0] - ro_local[0]) * inv_rd[0],
+                            (leaf_min[1] - ro_local[1]) * inv_rd[1],
+                            (leaf_min[2] - ro_local[2]) * inv_rd[2],
+                        ];
+                        let lt2 = [
+                            (leaf_max[0] - ro_local[0]) * inv_rd[0],
+                            (leaf_max[1] - ro_local[1]) * inv_rd[1],
+                            (leaf_max[2] - ro_local[2]) * inv_rd[2],
+                        ];
+                        let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
+                        // Assumes ray origin is outside the leaf. Inside-leaf
+                        // origins pick the nearest back face (all `tmin_v`
+                        // negative → argmax is the least-negative axis);
+                        // tracked as a follow-up to hash-thing-rv4. The
+                        // cascade uses `>=` on both comparators so ties
+                        // break identically to the shader in
+                        // `svdag_raycast.wgsl` — do NOT flip to `>`.
+                        let normal = if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
+                            [-rd[0].signum(), 0.0, 0.0]
+                        } else if tmin_v[1] >= tmin_v[2] {
+                            [0.0, -rd[1].signum(), 0.0]
+                        } else {
+                            [0.0, 0.0, -rd[2].signum()]
+                        };
                         return TraceResult {
                             hit_material: Some(mat),
                             steps: step,
                             events,
                             exhausted: false,
+                            hit_normal: Some(normal),
                         };
                     }
                     if record {
@@ -577,6 +627,7 @@ pub mod cpu_trace {
             steps: max_steps,
             events,
             exhausted: true,
+            hit_normal: None,
         }
     }
 }
@@ -1449,6 +1500,10 @@ mod tests {
         // below would be vacuously satisfied.
         let natural = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
         assert_eq!(natural.hit_material, None);
+        assert_eq!(
+            natural.hit_normal, None,
+            "clean miss must carry no normal (hash-thing-rv4 invariant)"
+        );
         assert!(
             !natural.exhausted,
             "natural diagonal miss must not exhaust at budget=32768"
@@ -1476,6 +1531,11 @@ mod tests {
             result.hit_material, None,
             "exhausted traversal must report no hit (CPU path must match \
              shader behavior where the magenta sentinel replaces any hit)",
+        );
+        assert_eq!(
+            result.hit_normal, None,
+            "exhausted traversal must carry no normal — guards the \
+             post-loop fall-through (hash-thing-rv4 invariant)",
         );
         assert_eq!(
             result.steps, budget,
@@ -1508,5 +1568,141 @@ mod tests {
         assert_eq!(via_root_level.hit_material, via_budget.hit_material);
         assert_eq!(via_root_level.steps, via_budget.steps);
         assert_eq!(via_root_level.exhausted, via_budget.exhausted);
+    }
+
+    /// hash-thing-rv4: the SVDAG shader must produce real per-face surface
+    /// normals at leaf hits, not a ray-direction shade, or the output
+    /// collapses to a flat-sticker look. The CPU replica computes the same
+    /// analytical normal as the shader, so asserting the normals here pins
+    /// both paths at once — if either drifts, this test breaks first.
+    ///
+    /// Six axis-aligned rays fire at a single voxel at the root center; each
+    /// ray enters through a distinct cube face, and the reported normal must
+    /// match that face. The voxel lives at (32,32,32) in a level-6 grid, so
+    /// its world-space AABB is [0.5, 0.515625]^3. Ray origins sit well
+    /// outside the root cube and aim at the voxel's center.
+    #[test]
+    fn leaf_hit_normals_match_entry_face() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        let mat1 = mat(1);
+        root = store.set_cell(root, 32, 32, 32, mat1);
+        let dag = Svdag::build(&store, root, 6);
+
+        // Voxel world-space center (32.5 / 64, 32.5 / 64, 32.5 / 64).
+        let cx = 32.5 / 64.0;
+        let cy = 32.5 / 64.0;
+        let cz = 32.5 / 64.0;
+
+        // (name, origin, expected_normal). Each origin is on the axis
+        // through the voxel center, far outside the root cube on one
+        // specific side. The expected normal points back toward the origin
+        // (opposite ray direction on the entry axis).
+        let cases: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("-x face", [-3.0, cy, cz], [-1.0, 0.0, 0.0]),
+            ("+x face", [3.0, cy, cz], [1.0, 0.0, 0.0]),
+            ("-y face", [cx, -3.0, cz], [0.0, -1.0, 0.0]),
+            ("+y face", [cx, 3.0, cz], [0.0, 1.0, 0.0]),
+            ("-z face", [cx, cy, -3.0], [0.0, 0.0, -1.0]),
+            ("+z face", [cx, cy, 3.0], [0.0, 0.0, 1.0]),
+        ];
+
+        for (name, ro, expected_normal) in cases {
+            let rd = normalize([cx - ro[0], cy - ro[1], cz - ro[2]]);
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd, false);
+            // hit_material is the raw packed cell word, not the decoded
+            // material id (post-1v0.1 16-bit tagged encoding).
+            assert_eq!(
+                result.hit_material,
+                Some(mat1 as u32),
+                "{name}: expected hit, got miss (exhausted={})",
+                result.exhausted,
+            );
+            let normal = result.hit_normal.expect("hit must carry a normal");
+            assert_eq!(
+                normal, *expected_normal,
+                "{name}: ray at {ro:?} → rd {rd:?} must yield normal {expected_normal:?}, got {normal:?}",
+            );
+        }
+    }
+
+    /// hash-thing-rv4 tie-breaker: when two axes have equal `tmin` at the
+    /// leaf entry (geometric corner hit), the normal-picking cascade must
+    /// still produce a unit face normal, never a zero vector. The shader
+    /// uses `>=` to break ties toward x then y — the CPU mirror matches.
+    /// This test shoots a ray that enters the voxel exactly on an xy edge
+    /// and asserts the normal is a valid unit face vector (one of the two
+    /// candidates), not a degenerate zero.
+    #[test]
+    fn leaf_hit_normal_corner_tiebreak_is_unit_face() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        let mat1 = mat(1);
+        root = store.set_cell(root, 32, 32, 32, mat1);
+        let dag = Svdag::build(&store, root, 6);
+
+        // Ray along (1, 1, 0) direction, aimed at the voxel's center. The
+        // entry tmin on x and y will be (nearly) identical; the tie-breaker
+        // picks x (because `tmin.x >= tmin.y`).
+        let cx = 32.5 / 64.0;
+        let cy = 32.5 / 64.0;
+        let cz = 32.5 / 64.0;
+        let ro = [cx - 1.0, cy - 1.0, cz];
+        let rd = normalize([1.0, 1.0, 0.0]);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+        assert_eq!(
+            result.hit_material,
+            Some(mat1 as u32),
+            "corner hit must land"
+        );
+
+        let normal = result.hit_normal.expect("hit must carry a normal");
+        // The cascade's first comparator is `tmin_v[0] >= tmin_v[1]`, so on
+        // an exact xy tie x wins and the ray (coming from -x,-y) gives the
+        // -x face normal. Pinning the specific axis here is the whole point
+        // of the CPU oracle: if someone flips the cascade to `>` instead of
+        // `>=`, CPU would pick y while the shader (also `>=`) still picks x,
+        // and this assertion will catch the drift before it hits the GPU.
+        assert_eq!(
+            normal,
+            [-1.0, 0.0, 0.0],
+            "xy-edge tie-break must pick x (x-first cascade with `>=`), got {normal:?}",
+        );
+    }
+
+    /// hash-thing-rv4: `hit_normal` must be `None` on every non-hit return
+    /// path. The CPU trace has four miss/exhausted sites; this test
+    /// exercises the two most reachable ones (clean miss, pre-root miss).
+    /// Empty-leaf and exhausted paths are covered by existing tests via
+    /// their `hit_material: None` assertion — the invariant "miss ⇒ no
+    /// normal" holds by construction of the struct literals, but pinning
+    /// it here is cheap insurance against future edits.
+    #[test]
+    fn miss_returns_no_normal() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 32, 32, 32, mat(1));
+        let dag = Svdag::build(&store, root, 6);
+
+        // 1. Pre-root miss: ray pointing away from the root cube.
+        let ro = [2.0, 2.0, 2.0];
+        let rd = normalize([1.0, 1.0, 1.0]);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+        assert_eq!(result.hit_material, None, "ray away from root must miss");
+        assert_eq!(
+            result.hit_normal, None,
+            "pre-root miss must carry no normal"
+        );
+
+        // 2. Clean in-root miss: enter the cube, traverse empty space, exit.
+        let ro = [2.0, 0.1, 0.1];
+        let rd = normalize([-1.0, 0.0, 0.0]);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false);
+        assert_eq!(
+            result.hit_material, None,
+            "ray through empty corner of root must miss (voxel is at center)",
+        );
+        assert_eq!(result.hit_normal, None, "in-root miss must carry no normal");
+        assert!(!result.exhausted, "clean miss must not trip budget");
     }
 }
