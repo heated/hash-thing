@@ -45,6 +45,7 @@ impl World {
             self.level
         );
         self.hashlife_stats = super::world::HashlifeStats::default();
+        let old_root = self.root;
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         let parity = (self.generation % 2) as u32;
@@ -52,17 +53,18 @@ impl World {
         self.root = result;
         self.generation += 1;
 
-        // Compact, preserving both the result root AND the padded root.
-        // The padded root's subtree contains the input nodes that the
-        // hashlife cache keys reference. Without preserving it, compaction
-        // GCs those nodes and remap drops all cache entries — making every
-        // frame a cold start (m1f.15.1).
-        let (new_store, new_root, remap) = self
-            .store
-            .compacted_with_remap_roots(&[self.root, padded_root]);
-        self.store = new_store;
-        self.root = new_root;
-        self.remap_caches(&remap);
+        // Skip compaction when the world is unchanged (m1f.15.5). For inert
+        // frames, the store is already stable and cache entries remain valid.
+        // When the world changes, compact but preserve the padded root so
+        // cache entries keyed by input NodeIds survive (m1f.15.2).
+        if result != old_root {
+            let (new_store, new_root, remap) = self
+                .store
+                .compacted_with_remap_roots(&[self.root, padded_root]);
+            self.store = new_store;
+            self.root = new_root;
+            self.remap_caches(&remap);
+        }
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -86,18 +88,21 @@ impl World {
             self.block_rule_present = None; // brute-force may have consumed block-rule cells
             return;
         }
+        let old_root = self.root;
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         let result = self.step_node_macro(padded_root, padded_level, self.generation);
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
 
-        let (new_store, new_root, remap) = self
-            .store
-            .compacted_with_remap_roots(&[self.root, padded_root]);
-        self.store = new_store;
-        self.root = new_root;
-        self.remap_caches(&remap);
+        if result != old_root {
+            let (new_store, new_root, remap) = self
+                .store
+                .compacted_with_remap_roots(&[self.root, padded_root]);
+            self.store = new_store;
+            self.root = new_root;
+            self.remap_caches(&remap);
+        }
     }
 
     fn has_block_rule_cells(&mut self) -> bool {
@@ -1166,6 +1171,12 @@ mod tests {
 
     /// Inert world cache behavior (m1f.15.1): a stone-only world is immediately
     /// at fixed point. The world state never changes.
+    ///
+    /// With deferred compaction (m1f.15.5), inert frames skip compaction,
+    /// preserving cache entries across frames. Combined with hash-cons dedup
+    /// (pad_root produces stable NodeIds), subsequent frames get cache hits
+    /// for every non-uniform surface node. Fixed-point detection catches
+    /// uniform subtrees even earlier (before cache lookup).
     #[test]
     fn inert_world_state_unchanged() {
         let mut world = World::new(4); // 16³
@@ -1306,5 +1317,56 @@ mod tests {
         );
 
         eprintln!("  frame 4 hit rate: {:.1}%", hit_rate_f4 * 100.0);
+    }
+
+    /// Deferred compaction enables cross-frame cache hits (m1f.15.5).
+    /// When the world is inert, compaction is skipped, preserving cache
+    /// entries. The second same-parity frame should get cache hits instead
+    /// of all misses.
+    #[test]
+    fn deferred_compaction_enables_cross_frame_cache_hits() {
+        let mut world = World::new(4); // 16³
+        let mut rng = SimpleRng::new(0xd1ce_u64);
+        for z in 0..16u64 {
+            for y in 0..16u64 {
+                for x in 0..16u64 {
+                    if rng.next_u64().is_multiple_of(3) {
+                        world.set(wc(x), wc(y), wc(z), STONE);
+                    }
+                }
+            }
+        }
+
+        // Gen 0 (parity 0): cold start, all misses
+        world.step_recursive();
+        let gen0 = world.hashlife_stats;
+        assert!(gen0.cache_misses > 0, "gen 0 should have cache misses");
+
+        // Gen 1 (parity 1): different parity, cache entries don't match
+        world.step_recursive();
+
+        // Gen 2 (parity 0): same parity as gen 0. With deferred compaction,
+        // the cache entries from gen 0 are still alive (no compaction ran
+        // on an inert world). We should see cache hits.
+        world.step_recursive();
+        let gen2 = world.hashlife_stats;
+
+        // The key assertion: gen 2 should have MORE cache hits than gen 0
+        // (gen 0 had 0 hits because the cache was empty).
+        assert!(
+            gen2.cache_hits > gen0.cache_hits,
+            "gen 2 should have cross-frame cache hits (got {} vs gen0's {}). \
+             Deferred compaction should preserve cache entries for inert frames.",
+            gen2.cache_hits,
+            gen0.cache_hits,
+        );
+
+        // And fewer misses than gen 0 (some entries are served from cache)
+        assert!(
+            gen2.cache_misses < gen0.cache_misses,
+            "gen 2 should have fewer misses ({}) than gen 0 ({})",
+            gen2.cache_misses,
+            gen0.cache_misses,
+        );
     }
 }
