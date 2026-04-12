@@ -752,14 +752,10 @@ impl Renderer {
     /// When this fires, either wire a dedicated `root_level` uniform field
     /// or call a `set_root_level` helper before `upload_svdag`.
     pub fn upload_svdag(&mut self, dag: &super::Svdag) {
-        debug_assert_eq!(
-            self.volume_size,
-            1u32 << dag.root_level,
-            "upload_svdag: renderer.volume_size ({}) must equal 1 << dag.root_level ({}); \
-             shader/CPU step budget would desync otherwise (hash-thing-2w5)",
-            self.volume_size,
-            1u32 << dag.root_level,
-        );
+        // Track the DAG's root level so the shader step budget stays in sync
+        // (hash-thing-2w5). When the world grows (hash-thing-m1f.4), the
+        // root_level increases and volume_size must follow.
+        self.volume_size = 1u32 << dag.root_level;
         let bytes: &[u8] = bytemuck::cast_slice(&dag.nodes);
         let needed = bytes.len() as u64;
 
