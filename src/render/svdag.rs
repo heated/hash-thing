@@ -90,7 +90,6 @@ impl Svdag {
     /// Convenience wrapper for tests and single-snapshot paths. Production code
     /// should construct once with `new()` and call `update()` each frame so the
     /// content cache persists across calls.
-    #[cfg(test)]
     pub fn build(store: &NodeStore, root: NodeId, root_level: u32) -> Self {
         let mut svdag = Self::new();
         svdag.update(store, root, root_level);

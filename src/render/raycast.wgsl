@@ -53,8 +53,13 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
 // in src/octree/node.rs. If that constant ever changes, update this
 // shader AND src/render/svdag_raycast.wgsl together. There is a pinning
 // test in src/render/mod.rs (test `wgsl_metadata_shift_matches_rust`).
+// Decode material id from packed cell word (drop metadata bits).
+fn decode_material(packed: u32) -> u32 {
+    return packed >> 6u;
+}
+
 fn material_color(packed: u32) -> vec3<f32> {
-    let mat_id = packed >> 6u;
+    let mat_id = decode_material(packed);
     switch mat_id {
         case 1u: { return vec3<f32>(0.4, 0.8, 0.3); }  // green (life)
         case 2u: { return vec3<f32>(0.8, 0.3, 0.2); }  // red
@@ -111,14 +116,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // Basic lighting: normal from gradient
                 let base_color = material_color(val);
 
-                // Approximate normal via central differences
+                // Approximate normal via central differences on decoded material
+                // (hash-thing-3gy: raw packed word includes metadata bits that
+                // would create bogus normals at metadata-only transitions).
                 let eps = vec3<i32>(1, 0, 0);
-                let nx = f32(textureLoad(volume, voxel_coord + eps, 0).r) -
-                         f32(textureLoad(volume, voxel_coord - eps, 0).r);
-                let ny = f32(textureLoad(volume, voxel_coord + vec3<i32>(0, 1, 0), 0).r) -
-                         f32(textureLoad(volume, voxel_coord - vec3<i32>(0, 1, 0), 0).r);
-                let nz = f32(textureLoad(volume, voxel_coord + vec3<i32>(0, 0, 1), 0).r) -
-                         f32(textureLoad(volume, voxel_coord - vec3<i32>(0, 0, 1), 0).r);
+                let nx = f32(decode_material(textureLoad(volume, voxel_coord + eps, 0).r)) -
+                         f32(decode_material(textureLoad(volume, voxel_coord - eps, 0).r));
+                let ny = f32(decode_material(textureLoad(volume, voxel_coord + vec3<i32>(0, 1, 0), 0).r)) -
+                         f32(decode_material(textureLoad(volume, voxel_coord - vec3<i32>(0, 1, 0), 0).r));
+                let nz = f32(decode_material(textureLoad(volume, voxel_coord + vec3<i32>(0, 0, 1), 0).r)) -
+                         f32(decode_material(textureLoad(volume, voxel_coord - vec3<i32>(0, 0, 1), 0).r));
                 var normal = normalize(vec3<f32>(-nx, -ny, -nz));
                 if length(vec3<f32>(nx, ny, nz)) < 0.01 {
                     // Flat surface — use ray direction for shading
