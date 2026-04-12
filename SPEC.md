@@ -408,7 +408,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
   - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) with comprehensive test suite (~1700 lines)
-  - **Bug fixes**: octant_of corner-exit tiebreak (6hd), inside-leaf exit-face normal (2nd), far-camera Laine-Karras entry clamp (27m), root_side-scaled step budget with magenta exhaustion sentinel (2w5), analytical entry-face normals (rv4)
+  - **Bug fixes**: octant_of corner-exit tiebreak (6hd), inside-leaf exit-face normal (2nd), far-camera Laine-Karras entry clamp (27m), root_side-scaled step budget with magenta exhaustion sentinel (2w5), analytical entry-face normals (rv4), sub-pixel LOD cutoff (x5w — stops descent when voxel < 1 pixel, shades with first non-empty child color)
   - **CPU/GPU drift guards** (`src/render/mod.rs::wgsl_drift_guard`): 6 textual pins covering METADATA_BITS shift, octant_of tiebreak (6hd), entry-face normal cascade (rv4), inside-leaf fallback (2nd), traversal constants MAX_DEPTH/MIN_STEP_BUDGET/STEP_BUDGET_FUDGE (2w5), material palette vs registry (xev)
   - **Property tests**: midpoint-exact corner fuzz (6cc, 500 cases), forward-progress invariants, 27-ray sweep at MAX_DEPTH, far-camera stall regression, budget saturation
   - GPU timestamp queries for render timing (6x3), graceful TIMESTAMP_QUERY fallback
@@ -459,6 +459,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + cave CA + lazy terrain expansion + perf tracking. Sand biomes (`y2s`): low-freq noise selects sandy regions where grass/dirt → sand (gravity block rule). Sea-level water (`4t6`): `HeightmapField.sea_level` fills air below sea level with water; `classify_box` proof updated. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`.
 - ✅ **Build infra (`4yb`, `3sw`)**: shared `CARGO_TARGET_DIR` across worktrees (saves ~15GB), `[profile.bench]` for fast representative builds, benchmarks use `--profile bench` instead of `--release`. `3sw`: sccache + per-worktree target dirs to eliminate cargo lock contention.
 - ✅ **Bug fixes**: `0xq` BlockRule boundary asymmetry (absorbing BCs instead of clipping), `08c` has_block_rule_cells O(n³)→O(nodes) walk, `bhi` NodeStore/SVDAG overflow diagnostics.
+- ✅ **Demo playability (`x5w`)**: sim step moved to background thread (render loop unblocked), SVDAG raycast LOD cutoff (sub-pixel voxels short-circuit to nearest color, cutting GPU step count for complex/distant geometry).
 
 ### In progress (P0-P1, from bd)
 
