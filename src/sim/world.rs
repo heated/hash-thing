@@ -1,7 +1,7 @@
 use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
-use crate::terrain::materials::{BlockRuleId, MaterialRegistry, FIRE, WATER};
+use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
@@ -282,6 +282,64 @@ impl World {
                     {
                         self.set(x, y, z, ALIVE.raw());
                     }
+                }
+            }
+        }
+    }
+
+    /// Seed a demo scene: stone room with grass walls (fuel), fire, and water.
+    ///
+    /// Demonstrates reaction phase (fire spreads to grass, water quenches fire)
+    /// plus movement phase (water falls and spreads via FluidBlockRule).
+    pub fn seed_burning_room(&mut self) {
+        let side = self.side() as u64;
+        let margin = side / 8;
+        let lo = margin;
+        let hi = side - margin;
+
+        for z in lo..hi {
+            for y in lo..hi {
+                for x in lo..hi {
+                    let on_wall = x == lo || x == hi - 1 || z == lo || z == hi - 1;
+                    let on_floor = y == lo;
+                    let on_ceiling = y == hi - 1;
+
+                    if on_floor {
+                        self.set(x, y, z, DIRT);
+                    } else if on_ceiling {
+                        self.set(x, y, z, STONE);
+                    } else if on_wall {
+                        self.set(x, y, z, GRASS);
+                    }
+                }
+            }
+        }
+
+        // Fire source: small cluster in one corner
+        let fire_x = lo + 2;
+        let fire_z = lo + 2;
+        for dy in 1..4u64 {
+            for dx in 0..2u64 {
+                for dz in 0..2u64 {
+                    let y = lo + dy;
+                    let x = fire_x + dx;
+                    let z = fire_z + dz;
+                    if x < hi && y < hi && z < hi {
+                        self.set(x, y, z, FIRE);
+                    }
+                }
+            }
+        }
+
+        // Water pool: opposite corner, a few layers deep
+        let water_hi_x = hi - 2;
+        let water_hi_z = hi - 2;
+        let water_lo_x = water_hi_x.saturating_sub(6);
+        let water_lo_z = water_hi_z.saturating_sub(6);
+        for y in (lo + 1)..(lo + 4).min(hi) {
+            for z in water_lo_z..water_hi_z {
+                for x in water_lo_x..water_hi_x {
+                    self.set(x, y, z, WATER);
                 }
             }
         }
@@ -606,6 +664,25 @@ mod tests {
         let mut w = World::new(6);
         w.seed_center(12, 0.35);
         assert!(w.population() > 0);
+    }
+
+    #[test]
+    fn seed_burning_room_produces_all_material_types() {
+        let mut w = World::new(6); // side 64
+        w.seed_burning_room();
+        assert!(w.population() > 0);
+        let grid = w.flatten();
+        let has = |mat: CellState| grid.iter().any(|&c| c == mat);
+        assert!(has(STONE), "room must have stone ceiling");
+        assert!(has(DIRT), "room must have dirt floor");
+        assert!(has(GRASS), "room must have grass walls");
+        assert!(has(FIRE), "room must have fire");
+        assert!(has(WATER), "room must have water");
+        // Verify population is reasonable (room structure + contents)
+        assert!(
+            w.population() > 100,
+            "burning room should have substantial content"
+        );
     }
 
     // -----------------------------------------------------------------
