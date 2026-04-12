@@ -261,12 +261,12 @@ impl Svdag {
 pub mod cpu_trace {
     use super::*;
 
-    pub const MAX_DEPTH: usize = 14;
+    pub const MAX_DEPTH: usize = 20;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
     /// Leaf-resolution grid size for integer DDA (hash-thing-pck).
-    /// Each axis has `2^MAX_DEPTH = 16384` cells at the finest level.
+    /// Each axis has `2^MAX_DEPTH = 1048576` cells at the finest level.
     const RESOLUTION: u32 = 1 << MAX_DEPTH as u32;
     const INV_RES: f32 = 1.0 / RESOLUTION as f32;
 
@@ -733,7 +733,7 @@ pub mod cpu_trace {
             }
             int_pos[exit_axis] = boundary_cell;
             // Derive t from the exact exit-axis boundary. boundary_cell
-            // is integer * 2^-14, so the boundary float is exact. The
+            // is integer * INV_RES (= 2^-MAX_DEPTH), so the boundary float is exact. The
             // slab time `(boundary - ro_local) * inv_rd` is the canonical
             // exit time — same as t2[exit_axis] but computed from the
             // integer boundary instead of float child_max. Guaranteed
@@ -771,6 +771,7 @@ pub mod cpu_trace {
 mod tests {
     use super::*;
     use crate::octree::{Cell, CellState, NodeStore};
+    use cpu_trace::MAX_DEPTH;
 
     fn normalize(v: [f32; 3]) -> [f32; 3] {
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -1173,19 +1174,19 @@ mod tests {
         }
     }
 
-    /// Regression: ro clamping must also handle the actual deepest
-    /// supported depth (MAX_DEPTH=14) where the smallest nudge
-    /// (`half/64 = 9.5e-7`) is closest to `f32` ULP and where the
-    /// un-clamped pre-fix v1 still stalled on far-camera rays with
-    /// any reasonable |ro|.
+    /// Regression: ro clamping must handle the deepest supported depth
+    /// (MAX_DEPTH) where integer DDA cell sizes are smallest. Far-camera
+    /// rays with high `|ro|` stressed the pre-clamp v1 traversal; the
+    /// clamped local-frame + integer DDA should handle any depth ≤ 24.
     #[test]
     fn far_camera_forward_progress_max_depth() {
         let mut store = NodeStore::new();
-        let mut root = store.empty(14);
+        let mut root = store.empty(MAX_DEPTH as u32);
         // Single voxel near the center at full MAX_DEPTH resolution.
-        // At depth 14, the cell size is 1/16384 ≈ 6.1e-5.
-        root = store.set_cell(root, 8192, 8192, 8192, mat(1));
-        let dag = Svdag::build(&store, root, 14);
+        // At depth 20, the cell size is 1/1048576 ≈ 9.5e-7.
+        let mid = 1u64 << (MAX_DEPTH as u64 - 1);
+        root = store.set_cell(root, mid, mid, mid, mat(1));
+        let dag = Svdag::build(&store, root, MAX_DEPTH as u32);
 
         // Far camera (|ro| ~ 10) with dominant + grazing axes so the ray
         // descends through deep octants.
@@ -1200,43 +1201,41 @@ mod tests {
             let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd_n, false);
             assert!(
                 result.steps < 400,
-                "case {i} (ro={ro:?}, rd={rd:?}): far-camera MAX_DEPTH \
-                 forward-progress regression — used {steps} steps out of \
-                 MAX_STEPS=512.",
+                "case {i} (ro={ro:?}, rd={rd:?}): far-camera MAX_DEPTH={MAX_DEPTH} \
+                 forward-progress regression — used {steps} steps.",
                 steps = result.steps,
             );
         }
     }
 
-    /// Static math invariant behind the 27m v2 `ro` clamp: in the
-    /// clamped frame, the maximum `|pos|` during traversal is bounded
-    /// by `√3 + √3 ≈ 3.46` (clamped `ro_local` is on a cube face, so
-    /// `|ro_local| ≤ √3`; the in-cube traversal adds at most `√3` more
-    /// along `rd`). For every `t` actually seen inside the loop,
-    /// `ULP(t) ≤ ULP(3.46) ≈ 4.77e-7`, which must stay strictly below
-    /// the depth-14 step-past nudge `half/64 = 9.54e-7`. If any future
-    /// change breaks this inequality — shrinking the nudge, increasing
-    /// MAX_DEPTH, or removing the clamp — this test fires.
+    /// Integer DDA invariant (hash-thing-pck): cell positions up to
+    /// RESOLUTION must be exactly representable in f32 so that
+    /// `boundary_cell as f32 * INV_RES` is exact. f32 has a 24-bit
+    /// mantissa, so RESOLUTION = 2^MAX_DEPTH must be ≤ 2^24. If
+    /// MAX_DEPTH ever exceeds 24, the integer-to-float conversion
+    /// loses precision and the DDA boundary computation is no longer
+    /// exact — this test fires.
     #[test]
-    fn ro_clamp_preserves_ulp_margin() {
-        // Worst-case |pos| after ro clamping: root face + cube diagonal.
-        let max_pos: f32 = 2.0 * (3f32.sqrt());
-        let ulp_max = f32::from_bits(max_pos.to_bits() + 1) - max_pos;
-
-        // Smallest nudge the step-past will ever produce (deepest cell).
-        // At MAX_DEPTH=14, stack_half = 0.5^15 ≈ 3.05e-5.
-        const MAX_DEPTH: i32 = 14;
-        const EPS: f32 = 1e-5;
-        let deepest_half = 0.5_f32.powi(MAX_DEPTH + 1);
-        let min_nudge = (deepest_half * (1.0 / 64.0)).min(EPS);
-
+    fn integer_dda_exact_representation() {
         assert!(
-            min_nudge > ulp_max,
-            "27m invariant: min nudge {min_nudge:e} must exceed max \
-             post-clamp ULP {ulp_max:e} to guarantee forward progress. \
-             Breaking this invariant re-opens the zero-progress regime \
-             (Codex Critical blocker, 27m review)."
+            MAX_DEPTH <= 24,
+            "integer DDA invariant: MAX_DEPTH={MAX_DEPTH} exceeds 24, \
+             so RESOLUTION=2^{MAX_DEPTH} doesn't fit in f32's 24-bit \
+             mantissa. Cell positions would lose precision, breaking \
+             the exact boundary computation that guarantees forward \
+             progress (hash-thing-pck)."
         );
+        // Verify the boundary float round-trips exactly for the worst case.
+        let res: u32 = 1 << MAX_DEPTH as u32;
+        let inv_res: f32 = 1.0 / res as f32;
+        for boundary_cell in [0u32, 1, res / 2, res - 1, res] {
+            let boundary = boundary_cell as f32 * inv_res;
+            let recovered = (boundary * res as f32) as u32;
+            assert_eq!(
+                recovered, boundary_cell,
+                "boundary_cell={boundary_cell} doesn't round-trip through f32"
+            );
+        }
     }
 
     /// Throughput regression for Claude Critical's deep-level concern:
@@ -1250,14 +1249,15 @@ mod tests {
     /// than `dt` for dominant-axis rays. Sparse scenes coalesce empty
     /// space into shallow cells, so most step-pasts happen at coarse
     /// levels anyway. This test asserts the actual observed behavior:
-    /// hitting or missing a single-voxel scene at root_level=14 from
+    /// hitting or missing a single-voxel scene at root_level=MAX_DEPTH from
     /// multiple ray directions completes in well under MAX_STEPS/4.
     #[test]
     fn dominant_axis_throughput_max_depth() {
         let mut store = NodeStore::new();
-        let mut root = store.empty(14);
-        root = store.set_cell(root, 8192, 8192, 8192, mat(1));
-        let dag = Svdag::build(&store, root, 14);
+        let mut root = store.empty(MAX_DEPTH as u32);
+        let mid = 1u64 << (MAX_DEPTH as u64 - 1);
+        root = store.set_cell(root, mid, mid, mid, mat(1));
+        let dag = Svdag::build(&store, root, MAX_DEPTH as u32);
 
         // Dominant-axis rays hitting and missing the single deep voxel
         // from different entry angles. `|ro|` kept small here because
@@ -1284,7 +1284,7 @@ mod tests {
             assert!(
                 result.steps < 128,
                 "case {i} (ro={ro:?}, rd={rd:?}): dominant-axis throughput \
-                 regression at root_level=14 — used {steps} steps, expected \
+                 regression at root_level={MAX_DEPTH} — used {steps} steps, expected \
                  < 128. If this fires, Claude Critical's `min` vs `max` \
                  concern may be warranted after all.",
                 steps = result.steps,
@@ -1712,7 +1712,7 @@ mod tests {
                                                      // Deep: fudge × side > floor → fudge × side wins.
         assert_eq!(cpu_trace::step_budget(8), 2048); // 8 * 256
         assert_eq!(cpu_trace::step_budget(12), 32768); // 8 * 4096 (SPEC target)
-        assert_eq!(cpu_trace::step_budget(14), 131072); // 8 * 16384 (MAX_DEPTH)
+        assert_eq!(cpu_trace::step_budget(14), 131072); // 8 * 16384
                                                         // Saturation: an absurd root_level must not panic. The .min(28)
                                                         // clamp keeps the shift in-range AND keeps `root_side * 8` within
                                                         // u32 so the shader mirror can use the same arithmetic. At
