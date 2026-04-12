@@ -129,12 +129,16 @@ if [[ "$DRY_RUN" != true ]]; then
         cat > "$LAUNCH_SCRIPT" <<LAUNCHER
 #!/usr/bin/env bash
 export BEADS_ACTOR=$SEAT
+export GIT_EDITOR=true
+export EDITOR=true
 exec codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "\$(cat .codex-crew-prompt.md)"
 LAUNCHER
     else
         cat > "$LAUNCH_SCRIPT" <<LAUNCHER
 #!/usr/bin/env bash
 export BEADS_ACTOR=$SEAT
+export GIT_EDITOR=true
+export EDITOR=true
 exec codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen "\$(cat .codex-crew-prompt.md)"
 LAUNCHER
     fi

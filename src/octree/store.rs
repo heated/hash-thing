@@ -388,6 +388,105 @@ impl NodeStore {
         self.step_cache.clear();
     }
 
+    // ---- Extraction primitives (hash-thing-6gf.6) ----
+
+    /// Extract the 26 Moore neighbors of a cell, wrapping toroidally.
+    ///
+    /// Returns `[Cell; 26]` in the same order as `sim::world::get_neighbors`:
+    /// all (dx, dy, dz) offsets in {-1, 0, +1}³ excluding (0,0,0), iterated
+    /// z-outer / y-middle / x-inner, skipping the center.
+    ///
+    /// Coordinates wrap via `rem_euclid(side)` so this is a torus — matching
+    /// the CaRule boundary semantics established in the brute-force stepper.
+    ///
+    /// **Performance note:** calls `get_cell` 26 times, each walking the tree
+    /// from root. For bulk extraction over an entire grid this is worse than
+    /// `flatten()` + grid indexing. The intended use is the recursive Hashlife
+    /// stepper's base case, where the neighborhood is extracted from a small
+    /// (level-2 or level-3) subtree with context, not the full world root.
+    pub fn extract_neighborhood(
+        &self,
+        root: NodeId,
+        side: i64,
+        x: i64,
+        y: i64,
+        z: i64,
+    ) -> [Cell; 26] {
+        let mut neighbors = [Cell::EMPTY; 26];
+        let mut idx = 0;
+        for dz in [-1i64, 0, 1] {
+            for dy in [-1i64, 0, 1] {
+                for dx in [-1i64, 0, 1] {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nx = (x + dx).rem_euclid(side) as u64;
+                    let ny = (y + dy).rem_euclid(side) as u64;
+                    let nz = (z + dz).rem_euclid(side) as u64;
+                    neighbors[idx] = Cell::from_raw(self.get_cell(root, nx, ny, nz));
+                    idx += 1;
+                }
+            }
+        }
+        neighbors
+    }
+
+    /// Extract an axis-aligned 2×2×2 block starting at `(bx, by, bz)`.
+    ///
+    /// Returns `[Cell; 8]` indexed by `block_index(dx, dy, dz)` — the same
+    /// convention as `sim::rule::block_index`. Coordinates are absolute
+    /// world-space; no wrapping (cells outside the tree return empty via
+    /// `get_cell`'s OOB contract).
+    ///
+    /// Useful for Margolus-partition extraction in the recursive stepper.
+    pub fn extract_block_2x2x2(&self, root: NodeId, bx: u64, by: u64, bz: u64) -> [Cell; 8] {
+        let mut block = [Cell::EMPTY; 8];
+        for dz in 0..2u64 {
+            for dy in 0..2u64 {
+                for dx in 0..2u64 {
+                    let idx = super::node::octant_index(dx as u32, dy as u32, dz as u32);
+                    block[idx] = Cell::from_raw(self.get_cell(root, bx + dx, by + dy, bz + dz));
+                }
+            }
+        }
+        block
+    }
+
+    /// Flatten an arbitrary axis-aligned sub-box of the octree into a flat
+    /// 3D array.
+    ///
+    /// Returns a `Vec<CellState>` of size `w * h * d`, indexed as
+    /// `[lx + ly * w + lz * w * h]` where `(lx, ly, lz)` are local
+    /// coordinates within the box.
+    ///
+    /// Coordinates outside the tree silently return 0 (via `get_cell`'s OOB
+    /// contract). This lets callers request a region that extends past the
+    /// tree boundary to capture border context for the recursive stepper.
+    ///
+    /// **Performance note:** calls `get_cell` once per voxel. For large
+    /// regions, `flatten()` + sub-indexing is faster. This is designed for
+    /// small regions (e.g. a level-2 subtree + 1-cell border = 6×6×6 = 216
+    /// cells) where the setup cost of a full flatten dominates.
+    pub fn flatten_region(
+        &self,
+        root: NodeId,
+        origin: [u64; 3],
+        extent: [usize; 3],
+    ) -> Vec<CellState> {
+        let [w, h, d] = extent;
+        let [x0, y0, z0] = origin;
+        let mut grid = vec![0 as CellState; w * h * d];
+        for lz in 0..d {
+            for ly in 0..h {
+                for lx in 0..w {
+                    grid[lx + ly * w + lz * w * h] =
+                        self.get_cell(root, x0 + lx as u64, y0 + ly as u64, z0 + lz as u64);
+                }
+            }
+        }
+        grid
+    }
+
     /// Stats for debugging.
     pub fn stats(&self) -> (usize, usize) {
         (self.nodes.len(), self.step_cache.len())
@@ -1430,5 +1529,216 @@ mod tests {
         let _ = store.get_cell(root, 0, 4, 0);
         let _ = store.get_cell(root, 0, 0, 4);
         let _ = store.get_cell(root, u64::MAX, u64::MAX, u64::MAX);
+    }
+
+    // ---- Extraction primitives (hash-thing-6gf.6) ----
+
+    /// `extract_neighborhood` returns the correct 26 Moore neighbors for
+    /// a cell in the interior of a small world, matching the flat-grid
+    /// `get_neighbors` used by the brute-force stepper.
+    #[test]
+    fn extract_neighborhood_interior_cell() {
+        let side = 4usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        // Place distinct materials at each cell so we can verify neighbor order.
+        // Only use material ids 1..=7 to stay within a small set.
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let id = ((x + y * 4 + z * 16) % 7 + 1) as u16;
+                    grid[x + y * side + z * side * side] = mat(id);
+                }
+            }
+        }
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+
+        // Check cell (1,1,1) — all neighbors are in-bounds, no wrapping.
+        let neighbors = store.extract_neighborhood(root, side as i64, 1, 1, 1);
+        let mut expected = [Cell::EMPTY; 26];
+        let mut idx = 0;
+        for dz in [-1i64, 0, 1] {
+            for dy in [-1i64, 0, 1] {
+                for dx in [-1i64, 0, 1] {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nx = (1 + dx) as usize;
+                    let ny = (1 + dy) as usize;
+                    let nz = (1 + dz) as usize;
+                    expected[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                    idx += 1;
+                }
+            }
+        }
+        assert_eq!(neighbors, expected);
+    }
+
+    /// `extract_neighborhood` wraps toroidally: neighbors of a corner
+    /// cell pull from the opposite side of the world.
+    #[test]
+    fn extract_neighborhood_wraps_toroidally() {
+        let side = 4usize;
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // 4x4x4
+                                       // Place a marker at (3,3,3) — the far corner.
+        root = store.set_cell(root, 3, 3, 3, mat(5));
+        // Neighbor of (0,0,0) in direction (-1,-1,-1) should wrap to (3,3,3).
+        let neighbors = store.extract_neighborhood(root, side as i64, 0, 0, 0);
+        // Direction (-1,-1,-1) is the first element in the iteration order
+        // (dz=-1, dy=-1, dx=-1, idx=0).
+        assert_eq!(neighbors[0], Cell::from_raw(mat(5)));
+    }
+
+    /// `extract_block_2x2x2` returns the correct 8 cells for an
+    /// axis-aligned block.
+    #[test]
+    fn extract_block_2x2x2_matches_cells() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3); // 8x8x8
+                                       // Place materials in a 2x2x2 block at (2,4,6).
+        let coords = [
+            (2, 4, 6),
+            (3, 4, 6),
+            (2, 5, 6),
+            (3, 5, 6),
+            (2, 4, 7),
+            (3, 4, 7),
+            (2, 5, 7),
+            (3, 5, 7),
+        ];
+        for (i, &(x, y, z)) in coords.iter().enumerate() {
+            root = store.set_cell(root, x, y, z, mat((i + 1) as u16));
+        }
+
+        let block = store.extract_block_2x2x2(root, 2, 4, 6);
+        for dz in 0..2u64 {
+            for dy in 0..2u64 {
+                for dx in 0..2u64 {
+                    let idx = super::super::node::octant_index(dx as u32, dy as u32, dz as u32);
+                    let expected = mat((dx + dy * 2 + dz * 4 + 1) as u16);
+                    assert_eq!(
+                        block[idx],
+                        Cell::from_raw(expected),
+                        "block[{idx}] at offset ({dx},{dy},{dz})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `extract_block_2x2x2` returns empty cells for OOB coordinates.
+    #[test]
+    fn extract_block_2x2x2_oob_returns_empty() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2); // 4x4x4
+                                   // Block starting at (3,3,3) extends to (4,4,4) — half OOB.
+        let block = store.extract_block_2x2x2(root, 3, 3, 3);
+        // Only (3,3,3) is in-bounds; the rest are OOB → empty.
+        // All should be empty since the tree is empty.
+        for cell in &block {
+            assert_eq!(*cell, Cell::EMPTY);
+        }
+    }
+
+    /// `flatten_region` matches cell-by-cell `get_cell` reads.
+    #[test]
+    fn flatten_region_matches_get_cell() {
+        let side = 8usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let id = ((x ^ y ^ z) & 0x7) as u16;
+                    grid[x + y * side + z * side * side] = if id == 0 { 0 } else { mat(id) };
+                }
+            }
+        }
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+
+        // Extract a 3x3x3 sub-box at (2,3,4).
+        let region = store.flatten_region(root, [2, 3, 4], [3, 3, 3]);
+        assert_eq!(region.len(), 27);
+        for lz in 0..3usize {
+            for ly in 0..3usize {
+                for lx in 0..3usize {
+                    let expected =
+                        store.get_cell(root, 2 + lx as u64, 3 + ly as u64, 4 + lz as u64);
+                    assert_eq!(
+                        region[lx + ly * 3 + lz * 3 * 3],
+                        expected,
+                        "region({lx},{ly},{lz})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `flatten_region` silently returns 0 for coordinates past the tree.
+    #[test]
+    fn flatten_region_oob_returns_zero() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // 4x4x4
+        root = store.set_cell(root, 3, 3, 3, mat(1));
+
+        // Region (3,3,3) to (4,4,4) — extends 1 cell past the tree edge.
+        let region = store.flatten_region(root, [3, 3, 3], [2, 2, 2]);
+        assert_eq!(region.len(), 8);
+        // (0,0,0) in local coords = (3,3,3) world → mat(1)
+        assert_eq!(region[0], mat(1));
+        // All others are OOB → 0
+        for (i, &val) in region.iter().enumerate().skip(1) {
+            assert_eq!(val, 0, "region[{i}] should be 0 (OOB)");
+        }
+    }
+
+    /// `extract_neighborhood` and `flatten` produce consistent results:
+    /// for every interior cell, the 26 neighbors from `extract_neighborhood`
+    /// match what you'd read from the flat grid.
+    #[test]
+    fn extract_neighborhood_consistent_with_flatten() {
+        let side = 8usize;
+        let mut grid = vec![0 as CellState; side * side * side];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let id = ((x * 3 + y * 7 + z * 11) % 5 + 1) as u16;
+                    grid[x + y * side + z * side * side] = mat(id);
+                }
+            }
+        }
+        let mut store = NodeStore::new();
+        let root = store.from_flat(&grid, side);
+
+        // Check all interior cells (1..7 on each axis to avoid wrap edge cases).
+        for z in 1..7 {
+            for y in 1..7 {
+                for x in 1..7 {
+                    let neighbors =
+                        store.extract_neighborhood(root, side as i64, x as i64, y as i64, z as i64);
+                    let mut idx = 0;
+                    for dz in [-1i64, 0, 1] {
+                        for dy in [-1i64, 0, 1] {
+                            for dx in [-1i64, 0, 1] {
+                                if dx == 0 && dy == 0 && dz == 0 {
+                                    continue;
+                                }
+                                let nx = (x as i64 + dx) as usize;
+                                let ny = (y as i64 + dy) as usize;
+                                let nz = (z as i64 + dz) as usize;
+                                let expected =
+                                    Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                                assert_eq!(
+                                    neighbors[idx], expected,
+                                    "mismatch at ({x},{y},{z}) neighbor ({dx},{dy},{dz})",
+                                );
+                                idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -425,6 +425,25 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("4") => {
                             self.select_rule(sim::GameOfLife3D::new(4, 7, 6, 8), "Pyroclastic");
                         }
+                        winit::keyboard::Key::Character("b") => {
+                            // Burning room demo: fire + water + grass walls.
+                            self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+                            self.world.seed_burning_room();
+                            self.gol_smoke_scene = false;
+                            self.paused = true;
+                            self.perf.clear();
+                            self.mem_stats.reset_peaks();
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.upload_palette(&self.world.materials.color_palette_rgba());
+                            }
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.svdag,
+                                &mut self.last_svdag_stats,
+                            );
+                            log::info!("Reset burning room demo: pop={}", self.world.population());
+                        }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.mode = match renderer.mode {
