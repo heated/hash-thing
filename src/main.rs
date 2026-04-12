@@ -62,6 +62,9 @@ struct App {
     renderer: Option<render::Renderer>,
     world: sim::World,
     rule: sim::GameOfLife3D,
+    /// Persistent serialized DAG. Kept across frames so that its content-
+    /// addressed cache lets us upload only new nodes each step (5bb.5).
+    svdag: render::Svdag,
     paused: bool,
     step_timer: std::time::Instant,
     /// Wall-clock checkpoint for the next perf summary line. Reset each
@@ -128,6 +131,7 @@ impl App {
             renderer: None,
             world,
             rule: sim::GameOfLife3D::amoeba(),
+            svdag: render::Svdag::new(),
             paused: true,
             step_timer: std::time::Instant::now(),
             log_timer: std::time::Instant::now(),
@@ -152,17 +156,16 @@ impl App {
     fn upload_volume(
         renderer: &mut Option<render::Renderer>,
         world: &sim::World,
+        svdag: &mut render::Svdag,
         last_svdag_stats: &mut (usize, usize, u32),
     ) {
         if let Some(renderer) = renderer {
             let data = world.flatten();
             renderer.upload_volume(&data);
-            // Also rebuild the SVDAG so the other render path stays in sync.
-            let dag = render::Svdag::build(&world.store, world.root, world.level);
-            // Capture stats here so the wall-clock log path reads
-            // them without triggering a second build.
-            *last_svdag_stats = (dag.node_count, dag.byte_size(), dag.root_level);
-            renderer.upload_svdag(&dag);
+            // Incremental rebuild: reuses cached offsets for unchanged subtrees.
+            svdag.update(&world.store, world.root, world.level);
+            *last_svdag_stats = (svdag.node_count, svdag.byte_size(), svdag.root_level);
+            renderer.upload_svdag(svdag);
         }
     }
 }
@@ -180,7 +183,7 @@ impl ApplicationHandler for App {
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
-            Self::upload_volume(&mut self.renderer, &self.world, &mut self.last_svdag_stats);
+            Self::upload_volume(&mut self.renderer, &self.world, &mut self.svdag, &mut self.last_svdag_stats);
         }
     }
 
@@ -233,6 +236,7 @@ impl ApplicationHandler for App {
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &self.world,
+                                &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
                             log::info!(
@@ -262,6 +266,7 @@ impl ApplicationHandler for App {
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &self.world,
+                                &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
                             let (nodes_after, _) = self.world.store.stats();
@@ -295,6 +300,7 @@ impl ApplicationHandler for App {
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &self.world,
+                                &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
                             let (nodes_after, _) = self.world.store.stats();
@@ -320,6 +326,7 @@ impl ApplicationHandler for App {
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &self.world,
+                                &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
                             log::info!("Reset GoL sphere: pop={}", self.world.population());
@@ -443,6 +450,7 @@ impl ApplicationHandler for App {
                         Self::upload_volume(
                             &mut self.renderer,
                             &self.world,
+                            &mut self.svdag,
                             &mut self.last_svdag_stats,
                         );
                     }

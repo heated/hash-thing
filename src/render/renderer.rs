@@ -267,6 +267,10 @@ pub struct Renderer {
     svdag_bind_group: Option<wgpu::BindGroup>,
     svdag_buffer: Option<wgpu::Buffer>,
     svdag_buffer_cap: u64, // current allocation in bytes
+    /// Tracks how many u32s of `Svdag::nodes` have been uploaded to the GPU.
+    /// Only the tail past this watermark (plus the root-offset header at slot 0)
+    /// needs re-uploading each frame. Reset to 0 on buffer reallocation.
+    svdag_uploaded_len: usize,
 
     // Shared
     uniform_buffer: wgpu::Buffer,
@@ -573,6 +577,7 @@ impl Renderer {
             svdag_bind_group: None,
             svdag_buffer: None,
             svdag_buffer_cap: 0,
+            svdag_uploaded_len: 0,
             uniform_buffer,
             volume_size,
             // R16Uint: 2 bytes per texel. Update alongside the `format:` line
@@ -627,9 +632,10 @@ impl Renderer {
         let bytes: &[u8] = bytemuck::cast_slice(&dag.nodes);
         let needed = bytes.len() as u64;
 
-        // Allocate a larger buffer if necessary (grow-only)
+        // Grow the GPU buffer if needed. Resets the upload watermark — the
+        // fresh buffer has nothing on it, so the next write must cover all.
+        let mut require_full = false;
         if self.svdag_buffer.is_none() || needed > self.svdag_buffer_cap {
-            // Grow to next power of 2 with a floor of 64KB
             let mut cap = self.svdag_buffer_cap.max(65536);
             while cap < needed {
                 cap *= 2;
@@ -640,14 +646,6 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-
-            // Build the bind group against the local `buffer` before moving it
-            // into `self.svdag_buffer`. Prior form did `self.svdag_buffer =
-            // Some(buffer)` first and then reached back in via
-            // `self.svdag_buffer.as_ref().unwrap()`, a provably-safe but
-            // refactor-fragile pattern: a future reorder that moved the
-            // `Some(buffer)` assignment would silently break the unwrap site
-            // (hash-thing-8zl).
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("svdag_bg"),
                 layout: &self.svdag_bind_group_layout,
@@ -664,11 +662,33 @@ impl Renderer {
             });
             self.svdag_buffer = Some(buffer);
             self.svdag_buffer_cap = cap;
+            self.svdag_uploaded_len = 0;
             self.svdag_bind_group = Some(bg);
+            require_full = true;
         }
 
-        if let Some(buf) = &self.svdag_buffer {
+        let Some(buf) = &self.svdag_buffer else {
+            return;
+        };
+
+        if require_full || self.svdag_uploaded_len > dag.nodes.len() {
+            // Fresh buffer or dag shrank (builder was recreated). Full upload.
             self.queue.write_buffer(buf, 0, bytes);
+            self.svdag_uploaded_len = dag.nodes.len();
+            return;
+        }
+
+        // Slot 0 is the root-offset header — changes almost every frame.
+        self.queue
+            .write_buffer(buf, 0, bytemuck::cast_slice(&dag.nodes[0..1]));
+
+        // Tail: append-only growth since the last upload.
+        if self.svdag_uploaded_len < dag.nodes.len() {
+            let tail_byte_offset = (self.svdag_uploaded_len * 4) as u64;
+            let tail_bytes: &[u8] =
+                bytemuck::cast_slice(&dag.nodes[self.svdag_uploaded_len..]);
+            self.queue.write_buffer(buf, tail_byte_offset, tail_bytes);
+            self.svdag_uploaded_len = dag.nodes.len();
         }
     }
 
