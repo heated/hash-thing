@@ -13,10 +13,9 @@ use std::time::Instant;
 
 /// Seed a world at the given level with terrain, then step it `n` times,
 /// printing per-generation timing and cache stats.
-fn bench_step(label: &str, level: u32, generations: usize, spatial_memo: bool) {
+fn bench_step(label: &str, level: u32, generations: usize) {
     let side = 1u64 << level;
-    let mode = if spatial_memo { "spatial" } else { "origin" };
-    eprintln!("--- {label} [{mode}] (level={level}, side={side}³) ---");
+    eprintln!("--- {label} (level={level}, side={side}³) ---");
 
     let t0 = Instant::now();
     let mut world = World::new(level);
@@ -28,8 +27,6 @@ fn bench_step(label: &str, level: u32, generations: usize, spatial_memo: bool) {
         world.population(),
         stats.gen_region_us,
     );
-
-    world.spatial_memo = spatial_memo;
 
     let mut times_us = Vec::with_capacity(generations);
     for gen in 0..generations {
@@ -81,22 +78,19 @@ fn bench_step(label: &str, level: u32, generations: usize, spatial_memo: bool) {
 #[test]
 #[ignore]
 fn bench_hashlife_512() {
-    bench_step("512³ origin-keyed", 9, 20, false);
-    bench_step("512³ spatial-memo", 9, 20, true);
+    bench_step("512³", 9, 20);
 }
 
 #[test]
 #[ignore]
 fn bench_hashlife_1024() {
-    bench_step("1024³ origin-keyed", 10, 5, false);
-    bench_step("1024³ spatial-memo", 10, 5, true);
+    bench_step("1024³", 10, 5);
 }
 
 #[test]
 #[ignore]
 fn bench_hashlife_4096() {
-    bench_step("4096³ origin-keyed", 12, 2, false);
-    bench_step("4096³ spatial-memo", 12, 2, true);
+    bench_step("4096³", 12, 2);
 }
 
 /// Measure edit propagation: seed → warm step → place block → re-step.
@@ -108,7 +102,6 @@ fn bench_edit_propagation(label: &str, level: u32, edits: usize) {
     let mut world = World::new(level);
     let params = TerrainParams::default();
     world.seed_terrain(&params);
-    world.spatial_memo = true;
 
     // Warm step — populate cache
     let t = Instant::now();
@@ -181,7 +174,6 @@ fn bench_edit_cache_impact_64() {
     let mut world = World::new(6);
     let params = TerrainParams::default();
     world.seed_terrain(&params);
-    world.spatial_memo = true;
 
     world.step_recursive();
     let warm = world.hashlife_stats;

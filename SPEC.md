@@ -321,10 +321,10 @@ Gravity, fluid flow, particle displacement. The world is partitioned into non-ov
 **Why this is Hashlife-compatible (PARTIALLY INCORRECT — see below):**
 - Both phases are deterministic functions of local state.
 - No scan order dependency, no global state.
-- ~~Memoization key is just the node contents + phase.~~ **Wrong.** BlockRule uses `cell_hash(coord, generation)` for per-cell RNG, making step results position-dependent. Cache key must include world-space origin, which defeats spatial memoization. See `docs/hashlife-stepping-analysis.md` for the full analysis.
+- Memoization key is `(NodeId, parity)` — node contents + generation parity. BlockRule is now a pure function of block contents (no coord/generation context), so spatial memoization works for all worlds (m1f.9, m1f.13, 9ww).
 - Margolus partition parity is implicit in the generation count, which maps cleanly onto tree levels in the Hashlife recursive step.
 
-**OPEN TENSION (2026-04-12):** Margolus as currently implemented kills hashlife's spatial compression — the core performance thesis of this project. Options: (1) drop Margolus, implement gravity via pure CaRule state machines; (2) make BlockRule RNG content-derived instead of coord-derived; (3) accept O(total nodes) cost and validate empirically; (4) hybrid approach. Decision tracked in hash-thing-m1f. Full analysis in `docs/hashlife-stepping-analysis.md`.
+**RESOLVED (m1f.9, m1f.13, 9ww):** This tension was resolved by making BlockRule a pure function of block contents only (no position/generation context), then enabling node-local Margolus alignment so the hashlife cache key is `(NodeId, parity)` — fully spatial memoization-compatible. All worlds, including those with block rules, now share cache entries for identical subtrees.
 
 **Material interactions: hand-authored.** Per-material-pair rules like "sand + air-below → swap," "fire + wood → fire," "water + lava → obsidian." The user explicitly endorsed hand-authored over emergent-only.
 
@@ -445,7 +445,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap + caves for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
 - ✅ **RealizedRegion value type (`ica`)**: `RealizedRegion { origin: [i64; 3], level: u32 }` encapsulates the world's spatial extent. `contains()`, `side()`, `octant_of()`, `Display` impl. `World::region()` returns a derived view.
 - ✅ **WorldCoord/LocalCoord newtypes (`7zc`)**: `WorldCoord(i64)` for world-space, `LocalCoord(u64)` for octree-internal. Compiler-enforced separation prevents the coordinate-mixing bug class that 819 fixed. All World API methods migrated.
-- ✅ **CI + release (epic `xb7`, 3/6)**
+- ✅ **CI + release (epic `xb7`, 5/7)**
   - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets`, gating `cargo fmt --check` (k5r), gating `cargo clippy -- -D warnings` (00f)
   - `xb7.3` Linux AppImage via linuxdeploy (packaging/linux/ desktop entry + placeholder icon)
   - `xb7.4` tag-triggered release workflow producing Windows `hash-thing.exe` via `gh release` CLI (no new third-party action deps). Sibling jobs for Mac (`xb7.2` notarization) extend as they land
@@ -457,12 +457,13 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **SVDAG rendering** (epic `5bb`, 10/11): `5bb.1`–`5bb.5` serialization through incremental uploads, `bx7` stale-slot compaction, `5bb.7` palette sync, `5bb.8` zero-direction guard, `5bb.9` particle renderer, `5bb.10` HUD overlay. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 - ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
 - ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + cave CA + lazy terrain expansion + perf tracking. Sand biomes (`y2s`): low-freq noise selects sandy regions where grass/dirt → sand (gravity block rule). Sea-level water (`4t6`): `HeightmapField.sea_level` fills air below sea level with water; `classify_box` proof updated. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`.
-- ✅ **Build infra (`4yb`)**: shared `CARGO_TARGET_DIR` across worktrees (saves ~15GB), `[profile.bench]` for fast representative builds, benchmarks use `--profile bench` instead of `--release`.
+- ✅ **Build infra (`4yb`, `3sw`)**: shared `CARGO_TARGET_DIR` across worktrees (saves ~15GB), `[profile.bench]` for fast representative builds, benchmarks use `--profile bench` instead of `--release`. `3sw`: sccache + per-worktree target dirs to eliminate cargo lock contention.
+- ✅ **Bug fixes**: `0xq` BlockRule boundary asymmetry (absorbing BCs instead of clipping), `08c` has_block_rule_cells O(n³)→O(nodes) walk, `bhi` NodeStore/SVDAG overflow diagnostics.
 
 ### In progress (P0-P1, from bd)
 
-- ☐ **Core engine validation** (epic `m1f`, 12/14): proving the full loop works at scale. Landed: `m1f.1` hashlife benchmarks, `m1f.3` edit propagation, `m1f.4` infinite world, `m1f.5` SVDAG edit sync, `m1f.6` new CA rules (sand/lava), `m1f.8` SVDAG depth 24 (16M³), `m1f.9` content-only Margolus (pure BlockRule), `m1f.10` PRNG research, `m1f.11` incremental cache invalidation, `m1f.12` stable NodeIds, `m1f.13` spatial memoization enabled, `m1f.15` performance epic (9/9 sub-beads, see below). Also: `99o` cache invalidation on direct edits, `7cz` terrain default scene, `9ww` node-local Margolus alignment (spatial memo for all worlds). Open: `m1f.2` SVDAG benchmark, `m1f.7` end-to-end demo.
-  - **Hashlife performance (m1f.15, complete):** 512³ terrain went from 7147ms mean / 0% warm cache hits to 192ms mean / 100% warm cache hits (37x). Settled worlds reach 0.0ms/frame (single cache lookup). Key fixes: `76a9446` preserve padded root through compaction, `ee49888` deferred compaction on inert frames, `a239d33` inert uniform subtree skip, `095c164` all-inert mixed-material detection, `71a411b` node-local Margolus. Active CA cold frames still ~1.5s at 512³ — next frontier is dirty-region tracking or GPU compute.
+- ☐ **Core engine validation** (epic `m1f`, 12/13): proving the full loop works at scale. Landed: `m1f.1` hashlife benchmarks, `m1f.2` SVDAG benchmark, `m1f.3` edit propagation, `m1f.4` infinite world, `m1f.5` SVDAG edit sync, `m1f.6` new CA rules (sand/lava), `m1f.8` SVDAG depth 24 (16M³), `m1f.9` content-only Margolus (pure BlockRule), `m1f.10` PRNG research, `m1f.11` incremental cache invalidation, `m1f.12` stable NodeIds, `m1f.13` spatial memoization enabled, `m1f.15` performance epic (9/9 sub-beads, see below), `m1f.16` dirty-region tracking. Also: `99o` cache invalidation on direct edits, `7cz` terrain default scene, `9ww` node-local Margolus alignment (spatial memo for all worlds). Open: `m1f.7` end-to-end demo.
+  - **Hashlife performance (m1f.15, complete):** 512³ terrain went from 7147ms mean / 0% warm cache hits to 192ms mean / 100% warm cache hits (37x). Settled worlds reach 0.0ms/frame (single cache lookup). Key fixes: `76a9446` preserve padded root through compaction, `ee49888` deferred compaction on inert frames, `a239d33` inert uniform subtree skip, `095c164` all-inert mixed-material detection, `71a411b` node-local Margolus. Threshold-based periodic compaction (`31bce90`, m1f.14 re-land) preserves intermediate nodes across frames for cache hits at all recursion levels. Active CA cold frames still ~1.5s at 512³ — next frontier is dirty-region tracking or GPU compute.
 
 ### Later (P2+, from bd)
 
