@@ -14,12 +14,15 @@
 //! When 1v0.1 lands, the `CellState(0) -> AIR` mapping must be preserved.
 //! A test should fail loudly if it ever changes.
 
-use crate::octree::CellState;
+use crate::octree::{Cell, CellState};
 
 pub const AIR: CellState = 0;
-pub const STONE: CellState = 1;
-pub const DIRT: CellState = 2;
-pub const GRASS: CellState = 3;
+/// Material 1, metadata 0 — encoded via `Cell::pack(1, 0)`.
+pub const STONE: CellState = Cell::pack(1, 0).raw();
+/// Material 2, metadata 0.
+pub const DIRT: CellState = Cell::pack(2, 0).raw();
+/// Material 3, metadata 0.
+pub const GRASS: CellState = Cell::pack(3, 0).raw();
 
 /// Map "depth below the surface y" to a material.
 ///

@@ -13,7 +13,8 @@
 use rustc_hash::FxHashMap;
 
 use super::field::RegionField;
-use crate::octree::{octant_coords, CellState, NodeId, NodeStore};
+use crate::octree::node::octant_coords;
+use crate::octree::{CellState, NodeId, NodeStore};
 
 /// Per-call generation diagnostics. Logged on `seed_terrain`; used by tests
 /// to verify that proof-based collapses actually fire.

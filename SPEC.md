@@ -222,33 +222,40 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ Main loop: keyboard controls (space pause, S step, R reset, 1-4 rule switch, V render-mode toggle, Esc exit)
 - ✅ Builds and runs on macOS with Metal backend
 - ✅ Pushed to `git@github.com:heated/ashfall.git`
-- ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3, 5bb.5)**
-  - `Svdag::build` / `Svdag::update` serialize the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker). Buffer layout: `nodes[0]` = root offset header, `nodes[1..]` = append-only stream of interior slots.
-  - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant. Shader starts traversal from `dag_nodes[0]` so the root can move every frame while the rest of the buffer stays stable.
+- ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3)**
+  - `Svdag::build` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker); handles leaf roots via degenerate single-node interior (nch)
+  - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
-  - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) + 4 regression tests
-  - Epsilon bug fixed: pop-check slack was beating step-past advance on multi-axis boundary crossings
-  - **5bb.5 incremental uploads:** `Svdag` keeps a persistent content-addressed cache (`offset_by_slot: FxHashMap<[u32; 9], u32>`) across calls. Identical subtrees across epochs (including cross-store, since `compacted()` rotates NodeIds every step) reuse old offsets, so `update` appends only genuinely new slots. `Renderer::upload_svdag` writes only the tail + the 4-byte root header. Renderer-side compaction (rebuild when stale-ratio crosses threshold) deferred as follow-up.
-- ✅ **Foundations pass (hash-thing-h34.1 + h34.2 + h34.3)**
-  - `h34.1`: stateless `hash(position, generation, seed)` PRNG in `src/rng.rs`. Frozen vectors derived from an independent oracle, multi-stream API via `hash_cell_stream(..., stream)`, `#[must_use]` extractors, edge-case contracts pinned.
-  - `h34.2`: determinism audit — no global PRNG, no scan-order dependence, all FxHashMap usages are point-lookup only. Fixed `World::seed_center` (was the one stateful stream). `NodeStore::step_cache` rule-blindness was flagged as a latent hazard and has since been given an interim answer by `hash-thing-88d` (cache lifetime ≡ store epoch, `debug_assert!(step_cache.is_empty())` at `compacted()` boundary; cross-epoch memoization deferred to `6gf.2`). Audit report at `.ship-notes/audit-h34.2.md`.
-  - `h34.3`: `src/perf.rs` — `PerfCounters` + `OpCounter` + `perf::time()` scope helper + `memory_bytes_estimate()`. Wired into `main.rs`, auto-logs every 2s while unpaused, `P` key for on-demand summary. 13 unit tests.
-- ✅ **Terrain generator (hash-thing-3fq.1 + 3fq.5)**
-  - `3fq.1`: `RegionField` trait + recursive direct-octree builder in `src/terrain/gen.rs` + `HeightmapField` with proof-based `classify_box` (y-band only, no corner-agreement heuristic). `ConstField` / `HalfSpaceField` independent oracles. `AIR=0` invariant pinned across store + rule + materials. Release 64³ gen budget is ~5ms.
-  - `3fq.5`: `GenStats.classify_calls` counter + `probe_sample_ns<F: RegionField>()` microbench helper. `log_gen_stats` summary line in `main.rs` reports nodes delta and estimated noise fraction of gen time without per-call timing overhead.
+  - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) with comprehensive test suite (~1700 lines)
+  - **Bug fixes**: octant_of corner-exit tiebreak (6hd), inside-leaf exit-face normal (2nd), far-camera Laine-Karras entry clamp (27m), root_side-scaled step budget with magenta exhaustion sentinel (2w5), analytical entry-face normals (rv4)
+  - **CPU/GPU drift guards** (`src/render/mod.rs::wgsl_drift_guard`): 5 textual pins covering METADATA_BITS shift, octant_of tiebreak (6hd), entry-face normal cascade (rv4), inside-leaf fallback (2nd), traversal constants MAX_DEPTH/MIN_STEP_BUDGET/STEP_BUDGET_FUDGE (2w5)
+  - **Property tests**: midpoint-exact corner fuzz (6cc, 500 cases), forward-progress invariants, 27-ray sweep at MAX_DEPTH, far-camera stall regression, budget saturation
+  - GPU timestamp queries for render timing (6x3), graceful TIMESTAMP_QUERY fallback
+  - FrameOutcome enum with Occluded suppression, no hot-spin (8jp)
+  - 31-bit node-count overflow assertion at write time (x9r)
+  - `padded_bytes_per_row` helper for COPY_BYTES_PER_ROW_ALIGNMENT (mys)
+- ✅ **Foundations progress (epic `h34`, 3/4)**
+  - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
+  - `h34.2` determinism audit: walked every file in sim + terrain-gen paths, no global PRNG / scan-order dependencies found, two minor follow-ups filed and closed (`99e` step_cache rule_id doc fix, `c6k` seed_center migrating to cell_rand_bool). Audit notes in `.ship-notes/ship-h34.2-determinism-audit.md`
+  - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`; wall-clock auto-log cadence (q63); memory-watchdog MemStats with ratcheting peaks and `memory_bytes_estimate` (yb5); GPU `_gpu` metric family via timestamp queries (6x3). One bead remains (retire-GoL `h34.4`, blocked on 1v0 material CA)
+- ✅ **NodeStore hash-cons unit tests (`1lq`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths
+- ✅ **CI + release (epic `xb7`, 2/6)**
+  - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets` before warn-only clippy
+  - `xb7.4` tag-triggered release workflow producing Windows `hash-thing.exe` via `gh release` CLI (no new third-party action deps). Sibling jobs for Mac (`xb7.2` notarization) and Linux (`xb7.3` AppImage) extend as they land
 
 ### Next up (P1, from bd)
 
 - ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step, `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). Currently we flatten-then-step; this is the biggest single perf unlock.
 - ☐ **Material-type CA** (epic `1v0`: `1v0.1` 16-bit tagged cell, `1v0.2` material registry, `1v0.3` hand-authored interaction table, `1v0.4` Margolus movement phase). Replaces the GoL3D scaffolding.
 - ☐ **SVDAG continuation**: `5bb.4` per-leaf material attributes (Molenaar-style), `5bb.5` HashDAG-style incremental edit uploads (so we don't re-serialize the whole DAG every step).
+- ☐ **Hash-cons compaction (`88d`)**: NodeStore is currently append-only — every dead generation's subtrees are retained forever. Plan in flight (`plan-flint-88d.md`, fresh-store rebuild via `NodeStore::compacted`).
 
 ### Later (P2+, from bd)
 
-- ☐ Foundations & determinism (`h34`): only `h34.4` remains (retire GoL3D scaffolding). `h34.1`/`h34.2`/`h34.3` landed above.
-- ☐ Terrain generation & infinite worlds (`3fq`): `3fq.2` cave smoothing CA pass, `3fq.3` dungeon carving layer, `3fq.4` lazy root expansion for infinite worlds. `3fq.1` + `3fq.5` landed above.
-- ☐ Cross-platform distribution (`xb7`): CI matrix, macOS notarization, Linux AppImage, Windows .exe, WASM/WebGPU, Steam (P4)
-- ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable. Research note at `.ship-notes/investigation-5bb.6.md` — decision still open, now gated on `hash-thing-sos` (per-material `CaRule` reframe) rather than `1v0.1` directly, since orientation semantics migrate into rules under the closed-world invariant.
+- ☐ Foundations & determinism (`h34`): retire GoL3D scaffolding (`h34.4` — blocked on 1v0 material CA landing)
+- ☐ Terrain generation & infinite worlds (`3fq`): multi-res `gen(node_region) → NodeId`, cave smoothing, dungeon carving, lazy root expansion, terrain-gen perf tracking
+- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, design-gated), Steam (`xb7.6`, P4 deferred)
+- ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 
 ---
 

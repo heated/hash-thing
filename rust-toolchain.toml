@@ -1,0 +1,6 @@
+[toolchain]
+# Pin the Rust version so CI is reproducible and a new stable release does
+# not silently break the build mid-day. Bump deliberately, not on a cron.
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -1,16 +1,3 @@
-// Pre-existing clippy noise in this early-stage codebase: dead code paths
-// scaffolded for upcoming features, convention-clash on `from_flat`, and
-// cosmetic lints. Suppress at the crate level rather than churn unrelated
-// files from a bugfix PR (hash-thing-88d is strictly about store compaction).
-#![allow(dead_code)]
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::wrong_self_convention)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::manual_is_multiple_of)]
-#![allow(clippy::erasing_op)]
-#![allow(clippy::identity_op)]
-#![allow(unused_imports)]
-
 mod octree;
 mod perf;
 mod render;
@@ -28,19 +15,15 @@ use winit::{
 
 const VOLUME_SIZE: u32 = 64;
 
+/// Wall-clock cadence for the consolidated perf log line. Decoupled from
+/// `world.generation` so the log keeps ticking even when the sim is paused
+/// or stepping slowly — see hash-thing-q63.
+const LOG_INTERVAL_SECS: f64 = 2.0;
+
 /// One-line gen summary. Centralised so the `App::new` startup path and the
 /// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
 /// classify_calls / nodes_delta / noise_fraction fields; the rest is carried
 /// over from the pre-3fq.5 log line.
-///
-/// `noise_ns_per_sample` comes from `terrain::probe_sample_ns`. The "noise
-/// fraction" number is `leaves * ns_per_sample / gen_time` — an *estimate*,
-/// not a measurement. It deliberately skips timing individual sample calls
-/// (which would roughly double gen cost). Read as "if every sample really
-/// costs the probe's ns/call, here's how much of the pass it accounts for";
-/// deviation from 100% means the bottleneck is elsewhere (classify, intern,
-/// allocation). The probe is not precise enough to call anything under ~5%
-/// or over ~95% with confidence.
 #[allow(clippy::too_many_arguments)]
 fn log_gen_stats(
     label: &str,
@@ -79,41 +62,53 @@ struct App {
     renderer: Option<render::Renderer>,
     world: sim::World,
     rule: sim::GameOfLife3D,
-    /// Persistent serialized DAG. Kept across frames so that its content-
-    /// addressed cache (`Svdag::offset_by_slot`) lets us upload only the
-    /// nodes whose content is genuinely new each step. See hash-thing-5bb.5.
-    svdag: render::Svdag,
     paused: bool,
     step_timer: std::time::Instant,
-    /// When to next emit an auto perf summary. Reset on each emission.
-    perf_log_timer: std::time::Instant,
-    perf: perf::PerfCounters,
+    /// Wall-clock checkpoint for the next perf summary line. Reset each
+    /// time the line fires so cadence stays ~LOG_INTERVAL_SECS regardless
+    /// of sim/step rate.
+    log_timer: std::time::Instant,
+    // Mouse interaction state
+    mouse_pressed: bool,
+    last_mouse: Option<(f64, f64)>,
+    perf: perf::Perf,
+    /// Memory-watchdog metric family — node-count + step-cache ratcheting
+    /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
+    /// on the wall-clock log path.
+    mem_stats: perf::MemStats,
+    /// Cached SVDAG stats captured during `upload_volume` so the wall-clock
+    /// log line can read them without rebuilding the SVDAG. Updated every
+    /// time the DAG is rebuilt for render. Tuple: (node_count, byte_size,
+    /// root_level).
+    last_svdag_stats: (usize, usize, u32),
+    /// Window visibility gate (hash-thing-8jp). When `true`, the redraw
+    /// treadmill is paused — `RedrawRequested` becomes a no-op and
+    /// `request_redraw` is not called.
+    occluded: bool,
     /// One-time microbench of `HeightmapField::sample()` in ns/call.
     /// Used to estimate noise fraction of each gen pass (hash-thing-3fq.5).
     /// Refreshed on terrain reset so a wildly different param set reprobes.
     noise_ns_per_sample: f64,
-    // Mouse interaction state
-    mouse_pressed: bool,
-    last_mouse: Option<(f64, f64)>,
 }
 
 impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-        let mut perf_counters = perf::PerfCounters::default();
 
+        // Seed with terrain instead of a GoL sphere.
         let params = terrain::TerrainParams::default();
         let nodes_before = world.store.stats().0;
-        let (stats, elapsed) = perf::time(|| world.seed_terrain(&params));
-        perf_counters.record_gen(elapsed, world.store.stats());
+        let start = std::time::Instant::now();
+        let stats = world.seed_terrain(&params);
+        let elapsed = start.elapsed();
 
         // Noise-bottleneck probe. One-time microbench of `sample()`
         // called outside the timed gen region so it does not pollute
-        // `record_gen`. See hash-thing-3fq.5.
+        // the gen measurement. See hash-thing-3fq.5.
         let noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
 
         let (nodes_after, _) = world.store.stats();
-        let nodes_delta = nodes_after - nodes_before;
+        let nodes_delta = nodes_after.saturating_sub(nodes_before);
         log_gen_stats(
             "Initial terrain",
             world.side(),
@@ -133,46 +128,41 @@ impl App {
             renderer: None,
             world,
             rule: sim::GameOfLife3D::amoeba(),
-            svdag: render::Svdag::new(),
             paused: true,
             step_timer: std::time::Instant::now(),
-            perf_log_timer: std::time::Instant::now(),
-            perf: perf_counters,
-            noise_ns_per_sample,
+            log_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
+            perf: perf::Perf::new(),
+            mem_stats: perf::MemStats::new(),
+            last_svdag_stats: (0, 0, 0),
+            occluded: false,
+            noise_ns_per_sample,
         }
     }
 
-    fn upload_volume(&mut self) {
-        if let Some(renderer) = &mut self.renderer {
-            // `flatten` is intentionally NOT folded into the perf timer.
-            // h34.3's spec names "step, terrain gen, DAG serialization";
-            // flatten is the Flat3D render path's own cost, not the
-            // SVDAG build's. If the Flat3D renderer is retired later,
-            // this call goes away; if it stays, it deserves its own
-            // counter rather than being hidden inside `svdag[...]`.
-            let data = self.world.flatten();
+    /// Refresh both GPU uploads (flat3D volume + SVDAG) and cache the
+    /// DAG stats for the wall-clock log path.
+    ///
+    /// Takes explicit field references rather than `&mut self` so
+    /// callers can wrap the call in a [`perf::Timer`] via
+    /// [`perf::Perf::start`]. A whole-self borrow would conflict with
+    /// the timer's borrow on `self.perf`; disjoint field borrows do
+    /// not — this is precisely the `hash-thing-yri` fix.
+    fn upload_volume(
+        renderer: &mut Option<render::Renderer>,
+        world: &sim::World,
+        last_svdag_stats: &mut (usize, usize, u32),
+    ) {
+        if let Some(renderer) = renderer {
+            let data = world.flatten();
             renderer.upload_volume(&data);
-            // Incremental rebuild: the persistent `svdag` reuses offsets for
-            // any content that's already in its buffer, so this call only
-            // appends the slots whose content is genuinely new this frame.
-            // Measure just the rebuild — the GPU upload is wgpu's problem.
-            let (_, elapsed) = perf::time(|| {
-                self.svdag
-                    .update(&self.world.store, self.world.root, self.world.level)
-            });
-            self.perf.record_svdag(elapsed, self.world.store.stats());
-            if self.world.generation.is_multiple_of(10) {
-                log::info!(
-                    "SVDAG: {} reachable, {} total cached, {} bytes, root_level={}",
-                    self.svdag.node_count,
-                    self.svdag.total_slot_count(),
-                    self.svdag.byte_size(),
-                    self.svdag.root_level,
-                );
-            }
-            renderer.upload_svdag(&self.svdag);
+            // Also rebuild the SVDAG so the other render path stays in sync.
+            let dag = render::Svdag::build(&world.store, world.root, world.level);
+            // Capture stats here so the wall-clock log path reads
+            // them without triggering a second build.
+            *last_svdag_stats = (dag.node_count, dag.byte_size(), dag.root_level);
+            renderer.upload_svdag(&dag);
         }
     }
 }
@@ -188,7 +178,9 @@ impl ApplicationHandler for App {
 
             let renderer = pollster::block_on(render::Renderer::new(window.clone(), VOLUME_SIZE));
             self.renderer = Some(renderer);
-            self.upload_volume();
+            // Initial upload — untimed; we haven't started the render
+            // loop yet and there's no perf summary to feed.
+            Self::upload_volume(&mut self.renderer, &self.world, &mut self.last_svdag_stats);
         }
     }
 
@@ -207,6 +199,19 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // Pause the redraw treadmill while the window is hidden
+            // (minimized, behind another window, screen locked). On un-occlude,
+            // re-arm the loop with a single `request_redraw`. See
+            // hash-thing-8jp.
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     match event.logical_key.as_ref() {
@@ -218,10 +223,18 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                         winit::keyboard::Key::Character("s") => {
-                            // Single step
-                            let (_, elapsed) = perf::time(|| self.world.step_flat(&self.rule));
-                            self.perf.record_step(elapsed, self.world.store.stats());
-                            self.upload_volume();
+                            // Single step. Instrumented with the same
+                            // `perf.start("step")` Timer as the auto-step
+                            // path (hash-thing-5qh + hash-thing-yri).
+                            {
+                                let _t = self.perf.start("step");
+                                self.world.step_flat(&self.rule);
+                            }
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.last_svdag_stats,
+                            );
                             log::info!(
                                 "Gen {}: pop={}",
                                 self.world.generation,
@@ -238,12 +251,19 @@ impl ApplicationHandler for App {
                                 ..Default::default()
                             };
                             let nodes_before = self.world.store.stats().0;
-                            let (stats, elapsed) = perf::time(|| self.world.seed_terrain(&params));
-                            self.perf.record_gen(elapsed, self.world.store.stats());
+                            let start = std::time::Instant::now();
+                            let stats = self.world.seed_terrain(&params);
+                            let elapsed = start.elapsed();
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
                             self.paused = true;
-                            self.upload_volume();
+                            self.perf.clear();
+                            self.mem_stats.reset_peaks();
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.last_svdag_stats,
+                            );
                             let (nodes_after, _) = self.world.store.stats();
                             let nodes_delta = nodes_after.saturating_sub(nodes_before);
                             log_gen_stats(
@@ -258,16 +278,25 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Re-seed terrain. Stays paused.
+                            // Re-seed terrain. Stays paused. Clear perf/mem
+                            // so post-reset stats aren't poisoned by stale
+                            // pre-reset values.
                             let params = terrain::TerrainParams::default();
                             let nodes_before = self.world.store.stats().0;
-                            let (stats, elapsed) = perf::time(|| self.world.seed_terrain(&params));
-                            self.perf.record_gen(elapsed, self.world.store.stats());
+                            let start = std::time::Instant::now();
+                            let stats = self.world.seed_terrain(&params);
+                            let elapsed = start.elapsed();
                             // Re-probe in case params drifted. Cheap (~1ms).
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
                             self.paused = true;
-                            self.upload_volume();
+                            self.perf.clear();
+                            self.mem_stats.reset_peaks();
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.last_svdag_stats,
+                            );
                             let (nodes_after, _) = self.world.store.stats();
                             let nodes_delta = nodes_after.saturating_sub(nodes_before);
                             log_gen_stats(
@@ -281,33 +310,42 @@ impl ApplicationHandler for App {
                                 self.noise_ns_per_sample,
                             );
                         }
-                        winit::keyboard::Key::Character("p") => {
-                            // Dump perf summary on demand.
-                            log::info!("{}", self.perf.summary());
-                        }
                         winit::keyboard::Key::Character("g") => {
                             // Swap to legacy GoL sphere seed (kept for CA scaffold demos).
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
                             self.world.seed_center(12, 0.35);
                             self.paused = true;
-                            self.upload_volume();
-                            log::info!("Reset GoL sphere: pop={}", self.world.population(),);
+                            self.perf.clear();
+                            self.mem_stats.reset_peaks();
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.last_svdag_stats,
+                            );
+                            log::info!("Reset GoL sphere: pop={}", self.world.population());
                         }
+                        // TODO(hash-thing-6gf.1): call self.world.store.clear_step_cache() here
+                        // once memoized stepping lands. See store.rs `step_cache` field doc for
+                        // the contract — the cache key is NodeId only, so swapping the rule
+                        // without clearing yields stale results from the previous rule.
                         winit::keyboard::Key::Character("1") => {
                             self.rule = sim::GameOfLife3D::amoeba();
-                            log::info!("Rule: Amoeba");
+                            log::info!("Rule: Amoeba ({})", self.rule);
                         }
+                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("2") => {
                             self.rule = sim::GameOfLife3D::crystal();
-                            log::info!("Rule: Crystal");
+                            log::info!("Rule: Crystal ({})", self.rule);
                         }
+                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("3") => {
                             self.rule = sim::GameOfLife3D::rule445();
-                            log::info!("Rule: 445");
+                            log::info!("Rule: 445 ({})", self.rule);
                         }
+                        // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("4") => {
                             self.rule = sim::GameOfLife3D::pyroclastic();
-                            log::info!("Rule: Pyroclastic");
+                            log::info!("Rule: Pyroclastic ({})", self.rule);
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
@@ -317,6 +355,25 @@ impl ApplicationHandler for App {
                                 };
                                 log::info!("Render mode: {:?}", renderer.mode);
                             }
+                        }
+                        // hash-thing-hso: on-demand dump of the full perf +
+                        // memory summary, independent of the wall-clock log
+                        // cadence.
+                        winit::keyboard::Key::Character("p") => {
+                            let (nodes, cache) = self.world.store.stats();
+                            self.mem_stats.update(nodes, cache);
+                            let (svdag_nodes, svdag_bytes, svdag_root_level) =
+                                self.last_svdag_stats;
+                            log::info!(
+                                "Gen {} (on demand): pop={} svdag={}/{}KB(L{}) | {} | {}",
+                                self.world.generation,
+                                self.world.population(),
+                                svdag_nodes,
+                                svdag_bytes / 1024,
+                                svdag_root_level,
+                                self.mem_stats.summary(),
+                                self.perf.summary(),
+                            );
                         }
                         _ => {}
                     }
@@ -358,36 +415,96 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                // If the window is hidden, skip the whole redraw path —
+                // stepping the sim + uploading the SVDAG during a 100%-CPU
+                // spin on an invisible surface is exactly what 8jp was about.
+                // `WindowEvent::Occluded(false)` re-arms the loop.
+                if self.occluded {
+                    return;
+                }
+
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
-                    let (_, elapsed) = perf::time(|| self.world.step_flat(&self.rule));
-                    self.perf.record_step(elapsed, self.world.store.stats());
-                    self.upload_volume();
-                    self.step_timer = std::time::Instant::now();
-
-                    if self.world.generation.is_multiple_of(10) {
-                        let (nodes, cache) = self.world.store.stats();
-                        log::info!(
-                            "Gen {}: pop={}, nodes={}, cache={}",
-                            self.world.generation,
-                            self.world.population(),
-                            nodes,
-                            cache
+                    // Time the step. `perf.start` returns a Timer that
+                    // borrows only self.perf; self.world and self.rule
+                    // are disjoint fields, so the borrow checker lets
+                    // step_flat proceed while the Timer is alive.
+                    {
+                        let _t = self.perf.start("step");
+                        self.world.step_flat(&self.rule);
+                    }
+                    // Time upload as one aggregate (flatten + Svdag::build +
+                    // upload_volume + upload_svdag). CPU-side submit only —
+                    // wgpu queue writes are async. upload_volume takes
+                    // explicit field references (not &mut self) precisely
+                    // so the Timer can coexist with the call.
+                    {
+                        let _t = self.perf.start("upload_cpu");
+                        Self::upload_volume(
+                            &mut self.renderer,
+                            &self.world,
+                            &mut self.last_svdag_stats,
                         );
+                    }
+
+                    self.step_timer = std::time::Instant::now();
+                }
+
+                // Wall-clock perf summary (hash-thing-q63). Sits outside the
+                // step gate so it fires on its own cadence regardless of
+                // sim/step rate — including when paused. Showing the same
+                // Gen repeatedly is intentional: it tells the user the app
+                // is still alive.
+                if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
+                    let (nodes, cache) = self.world.store.stats();
+                    self.mem_stats.update(nodes, cache);
+                    let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
+                    log::info!(
+                        "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
+                        self.world.generation,
+                        self.world.population(),
+                        svdag_nodes,
+                        svdag_bytes / 1024,
+                        svdag_root_level,
+                        self.mem_stats.summary(),
+                        self.perf.summary(),
+                    );
+                    self.log_timer = std::time::Instant::now();
+                }
+
+                // Time render. Disjoint-field borrows: the Timer holds
+                // self.perf, renderer borrows self.renderer — orthogonal.
+                // Timer drops at the end of the `if let` arm so the
+                // borrow ends before we inspect `outcome` below.
+                let outcome = if let Some(renderer) = self.renderer.as_mut() {
+                    let _t = self.perf.start("render_cpu");
+                    Some(renderer.render())
+                } else {
+                    None
+                };
+
+                // hash-thing-6x3: if the renderer resolved a GPU-side
+                // render-pass timing this frame (i.e. the previous
+                // frame's `map_async` readback landed), record it into
+                // `perf` as `render_gpu`. `take_last_gpu_frame_time`
+                // consumes the value so we don't double-record the same
+                // sample across frames. Adapters without TIMESTAMP_QUERY
+                // always return `None` here — `render_cpu` stays the
+                // only render metric on those machines.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    if let Some(d) = renderer.take_last_gpu_frame_time() {
+                        self.perf.record("render_gpu", d);
                     }
                 }
 
-                // Auto perf summary while the simulation is running. We
-                // skip the dump when paused so the log stays quiet if you
-                // tab out after seeding a world. Press `P` for an
-                // on-demand summary regardless of pause state.
-                if !self.paused && self.perf_log_timer.elapsed().as_secs() >= 2 {
-                    log::info!("{}", self.perf.summary());
-                    self.perf_log_timer = std::time::Instant::now();
-                }
-
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.render();
+                // Belt-and-suspenders: if the surface reports Occluded
+                // before winit fires `WindowEvent::Occluded(true)` (some
+                // platforms are lazy about that event), latch the flag here
+                // so the next RedrawRequested short-circuits at the top of
+                // the arm.
+                if matches!(outcome, Some(render::FrameOutcome::Occluded)) {
+                    self.occluded = true;
+                    return;
                 }
 
                 if let Some(window) = &self.window {
@@ -414,7 +531,7 @@ fn main() {
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");
-    log::info!("  P: dump perf summary");
+    log::info!("  P: dump perf + memory summary (on demand)");
     log::info!("  Esc: quit");
 
     let event_loop = EventLoop::new().unwrap();

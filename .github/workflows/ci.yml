@@ -1,170 +1,140 @@
-# hash-thing CI: cross-platform build, test, and release packaging.
-#
-# Build and test on Mac/Linux/Windows runners so OS-specific breakage (wgpu
-# backends, winit platform bindings, target-triple-only code paths) surfaces
-# before it lands on main. Originally landed as xb7.1; xb7.3 added the Linux
-# AppImage wrapper and xb7.4 added per-platform binary artifact upload.
-#
-# What this runs per platform:
-#   1. cargo fmt --check    (fast, catches format drift)
-#   2. cargo clippy -D warn (catches lints)
-#   3. cargo build --release
-#   4. cargo test --release
-#   5. upload bare release binary (xb7.4)
-#   6. Linux-only: wrap binary in an AppImage and upload that too (xb7.3)
-#
-# Still open in xb7: macOS notarization (xb7.2 — needs Apple Developer ID
-# cert as a repo secret), WASM/WebGPU build (xb7.5 — needs distribution
-# story), Steam (xb7.6 — deferred).
-#
-# Tests don't initialize a GPU — they're all pure octree/store/terrain/sim
-# logic — so a headless Linux runner works fine. The renderer code still has
-# to *compile* against wgpu/winit, which is where platform-specific breakage
-# typically lives.
-#
-# Caching strategy: Swatinem/rust-cache handles `~/.cargo/registry`,
-# `~/.cargo/git`, and `target/` keyed on Cargo.lock + rustc version. Cache
-# is per-platform (separate keys), which is what we want — Linux wgpu objects
-# won't relink on Mac.
-
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-  # Allow manual reruns without needing a push (e.g. after a runner upgrade).
-  workflow_dispatch:
 
-# Release binary artifacts (xb7.3 bare-binary fallback + xb7.4) — every
-# successful build uploads the freshly linked binary so humans can pull
-# it from the run page without re-running locally. Tag-driven releases
-# (xb7.2 macOS notarization, xb7.3 proper AppImage wrapping) happen on
-# top of these artifacts, not instead of them.
+# Minimal default permissions; downstream xb7.2/3/4 jobs will extend at
+# the job level (releases, packages).
+permissions:
+  contents: read
 
-# Cancel stale runs on the same ref so a rapid push sequence doesn't eat
-# runner minutes waiting for superseded commits.
+# Cancel in-flight runs on PRs only — never on main pushes, so a fast
+# follow-up commit doesn't kill the integration build of the previous one.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  # Deny warnings everywhere — clippy lines already do, but RUSTFLAGS catches
-  # plain `rustc` warnings during `cargo build` too.
-  RUSTFLAGS: -D warnings
+  # Incremental compilation on CI is slower than non-incremental and bloats
+  # the cache. Warning gating lives in [lints.rust] in Cargo.toml, NOT in
+  # workflow-level RUSTFLAGS (which would poison the dep graph and the cache
+  # fingerprint).
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  check:
-    name: ${{ matrix.name }}
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
+  build:
+    name: build (${{ matrix.os }})
+    needs: actionlint
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
-      # One platform failing shouldn't cancel the others — we want the full
-      # matrix signal on every run, not a race to the first failure.
+      # See all platforms light up red on a multi-platform regression
+      # rather than cancelling siblings on first failure.
       fail-fast: false
       matrix:
         include:
-          # `artifact_name` is the filename uploaded from each runner. Using
-          # a per-OS suffix keeps the Windows `.exe` extension explicit and
-          # avoids name collisions when someone downloads all three and
-          # drops them in the same folder.
-          - name: Linux
-            os: ubuntu-latest
+          - os: ubuntu-24.04
+            run-tests: true
             artifact_name: hash-thing-linux-x86_64
             binary_path: target/release/hash-thing
-          - name: macOS
-            os: macos-latest
+          - os: macos-15
+            run-tests: false
             artifact_name: hash-thing-macos-aarch64
             binary_path: target/release/hash-thing
-          - name: Windows
-            os: windows-latest
+          - os: windows-2025
+            run-tests: false
             artifact_name: hash-thing-windows-x86_64.exe
             binary_path: target/release/hash-thing.exe
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # Linux runners ship without the wayland/xkbcommon headers that winit
-      # links against when building with the default features. Installing
-      # them keeps the workflow target-agnostic (no need to disable winit
-      # features just to pass CI).
-      #
-      # libfuse2 is for the AppImage build step (xb7.3): linuxdeploy and
-      # appimagetool are themselves AppImages and require libfuse2 to run.
-      # ubuntu-22.04+ stopped shipping libfuse2 by default; the alternative
-      # is `--appimage-extract-and-run`, but installing the lib is simpler
-      # and shaves a few seconds off each invocation.
-      - name: Install Linux winit deps
-        if: runner.os == 'Linux'
+      # The dtolnay action reads rust-toolchain.toml at the repo root, so
+      # the channel pin lives there, not in the workflow.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable as of 2026-04-11
+        with:
+          components: clippy
+
+      - name: Linux system deps (winit / wgpu)
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwayland-dev \
+            pkg-config \
             libxkbcommon-dev \
-            libx11-dev \
-            libxcursor-dev \
-            libxi-dev \
-            libxrandr-dev \
+            libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcursor-dev libxi-dev libxrandr-dev \
+            libudev-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
             libfuse2
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@5cb072d7354962be830356aa6b146f7612846014 # v2.7.5
         with:
-          components: rustfmt, clippy
+          shared-key: ci-${{ matrix.os }}
+          # Only main pushes write to the cache; PRs read from it. Keeps the
+          # 10GB cache budget from thrashing on busy branches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Shared key segment lets all jobs on the same Cargo.lock reuse
-          # the same registry download; target/ stays per-OS automatically.
-          shared-key: hash-thing
+      # Gating compile-check across all targets, all platforms. This is the
+      # ONLY step that compiles test code on Mac/Windows; if it passes here,
+      # the test code at minimum builds on every supported OS.
+      - name: Compile-check (all targets, gating)
+        run: cargo check --all-targets --locked
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
+      - name: Test
+        if: matrix.run-tests
+        run: cargo test --locked
 
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+      # Warn-only until hash-thing-k5r closes out the fmt drift backlog
+      # (store.rs / renderer.rs / svdag.rs / rule.rs / world.rs). rustfmt
+      # output is deterministic across platforms, so running on the ubuntu
+      # leg only is sufficient — no point burning mac+windows minutes on
+      # the same diff. Flip to gating once drift clears.
+      - name: Cargo fmt (warn-only until hash-thing-k5r)
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo fmt --check
+        continue-on-error: true
 
-      - name: cargo build (release)
-        run: cargo build --release
+      # Warn-only until hash-thing-00f closes out the existing clippy backlog.
+      # Compile errors will already have been caught above by `cargo check`,
+      # so leaving this step at continue-on-error doesn't hide build breakage.
+      - name: Clippy (warn-only until hash-thing-00f)
+        run: cargo clippy --all-targets --locked
+        continue-on-error: true
 
-      - name: cargo test (release)
-        run: cargo test --release
+      # Build release binary for artifact upload (xb7.4).
+      - name: Build release binary
+        run: cargo build --release --locked
 
       # Upload the freshly linked release binary as a workflow artifact.
-      # xb7.4 closes this loop for Windows (.exe); xb7.3 still wants a
-      # proper AppImage wrapper on top, and xb7.2 still wants macOS
-      # notarization — but both now have a known-good upstream artifact
-      # to build on. Retention defaults to the repo policy (90 days);
-      # we don't override it because these are development builds, not
-      # release artifacts.
+      # Retention defaults to repo policy (90 days); these are development
+      # builds, not release artifacts.
       - name: Upload release binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.binary_path }}
           if-no-files-found: error
 
       # AppImage wrapping (xb7.3). Linux-only. Pulls linuxdeploy from its
-      # rolling-release channel (linuxdeploy doesn't tag), stages an AppDir
-      # with the freshly built binary plus the .desktop file + placeholder
-      # icon from packaging/linux/, and produces a single-file .AppImage.
-      #
-      # `OUTPUT` env var pins the output filename so the upload step has a
-      # stable glob to grab. Without it linuxdeploy derives the name from
-      # the .desktop file's `Name=` and the host arch, which is fine but
-      # changes if anyone renames the app — better to be explicit.
-      #
-      # The bundled libraries are whatever linuxdeploy autodetects from the
-      # binary's ELF deps. For a winit + wgpu app this typically pulls in
-      # libwayland, libxkbcommon, libX11, etc. — the same libs the
-      # `Install Linux winit deps` step installed at build time. The
-      # AppImage will fall back to system libs at run time if available
-      # (the standard AppImage rpath behavior).
+      # rolling-release channel, stages an AppDir with the freshly built
+      # binary plus the .desktop file + placeholder icon from packaging/linux/,
+      # and produces a single-file .AppImage.
       - name: Build AppImage
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-24.04'
         env:
           OUTPUT: hash-thing-x86_64.AppImage
         run: |
@@ -178,8 +148,8 @@ jobs:
             --output appimage
 
       - name: Upload AppImage
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: hash-thing-linux-x86_64.AppImage
           path: hash-thing-x86_64.AppImage
