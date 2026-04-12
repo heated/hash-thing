@@ -32,6 +32,8 @@ Explicit-only seat: `mayor` — singular, never auto-assigned, see the mayor ski
 
 Seats are worktree labels, not specializations. Any non-mayor seat picks any ready bead — including infra, tooling, process, and crew-coordination beads, not just codebase work. Reuse a name for the same worktree; don't rewrite historical assignees.
 
+**Infra/process beads gate on human.** Daemons, crew coordination, skill defs, workflow tooling — flag with a plan before implementing.
+
 ### Peer autonomy — no central orchestrator
 
 There is no lead agent. Every seat owns the full loop: claim → implement → review → push → close. Any seat may spawn background workers, file beads, fix cross-cutting stuff, or propose policy without asking. If you notice the crew is missing a protocol (like this section before it existed), write it and ship it; don't wait for a "coordinator" to file the bead.
