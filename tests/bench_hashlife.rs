@@ -6,8 +6,10 @@
 //! dependencies. The `--release` flag is critical — debug builds are 10-50x
 //! slower and not representative of real performance.
 
+use hash_thing::octree::Cell;
+use hash_thing::sim::world::WorldCoord;
 use hash_thing::sim::World;
-use hash_thing::terrain::materials::STONE;
+use hash_thing::terrain::materials::{STONE, WATER_MATERIAL_ID};
 use hash_thing::terrain::TerrainParams;
 use std::time::Instant;
 
@@ -209,5 +211,92 @@ fn bench_edit_cache_impact_64() {
     eprintln!(
         "one-edit:  hits={}, misses={}, empty={}, fixed={}",
         edited.cache_hits, edited.cache_misses, edited.empty_skips, edited.fixed_point_skips
+    );
+}
+
+/// Benchmark a partially-active world: terrain + a column of water that
+/// falls and spreads. This exercises the case where most of the world is
+/// inert but a small region has active block rules (gravity, lateral spread).
+#[test]
+#[ignore]
+fn bench_active_water_512() {
+    let level = 9;
+    let side = 1u64 << level;
+    eprintln!("--- 512³ with active water column ---");
+
+    let mut world = World::new(level);
+    let params = TerrainParams::default();
+    let stats = world.seed_terrain(&params);
+    eprintln!(
+        "  seed: population={}, gen_region={}µs",
+        world.population(),
+        stats.gen_region_us,
+    );
+
+    // Place a column of water at the center, above the terrain surface.
+    // At 512³ (level 9), terrain fills roughly the bottom half.
+    let center = side / 2;
+    let water = Cell::pack(WATER_MATERIAL_ID, 0).raw();
+    let mut water_count = 0u64;
+    for y in (center..center + 32).rev() {
+        for dx in 0..4 {
+            for dz in 0..4 {
+                world.set(
+                    WorldCoord((center + dx) as i64),
+                    WorldCoord(y as i64),
+                    WorldCoord((center + dz) as i64),
+                    water,
+                );
+                water_count += 1;
+            }
+        }
+    }
+    eprintln!(
+        "  placed {water_count} water cells, population={}",
+        world.population()
+    );
+
+    let mut times_us = Vec::with_capacity(20);
+    for gen in 0..20 {
+        let t = Instant::now();
+        world.step_recursive();
+        let us = t.elapsed().as_micros();
+        times_us.push(us);
+
+        let s = world.hashlife_stats;
+        let total_lookups = s.cache_hits + s.cache_misses;
+        let hit_rate = if total_lookups > 0 {
+            s.cache_hits as f64 / total_lookups as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        if gen < 5 || gen >= 18 {
+            eprintln!(
+                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
+                us as f64 / 1000.0,
+                world.population(),
+                s.cache_hits,
+                s.cache_misses,
+                s.empty_skips,
+                s.fixed_point_skips,
+                hit_rate,
+            );
+        } else if gen == 5 {
+            eprintln!("  ...");
+        }
+    }
+
+    let total_us: u128 = times_us.iter().sum();
+    let mean_us = total_us / 20;
+    times_us.sort();
+    let median_us = times_us[10];
+    let p95_us = times_us[19];
+    eprintln!(
+        "  summary: 20 gens, mean={:.1}ms, median={:.1}ms, p95={:.1}ms, total={:.1}s",
+        mean_us as f64 / 1000.0,
+        median_us as f64 / 1000.0,
+        p95_us as f64 / 1000.0,
+        total_us as f64 / 1_000_000.0,
     );
 }
