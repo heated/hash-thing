@@ -594,6 +594,50 @@ mod tests {
         }
     }
 
+    /// Timing comparison: brute-force vs recursive Hashlife on 64³ terrain.
+    /// Run with `cargo test --release bench_stepper_comparison -- --ignored --nocapture`.
+    /// At 64³ the recursive path is ~3x slower due to hash-consing overhead;
+    /// its value comes from larger worlds, spatial redundancy, and exponential time-skip.
+    #[test]
+    #[ignore]
+    fn bench_stepper_comparison() {
+        use crate::terrain::TerrainParams;
+        use std::time::Instant;
+
+        let steps = 10;
+        let level = 6; // 64³
+
+        // Set up identical worlds with terrain.
+        let params = TerrainParams::default();
+        let mut brute = World::new(level);
+        let mut recur = World::new(level);
+        brute.seed_terrain(&params);
+        recur.seed_terrain(&params);
+
+        // Brute-force timing.
+        let t0 = Instant::now();
+        for _ in 0..steps {
+            brute.step();
+        }
+        let brute_ms = t0.elapsed().as_millis();
+
+        // Recursive timing.
+        let t0 = Instant::now();
+        for _ in 0..steps {
+            recur.step_recursive();
+        }
+        let recur_ms = t0.elapsed().as_millis();
+
+        // Correctness check.
+        assert_eq!(brute.flatten(), recur.flatten(), "results diverged");
+
+        eprintln!(
+            "64³ terrain × {steps} steps: brute={brute_ms}ms, recursive={recur_ms}ms, \
+             ratio={:.2}x",
+            brute_ms as f64 / recur_ms.max(1) as f64
+        );
+    }
+
     #[test]
     fn center_node_extracts_inner_octants() {
         let mut world = World::new(3);

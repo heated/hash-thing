@@ -296,7 +296,7 @@ impl ApplicationHandler for App {
                             // path (hash-thing-5qh + hash-thing-yri).
                             {
                                 let _t = self.perf.start("step");
-                                self.world.step_recursive();
+                                self.world.step();
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
