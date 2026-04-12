@@ -650,9 +650,10 @@ impl ApplicationHandler for App {
                             &mut self.last_svdag_stats,
                         );
                         // Upload particle billboard data. Positions are in
-                        // world coords — normalize to [0,1]³ for the renderer.
+                        // world coords — subtract origin and normalize to [0,1]³.
                         if let Some(renderer) = &mut self.renderer {
                             let inv_size = 1.0 / self.world.side() as f32;
+                            let wo = self.world.origin;
                             let particle_data: Vec<[f32; 4]> = self
                                 .entities
                                 .iter()
@@ -662,9 +663,9 @@ impl ApplicationHandler for App {
                                         sim::EntityKind::Player(_) => return None,
                                     };
                                     Some([
-                                        e.pos[0] as f32 * inv_size,
-                                        e.pos[1] as f32 * inv_size,
-                                        e.pos[2] as f32 * inv_size,
+                                        (e.pos[0] - wo[0] as f64) as f32 * inv_size,
+                                        (e.pos[1] - wo[1] as f64) as f32 * inv_size,
+                                        (e.pos[2] - wo[2] as f64) as f32 * inv_size,
                                         f32::from_bits(mat),
                                     ])
                                 })
@@ -750,36 +751,42 @@ impl ApplicationHandler for App {
                             p.pos = player::apply_movement(&self.world, &p.pos, &delta);
                         }
 
-                        // hash-thing-m1f.4: grow the world when the player
-                        // approaches the boundary. Growth triggers when any
-                        // axis is within GROWTH_MARGIN cells of the edge.
-                        // ensure_contains is a no-op when already in-bounds.
+                        // hash-thing-m1f.4 / 37r: grow the world when the
+                        // player approaches any boundary (positive or negative).
                         if let Some(p) = self.entities.get_mut(pid) {
-                            // Only grow toward +xyz (current root growth
-                            // direction). Negative-direction growth needs a
-                            // different root placement strategy.
                             const GROWTH_MARGIN: f64 = 8.0;
+                            let origin = self.world.origin;
                             let side = self.world.side() as f64;
                             let pos = p.pos;
-                            let needs_growth = pos.iter().any(|&c| c > side - GROWTH_MARGIN);
-                            if needs_growth {
-                                let margin = GROWTH_MARGIN as i64;
+                            let margin = GROWTH_MARGIN as i64;
+                            let near_pos_edge = pos
+                                .iter()
+                                .enumerate()
+                                .any(|(i, &c)| c > origin[i] as f64 + side - GROWTH_MARGIN);
+                            let near_neg_edge = pos
+                                .iter()
+                                .enumerate()
+                                .any(|(i, &c)| c < origin[i] as f64 + GROWTH_MARGIN);
+                            if near_pos_edge || near_neg_edge {
+                                let min = [
+                                    sim::WorldCoord(pos[0] as i64 - margin),
+                                    sim::WorldCoord(pos[1] as i64 - margin),
+                                    sim::WorldCoord(pos[2] as i64 - margin),
+                                ];
                                 let max = [
                                     sim::WorldCoord(pos[0] as i64 + margin),
                                     sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
                                     sim::WorldCoord(pos[2] as i64 + margin),
                                 ];
                                 let old_level = self.world.level;
-                                self.world.ensure_region(
-                                    [sim::WorldCoord(0), sim::WorldCoord(0), sim::WorldCoord(0)],
-                                    max,
-                                );
+                                self.world.ensure_region(min, max);
                                 if self.world.level != old_level {
                                     log::info!(
-                                        "World grew: level {} → {} (side {})",
+                                        "World grew: level {} → {} (side {}, origin {:?})",
                                         old_level,
                                         self.world.level,
-                                        self.world.side()
+                                        self.world.side(),
+                                        self.world.origin,
                                     );
                                     Self::upload_volume(
                                         &mut self.renderer,
@@ -794,11 +801,13 @@ impl ApplicationHandler for App {
                         // Sync camera to player position and orientation.
                         if let Some(player) = self.entities.get_mut(pid) {
                             let inv_size = 1.0 / self.world.side() as f64;
+                            let wo = self.world.origin;
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.camera_target = [
-                                    player.pos[0] as f32 * inv_size as f32,
-                                    (player.pos[1] + PLAYER_HEIGHT * 0.85) as f32 * inv_size as f32,
-                                    player.pos[2] as f32 * inv_size as f32,
+                                    (player.pos[0] - wo[0] as f64) as f32 * inv_size as f32,
+                                    (player.pos[1] - wo[1] as f64 + PLAYER_HEIGHT * 0.85) as f32
+                                        * inv_size as f32,
+                                    (player.pos[2] - wo[2] as f64) as f32 * inv_size as f32,
                                 ];
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
                                     renderer.camera_yaw = ps.yaw as f32;

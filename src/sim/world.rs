@@ -97,6 +97,10 @@ pub struct World {
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
+    /// World-space origin of local coordinate (0,0,0). When the world
+    /// grows in the negative direction, origin shifts to keep the old
+    /// root's cells at the same world-space positions.
+    pub origin: [i64; 3],
 }
 
 impl World {
@@ -128,6 +132,7 @@ impl World {
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
             queue: MutationQueue::new(),
+            origin: [0, 0, 0],
         }
     }
 
@@ -138,7 +143,7 @@ impl World {
     /// The realized region as a value type.
     pub fn region(&self) -> RealizedRegion {
         RealizedRegion {
-            origin: [0, 0, 0],
+            origin: self.origin,
             level: self.level,
         }
     }
@@ -158,17 +163,17 @@ impl World {
         self.invalidate_rule_caches();
     }
 
-    fn require_local_world_coord(axis: &str, coord: WorldCoord) -> u64 {
-        u64::try_from(coord.0).unwrap_or_else(|_| {
+    /// Convert world coordinate to local on a specific axis index (0=x, 1=y, 2=z).
+    /// Panics if the result is negative (coordinate is below the world origin).
+    fn local_from_world(&self, axis: usize, coord: WorldCoord) -> LocalCoord {
+        let local = coord.0 - self.origin[axis];
+        LocalCoord(u64::try_from(local).unwrap_or_else(|_| {
             panic!(
-                "World::{axis}: negative world coord {} is not yet realizable by the current +xyz-only root growth",
-                coord.0
+                "World: world coord {} maps to negative local coord {} \
+                 (origin[{axis}]={})",
+                coord.0, local, self.origin[axis]
             )
-        })
-    }
-
-    fn local_from_world(axis: &str, coord: WorldCoord) -> LocalCoord {
-        LocalCoord(Self::require_local_world_coord(axis, coord))
+        }))
     }
 
     fn set_local(&mut self, x: LocalCoord, y: LocalCoord, z: LocalCoord, state: CellState) {
@@ -189,18 +194,10 @@ impl World {
 
     /// Grow the root octree until `(x, y, z)` is in-bounds.
     ///
-    /// Wraps the current root in successively bigger parent nodes. The
-    /// existing root becomes octant 0 (the −x,−y,−z corner child) of
-    /// each new parent; the other 7 children are canonical empty nodes.
-    /// This preserves all existing cell coordinates — the world grows
-    /// in the +x, +y, +z direction only.
+    /// Supports growth in all directions — negative coordinates shift
+    /// the origin while preserving existing cell positions.
     ///
     /// No-op when the coordinate is already in-bounds.
-    ///
-    /// Negative coordinates are representable at the type level but are not
-    /// realizable yet by the current +x/+y/+z-only root growth strategy.
-    /// Those calls panic with a coordinate-contract message instead of
-    /// silently aliasing them to huge unsigned values.
     ///
     /// **Step cache:** existing cached results survive expansion because
     /// they are keyed by `NodeId`, and the old root's `NodeId` is still
@@ -213,36 +210,71 @@ impl World {
     /// Grow the root octree until the axis-aligned box `[min, max]` is
     /// fully in-bounds (inclusive on both ends).
     ///
-    /// Since growth only extends in the +x, +y, +z direction (the existing
-    /// root stays at octant 0), it is sufficient to grow until `max` is
-    /// contained — `min` is automatically in-bounds once `max` is.
+    /// Supports growth in all directions. For each axis needing negative
+    /// growth, the old root is placed in the positive half of the new
+    /// parent and origin shifts by −half. For positive growth, the old
+    /// root stays in the negative half.
     ///
     /// No-op when the region is already in-bounds.
-    pub fn ensure_region(&mut self, _min: [WorldCoord; 3], max: [WorldCoord; 3]) {
-        let max = [
-            Self::local_from_world("ensure_region", max[0]),
-            Self::local_from_world("ensure_region", max[1]),
-            Self::local_from_world("ensure_region", max[2]),
-        ];
+    pub fn ensure_region(&mut self, min: [WorldCoord; 3], max: [WorldCoord; 3]) {
         loop {
-            let side = 1u64 << self.level;
-            if max[0].0 < side && max[1].0 < side && max[2].0 < side {
-                return;
+            let side = 1i64 << self.level;
+            let origin = self.origin;
+
+            // Check which axes need growth and in which direction.
+            let need_neg = [
+                min[0].0 < origin[0],
+                min[1].0 < origin[1],
+                min[2].0 < origin[2],
+            ];
+            let need_pos = [
+                max[0].0 >= origin[0] + side,
+                max[1].0 >= origin[1] + side,
+                max[2].0 >= origin[2] + side,
+            ];
+
+            if !need_neg.iter().any(|&b| b) && !need_pos.iter().any(|&b| b) {
+                return; // everything fits
             }
+
+            // Determine which octant the old root goes into.
+            // Negative growth on axis → old root in + half (bit=1), origin shifts.
+            // Positive growth → old root in - half (bit=0).
+            let old_octant = (if need_neg[0] { 1 } else { 0 })
+                + (if need_neg[1] { 2 } else { 0 })
+                + (if need_neg[2] { 4 } else { 0 });
+
+            let half = side; // half of the NEW size = old side
             let sibling_level = self.level;
-            let half = 1i64 << sibling_level;
             let new_level = self.level + 1;
-            let mut children = [NodeId::EMPTY; 8];
-            children[0] = self.root;
-            for (oct, child) in children.iter_mut().enumerate().skip(1) {
-                let (cx, cy, cz) = crate::octree::node::octant_coords(oct);
-                *child = self.gen_sibling(
-                    sibling_level,
-                    [cx as i64 * half, cy as i64 * half, cz as i64 * half],
-                );
+
+            // Compute new origin — shift negative on axes that need it.
+            let mut new_origin = origin;
+            for axis in 0..3 {
+                if need_neg[axis] {
+                    new_origin[axis] -= half;
+                }
             }
+
+            // Build children array.
+            let mut children = [NodeId::EMPTY; 8];
+            children[old_octant] = self.root;
+            for (oct, child) in children.iter_mut().enumerate() {
+                if oct == old_octant {
+                    continue;
+                }
+                let (cx, cy, cz) = crate::octree::node::octant_coords(oct);
+                let sibling_origin = [
+                    new_origin[0] + cx as i64 * half,
+                    new_origin[1] + cy as i64 * half,
+                    new_origin[2] + cz as i64 * half,
+                ];
+                *child = self.gen_sibling(sibling_level, sibling_origin);
+            }
+
             self.root = self.store.interior(new_level, children);
             self.level = new_level;
+            self.origin = new_origin;
         }
     }
 
@@ -270,17 +302,12 @@ impl World {
     /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). For writes to
     /// coordinates outside the current realized root, call `ensure_contains`
     /// first to grow the tree.
-    ///
-    /// Negative world coordinates are a typed, explicit input now, but the
-    /// current realization strategy still only grows in +x/+y/+z. Negative
-    /// writes therefore panic with a contract error instead of silently
-    /// reinterpreting the bits as `u64`.
     #[track_caller]
     pub fn set(&mut self, x: WorldCoord, y: WorldCoord, z: WorldCoord, state: CellState) {
         self.set_local(
-            Self::local_from_world("set", x),
-            Self::local_from_world("set", y),
-            Self::local_from_world("set", z),
+            self.local_from_world(0, x),
+            self.local_from_world(1, y),
+            self.local_from_world(2, z),
             state,
         );
     }
@@ -313,16 +340,18 @@ impl World {
     /// conceptually unrealized empty space. This includes negative world
     /// coordinates until signed-region realization lands.
     pub fn get(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
-        let Ok(x) = u64::try_from(x.0) else {
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = self.side() as i64;
+        if lx < 0 || ly < 0 || lz < 0 || lx >= side || ly >= side || lz >= side {
             return 0;
-        };
-        let Ok(y) = u64::try_from(y.0) else {
-            return 0;
-        };
-        let Ok(z) = u64::try_from(z.0) else {
-            return 0;
-        };
-        self.get_local(LocalCoord(x), LocalCoord(y), LocalCoord(z))
+        }
+        self.get_local(
+            LocalCoord(lx as u64),
+            LocalCoord(ly as u64),
+            LocalCoord(lz as u64),
+        )
     }
 
     /// Stepper-oriented read: "what is this cell right now?"
@@ -347,11 +376,11 @@ impl World {
     /// when distinguishing "realized empty" from "unrealized" matters
     /// (e.g. debug overlays rendering the region boundary).
     pub fn is_realized(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> bool {
-        let (Ok(ux), Ok(uy), Ok(uz)) = (u64::try_from(x.0), u64::try_from(y.0), u64::try_from(z.0))
-        else {
-            return false;
-        };
-        self.region().contains(ux, uy, uz)
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = self.side() as i64;
+        lx >= 0 && ly >= 0 && lz >= 0 && lx < side && ly < side && lz < side
     }
 
     /// Flatten to a 3D grid for rendering.
@@ -2032,5 +2061,94 @@ mod tests {
             state: STONE,
         });
         world.step_ca(); // should panic
+    }
+
+    // -----------------------------------------------------------------
+    // Negative-direction world growth (hash-thing-37r).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ensure_contains_negative_shifts_origin() {
+        let mut world = World::new(3); // side=8, origin=[0,0,0]
+        world.set(wc(4), wc(4), wc(4), STONE);
+        world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
+        // Origin must have shifted negative on x.
+        assert!(
+            world.origin[0] < 0,
+            "origin[0] should be negative after negative growth"
+        );
+        // The old cell at world coord (4,4,4) must still be readable.
+        assert_eq!(world.get(wc(4), wc(4), wc(4)), STONE);
+    }
+
+    #[test]
+    fn ensure_contains_negative_preserves_population() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(5), STONE);
+        world.set(wc(6), wc(1), wc(7), WATER);
+        let pop_before = world.population();
+        world.ensure_contains(WorldCoord(-10), WorldCoord(-10), WorldCoord(-10));
+        assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn ensure_contains_negative_then_set_roundtrips() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5));
+        world.set(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5), STONE);
+        assert_eq!(
+            world.get(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5)),
+            STONE
+        );
+    }
+
+    #[test]
+    fn ensure_region_negative_min_grows_correctly() {
+        let mut world = World::new(3);
+        world.ensure_region(
+            [WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)],
+            [WorldCoord(7), WorldCoord(7), WorldCoord(7)],
+        );
+        // Both the negative and positive corners should be in-bounds.
+        assert!(world.is_realized(WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
+    }
+
+    #[test]
+    fn negative_growth_origin_tracks_correctly() {
+        let mut world = World::new(3); // side=8, origin=[0,0,0]
+        world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
+        let o = world.origin;
+        let side = world.side() as i64;
+        // The entire old region [0..8) must still be valid.
+        assert!(o[0] <= 0);
+        assert!(o[0] + side >= 8);
+    }
+
+    #[test]
+    fn get_returns_zero_below_origin() {
+        let world = World::new(3); // origin=[0,0,0], side=8
+                                   // Don't grow — coord -1 is below origin.
+        assert_eq!(world.get(WorldCoord(-1), wc(0), wc(0)), 0);
+    }
+
+    #[test]
+    fn mixed_direction_growth_preserves_cells() {
+        let mut world = World::new(3); // side=8
+        world.set(wc(2), wc(3), wc(4), STONE);
+        world.set(wc(6), wc(1), wc(7), WATER);
+        // Grow negative on x, positive on z.
+        world.ensure_region([WorldCoord(-5), wc(0), wc(0)], [wc(0), wc(0), wc(20)]);
+        assert_eq!(world.get(wc(2), wc(3), wc(4)), STONE);
+        assert_eq!(world.get(wc(6), wc(1), wc(7)), WATER);
+    }
+
+    #[test]
+    fn is_realized_works_after_negative_growth() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3));
+        assert!(world.is_realized(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3)));
+        assert!(world.is_realized(wc(0), wc(0), wc(0)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 }

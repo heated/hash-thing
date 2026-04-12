@@ -141,7 +141,10 @@ fn bench_edit_cache_impact(label: &str, level: u32) {
     let t = Instant::now();
     world.step_recursive();
     let step_cold = t.elapsed().as_micros();
-    eprintln!("  step (no prior edit): {step_cold}µs ({:.1}ms)", step_cold as f64 / 1000.0);
+    eprintln!(
+        "  step (no prior edit): {step_cold}µs ({:.1}ms)",
+        step_cold as f64 / 1000.0
+    );
 
     // Edit a cell
     let center = (side / 4) as i64;
