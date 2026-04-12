@@ -1,7 +1,7 @@
-use super::rule::{block_index, BlockContext, ALIVE};
+use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
-use crate::terrain::materials::{BlockRuleId, MaterialRegistry, FIRE, WATER};
+use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
@@ -48,6 +48,24 @@ impl World {
 
     pub fn side(&self) -> usize {
         1 << self.level
+    }
+
+    /// Invalidate caches whose keys depend on the active CA rule.
+    ///
+    /// Today this only clears `NodeStore::step_cache`, whose key is `NodeId`
+    /// only. Call this before or immediately after any rule swap so future
+    /// memoized stepping cannot reuse results from a different ruleset.
+    pub fn invalidate_rule_caches(&mut self) {
+        self.store.clear_step_cache();
+    }
+
+    /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
+    ///
+    /// This also invalidates rule-dependent caches because the CA dispatch
+    /// table changes even though the octree content does not.
+    pub fn set_gol_smoke_rule(&mut self, rule: GameOfLife3D) {
+        self.materials = MaterialRegistry::gol_smoke_with_rule(rule);
+        self.invalidate_rule_caches();
     }
 
     /// Set a cell.
@@ -264,6 +282,64 @@ impl World {
                     {
                         self.set(x, y, z, ALIVE.raw());
                     }
+                }
+            }
+        }
+    }
+
+    /// Seed a demo scene: stone room with grass walls (fuel), fire, and water.
+    ///
+    /// Demonstrates reaction phase (fire spreads to grass, water quenches fire)
+    /// plus movement phase (water falls and spreads via FluidBlockRule).
+    pub fn seed_burning_room(&mut self) {
+        let side = self.side() as u64;
+        let margin = side / 8;
+        let lo = margin;
+        let hi = side - margin;
+
+        for z in lo..hi {
+            for y in lo..hi {
+                for x in lo..hi {
+                    let on_wall = x == lo || x == hi - 1 || z == lo || z == hi - 1;
+                    let on_floor = y == lo;
+                    let on_ceiling = y == hi - 1;
+
+                    if on_floor {
+                        self.set(x, y, z, DIRT);
+                    } else if on_ceiling {
+                        self.set(x, y, z, STONE);
+                    } else if on_wall {
+                        self.set(x, y, z, GRASS);
+                    }
+                }
+            }
+        }
+
+        // Fire source: small cluster in one corner
+        let fire_x = lo + 2;
+        let fire_z = lo + 2;
+        for dy in 1..4u64 {
+            for dx in 0..2u64 {
+                for dz in 0..2u64 {
+                    let y = lo + dy;
+                    let x = fire_x + dx;
+                    let z = fire_z + dz;
+                    if x < hi && y < hi && z < hi {
+                        self.set(x, y, z, FIRE);
+                    }
+                }
+            }
+        }
+
+        // Water pool: opposite corner, a few layers deep
+        let water_hi_x = hi - 2;
+        let water_hi_z = hi - 2;
+        let water_lo_x = water_hi_x.saturating_sub(6);
+        let water_lo_z = water_hi_z.saturating_sub(6);
+        for y in (lo + 1)..(lo + 4).min(hi) {
+            for z in water_lo_z..water_hi_z {
+                for x in water_lo_x..water_hi_x {
+                    self.set(x, y, z, WATER);
                 }
             }
         }
@@ -590,6 +666,25 @@ mod tests {
         assert!(w.population() > 0);
     }
 
+    #[test]
+    fn seed_burning_room_produces_all_material_types() {
+        let mut w = World::new(6); // side 64
+        w.seed_burning_room();
+        assert!(w.population() > 0);
+        let grid = w.flatten();
+        let has = |mat: CellState| grid.iter().any(|&c| c == mat);
+        assert!(has(STONE), "room must have stone ceiling");
+        assert!(has(DIRT), "room must have dirt floor");
+        assert!(has(GRASS), "room must have grass walls");
+        assert!(has(FIRE), "room must have fire");
+        assert!(has(WATER), "room must have water");
+        // Verify population is reasonable (room structure + contents)
+        assert!(
+            w.population() > 100,
+            "burning room should have substantial content"
+        );
+    }
+
     // -----------------------------------------------------------------
     // 9-11. Bounds check on World::set / World::get (hash-thing-fb5).
     // -----------------------------------------------------------------
@@ -893,5 +988,61 @@ mod tests {
             b.flatten(),
             "block stepping must be deterministic"
         );
+    }
+
+    #[test]
+    fn invalidate_rule_caches_clears_step_cache() {
+        let mut world = World::new(3);
+        let input = world.store.leaf(Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        let output = world.store.leaf(Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.store.cache_step(input, output);
+        assert_eq!(world.store.get_cached_step(input), Some(output));
+
+        world.invalidate_rule_caches();
+
+        assert_eq!(world.store.get_cached_step(input), None);
+    }
+
+    // -----------------------------------------------------------------
+    // seed_terrain with dungeons integration test (hash-thing-3fq.10).
+    // -----------------------------------------------------------------
+
+    use crate::terrain::DungeonParams;
+
+    #[test]
+    fn seed_terrain_with_dungeons_reduces_stone() {
+        let mut world_no_dungeons = World::new(6);
+        let params_no = TerrainParams::default();
+        let _ = world_no_dungeons.seed_terrain(&params_no);
+        let pop_no = world_no_dungeons.population();
+
+        let mut world_dungeons = World::new(6);
+        let params_yes = TerrainParams {
+            dungeons: Some(DungeonParams::default()),
+            ..Default::default()
+        };
+        let stats = world_dungeons.seed_terrain(&params_yes);
+        let pop_yes = world_dungeons.population();
+
+        assert!(
+            pop_yes < pop_no,
+            "dungeons must carve some stone: pop_no={pop_no}, pop_yes={pop_yes}",
+        );
+        assert!(
+            stats.dungeon_us > 0,
+            "dungeon_us must be populated when dungeons are enabled",
+        );
+        assert!(
+            stats.nodes_after_dungeons > 0,
+            "nodes_after_dungeons must be populated",
+        );
+    }
+
+    #[test]
+    fn seed_terrain_without_dungeons_has_zero_dungeon_stats() {
+        let mut world = World::new(6);
+        let params = TerrainParams::default();
+        let stats = world.seed_terrain(&params);
+        assert_eq!(stats.dungeon_us, 0);
     }
 }

@@ -5,9 +5,7 @@
 //! transition surface, so the builder must actually recurse into the
 //! straddling box and short-circuit on the boxes that are fully on one side.
 
-// Test-only fixture today; will become a real consumer when caves / dungeons
-// land in 3fq.2+.
-#![allow(dead_code)]
+// Test-only fixture — used for builder regression tests.
 
 use super::RegionField;
 use crate::octree::CellState;

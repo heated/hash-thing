@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Procedural dungeon carving post-pass (hash-thing-3fq.3).
 //!
 //! Generates rectangular rooms connected by corridors within the stone
