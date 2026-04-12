@@ -495,6 +495,27 @@ impl ApplicationHandler for App {
                             &mut self.svdag,
                             &mut self.last_svdag_stats,
                         );
+                        // Upload particle billboard data. Positions are in
+                        // world coords — normalize to [0,1]³ for the renderer.
+                        if let Some(renderer) = &mut self.renderer {
+                            let inv_size = 1.0 / VOLUME_SIZE as f32;
+                            let particle_data: Vec<[f32; 4]> = self
+                                .entities
+                                .iter()
+                                .map(|e| {
+                                    let mat = match &e.kind {
+                                        sim::EntityKind::Particle(p) => p.material as u32,
+                                    };
+                                    [
+                                        e.pos[0] as f32 * inv_size,
+                                        e.pos[1] as f32 * inv_size,
+                                        e.pos[2] as f32 * inv_size,
+                                        f32::from_bits(mat),
+                                    ]
+                                })
+                                .collect();
+                            renderer.upload_particles(&particle_data);
+                        }
                     }
 
                     self.step_timer = std::time::Instant::now();

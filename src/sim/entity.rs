@@ -76,12 +76,7 @@ impl EntityStore {
     pub fn add(&mut self, pos: Vec3, vel: Vec3, kind: EntityKind) -> EntityId {
         let id = EntityId(self.next_id);
         self.next_id += 1;
-        let entity = Entity {
-            id,
-            pos,
-            vel,
-            kind,
-        };
+        let entity = Entity { id, pos, vel, kind };
         // Find a free slot or push.
         if let Some(slot) = self.entities.iter_mut().find(|s| s.is_none()) {
             *slot = Some(entity);
