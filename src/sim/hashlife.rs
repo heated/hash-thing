@@ -946,9 +946,9 @@ mod tests {
     }
 
     /// Timing comparison: brute-force vs recursive Hashlife on 64³ terrain.
-    /// Run with `cargo test --release bench_stepper_comparison -- --ignored --nocapture`.
-    /// At 64³ the recursive path is ~3x slower due to hash-consing overhead;
-    /// its value comes from larger worlds, spatial redundancy, and exponential time-skip.
+    /// Run with `cargo test --release --lib bench_stepper_comparison -- --ignored --nocapture`.
+    /// At 64³ the recursive path is roughly at parity with brute-force thanks to
+    /// the empty-node short-circuit (6gf.14) and incremental cache (m1f.11/m1f.12).
     #[test]
     #[ignore]
     fn bench_stepper_comparison() {
