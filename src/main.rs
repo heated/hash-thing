@@ -755,12 +755,13 @@ impl ApplicationHandler for App {
                         // axis is within GROWTH_MARGIN cells of the edge.
                         // ensure_contains is a no-op when already in-bounds.
                         if let Some(p) = self.entities.get_mut(pid) {
+                            // Only grow toward +xyz (current root growth
+                            // direction). Negative-direction growth needs a
+                            // different root placement strategy.
                             const GROWTH_MARGIN: f64 = 8.0;
                             let side = self.world.side() as f64;
                             let pos = p.pos;
-                            let needs_growth = pos
-                                .iter()
-                                .any(|&c| c < GROWTH_MARGIN || c > side - GROWTH_MARGIN);
+                            let needs_growth = pos.iter().any(|&c| c > side - GROWTH_MARGIN);
                             if needs_growth {
                                 let margin = GROWTH_MARGIN as i64;
                                 let max = [
