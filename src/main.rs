@@ -136,9 +136,16 @@ struct App {
 impl App {
     fn new(volume_size: u32) -> Self {
         let mut world = sim::World::new(volume_size.trailing_zeros());
+        // Skip caves at 1024³+ — cave carving is O(n³) and takes minutes.
+        let level = volume_size.trailing_zeros();
+        let caves = if level <= 9 {
+            Some(terrain::CaveParams::default())
+        } else {
+            None
+        };
         let terrain_params = terrain::TerrainParams {
-            caves: Some(terrain::CaveParams::default()),
-            ..terrain::TerrainParams::for_level(volume_size.trailing_zeros())
+            caves,
+            ..terrain::TerrainParams::for_level(level)
         };
         let stats = world.seed_terrain(&terrain_params);
         let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
