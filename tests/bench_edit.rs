@@ -34,7 +34,7 @@ fn bench_set_cell(label: &str, level: u32, n_edits: usize) {
     eprintln!("--- {label}: set_cell (level={level}, side={side}³) ---");
 
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
 
     let material = Cell::pack(1, 0).raw();
     let center = (side / 4) as i64; // avoid boundary
@@ -69,7 +69,7 @@ fn bench_flatten(label: &str, level: u32) {
     eprintln!("--- {label}: flatten (level={level}, side={side}³) ---");
 
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
 
     // Flatten a few times to get stable numbers.
     let n = 5;
@@ -98,7 +98,7 @@ fn bench_edit_to_upload(label: &str, level: u32) {
     eprintln!("--- {label}: edit→flatten cycle (level={level}, side={side}³) ---");
 
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
 
     let material = Cell::pack(1, 0).raw();
     let center = (side / 4) as i64;
@@ -134,7 +134,7 @@ fn bench_edit_cache_impact(label: &str, level: u32) {
     eprintln!("--- {label}: cache impact of edit (level={level}, side={side}³) ---");
 
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
 
     // Step once to warm the cache... except the cache clears each gen.
     // So we're measuring: does an edit between steps change step timing?

@@ -396,7 +396,7 @@ fn bench_raycast(label: &str, level: u32, frames: usize) {
     // Build world + SVDAG
     let build_start = Instant::now();
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
     let svdag = Svdag::build(&world.store, world.root, world.level);
     let build_ms = build_start.elapsed().as_millis();
     eprintln!(
@@ -517,7 +517,7 @@ fn bench_raycast_with_active_ca() {
     eprintln!("--- Active CA benchmark: {side}³ with stepping ---");
 
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
 
     let mut renderer = match HeadlessRenderer::new() {
         Some(r) => r,

@@ -407,9 +407,12 @@ impl Renderer {
         });
 
         // Palette binding entry shared by both pipeline layouts (binding 2).
+        // VERTEX | FRAGMENT: SVDAG reads palette in fragment only, but the
+        // particle shader reads it in the vertex stage (vs_main looks up
+        // material color to pass to the fragment stage).
         let palette_bgl_entry = wgpu::BindGroupLayoutEntry {
             binding: 2,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false,
