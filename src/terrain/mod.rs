@@ -13,7 +13,6 @@ pub mod gen;
 pub mod materials;
 pub mod noise;
 
-#[allow(unused_imports)]
 pub use caves::{carve_caves, carve_caves_grid, CaveParams};
 pub use dungeons::{carve_dungeons, carve_dungeons_grid, DungeonParams};
 pub use field::HeightmapField;

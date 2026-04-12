@@ -1,7 +1,5 @@
 // Public API of a utility module that feeds future consumers (Margolus movement
-// phase, probabilistic CA rules, terrain-gen). Some entry points have no call
-// sites yet; silence dead_code until those land.
-#![allow(dead_code)]
+// phase, probabilistic CA rules, terrain-gen).
 
 //! Deterministic per-cell randomness for Hashlife-compatible CA rules.
 //!

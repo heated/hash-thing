@@ -1,6 +1,4 @@
-// Public API consumed by future beads (1v0.5 gravity/fluid). Some entry points
-// only have test call sites until main.rs wires them. Silence dead_code until then.
-#![allow(dead_code)]
+// Built-in Margolus block transforms, consumed by World::step_blocks.
 //! Built-in Margolus block transforms.
 //!
 //! Each struct implements `BlockRule` for a specific 2x2x2 block behavior.
