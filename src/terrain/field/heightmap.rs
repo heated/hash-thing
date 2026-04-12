@@ -152,6 +152,9 @@ pub struct PrecomputedHeightmapField {
     mip_min: Vec<Vec<f32>>,
     /// Max surface height per mipmap level.
     mip_max: Vec<Vec<f32>>,
+    /// Precomputed biome: true if this (x, z) column is in a sandy biome.
+    /// Avoids live `biome_2d` noise evaluation during `sample()`.
+    is_sandy: Vec<bool>,
 }
 
 impl PrecomputedHeightmapField {
@@ -214,11 +217,25 @@ impl PrecomputedHeightmapField {
             mip_max.push(cur_max);
         }
 
+        // Precompute biome classification to avoid live noise in sample().
+        let mut is_sandy = vec![false; n];
+        for z in 0..side {
+            for x in 0..side {
+                let biome = biome_2d(
+                    x as f32 / BIOME_WAVELENGTH,
+                    z as f32 / BIOME_WAVELENGTH,
+                    field.seed,
+                );
+                is_sandy[z * side + x] = biome < SAND_BIOME_THRESHOLD;
+            }
+        }
+
         Self {
             inner: field,
             side,
             mip_min,
             mip_max,
+            is_sandy,
         }
     }
 
@@ -264,12 +281,18 @@ impl RegionField for PrecomputedHeightmapField {
             return AIR;
         }
         if base != STONE && depth < 4.0 {
-            let biome = biome_2d(
-                p[0] as f32 / BIOME_WAVELENGTH,
-                p[2] as f32 / BIOME_WAVELENGTH,
-                self.inner.seed,
-            );
-            if biome < SAND_BIOME_THRESHOLD {
+            let ux = p[0] as usize;
+            let uz = p[2] as usize;
+            let sandy = if ux < self.side && uz < self.side {
+                self.is_sandy[uz * self.side + ux]
+            } else {
+                biome_2d(
+                    p[0] as f32 / BIOME_WAVELENGTH,
+                    p[2] as f32 / BIOME_WAVELENGTH,
+                    self.inner.seed,
+                ) < SAND_BIOME_THRESHOLD
+            };
+            if sandy {
                 return SAND;
             }
         }
