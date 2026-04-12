@@ -18,10 +18,12 @@
 //!      (each level n-1), recursively step each → 8 results at level n-2.
 //!      Assemble into the level-(n-1) output.
 //!
-//! Step results are memoized by (NodeId, origin) so identical subtrees at
+//! Step results are memoized by (NodeId, origin, parity) so identical subtrees at
 //! the same world-space position are computed only once per generation.
-//! The cache is cleared after each step (generation changes affect BlockRule
-//! rng_hash, and compaction remaps NodeIds).
+//! After each step, compaction remaps NodeIds; the cache entries are translated
+//! through the remap table rather than cleared. Entries for GC'd nodes are
+//! dropped automatically. Since parity alternates 0/1, cache hits occur every
+//! OTHER frame for stable subtrees (parity match on frame N+2, not N+1).
 
 use super::world::World;
 use crate::octree::node::octant_index;
