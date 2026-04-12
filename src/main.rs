@@ -367,6 +367,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: Amoeba ({})", self.rule);
                         }
@@ -376,6 +380,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: Crystal ({})", self.rule);
                         }
@@ -385,6 +393,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: 445 ({})", self.rule);
                         }
@@ -394,6 +406,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: Pyroclastic ({})", self.rule);
                         }
