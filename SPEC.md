@@ -223,15 +223,21 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ Builds and runs on macOS with Metal backend
 - ✅ Pushed to `git@github.com:heated/ashfall.git`
 - ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3)**
-  - `Svdag::build` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker)
+  - `Svdag::build` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker); handles leaf roots via degenerate single-node interior (nch)
   - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
-  - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) + 4 regression tests
-  - Epsilon bug fixed: pop-check slack was beating step-past advance on multi-axis boundary crossings
+  - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) with comprehensive test suite (~1700 lines)
+  - **Bug fixes**: octant_of corner-exit tiebreak (6hd), inside-leaf exit-face normal (2nd), far-camera Laine-Karras entry clamp (27m), root_side-scaled step budget with magenta exhaustion sentinel (2w5), analytical entry-face normals (rv4)
+  - **CPU/GPU drift guards** (`src/render/mod.rs::wgsl_drift_guard`): 5 textual pins covering METADATA_BITS shift, octant_of tiebreak (6hd), entry-face normal cascade (rv4), inside-leaf fallback (2nd), traversal constants MAX_DEPTH/MIN_STEP_BUDGET/STEP_BUDGET_FUDGE (2w5)
+  - **Property tests**: midpoint-exact corner fuzz (6cc, 500 cases), forward-progress invariants, 27-ray sweep at MAX_DEPTH, far-camera stall regression, budget saturation
+  - GPU timestamp queries for render timing (6x3), graceful TIMESTAMP_QUERY fallback
+  - FrameOutcome enum with Occluded suppression, no hot-spin (8jp)
+  - 31-bit node-count overflow assertion at write time (x9r)
+  - `padded_bytes_per_row` helper for COPY_BYTES_PER_ROW_ALIGNMENT (mys)
 - ✅ **Foundations progress (epic `h34`, 3/4)**
   - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
   - `h34.2` determinism audit: walked every file in sim + terrain-gen paths, no global PRNG / scan-order dependencies found, two minor follow-ups filed and closed (`99e` step_cache rule_id doc fix, `c6k` seed_center migrating to cell_rand_bool). Audit notes in `.ship-notes/ship-h34.2-determinism-audit.md`
-  - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`. One bead remains (retire-GoL `h34.4`, blocked on 1v0 material CA)
+  - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`; wall-clock auto-log cadence (q63); memory-watchdog MemStats with ratcheting peaks and `memory_bytes_estimate` (yb5); GPU `_gpu` metric family via timestamp queries (6x3). One bead remains (retire-GoL `h34.4`, blocked on 1v0 material CA)
 - ✅ **NodeStore hash-cons unit tests (`1lq`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths
 - ✅ **CI + release (epic `xb7`, 2/6)**
   - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets` before warn-only clippy
