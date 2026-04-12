@@ -304,7 +304,7 @@ fn bench_active_water_512() {
             0.0
         };
 
-        if gen < 5 || gen >= 18 {
+        if !(5..18).contains(&gen) {
             eprintln!(
                 "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
                 us as f64 / 1000.0,
