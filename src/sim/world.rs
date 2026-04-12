@@ -284,7 +284,7 @@ impl World {
 
     /// Find the unique BlockRuleId across all non-empty cells in a block.
     /// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
-    fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
+    pub(crate) fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
         let mut found: Option<BlockRuleId> = None;
         for cell in block {
             if let Some(id) = self.materials.block_rule_id_for_cell(*cell) {
@@ -1049,7 +1049,7 @@ mod tests {
     #[test]
     fn fluid_water_falls_under_gravity() {
         let mut world = World::new(3); // 8x8x8, terrain_defaults includes FluidBlockRule
-        // Place water at y=3, air at y=2 — same block column at even offset.
+                                       // Place water at y=3, air at y=2 — same block column at even offset.
         world.set(2, 3, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
         assert_eq!(world.get(2, 2, 2), 0, "bottom should be air initially");
 
@@ -1102,7 +1102,11 @@ mod tests {
         }
 
         // Water must still exist (conservation) but may have moved.
-        assert_eq!(world.population(), 1, "exactly one water cell should remain");
+        assert_eq!(
+            world.population(),
+            1,
+            "exactly one water cell should remain"
+        );
         // It should NOT still be at (2,3,2) after gravity — verify it settled
         // at a y=0 or y=2 position (even-aligned bottom).
     }
