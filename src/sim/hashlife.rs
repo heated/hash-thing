@@ -347,7 +347,12 @@ fn get_neighbors_from_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::world::WorldCoord;
     use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
+
+    fn wc(coord: u64) -> WorldCoord {
+        WorldCoord(coord as i64)
+    }
 
     #[test]
     fn recursive_matches_brute_force_empty() {
@@ -363,8 +368,8 @@ mod tests {
     fn recursive_matches_brute_force_single_cell() {
         let mut brute = World::new(3);
         let mut recur = World::new(3);
-        brute.set(3, 3, 3, STONE);
-        recur.set(3, 3, 3, STONE);
+        brute.set(wc(3), wc(3), wc(3), STONE);
+        recur.set(wc(3), wc(3), wc(3), STONE);
         brute.step();
         recur.step_recursive();
         assert_eq!(brute.flatten(), recur.flatten());
@@ -389,8 +394,8 @@ mod tests {
                 crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw(),
             ),
         ] {
-            brute.set(x, y, z, mat);
-            recur.set(x, y, z, mat);
+            brute.set(wc(x), wc(y), wc(z), mat);
+            recur.set(wc(x), wc(y), wc(z), mat);
         }
         for step in 0..4 {
             brute.step();
@@ -417,8 +422,8 @@ mod tests {
             (5, 5, 5),
             (6, 6, 6),
         ] {
-            brute.set(x, y, z, STONE);
-            recur.set(x, y, z, STONE);
+            brute.set(wc(x), wc(y), wc(z), STONE);
+            recur.set(wc(x), wc(y), wc(z), STONE);
         }
         for step in 0..6 {
             brute.step();
@@ -457,8 +462,8 @@ mod tests {
     #[test]
     fn recursive_conserves_population_with_stone() {
         let mut world = World::new(3);
-        world.set(3, 3, 3, STONE);
-        world.set(4, 4, 4, STONE);
+        world.set(wc(3), wc(3), wc(3), STONE);
+        world.set(wc(4), wc(4), wc(4), STONE);
         let pop_before = world.population();
         world.step_recursive();
         assert_eq!(world.population(), pop_before);
@@ -467,7 +472,7 @@ mod tests {
     #[test]
     fn pad_root_preserves_center() {
         let mut world = World::new(3);
-        world.set(2, 3, 4, STONE);
+        world.set(wc(2), wc(3), wc(4), STONE);
         let flat_before = world.flatten();
         let padded = world.pad_root();
         let padded_side = 16usize;
@@ -501,8 +506,8 @@ mod tests {
     fn center_node_extracts_inner_octants() {
         let mut world = World::new(3);
         // Place stone throughout so we have distinct subtrees.
-        world.set(3, 3, 3, STONE);
-        world.set(4, 4, 4, STONE);
+        world.set(wc(3), wc(3), wc(3), STONE);
+        world.set(wc(4), wc(4), wc(4), STONE);
         let center = world.center_node(world.root, 3);
         let center_grid = world.store.flatten(center, 4);
         for z in 0..4usize {
