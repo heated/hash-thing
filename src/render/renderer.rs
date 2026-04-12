@@ -296,6 +296,10 @@ pub struct Renderer {
     // Shared
     uniform_buffer: wgpu::Buffer,
     volume_size: u32,
+    /// Fixed 3D texture side length (set at creation, never resized).
+    /// After world growth `volume_size` may exceed this; `upload_volume`
+    /// skips the write when the grid outgrows the texture.
+    volume_texture_size: u32,
     /// Bytes-per-texel for the volume format. R8Uint = 1, R16Uint = 2. Stored
     /// alongside `volume_size` so `upload_volume` can compute row padding
     /// without re-deriving it from the texture format enum.
@@ -711,6 +715,7 @@ impl Renderer {
             palette_buffer,
             uniform_buffer,
             volume_size,
+            volume_texture_size: volume_size,
             // R16Uint: 2 bytes per texel. Update alongside the `format:` line
             // above if the texture format ever widens again.
             volume_bytes_per_texel: 2,
@@ -752,14 +757,10 @@ impl Renderer {
     /// When this fires, either wire a dedicated `root_level` uniform field
     /// or call a `set_root_level` helper before `upload_svdag`.
     pub fn upload_svdag(&mut self, dag: &super::Svdag) {
-        debug_assert_eq!(
-            self.volume_size,
-            1u32 << dag.root_level,
-            "upload_svdag: renderer.volume_size ({}) must equal 1 << dag.root_level ({}); \
-             shader/CPU step budget would desync otherwise (hash-thing-2w5)",
-            self.volume_size,
-            1u32 << dag.root_level,
-        );
+        // Track the DAG's root level so the shader step budget stays in sync
+        // (hash-thing-2w5). When the world grows (hash-thing-m1f.4), the
+        // root_level increases and volume_size must follow.
+        self.volume_size = 1u32 << dag.root_level;
         let bytes: &[u8] = bytemuck::cast_slice(&dag.nodes);
         let needed = bytes.len() as u64;
 
@@ -967,7 +968,17 @@ impl Renderer {
     /// `data` is one `u16` per voxel in x-major, y-stride, z-slice order.
     /// Row strides are padded up to `COPY_BYTES_PER_ROW_ALIGNMENT` via
     /// `padded_bytes_per_row` — see that helper for the full story.
+    ///
+    /// WARNING (hash-thing-m1f.4): the 3D texture is allocated at
+    /// `Renderer::new()` time with the initial `volume_size`. After world
+    /// growth, `volume_size` tracks the SVDAG root but the texture stays
+    /// the old size. Skip the upload if the grid outgrew the texture.
     pub fn upload_volume(&self, data: &[u16]) {
+        // After world growth, the grid is larger than the fixed 3D texture.
+        // The SVDAG path is the primary renderer; skip the legacy upload.
+        if self.volume_size > self.volume_texture_size {
+            return;
+        }
         let w = self.volume_size;
         let bpt = self.volume_bytes_per_texel;
         let unpadded = w * bpt;

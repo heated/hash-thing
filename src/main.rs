@@ -652,7 +652,7 @@ impl ApplicationHandler for App {
                         // Upload particle billboard data. Positions are in
                         // world coords — normalize to [0,1]³ for the renderer.
                         if let Some(renderer) = &mut self.renderer {
-                            let inv_size = 1.0 / VOLUME_SIZE as f32;
+                            let inv_size = 1.0 / self.world.side() as f32;
                             let particle_data: Vec<[f32; 4]> = self
                                 .entities
                                 .iter()
@@ -750,9 +750,50 @@ impl ApplicationHandler for App {
                             p.pos = player::apply_movement(&self.world, &p.pos, &delta);
                         }
 
+                        // hash-thing-m1f.4: grow the world when the player
+                        // approaches the boundary. Growth triggers when any
+                        // axis is within GROWTH_MARGIN cells of the edge.
+                        // ensure_contains is a no-op when already in-bounds.
+                        if let Some(p) = self.entities.get_mut(pid) {
+                            // Only grow toward +xyz (current root growth
+                            // direction). Negative-direction growth needs a
+                            // different root placement strategy.
+                            const GROWTH_MARGIN: f64 = 8.0;
+                            let side = self.world.side() as f64;
+                            let pos = p.pos;
+                            let needs_growth = pos.iter().any(|&c| c > side - GROWTH_MARGIN);
+                            if needs_growth {
+                                let margin = GROWTH_MARGIN as i64;
+                                let max = [
+                                    sim::WorldCoord(pos[0] as i64 + margin),
+                                    sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
+                                    sim::WorldCoord(pos[2] as i64 + margin),
+                                ];
+                                let old_level = self.world.level;
+                                self.world.ensure_region(
+                                    [sim::WorldCoord(0), sim::WorldCoord(0), sim::WorldCoord(0)],
+                                    max,
+                                );
+                                if self.world.level != old_level {
+                                    log::info!(
+                                        "World grew: level {} → {} (side {})",
+                                        old_level,
+                                        self.world.level,
+                                        self.world.side()
+                                    );
+                                    Self::upload_volume(
+                                        &mut self.renderer,
+                                        &self.world,
+                                        &mut self.svdag,
+                                        &mut self.last_svdag_stats,
+                                    );
+                                }
+                            }
+                        }
+
                         // Sync camera to player position and orientation.
                         if let Some(player) = self.entities.get_mut(pid) {
-                            let inv_size = 1.0 / VOLUME_SIZE as f64;
+                            let inv_size = 1.0 / self.world.side() as f64;
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.camera_target = [
                                     player.pos[0] as f32 * inv_size as f32,
