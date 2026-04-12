@@ -214,13 +214,13 @@ pub mod cpu_trace {
     /// root_level-derived bound is smaller; prevents a tiny analytical bound
     /// from starving demo-sized worlds. Must stay ≥ the pre-2w5 fixed cap
     /// (512) so nothing regresses on the existing regression suite.
-    const MIN_STEP_BUDGET: usize = 1024;
+    pub const MIN_STEP_BUDGET: usize = 1024;
 
     /// Per-cell fudge factor on top of `root_side`. A straight diagonal ray
     /// crosses at most `3 * root_side` cells; real rays re-enter neighbor
     /// cells across boundaries and need headroom. `8 *` is conservative —
     /// instrumentable via the new `exhausted` flag on `TraceResult`.
-    const STEP_BUDGET_FUDGE: usize = 8;
+    pub const STEP_BUDGET_FUDGE: usize = 8;
 
     /// Compute the MAX_STEPS budget for a given `root_level`.
     ///

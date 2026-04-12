@@ -127,4 +127,37 @@ mod wgsl_drift_guard {
             );
         }
     }
+
+    /// hash-thing-2w5 retroactive scout: pins the step-budget constants in
+    /// the SVDAG shader to the CPU oracle in `src/render/svdag.rs`. Both
+    /// sides must agree on `MIN_STEP_BUDGET` and `STEP_BUDGET_FUDGE` so
+    /// that exhaustion behavior (the magenta sentinel) fires at the same
+    /// step count. CPU drift is caught by `step_budget_respects_floor_and_fudge`;
+    /// this guard fills the symmetric shader-only drift gap.
+    #[test]
+    fn wgsl_svdag_step_budget_constants_match_rust() {
+        use crate::render::svdag::cpu_trace;
+
+        let expected_min = format!(
+            "const MIN_STEP_BUDGET: u32 = {}u;",
+            cpu_trace::MIN_STEP_BUDGET
+        );
+        let expected_fudge = format!(
+            "const STEP_BUDGET_FUDGE: u32 = {}u;",
+            cpu_trace::STEP_BUDGET_FUDGE
+        );
+
+        assert!(
+            SVDAG_RAYCAST_WGSL.contains(&expected_min),
+            "svdag_raycast.wgsl must contain `{expected_min}` — \
+             MIN_STEP_BUDGET drifted from the CPU oracle in \
+             svdag.rs::cpu_trace. Update whichever side is wrong."
+        );
+        assert!(
+            SVDAG_RAYCAST_WGSL.contains(&expected_fudge),
+            "svdag_raycast.wgsl must contain `{expected_fudge}` — \
+             STEP_BUDGET_FUDGE drifted from the CPU oracle in \
+             svdag.rs::cpu_trace. Update whichever side is wrong."
+        );
+    }
 }
