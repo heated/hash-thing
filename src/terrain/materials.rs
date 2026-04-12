@@ -24,6 +24,39 @@ pub const DIRT: CellState = Cell::pack(2, 0).raw();
 /// Material 3, metadata 0.
 pub const GRASS: CellState = Cell::pack(3, 0).raw();
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn air_is_zero() {
+        assert_eq!(AIR, 0, "AIR must be CellState 0 — load-bearing invariant");
+    }
+
+    #[test]
+    fn materials_are_distinct() {
+        let mats = [AIR, STONE, DIRT, GRASS];
+        for (i, &a) in mats.iter().enumerate() {
+            for (j, &b) in mats.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "material constants must be distinct");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn material_from_depth_boundary() {
+        assert_eq!(material_from_depth(-1.0), AIR);
+        assert_eq!(material_from_depth(0.0), GRASS);
+        assert_eq!(material_from_depth(0.5), GRASS);
+        assert_eq!(material_from_depth(1.0), DIRT);
+        assert_eq!(material_from_depth(3.9), DIRT);
+        assert_eq!(material_from_depth(4.0), STONE);
+        assert_eq!(material_from_depth(100.0), STONE);
+    }
+}
+
 /// Map "depth below the surface y" to a material.
 ///
 /// `depth` is `surface_y - cell_y`. Above the surface (`depth < 0`) is `AIR`.
