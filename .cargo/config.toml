@@ -2,7 +2,6 @@
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-fuse-ld=/usr/bin/ld"]
 
-# sccache: each worktree keeps its own target/ (no lock contention)
-# but sccache caches compiled artifacts across all of them.
-[build]
-rustc-wrapper = "/usr/local/bin/sccache"
+# sccache: set RUSTC_WRAPPER=sccache in your shell profile for
+# cross-worktree compile caching. Not in config.toml because CI
+# doesn't have sccache installed.
