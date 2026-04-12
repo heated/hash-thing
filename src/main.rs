@@ -257,8 +257,6 @@ impl App {
         last_svdag_stats: &mut (usize, usize, u32),
     ) {
         if let Some(renderer) = renderer {
-            let data = world.flatten();
-            renderer.upload_volume(&data);
             // Incremental rebuild: reuses cached offsets for unchanged subtrees.
             svdag.update(&world.store, world.root, world.level);
             // Compact when >50% of the buffer is stale slots (hash-thing-bx7).
@@ -513,15 +511,6 @@ impl ApplicationHandler for App {
                             // Burning room demo: fire + water + grass walls.
                             self.load_burning_room_demo("Reset burning room demo");
                         }
-                        winit::keyboard::Key::Character("v") => {
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.mode = match renderer.mode {
-                                    render::RenderMode::Flat3D => render::RenderMode::Svdag,
-                                    render::RenderMode::Svdag => render::RenderMode::Flat3D,
-                                };
-                                log::info!("Render mode: {:?}", renderer.mode);
-                            }
-                        }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
                         // cadence.
@@ -636,11 +625,10 @@ impl ApplicationHandler for App {
                         self.entities.update(&self.world, &mut queue);
                         self.world.queue = queue;
                     }
-                    // Time upload as one aggregate (flatten + Svdag::build +
-                    // upload_volume + upload_svdag). CPU-side submit only —
-                    // wgpu queue writes are async. upload_volume takes
-                    // explicit field references (not &mut self) precisely
-                    // so the Timer can coexist with the call.
+                    // Time SVDAG rebuild + GPU upload. CPU-side submit
+                    // only — wgpu queue writes are async. upload_volume
+                    // takes explicit field references (not &mut self)
+                    // precisely so the Timer can coexist with the call.
                     {
                         let _t = self.perf.start("upload_cpu");
                         Self::upload_volume(
@@ -878,7 +866,6 @@ fn main() {
     log::info!("  C: reset terrain with caves (CA post-pass)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
-    log::info!("  V: toggle Flat3D / SVDAG rendering");
     log::info!("  P: dump perf + memory summary (on demand)");
     log::info!("  Esc: quit");
 

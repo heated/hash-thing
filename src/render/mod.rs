@@ -1,7 +1,7 @@
 mod renderer;
 mod svdag;
 
-pub use renderer::{FrameOutcome, RenderMode, Renderer};
+pub use renderer::{FrameOutcome, Renderer};
 pub use svdag::Svdag;
 
 #[cfg(test)]
@@ -12,17 +12,11 @@ mod wgsl_drift_guard {
     //! same change. See comments next to `material_color` in each shader.
     use crate::octree::Cell;
 
-    const RAYCAST_WGSL: &str = include_str!("raycast.wgsl");
     const SVDAG_RAYCAST_WGSL: &str = include_str!("svdag_raycast.wgsl");
 
     #[test]
     fn wgsl_metadata_shift_matches_rust() {
         let expected = format!("packed >> {}u", Cell::METADATA_BITS);
-        assert!(
-            RAYCAST_WGSL.contains(&expected),
-            "raycast.wgsl must contain `{expected}` — Cell::METADATA_BITS \
-             drifted from the hardcoded shift. Update the shader."
-        );
         assert!(
             SVDAG_RAYCAST_WGSL.contains(&expected),
             "svdag_raycast.wgsl must contain `{expected}` — \
@@ -135,12 +129,6 @@ mod wgsl_drift_guard {
     #[test]
     fn wgsl_material_palette_uses_buffer_lookup() {
         let expected = "palette[mat_id].xyz";
-        assert!(
-            RAYCAST_WGSL.contains(expected),
-            "raycast.wgsl must contain `{expected}` — material_color \
-             should read from the GPU palette buffer, not a hardcoded switch \
-             (hash-thing-5bb.7)."
-        );
         assert!(
             SVDAG_RAYCAST_WGSL.contains(expected),
             "svdag_raycast.wgsl must contain `{expected}` — material_color \
