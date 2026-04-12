@@ -20,10 +20,15 @@
 //!
 //! Step results are memoized by (NodeId, origin, parity) so identical subtrees at
 //! the same world-space position are computed only once per generation.
-//! After each step, compaction remaps NodeIds; the cache entries are translated
-//! through the remap table rather than cleared. Entries for GC'd nodes are
-//! dropped automatically. Since parity alternates 0/1, cache hits occur every
-//! OTHER frame for stable subtrees (parity match on frame N+2, not N+1).
+//! Since parity alternates 0/1, cache hits occur every OTHER frame for stable
+//! subtrees (parity match on frame N+2, not N+1). After both parities are
+//! cached, warm-frame stepping is near-instant for inert worlds.
+//!
+//! **Cache-preserving compaction (m1f.15.4):** The recursive descent builds
+//! intermediate nodes (27 per recursive level) that become cache keys but are
+//! NOT reachable from the step result. When compaction fires, cache keys are
+//! passed as extra roots to `compacted_with_remap_keeping`, keeping them alive
+//! through GC so cache entries survive.
 
 use super::world::World;
 use crate::octree::node::octant_index;
@@ -95,10 +100,14 @@ impl World {
         self.maybe_compact();
     }
 
-    /// Compact the store when it has grown past 2× its post-compaction size.
-    /// Deferred compaction (m1f.14) lets intermediate nodes from recursive
-    /// descent survive across frames, enabling cache hits at every recursion
-    /// level. Periodic compaction bounds memory growth.
+    /// Compact the store when it has grown past 2× its post-compaction size,
+    /// keeping cache-referenced intermediate nodes alive (m1f.15.4).
+    ///
+    /// Deferred compaction lets intermediate nodes from recursive descent
+    /// survive across frames, enabling cache hits. When compaction fires,
+    /// cache keys are passed as extra roots so they survive GC — without
+    /// this, every compaction destroys the cache and forces full
+    /// recomputation.
     fn maybe_compact(&mut self) {
         let current_size = self.store.stats();
         if self.store_size_at_last_compact == 0 {
@@ -108,11 +117,30 @@ impl World {
         if current_size <= self.store_size_at_last_compact * 2 {
             return;
         }
-        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
+        let extra_roots = self.cache_referenced_nodes();
+        let (new_store, new_root, remap) = self
+            .store
+            .compacted_with_remap_keeping(self.root, &extra_roots);
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
         self.store_size_at_last_compact = self.store.stats();
+    }
+
+    /// Collect cache key NodeIds that must survive compaction.
+    /// Cache keys are intermediate nodes not reachable from the world root;
+    /// cache values are step results that ARE reachable from root, so only
+    /// keys need to be kept alive as extra roots.
+    fn cache_referenced_nodes(&self) -> Vec<NodeId> {
+        let mut nodes =
+            Vec::with_capacity(self.hashlife_cache.len() + self.hashlife_macro_cache.len());
+        for &(node, _, _) in self.hashlife_cache.keys() {
+            nodes.push(node);
+        }
+        for &(node, _, _) in self.hashlife_macro_cache.keys() {
+            nodes.push(node);
+        }
+        nodes
     }
 
     fn has_block_rule_cells(&mut self) -> bool {

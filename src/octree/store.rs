@@ -497,14 +497,27 @@ impl NodeStore {
         &self,
         root: NodeId,
     ) -> (NodeStore, NodeId, FxHashMap<NodeId, NodeId>) {
+        self.compacted_with_remap_keeping(root, &[])
+    }
+
+    /// Compact, keeping alive all nodes referenced by `extra_roots` in
+    /// addition to those reachable from `root`. Used to preserve hashlife
+    /// cache intermediate nodes through GC (m1f.15.4).
+    pub fn compacted_with_remap_keeping(
+        &self,
+        root: NodeId,
+        extra_roots: &[NodeId],
+    ) -> (NodeStore, NodeId, FxHashMap<NodeId, NodeId>) {
         let mut dst = NodeStore::new();
         let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
-        // Pre-seed EMPTY as a perf short-circuit. Note: this is NOT
-        // semantically load-bearing — `dst.leaf(0)` already dedups to
-        // `NodeId::EMPTY` via the hash-cons path — but it skips the
-        // recursive walk whenever we hit an empty subtree.
+        // Pre-seed EMPTY as a perf short-circuit. `dst.leaf(0)` already
+        // dedups to `NodeId::EMPTY` via hash-cons, but this skips the
+        // recursive walk for empty subtrees.
         remap.insert(NodeId::EMPTY, NodeId::EMPTY);
         let new_root = clone_reachable(self, &mut dst, &mut remap, root);
+        for &extra in extra_roots {
+            clone_reachable(self, &mut dst, &mut remap, extra);
+        }
         (dst, new_root, remap)
     }
 }
