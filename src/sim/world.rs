@@ -672,7 +672,7 @@ mod tests {
         w.seed_burning_room();
         assert!(w.population() > 0);
         let grid = w.flatten();
-        let has = |mat: CellState| grid.iter().any(|&c| c == mat);
+        let has = |mat: CellState| grid.contains(&mat);
         assert!(has(STONE), "room must have stone ceiling");
         assert!(has(DIRT), "room must have dirt floor");
         assert!(has(GRASS), "room must have grass walls");
