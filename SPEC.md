@@ -252,11 +252,14 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **Octree extraction primitives (`6gf.6`)**: `extract_neighborhood` (26 Moore neighbors, toroidal wrap), `extract_block_2x2x2` (Margolus partition extraction), `flatten_region` (arbitrary AABB sub-box). Foundation for recursive Hashlife step.
 - ✅ **Lazy root expansion (`e9h`, `5qp`)**: `World::ensure_contains(x,y,z)` grows root octree by wrapping in bigger parent nodes. `ensure_region([min],[max])` is the batch form. OOB bounds checking on set_cell/get_cell (`819`) also landed.
 - ✅ **Out-of-bounds coordinate safety (`819`, `fb5`)**: `set_cell` panics on OOB with `#[track_caller]`; `get_cell` silently returns 0 for OOB (no storage growth). 7 boundary tests.
-- ✅ **Terrain generation (epic `3fq`, partial)**
+- ✅ **Terrain generation (epic `3fq`, complete 10/10)**
   - Heightmap-based recursive octree gen with proof-based collapse (sky/deep-stone short-circuit)
   - Cave CA post-pass (B13/S13 majority-vote, stone-only mask, surface-preserving)
   - Dungeon carving (3fq.3): room placement + L-shaped corridors in deep stone, `DungeonParams` wired through `TerrainParams` and `seed_terrain`. Key binding: D (caves + dungeons)
   - Per-phase perf tracking in GenStats: gen_region_us, cave_us, dungeon_us, node counts, noise bottleneck estimate (3fq.5)
+  - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap + caves + dungeons for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
+- ✅ **RealizedRegion value type (`ica`)**: `RealizedRegion { origin: [i64; 3], level: u32 }` encapsulates the world's spatial extent. `contains()`, `side()`, `octant_of()`, `Display` impl. `World::region()` returns a derived view.
+- ✅ **WorldCoord/LocalCoord newtypes (`7zc`)**: `WorldCoord(i64)` for world-space, `LocalCoord(u64)` for octree-internal. Compiler-enforced separation prevents the coordinate-mixing bug class that 819 fixed. All World API methods migrated.
 - ✅ **CI + release (epic `xb7`, 3/6)**
   - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets`, gating `cargo fmt --check` (k5r), gating `cargo clippy -- -D warnings` (00f)
   - `xb7.3` Linux AppImage via linuxdeploy (packaging/linux/ desktop entry + placeholder icon)
@@ -264,14 +267,14 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Next up (P1, from bd)
 
-- ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step (in progress, flint), `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). ✅ `6gf.5` store gap-fill tests, ✅ `6gf.6` extraction primitives. Currently we flatten-then-step; this is the biggest single perf unlock.
-- ☐ **Material-type CA continuation** (epic `1v0`): ✅ `1v0.1`-`1v0.4` landed. In progress: `1v0.5` gravity/fluid flow (cairn). Remaining: `1v0.6` entity system, `1v0.7` fire/temperature demo, `1v0.8` cell/block granularity, `1v0.9` mutation channel, `1v0.10` player entity.
+- ☐ **Recursive Hashlife stepping** (epic `6gf`, 3/6): ✅ `6gf.1` recursive step landed (spark), ✅ `6gf.5` store gap-fill tests, ✅ `6gf.6` extraction primitives. Next: `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading. Memoization is the biggest single perf unlock.
+- ☐ **Material-type CA continuation** (epic `1v0`, 15/18): ✅ `1v0.1`-`1v0.5`, `1v0.7`, `1v0.9` landed. Remaining: `1v0.6` entity system (unblocked), `1v0.8` cell/block granularity (design gate), `1v0.10` player entity (blocked on 1v0.6 + 1v0.8).
 - ☐ **SVDAG continuation**: ✅ `5bb.4` per-leaf material attributes. ✅ `5bb.5` incremental edit uploads. ✅ `bx7` stale-slot compaction. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
 ### Later (P2+, from bd)
 
 - ☐ Foundations & determinism (`h34`): retire GoL3D scaffolding (`h34.4` — blocked on 1v0.4 Margolus landing). ✅ `h34.5` iterative clone_reachable (8m7 landed it)
-- ☐ Terrain generation & infinite worlds (`3fq`): ✅ heightmap gen + cave CA + dungeon carving (`3fq.3`). ✅ lazy root expansion (`e9h` + `5qp`). ✅ `3fq.5` terrain-gen perf tracking. Remaining: `3fq.4` infinite world chunking (blocked on lazy expansion design).
+- ✅ Terrain generation & infinite worlds (`3fq`): complete (10/10). Heightmap gen + cave CA + dungeon carving + lazy terrain expansion + perf tracking.
 - ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), ✅ Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, in progress), Steam (`xb7.6`, P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 - ☐ GPU palette buffer (`ll6`): upload `MaterialRegistry::color_palette_rgba()` as uniform buffer instead of hardcoded shader switch. Eliminates palette drift class entirely.
