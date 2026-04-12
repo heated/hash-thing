@@ -331,9 +331,11 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Next up (P1, from bd)
 
-- ☐ **Recursive Hashlife stepping** (epic `6gf`, 11/13): ✅ `6gf.1` recursive step, ✅ `6gf.2` memoization, ✅ `6gf.3` correctness harness, ✅ `6gf.4` Margolus parity, ✅ `6gf.5`-`6gf.6` tests + primitives, ✅ `6gf.7` exponential time-skip (macro step), ✅ `6gf.8` main loop switchover, ✅ `6gf.9` timing comparison, ✅ `6gf.10` defensive hardening (overflow guards, assert promotion), ✅ `6gf.11` deep recursion tests (level 5), ✅ `6gf.12` boundary BC analysis (closed not-a-bug). In progress: `6gf.13` remove vestigial step_cache (edward).
+- ✅ **Recursive Hashlife stepping** (epic `6gf`, complete): all 13 beads landed including `6gf.8` main loop switchover, `6gf.10` defensive hardening, `6gf.11` deep recursion tests, `6gf.13` vestigial step_cache removal.
 - ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
 - ✅ **SVDAG continuation**: `5bb.4` per-leaf material attributes, `5bb.5` incremental edit uploads, `bx7` stale-slot compaction, `ll6` GPU palette buffer. Remaining: `5bb.6` SSVDAG/LOD research (P4).
+
+- ☐ **Core engine validation** (epic `m1f`): ✅ `m1f.2` SVDAG benchmark, ✅ `m1f.3` edit propagation measurement, ✅ `m1f.4` infinite world growth (player-triggered boundary expansion), ✅ `m1f.8` SVDAG depth 14→20 (1M^3 leaf grid). Remaining: `m1f.5` incremental SVDAG validation (in progress), `m1f.6` new CA rules, `m1f.7` end-to-end demo polish.
 
 ### Later (P2+, from bd)
 
