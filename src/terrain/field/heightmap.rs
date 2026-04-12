@@ -89,3 +89,111 @@ impl RegionField for HeightmapField {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic field with known bounds for testing classify_box.
+    /// base_y=32, amplitude=8 → surface ∈ [24, 40].
+    fn test_field() -> HeightmapField {
+        HeightmapField {
+            seed: 42,
+            base_y: 32.0,
+            amplitude: 8.0,
+            wavelength: 16.0,
+            octaves: 2,
+        }
+    }
+
+    #[test]
+    fn sky_box_returns_air() {
+        let f = test_field();
+        // surface_max = 32 + 8 = 40, SURFACE_MARGIN = 2 → threshold = 42.
+        // Box at y_min=42: entirely above maximum surface.
+        assert_eq!(
+            f.classify_box([0, 42, 0], 2),
+            Some(AIR),
+            "box above surface_max + margin must be AIR",
+        );
+    }
+
+    #[test]
+    fn sky_box_just_below_threshold_returns_none() {
+        let f = test_field();
+        // Box at y_min=41, size=4 (size_log2=2) → y in [41, 45).
+        // Threshold is 42 (surface_max + margin). y_min=41 < 42 → not provably AIR.
+        assert_eq!(
+            f.classify_box([0, 41, 0], 2),
+            None,
+            "box with y_min below sky threshold must not short-circuit",
+        );
+    }
+
+    #[test]
+    fn deep_stone_box_returns_stone() {
+        let f = test_field();
+        // surface_min = 32 - 8 = 24, DEPTH_MARGIN = 4 → threshold = 20.
+        // Box y_max must be ≤ 20. With size_log2=2 (size=4): origin y=16 → y_max=20.
+        assert_eq!(
+            f.classify_box([0, 16, 0], 2),
+            Some(STONE),
+            "box fully below surface_min - DEPTH_MARGIN must be STONE",
+        );
+    }
+
+    #[test]
+    fn deep_stone_box_just_above_threshold_returns_none() {
+        let f = test_field();
+        // origin y=17, size=4 → y_max=21 > 20 → not provably all STONE.
+        assert_eq!(
+            f.classify_box([0, 17, 0], 2),
+            None,
+            "box with y_max above deep-stone threshold must not short-circuit",
+        );
+    }
+
+    #[test]
+    fn surface_straddling_box_returns_none() {
+        let f = test_field();
+        // Box around y=32 (base_y) — clearly straddles the surface.
+        assert_eq!(
+            f.classify_box([0, 30, 0], 3),
+            None,
+            "box straddling the surface band must return None",
+        );
+    }
+
+    #[test]
+    fn large_sky_box_collapses() {
+        let f = test_field();
+        // size_log2=5 (size=32), origin y=48 → y_min=48 ≥ 42 → AIR.
+        assert_eq!(
+            f.classify_box([0, 48, 0], 5),
+            Some(AIR),
+            "large box well above surface must collapse to AIR",
+        );
+    }
+
+    #[test]
+    fn large_deep_box_collapses() {
+        let f = test_field();
+        // size_log2=3 (size=8), origin y=0 → y_max=8 ≤ 20 → STONE.
+        assert_eq!(
+            f.classify_box([0, 0, 0], 3),
+            Some(STONE),
+            "large box well below surface must collapse to STONE",
+        );
+    }
+
+    #[test]
+    fn sample_agrees_with_surface_y() {
+        let f = test_field();
+        // A point well above the surface should be AIR.
+        let high = f.sample([10, 50, 10]);
+        assert_eq!(high, AIR, "point at y=50 must be AIR");
+        // A point well below should be STONE.
+        let deep = f.sample([10, 0, 10]);
+        assert_eq!(deep, STONE, "point at y=0 must be STONE");
+    }
+}
