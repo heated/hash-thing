@@ -1,3 +1,8 @@
+---
+name: review-tiers
+description: Select the right code review tier based on diff stats and risk signals
+---
+
 # Review Tier Selection
 
 Select the right code review tier based on diff stats and risk signals. Use when deciding review tier for /ship, /code_review, Rita patrols, or any code review.

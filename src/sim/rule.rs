@@ -318,14 +318,33 @@ mod tests {
     }
 
     #[test]
-    fn noop_rule_preserves_center_exactly() {
+    fn noop_rule_is_identity_for_varied_cells() {
         let rule = NoopRule;
-        let neighbors = [ALIVE; 26];
-        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::EMPTY);
-        assert_eq!(
-            rule.step_cell(Cell::pack(11, 1), &neighbors),
-            Cell::pack(11, 1)
-        );
+        let neighbor_sets = [[Cell::EMPTY; 26], [ALIVE; 26], neighbors_with_alive(7), {
+            let mut mixed = [Cell::EMPTY; 26];
+            mixed[0] = Cell::pack(2, 5);
+            mixed[1] = Cell::pack(9, 1);
+            mixed[2] = Cell::pack(Cell::MAX_MATERIAL, Cell::MAX_METADATA);
+            mixed
+        }];
+
+        let centers = [
+            Cell::EMPTY,
+            ALIVE,
+            Cell::pack(11, 1),
+            Cell::pack(27, 42),
+            Cell::pack(Cell::MAX_MATERIAL, Cell::MAX_METADATA),
+        ];
+
+        for neighbors in neighbor_sets {
+            for center in centers {
+                assert_eq!(
+                    rule.step_cell(center, &neighbors),
+                    center,
+                    "NoopRule must leave {center:?} unchanged"
+                );
+            }
+        }
     }
 
     #[test]
@@ -353,6 +372,32 @@ mod tests {
     }
 
     #[test]
+    fn fire_rule_quencher_beats_fuel_and_extinguishes() {
+        let rule = FireRule {
+            fuel_material: 3,
+            quencher_material: 5,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(3);
+        neighbors[1] = mat(5);
+
+        assert_eq!(rule.step_cell(Cell::pack(4, 9), &neighbors), Cell::EMPTY);
+    }
+
+    #[test]
+    fn fire_rule_preserves_center_payload_when_fueled() {
+        let rule = FireRule {
+            fuel_material: 3,
+            quencher_material: 5,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(3);
+        let tagged_fire = Cell::pack(4, 9);
+
+        assert_eq!(rule.step_cell(tagged_fire, &neighbors), tagged_fire);
+    }
+
+    #[test]
     fn water_rule_reacts_to_configured_neighbor() {
         let rule = WaterRule {
             reactive_material: 4,
@@ -361,6 +406,32 @@ mod tests {
         let mut neighbors = [Cell::EMPTY; 26];
         neighbors[0] = mat(4);
         assert_eq!(rule.step_cell(mat(5), &neighbors), mat(1));
+    }
+
+    #[test]
+    fn water_rule_preserves_center_without_reactive_neighbor() {
+        let rule = WaterRule {
+            reactive_material: 4,
+            reaction_product: Cell::pack(1, 7),
+        };
+        let center = Cell::pack(5, 11);
+
+        assert_eq!(rule.step_cell(center, &[Cell::EMPTY; 26]), center);
+    }
+
+    #[test]
+    fn water_rule_returns_exact_configured_product() {
+        let rule = WaterRule {
+            reactive_material: 4,
+            reaction_product: Cell::pack(8, 13),
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(4);
+
+        assert_eq!(
+            rule.step_cell(Cell::pack(5, 2), &neighbors),
+            Cell::pack(8, 13)
+        );
     }
 
     #[test]

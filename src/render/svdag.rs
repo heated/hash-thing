@@ -74,6 +74,12 @@ pub struct Svdag {
     pub node_count: usize,
 }
 
+impl Default for Svdag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Svdag {
     /// Empty builder. Slot 0 is pre-reserved for the root offset header.
     pub fn new() -> Self {

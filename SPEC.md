@@ -230,12 +230,19 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
   - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) with comprehensive test suite (~1700 lines)
   - **Bug fixes**: octant_of corner-exit tiebreak (6hd), inside-leaf exit-face normal (2nd), far-camera Laine-Karras entry clamp (27m), root_side-scaled step budget with magenta exhaustion sentinel (2w5), analytical entry-face normals (rv4)
-  - **CPU/GPU drift guards** (`src/render/mod.rs::wgsl_drift_guard`): 5 textual pins covering METADATA_BITS shift, octant_of tiebreak (6hd), entry-face normal cascade (rv4), inside-leaf fallback (2nd), traversal constants MAX_DEPTH/MIN_STEP_BUDGET/STEP_BUDGET_FUDGE (2w5)
+  - **CPU/GPU drift guards** (`src/render/mod.rs::wgsl_drift_guard`): 6 textual pins covering METADATA_BITS shift, octant_of tiebreak (6hd), entry-face normal cascade (rv4), inside-leaf fallback (2nd), traversal constants MAX_DEPTH/MIN_STEP_BUDGET/STEP_BUDGET_FUDGE (2w5), material palette vs registry (xev)
   - **Property tests**: midpoint-exact corner fuzz (6cc, 500 cases), forward-progress invariants, 27-ray sweep at MAX_DEPTH, far-camera stall regression, budget saturation
   - GPU timestamp queries for render timing (6x3), graceful TIMESTAMP_QUERY fallback
   - FrameOutcome enum with Occluded suppression, no hot-spin (8jp)
   - 31-bit node-count overflow assertion at write time (x9r)
   - `padded_bytes_per_row` helper for COPY_BYTES_PER_ROW_ALIGNMENT (mys)
+  - Material palette sync with registry (xev): both shaders now match `MaterialRegistry::terrain_defaults()` colors
+- ✅ **Material-type CA (epic `1v0`, partial — 3/10+)**
+  - `1v0.1` 16-bit tagged cell: `Cell` packs 10-bit `material_id` + 6-bit `metadata` into `u16`. `METADATA_BITS=6` is pinned by drift guard in both shaders.
+  - `1v0.2` `MaterialRegistry` with per-material rules, visual properties (label, base_color, texture_ref), physical properties (density, flammability, conductivity). `terrain_defaults()` registers air/stone/dirt/grass/fire/water. `gol_smoke()` bridges legacy GoL presets. GPU palette export via `color_palette_rgba()`.
+  - `1v0.3` Per-material `CaRule` dispatch in `World::step`: `trait CaRule { fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell; }`. `NoopRule` for static materials, `FireRule` (spreads from fuel, quenched by water), `WaterRule` (reacts with fire → stone). No central interaction table.
+  - In progress: `1v0.4` Margolus 2×2×2 movement phase (claimed by onyx)
+- ✅ **Hash-cons compaction (`88d`)**: `NodeStore::compacted(root)` rebuilds reachable graph into a fresh store via iterative post-order traversal (`8m7`). Called after every `commit_step` and on `seed_terrain` epoch boundaries.
 - ✅ **Foundations progress (epic `h34`, 3/4)**
   - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
   - `h34.2` determinism audit: walked every file in sim + terrain-gen paths, no global PRNG / scan-order dependencies found, two minor follow-ups filed and closed (`99e` step_cache rule_id doc fix, `c6k` seed_center migrating to cell_rand_bool). Audit notes in `.ship-notes/ship-h34.2-determinism-audit.md`
@@ -253,16 +260,16 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 ### Next up (P1, from bd)
 
 - ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step, `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). Currently we flatten-then-step; this is the biggest single perf unlock.
-- ☐ **Material-type CA** (epic `1v0`: `1v0.1` 16-bit tagged cell, `1v0.2` material registry, `1v0.3` hand-authored interaction table, `1v0.4` Margolus movement phase). Replaces the GoL3D scaffolding.
-- ☐ **SVDAG continuation**: ✅ `5bb.4` per-leaf material attributes (16-bit CellState already flows through DAG leaves; shader decodes material_id). ✅ `5bb.5` incremental edit uploads landed (persistent `FxHashMap<[u32; 9], u32>` content cache, append-only buffer with root-offset header, watermark-based tail uploads). ✅ `bx7` stale-slot compaction (rebuild when >50% unreachable). Remaining: `5bb.6` SSVDAG/LOD research (P4).
-- ☐ **Hash-cons compaction (`88d`)**: NodeStore is currently append-only — every dead generation's subtrees are retained forever. Plan in flight (`plan-flint-88d.md`, fresh-store rebuild via `NodeStore::compacted`).
+- ☐ **Material-type CA continuation** (epic `1v0`): ✅ `1v0.1` 16-bit tagged cell, ✅ `1v0.2` material registry, ✅ `1v0.3` per-material CaRule dispatch. In progress: `1v0.4` Margolus 2×2×2 movement phase. Remaining: `1v0.5` gravity/fluid flow, `1v0.6` entity system, `1v0.7` fire/temperature demo, `1v0.8` cell/block granularity, `1v0.9` mutation channel, `1v0.10` player entity.
+- ☐ **SVDAG continuation**: ✅ `5bb.4` per-leaf material attributes. ✅ `5bb.5` incremental edit uploads. ✅ `bx7` stale-slot compaction. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
 ### Later (P2+, from bd)
 
-- ☐ Foundations & determinism (`h34`): retire GoL3D scaffolding (`h34.4` — blocked on 1v0 material CA landing)
-- ☐ Terrain generation & infinite worlds (`3fq`): multi-res `gen(node_region) → NodeId`, cave smoothing, dungeon carving, lazy root expansion. ✅ `3fq.5` terrain-gen perf tracking (per-phase timing: gen_region_us, cave_us, node counts).
-- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), ✅ Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, design-gated), Steam (`xb7.6`, P4 deferred)
+- ☐ Foundations & determinism (`h34`): retire GoL3D scaffolding (`h34.4` — blocked on 1v0.4 Margolus landing). ✅ `h34.5` iterative clone_reachable (8m7 landed it)
+- ☐ Terrain generation & infinite worlds (`3fq`): ✅ heightmap gen + cave CA post-pass. Remaining: `3fq.3` dungeon carving (in progress), `3fq.4` lazy root expansion (blocked on e9h/819). ✅ `3fq.5` terrain-gen perf tracking.
+- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), ✅ Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, in progress), Steam (`xb7.6`, P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
+- ☐ GPU palette buffer (`ll6`): upload `MaterialRegistry::color_palette_rgba()` as uniform buffer instead of hardcoded shader switch. Eliminates palette drift class entirely.
 
 ---
 

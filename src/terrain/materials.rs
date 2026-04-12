@@ -373,6 +373,18 @@ mod tests {
     }
 
     #[test]
+    fn terrain_defaults_register_known_materials_and_leave_unknown_missing() {
+        let registry = MaterialRegistry::terrain_defaults();
+
+        assert_eq!(registry.entry(AIR_MATERIAL_ID).unwrap().visual.label, "air");
+        assert_eq!(
+            registry.entry(WATER_MATERIAL_ID).unwrap().visual.label,
+            "water"
+        );
+        assert!(registry.entry(42).is_none());
+    }
+
+    #[test]
     fn terrain_defaults_export_gpu_palette() {
         let registry = MaterialRegistry::terrain_defaults();
         let palette = registry.color_palette_rgba();
@@ -391,9 +403,12 @@ mod tests {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
         registry.insert(300, entry_with(rule_id, [0.9, 0.2, 0.1, 1.0]));
+        let palette = registry.color_palette_rgba();
 
         assert_eq!(registry.entry(300).unwrap().rule_id, rule_id);
-        assert_eq!(registry.color_palette_rgba().len(), 301);
+        assert_eq!(palette.len(), 301);
+        assert_eq!(palette[299], [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(palette[300], [0.9, 0.2, 0.1, 1.0]);
     }
 
     #[test]
@@ -418,6 +433,13 @@ mod tests {
     }
 
     #[test]
+    fn rule_for_cell_returns_none_for_unregistered_material() {
+        let registry = MaterialRegistry::terrain_defaults();
+
+        assert!(registry.rule_for_cell(Cell::pack(42, 0)).is_none());
+    }
+
+    #[test]
     fn gol_smoke_overrides_air_and_alive_dispatch() {
         let registry = MaterialRegistry::gol_smoke(GameOfLife3D::rule445());
         let neighbors = [Cell::pack(STONE_MATERIAL_ID, 0); 26];
@@ -435,6 +457,27 @@ mod tests {
                 .unwrap()
                 .step_cell(Cell::pack(STONE_MATERIAL_ID, 0), &neighbors),
             Cell::EMPTY,
+        );
+    }
+
+    #[test]
+    fn gol_smoke_preserves_non_overridden_material_dispatch() {
+        let registry = MaterialRegistry::gol_smoke(GameOfLife3D::rule445());
+        let fire_neighbors = [Cell::pack(FIRE_MATERIAL_ID, 0); 26];
+
+        assert_eq!(
+            registry
+                .rule_for_cell(Cell::pack(WATER_MATERIAL_ID, 0))
+                .unwrap()
+                .step_cell(Cell::pack(WATER_MATERIAL_ID, 0), &fire_neighbors),
+            Cell::pack(STONE_MATERIAL_ID, 0),
+        );
+        assert_eq!(
+            registry
+                .rule_for_cell(Cell::pack(GRASS_MATERIAL_ID, 7))
+                .unwrap()
+                .step_cell(Cell::pack(GRASS_MATERIAL_ID, 7), &fire_neighbors),
+            Cell::pack(GRASS_MATERIAL_ID, 7),
         );
     }
 }

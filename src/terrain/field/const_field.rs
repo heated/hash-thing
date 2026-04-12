@@ -2,7 +2,7 @@
 //! oracle: the builder recursing against `ConstField { AIR }` must produce
 //! exactly `store.uniform(level, AIR)`.
 
-// Test-only fixture today; will become a real consumer once 1v0.1 lands.
+// Test-only fixture — the trivial RegionField for builder regression tests.
 #![allow(dead_code)]
 
 use super::RegionField;
