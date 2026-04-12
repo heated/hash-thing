@@ -1214,6 +1214,72 @@ mod tests {
         source_index(3, 0);
     }
 
+    #[test]
+    fn remap_caches_preserves_reachable_entries_and_drops_unreachable_ones() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), STONE);
+
+        let reachable = world.root;
+        let unreachable = world.store.uniform(1, STONE);
+        assert_ne!(
+            reachable, unreachable,
+            "fixture requires a non-reachable node distinct from the world root"
+        );
+
+        // Seed all four caches with one reachable and one unreachable entry
+        world.hashlife_cache.insert((reachable, 0), reachable);
+        world.hashlife_cache.insert((unreachable, 1), unreachable);
+        world
+            .hashlife_macro_cache
+            .insert((reachable, 11), reachable);
+        world
+            .hashlife_macro_cache
+            .insert((unreachable, 12), unreachable);
+        world.hashlife_inert_cache.insert(reachable, None);
+        world.hashlife_inert_cache.insert(unreachable, Some(STONE));
+        world.hashlife_all_inert_cache.insert(reachable, true);
+        world.hashlife_all_inert_cache.insert(unreachable, false);
+
+        let (new_store, new_root, remap) = world.store.compacted_with_remap(world.root);
+        let &new_reachable = remap
+            .get(&reachable)
+            .expect("reachable root must survive compaction");
+        assert_eq!(new_reachable, new_root);
+        assert!(
+            !remap.contains_key(&unreachable),
+            "unreachable cache fixture node should be dropped by compaction"
+        );
+
+        world.store = new_store;
+        world.root = new_root;
+        world.remap_caches(&remap);
+
+        // hashlife_cache: only reachable entry survives
+        assert_eq!(world.hashlife_cache.len(), 1);
+        assert_eq!(
+            world.hashlife_cache.get(&(new_reachable, 0)),
+            Some(&new_reachable)
+        );
+
+        // hashlife_macro_cache: only reachable entry survives
+        assert_eq!(world.hashlife_macro_cache.len(), 1);
+        assert_eq!(
+            world.hashlife_macro_cache.get(&(new_reachable, 11)),
+            Some(&new_reachable)
+        );
+
+        // hashlife_inert_cache: only reachable entry survives
+        assert_eq!(world.hashlife_inert_cache.len(), 1);
+        assert_eq!(world.hashlife_inert_cache.get(&new_reachable), Some(&None));
+
+        // hashlife_all_inert_cache: only reachable entry survives
+        assert_eq!(world.hashlife_all_inert_cache.len(), 1);
+        assert_eq!(
+            world.hashlife_all_inert_cache.get(&new_reachable),
+            Some(&true)
+        );
+    }
+
     /// Inert world cache behavior (m1f.15.1): a stone-only world is immediately
     /// at fixed point. The world state never changes.
     ///
