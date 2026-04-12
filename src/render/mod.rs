@@ -31,6 +31,37 @@ mod wgsl_drift_guard {
         );
     }
 
+    /// hash-thing-rv4 retroactive scout: pins the entry-face normal cascade
+    /// in the SVDAG shader to the CPU oracle in `src/render/svdag.rs`.
+    /// The rv4 fix added analytical face normals via `argmax(tmin_v)`
+    /// with `>=` cascade ties (x then y then z); the comparator shape
+    /// AND the `-sign(rd.*)` flip direction must stay byte-equivalent
+    /// with the CPU oracle. CPU drift is caught by
+    /// `leaf_hit_normal_corner_tiebreak_is_unit_face`; this guard fills
+    /// the symmetric shader-only drift gap. Filed as scout work after
+    /// hash-thing-2nd witnessed the same gap pattern twice (6hd + 2nd).
+    #[test]
+    fn wgsl_svdag_entry_face_normal_cascade_matches_rust() {
+        let expected_lines = [
+            "} else if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {",
+            "normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);",
+            "} else if tmin_v.y >= tmin_v.z {",
+            "normal = vec3<f32>(0.0, -sign(rd.y), 0.0);",
+            "normal = vec3<f32>(0.0, 0.0, -sign(rd.z));",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` verbatim — \
+                 the entry-face normal cascade drifted from the CPU \
+                 oracle in svdag.rs::cpu_trace::raycast_with_budget. \
+                 Both sides must use `>=` ties on `argmax(tmin_v)` with \
+                 `-sign(rd.*)` on the entry axis (hash-thing-rv4). \
+                 Update whichever side is wrong so they stay byte-equivalent."
+            );
+        }
+    }
+
     /// hash-thing-2nd: pins the inside-leaf face-normal fallback in the
     /// SVDAG shader to the CPU oracle in `src/render/svdag.rs`. When the
     /// ray origin sits inside a filled voxel, the entry-face picker
@@ -95,5 +126,47 @@ mod wgsl_drift_guard {
                  side is wrong so they stay byte-equivalent."
             );
         }
+    }
+
+    /// hash-thing-2w5 retroactive scout: pins the traversal constants in
+    /// the SVDAG shader to the CPU oracle in `src/render/svdag.rs`. Both
+    /// sides must agree on `MAX_DEPTH`, `MIN_STEP_BUDGET`, and
+    /// `STEP_BUDGET_FUDGE` so that stack depth, exhaustion behavior (the
+    /// magenta sentinel), and step counts all fire identically. CPU drift
+    /// is caught by `step_budget_respects_floor_and_fudge` and the
+    /// MAX_DEPTH-dependent nudge tests; this guard fills the symmetric
+    /// shader-only drift gap.
+    #[test]
+    fn wgsl_svdag_traversal_constants_match_rust() {
+        use crate::render::svdag::cpu_trace;
+
+        let expected_depth = format!("const MAX_DEPTH: u32 = {}u;", cpu_trace::MAX_DEPTH);
+        let expected_min = format!(
+            "const MIN_STEP_BUDGET: u32 = {}u;",
+            cpu_trace::MIN_STEP_BUDGET
+        );
+        let expected_fudge = format!(
+            "const STEP_BUDGET_FUDGE: u32 = {}u;",
+            cpu_trace::STEP_BUDGET_FUDGE
+        );
+
+        assert!(
+            SVDAG_RAYCAST_WGSL.contains(&expected_depth),
+            "svdag_raycast.wgsl must contain `{expected_depth}` — \
+             MAX_DEPTH drifted from the CPU oracle in \
+             svdag.rs::cpu_trace. Update whichever side is wrong."
+        );
+        assert!(
+            SVDAG_RAYCAST_WGSL.contains(&expected_min),
+            "svdag_raycast.wgsl must contain `{expected_min}` — \
+             MIN_STEP_BUDGET drifted from the CPU oracle in \
+             svdag.rs::cpu_trace. Update whichever side is wrong."
+        );
+        assert!(
+            SVDAG_RAYCAST_WGSL.contains(&expected_fudge),
+            "svdag_raycast.wgsl must contain `{expected_fudge}` — \
+             STEP_BUDGET_FUDGE drifted from the CPU oracle in \
+             svdag.rs::cpu_trace. Update whichever side is wrong."
+        );
     }
 }
