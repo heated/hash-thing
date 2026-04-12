@@ -89,6 +89,10 @@ pub struct World {
     /// Key: (NodeId, world-space origin). Value: stepped result NodeId.
     /// Cleared after each generation and on rule changes.
     pub(crate) hashlife_cache: FxHashMap<(NodeId, [i64; 3], u32), NodeId>,
+    /// Memoization cache for the exponential Hashlife macro-stepper (6gf.7).
+    /// Key: (NodeId, world-space origin, starting generation).
+    /// Cleared after each macro-step and on rule changes.
+    pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, [i64; 3], u64), NodeId>,
 }
 
 impl World {
@@ -118,6 +122,7 @@ impl World {
             materials,
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
+            hashlife_macro_cache: FxHashMap::default(),
         }
     }
 
@@ -141,6 +146,7 @@ impl World {
     pub fn invalidate_rule_caches(&mut self) {
         self.store.clear_step_cache();
         self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
@@ -617,6 +623,8 @@ impl World {
         params.validate().expect("invalid TerrainParams");
         self.store = NodeStore::new();
         self.store.clear_step_cache();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         let field = params.to_heightmap();
         let gen_start = std::time::Instant::now();
         let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
