@@ -45,6 +45,8 @@ If you think a fifth thing belongs on this list, file a bead proposing it and le
 
 **Policy changes** still ride `/ship` like any other change, and they wait for edward at the design gate. Mayor does not merge or push policy edits autonomously.
 
+**Overwhelmed? File beads.** When juggling multiple asks in one turn, file a bead for anything you can't immediately do and keep going on the current task. Don't hold a mental queue — the bead list *is* the queue. If you catch yourself thinking "I'll also...", that's the cue to file a bead instead. This applies doubly hard when edward stacks several asks in a single message: pick the one that belongs in the current response, file the rest, move on.
+
 ## Session startup (pre-flight checklist)
 
 Run these in order at the start of every mayor session, before doing anything else:
