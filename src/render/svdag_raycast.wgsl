@@ -136,13 +136,16 @@ const STEP_BUDGET_FUDGE: u32 = 8u;
 // budget. Optimizations (ray-octant mirroring, ancestor memoization, bitmask
 // coalescing) can be layered on later.
 fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
-    // Guard against zero ray-direction components (hash-thing-5bb.8).
-    // Clamp near-zero to ±ε so 1/d stays finite, avoiding inf/NaN in
-    // AABB slab tests. sign(0)=0 in WGSL, so we use a < comparison for
-    // the negative branch — IEEE -0 < 0 is false, mapping to +ε (fine).
+    // Laine-Karras Stage 2: mirror ray so rd is componentwise non-negative.
+    // Octant child indices are XORed with mirror_mask during DAG lookup.
+    let neg = rd < vec3<f32>(0.0);
+    let mirror_mask = select(0u, 1u, neg.x) | select(0u, 2u, neg.y) | select(0u, 4u, neg.z);
+    let rd_m = abs(rd);
+    let ro_m = select(ro, vec3<f32>(1.0) - ro, neg);
+
+    // Guard zero ray-direction components (hash-thing-5bb.8).
     let rd_eps = vec3<f32>(1e-30);
-    let rd_sign = select(vec3<f32>(1.0), vec3<f32>(-1.0), rd < vec3<f32>(0.0));
-    let safe_rd = select(rd, rd_sign * rd_eps, abs(rd) < rd_eps);
+    let safe_rd = max(rd_m, rd_eps);
     let inv_rd = 1.0 / safe_rd;
 
     // Per-ray step budget (hash-thing-2w5). Derived from u.params.x which the
@@ -157,20 +160,15 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let root_side = min(root_side_raw, 1u << 28u);
     let max_steps = max(MIN_STEP_BUDGET, root_side * STEP_BUDGET_FUDGE);
 
-    // Intersect ray with root cube [0,1]^3
-    let root_hit = intersect_aabb(ro, inv_rd, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Intersect mirrored ray with root cube [0,1]^3
+    let root_hit = intersect_aabb(ro_m, inv_rd, vec3<f32>(0.0), vec3<f32>(1.0));
     if root_hit.x > root_hit.y || root_hit.y < 0.0 {
         return vec4<f32>(0.0);
     }
 
     // hash-thing-27m v2: clamp ro to the root-cube entry (Laine-Karras).
-    // After this, `t` inside the loop is the in-cube traversal length,
-    // bounded by √3, so ULP(t) stays ≤ ~2.4e-7 regardless of original
-    // camera distance. Without this, far-camera rays stall because
-    // ULP(t) exceeds the depth-scaled nudge (~9.5e-7 at MAX_DEPTH) and
-    // `t_new = oct_far + dt` rounds back to `t_old` in f32.
     let entry = max(root_hit.x, 0.0);
-    let ro_local = ro + rd * entry;
+    let ro_local = ro_m + rd_m * entry;
     let t_exit = root_hit.y - entry;
 
     // Stack of (node_offset, node_min, half_size)
@@ -194,7 +192,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
         // so any `break` here would render every clean root-exit as magenta.
         if t > t_exit { return vec4<f32>(0.0); }
-        let pos = ro_local + rd * t;
+        let pos = ro_local + rd_m * t;
 
         // If the current top-of-stack no longer contains `pos`, pop.
         // NOTE: STRICT bounds (no EPS slack). Two guarantees keep this safe:
@@ -231,8 +229,9 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let node_offset = stack_node[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
-            let oct = octant_of(pos, rd, node_min, half);
-            let child_slot = dag_nodes[node_offset + 1u + oct];
+            let oct = octant_of(pos, rd_m, node_min, half);
+            // Stage 2: XOR to un-mirror the octant for DAG lookup.
+            let child_slot = dag_nodes[node_offset + 1u + (oct ^ mirror_mask)];
 
             if (child_slot & LEAF_BIT) != 0u {
                 let mat = child_slot & 0xFFFFu;
@@ -332,29 +331,25 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // resulting per-axis pos advance was sub-ULP near pos ~ 0.5.
         let node_min = stack_min[depth];
         let half = stack_half[depth];
-        let oct = octant_of(pos, rd, node_min, half);
+        let oct = octant_of(pos, rd_m, node_min, half);
         let child_min = vec3<f32>(
             node_min.x + f32(oct & 1u) * half,
             node_min.y + f32((oct >> 1u) & 1u) * half,
             node_min.z + f32((oct >> 2u) & 1u) * half,
         );
         let child_max = child_min + vec3<f32>(half);
-        // Per-axis exit times. oct_far is the smallest tmax across the
-        // three axes — same value the old `intersect_aabb(...).y` returned
-        // — but exposed per-axis so we can identify which axis is the
-        // actual exit and scale the post-exit nudge against its |rd|.
-        let t1 = (child_min - ro_local) * inv_rd;
+        // Stage 2: rd_m is all non-negative, so t2 > t1 on every axis.
+        // tmax_v = t2 directly; no min/max needed.
         let t2 = (child_max - ro_local) * inv_rd;
-        let tmax_v = max(t1, t2);
-        var oct_far: f32 = tmax_v.x;
-        var exit_rd: f32 = abs(rd.x);
-        if tmax_v.y < oct_far {
-            oct_far = tmax_v.y;
-            exit_rd = abs(rd.y);
+        var oct_far: f32 = t2.x;
+        var exit_rd: f32 = rd_m.x; // no abs needed
+        if t2.y < oct_far {
+            oct_far = t2.y;
+            exit_rd = rd_m.y;
         }
-        if tmax_v.z < oct_far {
-            oct_far = tmax_v.z;
-            exit_rd = abs(rd.z);
+        if t2.z < oct_far {
+            oct_far = t2.z;
+            exit_rd = rd_m.z;
         }
         // Cell-scaled nudge clipped to 1e-5 at shallow levels (so the root
         // behaves identically to the old `+1e-5` code) and shrinking with
@@ -367,7 +362,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // Cap dt so the fastest axis advances at most one child span,
         // preventing the step from skipping a non-empty sibling on a
         // dominant axis.
-        let max_rd = max(max(abs(rd.x), abs(rd.y)), abs(rd.z));
+        let max_rd = max(max(rd_m.x, rd_m.y), rd_m.z);
         let dt_cap = half / max(max_rd, 1e-6);
         let dt = min(dt_raw, dt_cap);
         t = oct_far + dt;

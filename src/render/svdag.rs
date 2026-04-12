@@ -432,10 +432,22 @@ pub mod cpu_trace {
             const EPS: f32 = 1e-30;
             1.0 / if d.abs() < EPS { EPS.copysign(d) } else { d }
         }
-        let inv_rd = [safe_rcp(rd[0]), safe_rcp(rd[1]), safe_rcp(rd[2])];
+        // Laine-Karras Stage 2: mirror ray so rd is componentwise non-negative.
+        // XOR octant indices with mirror_mask when indexing into DAG children.
+        let mut mirror_mask = 0u32;
+        let mut ro_m = ro;
+        let mut rd_m = rd;
+        for axis in 0..3 {
+            if rd[axis] < 0.0 {
+                mirror_mask |= 1 << axis;
+                rd_m[axis] = -rd_m[axis];
+                ro_m[axis] = 1.0 - ro_m[axis];
+            }
+        }
+        let inv_rd = [safe_rcp(rd_m[0]), safe_rcp(rd_m[1]), safe_rcp(rd_m[2])];
         let mut events = Vec::new();
 
-        let (root_near, root_far) = intersect_aabb(ro, inv_rd, [0.0; 3], [1.0; 3]);
+        let (root_near, root_far) = intersect_aabb(ro_m, inv_rd, [0.0; 3], [1.0; 3]);
         if root_near > root_far || root_far < 0.0 {
             return TraceResult {
                 hit_cell: None,
@@ -456,9 +468,9 @@ pub mod cpu_trace {
         // (9.5e-7 at MAX_DEPTH). Flagged by Codex Critical in 27m review.
         let entry = root_near.max(0.0);
         let ro_local = [
-            ro[0] + rd[0] * entry,
-            ro[1] + rd[1] * entry,
-            ro[2] + rd[2] * entry,
+            ro_m[0] + rd_m[0] * entry,
+            ro_m[1] + rd_m[1] * entry,
+            ro_m[2] + rd_m[2] * entry,
         ];
         let t_exit = root_far - entry;
 
@@ -486,9 +498,9 @@ pub mod cpu_trace {
                 };
             }
             let pos = [
-                ro_local[0] + rd[0] * t,
-                ro_local[1] + rd[1] * t,
-                ro_local[2] + rd[2] * t,
+                ro_local[0] + rd_m[0] * t,
+                ro_local[1] + rd_m[1] * t,
+                ro_local[2] + rd_m[2] * t,
             ];
 
             // Pop until top contains pos.
@@ -546,8 +558,9 @@ pub mod cpu_trace {
                 let node_offset = stack_node[depth] as usize;
                 let node_min = stack_min[depth];
                 let half = stack_half[depth];
-                let oct = octant_of(pos, rd, node_min, half);
-                let child_slot = dag[node_offset + 1 + oct as usize];
+                let oct = octant_of(pos, rd_m, node_min, half);
+                // Stage 2: XOR to un-mirror the octant for DAG lookup.
+                let child_slot = dag[node_offset + 1 + (oct ^ mirror_mask) as usize];
 
                 if child_slot & LEAF_BIT != 0 {
                     let mat = child_slot & 0xFFFF;
@@ -596,6 +609,9 @@ pub mod cpu_trace {
                         // The inner (inside) cascade uses `<=` for the same
                         // reason: CPU/GPU must break exit-face ties identically.
                         let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
+                        // Use original `rd` (not mirrored) for normal direction
+                        // — axis selection from slab test is valid in either
+                        // space, but the sign must match the physical ray.
                         let normal = if inside {
                             if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
                                 [rd[0].signum(), 0.0, 0.0]
@@ -660,7 +676,7 @@ pub mod cpu_trace {
             // fastest axis never crosses more than one child span.
             let node_min = stack_min[depth];
             let half = stack_half[depth];
-            let oct = octant_of(pos, rd, node_min, half);
+            let oct = octant_of(pos, rd_m, node_min, half);
             let child_min = [
                 node_min[0] + (oct & 1) as f32 * half,
                 node_min[1] + ((oct >> 1) & 1) as f32 * half,
@@ -671,30 +687,22 @@ pub mod cpu_trace {
                 child_min[1] + half,
                 child_min[2] + half,
             ];
-            // Per-axis exit times. oct_far is the smallest tmax across the
-            // three axes (same value the old `intersect_aabb(...).1` returned)
-            // but exposed per-axis so we can identify which axis is the actual
-            // exit and scale the post-exit nudge against its |rd|.
-            let t1 = [
-                (child_min[0] - ro_local[0]) * inv_rd[0],
-                (child_min[1] - ro_local[1]) * inv_rd[1],
-                (child_min[2] - ro_local[2]) * inv_rd[2],
-            ];
+            // Per-axis exit times. Stage 2: rd_m is all-positive so t2 > t1
+            // on every axis; tmax_v = t2 directly.
             let t2 = [
                 (child_max[0] - ro_local[0]) * inv_rd[0],
                 (child_max[1] - ro_local[1]) * inv_rd[1],
                 (child_max[2] - ro_local[2]) * inv_rd[2],
             ];
-            let tmax_v = [t1[0].max(t2[0]), t1[1].max(t2[1]), t1[2].max(t2[2])];
-            let mut oct_far = tmax_v[0];
-            let mut exit_rd = rd[0].abs();
-            if tmax_v[1] < oct_far {
-                oct_far = tmax_v[1];
-                exit_rd = rd[1].abs();
+            let mut oct_far = t2[0];
+            let mut exit_rd = rd_m[0]; // rd_m is non-negative, no abs needed
+            if t2[1] < oct_far {
+                oct_far = t2[1];
+                exit_rd = rd_m[1];
             }
-            if tmax_v[2] < oct_far {
-                oct_far = tmax_v[2];
-                exit_rd = rd[2].abs();
+            if t2[2] < oct_far {
+                oct_far = t2[2];
+                exit_rd = rd_m[2];
             }
             // World-space exit-axis nudge. `dt_raw = nudge / exit_rd` means
             // pos advances by exactly `nudge_world` on the exit axis. Clip
@@ -708,7 +716,7 @@ pub mod cpu_trace {
             // dominant axis. For ultra-grazing rays (|rd_axis| < ~1e-5 at
             // MAX_DEPTH) the cap binds and the exit-axis advance collapses
             // below ULP — the f32 frontier noted in the plan.
-            let max_rd = rd[0].abs().max(rd[1].abs()).max(rd[2].abs());
+            let max_rd = rd_m[0].max(rd_m[1]).max(rd_m[2]);
             let dt_cap = half / max_rd.max(1e-6);
             let dt = dt_raw.min(dt_cap);
             let t_old = t;
