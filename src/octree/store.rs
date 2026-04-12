@@ -110,7 +110,6 @@ impl NodeStore {
     }
 
     /// Get children of an interior node. Panics if called on a leaf.
-    #[allow(dead_code)]
     pub fn children(&self, id: NodeId) -> [NodeId; 8] {
         match self.get(id) {
             Node::Interior { children, .. } => *children,
@@ -119,7 +118,6 @@ impl NodeStore {
     }
 
     /// Get a specific child by octant index.
-    #[allow(dead_code)]
     pub fn child(&self, id: NodeId, octant: usize) -> NodeId {
         self.children(id)[octant]
     }
@@ -219,7 +217,6 @@ impl NodeStore {
     ///
     /// Footgun: `root` must be a real world root. `NodeId::EMPTY` has level
     /// 0, so every non-origin coordinate reflects to 0 via the OOB branch.
-    #[allow(dead_code)]
     pub fn get_cell(&self, root: NodeId, x: u64, y: u64, z: u64) -> CellState {
         let level = self.get(root).level();
         let side = 1u64 << level;
@@ -365,13 +362,11 @@ impl NodeStore {
     }
 
     /// Cache a step result.
-    #[allow(dead_code)]
     pub fn cache_step(&mut self, input: NodeId, result: NodeId) {
         self.step_cache.insert(input, result);
     }
 
     /// Look up a cached step result.
-    #[allow(dead_code)]
     pub fn get_cached_step(&self, input: NodeId) -> Option<NodeId> {
         self.step_cache.get(&input).copied()
     }
@@ -383,7 +378,6 @@ impl NodeStore {
     /// Failure to clear after a rule swap will silently return stale results
     /// from the previous rule once a memoized stepper is in place
     /// (hash-thing-6gf.1).
-    #[allow(dead_code)]
     pub fn clear_step_cache(&mut self) {
         self.step_cache.clear();
     }
