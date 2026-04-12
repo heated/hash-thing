@@ -307,6 +307,14 @@ impl MaterialRegistry {
         self.entry(cell.material())?.block_rule_id
     }
 
+    /// True if this cell has no block rule and its CA rule is noop (identity).
+    /// Such cells never change state — hashlife can skip stepping entire
+    /// subtrees composed of these materials.
+    pub fn cell_is_inert_fixed_point(&self, cell: Cell) -> bool {
+        self.block_rule_id_for_cell(cell).is_none()
+            && self.rule_for_cell(cell).is_some_and(|rule| rule.is_noop())
+    }
+
     pub fn color_palette_rgba(&self) -> Vec<[f32; 4]> {
         let mut palette =
             vec![[0.0, 0.0, 0.0, 0.0]; self.entries.len().max(INITIAL_MATERIAL_SLOTS)];

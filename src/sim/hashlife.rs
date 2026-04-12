@@ -161,6 +161,56 @@ impl World {
         }
     }
 
+    /// Check if every leaf in the subtree is inert (CaRule::Noop, no BlockRule).
+    /// Unlike `inert_uniform_state`, this catches mixed-material subtrees
+    /// (e.g. stone/air boundaries). For all-inert nodes, stepping produces
+    /// the center extraction — no CA computation needed.
+    fn is_all_inert(&mut self, node: NodeId) -> bool {
+        if node == NodeId::EMPTY {
+            return true;
+        }
+        if let Some(&cached) = self.hashlife_all_inert_cache.get(&node) {
+            return cached;
+        }
+        let result = match self.store.get(node).clone() {
+            Node::Leaf(state) => {
+                state == 0
+                    || self
+                        .materials
+                        .cell_is_inert_fixed_point(Cell::from_raw(state))
+            }
+            Node::Interior { children, .. } => children.into_iter().all(|c| self.is_all_inert(c)),
+        };
+        self.hashlife_all_inert_cache.insert(node, result);
+        result
+    }
+
+    /// Check if a subtree is uniformly one inert material.
+    /// Returns Some(state) if all leaves are the same inert state.
+    fn inert_uniform_state(&mut self, node: NodeId) -> Option<CellState> {
+        if let Some(&cached) = self.hashlife_inert_cache.get(&node) {
+            return cached;
+        }
+        let result = match self.store.get(node).clone() {
+            Node::Leaf(state) => self
+                .materials
+                .cell_is_inert_fixed_point(Cell::from_raw(state))
+                .then_some(state),
+            Node::Interior { children, .. } => {
+                let state = self.inert_uniform_state(children[0])?;
+                for child in children.into_iter().skip(1) {
+                    if self.inert_uniform_state(child) != Some(state) {
+                        self.hashlife_inert_cache.insert(node, None);
+                        return None;
+                    }
+                }
+                Some(state)
+            }
+        };
+        self.hashlife_inert_cache.insert(node, result);
+        result
+    }
+
     /// Remap hashlife cache keys and values through a compaction remap table.
     /// Entries referencing unreachable nodes (not in remap) are dropped.
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
@@ -180,6 +230,24 @@ impl World {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
                 self.hashlife_macro_cache
                     .insert((new_node, gen), new_result);
+            }
+        }
+
+        // Remap hashlife_inert_cache: NodeId → Option<CellState>
+        let old_inert = std::mem::take(&mut self.hashlife_inert_cache);
+        self.hashlife_inert_cache.reserve(old_inert.len());
+        for (node, state) in old_inert {
+            if let Some(&new_node) = remap.get(&node) {
+                self.hashlife_inert_cache.insert(new_node, state);
+            }
+        }
+
+        // Remap hashlife_all_inert_cache: NodeId → bool
+        let old_all_inert = std::mem::take(&mut self.hashlife_all_inert_cache);
+        self.hashlife_all_inert_cache.reserve(old_all_inert.len());
+        for (node, inert) in old_all_inert {
+            if let Some(&new_node) = remap.get(&node) {
+                self.hashlife_all_inert_cache.insert(new_node, inert);
             }
         }
     }
@@ -211,6 +279,20 @@ impl World {
         if self.store.population(node) == 0 {
             self.hashlife_stats.empty_skips += 1;
             return self.store.empty(level - 1);
+        }
+
+        // Fixed-point: uniform inert subtree (all leaves same inert material).
+        // Stepping produces the same uniform node one level smaller.
+        if let Some(state) = self.inert_uniform_state(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return self.store.uniform(level - 1, state);
+        }
+
+        // All-inert: every leaf is CaRule::Noop, no BlockRule (but possibly
+        // mixed materials, e.g. stone/air boundary). Stepping = center extract.
+        if self.is_all_inert(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return self.center_node(node, level);
         }
 
         let key = (node, parity);
@@ -248,6 +330,16 @@ impl World {
         // identity^N = identity. CaRule-only worlds (macro path prerequisite).
         if self.store.population(node) == 0 {
             return self.store.empty(level - 1);
+        }
+
+        // Fixed-point: uniform inert subtree → same material, smaller node.
+        if let Some(state) = self.inert_uniform_state(node) {
+            return self.store.uniform(level - 1, state);
+        }
+
+        // All-inert: mixed materials but all noop → center extract.
+        if self.is_all_inert(node) {
+            return self.center_node(node, level);
         }
 
         let key = (node, generation);

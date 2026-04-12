@@ -93,6 +93,12 @@ pub struct World {
     pub hashlife_stats: HashlifeStats,
     /// Store size after the last compaction, used to trigger periodic GC.
     pub(crate) store_size_at_last_compact: usize,
+    /// Cache for `inert_uniform_state`: NodeId → Option<CellState>.
+    /// `Some(state)` = all leaves are the same inert material; `None` = mixed or active.
+    pub(crate) hashlife_inert_cache: FxHashMap<NodeId, Option<CellState>>,
+    /// Cache for `is_all_inert`: NodeId → bool.
+    /// True if every leaf in the subtree has CaRule::Noop and no BlockRule.
+    pub(crate) hashlife_all_inert_cache: FxHashMap<NodeId, bool>,
     /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
     /// Avoids O(n³) flatten-and-scan on every `step_recursive_pow2` call.
     pub(crate) block_rule_present: Option<bool>,
@@ -111,6 +117,7 @@ pub struct HashlifeStats {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub empty_skips: u64,
+    pub fixed_point_skips: u64,
 }
 
 impl World {
@@ -143,6 +150,8 @@ impl World {
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
             store_size_at_last_compact: 0,
+            hashlife_inert_cache: FxHashMap::default(),
+            hashlife_all_inert_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
             origin: [0, 0, 0],
@@ -165,6 +174,8 @@ impl World {
     pub fn invalidate_rule_caches(&mut self) {
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
@@ -200,6 +211,8 @@ impl World {
         );
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
         self.root = self.store.set_cell(self.root, x.0, y.0, z.0, state);
         self.block_rule_present = None; // invalidate cache
     }
@@ -711,6 +724,8 @@ impl World {
         self.store = new_store;
         self.root = new_root;
         self.hashlife_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
     }
 
     /// Replace the world with terrain generated from `params`. Uses
@@ -731,6 +746,8 @@ impl World {
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
         let field = params.to_heightmap();
         let gen_start = std::time::Instant::now();
         let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
