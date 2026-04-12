@@ -411,11 +411,10 @@ impl World {
     ///
     /// This is an intentional "react then move" physics model.
     ///
-    /// **Boundary asymmetry:** CaRule wraps toroidally (`rem_euclid`); BlockRule
-    /// skips partial blocks at world edges (clipping). This is deliberate — Margolus
-    /// blocks must not straddle the world boundary. Cells at the boundary participate
-    /// in CaRule every tick but only in BlockRule on generations where the partition
-    /// offset aligns them away from the edge.
+    /// **Boundary conditions:** Both CaRule and BlockRule use absorbing boundaries
+    /// (out-of-bounds = empty), matching hashlife's infinite-world semantics.
+    /// BlockRule additionally skips partial blocks at world edges (clipping) —
+    /// Margolus blocks must not straddle the world boundary.
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
@@ -702,20 +701,29 @@ impl World {
     }
 }
 
-/// Get the 26 Moore neighbors of a cell, wrapping at boundaries.
+/// Get the 26 Moore neighbors of a cell. Out-of-bounds neighbors are
+/// `Cell::EMPTY` (absorbing boundary), matching hashlife's infinite-world
+/// semantics.
 fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [Cell; 26] {
     let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;
+    let s = side as i32;
     for dz in [-1i32, 0, 1] {
         for dy in [-1i32, 0, 1] {
             for dx in [-1i32, 0, 1] {
                 if dx == 0 && dy == 0 && dz == 0 {
                     continue;
                 }
-                let nx = (x as i32 + dx).rem_euclid(side as i32) as usize;
-                let ny = (y as i32 + dy).rem_euclid(side as i32) as usize;
-                let nz = (z as i32 + dz).rem_euclid(side as i32) as usize;
-                neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                let nz = z as i32 + dz;
+                if nx >= 0 && nx < s && ny >= 0 && ny < s && nz >= 0 && nz < s {
+                    let nx = nx as usize;
+                    let ny = ny as usize;
+                    let nz = nz as usize;
+                    neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                }
+                // else: stays Cell::EMPTY (absorbing boundary)
                 idx += 1;
             }
         }
