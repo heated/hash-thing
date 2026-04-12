@@ -237,21 +237,26 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - 31-bit node-count overflow assertion at write time (x9r)
   - `padded_bytes_per_row` helper for COPY_BYTES_PER_ROW_ALIGNMENT (mys)
   - Material palette sync with registry (xev): both shaders now match `MaterialRegistry::terrain_defaults()` colors
-- ✅ **Material-type CA (epic `1v0`, partial — 3/10+)**
+- ✅ **Material-type CA (epic `1v0`, partial — 5/10+)**
   - `1v0.1` 16-bit tagged cell: `Cell` packs 10-bit `material_id` + 6-bit `metadata` into `u16`. `METADATA_BITS=6` is pinned by drift guard in both shaders.
   - `1v0.2` `MaterialRegistry` with per-material rules, visual properties (label, base_color, texture_ref), physical properties (density, flammability, conductivity). `terrain_defaults()` registers air/stone/dirt/grass/fire/water. `gol_smoke()` bridges legacy GoL presets. GPU palette export via `color_palette_rgba()`.
   - `1v0.3` Per-material `CaRule` dispatch in `World::step`: `trait CaRule { fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell; }`. `NoopRule` for static materials, `FireRule` (spreads from fuel, quenched by water), `WaterRule` (reacts with fire → stone). No central interaction table.
-  - In progress: `1v0.4` Margolus 2×2×2 movement phase (claimed by onyx)
+  - `1v0.4` Margolus 2×2×2 movement phase: `trait BlockRule { fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8]; }`. Alternating partition offset (even/odd gen). `GravityBlockRule` for density-based vertical swaps. Mass conservation enforced via debug_assert.
+  - In progress: `1v0.5` gravity/fluid flow via `FluidBlockRule` (cairn)
 - ✅ **Hash-cons compaction (`88d`)**: `NodeStore::compacted(root)` rebuilds reachable graph into a fresh store via iterative post-order traversal (`8m7`). Called after every `commit_step` and on `seed_terrain` epoch boundaries.
 - ✅ **Foundations progress (epic `h34`, 3/4)**
   - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
   - `h34.2` determinism audit: walked every file in sim + terrain-gen paths, no global PRNG / scan-order dependencies found, two minor follow-ups filed and closed (`99e` step_cache rule_id doc fix, `c6k` seed_center migrating to cell_rand_bool). Audit notes in `.ship-notes/ship-h34.2-determinism-audit.md`
   - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`; wall-clock auto-log cadence (q63); memory-watchdog MemStats with ratcheting peaks and `memory_bytes_estimate` (yb5); GPU `_gpu` metric family via timestamp queries (6x3). One bead remains (retire-GoL `h34.4`, blocked on 1v0 material CA)
-- ✅ **NodeStore hash-cons unit tests (`1lq`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths
+- ✅ **NodeStore hash-cons unit tests (`1lq`, `6gf.5`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths, uniform collapse, metadata, overwrite, accessor coverage
+- ✅ **Octree extraction primitives (`6gf.6`)**: `extract_neighborhood` (26 Moore neighbors, toroidal wrap), `extract_block_2x2x2` (Margolus partition extraction), `flatten_region` (arbitrary AABB sub-box). Foundation for recursive Hashlife step.
+- ✅ **Lazy root expansion (`e9h`, `5qp`)**: `World::ensure_contains(x,y,z)` grows root octree by wrapping in bigger parent nodes. `ensure_region([min],[max])` is the batch form. OOB bounds checking on set_cell/get_cell (`819`) also landed.
+- ✅ **Out-of-bounds coordinate safety (`819`, `fb5`)**: `set_cell` panics on OOB with `#[track_caller]`; `get_cell` silently returns 0 for OOB (no storage growth). 7 boundary tests.
 - ✅ **Terrain generation (epic `3fq`, partial)**
   - Heightmap-based recursive octree gen with proof-based collapse (sky/deep-stone short-circuit)
   - Cave CA post-pass (B13/S13 majority-vote, stone-only mask, surface-preserving)
-  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, node counts, noise bottleneck estimate (3fq.5)
+  - Dungeon carving (3fq.3): room placement + L-shaped corridors in deep stone, `DungeonParams` wired through `TerrainParams` and `seed_terrain`. Key binding: D (caves + dungeons)
+  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, dungeon_us, node counts, noise bottleneck estimate (3fq.5)
 - ✅ **CI + release (epic `xb7`, 3/6)**
   - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets`, gating `cargo fmt --check` (k5r), gating `cargo clippy -- -D warnings` (00f)
   - `xb7.3` Linux AppImage via linuxdeploy (packaging/linux/ desktop entry + placeholder icon)
@@ -259,14 +264,14 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Next up (P1, from bd)
 
-- ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step, `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). Currently we flatten-then-step; this is the biggest single perf unlock.
-- ☐ **Material-type CA continuation** (epic `1v0`): ✅ `1v0.1` 16-bit tagged cell, ✅ `1v0.2` material registry, ✅ `1v0.3` per-material CaRule dispatch. In progress: `1v0.4` Margolus 2×2×2 movement phase. Remaining: `1v0.5` gravity/fluid flow, `1v0.6` entity system, `1v0.7` fire/temperature demo, `1v0.8` cell/block granularity, `1v0.9` mutation channel, `1v0.10` player entity.
+- ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step (in progress, flint), `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). ✅ `6gf.5` store gap-fill tests, ✅ `6gf.6` extraction primitives. Currently we flatten-then-step; this is the biggest single perf unlock.
+- ☐ **Material-type CA continuation** (epic `1v0`): ✅ `1v0.1`-`1v0.4` landed. In progress: `1v0.5` gravity/fluid flow (cairn). Remaining: `1v0.6` entity system, `1v0.7` fire/temperature demo, `1v0.8` cell/block granularity, `1v0.9` mutation channel, `1v0.10` player entity.
 - ☐ **SVDAG continuation**: ✅ `5bb.4` per-leaf material attributes. ✅ `5bb.5` incremental edit uploads. ✅ `bx7` stale-slot compaction. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
 ### Later (P2+, from bd)
 
 - ☐ Foundations & determinism (`h34`): retire GoL3D scaffolding (`h34.4` — blocked on 1v0.4 Margolus landing). ✅ `h34.5` iterative clone_reachable (8m7 landed it)
-- ☐ Terrain generation & infinite worlds (`3fq`): ✅ heightmap gen + cave CA post-pass. Remaining: `3fq.3` dungeon carving (in progress), `3fq.4` lazy root expansion (blocked on e9h/819). ✅ `3fq.5` terrain-gen perf tracking.
+- ☐ Terrain generation & infinite worlds (`3fq`): ✅ heightmap gen + cave CA + dungeon carving (`3fq.3`). ✅ lazy root expansion (`e9h` + `5qp`). ✅ `3fq.5` terrain-gen perf tracking. Remaining: `3fq.4` infinite world chunking (blocked on lazy expansion design).
 - ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), ✅ Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, in progress), Steam (`xb7.6`, P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 - ☐ GPU palette buffer (`ll6`): upload `MaterialRegistry::color_palette_rgba()` as uniform buffer instead of hardcoded shader switch. Eliminates palette drift class entirely.
