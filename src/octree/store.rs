@@ -468,6 +468,17 @@ impl NodeStore {
     /// the returned store and must not be mixed.
     ///
     pub fn compacted(&self, root: NodeId) -> (NodeStore, NodeId) {
+        let (store, root, _remap) = self.compacted_with_remap(root);
+        (store, root)
+    }
+
+    /// Like [`compacted`](Self::compacted) but also returns the old→new NodeId
+    /// remap table. Callers can use this to translate external references
+    /// (e.g. cache entries) instead of discarding them.
+    pub fn compacted_with_remap(
+        &self,
+        root: NodeId,
+    ) -> (NodeStore, NodeId, FxHashMap<NodeId, NodeId>) {
         let mut dst = NodeStore::new();
         let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
         // Pre-seed EMPTY as a perf short-circuit. Note: this is NOT
@@ -476,7 +487,7 @@ impl NodeStore {
         // recursive walk whenever we hit an empty subtree.
         remap.insert(NodeId::EMPTY, NodeId::EMPTY);
         let new_root = clone_reachable(self, &mut dst, &mut remap, root);
-        (dst, new_root)
+        (dst, new_root, remap)
     }
 }
 

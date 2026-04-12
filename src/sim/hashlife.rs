@@ -18,10 +18,12 @@
 //!      (each level n-1), recursively step each → 8 results at level n-2.
 //!      Assemble into the level-(n-1) output.
 //!
-//! Step results are memoized by (NodeId, origin) so identical subtrees at
+//! Step results are memoized by (NodeId, origin, parity) so identical subtrees at
 //! the same world-space position are computed only once per generation.
-//! The cache is cleared after each step (generation changes affect BlockRule
-//! rng_hash, and compaction remaps NodeIds).
+//! After each step, compaction remaps NodeIds; the cache entries are translated
+//! through the remap table rather than cleared. Entries for GC'd nodes are
+//! dropped automatically. Since parity alternates 0/1, cache hits occur every
+//! OTHER frame for stable subtrees (parity match on frame N+2, not N+1).
 
 use super::rule::BlockContext;
 use super::world::World;
@@ -48,11 +50,11 @@ impl World {
         self.root = result;
         self.generation += 1;
 
-        self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
-        let (new_store, new_root) = self.store.compacted(self.root);
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.remap_hashlife_cache(&remap);
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -83,11 +85,22 @@ impl World {
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
 
-        self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
-        let (new_store, new_root) = self.store.compacted(self.root);
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.remap_hashlife_cache(&remap);
+    }
+
+    /// Translate hashlife_cache entries through a compaction remap table.
+    /// Entries whose key or value NodeId was GC'd (absent from remap) are dropped.
+    fn remap_hashlife_cache(&mut self, remap: &rustc_hash::FxHashMap<NodeId, NodeId>) {
+        let old_cache = std::mem::take(&mut self.hashlife_cache);
+        for ((node, origin, parity), result) in old_cache {
+            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+                self.hashlife_cache.insert((new_node, origin, parity), new_result);
+            }
+        }
     }
 
     fn has_block_rule_cells(&self) -> bool {

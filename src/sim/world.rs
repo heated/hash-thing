@@ -657,9 +657,13 @@ impl World {
         // subtrees unreachable but still present. Rebuild into a fresh store
         // so memory tracks live-scene size, not cumulative history.
         // See hash-thing-88d.
+        //
+        // Brute-force compaction remaps all NodeIds without updating
+        // hashlife_cache, so clear it to prevent stale cross-path hits.
         let (new_store, new_root) = self.store.compacted(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.hashlife_cache.clear();
     }
 
     /// Replace the world with terrain generated from `params`. Uses
