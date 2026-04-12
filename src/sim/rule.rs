@@ -12,6 +12,45 @@ pub trait CaRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
 }
 
+/// Context passed to block rules for deterministic RNG and position awareness.
+///
+/// All fields are pure functions of position + generation + seed, so block rules
+/// remain Hashlife-compatible (no global mutable state).
+#[derive(Clone, Copy, Debug)]
+pub struct BlockContext {
+    /// World-space origin of the block's (0,0,0) corner.
+    pub block_origin: [i64; 3],
+    /// Current simulation generation.
+    pub generation: u64,
+    /// Per-world seed for deterministic randomness.
+    pub world_seed: u64,
+    /// Pre-computed RNG hash from `rng::cell_hash(origin, generation, seed)`.
+    pub rng_hash: u64,
+}
+
+/// A block-based CA rule operating on 2x2x2 cell blocks.
+///
+/// Block rules implement mass-conserving permutations: the output must be a
+/// rearrangement of the input cells (multiset equality). This invariant enables
+/// Margolus-style movement (sand falling, fluid flow) without creating or
+/// destroying matter.
+///
+/// Cell ordering within the block follows octant convention:
+///   `block_index(dx, dy, dz) = dx + dy*2 + dz*4`
+/// matching `octant_index` in `src/octree/node.rs`.
+pub trait BlockRule {
+    fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8];
+}
+
+/// Map local (dx, dy, dz) offsets (each 0 or 1) to an index in `[Cell; 8]`.
+///
+/// Matches `octant_index` in `src/octree/node.rs` — this is a load-bearing
+/// invariant. Do not change one without the other.
+#[inline]
+pub const fn block_index(dx: usize, dy: usize, dz: usize) -> usize {
+    dx + dy * 2 + dz * 4
+}
+
 /// Identity rule for static materials. Returns the center cell unchanged.
 pub struct NoopRule;
 
@@ -333,5 +372,37 @@ mod tests {
             GameOfLife3D::pyroclastic().step_cell(ALIVE, &full),
             Cell::EMPTY
         );
+    }
+
+    // ---------------------------------------------------------------
+    // BlockRule / BlockContext / block_index tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn block_index_matches_octant_convention() {
+        // dx + dy*2 + dz*4
+        assert_eq!(block_index(0, 0, 0), 0);
+        assert_eq!(block_index(1, 0, 0), 1);
+        assert_eq!(block_index(0, 1, 0), 2);
+        assert_eq!(block_index(1, 1, 0), 3);
+        assert_eq!(block_index(0, 0, 1), 4);
+        assert_eq!(block_index(1, 0, 1), 5);
+        assert_eq!(block_index(0, 1, 1), 6);
+        assert_eq!(block_index(1, 1, 1), 7);
+    }
+
+    #[test]
+    fn block_index_covers_all_8() {
+        let mut seen = [false; 8];
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let idx = block_index(dx, dy, dz);
+                    assert!(!seen[idx], "duplicate index {idx}");
+                    seen[idx] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s));
     }
 }
