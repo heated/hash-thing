@@ -120,17 +120,31 @@ if [[ "$DRY_RUN" != true ]]; then
     printf '%s' "$PROMPT" > "$PROMPT_FILE"
 fi
 
-if [[ "$EXEC_MODE" == true ]]; then
-    CODEX_CMD="export BEADS_ACTOR=$SEAT && codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"\$(cat .codex-crew-prompt.md)\""
-else
-    # Interactive mode: stays alive between tasks, no-alt-screen for cmux compat
-    CODEX_CMD="export BEADS_ACTOR=$SEAT && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen \"\$(cat .codex-crew-prompt.md)\""
+# Write a wrapper script that sets env and launches codex.
+# cmux new-workspace --command doesn't expand $(cat) reliably, so we use a
+# self-contained script the terminal shell can exec.
+LAUNCH_SCRIPT="$WORKTREE_PATH/.codex-launch.sh"
+if [[ "$DRY_RUN" != true ]]; then
+    if [[ "$EXEC_MODE" == true ]]; then
+        cat > "$LAUNCH_SCRIPT" <<LAUNCHER
+#!/usr/bin/env bash
+export BEADS_ACTOR=$SEAT
+exec codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "\$(cat .codex-crew-prompt.md)"
+LAUNCHER
+    else
+        cat > "$LAUNCH_SCRIPT" <<LAUNCHER
+#!/usr/bin/env bash
+export BEADS_ACTOR=$SEAT
+exec codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen "\$(cat .codex-crew-prompt.md)"
+LAUNCHER
+    fi
+    chmod +x "$LAUNCH_SCRIPT"
 fi
 
 if [[ "$DRY_RUN" == true ]]; then
     echo ""
     echo "[dry-run] Would launch in workspace=${WORKSPACE_REF:-new}"
-    echo "[dry-run] Command: $CODEX_CMD"
+    echo "[dry-run] Mode: $(if $EXEC_MODE; then echo exec; else echo interactive; fi)"
     exit 0
 fi
 
@@ -139,11 +153,11 @@ if [[ -n "$WORKSPACE_REF" ]]; then
     echo "Sending to existing workspace $WORKSPACE_REF..."
     cmux send --workspace "$WORKSPACE_REF" $'\x03'  # Ctrl-C
     sleep 1
-    cmux send --workspace "$WORKSPACE_REF" "cd '$WORKTREE_PATH' && $CODEX_CMD"
+    cmux send --workspace "$WORKSPACE_REF" "cd '$WORKTREE_PATH' && bash .codex-launch.sh"
     cmux send-key --workspace "$WORKSPACE_REF" enter
 else
     echo "Opening new cmux workspace..."
-    cmux new-workspace --cwd "$WORKTREE_PATH" --command "$CODEX_CMD"
+    cmux new-workspace --cwd "$WORKTREE_PATH" --command "bash .codex-launch.sh"
 fi
 
 echo ""
