@@ -1,14 +1,24 @@
 # hash-thing
 
-3D voxel engine built on a hash-consed octree with SVDAG raycasting and cellular automaton simulation.
+3D voxel cellular automaton engine. Hash-consed octree storage, SVDAG rendering, material-type CA rules.
 
-## Quick start
+## Quick demo (pre-built)
 
-```bash
+If you've already built once on this machine:
+
+```
+./target/release/hash-thing
+```
+
+## Build from source
+
+```
 cargo run --release
 ```
 
-First build takes ~60s (wgpu + dependencies). Subsequent builds are incremental.
+First build ~60s. Subsequent builds are incremental (~2-5s).
+
+Requires Rust (install via [rustup](https://rustup.rs)).
 
 ## What you're looking at
 
@@ -19,19 +29,19 @@ The octree is hash-consed: identical subtrees share storage. This is the foundat
 ## Controls
 
 | Key | Action |
-|---|---|
-| Mouse drag | Orbit camera |
-| Scroll | Zoom |
-| Space | Pause / resume simulation |
-| S | Single step |
-| R | Reset terrain (heightmap only) |
-| C | Reset terrain with caves (CA post-pass) |
-| D | Reset terrain with caves + dungeons |
-| G | Switch to legacy Game of Life sphere seed |
-| 1-4 | Switch GoL rule (Amoeba, Crystal, 445, Pyroclastic) |
-| V | Toggle Flat3D / SVDAG rendering |
-| P | Dump perf + memory summary |
-| Esc | Quit |
+|-----|--------|
+| **Mouse drag** | Orbit camera |
+| **Scroll** | Zoom in/out |
+| **Space** | Pause / resume simulation |
+| **S** | Single step |
+| **R** | Reset terrain (heightmap only) |
+| **C** | Reset terrain with caves (CA post-pass) |
+| **D** | Reset terrain with caves + dungeons |
+| **G** | Switch to legacy Game of Life sphere seed |
+| **1-4** | Switch CA rule (Amoeba, Crystal, Rule445, Pyroclastic) |
+| **V** | Toggle render mode (Flat3D / SVDAG) |
+| **P** | Print perf stats |
+| **Esc** | Quit |
 
 ## Architecture
 
