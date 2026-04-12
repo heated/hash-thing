@@ -28,7 +28,7 @@ Named agents working on this repo. `BEADS_ACTOR` draws from a small pool of natu
 Auto-assign pool (used by the `claude -w` seat hook): `flint · cairn · onyx · ember · spark`
 Explicit-only seat: `mayor` — singular, never auto-assigned, see the mayor skill
 
-Seats are worktree labels, not specializations. Any non-mayor seat picks any ready bead. Reuse a name for the same worktree; don't rewrite historical assignees.
+Seats are worktree labels, not specializations. Any non-mayor seat picks any ready bead — including infra, tooling, process, and crew-coordination beads, not just codebase work. Reuse a name for the same worktree; don't rewrite historical assignees.
 
 ### Peer autonomy — no central orchestrator
 
