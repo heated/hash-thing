@@ -191,7 +191,9 @@ impl ApplicationHandler for App {
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
             self.window = Some(window.clone());
 
-            let renderer = pollster::block_on(render::Renderer::new(window.clone(), VOLUME_SIZE));
+            let mut renderer =
+                pollster::block_on(render::Renderer::new(window.clone(), VOLUME_SIZE));
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
@@ -345,6 +347,9 @@ impl ApplicationHandler for App {
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.upload_palette(&self.world.materials.color_palette_rgba());
+                            }
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &self.world,
@@ -362,6 +367,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: Amoeba ({})", self.rule);
                         }
@@ -371,6 +380,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: Crystal ({})", self.rule);
                         }
@@ -380,6 +393,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: 445 ({})", self.rule);
                         }
@@ -389,6 +406,10 @@ impl ApplicationHandler for App {
                             if self.legacy_gol_smoke {
                                 self.world.materials =
                                     terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
                             }
                             log::info!("Rule: Pyroclastic ({})", self.rule);
                         }

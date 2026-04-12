@@ -324,6 +324,7 @@ pub mod cpu_trace {
         ExitedRoot,
     }
 
+    #[derive(Debug)]
     pub struct TraceResult {
         pub hit_cell: Option<u32>,
         pub steps: usize,

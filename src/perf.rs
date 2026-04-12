@@ -62,6 +62,7 @@ const RING_CAPACITY: usize = 64;
 
 /// Fixed-capacity ring buffer of `Duration`s. Oldest sample is evicted FIFO
 /// once capacity is exceeded.
+#[derive(Debug)]
 struct Ring {
     buf: [Duration; RING_CAPACITY],
     head: usize,
@@ -115,6 +116,7 @@ impl Ring {
 }
 
 /// Per-operation timing tracker. Owned by `App` in `main.rs`.
+#[derive(Debug)]
 pub struct Perf {
     rings: HashMap<&'static str, Ring>,
 }
@@ -225,6 +227,7 @@ impl Perf {
 /// immediately and record a ~0ns sample, which is almost never what
 /// the caller wants. Binding to `_name` (with any non-`_` prefix) keeps
 /// the value alive until end-of-scope as expected.
+#[derive(Debug)]
 #[must_use = "Timer records when dropped; bind it to a named variable to keep \
               the timed region alive, e.g. `let _t = perf.start(\"render_cpu\")`"]
 pub struct Timer<'a> {

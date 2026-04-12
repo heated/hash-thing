@@ -64,6 +64,15 @@ pub struct MaterialRegistry {
     block_rules: Vec<Box<dyn BlockRule>>,
 }
 
+impl fmt::Debug for MaterialRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaterialRegistry")
+            .field("entries", &self.entries)
+            .field("rules_count", &self.rules.len())
+            .finish()
+    }
+}
+
 impl MaterialRegistry {
     pub fn new() -> Self {
         Self {
