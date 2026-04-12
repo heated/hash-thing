@@ -237,8 +237,16 @@ impl GpuTiming {
         // Two little-endian u64s. wgpu reports timestamps in the
         // backend's native byte order, which on every platform we care
         // about is LE. Use from_le_bytes to be explicit.
-        let start = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let end = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let start = u64::from_le_bytes(
+            data[0..8]
+                .try_into()
+                .expect("GPU timestamp readback: first 8 bytes must convert to [u8; 8]"),
+        );
+        let end = u64::from_le_bytes(
+            data[8..16]
+                .try_into()
+                .expect("GPU timestamp readback: second 8 bytes must convert to [u8; 8]"),
+        );
         drop(data);
         self.readback_buffer.unmap();
 
@@ -314,7 +322,9 @@ impl Renderer {
             memory_budget_thresholds: Default::default(),
         });
 
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("failed to create wgpu surface from window");
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
