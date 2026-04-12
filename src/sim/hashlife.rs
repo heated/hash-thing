@@ -29,6 +29,12 @@ use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, NodeId};
 use crate::rng::cell_hash;
 
+const LEVEL3_SIDE: usize = 8;
+const LEVEL3_CELL_COUNT: usize = LEVEL3_SIDE * LEVEL3_SIDE * LEVEL3_SIDE;
+const CENTER_LEVEL3_SIDE: usize = 4;
+const CENTER_LEVEL3_CELL_COUNT: usize =
+    CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE;
+
 impl World {
     /// Step the world forward one generation using the recursive Hashlife path.
     pub fn step_recursive(&mut self) {
@@ -142,9 +148,8 @@ impl World {
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
     fn step_base_case(&mut self, node: NodeId, origin: [i64; 3], _parity: u32) -> NodeId {
-        let side = 8usize;
-        let grid = self.store.flatten(node, side);
-        let next = self.step_grid_once(&grid, side, origin, self.generation);
+        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        let next = self.step_grid_once(&grid, origin, self.generation);
         self.center_level3_grid_to_node(&next)
     }
 
@@ -182,25 +187,24 @@ impl World {
     }
 
     fn step_base_case_macro(&mut self, node: NodeId, origin: [i64; 3], generation: u64) -> NodeId {
-        let side = 8usize;
-        let grid = self.store.flatten(node, side);
-        let next = self.step_grid_once(&grid, side, origin, generation);
-        let next = self.step_grid_once(&next, side, origin, generation + 1);
+        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        let next = self.step_grid_once(&grid, origin, generation);
+        let next = self.step_grid_once(&next, origin, generation + 1);
         self.center_level3_grid_to_node(&next)
     }
 
     fn step_grid_once(
         &self,
         grid: &[CellState],
-        side: usize,
         origin: [i64; 3],
         generation: u64,
-    ) -> Vec<CellState> {
+    ) -> [CellState; LEVEL3_CELL_COUNT] {
+        let side = LEVEL3_SIDE;
         // Phase 1: CaRule on interior cells (1..side-1 on each axis).
         // The outermost ring cannot be evolved correctly because its neighbors
         // would wrap outside the padded region. Callers only extract the center
         // that remains valid after the requested number of steps.
-        let mut next = vec![0 as CellState; side * side * side];
+        let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
         for z in 1..side - 1 {
             for y in 1..side - 1 {
                 for x in 1..side - 1 {
@@ -245,17 +249,18 @@ impl World {
     }
 
     fn center_level3_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
-        let center_side = 4usize;
-        let mut center_grid = vec![0 as CellState; center_side * center_side * center_side];
-        for cz in 0..center_side {
-            for cy in 0..center_side {
-                for cx in 0..center_side {
-                    center_grid[cx + cy * center_side + cz * center_side * center_side] =
-                        grid[(cx + 2) + (cy + 2) * 8 + (cz + 2) * 8 * 8];
+        let mut center_grid = [0 as CellState; CENTER_LEVEL3_CELL_COUNT];
+        for cz in 0..CENTER_LEVEL3_SIDE {
+            for cy in 0..CENTER_LEVEL3_SIDE {
+                for cx in 0..CENTER_LEVEL3_SIDE {
+                    center_grid[cx
+                        + cy * CENTER_LEVEL3_SIDE
+                        + cz * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE] = grid
+                        [(cx + 2) + (cy + 2) * LEVEL3_SIDE + (cz + 2) * LEVEL3_SIDE * LEVEL3_SIDE];
                 }
             }
         }
-        self.store.from_flat(&center_grid, center_side)
+        self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
     }
 
     /// Apply a single block rule within a flat grid.
