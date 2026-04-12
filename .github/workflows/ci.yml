@@ -32,6 +32,12 @@ on:
   # Allow manual reruns without needing a push (e.g. after a runner upgrade).
   workflow_dispatch:
 
+# Release binary artifacts (xb7.3 bare-binary fallback + xb7.4) — every
+# successful build uploads the freshly linked binary so humans can pull
+# it from the run page without re-running locally. Tag-driven releases
+# (xb7.2 macOS notarization, xb7.3 proper AppImage wrapping) happen on
+# top of these artifacts, not instead of them.
+
 # Cancel stale runs on the same ref so a rapid push sequence doesn't eat
 # runner minutes waiting for superseded commits.
 concurrency:
@@ -54,12 +60,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `artifact_name` is the filename uploaded from each runner. Using
+          # a per-OS suffix keeps the Windows `.exe` extension explicit and
+          # avoids name collisions when someone downloads all three and
+          # drops them in the same folder.
           - name: Linux
             os: ubuntu-latest
+            artifact_name: hash-thing-linux-x86_64
+            binary_path: target/release/hash-thing
           - name: macOS
             os: macos-latest
+            artifact_name: hash-thing-macos-aarch64
+            binary_path: target/release/hash-thing
           - name: Windows
             os: windows-latest
+            artifact_name: hash-thing-windows-x86_64.exe
+            binary_path: target/release/hash-thing.exe
 
     steps:
       - name: Checkout
@@ -104,3 +120,17 @@ jobs:
 
       - name: cargo test (release)
         run: cargo test --release
+
+      # Upload the freshly linked release binary as a workflow artifact.
+      # xb7.4 closes this loop for Windows (.exe); xb7.3 still wants a
+      # proper AppImage wrapper on top, and xb7.2 still wants macOS
+      # notarization — but both now have a known-good upstream artifact
+      # to build on. Retention defaults to the repo policy (90 days);
+      # we don't override it because these are development builds, not
+      # release artifacts.
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
