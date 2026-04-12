@@ -164,6 +164,10 @@ impl App {
             renderer.upload_volume(&data);
             // Incremental rebuild: reuses cached offsets for unchanged subtrees.
             svdag.update(&world.store, world.root, world.level);
+            // Compact when >50% of the buffer is stale slots (hash-thing-bx7).
+            if svdag.stale_ratio() > 0.5 {
+                svdag.compact(&world.store, world.root);
+            }
             *last_svdag_stats = (svdag.node_count, svdag.byte_size(), svdag.root_level);
             renderer.upload_svdag(svdag);
         }

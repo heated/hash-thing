@@ -212,6 +212,30 @@ impl Svdag {
     pub fn total_slot_count(&self) -> usize {
         self.offset_by_slot.len()
     }
+
+    /// Ratio of stale (unreachable) slots to total interned slots.
+    /// Returns 0.0 when `total_slot_count` is 0.
+    pub fn stale_ratio(&self) -> f64 {
+        let total = self.offset_by_slot.len();
+        if total == 0 {
+            return 0.0;
+        }
+        1.0 - (self.node_count as f64 / total as f64)
+    }
+
+    /// Compact the buffer by rebuilding from the current root into a fresh
+    /// Svdag, dropping unreachable slots and the stale cache entries that
+    /// pointed at them. The renderer must do a full re-upload after this
+    /// (the returned Svdag has a fresh buffer).
+    ///
+    /// Callers should check `stale_ratio()` first — compaction is O(reachable),
+    /// which is the same cost as `update()`, so running it every frame is
+    /// wasteful. A threshold of 0.5 (compact when >50% of buffer is stale)
+    /// is a reasonable default.
+    pub fn compact(&mut self, store: &NodeStore, root: NodeId) {
+        let root_level = self.root_level;
+        *self = Self::build(store, root, root_level);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2175,6 +2199,45 @@ mod tests {
             svdag.nodes.len(),
             len_after_first,
             "cross-epoch update with identical content must not grow the buffer"
+        );
+    }
+
+    #[test]
+    fn compact_reduces_buffer_after_edits() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 0, 0, 0, mat(1));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 6);
+
+        // Make several edits to accumulate stale slots.
+        for i in 1..10 {
+            root = store.set_cell(root, i * 5, i * 3, i * 4, mat(1));
+            svdag.update(&store, root, 6);
+        }
+
+        let pre_compact_len = svdag.nodes.len();
+        let pre_compact_total = svdag.total_slot_count();
+        assert!(
+            svdag.stale_ratio() > 0.0,
+            "edits should produce some stale slots"
+        );
+
+        svdag.compact(&store, root);
+
+        assert!(
+            svdag.nodes.len() <= pre_compact_len,
+            "compact must not grow the buffer"
+        );
+        assert!(
+            svdag.total_slot_count() <= pre_compact_total,
+            "compact must not grow the cache"
+        );
+        assert_eq!(
+            svdag.stale_ratio(),
+            0.0,
+            "after compact, every cached slot is reachable"
         );
     }
 
