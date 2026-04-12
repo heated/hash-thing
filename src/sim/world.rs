@@ -277,6 +277,35 @@ impl World {
         self.get_local(LocalCoord(x), LocalCoord(y), LocalCoord(z))
     }
 
+    /// Stepper-oriented read: "what is this cell right now?"
+    ///
+    /// Semantic alias for [`get`](Self::get) that signals the caller accepts
+    /// OOB-empty semantics without reservation. Hashlife steppers reading a
+    /// 3×3×3 neighborhood call `probe` — the unrealized world *is* empty
+    /// from the stepper's perspective, so returning 0 for out-of-bounds is
+    /// the correct physical answer, not a lossy fallback.
+    ///
+    /// Use [`is_realized`](Self::is_realized) when you need to distinguish
+    /// "genuinely empty" from "outside the realized region."
+    #[inline]
+    pub fn probe(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        self.get(x, y, z)
+    }
+
+    /// Is the coordinate inside the realized region?
+    ///
+    /// Returns `false` for negative coordinates and for positions beyond
+    /// the current octree extent. Use this alongside [`get`](Self::get)
+    /// when distinguishing "realized empty" from "unrealized" matters
+    /// (e.g. debug overlays rendering the region boundary).
+    pub fn is_realized(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> bool {
+        let (Ok(ux), Ok(uy), Ok(uz)) = (u64::try_from(x.0), u64::try_from(y.0), u64::try_from(z.0))
+        else {
+            return false;
+        };
+        self.region().contains(ux, uy, uz)
+    }
+
     /// Flatten to a 3D grid for rendering.
     pub fn flatten(&self) -> Vec<CellState> {
         self.store.flatten(self.root, self.side())
@@ -1588,5 +1617,35 @@ mod tests {
         world.ensure_contains(wc(20), wc(0), wc(0));
         assert!(world.region().side() > 20);
         assert_eq!(world.region().level, world.level);
+    }
+
+    #[test]
+    fn probe_matches_get() {
+        let mut world = World::new(3);
+        let stone = crate::terrain::materials::STONE;
+        world.set(wc(1), wc(2), wc(3), stone);
+        assert_eq!(
+            world.probe(wc(1), wc(2), wc(3)),
+            world.get(wc(1), wc(2), wc(3))
+        );
+        // OOB returns 0 from both
+        assert_eq!(world.probe(WorldCoord(-1), wc(0), wc(0)), 0);
+        assert_eq!(world.probe(wc(100), wc(0), wc(0)), 0);
+    }
+
+    #[test]
+    fn is_realized_inside() {
+        let world = World::new(3); // side=8
+        assert!(world.is_realized(wc(0), wc(0), wc(0)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
+        assert!(world.is_realized(wc(4), wc(2), wc(6)));
+    }
+
+    #[test]
+    fn is_realized_outside() {
+        let world = World::new(3); // side=8
+        assert!(!world.is_realized(WorldCoord(-1), wc(0), wc(0)));
+        assert!(!world.is_realized(wc(8), wc(0), wc(0)));
+        assert!(!world.is_realized(wc(0), wc(100), wc(0)));
     }
 }
