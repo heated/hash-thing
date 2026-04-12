@@ -121,6 +121,8 @@ struct App {
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
     step_handle: Option<JoinHandle<sim::World>>,
+    /// When the background step was spawned, for perf timing.
+    step_start: std::time::Instant,
     /// Cached world origin for rendering during background step.
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
@@ -175,6 +177,7 @@ impl App {
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
+            step_start: std::time::Instant::now(),
             render_origin,
             render_inv_size,
         };
@@ -718,6 +721,7 @@ impl ApplicationHandler for App {
                 if let Some(ref handle) = self.step_handle {
                     if handle.is_finished() {
                         let handle = self.step_handle.take().unwrap();
+                        self.perf.record("step", self.step_start.elapsed());
                         self.world = handle.join().expect("step thread panicked");
                         // Entity update runs on the main thread (needs
                         // both &World and &mut EntityStore).
@@ -765,7 +769,7 @@ impl ApplicationHandler for App {
                     && self.step_timer.elapsed().as_millis() > 200
                     && !self.is_stepping()
                 {
-                    let _t = self.perf.start("step");
+                    self.step_start = std::time::Instant::now();
                     // Move world to background thread; replace with tiny
                     // placeholder so self.world remains valid (but inert).
                     let mut world = std::mem::replace(
