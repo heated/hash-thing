@@ -118,6 +118,12 @@ impl World {
     fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
         assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
+        // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
+        // (NoopRule is identity; GoL-family rules have birth_min >= 1). No BlockRule on air.
+        if self.store.population(node) == 0 {
+            return self.store.empty(level - 1);
+        }
+
         let key = (node, origin, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
             return cached;
@@ -153,6 +159,12 @@ impl World {
             level >= 3,
             "step_node_macro requires level >= 3, got {level}"
         );
+
+        // Empty nodes step to empty across any number of generations:
+        // identity^N = identity. CaRule-only worlds (macro path prerequisite).
+        if self.store.population(node) == 0 {
+            return self.store.empty(level - 1);
+        }
 
         let key = (node, origin, generation);
         if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
