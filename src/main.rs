@@ -228,6 +228,35 @@ impl ApplicationHandler for App {
                                 self.world.population()
                             );
                         }
+                        winit::keyboard::Key::Character("c") => {
+                            // Re-seed terrain with caves enabled. Stays paused.
+                            // hash-thing-3fq.2: drives the cave-CA post-pass
+                            // end-to-end so the effect is visible without
+                            // editing source.
+                            let params = terrain::TerrainParams {
+                                caves: Some(terrain::CaveParams::default()),
+                                ..Default::default()
+                            };
+                            let nodes_before = self.world.store.stats().0;
+                            let (stats, elapsed) = perf::time(|| self.world.seed_terrain(&params));
+                            self.perf.record_gen(elapsed, self.world.store.stats());
+                            self.noise_ns_per_sample =
+                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+                            self.paused = true;
+                            self.upload_volume();
+                            let (nodes_after, _) = self.world.store.stats();
+                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
+                            log_gen_stats(
+                                "Caves terrain",
+                                self.world.side(),
+                                self.world.population(),
+                                nodes_after,
+                                nodes_delta,
+                                &stats,
+                                elapsed,
+                                self.noise_ns_per_sample,
+                            );
+                        }
                         winit::keyboard::Key::Character("r") => {
                             // Re-seed terrain. Stays paused.
                             let params = terrain::TerrainParams::default();
@@ -381,6 +410,7 @@ fn main() {
     log::info!("  Space: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
+    log::info!("  C: reset terrain with caves (CA post-pass)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");

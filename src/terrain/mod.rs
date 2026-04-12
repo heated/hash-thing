@@ -6,11 +6,13 @@
 //! recursion + proof-based collapse + interning shape that lives in
 //! `terrain::gen`.
 
+pub mod caves;
 pub mod field;
 pub mod gen;
 pub mod materials;
 pub mod noise;
 
+pub use caves::{carve_caves, carve_caves_grid, CaveParams};
 pub use field::HeightmapField;
 pub use gen::{gen_region, probe_sample_ns, GenStats};
 
@@ -23,6 +25,11 @@ pub struct TerrainParams {
     pub amplitude: f32,
     pub wavelength: f32,
     pub octaves: u32,
+    /// When `Some`, run the cave-CA post-pass with these params after
+    /// heightmap generation. Default `None` keeps the baseline terrain
+    /// path unchanged — tests and perf baselines don't see caves unless
+    /// a caller opts in.
+    pub caves: Option<CaveParams>,
 }
 
 impl Default for TerrainParams {
@@ -35,6 +42,7 @@ impl Default for TerrainParams {
             amplitude: 8.0,
             wavelength: 24.0,
             octaves: 4,
+            caves: None,
         }
     }
 }

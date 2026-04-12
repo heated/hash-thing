@@ -1,7 +1,7 @@
 use super::rule::CaRule;
 use crate::octree::{CellState, NodeId, NodeStore};
 use crate::rng::cell_rand_bool;
-use crate::terrain::{gen_region, GenStats, TerrainParams};
+use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -139,7 +139,14 @@ impl World {
         params.validate().expect("invalid TerrainParams");
         self.store = NodeStore::new();
         let field = params.to_heightmap();
-        let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        let (mut root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        // Opt-in cave-CA post-pass. Runs as a separate stage after the
+        // heightmap recursion so the baseline perf path (and every
+        // pre-caves test) sees identical work when `params.caves` is
+        // `None`. See `terrain::caves` for algorithm and rationale.
+        if let Some(cave_params) = params.caves {
+            root = carve_caves(&mut self.store, root, self.level, &cave_params);
+        }
         self.root = root;
         self.generation = 0;
         stats
