@@ -112,6 +112,14 @@ impl EntityStore {
         false
     }
 
+    /// Get a mutable reference to an entity by id.
+    pub fn get_mut(&mut self, id: EntityId) -> Option<&mut Entity> {
+        self.entities
+            .iter_mut()
+            .filter_map(|s| s.as_mut())
+            .find(|e| e.id == id)
+    }
+
     /// Iterate over all live entities.
     pub fn iter(&self) -> impl Iterator<Item = &Entity> {
         self.entities.iter().filter_map(|s| s.as_ref())

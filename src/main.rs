@@ -3,15 +3,39 @@ use hash_thing::render;
 use hash_thing::sim;
 use hash_thing::terrain;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::EventLoop,
+    keyboard::KeyCode,
     window::{Window, WindowAttributes},
 };
 
 const VOLUME_SIZE: u32 = 64;
+
+/// Camera mode: orbit around a target point, or first-person at the player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CameraMode {
+    /// Debug orbit camera (original). Mouse drag rotates, scroll zooms.
+    Orbit,
+    /// First-person: eye at player position, mouse look, WASD movement.
+    FirstPerson,
+}
+
+/// Player movement speed in cells per frame.
+const PLAYER_SPEED: f64 = 0.15;
+/// Sprint multiplier.
+const PLAYER_SPRINT: f64 = 2.5;
+/// Player bounding box half-width on X/Z (cells).
+const PLAYER_HALF_W: f64 = 0.3;
+/// Player height (cells).
+const PLAYER_HEIGHT: f64 = 1.6;
+/// Mouse look sensitivity (radians per pixel).
+const LOOK_SENSITIVITY: f64 = 0.003;
+/// Maximum raycast range for block place/break (in cells).
+const INTERACT_RANGE: f64 = 40.0;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -81,6 +105,12 @@ struct App {
     // Mouse interaction state
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
+    /// Currently held keyboard keys (for per-frame movement polling).
+    keys_held: HashSet<KeyCode>,
+    /// Camera mode: orbit (debug) or first-person (gameplay).
+    camera_mode: CameraMode,
+    /// The player entity, if spawned.
+    player_id: Option<sim::EntityId>,
     perf: perf::Perf,
     /// Memory-watchdog metric family — node-count + step-cache ratcheting
     /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
@@ -117,7 +147,7 @@ impl App {
         // Start paused so the user opts into stepping explicitly. The
         // default scene is now a CA/materials showcase and should not
         // start evolving until requested.
-        Self {
+        let mut app = Self {
             window: None,
             renderer: None,
             world,
@@ -129,12 +159,199 @@ impl App {
             log_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
+            keys_held: HashSet::new(),
+            camera_mode: CameraMode::FirstPerson,
+            player_id: None,
             perf: perf::Perf::new(),
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
             noise_ns_per_sample: 0.0,
             entities: sim::EntityStore::new(),
+        };
+
+        // Spawn the player entity at the world center, looking forward.
+        let center = VOLUME_SIZE as f64 / 2.0;
+        let player_id = app.entities.add(
+            [center, center + 2.0, center],
+            [0.0; 3],
+            sim::EntityKind::Player(sim::PlayerState {
+                yaw: std::f64::consts::FRAC_PI_4,
+                pitch: 0.0,
+                held_material: 1, // stone
+            }),
+        );
+        app.player_id = Some(player_id);
+        log::info!("Player spawned at ({center}, {}, {center})", center + 2.0);
+
+        app
+    }
+
+    /// Check if the player's AABB at `pos` overlaps any solid cell.
+    fn player_collides(world: &sim::World, pos: &[f64; 3]) -> bool {
+        let hw = PLAYER_HALF_W;
+        // Sample the 8 corners of the player AABB.
+        let corners = [
+            [pos[0] - hw, pos[1], pos[2] - hw],
+            [pos[0] + hw, pos[1], pos[2] - hw],
+            [pos[0] - hw, pos[1], pos[2] + hw],
+            [pos[0] + hw, pos[1], pos[2] + hw],
+            [pos[0] - hw, pos[1] + PLAYER_HEIGHT, pos[2] - hw],
+            [pos[0] + hw, pos[1] + PLAYER_HEIGHT, pos[2] - hw],
+            [pos[0] - hw, pos[1] + PLAYER_HEIGHT, pos[2] + hw],
+            [pos[0] + hw, pos[1] + PLAYER_HEIGHT, pos[2] + hw],
+        ];
+        for c in &corners {
+            let cx = c[0].floor() as i64;
+            let cy = c[1].floor() as i64;
+            let cz = c[2].floor() as i64;
+            let cell = world.get(
+                sim::WorldCoord(cx),
+                sim::WorldCoord(cy),
+                sim::WorldCoord(cz),
+            );
+            if cell != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
+    /// `hit_cell` is the first solid cell along the ray, `prev_cell` is the
+    /// empty cell just before it (for block placement).
+    fn raycast_cells(&self, origin: [f64; 3], dir: [f64; 3]) -> Option<([i64; 3], [i64; 3])> {
+        let mut pos = [
+            origin[0].floor() as i64,
+            origin[1].floor() as i64,
+            origin[2].floor() as i64,
+        ];
+        let step = [
+            if dir[0] >= 0.0 { 1i64 } else { -1 },
+            if dir[1] >= 0.0 { 1i64 } else { -1 },
+            if dir[2] >= 0.0 { 1i64 } else { -1 },
+        ];
+        // Distance along ray to the next cell boundary on each axis.
+        let mut t_max = [0.0f64; 3];
+        let mut t_delta = [0.0f64; 3];
+        for i in 0..3 {
+            if dir[i].abs() < 1e-12 {
+                t_max[i] = f64::INFINITY;
+                t_delta[i] = f64::INFINITY;
+            } else {
+                let boundary = if dir[i] > 0.0 {
+                    (pos[i] + 1) as f64
+                } else {
+                    pos[i] as f64
+                };
+                t_max[i] = (boundary - origin[i]) / dir[i];
+                t_delta[i] = (step[i] as f64) / dir[i];
+            }
+        }
+
+        let max_steps = (INTERACT_RANGE * 2.0) as usize;
+        let mut prev = pos;
+        for _ in 0..max_steps {
+            // Check current cell.
+            let cell = self.world.get(
+                sim::WorldCoord(pos[0]),
+                sim::WorldCoord(pos[1]),
+                sim::WorldCoord(pos[2]),
+            );
+            if cell != 0 {
+                return Some((pos, prev));
+            }
+            prev = pos;
+
+            // Advance to next cell boundary.
+            if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
+                pos[0] += step[0];
+                t_max[0] += t_delta[0];
+            } else if t_max[1] < t_max[2] {
+                pos[1] += step[1];
+                t_max[1] += t_delta[1];
+            } else {
+                pos[2] += step[2];
+                t_max[2] += t_delta[2];
+            }
+        }
+        None
+    }
+
+    /// Get the player's eye position and look direction.
+    fn player_eye_ray(&self) -> Option<([f64; 3], [f64; 3])> {
+        let pid = self.player_id?;
+        let player = self.entities.iter().find(|e| e.id == pid)?;
+        let (yaw, pitch) = if let sim::EntityKind::Player(ref ps) = player.kind {
+            (ps.yaw, ps.pitch)
+        } else {
+            return None;
+        };
+        let eye = [
+            player.pos[0],
+            player.pos[1] + PLAYER_HEIGHT * 0.85,
+            player.pos[2],
+        ];
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = pitch.sin_cos();
+        let dir = [-cos_pitch * sin_yaw, sin_pitch, -cos_pitch * cos_yaw];
+        Some((eye, dir))
+    }
+
+    /// Break the block the player is looking at.
+    fn break_block(&mut self) {
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((hit, _prev)) = self.raycast_cells(eye, dir) {
+            self.world.set(
+                sim::WorldCoord(hit[0]),
+                sim::WorldCoord(hit[1]),
+                sim::WorldCoord(hit[2]),
+                0, // empty
+            );
+            // Re-upload volume since we modified the world directly.
+            Self::upload_volume(
+                &mut self.renderer,
+                &self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
+        }
+    }
+
+    /// Place a block on the face the player is looking at.
+    fn place_block(&mut self) {
+        let pid = self.player_id;
+        let held_material = pid
+            .and_then(|id| self.entities.iter().find(|e| e.id == id))
+            .and_then(|e| {
+                if let sim::EntityKind::Player(ref ps) = e.kind {
+                    Some(ps.held_material)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1);
+
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((_hit, prev)) = self.raycast_cells(eye, dir) {
+            // Place at the empty cell just before the hit.
+            let state = hash_thing::octree::Cell::pack(held_material, 0).raw();
+            self.world.set(
+                sim::WorldCoord(prev[0]),
+                sim::WorldCoord(prev[1]),
+                sim::WorldCoord(prev[2]),
+                state,
+            );
+            Self::upload_volume(
+                &mut self.renderer,
+                &self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
         }
     }
 
@@ -286,14 +503,36 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // Track physical key state for per-frame movement polling.
+                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            self.keys_held.insert(code);
+                        }
+                        ElementState::Released => {
+                            self.keys_held.remove(&code);
+                        }
+                    }
+                }
                 if event.state == ElementState::Pressed {
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
-                            self.paused = !self.paused;
-                            log::info!("Paused: {}", self.paused);
+                            // In orbit mode, Space toggles pause.
+                            // In FPS mode, Space is fly-up (handled per-frame).
+                            if self.camera_mode == CameraMode::Orbit {
+                                self.paused = !self.paused;
+                                log::info!("Paused: {}", self.paused);
+                            }
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
                             event_loop.exit();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                            self.camera_mode = match self.camera_mode {
+                                CameraMode::Orbit => CameraMode::FirstPerson,
+                                CameraMode::FirstPerson => CameraMode::Orbit,
+                            };
+                            log::info!("Camera mode: {:?}", self.camera_mode);
                         }
                         winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
@@ -427,22 +666,48 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
-                    self.mouse_pressed = state == ElementState::Pressed;
-                    if !self.mouse_pressed {
-                        self.last_mouse = None;
+                    if self.camera_mode == CameraMode::Orbit {
+                        self.mouse_pressed = state == ElementState::Pressed;
+                        if !self.mouse_pressed {
+                            self.last_mouse = None;
+                        }
+                    } else if state == ElementState::Pressed {
+                        // FPS mode: left click = break block.
+                        self.break_block();
                     }
+                }
+                if button == MouseButton::Right
+                    && state == ElementState::Pressed
+                    && self.camera_mode == CameraMode::FirstPerson
+                {
+                    self.place_block();
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                if self.mouse_pressed {
+                let should_look = match self.camera_mode {
+                    CameraMode::Orbit => self.mouse_pressed,
+                    CameraMode::FirstPerson => true, // always look in FPS
+                };
+                if should_look {
                     if let Some((lx, ly)) = self.last_mouse {
-                        let dx = (position.x - lx) as f32;
-                        let dy = (position.y - ly) as f32;
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.camera_yaw += dx * 0.005;
+                        let dx = position.x - lx;
+                        let dy = position.y - ly;
+                        if self.camera_mode == CameraMode::FirstPerson {
+                            // Update player yaw/pitch directly.
+                            if let Some(pid) = self.player_id {
+                                if let Some(player) = self.entities.get_mut(pid) {
+                                    if let sim::EntityKind::Player(ref mut ps) = player.kind {
+                                        ps.yaw += dx * LOOK_SENSITIVITY;
+                                        ps.pitch =
+                                            (ps.pitch - dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
+                                    }
+                                }
+                            }
+                        } else if let Some(renderer) = &mut self.renderer {
+                            renderer.camera_yaw += dx as f32 * 0.005;
                             renderer.camera_pitch =
-                                (renderer.camera_pitch + dy * 0.005).clamp(-1.4, 1.4);
+                                (renderer.camera_pitch + dy as f32 * 0.005).clamp(-1.4, 1.4);
                         }
                     }
                     self.last_mouse = Some((position.x, position.y));
@@ -542,6 +807,106 @@ impl ApplicationHandler for App {
                         self.perf.summary(),
                     );
                     self.log_timer = std::time::Instant::now();
+                }
+
+                // Player movement (per-frame, not per-tick) and camera sync.
+                if self.camera_mode == CameraMode::FirstPerson {
+                    if let Some(pid) = self.player_id {
+                        // Read player state for movement computation.
+                        let (yaw, _pitch) = if let Some(player) = self.entities.get_mut(pid) {
+                            if let sim::EntityKind::Player(ref ps) = player.kind {
+                                (ps.yaw, ps.pitch)
+                            } else {
+                                (0.0, 0.0)
+                            }
+                        } else {
+                            (0.0, 0.0)
+                        };
+
+                        // Compute movement from held keys relative to yaw.
+                        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+                        // Forward is along -Z in local space, rotated by yaw.
+                        let fwd = [-sin_yaw, 0.0, -cos_yaw];
+                        let right = [cos_yaw, 0.0, -sin_yaw];
+
+                        let mut move_dir = [0.0f64; 3];
+                        if self.keys_held.contains(&KeyCode::KeyW) {
+                            move_dir[0] += fwd[0];
+                            move_dir[2] += fwd[2];
+                        }
+                        if self.keys_held.contains(&KeyCode::KeyS) {
+                            move_dir[0] -= fwd[0];
+                            move_dir[2] -= fwd[2];
+                        }
+                        if self.keys_held.contains(&KeyCode::KeyA) {
+                            move_dir[0] -= right[0];
+                            move_dir[2] -= right[2];
+                        }
+                        if self.keys_held.contains(&KeyCode::KeyD) {
+                            move_dir[0] += right[0];
+                            move_dir[2] += right[2];
+                        }
+                        // Vertical movement (creative fly mode).
+                        if self.keys_held.contains(&KeyCode::Space) {
+                            move_dir[1] += 1.0;
+                        }
+                        if self.keys_held.contains(&KeyCode::ShiftLeft)
+                            || self.keys_held.contains(&KeyCode::ShiftRight)
+                        {
+                            move_dir[1] -= 1.0;
+                        }
+
+                        // Normalize and apply speed.
+                        let len = (move_dir[0] * move_dir[0]
+                            + move_dir[1] * move_dir[1]
+                            + move_dir[2] * move_dir[2])
+                            .sqrt();
+                        if len > 1e-9 {
+                            let speed = if self.keys_held.contains(&KeyCode::ControlLeft)
+                                || self.keys_held.contains(&KeyCode::ControlRight)
+                            {
+                                PLAYER_SPEED * PLAYER_SPRINT
+                            } else {
+                                PLAYER_SPEED
+                            };
+                            let inv_len = speed / len;
+                            let delta = [
+                                move_dir[0] * inv_len,
+                                move_dir[1] * inv_len,
+                                move_dir[2] * inv_len,
+                            ];
+
+                            // Apply movement with per-axis collision.
+                            if let Some(player) = self.entities.get_mut(pid) {
+                                for (axis, &d) in delta.iter().enumerate() {
+                                    let old = player.pos[axis];
+                                    player.pos[axis] += d;
+
+                                    // AABB collision check: sample corners.
+                                    if Self::player_collides(&self.world, &player.pos) {
+                                        player.pos[axis] = old; // reject this axis
+                                    }
+                                }
+                            }
+                        }
+
+                        // Sync camera to player position and orientation.
+                        if let Some(player) = self.entities.get_mut(pid) {
+                            let inv_size = 1.0 / VOLUME_SIZE as f64;
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.camera_target = [
+                                    player.pos[0] as f32 * inv_size as f32,
+                                    (player.pos[1] + PLAYER_HEIGHT * 0.85) as f32 * inv_size as f32,
+                                    player.pos[2] as f32 * inv_size as f32,
+                                ];
+                                if let sim::EntityKind::Player(ref ps) = player.kind {
+                                    renderer.camera_yaw = ps.yaw as f32;
+                                    renderer.camera_pitch = ps.pitch as f32;
+                                }
+                                renderer.camera_dist = 0.0;
+                            }
+                        }
+                    }
                 }
 
                 // Time render. Disjoint-field borrows: the Timer holds
