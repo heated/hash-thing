@@ -18,12 +18,13 @@
 //!      (each level n-1), recursively step each → 8 results at level n-2.
 //!      Assemble into the level-(n-1) output.
 //!
-//! Step results are memoized by (NodeId, origin, parity) so identical subtrees at
-//! the same world-space position are computed only once per generation.
-//! After each step, compaction remaps NodeIds; the cache entries are translated
-//! through the remap table rather than cleared. Entries for GC'd nodes are
-//! dropped automatically. Since parity alternates 0/1, cache hits occur every
-//! OTHER frame for stable subtrees (parity match on frame N+2, not N+1).
+//! Step results are memoized by (NodeId, parity) so identical subtrees anywhere
+//! in the world share a single cache entry per generation. Block-rule partition
+//! uses node-local alignment (9ww), so origin is not in the cache key.
+//! Compaction is deferred (m1f.14): intermediate nodes survive across frames,
+//! enabling cache hits at every recursion level. Periodic compaction triggers
+//! when the store exceeds 2× its post-compaction size. Since parity alternates
+//! 0/1, cache hits occur every OTHER frame for stable subtrees.
 
 use super::world::World;
 use crate::octree::node::octant_index;
@@ -45,18 +46,10 @@ impl World {
             self.level
         );
         self.hashlife_stats = super::world::HashlifeStats::default();
-        // Auto-enable spatial memoization for CaRule-only worlds.
-        // BlockRule partition alignment depends on world-space origin, so
-        // origin must remain in the cache key when block rules are present.
-        self.spatial_memo = !self.materials.has_any_block_rules();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
-        // World-space origin of the padded root: the original world is
-        // centered, so it starts at 2^(level-1) from the padded root's origin.
-        let quarter = 1u64 << (self.level - 1);
-        let origin = [-(quarter as i64); 3];
         let parity = (self.generation % 2) as u32;
-        let result = self.step_node(padded_root, padded_level, origin, parity);
+        let result = self.step_node(padded_root, padded_level, parity);
         self.root = result;
         self.generation += 1;
 
@@ -86,9 +79,7 @@ impl World {
         }
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
-        let quarter = 1u64 << (self.level - 1);
-        let origin = [-(quarter as i64); 3];
-        let result = self.step_node_macro(padded_root, padded_level, origin, self.generation);
+        let result = self.step_node_macro(padded_root, padded_level, self.generation);
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
 
@@ -144,23 +135,22 @@ impl World {
     /// Remap hashlife cache keys and values through a compaction remap table.
     /// Entries referencing unreachable nodes (not in remap) are dropped.
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
-        // Remap hashlife_cache: (NodeId, origin, parity) → NodeId
+        // Remap hashlife_cache: (NodeId, parity) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
         self.hashlife_cache.reserve(old_cache.len());
-        for ((node, origin, parity), result) in old_cache {
+        for ((node, parity), result) in old_cache {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
-                self.hashlife_cache
-                    .insert((new_node, origin, parity), new_result);
+                self.hashlife_cache.insert((new_node, parity), new_result);
             }
         }
 
-        // Remap hashlife_macro_cache: (NodeId, origin, generation) → NodeId
+        // Remap hashlife_macro_cache: (NodeId, generation) → NodeId
         let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
         self.hashlife_macro_cache.reserve(old_macro.len());
-        for ((node, origin, gen), result) in old_macro {
+        for ((node, gen), result) in old_macro {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
                 self.hashlife_macro_cache
-                    .insert((new_node, origin, gen), new_result);
+                    .insert((new_node, gen), new_result);
             }
         }
     }
@@ -181,8 +171,10 @@ impl World {
     }
 
     /// Recursively step a node. Input level n (≥ 3), output level n-1.
-    /// `origin` is the world-space coordinate of the node's (0,0,0) corner.
-    fn step_node(&mut self, node: NodeId, level: u32, origin: [i64; 3], parity: u32) -> NodeId {
+    /// Block-rule partition uses node-local alignment, so origin is not needed
+    /// and the cache key is just (NodeId, parity) — enabling spatial memoization
+    /// for all worlds, including those with block rules (9ww).
+    fn step_node(&mut self, node: NodeId, level: u32, parity: u32) -> NodeId {
         assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
@@ -192,28 +184,7 @@ impl World {
             return self.store.empty(level - 1);
         }
 
-        // Spatial memoization: for CaRule-only worlds, identical subtrees at
-        // different positions produce the same result. Use (NodeId, parity)
-        // as cache key instead of (NodeId, origin, parity).
-        if self.spatial_memo {
-            let spatial_key = (node, parity);
-            if let Some(&cached) = self.hashlife_spatial_cache.get(&spatial_key) {
-                self.hashlife_stats.cache_hits += 1;
-                return cached;
-            }
-            self.hashlife_stats.cache_misses += 1;
-
-            let result = if level == 3 {
-                self.step_base_case(node, origin, parity)
-            } else {
-                self.step_recursive_case(node, level, origin, parity)
-            };
-
-            self.hashlife_spatial_cache.insert(spatial_key, result);
-            return result;
-        }
-
-        let key = (node, origin, parity);
+        let key = (node, parity);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
@@ -221,9 +192,9 @@ impl World {
         self.hashlife_stats.cache_misses += 1;
 
         let result = if level == 3 {
-            self.step_base_case(node, origin, parity)
+            self.step_base_case(node, parity)
         } else {
-            self.step_recursive_case(node, level, origin, parity)
+            self.step_recursive_case(node, level, parity)
         };
 
         self.hashlife_cache.insert(key, result);
@@ -232,9 +203,9 @@ impl World {
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
-    fn step_base_case(&mut self, node: NodeId, origin: [i64; 3], _parity: u32) -> NodeId {
+    fn step_base_case(&mut self, node: NodeId, _parity: u32) -> NodeId {
         let grid = self.store.flatten(node, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, origin, self.generation);
+        let next = self.step_grid_once(&grid, self.generation);
         self.center_level3_grid_to_node(&next)
     }
 
@@ -242,7 +213,6 @@ impl World {
         &mut self,
         node: NodeId,
         level: u32,
-        origin: [i64; 3],
         generation: u64,
     ) -> NodeId {
         debug_assert!(
@@ -256,32 +226,31 @@ impl World {
             return self.store.empty(level - 1);
         }
 
-        let key = (node, origin, generation);
+        let key = (node, generation);
         if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
             return cached;
         }
 
         let result = if level == 3 {
-            self.step_base_case_macro(node, origin, generation)
+            self.step_base_case_macro(node, generation)
         } else {
-            self.step_recursive_case_macro(node, level, origin, generation)
+            self.step_recursive_case_macro(node, level, generation)
         };
 
         self.hashlife_macro_cache.insert(key, result);
         result
     }
 
-    fn step_base_case_macro(&mut self, node: NodeId, origin: [i64; 3], generation: u64) -> NodeId {
+    fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
         let grid = self.store.flatten(node, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, origin, generation);
-        let next = self.step_grid_once(&next, origin, generation + 1);
+        let next = self.step_grid_once(&grid, generation);
+        let next = self.step_grid_once(&next, generation + 1);
         self.center_level3_grid_to_node(&next)
     }
 
     fn step_grid_once(
         &self,
         grid: &[CellState],
-        origin: [i64; 3],
         generation: u64,
     ) -> [CellState; LEVEL3_CELL_COUNT] {
         let side = LEVEL3_SIDE;
@@ -304,23 +273,19 @@ impl World {
         }
 
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
+        // Node-local alignment (9ww): the partition is determined by grid-local
+        // coordinates, not world-space origin. Every block starting at offset
+        // is valid — no world-space alignment check needed. This makes the
+        // cache key origin-independent, enabling spatial memoization for all
+        // worlds including those with block rules.
         let offset = (generation % 2) as usize;
-        let start = offset;
-        let mut bz = start;
+        let mut bz = offset;
         while bz + 1 < side - 1 {
-            let mut by = start;
+            let mut by = offset;
             while by + 1 < side - 1 {
-                let mut bx = start;
+                let mut bx = offset;
                 while bx + 1 < side - 1 {
-                    let wbx = origin[0] + bx as i64;
-                    let wby = origin[1] + by as i64;
-                    let wbz = origin[2] + bz as i64;
-                    if wbx.rem_euclid(2) == offset as i64
-                        && wby.rem_euclid(2) == offset as i64
-                        && wbz.rem_euclid(2) == offset as i64
-                    {
-                        self.apply_block_in_grid(&mut next, side, bx, by, bz);
-                    }
+                    self.apply_block_in_grid(&mut next, side, bx, by, bz);
                     bx += 2;
                 }
                 by += 2;
@@ -394,13 +359,7 @@ impl World {
     }
 
     /// Recursive case: level ≥ 3.
-    fn step_recursive_case(
-        &mut self,
-        node: NodeId,
-        level: u32,
-        origin: [i64; 3],
-        parity: u32,
-    ) -> NodeId {
+    fn step_recursive_case(&mut self, node: NodeId, level: u32, parity: u32) -> NodeId {
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
@@ -437,8 +396,6 @@ impl World {
         }
 
         // Group into 8 overlapping sub-cubes (level n-1) and recurse.
-        let quarter = 1i64 << (level - 2); // size of a level-(n-2) node
-        let half_quarter = quarter / 2; // = 2^(level-3)
         let mut result_children = [NodeId::EMPTY; 8];
         for oz in 0..2usize {
             for oy in 0..2usize {
@@ -453,15 +410,8 @@ impl World {
                         }
                     }
                     let sub_root = self.store.interior(level - 1, sub_cube);
-                    // World-space origin: centered[0] starts at origin + half_quarter.
-                    // Each subsequent centered node adds quarter.
-                    let sub_origin = [
-                        origin[0] + half_quarter + (ox as i64) * quarter,
-                        origin[1] + half_quarter + (oy as i64) * quarter,
-                        origin[2] + half_quarter + (oz as i64) * quarter,
-                    ];
                     result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node(sub_root, level - 1, sub_origin, parity);
+                        self.step_node(sub_root, level - 1, parity);
                 }
             }
         }
@@ -473,15 +423,12 @@ impl World {
         &mut self,
         node: NodeId,
         level: u32,
-        origin: [i64; 3],
         generation: u64,
     ) -> NodeId {
         debug_assert!(level > 3, "macro recursive case requires level > 3");
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
-        let quarter = 1i64 << (level - 2);
-        let half_quarter = quarter / 2;
         let half_skip = 1u64 << (level - 3);
 
         // Phase 1: compute each overlapping level-(n-1) intermediate node's
@@ -507,13 +454,8 @@ impl World {
                         }
                     }
                     let inter = self.store.interior(level - 1, octants);
-                    let inter_origin = [
-                        origin[0] + (px as i64) * quarter,
-                        origin[1] + (py as i64) * quarter,
-                        origin[2] + (pz as i64) * quarter,
-                    ];
                     phased[px + py * 3 + pz * 9] =
-                        self.step_node_macro(inter, level - 1, inter_origin, generation);
+                        self.step_node_macro(inter, level - 1, generation);
                 }
             }
         }
@@ -535,13 +477,8 @@ impl World {
                         }
                     }
                     let sub_root = self.store.interior(level - 1, sub_cube);
-                    let sub_origin = [
-                        origin[0] + half_quarter + (ox as i64) * quarter,
-                        origin[1] + half_quarter + (oy as i64) * quarter,
-                        origin[2] + half_quarter + (oz as i64) * quarter,
-                    ];
-                    result_children[octant_index(ox as u32, oy as u32, oz as u32)] = self
-                        .step_node_macro(sub_root, level - 1, sub_origin, generation + half_skip);
+                    result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
+                        self.step_node_macro(sub_root, level - 1, generation + half_skip);
                 }
             }
         }

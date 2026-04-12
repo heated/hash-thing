@@ -81,22 +81,14 @@ pub struct World {
     /// `ensure_region` generates terrain (heightmap + caves)
     /// for newly-created sibling octants instead of leaving them empty.
     terrain_params: Option<TerrainParams>,
-    /// Memoization cache for the recursive Hashlife stepper (6gf.2).
-    /// Key: (NodeId, world-space origin). Value: stepped result NodeId.
-    /// Cleared after each generation and on rule changes.
-    pub(crate) hashlife_cache: FxHashMap<(NodeId, [i64; 3], u32), NodeId>,
+    /// Spatial memoization cache for the recursive Hashlife stepper.
+    /// Key: (NodeId, parity). Identical subtrees anywhere in the world
+    /// share a single cache entry — block-rule partition uses node-local
+    /// alignment so origin is no longer in the key (9ww).
+    pub(crate) hashlife_cache: FxHashMap<(NodeId, u32), NodeId>,
     /// Memoization cache for the exponential Hashlife macro-stepper (6gf.7).
-    /// Key: (NodeId, world-space origin, starting generation).
-    /// Cleared after each macro-step and on rule changes.
-    pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, [i64; 3], u64), NodeId>,
-    /// Spatial memoization cache for CaRule-only worlds (m1f.1).
-    /// Key: (NodeId, parity) — no origin, so identical subtrees anywhere
-    /// in the world share a single cache entry.
-    pub(crate) hashlife_spatial_cache: FxHashMap<(NodeId, u32), NodeId>,
-    /// When true, `step_recursive` uses spatial memoization (origin-free
-    /// cache key). Only correct for CaRule-only worlds — BlockRule depends
-    /// on world-space coordinates for RNG. Defaults to false.
-    pub spatial_memo: bool,
+    /// Key: (NodeId, starting generation).
+    pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, u64), NodeId>,
     /// Hashlife cache statistics from the most recent step.
     pub hashlife_stats: HashlifeStats,
     /// Store size after the last compaction, used to trigger periodic GC.
@@ -149,8 +141,6 @@ impl World {
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
-            hashlife_spatial_cache: FxHashMap::default(),
-            spatial_memo: false,
             hashlife_stats: HashlifeStats::default(),
             store_size_at_last_compact: 0,
             block_rule_present: None,
@@ -1912,10 +1902,10 @@ mod tests {
         let mut world = World::new(3);
         world
             .hashlife_cache
-            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
         world
             .hashlife_macro_cache
-            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
 
         world.set(wc(3), wc(3), wc(3), STONE);
 
@@ -1935,10 +1925,10 @@ mod tests {
         let mut world = World::new(3);
         world
             .hashlife_cache
-            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
         world
             .hashlife_macro_cache
-            .insert((NodeId::EMPTY, [0, 0, 0], 0), NodeId::EMPTY);
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
         world.queue.push(WorldMutation::SetCell {
             x: wc(2),
             y: wc(2),
