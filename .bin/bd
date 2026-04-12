@@ -12,29 +12,155 @@
 
 set -euo pipefail
 
-BD_REAL="/usr/local/bin/bd"
+BD_REAL="${BD_REAL:-/usr/local/bin/bd}"
 MAX_RETRIES=5
 BASE_DELAY=1  # seconds
 
-for attempt in $(seq 0 "$MAX_RETRIES"); do
-    output=$("$BD_REAL" "$@" 2>&1) && {
-        printf '%s\n' "$output"
-        exit 0
-    }
-    rc=$?
+run_bd() {
+    local output rc attempt
+    for attempt in $(seq 0 "$MAX_RETRIES"); do
+        output=$("$BD_REAL" "$@" 2>&1) && {
+            printf '%s\n' "$output"
+            return 0
+        }
+        rc=$?
 
-    if printf '%s' "$output" | grep -q "another process holds the exclusive lock"; then
-        if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+        if printf '%s' "$output" | grep -q "another process holds the exclusive lock"; then
+            if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+                printf '%s\n' "$output" >&2
+                return "$rc"
+            fi
+            # Exponential backoff: 1, 2, 4, 8, 16 seconds + up to 1s jitter
+            local delay=$(( BASE_DELAY << attempt ))
+            local jitter=$(( RANDOM % 1000 ))
+            sleep "${delay}.${jitter}"
+        else
+            # Non-lock error — don't retry
             printf '%s\n' "$output" >&2
-            exit "$rc"
+            return "$rc"
         fi
-        # Exponential backoff: 1, 2, 4, 8, 16 seconds + up to 1s jitter
-        delay=$(( BASE_DELAY << attempt ))
-        jitter=$(( RANDOM % 1000 ))
-        sleep "${delay}.${jitter}"
-    else
-        # Non-lock error — don't retry
-        printf '%s\n' "$output" >&2
-        exit "$rc"
+    done
+}
+
+is_close_command() {
+    case "${1:-}" in
+        close|done)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+main_ref_contains_commit() {
+    local commit="$1"
+    local tmp_ref="refs/bd/close-check-$$-$RANDOM"
+
+    git fetch --quiet origin "refs/heads/main:$tmp_ref" >/dev/null 2>&1 || return 1
+    git merge-base --is-ancestor "$commit" "$tmp_ref"
+    local rc=$?
+    git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true
+    return "$rc"
+}
+
+preflight_close() {
+    local actor="${BEADS_ACTOR:-}"
+    if [ -z "$actor" ]; then
+        actor=$(git config user.name 2>/dev/null || true)
     fi
-done
+
+    local require_commit=""
+    local -a passthrough=()
+    local -a issue_ids=()
+    shift
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --require-commit=*)
+                require_commit="${1#--require-commit=}"
+                ;;
+            --require-commit)
+                if [ "$#" -lt 2 ]; then
+                    printf 'bd close: --require-commit expects a commit SHA\n' >&2
+                    return 2
+                fi
+                require_commit="$2"
+                shift
+                ;;
+            --reason|--session|--actor|--db|--dolt-auto-commit)
+                if [ "$#" -lt 2 ]; then
+                    printf 'bd close: %s expects a value\n' "$1" >&2
+                    return 2
+                fi
+                passthrough+=("$1" "$2")
+                shift
+                ;;
+            -r)
+                if [ "$#" -lt 2 ]; then
+                    printf 'bd close: %s expects a value\n' "$1" >&2
+                    return 2
+                fi
+                passthrough+=("$1" "$2")
+                shift
+                ;;
+            --*)
+                passthrough+=("$1")
+                ;;
+            -*)
+                passthrough+=("$1")
+                ;;
+            *)
+                issue_ids+=("$1")
+                passthrough+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    if [ "${#issue_ids[@]}" -eq 0 ]; then
+        printf 'bd close: explicit issue ID required when using .bin/bd\n' >&2
+        return 2
+    fi
+
+    if [ -z "$require_commit" ]; then
+        require_commit=$(git rev-parse HEAD)
+    fi
+
+    if ! git rev-parse --verify "$require_commit^{commit}" >/dev/null 2>&1; then
+        printf 'bd close: commit %s does not exist locally\n' "$require_commit" >&2
+        return 2
+    fi
+
+    if ! git merge-base --is-ancestor "$require_commit" HEAD; then
+        printf 'bd close: commit %s is not reachable from HEAD\n' "$require_commit" >&2
+        return 2
+    fi
+
+    if ! main_ref_contains_commit "$require_commit"; then
+        printf 'bd close: commit %s is not reachable from origin/main; push to main before closing\n' "$require_commit" >&2
+        return 2
+    fi
+
+    if [ -n "$actor" ]; then
+        local issue_json
+        for issue_id in "${issue_ids[@]}"; do
+            issue_json=$(run_bd show "$issue_id" --json 2>/dev/null) || {
+                printf 'bd close: failed to inspect issue %s\n' "$issue_id" >&2
+                return 2
+            }
+            if ! printf '%s' "$issue_json" | grep -Eq "\"assignee\"[[:space:]]*:[[:space:]]*\"$actor\""; then
+                printf 'bd close: issue %s is not assigned to %s\n' "$issue_id" "$actor" >&2
+                return 2
+            fi
+        done
+    fi
+
+    run_bd close "${passthrough[@]}"
+}
+
+if is_close_command "${1:-}"; then
+    preflight_close "$@"
+else
+    run_bd "$@"
+fi
