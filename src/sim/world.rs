@@ -120,7 +120,11 @@ impl World {
     /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
     /// distinct rule exists, run it. If zero or multiple: skip (identity).
     fn step_blocks(&self, grid: &mut [CellState], side: usize) {
-        let offset = if self.generation.is_multiple_of(2) { 0 } else { 1 };
+        let offset = if self.generation.is_multiple_of(2) {
+            0
+        } else {
+            1
+        };
 
         let mut bz = offset;
         while bz + 1 < side {
@@ -636,9 +640,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::sim::margolus::{GravityBlockRule, IdentityBlockRule};
-    use crate::terrain::materials::{
-        DIRT_MATERIAL_ID, STONE_MATERIAL_ID, WATER_MATERIAL_ID,
-    };
+    use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE_MATERIAL_ID, WATER_MATERIAL_ID};
 
     fn simple_density(cell: Cell) -> f32 {
         if cell.is_empty() {
@@ -657,8 +659,9 @@ mod tests {
     /// Wire a gravity block rule onto specific materials and return the world.
     fn gravity_world(materials_with_gravity: &[u16]) -> World {
         let mut world = World::new(3); // 8x8x8
-        let gravity_id =
-            world.materials.register_block_rule(GravityBlockRule::new(simple_density));
+        let gravity_id = world
+            .materials
+            .register_block_rule(GravityBlockRule::new(simple_density));
         for &mat_id in materials_with_gravity {
             world.materials.assign_block_rule(mat_id, gravity_id);
         }
@@ -755,10 +758,12 @@ mod tests {
     fn mixed_block_rules_skip_block() {
         // Two materials with different block rules → block should be skipped.
         let mut world = World::new(3);
-        let gravity_a =
-            world.materials.register_block_rule(GravityBlockRule::new(simple_density));
-        let gravity_b =
-            world.materials.register_block_rule(GravityBlockRule::new(simple_density));
+        let gravity_a = world
+            .materials
+            .register_block_rule(GravityBlockRule::new(simple_density));
+        let gravity_b = world
+            .materials
+            .register_block_rule(GravityBlockRule::new(simple_density));
         world
             .materials
             .assign_block_rule(DIRT_MATERIAL_ID, gravity_a);

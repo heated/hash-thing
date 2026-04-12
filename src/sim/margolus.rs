@@ -157,11 +157,7 @@ mod tests {
         block[block_index(0, 1, 0)] = mat(5); // top — heavier, should fall
         let out = rule.step_block(&block, &test_ctx());
         assert_eq!(out[block_index(0, 0, 0)], mat(5), "heavy cell should fall");
-        assert_eq!(
-            out[block_index(0, 1, 0)],
-            Cell::EMPTY,
-            "air should rise"
-        );
+        assert_eq!(out[block_index(0, 1, 0)], Cell::EMPTY, "air should rise");
     }
 
     #[test]
