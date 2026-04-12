@@ -2,3 +2,8 @@
 .claude/
 .ship-notes/*
 !.ship-notes/design-ledger.md
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
