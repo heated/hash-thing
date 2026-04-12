@@ -43,11 +43,12 @@ fn log_gen_stats(
     };
     let gen_region_ms = stats.gen_region_us as f64 / 1_000.0;
     let cave_ms = stats.cave_us as f64 / 1_000.0;
+    let dungeon_ms = stats.dungeon_us as f64 / 1_000.0;
     log::info!(
         "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
          gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
-         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms) \
-         nodes_after_gen={nag} nodes_after_caves={nac} | \
+         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms dungeon={dungeon_ms:.2}ms) \
+         nodes_after_gen={nag} nodes_after_caves={nac} nodes_after_dungeons={nad} | \
          noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
         pop = population,
         delta = nodes_delta,
@@ -57,6 +58,7 @@ fn log_gen_stats(
         collapses = stats.total_collapses(),
         nag = stats.nodes_after_gen,
         nac = stats.nodes_after_caves,
+        nad = stats.nodes_after_dungeons,
         ns = noise_ns_per_sample,
     );
 }
@@ -293,6 +295,44 @@ impl ApplicationHandler for App {
                             let nodes_delta = nodes_after.saturating_sub(nodes_before);
                             log_gen_stats(
                                 "Caves terrain",
+                                self.world.side(),
+                                self.world.population(),
+                                nodes_after,
+                                nodes_delta,
+                                &stats,
+                                elapsed,
+                                self.noise_ns_per_sample,
+                            );
+                        }
+                        winit::keyboard::Key::Character("d") => {
+                            // Re-seed terrain with caves + dungeons. Stays paused.
+                            // hash-thing-3fq.8: drives the dungeon carving
+                            // post-pass end-to-end.
+                            let params = terrain::TerrainParams {
+                                caves: Some(terrain::CaveParams::default()),
+                                dungeons: Some(terrain::DungeonParams::default()),
+                                ..Default::default()
+                            };
+                            let nodes_before = self.world.store.stats().0;
+                            let start = std::time::Instant::now();
+                            let stats = self.world.seed_terrain(&params);
+                            let elapsed = start.elapsed();
+                            self.noise_ns_per_sample =
+                                terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+                            self.legacy_gol_smoke = false;
+                            self.paused = true;
+                            self.perf.clear();
+                            self.mem_stats.reset_peaks();
+                            Self::upload_volume(
+                                &mut self.renderer,
+                                &self.world,
+                                &mut self.svdag,
+                                &mut self.last_svdag_stats,
+                            );
+                            let (nodes_after, _) = self.world.store.stats();
+                            let nodes_delta = nodes_after.saturating_sub(nodes_before);
+                            log_gen_stats(
+                                "Dungeon terrain",
                                 self.world.side(),
                                 self.world.population(),
                                 nodes_after,
@@ -595,6 +635,7 @@ fn main() {
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  C: reset terrain with caves (CA post-pass)");
+    log::info!("  D: reset terrain with caves + dungeons");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");

@@ -2,7 +2,7 @@ use super::rule::{block_index, BlockContext, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, FIRE, WATER};
-use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
+use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -319,6 +319,14 @@ impl World {
             stats.cave_us = cave_start.elapsed().as_micros() as u64;
         }
         stats.nodes_after_caves = self.store.stats().0;
+        // Opt-in dungeon carving post-pass. Runs after caves so dungeons
+        // carve through already-opened cave networks.
+        if let Some(dungeon_params) = &params.dungeons {
+            let dungeon_start = std::time::Instant::now();
+            root = carve_dungeons(&mut self.store, root, self.level, dungeon_params);
+            stats.dungeon_us = dungeon_start.elapsed().as_micros() as u64;
+        }
+        stats.nodes_after_dungeons = self.store.stats().0;
         self.root = root;
         self.generation = 0;
         stats
