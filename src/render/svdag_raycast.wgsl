@@ -92,6 +92,10 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
 // (unchanged by the sub-ULP nudge on y), pos.z = 0.25 — old code returned
 // oct 3 (x-HIGH, y-HIGH), physically correct is oct 1 (x-HIGH, y-LOW)
 // because rd.y < 0.
+//
+// Zero-rd convention: when rd.axis == 0.0, the tiebreak resolves to HIGH
+// (the ray can't cross the midpoint on that axis, so the choice is
+// physically inert). Must match the CPU oracle in svdag.rs.
 fn octant_of(pos: vec3<f32>, rd: vec3<f32>, node_min: vec3<f32>, half: f32) -> u32 {
     var idx: u32 = 0u;
     let mid = node_min + vec3<f32>(half);

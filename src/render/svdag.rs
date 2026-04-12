@@ -299,6 +299,12 @@ pub mod cpu_trace {
     /// picked the wrong sibling whenever `rd_axis < 0`. Mirrors the shader
     /// fix in `svdag_raycast.wgsl` 1:1 — both sides use `>` + rd tiebreak
     /// and the SAME tiebreak direction so CPU/GPU stay byte-aligned.
+    ///
+    /// Zero-rd convention: when `rd[axis] == 0.0`, the tiebreak resolves to
+    /// HIGH (because `rd[axis] >= 0.0` is true). The ray can't cross the
+    /// midpoint on that axis anyway, so the choice is physically inert —
+    /// we pick HIGH to stay symmetric with the shader's `sign(0.0) = 0`
+    /// behavior and the pre-6hd `>=` default.
     pub(super) fn octant_of(pos: [f32; 3], rd: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
         let mut idx = 0u32;
         let mid = [node_min[0] + half, node_min[1] + half, node_min[2] + half];
