@@ -2005,6 +2005,42 @@ mod tests {
     }
 
     #[test]
+    fn block_fill_vs_cell_fill_node_count() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // Fill a 16³ world with stone: once via set_block, once via individual set calls.
+        // Both should produce identical octrees (hash-consing deduplicates).
+        let k = CELLS_PER_BLOCK as u64;
+        let level = 4u32; // 16³ world
+
+        // Block fill: 2 blocks per axis at K=3 → (16/8)³ = 8 blocks
+        let mut world_block = World::new(level);
+        let blocks_per_axis = (1u64 << level) / k;
+        for bz in 0..blocks_per_axis as i64 {
+            for by in 0..blocks_per_axis as i64 {
+                for bx in 0..blocks_per_axis as i64 {
+                    world_block.set_block(bx, by, bz, STONE);
+                }
+            }
+        }
+        world_block.apply_mutations();
+
+        // Cell fill: 16³ = 4096 individual set calls
+        let mut world_cell = World::new(level);
+        let side = 1u64 << level;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    world_cell.set(wc(x), wc(y), wc(z), STONE);
+                }
+            }
+        }
+
+        // Both should produce the same root (hash-cons identity) — uniform
+        // stone compresses identically regardless of insertion order.
+        assert_eq!(world_block.root, world_cell.root);
+    }
+
+    #[test]
     fn step_ca_runs_clean_on_empty_queue() {
         let mut world = World::new(3);
         world.set(wc(3), wc(3), wc(3), STONE);
