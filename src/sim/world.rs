@@ -1,9 +1,8 @@
 use std::fmt;
 
 use super::mutation::{MutationQueue, WorldMutation};
-use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
+use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
-use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
 use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -540,20 +539,7 @@ impl World {
         };
 
         let rule = self.materials.block_rule(rule_id);
-        let ctx = BlockContext {
-            block_origin: [bx as i64, by as i64, bz as i64],
-            generation: self.generation,
-            world_seed: self.simulation_seed,
-            rng_hash: cell_hash(
-                bx as i64,
-                by as i64,
-                bz as i64,
-                self.generation,
-                self.simulation_seed,
-            ),
-        };
-
-        let result = rule.step_block(&block, &ctx);
+        let result = rule.step_block(&block);
 
         // Mass conservation assertion: output must be a permutation of input.
         debug_assert!(
