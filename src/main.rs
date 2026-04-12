@@ -120,7 +120,9 @@ struct App {
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
-    step_handle: Option<JoinHandle<sim::World>>,
+    step_handle: Option<JoinHandle<Result<sim::World, String>>>,
+    /// When the background step was spawned, for perf timing.
+    step_start: std::time::Instant,
     /// Cached world origin for rendering during background step.
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
@@ -132,7 +134,7 @@ impl App {
         let mut world = sim::World::new(volume_size.trailing_zeros());
         let terrain_params = terrain::TerrainParams {
             caves: Some(terrain::CaveParams::default()),
-            ..Default::default()
+            ..terrain::TerrainParams::for_level(volume_size.trailing_zeros())
         };
         let stats = world.seed_terrain(&terrain_params);
         let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
@@ -175,6 +177,7 @@ impl App {
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
+            step_start: std::time::Instant::now(),
             render_origin,
             render_inv_size,
         };
@@ -535,7 +538,9 @@ impl ApplicationHandler for App {
                                 "Caves terrain",
                                 terrain::TerrainParams {
                                     caves: Some(terrain::CaveParams::default()),
-                                    ..Default::default()
+                                    ..terrain::TerrainParams::for_level(
+                                        self.volume_size.trailing_zeros(),
+                                    )
                                 },
                             );
                         }
@@ -548,7 +553,9 @@ impl ApplicationHandler for App {
                             // toggle, but is no longer the default scene.
                             self.load_terrain_scene(
                                 "Reset terrain",
-                                terrain::TerrainParams::default(),
+                                terrain::TerrainParams::for_level(
+                                    self.volume_size.trailing_zeros(),
+                                ),
                             );
                         }
                         winit::keyboard::Key::Character("g") if !self.is_stepping() => {
@@ -718,42 +725,56 @@ impl ApplicationHandler for App {
                 if let Some(ref handle) = self.step_handle {
                     if handle.is_finished() {
                         let handle = self.step_handle.take().unwrap();
-                        self.world = handle.join().expect("step thread panicked");
-                        // Entity update runs on the main thread (needs
-                        // both &World and &mut EntityStore).
-                        let mut queue = std::mem::take(&mut self.world.queue);
-                        self.entities.update(&self.world, &mut queue);
-                        self.world.queue = queue;
-                        self.sync_render_cache();
-                        // SVDAG rebuild + GPU upload now that world is back.
-                        {
-                            let _t = self.perf.start("upload_cpu");
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            if let Some(renderer) = &mut self.renderer {
-                                let inv_size = self.render_inv_size;
-                                let wo = self.render_origin;
-                                let particle_data: Vec<[f32; 4]> = self
-                                    .entities
-                                    .iter()
-                                    .filter_map(|e| {
-                                        let mat = match &e.kind {
-                                            sim::EntityKind::Particle(p) => p.material as u32,
-                                            sim::EntityKind::Player(_) => return None,
-                                        };
-                                        Some([
-                                            (e.pos[0] - wo[0] as f64) as f32 * inv_size,
-                                            (e.pos[1] - wo[1] as f64) as f32 * inv_size,
-                                            (e.pos[2] - wo[2] as f64) as f32 * inv_size,
-                                            f32::from_bits(mat),
-                                        ])
-                                    })
-                                    .collect();
-                                renderer.upload_particles(&particle_data);
+                        self.perf.record("step", self.step_start.elapsed());
+                        match handle.join().expect("step thread aborted") {
+                            Ok(world) => {
+                                self.world = world;
+                                // Entity update on main thread (needs both
+                                // &World and &mut EntityStore).
+                                let mut queue = std::mem::take(&mut self.world.queue);
+                                self.entities.update(&self.world, &mut queue);
+                                self.world.queue = queue;
+                                self.sync_render_cache();
+                                // SVDAG rebuild + GPU upload.
+                                {
+                                    let _t = self.perf.start("upload_cpu");
+                                    Self::upload_volume(
+                                        &mut self.renderer,
+                                        &self.world,
+                                        &mut self.svdag,
+                                        &mut self.last_svdag_stats,
+                                    );
+                                    if let Some(renderer) = &mut self.renderer {
+                                        let inv_size = self.render_inv_size;
+                                        let wo = self.render_origin;
+                                        let particle_data: Vec<[f32; 4]> = self
+                                            .entities
+                                            .iter()
+                                            .filter_map(|e| {
+                                                let mat = match &e.kind {
+                                                    sim::EntityKind::Particle(p) => {
+                                                        p.material as u32
+                                                    }
+                                                    sim::EntityKind::Player(_) => return None,
+                                                };
+                                                Some([
+                                                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
+                                                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
+                                                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
+                                                    f32::from_bits(mat),
+                                                ])
+                                            })
+                                            .collect();
+                                        renderer.upload_particles(&particle_data);
+                                    }
+                                }
+                            }
+                            Err(msg) => {
+                                // Step panicked — log and pause sim. The
+                                // placeholder world stays in place; render
+                                // continues with the stale SVDAG (4lp).
+                                log::error!("Sim step panicked: {msg}");
+                                self.paused = true;
                             }
                         }
                         self.step_timer = std::time::Instant::now();
@@ -765,14 +786,25 @@ impl ApplicationHandler for App {
                     && self.step_timer.elapsed().as_millis() > 200
                     && !self.is_stepping()
                 {
-                    let _t = self.perf.start("step");
+                    self.step_start = std::time::Instant::now();
                     // Move world to background thread; replace with tiny
                     // placeholder so self.world remains valid (but inert).
-                    let mut world = std::mem::replace(&mut self.world, sim::World::new(1));
+                    let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
                     self.step_handle = Some(std::thread::spawn(move || {
-                        world.apply_mutations();
-                        world.step_recursive();
-                        world
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            world.apply_mutations();
+                            world.step_recursive();
+                            world
+                        }))
+                        .map_err(|e| {
+                            if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            }
+                        })
                     }));
                 }
 

@@ -16,6 +16,10 @@ impl BlockRule for IdentityBlockRule {
     fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
         *block
     }
+
+    fn clone_box(&self) -> Box<dyn BlockRule + Send> {
+        Box::new(IdentityBlockRule)
+    }
 }
 
 /// Fluid block rule — gravity (vertical swaps) plus lateral spread.
@@ -43,6 +47,13 @@ impl FluidBlockRule {
 }
 
 impl BlockRule for FluidBlockRule {
+    fn clone_box(&self) -> Box<dyn BlockRule + Send> {
+        Box::new(FluidBlockRule {
+            density_fn: self.density_fn,
+            fluid_material: self.fluid_material,
+        })
+    }
+
     fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
         let mut out = *block;
 
@@ -133,6 +144,12 @@ impl GravityBlockRule {
 }
 
 impl BlockRule for GravityBlockRule {
+    fn clone_box(&self) -> Box<dyn BlockRule + Send> {
+        Box::new(GravityBlockRule {
+            density_fn: self.density_fn,
+        })
+    }
+
     fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
         let mut out = *block;
         // There are 4 vertical columns in a 2x2x2 block.

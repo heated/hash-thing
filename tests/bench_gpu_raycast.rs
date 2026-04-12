@@ -111,7 +111,12 @@ impl HeadlessRenderer {
             camera_dir: [0.0; 4],
             camera_up: [0.0, 1.0, 0.0, 0.0],
             camera_right: [1.0, 0.0, 0.0, 0.0],
-            params: [64.0, RENDER_WIDTH as f32 / RENDER_HEIGHT as f32, 1.0, 0.0],
+            params: [
+                64.0,
+                RENDER_WIDTH as f32 / RENDER_HEIGHT as f32,
+                1.0,
+                RENDER_HEIGHT as f32,
+            ],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -391,7 +396,7 @@ fn bench_raycast(label: &str, level: u32, frames: usize) {
     // Build world + SVDAG
     let build_start = Instant::now();
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
     let svdag = Svdag::build(&world.store, world.root, world.level);
     let build_ms = build_start.elapsed().as_millis();
     eprintln!(
@@ -512,7 +517,7 @@ fn bench_raycast_with_active_ca() {
     eprintln!("--- Active CA benchmark: {side}³ with stepping ---");
 
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::default());
+    let _ = world.seed_terrain(&TerrainParams::for_level(level));
 
     let mut renderer = match HeadlessRenderer::new() {
         Some(r) => r,

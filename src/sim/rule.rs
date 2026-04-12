@@ -16,6 +16,10 @@ pub trait CaRule {
     fn is_noop(&self) -> bool {
         false
     }
+
+    /// Clone into a boxed trait object. Enables Clone for MaterialRegistry
+    /// (and transitively World) for snapshots, undo, and testing.
+    fn clone_box(&self) -> Box<dyn CaRule + Send>;
 }
 
 /// A block-based CA rule operating on 2x2x2 cell blocks.
@@ -35,6 +39,9 @@ pub trait CaRule {
 /// matching `octant_index` in `src/octree/node.rs`.
 pub trait BlockRule {
     fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8];
+
+    /// Clone into a boxed trait object.
+    fn clone_box(&self) -> Box<dyn BlockRule + Send>;
 }
 
 /// Map local (dx, dy, dz) offsets (each 0 or 1) to an index in `[Cell; 8]`.
@@ -57,6 +64,10 @@ impl CaRule for NoopRule {
 
     fn is_noop(&self) -> bool {
         true
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(NoopRule)
     }
 }
 
@@ -84,6 +95,13 @@ impl CaRule for FireRule {
             Cell::EMPTY
         }
     }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(FireRule {
+            fuel_material: self.fuel_material,
+            quencher_material: self.quencher_material,
+        })
+    }
 }
 
 /// Water solidifies into a configured product when the reactive material is adjacent.
@@ -104,6 +122,13 @@ impl CaRule for WaterRule {
         } else {
             center
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(WaterRule {
+            reactive_material: self.reactive_material,
+            reaction_product: self.reaction_product,
+        })
     }
 }
 
@@ -131,6 +156,13 @@ impl CaRule for LavaRule {
         } else {
             center
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(LavaRule {
+            water_material: self.water_material,
+            solidify_product: self.solidify_product,
+        })
     }
 }
 
@@ -201,6 +233,10 @@ impl CaRule for GameOfLife3D {
         } else {
             Cell::EMPTY
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(*self)
     }
 }
 

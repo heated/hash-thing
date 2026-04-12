@@ -39,7 +39,7 @@ pub enum WorldMutation {
 
 /// A bounded FIFO of pending world mutations. Entities push; the world
 /// drains in arrival order during `apply_mutations`.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct MutationQueue {
     pending: Vec<WorldMutation>,
 }

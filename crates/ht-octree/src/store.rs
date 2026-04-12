@@ -12,6 +12,7 @@ use rustc_hash::FxHashMap;
 /// world with terrain + active water typically produces ~200K nodes.
 /// The `intern_node` path panics with a diagnostic message if this limit
 /// is ever reached.
+#[derive(Clone)]
 pub struct NodeStore {
     /// All canonical nodes, indexed by NodeId.
     nodes: Vec<Node>,

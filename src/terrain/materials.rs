@@ -87,6 +87,16 @@ pub struct MaterialRegistry {
     block_rules: Vec<Box<dyn BlockRule + Send>>,
 }
 
+impl Clone for MaterialRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            rules: self.rules.iter().map(|r| r.clone_box()).collect(),
+            block_rules: self.block_rules.iter().map(|r| r.clone_box()).collect(),
+        }
+    }
+}
+
 impl fmt::Debug for MaterialRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MaterialRegistry")

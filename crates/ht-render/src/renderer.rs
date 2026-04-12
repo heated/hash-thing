@@ -44,7 +44,7 @@ struct Uniforms {
     camera_dir: [f32; 4],
     camera_up: [f32; 4],
     camera_right: [f32; 4],
-    /// x: volume_size, y: aspect_ratio, z: fov_tan, w: time
+    /// x: volume_size, y: aspect_ratio, z: fov_tan, w: screen_height
     params: [f32; 4],
 }
 
@@ -395,9 +395,12 @@ impl Renderer {
         });
 
         // Palette binding entry shared by both pipeline layouts (binding 2).
+        // VERTEX | FRAGMENT: SVDAG reads palette in fragment only, but the
+        // particle shader reads it in the vertex stage (vs_main looks up
+        // material color to pass to the fragment stage).
         let palette_bgl_entry = wgpu::BindGroupLayoutEntry {
             binding: 2,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false,
@@ -953,7 +956,12 @@ impl Renderer {
             camera_dir: [cam_dir[0], cam_dir[1], cam_dir[2], 0.0],
             camera_up: [up[0], up[1], up[2], 0.0],
             camera_right: [right[0], right[1], right[2], 0.0],
-            params: [self.volume_size as f32, aspect, fov_tan, 0.0],
+            params: [
+                self.volume_size as f32,
+                aspect,
+                fov_tan,
+                self.config.height as f32,
+            ],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));

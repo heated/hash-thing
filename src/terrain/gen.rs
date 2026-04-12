@@ -41,6 +41,8 @@ pub struct GenStats {
     /// break the invariant without a test failing.
     pub classify_calls: u64,
     pub interiors_interned: u64,
+    /// Wall-clock time for the heightmap precomputation pass (set by seed_terrain).
+    pub precompute_us: u64,
     /// Wall-clock time for the heightmap gen_region pass (set by seed_terrain).
     pub gen_region_us: u64,
     /// Wall-clock time for the cave CA post-pass, 0 if caves disabled.
