@@ -670,7 +670,10 @@ pub mod cpu_trace {
                         ];
                         let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
                         let tmax_v = [lt1[0].max(lt2[0]), lt1[1].max(lt2[1]), lt1[2].max(lt2[2])];
-                        // hash-thing-2nd: inside-leaf fallback.
+                        // hash-thing-2nd: inside-leaf fallback. Cascades use
+                        // `<=`/`>=` to break ties identically to the GPU
+                        // shader — do NOT flip to `<`/`>`. CPU/GPU parity
+                        // depends on matching tiebreak order.
                         let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
                         let normal = if inside {
                             if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
@@ -724,9 +727,11 @@ pub mod cpu_trace {
 
             // Step past the current (empty) octant, then skip consecutive
             // empty siblings using the parent's child_mask (hash-thing-x5w.1).
+            // Hoist invariants — depth doesn't change within the inner loop.
+            let skip_mask = dag[stack_node[depth] as usize];
+            let node_min = stack_min[depth];
+            let half = stack_half[depth];
             loop {
-                let node_min = stack_min[depth];
-                let half = stack_half[depth];
                 let pos_s = [
                     (int_pos[0] as f32 + 0.5) * INV_RES,
                     (int_pos[1] as f32 + 0.5) * INV_RES,
@@ -818,8 +823,7 @@ pub mod cpu_trace {
                     break;
                 }
                 let next_oct = octant_of(pos, rd_m, node_min, half);
-                let mask = dag[stack_node[depth] as usize];
-                if mask & (1 << ((next_oct ^ mirror_mask) as u32)) != 0 {
+                if skip_mask & (1 << ((next_oct ^ mirror_mask) as u32)) != 0 {
                     break; // next octant is occupied
                 }
                 if record {

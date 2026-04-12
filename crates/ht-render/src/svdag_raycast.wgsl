@@ -332,9 +332,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // this inner loop, each empty sibling costs a full outer-loop
         // iteration (pop + descend + DDA). With it, the ray jumps across all
         // empty children of a node in one pass — major win for sparse scenes.
+        // Hoist invariants — depth doesn't change within the inner loop.
+        let skip_mask = dag_nodes[stack_node[depth]];
+        let node_min_s = stack_min[depth];
+        let half_s = stack_half[depth];
         loop {
-            let node_min_s = stack_min[depth];
-            let half_s = stack_half[depth];
             let pos_s = (vec3<f32>(int_pos) + 0.5) * INV_RES;
             let oct_s = octant_of(pos_s, rd_m, node_min_s, half_s);
             let child_min_s = vec3<f32>(
@@ -390,8 +392,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                 break; // exited parent — outer loop will pop
             }
             let next_oct = octant_of(pos, rd_m, node_min_s, half_s);
-            let mask = dag_nodes[stack_node[depth]];
-            if (mask & (1u << (next_oct ^ mirror_mask))) != 0u {
+            if (skip_mask & (1u << (next_oct ^ mirror_mask))) != 0u {
                 break; // next octant is occupied — outer loop will descend
             }
             // Next octant is empty — continue inner DDA loop to skip it
