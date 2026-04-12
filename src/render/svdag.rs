@@ -54,6 +54,12 @@ use rustc_hash::FxHashMap;
 /// `LEAF_BIT = 0x80000000u` in `src/render/svdag_raycast.wgsl`; if you change
 /// one, change the other.
 pub(crate) const LEAF_BIT: u32 = 0x8000_0000;
+/// Maximum root level the current SVDAG renderer can traverse exactly.
+///
+/// The WGSL path uses f32 integer DDA at leaf resolution, so `2^root_level`
+/// must stay exactly representable in f32's 24-bit mantissa. Deeper worlds
+/// need a different render strategy (camera-centered rerooting, tiling, LOD).
+pub const MAX_RENDER_DEPTH: u32 = 24;
 
 /// GPU-friendly serialized DAG with persistent content-addressed cache.
 ///
@@ -111,6 +117,14 @@ impl Svdag {
     /// interior** with all 8 children pointing at the leaf's inline encoding —
     /// the shader handles that path with no special casing (hash-thing-nch).
     pub fn update(&mut self, store: &NodeStore, root: NodeId, root_level: u32) {
+        assert!(
+            root_level <= MAX_RENDER_DEPTH,
+            "SVDAG renderer supports root_level <= {} (f32 mantissa / MAX_DEPTH limit); \
+             got {}. Use a camera-centered subtree, tiling, or another render path \
+             before drawing deeper worlds (hash-thing-2mp).",
+            MAX_RENDER_DEPTH,
+            root_level,
+        );
         self.root_level = root_level;
 
         if let Node::Leaf(state) = store.get(root) {
@@ -323,7 +337,7 @@ impl Svdag {
 pub mod cpu_trace {
     use super::*;
 
-    pub const MAX_DEPTH: usize = 24;
+    pub const MAX_DEPTH: usize = MAX_RENDER_DEPTH as usize;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
@@ -1282,7 +1296,7 @@ mod tests {
     fn integer_dda_exact_representation() {
         const {
             assert!(
-                MAX_DEPTH <= 24,
+                MAX_DEPTH as u32 <= MAX_RENDER_DEPTH,
                 "integer DDA invariant: MAX_DEPTH exceeds 24, \
                  so RESOLUTION doesn't fit in f32's 24-bit \
                  mantissa. Cell positions would lose precision, breaking \
@@ -1301,6 +1315,14 @@ mod tests {
                 "boundary_cell={boundary_cell} doesn't round-trip through f32"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "SVDAG renderer supports root_level <=")]
+    fn build_panics_above_max_render_depth() {
+        let mut store = NodeStore::new();
+        let root = store.empty(MAX_RENDER_DEPTH + 1);
+        let _ = Svdag::build(&store, root, MAX_RENDER_DEPTH + 1);
     }
 
     /// Throughput regression for Claude Critical's deep-level concern:
