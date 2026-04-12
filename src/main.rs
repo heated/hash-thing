@@ -296,7 +296,7 @@ impl ApplicationHandler for App {
                             // path (hash-thing-5qh + hash-thing-yri).
                             {
                                 let _t = self.perf.start("step");
-                                self.world.step();
+                                self.world.step_recursive();
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
@@ -468,7 +468,7 @@ impl ApplicationHandler for App {
                     // Timer is alive.
                     {
                         let _t = self.perf.start("step");
-                        self.world.step();
+                        self.world.step_recursive();
                     }
                     // Time upload as one aggregate (flatten + Svdag::build +
                     // upload_volume + upload_svdag). CPU-side submit only —
