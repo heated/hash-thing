@@ -237,14 +237,17 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - 31-bit node-count overflow assertion at write time (x9r)
   - `padded_bytes_per_row` helper for COPY_BYTES_PER_ROW_ALIGNMENT (mys)
   - Material palette sync with registry (xev): both shaders now match `MaterialRegistry::terrain_defaults()` colors
-- ✅ **Material-type CA (epic `1v0`, partial — 9/10+)**
+- ✅ **Material-type CA (epic `1v0`, complete)**
   - `1v0.1` 16-bit tagged cell: `Cell` packs 10-bit `material_id` + 6-bit `metadata` into `u16`. `METADATA_BITS=6` is pinned by drift guard in both shaders.
   - `1v0.2` `MaterialRegistry` with per-material rules, visual properties (label, base_color, texture_ref), physical properties (density, flammability, conductivity). `terrain_defaults()` registers air/stone/dirt/grass/fire/water. `gol_smoke()` bridges legacy GoL presets. GPU palette export via `color_palette_rgba()`.
   - `1v0.3` Per-material `CaRule` dispatch in `World::step`: `trait CaRule { fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell; }`. `NoopRule` for static materials, `FireRule` (spreads from fuel, quenched by water), `WaterRule` (reacts with fire → stone). No central interaction table.
   - `1v0.4` Margolus 2×2×2 movement phase: `trait BlockRule { fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8]; }`. Alternating partition offset (even/odd gen). `GravityBlockRule` for density-based vertical swaps. Mass conservation enforced via debug_assert.
   - `1v0.5` `FluidBlockRule`: 2-phase block rule — gravity (vertical swaps by density) then lateral spread (fluid↔air swaps). Hashlife-compatible determinism via `rng_hash`.
+  - `1v0.6` Entity system: `EntityStore` with `EntityKind::Particle` (continuous position, velocity, TTL, collision, gravity). Mutation queue integration.
   - `1v0.7` Burning room demo scene: stone room with grass walls (fuel), fire corner, water pool. Key binding: B.
+  - `1v0.8` Cell/block granularity: `CELLS_PER_BLOCK_LOG2=3` (8³ cells per gameplay block), `World::set_block()` API with auto-grow.
   - `1v0.9` Mutation channel: `WorldMutation` enum + `apply_mutations()` for entity→world edit API with runtime guards.
+  - `1v0.10` Player entity: `EntityKind::Player(PlayerState)` with first-person camera (Tab toggle), WASD+mouse look, AABB collision, DDA raycast block place/break.
 - ✅ **Hash-cons compaction (`88d`)**: `NodeStore::compacted(root)` rebuilds reachable graph into a fresh store via iterative post-order traversal (`8m7`). Called after every `commit_step` and on `seed_terrain` epoch boundaries.
 - ✅ **Foundations progress (epic `h34`, 4/4 — complete)**
   - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
@@ -271,7 +274,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 ### Next up (P1, from bd)
 
 - ☐ **Recursive Hashlife stepping** (epic `6gf`, 11/13): ✅ `6gf.1` recursive step, ✅ `6gf.2` memoization, ✅ `6gf.3` correctness harness, ✅ `6gf.4` Margolus parity, ✅ `6gf.5`-`6gf.6` tests + primitives, ✅ `6gf.7` exponential time-skip (macro step), ✅ `6gf.8` main loop switchover, ✅ `6gf.9` timing comparison, ✅ `6gf.10` defensive hardening (overflow guards, assert promotion), ✅ `6gf.11` deep recursion tests (level 5), ✅ `6gf.12` boundary BC analysis (closed not-a-bug). In progress: `6gf.13` remove vestigial step_cache (edward).
-- ☐ **Material-type CA continuation** (epic `1v0`, 15/18): ✅ `1v0.1`-`1v0.5`, `1v0.7`, `1v0.9` landed. Remaining: `1v0.6` entity system (design gate), `1v0.8` cell/block granularity (unblocked, assigned cedar), `1v0.10` player entity (blocked on 1v0.6 + 1v0.8).
+- ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
 - ✅ **SVDAG continuation**: `5bb.4` per-leaf material attributes, `5bb.5` incremental edit uploads, `bx7` stale-slot compaction, `ll6` GPU palette buffer. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
 ### Later (P2+, from bd)
