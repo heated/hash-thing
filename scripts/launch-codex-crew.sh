@@ -2,15 +2,15 @@
 # launch-codex-crew.sh — spawn a Codex crew seat in a worktree
 #
 # Usage:
-#   scripts/launch-codex-crew.sh <seat-name> [--workspace <ref>] [--interactive] [--dry-run]
+#   scripts/launch-codex-crew.sh <seat-name> [--workspace <ref>] [--exec] [--dry-run]
 #
 # Creates a fresh git worktree at .claude/worktrees/codex-<seat>, writes
-# .beads/actor, and launches Codex with full crew context. The seat name is
-# whatever you want — no fixed pool.
+# .beads/actor, and launches Codex in interactive mode with full crew context.
+# Interactive mode keeps the session alive between tasks — no relaunch needed.
 #
 # Options:
 #   --workspace <ref>   Send to an existing cmux workspace instead of creating one
-#   --interactive       Launch codex in interactive mode (default is exec --full-auto)
+#   --exec              Use non-interactive exec mode (exits after one pass)
 #   --dry-run           Print what would happen without doing it
 #
 # hash-thing-d13
@@ -20,13 +20,14 @@ set -euo pipefail
 # --- Parse args ---
 SEAT=""
 WORKSPACE_REF=""
-INTERACTIVE=false
+EXEC_MODE=false
 DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --workspace) WORKSPACE_REF="$2"; shift 2 ;;
-        --interactive) INTERACTIVE=true; shift ;;
+        --exec) EXEC_MODE=true; shift ;;
+        --interactive) shift ;;  # no-op, interactive is default now
         --dry-run) DRY_RUN=true; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 1 ;;
         *)
@@ -38,12 +39,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SEAT" ]]; then
-    echo "Usage: scripts/launch-codex-crew.sh <seat-name> [--workspace <ref>] [--interactive] [--dry-run]" >&2
+    echo "Usage: scripts/launch-codex-crew.sh <seat-name> [--workspace <ref>] [--exec] [--dry-run]" >&2
     echo "" >&2
     echo "Examples:" >&2
-    echo "  scripts/launch-codex-crew.sh cedar                    # new workspace" >&2
-    echo "  scripts/launch-codex-crew.sh cedar --workspace ws:18  # reuse workspace" >&2
-    echo "  scripts/launch-codex-crew.sh cedar --interactive      # interactive codex" >&2
+    echo "  scripts/launch-codex-crew.sh cedar --workspace ws:18  # interactive (default)" >&2
+    echo "  scripts/launch-codex-crew.sh cedar --exec             # one-shot exec mode" >&2
     exit 1
 fi
 
@@ -114,14 +114,17 @@ RULES:
 - Always run cargo test before committing
 - Land every completed bead on origin/main before moving to the next one"
 
-if [[ "$INTERACTIVE" == true ]]; then
-    CODEX_CMD="export BEADS_ACTOR=$SEAT && codex"
-else
-    PROMPT_FILE="$WORKTREE_PATH/.codex-crew-prompt.md"
-    if [[ "$DRY_RUN" != true ]]; then
-        printf '%s' "$PROMPT" > "$PROMPT_FILE"
-    fi
+# Always write the prompt file (used by both modes)
+PROMPT_FILE="$WORKTREE_PATH/.codex-crew-prompt.md"
+if [[ "$DRY_RUN" != true ]]; then
+    printf '%s' "$PROMPT" > "$PROMPT_FILE"
+fi
+
+if [[ "$EXEC_MODE" == true ]]; then
     CODEX_CMD="export BEADS_ACTOR=$SEAT && codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \"\$(cat .codex-crew-prompt.md)\""
+else
+    # Interactive mode: stays alive between tasks, no-alt-screen for cmux compat
+    CODEX_CMD="export BEADS_ACTOR=$SEAT && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen \"\$(cat .codex-crew-prompt.md)\""
 fi
 
 if [[ "$DRY_RUN" == true ]]; then
@@ -147,4 +150,4 @@ echo ""
 echo "Codex crew seat '$SEAT' launched"
 echo "  Worktree: $WORKTREE_PATH"
 echo "  Actor:    $SEAT"
-echo "  Mode:     $(if $INTERACTIVE; then echo interactive; else echo full-auto; fi)"
+echo "  Mode:     $(if $EXEC_MODE; then echo exec; else echo interactive; fi)"
