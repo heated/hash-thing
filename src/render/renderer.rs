@@ -685,8 +685,7 @@ impl Renderer {
         // Tail: append-only growth since the last upload.
         if self.svdag_uploaded_len < dag.nodes.len() {
             let tail_byte_offset = (self.svdag_uploaded_len * 4) as u64;
-            let tail_bytes: &[u8] =
-                bytemuck::cast_slice(&dag.nodes[self.svdag_uploaded_len..]);
+            let tail_bytes: &[u8] = bytemuck::cast_slice(&dag.nodes[self.svdag_uploaded_len..]);
             self.queue.write_buffer(buf, tail_byte_offset, tail_bytes);
             self.svdag_uploaded_len = dag.nodes.len();
         }

@@ -193,7 +193,12 @@ impl ApplicationHandler for App {
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
-            Self::upload_volume(&mut self.renderer, &self.world, &mut self.svdag, &mut self.last_svdag_stats);
+            Self::upload_volume(
+                &mut self.renderer,
+                &self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
         }
     }
 
