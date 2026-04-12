@@ -393,7 +393,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Landed
 
-- ✅ Cargo project scaffold, `src/{octree,sim,render}` modules
+- ✅ Cargo workspace: `ht-octree` (octree+rng), `ht-render` (renderer+svdag+shaders), root crate (sim+terrain+main). Incremental build 24s→8s for sim edits (cvu)
 - ✅ Hash-consed octree with NodeStore (intern/lookup, flatten, from_flat, set_cell, stats)
 - ✅ 3D Game of Life CA rules (4 presets: amoeba, crystal, 445, pyroclastic) — scaffolding for experimentation, to be replaced by material-type CA
 - ✅ Brute-force grid stepping (temporary, will be replaced by recursive Hashlife stepping)
