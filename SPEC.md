@@ -55,6 +55,26 @@ Repo: `git@github.com:heated/ashfall.git`
 >
 > and then build it!
 
+### Product vision and demo direction (2026-04-12)
+
+> We definitely want it to be a game. It'd be great if the engine could support other games, a la the Metaverse thing. But definitely not a tech demo or just a basic toy — we'll try to shoot a little higher but I'm willing to walk it back a bit.
+>
+> When they launch it, we want to start with a basic voxel thing — like, okay this is normal — and then they walk around and start seeing crazier and crazier things. For a demo, maybe it starts looking like Minecraft, but I'm not married to that. I just want to say we could do other things. And as they keep moving and walking through the demo they start seeing the whole world come to life and crazy cool interactions and really novel shit.
+>
+> A character, and still able to interact with the world. Probably placing material, but definitely seeing stuff.
+>
+> For physics: primarily powder game stuff or maybe fire. Not really redstone to begin with.
+>
+> For terrain/dungeons: I could see a lot of different possible generation — a lot of different worlds to step into. I don't want terrain to just be one kind of terrain. I might want to start in an infinite 3D dungeon or whatever, but I'm also down to support the normal terrain.
+>
+> For materials: it could be good to have different material stacks — different namespaces of materials depending on the front end game on top of this. One of the sets should be whatever standard Minecraft-y materials, except more in the direction of powder game. Any sort of material stack should be a little more in the direction of powder game — stuff moving around by default, a little more alive.
+>
+> Done enough to show someone: it's fast enough, things are moving enough, it looks like a relatively complete thing. More of a complete thing than what it is now.
+>
+> I'm gonna want to talk more about what specific set of features we want to put in. There's a standard RPG stack, but I don't necessarily want to do that. I don't want it to look exactly like Minecraft. I don't know if I want crafting, stuff like that. So let's talk more about those.
+>
+> If it's clear from what my vision is, the answer to whatever downstream design question pops up — don't require a human gate. Only gate if it's not obvious from the spec.
+
 ---
 
 ## Extracted requirements (derived from the user's words above)
@@ -78,12 +98,38 @@ These are the operational specifications. If one of these ever disagrees with th
 - **Direct octree operation, avoiding flatten-to-grid for everything except testing/scaffolding.** (Verbatim: "I'm down to use this for testing, but definitely want to see if we can avoid this for every single aspect of the game.")
 - **Keep an eye on terrain-gen performance and surface issues early.**
 
+- **This is a game, not a tech demo.** The engine should support multiple games (metaverse direction), but the first product is a game with a player character. (Verbatim: "definitely not a tech demo or just a basic toy")
+- **Player character with world interaction.** First-person or third-person character that can walk around and place/interact with materials. Not god-mode-only. (Verbatim: "a character, and still able to interact with the world. Probably placing material, but definitely seeing stuff.")
+- **Demo experience: normal→extraordinary gradient.** Launch should look familiar (Minecraft-ish), then reveal increasingly alive/dynamic world as player explores. (Verbatim: "start with a basic voxel thing... then they start seeing crazier and crazier things")
+- **Powder-game physics first, not redstone.** Gravity, fluids, fire/temperature. Redstone-style logic comes later. (Verbatim: "primarily powder game stuff or maybe fire. Not really redstone to begin with.")
+- **Materials should feel alive.** Default behavior is movement/interaction, not static blocks. All material stacks lean powder-game. (Verbatim: "stuff moving around by default, a little more alive")
+- **Multiple terrain types / world presets.** Not locked to one biome. Could start in a dungeon, could start on terrain. Configurable. (Verbatim: "a lot of different worlds to step into")
+- **Material namespaces per game.** Engine supports different material stacks for different front-end games. One standard Minecraft-ish-but-alive set as baseline. (Verbatim: "different namespaces of materials depending on the front end game on top of this")
+- **Feature set TBD — not copying Minecraft.** Crafting, RPG mechanics, specific features not yet decided. Require human gate. (Verbatim: "I don't necessarily want to do that. I don't know if I want crafting.")
+
 ### Soft requirements
 
 - **More than 256 material types is desirable if performance allows.** (Verbatim: "I'm willing to start with 256 but it could be cool to just support more unless it becomes a performance issue")
 - **Fold metadata into material as tagged pointer space.** (Verbatim: "Maybe we fold meta into the material, some sort of tagged pointer space?")
 - **Experiment with physics.** (Verbatim: "physics: lets experiment")
 - **Emergent behavior is acceptable alongside hand-authored.** (Verbatim: "and im down to have a lot of this (and less, emergent. whatever works)")
+
+### Design gates (what needs edward vs what's clear from spec)
+
+**Autonomous (no gate needed):**
+- Powder-game physics: gravity, fluids, fire, temperature — this is the priority
+- Making materials feel alive / move by default
+- Multiple terrain presets / world types
+- Player character movement and camera
+- Performance work, engine internals, octree ops
+- Material interactions that are obvious powder-game staples (sand falls, water flows, fire spreads)
+
+**Requires human gate:**
+- Which specific features to build (crafting? inventory? RPG mechanics? building tools?)
+- What the game *is* beyond "walk around a living voxel world"
+- Specific material sets beyond the obvious powder-game baseline
+- Any user-visible interaction model beyond "walk + place materials + observe"
+- Anything that makes it look/feel like a specific existing game (Minecraft clone, Terraria clone, etc.)
 
 ### Questions the user raised that are not yet resolved
 
