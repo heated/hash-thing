@@ -1,9 +1,7 @@
-mod octree;
-mod perf;
-mod render;
-mod rng;
-mod sim;
-mod terrain;
+use hash_thing::perf;
+use hash_thing::render;
+use hash_thing::sim;
+use hash_thing::terrain;
 
 use std::sync::Arc;
 use winit::{

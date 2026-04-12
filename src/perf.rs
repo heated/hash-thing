@@ -119,6 +119,12 @@ pub struct Perf {
     rings: HashMap<&'static str, Ring>,
 }
 
+impl Default for Perf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Perf {
     pub fn new() -> Self {
         Self {
