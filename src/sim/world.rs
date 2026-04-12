@@ -159,6 +159,32 @@ impl World {
         }
     }
 
+    /// Lightweight placeholder world for use as a temporary swap target
+    /// (e.g. while the real world is on a background thread). Skips
+    /// material registry setup — NOT valid for simulation.
+    pub fn placeholder() -> Self {
+        let mut store = NodeStore::new();
+        let root = store.empty(1);
+        Self {
+            store,
+            root,
+            level: 1,
+            generation: 0,
+            simulation_seed: 0,
+            materials: MaterialRegistry::new(),
+            terrain_params: None,
+            hashlife_cache: FxHashMap::default(),
+            hashlife_macro_cache: FxHashMap::default(),
+            hashlife_stats: HashlifeStats::default(),
+            store_size_at_last_compact: 0,
+            hashlife_inert_cache: FxHashMap::default(),
+            hashlife_all_inert_cache: FxHashMap::default(),
+            block_rule_present: None,
+            queue: MutationQueue::new(),
+            origin: [0, 0, 0],
+        }
+    }
+
     pub fn side(&self) -> usize {
         1 << self.level
     }

@@ -774,7 +774,7 @@ impl ApplicationHandler for App {
                     // placeholder so self.world remains valid (but inert).
                     let mut world = std::mem::replace(
                         &mut self.world,
-                        sim::World::new(1),
+                        sim::World::placeholder(),
                     );
                     self.step_handle = Some(std::thread::spawn(move || {
                         world.apply_mutations();
