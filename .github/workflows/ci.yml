@@ -46,10 +46,16 @@ jobs:
         include:
           - os: ubuntu-24.04
             run-tests: true
+            artifact_name: hash-thing-linux-x86_64
+            binary_path: target/release/hash-thing
           - os: macos-15
             run-tests: false
+            artifact_name: hash-thing-macos-aarch64
+            binary_path: target/release/hash-thing
           - os: windows-2025
             run-tests: false
+            artifact_name: hash-thing-windows-x86_64.exe
+            binary_path: target/release/hash-thing.exe
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -71,7 +77,8 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxcursor-dev libxi-dev libxrandr-dev \
             libudev-dev \
-            libgl1-mesa-dev libegl1-mesa-dev
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libfuse2
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@5cb072d7354962be830356aa6b146f7612846014 # v2.7.5
@@ -91,19 +98,53 @@ jobs:
         if: matrix.run-tests
         run: cargo test --locked
 
-      # Warn-only until hash-thing-k5r closes out the fmt drift backlog
-      # (store.rs / renderer.rs / svdag.rs / rule.rs / world.rs). rustfmt
+      # Gating: fmt drift backlog is clear (hash-thing-k5r closed). rustfmt
       # output is deterministic across platforms, so running on the ubuntu
-      # leg only is sufficient — no point burning mac+windows minutes on
-      # the same diff. Flip to gating once drift clears.
-      - name: Cargo fmt (warn-only until hash-thing-k5r)
+      # leg only is sufficient.
+      - name: Cargo fmt
         if: matrix.os == 'ubuntu-24.04'
         run: cargo fmt --check
-        continue-on-error: true
 
-      # Warn-only until hash-thing-00f closes out the existing clippy backlog.
-      # Compile errors will already have been caught above by `cargo check`,
-      # so leaving this step at continue-on-error doesn't hide build breakage.
-      - name: Clippy (warn-only until hash-thing-00f)
-        run: cargo clippy --all-targets --locked
-        continue-on-error: true
+      # Gating: clippy backlog is clear (hash-thing-00f closed).
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Build release binary for artifact upload (xb7.4).
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      # Upload the freshly linked release binary as a workflow artifact.
+      # Retention defaults to repo policy (90 days); these are development
+      # builds, not release artifacts.
+      - name: Upload release binary
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+
+      # AppImage wrapping (xb7.3). Linux-only. Pulls linuxdeploy from its
+      # rolling-release channel, stages an AppDir with the freshly built
+      # binary plus the .desktop file + placeholder icon from packaging/linux/,
+      # and produces a single-file .AppImage.
+      - name: Build AppImage
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          OUTPUT: hash-thing-x86_64.AppImage
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable target/release/hash-thing \
+            --desktop-file packaging/linux/hash-thing.desktop \
+            --icon-file packaging/linux/hash-thing.svg \
+            --output appimage
+
+      - name: Upload AppImage
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: hash-thing-linux-x86_64.AppImage
+          path: hash-thing-x86_64.AppImage
+          if-no-files-found: error

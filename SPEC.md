@@ -223,7 +223,9 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ Builds and runs on macOS with Metal backend
 - ✅ Pushed to `git@github.com:heated/ashfall.git`
 - ✅ **SVDAG rendering pipeline (hash-thing-5bb.1, 5bb.2, 5bb.3)**
-  - `Svdag::build` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker); handles leaf roots via degenerate single-node interior (nch)
+  - `Svdag` serializes the DAG to a flat GPU buffer (9 u32 per interior: mask + 8 children; leaves inlined via high-bit marker); handles leaf roots via degenerate single-node interior (nch)
+  - **Incremental uploads (5bb.5)**: persistent `FxHashMap<[u32; 9], u32>` content cache across frames — `update()` reuses offsets for unchanged subtrees, only appends new slots. Buffer layout: `nodes[0]` = root-offset header, `nodes[1..]` = append-only slots. Renderer uploads only the tail past a watermark + root header each frame
+  - **Stale-slot compaction (bx7)**: `compact()` rebuilds from scratch when >50% of buffer is unreachable, reclaiming memory from superseded subtrees
   - `svdag_raycast.wgsl` iterative stack-based descent: pop-until-contains, descend-until-leaf, step-past-empty-octant
   - Dual renderer pipelines (Flat3D / Svdag), V toggles at runtime
   - CPU-side trace replica of the shader (`src/render/svdag.rs::cpu_trace`) with comprehensive test suite (~1700 lines)
@@ -239,22 +241,27 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - `h34.2` determinism audit: walked every file in sim + terrain-gen paths, no global PRNG / scan-order dependencies found, two minor follow-ups filed and closed (`99e` step_cache rule_id doc fix, `c6k` seed_center migrating to cell_rand_bool). Audit notes in `.ship-notes/ship-h34.2-determinism-audit.md`
   - `h34.3` perf measurement infra: `src/perf.rs` 64-sample ring buffer + `Perf::time(name, closure)` + consolidated per-generation log line with mean/p95 on `step_cpu`, `upload_cpu`, `render_cpu`; wall-clock auto-log cadence (q63); memory-watchdog MemStats with ratcheting peaks and `memory_bytes_estimate` (yb5); GPU `_gpu` metric family via timestamp queries (6x3). One bead remains (retire-GoL `h34.4`, blocked on 1v0 material CA)
 - ✅ **NodeStore hash-cons unit tests (`1lq`)**: intern idempotency, lookup round-trip, flatten/from_flat determinism, set_cell paths
-- ✅ **CI + release (epic `xb7`, 2/6)**
-  - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets` before warn-only clippy
-  - `xb7.4` tag-triggered release workflow producing Windows `hash-thing.exe` via `gh release` CLI (no new third-party action deps). Sibling jobs for Mac (`xb7.2` notarization) and Linux (`xb7.3` AppImage) extend as they land
+- ✅ **Terrain generation (epic `3fq`, partial)**
+  - Heightmap-based recursive octree gen with proof-based collapse (sky/deep-stone short-circuit)
+  - Cave CA post-pass (B13/S13 majority-vote, stone-only mask, surface-preserving)
+  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, node counts, noise bottleneck estimate (3fq.5)
+- ✅ **CI + release (epic `xb7`, 3/6)**
+  - `xb7.1` 3-platform CI matrix (Linux + Mac + Windows), all actions SHA-pinned, `rust-toolchain.toml` channel pin, `Cargo.toml [lints.rust]` for first-party warning gating, actionlint job, gating `cargo check --all-targets`, gating `cargo fmt --check` (k5r), gating `cargo clippy -- -D warnings` (00f)
+  - `xb7.3` Linux AppImage via linuxdeploy (packaging/linux/ desktop entry + placeholder icon)
+  - `xb7.4` tag-triggered release workflow producing Windows `hash-thing.exe` via `gh release` CLI (no new third-party action deps). Sibling jobs for Mac (`xb7.2` notarization) extend as they land
 
 ### Next up (P1, from bd)
 
 - ☐ **Recursive Hashlife stepping** (epic `6gf`: `6gf.1` recursive step, `6gf.2` memoize by (NodeId, phase), `6gf.3` correctness harness vs brute-force, `6gf.4` Margolus parity threading). Currently we flatten-then-step; this is the biggest single perf unlock.
 - ☐ **Material-type CA** (epic `1v0`: `1v0.1` 16-bit tagged cell, `1v0.2` material registry, `1v0.3` hand-authored interaction table, `1v0.4` Margolus movement phase). Replaces the GoL3D scaffolding.
-- ☐ **SVDAG continuation**: `5bb.4` per-leaf material attributes (Molenaar-style), `5bb.5` HashDAG-style incremental edit uploads (so we don't re-serialize the whole DAG every step).
+- ☐ **SVDAG continuation**: ✅ `5bb.4` per-leaf material attributes (16-bit CellState already flows through DAG leaves; shader decodes material_id). ✅ `5bb.5` incremental edit uploads landed (persistent `FxHashMap<[u32; 9], u32>` content cache, append-only buffer with root-offset header, watermark-based tail uploads). ✅ `bx7` stale-slot compaction (rebuild when >50% unreachable). Remaining: `5bb.6` SSVDAG/LOD research (P4).
 - ☐ **Hash-cons compaction (`88d`)**: NodeStore is currently append-only — every dead generation's subtrees are retained forever. Plan in flight (`plan-flint-88d.md`, fresh-store rebuild via `NodeStore::compacted`).
 
 ### Later (P2+, from bd)
 
 - ☐ Foundations & determinism (`h34`): retire GoL3D scaffolding (`h34.4` — blocked on 1v0 material CA landing)
-- ☐ Terrain generation & infinite worlds (`3fq`): multi-res `gen(node_region) → NodeId`, cave smoothing, dungeon carving, lazy root expansion, terrain-gen perf tracking
-- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, design-gated), Steam (`xb7.6`, P4 deferred)
+- ☐ Terrain generation & infinite worlds (`3fq`): multi-res `gen(node_region) → NodeId`, cave smoothing, dungeon carving, lazy root expansion. ✅ `3fq.5` terrain-gen perf tracking (per-phase timing: gen_region_us, cave_us, node counts).
+- ☐ Cross-platform distribution (`xb7`): macOS notarization (`xb7.2`, credentials-gated), ✅ Linux AppImage (`xb7.3`), WASM/WebGPU (`xb7.5`, design-gated), Steam (`xb7.6`, P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 
 ---

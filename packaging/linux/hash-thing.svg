@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Placeholder icon for the AppImage build (xb7.3). Intentionally a flat
+  geometric mark — replace with real branding before any tagged release.
+  256x256 viewBox keeps it crisp at the GNOME / KDE / Xfce default
+  desktop icon sizes (16/22/32/48/64/128/256 px).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect width="256" height="256" rx="32" ry="32" fill="#1a1a2e"/>
+  <g fill="none" stroke="#7dd3fc" stroke-width="12" stroke-linecap="round">
+    <line x1="80" y1="48"  x2="80"  y2="208"/>
+    <line x1="176" y1="48" x2="176" y2="208"/>
+    <line x1="48" y1="96"  x2="208" y2="96"/>
+    <line x1="48" y1="160" x2="208" y2="160"/>
+  </g>
+</svg>

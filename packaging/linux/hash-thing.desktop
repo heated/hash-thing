@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hash-Thing
+GenericName=3D Hashlife Engine
+Comment=Hash-consed octree voxel engine with cellular automaton stepping
+Exec=hash-thing
+Icon=hash-thing
+Categories=Graphics;Science;Simulation;
+Terminal=false
+StartupNotify=false

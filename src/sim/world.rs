@@ -1,5 +1,7 @@
-use super::rule::{CaRule, ALIVE};
-use crate::octree::{CellState, NodeId, NodeStore};
+use super::rule::ALIVE;
+use crate::octree::{Cell, CellState, NodeId, NodeStore};
+use crate::terrain::materials::{MaterialRegistry, FIRE, WATER};
+use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -11,6 +13,7 @@ pub struct World {
     pub root: NodeId,
     pub level: u32, // root level — grid is 2^level per side
     pub generation: u64,
+    pub materials: MaterialRegistry,
 }
 
 impl World {
@@ -18,11 +21,25 @@ impl World {
     pub fn new(level: u32) -> Self {
         let mut store = NodeStore::new();
         let root = store.empty(level);
+        let materials = MaterialRegistry::terrain_defaults();
+        assert!(
+            materials.rule_for_cell(ALIVE).is_some(),
+            "default material registry must define the legacy ALIVE payload",
+        );
+        assert!(
+            materials.rule_for_cell(Cell::from_raw(FIRE)).is_some(),
+            "default material registry must define the fire material",
+        );
+        assert!(
+            materials.rule_for_cell(Cell::from_raw(WATER)).is_some(),
+            "default material registry must define the water material",
+        );
         Self {
             store,
             root,
             level,
             generation: 0,
+            materials,
         }
     }
 
@@ -51,10 +68,7 @@ impl World {
     ///
     /// Out-of-bounds reads return `0` silently (hash-thing-fb5). `get` is a
     /// pure query over the realized region — outside that region is
-    /// conceptually unrealized empty space. Future stepper neighbor-gathers
-    /// and debug visualizers probe across the root edge relying on this
-    /// contract; a panic would be catastrophic there. No `debug_assert!` —
-    /// the assert would fire on the exact pattern the API sanctions.
+    /// conceptually unrealized empty space.
     #[allow(dead_code)]
     pub fn get(&self, x: u64, y: u64, z: u64) -> CellState {
         self.store.get_cell(self.root, x, y, z)
@@ -65,9 +79,9 @@ impl World {
         self.store.flatten(self.root, self.side())
     }
 
-    /// Step the simulation forward one generation using brute-force grid evaluation.
-    /// This is the simple path — true Hashlife stepping replaces this later.
-    pub fn step_flat(&mut self, rule: &dyn CaRule) {
+    /// Step the simulation forward one generation using per-material rule dispatch.
+    /// This is the simple brute-force path — true Hashlife stepping replaces it later.
+    pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
         let mut next = vec![0 as CellState; side * side * side];
@@ -75,24 +89,17 @@ impl World {
         for z in 0..side {
             for y in 0..side {
                 for x in 0..side {
-                    let center = grid[x + y * side + z * side * side];
+                    let center = Cell::from_raw(grid[x + y * side + z * side * side]);
                     let neighbors = get_neighbors(&grid, side, x, y, z);
-                    next[x + y * side + z * side * side] = rule.step_cell(center, &neighbors);
+                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
+                        panic!("missing CaRule for material {}", center.material())
+                    });
+                    next[x + y * side + z * side * side] = rule.step_cell(center, &neighbors).raw();
                 }
             }
         }
 
-        self.root = self.store.from_flat(&next, side);
-        self.generation += 1;
-
-        // Fresh-store compaction: `from_flat` interned a brand new generation
-        // into the append-only store, leaving the previous generation's
-        // subtrees unreachable but still present. Rebuild into a fresh store
-        // so memory tracks live-scene size, not cumulative history.
-        // See hash-thing-88d.
-        let (new_store, new_root) = self.store.compacted(self.root);
-        self.store = new_store;
-        self.root = new_root;
+        self.commit_step(&next, side);
     }
 
     /// Place a random seed pattern in the center of the world.
@@ -116,7 +123,7 @@ impl World {
                     if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
                         && rng.next_f64() < density
                     {
-                        self.set(x, y, z, ALIVE);
+                        self.set(x, y, z, ALIVE.raw());
                     }
                 }
             }
@@ -126,11 +133,62 @@ impl World {
     pub fn population(&self) -> u64 {
         self.store.population(self.root)
     }
+
+    fn commit_step(&mut self, next: &[CellState], side: usize) {
+        self.root = self.store.from_flat(next, side);
+        self.generation += 1;
+
+        // Fresh-store compaction: `from_flat` interned a brand new generation
+        // into the append-only store, leaving the previous generation's
+        // subtrees unreachable but still present. Rebuild into a fresh store
+        // so memory tracks live-scene size, not cumulative history.
+        // See hash-thing-88d.
+        let (new_store, new_root) = self.store.compacted(self.root);
+        self.store = new_store;
+        self.root = new_root;
+    }
+
+    /// Replace the world with terrain generated from `params`. Uses
+    /// a fresh `NodeStore` and clears the step cache — every `NodeId`
+    /// from the previous world is invalidated. Resets `generation` to 0.
+    ///
+    /// ## Fresh-store epoch
+    ///
+    /// `seed_terrain` is a new epoch: everything from the previous world
+    /// is unreachable after this returns, so there is no point interning
+    /// the new terrain into a store full of garbage. Building into a
+    /// fresh store is cheaper (no post-build compaction walk), keeps
+    /// node counts honest, and makes the epoch boundary explicit.
+    ///
+    /// **The caller MUST keep the simulation paused around this call.**
+    pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
+        params.validate().expect("invalid TerrainParams");
+        self.store = NodeStore::new();
+        self.store.clear_step_cache();
+        let field = params.to_heightmap();
+        let gen_start = std::time::Instant::now();
+        let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        stats.gen_region_us = gen_start.elapsed().as_micros() as u64;
+        stats.nodes_after_gen = self.store.stats().0;
+        // Opt-in cave-CA post-pass. Runs as a separate stage after the
+        // heightmap recursion so the baseline perf path (and every
+        // pre-caves test) sees identical work when `params.caves` is
+        // `None`.
+        if let Some(cave_params) = params.caves {
+            let cave_start = std::time::Instant::now();
+            root = carve_caves(&mut self.store, root, self.level, &cave_params);
+            stats.cave_us = cave_start.elapsed().as_micros() as u64;
+        }
+        stats.nodes_after_caves = self.store.stats().0;
+        self.root = root;
+        self.generation = 0;
+        stats
+    }
 }
 
 /// Get the 26 Moore neighbors of a cell, wrapping at boundaries.
-fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [CellState; 26] {
-    let mut neighbors = [0 as CellState; 26];
+fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [Cell; 26] {
+    let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;
     for dz in [-1i32, 0, 1] {
         for dy in [-1i32, 0, 1] {
@@ -141,7 +199,7 @@ fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) 
                 let nx = (x as i32 + dx).rem_euclid(side as i32) as usize;
                 let ny = (y as i32 + dy).rem_euclid(side as i32) as usize;
                 let nz = (z as i32 + dz).rem_euclid(side as i32) as usize;
-                neighbors[idx] = grid[nx + ny * side + nz * side * side];
+                neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
                 idx += 1;
             }
         }
@@ -171,39 +229,21 @@ impl SimpleRng {
 
 #[cfg(test)]
 mod tests {
-    //! Reference tests for the brute-force step_flat.
-    //!
-    //! These pin the current behavior so that hash-thing-6gf.3 (recursive
-    //! Hashlife vs brute-force harness) has a stable reference to compare
-    //! against. They cover the floor of correctness items from nna:
-    //!
-    //!   1. empty world stays empty (amoeba)
-    //!   2. single live cell dies under amoeba (0 live neighbors)
-    //!   3. single live cell under crystal → 3x3x3 cube (27 cells)
-    //!   4. 2x2x2 cube is a still-life under custom S7-7/B3-3
-    //!   5. determinism: same initial state + rule → byte-equal output
-    //!   6. corner-placed single cell under amoeba still dies
-    //!
-    //! Not yet covered: a 3D GoL period-2 oscillator. Hand-computing one for
-    //! any of the standard presets (amoeba, crystal, rule445, pyroclastic)
-    //! needs either a literature lookup or brute-force search and is left as
-    //! follow-up — see the nna comment trail.
-    //!
-    //! Wraparound semantics note: src/sim/world.rs::get_neighbors uses
-    //! rem_euclid for neighbor lookup, so the brute-force CA wraps at the
-    //! world boundary. These tests are written to be correct *under* that
-    //! semantics. If wraparound is ever removed, tests 1-5 still pass as
-    //! written (they never rely on wrapping behavior); test 6 also still
-    //! passes because the single corner cell has zero live Moore neighbors
-    //! whether or not wraparound is enabled.
+    //! Reference tests for the brute-force dispatch step.
 
     use super::*;
-    use crate::octree::Cell;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
+    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, STONE, WATER};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
         World::new(3)
+    }
+
+    fn gol_world(rule: GameOfLife3D) -> World {
+        let mut world = empty_world();
+        world.materials = MaterialRegistry::gol_smoke(rule);
+        world
     }
 
     // -----------------------------------------------------------------
@@ -211,10 +251,8 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn empty_world_stays_empty_under_amoeba() {
-        let mut world = empty_world();
-        let rule = GameOfLife3D::amoeba();
-
-        world.step_flat(&rule);
+        let mut world = gol_world(GameOfLife3D::amoeba());
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -229,19 +267,13 @@ mod tests {
 
     // -----------------------------------------------------------------
     // 2. Single live cell under amoeba dies (zero neighbors).
-    //
-    // Amoeba is S9-26/B5-7. A lone live cell has 0 live neighbors, which is
-    // not in [9,26] → dies. Each of its 26 Moore-1 neighbors has exactly 1
-    // live neighbor, which is not in [5,7] → no births.
     // -----------------------------------------------------------------
     #[test]
     fn single_cell_dies_under_amoeba() {
-        let mut world = empty_world();
-        world.set(4, 4, 4, ALIVE);
+        let mut world = gol_world(GameOfLife3D::amoeba());
+        world.set(4, 4, 4, ALIVE.raw());
         assert_eq!(world.population(), 1);
-
-        let rule = GameOfLife3D::amoeba();
-        world.step_flat(&rule);
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -252,24 +284,12 @@ mod tests {
 
     // -----------------------------------------------------------------
     // 3. Single live cell under crystal grows to a 3x3x3 cube.
-    //
-    // Crystal is S0-6/B1-3.
-    //   - The live cell at (4,4,4) has 0 live neighbors, which is in [0,6]
-    //     → SURVIVES.
-    //   - Each of its 26 Moore-1 neighbors has exactly 1 live neighbor
-    //     (the center), which is in [1,3] → BIRTHS.
-    //   - Cells at Moore distance ≥2 have 0 live neighbors → no births.
-    //
-    // Result after one step: the 3x3x3 cube centered at (4,4,4), i.e.
-    // 27 cells in (3..=5)^3.
     // -----------------------------------------------------------------
     #[test]
     fn single_cell_grows_to_3x3x3_cube_under_crystal() {
-        let mut world = empty_world();
-        world.set(4, 4, 4, ALIVE);
-
-        let rule = GameOfLife3D::crystal();
-        world.step_flat(&rule);
+        let mut world = gol_world(GameOfLife3D::crystal());
+        world.set(4, 4, 4, ALIVE.raw());
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -282,7 +302,7 @@ mod tests {
                 for x in 3..=5u64 {
                     assert_eq!(
                         world.get(x, y, z),
-                        ALIVE,
+                        ALIVE.raw(),
                         "cell ({},{},{}) must be alive inside the expected 3x3x3 cube",
                         x,
                         y,
@@ -303,40 +323,21 @@ mod tests {
 
     // -----------------------------------------------------------------
     // 4. 2x2x2 cube is a still-life under custom S7-7/B3-3.
-    //
-    // Cube placed at (3..=4)^3 inside an 8^3 world — well clear of the
-    // boundary so wraparound can never contaminate neighbor counts.
-    //
-    // Every cube cell is Moore-1 adjacent to the other 7 cube cells, so
-    // each has exactly 7 live neighbors → in [7,7] → SURVIVES.
-    //
-    // Dead cells adjacent to the cube have live-neighbor counts that depend
-    // on how they touch the cube:
-    //   - face-shell cells (e.g. (2,3,3)): 4 live neighbors
-    //   - edge-shell cells (e.g. (2,2,3)): 2 live neighbors
-    //   - corner-shell cells (e.g. (2,2,2)): 1 live neighbor
-    // None of {1, 2, 4} is in [3,3], and cells far from the cube have 0
-    // neighbors (also not 3), so nothing births. True still-life under
-    // this rule.
     // -----------------------------------------------------------------
     #[test]
     fn cube_2x2x2_is_still_life_under_s7_b3() {
-        let rule = GameOfLife3D::new(7, 7, 3, 3);
-
-        let mut world = empty_world();
+        let mut world = gol_world(GameOfLife3D::new(7, 7, 3, 3));
         for z in 3..=4u64 {
             for y in 3..=4u64 {
                 for x in 3..=4u64 {
-                    world.set(x, y, z, ALIVE);
+                    world.set(x, y, z, ALIVE.raw());
                 }
             }
         }
         assert_eq!(world.population(), 8, "initial cube must have 8 cells");
 
-        // Step several generations — population and exact configuration must
-        // remain identical.
         for gen in 1..=5 {
-            world.step_flat(&rule);
+            world.step();
             assert_eq!(
                 world.population(),
                 8,
@@ -350,7 +351,7 @@ mod tests {
                         let expected =
                             if (3..=4).contains(&x) && (3..=4).contains(&y) && (3..=4).contains(&z)
                             {
-                                ALIVE
+                                ALIVE.raw()
                             } else {
                                 0
                             };
@@ -370,38 +371,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 5. Determinism: same initial state + same rule → byte-equal result.
-    //
-    // Builds two independent worlds, seeds them identically, steps both 3
-    // times under crystal, and asserts the flattened grids are equal. This
-    // is the property 6gf.3 ultimately compares the recursive Hashlife step
-    // against, so pin it here.
+    // 5. Determinism: same initial state + same rule -> byte-equal result.
     // -----------------------------------------------------------------
     #[test]
-    fn step_flat_is_deterministic() {
-        let rule = GameOfLife3D::crystal();
+    fn step_is_deterministic() {
+        let mut world_a = gol_world(GameOfLife3D::crystal());
+        let mut world_b = gol_world(GameOfLife3D::crystal());
 
-        let mut world_a = empty_world();
-        let mut world_b = empty_world();
-
-        // A handful of seeds placed in the interior to avoid accidental
-        // coupling to wraparound semantics.
         let seeds: &[(u64, u64, u64)] = &[(4, 4, 4), (3, 4, 5), (5, 2, 4)];
         for &(x, y, z) in seeds {
-            world_a.set(x, y, z, ALIVE);
-            world_b.set(x, y, z, ALIVE);
+            world_a.set(x, y, z, ALIVE.raw());
+            world_b.set(x, y, z, ALIVE.raw());
         }
 
         for _ in 0..3 {
-            world_a.step_flat(&rule);
-            world_b.step_flat(&rule);
+            world_a.step();
+            world_b.step();
         }
 
         let flat_a = world_a.flatten();
         let flat_b = world_b.flatten();
         assert_eq!(
             flat_a, flat_b,
-            "step_flat must produce identical output for identical input"
+            "step must produce identical output for identical input"
         );
         assert_eq!(
             world_a.population(),
@@ -412,27 +404,14 @@ mod tests {
 
     // -----------------------------------------------------------------
     // 6. Corner-placed single cell still dies under amoeba.
-    //
-    // Places a single live cell at the maximum-index corner of an 8^3 world
-    // and steps under amoeba. The cell has 0 live Moore neighbors (all 26
-    // neighbor slots — whether wrapped or not — land on dead cells, since
-    // there are no other live cells in the world), so it dies.
-    //
-    // This is not a true no-wraparound assertion. Pinning that down would
-    // require multiple live cells straddling opposite faces — filed as
-    // follow-up. The value of this test is: it proves step_flat doesn't
-    // crash, panic, or misbehave at the max index edge in either wraparound
-    // or non-wraparound semantics.
     // -----------------------------------------------------------------
     #[test]
     fn corner_single_cell_dies_under_amoeba() {
-        let mut world = empty_world();
+        let mut world = gol_world(GameOfLife3D::amoeba());
         let side = world.side() as u64;
-        world.set(side - 1, side - 1, side - 1, ALIVE);
+        world.set(side - 1, side - 1, side - 1, ALIVE.raw());
         assert_eq!(world.population(), 1);
-
-        let rule = GameOfLife3D::amoeba();
-        world.step_flat(&rule);
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -443,13 +422,6 @@ mod tests {
 
     // -----------------------------------------------------------------
     // 7. Regression for hash-thing-2o5: seed_center with radius > center.
-    //
-    // Level 4 -> side 16, center 8. Pre-fix, radius=12 made the loop
-    // range `(center - radius)..(center + radius)` on u64, which
-    // underflows to a 2^64-scale range and debug-panics (or release-wraps
-    // into an 18-quintillion-iteration hang). Post-fix the bounds are
-    // clamped to `[0, side)` and the spherical mask still fills a large
-    // fraction of cells at density 0.35.
     // -----------------------------------------------------------------
     #[test]
     fn seed_center_radius_larger_than_center_does_not_underflow() {
@@ -462,10 +434,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 8. Non-underflow path: demo default level 6 (side 64), radius 12,
-    //    density 0.35 — matches main.rs VOLUME_SIZE=64. Radius < center
-    //    here, so the clamp is a no-op and this exercises the normal
-    //    path alongside the clamp regression above.
+    // 8. Normal-radius seed_center produces population.
     // -----------------------------------------------------------------
     #[test]
     fn seed_center_normal_radius_produces_population() {
@@ -475,23 +444,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 9-11. Bounds check on World::set / World::get (hash-thing-fb5 /
-    //       819 bug-fix half). Writes panic OOB, reads return 0. See
-    //       src/octree/store.rs for the NodeStore-layer counterparts.
+    // 9-11. Bounds check on World::set / World::get (hash-thing-fb5).
     // -----------------------------------------------------------------
 
     #[test]
     #[should_panic(expected = "out of bounds")]
     fn world_set_panics_oob() {
         let mut w = World::new(2); // side 4
-        w.set(4, 0, 0, ALIVE);
+        w.set(4, 0, 0, ALIVE.raw());
     }
 
     #[test]
     fn world_set_in_bounds_at_max_corner() {
         let mut w = World::new(2); // side 4
-        w.set(3, 3, 3, ALIVE);
-        assert_eq!(w.get(3, 3, 3), ALIVE);
+        w.set(3, 3, 3, ALIVE.raw());
+        assert_eq!(w.get(3, 3, 3), ALIVE.raw());
         // And the complementary corner — distinct material id 2, metadata 0.
         let mat2 = Cell::pack(2, 0).raw();
         w.set(0, 0, 0, mat2);
@@ -505,5 +472,60 @@ mod tests {
         assert_eq!(w.get(0, 4, 0), 0);
         assert_eq!(w.get(0, 0, 4), 0);
         assert_eq!(w.get(u64::MAX, 0, 0), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // 12. seed_terrain epoch boundary test.
+    // -----------------------------------------------------------------
+    #[test]
+    fn seed_terrain_is_an_epoch_boundary() {
+        let mut world = World::new(6);
+        let params = TerrainParams::default();
+
+        let _ = world.seed_terrain(&params);
+        let nodes_after_first = world.store.stats().0;
+
+        let _ = world.seed_terrain(&params);
+        let nodes_after_second = world.store.stats().0;
+
+        assert_eq!(
+            nodes_after_first, nodes_after_second,
+            "seed_terrain must start a fresh epoch; node count drifted \
+             from {nodes_after_first} to {nodes_after_second} across a \
+             deterministic re-seed",
+        );
+    }
+
+    #[test]
+    fn water_turns_to_stone_when_fire_is_adjacent() {
+        let mut world = empty_world();
+        world.set(4, 4, 4, WATER);
+        world.set(5, 4, 4, FIRE);
+
+        world.step();
+
+        assert_eq!(world.get(4, 4, 4), STONE);
+    }
+
+    #[test]
+    fn isolated_fire_burns_out() {
+        let mut world = empty_world();
+        world.set(4, 4, 4, FIRE);
+
+        world.step();
+
+        assert_eq!(world.get(4, 4, 4), 0);
+    }
+
+    #[test]
+    fn fire_persists_next_to_grass_fuel() {
+        let mut world = empty_world();
+        world.set(4, 4, 4, FIRE);
+        world.set(5, 4, 4, GRASS);
+
+        world.step();
+
+        assert_eq!(world.get(4, 4, 4), FIRE);
+        assert_eq!(world.get(5, 4, 4), GRASS);
     }
 }

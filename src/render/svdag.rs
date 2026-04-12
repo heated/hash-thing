@@ -10,16 +10,39 @@
 //!     (per-voxel attributes on top of HashDAG)
 //!
 //! Our hash-consed octree is already a DAG — identical subtrees are interned to the
-//! same NodeId. This module just serializes that DAG into a flat array the GPU can
-//! traverse with an iterative descent shader.
+//! same NodeId. This module serializes that DAG into a flat array the GPU can
+//! traverse with an iterative descent shader, and — critically — **keeps the flat
+//! array across frames** so that unchanged subtrees never need to be re-uploaded.
 //!
-//! Node format (u32 per slot, 9 u32s per interior node = 36 bytes):
-//!   [0]: child_mask (low 8 bits: which octants are non-empty; high bits: reserved)
-//!   [1..=8]: child_index — packed as (is_leaf << 31) | payload_bits
-//!     - if is_leaf: payload is the 16-bit material state in low bits
-//!     - else:       payload is the index of the child node in the buffer
+//! Buffer layout (u32 per slot):
+//!   [0]:        root_offset — absolute index of the current root node's slot
+//!   [1..]:      concatenated 9-u32 interior-node slots, append-only
 //!
-//! Root is always at index 0.
+//! Interior node slot (9 u32s = 36 bytes):
+//!   [0]:        child_mask (low 8 bits: which octants are non-empty)
+//!   [1..=8]:    child entries — packed as (is_leaf << 31) | payload_bits
+//!     - is_leaf: payload is the 16-bit material state in low bits
+//!     - else:    payload is the absolute offset of the child node in this buffer
+//!
+//! ## Incremental uploads (hash-thing-5bb.5)
+//!
+//! `World::step` calls `NodeStore::compacted()` every step, so `NodeId`s are
+//! **not** stable across simulation steps — a NodeId-keyed cache is invalidated on
+//! every step. Content identity is stable, though: two subtrees with the same
+//! `(mask, child_slots)` tuple represent the same voxel volume regardless of which
+//! store epoch they came from.
+//!
+//! `Svdag` exploits this by keeping a persistent `offset_by_slot: FxHashMap<[u32; 9],
+//! u32>` map across calls. `update()` walks the new DAG, computes each node's 9-u32
+//! slot bottom-up, and checks the map: hit → reuse the existing GPU-side offset;
+//! miss → append to `nodes` and insert. The root's slot changes almost every step
+//! (its children change), so the root gets a fresh offset; `nodes[0]` is overwritten
+//! with it so the shader can find the new root without hardcoding a position.
+//!
+//! This makes the upload path O(new-content) instead of O(reachable): for a single-
+//! cell edit, only the O(log N) nodes on the path from root to leaf are new. The
+//! renderer tracks an upload watermark and writes only the appended tail (plus slot
+//! 0 for the root header). See `Renderer::upload_svdag`.
 
 use crate::octree::{Node, NodeId, NodeStore};
 use rustc_hash::FxHashMap;
@@ -32,161 +55,188 @@ use rustc_hash::FxHashMap;
 /// one, change the other.
 pub(crate) const LEAF_BIT: u32 = 0x8000_0000;
 
-/// GPU-friendly serialized DAG.
+/// GPU-friendly serialized DAG with persistent content-addressed cache.
+///
+/// `nodes[0]` is reserved for the current root offset. `nodes[1..]` is an
+/// append-only stream of 9-u32 interior-node slots. `offset_by_slot` maps each
+/// unique slot tuple to its absolute offset in `nodes`, so repeated `update()`
+/// calls reuse offsets for content that already lives in the buffer.
 pub struct Svdag {
-    /// Packed node data. Each interior node takes 9 u32s:
-    /// [mask, child0, child1, ..., child7]
+    /// Packed node data. `nodes[0]` = root offset header, rest = slots.
     pub nodes: Vec<u32>,
-    /// Level of the root node (2^level cells per side).
+    /// Persistent content-exact cache: slot bytes → their offset in `nodes`.
+    ///
+    /// Keyed by the full 9-u32 slot (not a hash) so lookups are collision-free.
+    offset_by_slot: FxHashMap<[u32; 9], u32>,
+    /// Level of the current root (2^level cells per side).
     pub root_level: u32,
-    /// Number of distinct interior nodes serialized.
+    /// Number of interior nodes reachable from the current root.
     pub node_count: usize,
 }
 
 impl Svdag {
-    /// Serialize the octree rooted at `root` from `store` into a flat GPU buffer.
+    /// Empty builder. Slot 0 is pre-reserved for the root offset header.
+    pub fn new() -> Self {
+        Self {
+            nodes: vec![0u32],
+            offset_by_slot: FxHashMap::default(),
+            root_level: 0,
+            node_count: 0,
+        }
+    }
+
+    /// One-shot build — creates a fresh `Svdag` and runs `update` once.
     ///
-    /// Walks the DAG in depth-first order, interning each `NodeId` to a flat-buffer
-    /// offset so shared subtrees become shared offsets in the output.
+    /// Convenience wrapper for tests and single-snapshot paths. Production code
+    /// should construct once with `new()` and call `update()` each frame so the
+    /// content cache persists across calls.
+    pub fn build(store: &NodeStore, root: NodeId, root_level: u32) -> Self {
+        let mut svdag = Self::new();
+        svdag.update(store, root, root_level);
+        svdag
+    }
+
+    /// Rebuild the serialized DAG for a new root, reusing any slots that were
+    /// already interned on previous calls. Writes the fresh root offset to
+    /// `nodes[0]` and updates `root_level` and `node_count`.
     ///
     /// Leaf roots (a uniform world, a single-voxel test fixture, or a future
     /// root-collapse optimization) are serialized as a **degenerate single-node
     /// interior** with all 8 children pointing at the leaf's inline encoding —
-    /// the shader already handles that path with no special casing, and the
-    /// caller sees `node_count = 1` regardless of `root_level` (hash-thing-nch).
-    pub fn build(store: &NodeStore, root: NodeId, root_level: u32) -> Self {
-        let mut nodes: Vec<u32> = Vec::new();
-        let mut id_to_offset: FxHashMap<NodeId, u32> = FxHashMap::default();
+    /// the shader handles that path with no special casing (hash-thing-nch).
+    pub fn update(&mut self, store: &NodeStore, root: NodeId, root_level: u32) {
+        self.root_level = root_level;
 
         if let Node::Leaf(state) = store.get(root) {
             // Degenerate single-node DAG: all 8 children point at the same
-            // inline leaf. Mask is 0xff when populated, 0 when empty — matches
-            // the inline-leaf semantics used for interior-node children below.
-            const NODE_STRIDE: usize = 9;
-            nodes.resize(NODE_STRIDE, 0);
+            // inline leaf. Build the slot and cache it normally.
             let mask = if *state != 0 { 0xffu32 } else { 0u32 };
-            nodes[0] = mask;
             let leaf_slot = LEAF_BIT | (*state as u32);
+            let mut slot = [0u32; 9];
+            slot[0] = mask;
             for i in 0..8 {
-                nodes[1 + i] = leaf_slot;
+                slot[1 + i] = leaf_slot;
             }
-            return Svdag {
-                nodes,
-                root_level,
-                node_count: 1,
-            };
+            let offset = self.intern_slot(slot);
+            self.nodes[0] = offset;
+            self.node_count = 1;
+            return;
         }
 
-        // Reserve slot 0 for the root; we'll fill it in after recursion.
-        let root_offset = Self::write_node(&mut nodes, &mut id_to_offset, store, root);
-        debug_assert_eq!(root_offset, 0, "root must be at offset 0");
-
-        // Each emitted interior node is exactly NODE_STRIDE u32s (mask + 8 children).
-        // Derive node_count from the buffer length so it stays in lock-step with
-        // `byte_size() / 36` by construction; the debug_assert below catches any
-        // future change that breaks the stride invariant. (Today this happens to
-        // equal `id_to_offset.len()` because only interior nodes are interned —
-        // leaves are encoded inline in the parent's child slot — but that
-        // equivalence is a coincidence of the current writer, not an invariant
-        // we want to depend on.)
-        const NODE_STRIDE: usize = 9;
-        debug_assert_eq!(
-            nodes.len() % NODE_STRIDE,
-            0,
-            "SVDAG buffer length should be a multiple of {NODE_STRIDE}",
-        );
-        let node_count = nodes.len() / NODE_STRIDE;
-        Svdag {
-            nodes,
-            root_level,
-            node_count,
-        }
+        let mut id_to_offset: FxHashMap<NodeId, u32> = FxHashMap::default();
+        let root_offset = self.visit(store, root, &mut id_to_offset);
+        self.nodes[0] = root_offset;
+        self.node_count = id_to_offset.len();
     }
 
-    /// Recursively serialize a node. Returns the offset of the node in `nodes`.
-    /// If the node is a leaf, returns `LEAF_MARKER | material` — callers must
-    /// handle leaves inline in the parent's child slot rather than emitting a node.
-    fn write_node(
-        nodes: &mut Vec<u32>,
-        id_to_offset: &mut FxHashMap<NodeId, u32>,
+    /// Recursively visit a node. Returns its absolute offset in `nodes`.
+    ///
+    /// Bottom-up: child offsets are resolved before the parent's slot is
+    /// assembled, so the parent's slot is itself a fully content-determined
+    /// identity once the children have been placed.
+    fn visit(
+        &mut self,
         store: &NodeStore,
         id: NodeId,
+        id_to_offset: &mut FxHashMap<NodeId, u32>,
     ) -> u32 {
-        // Check cache first (DAG dedup)
         if let Some(&offset) = id_to_offset.get(&id) {
             return offset;
         }
-
         match store.get(id) {
             Node::Leaf(_) => {
-                // Leaves don't get their own node entry; the parent encodes
-                // them inline. `Svdag::build` intercepts leaf roots above and
-                // emits a degenerate single-node interior, so this branch is
-                // unreachable via the public API (hash-thing-nch).
                 unreachable!(
-                    "write_node called on a leaf — parents must encode leaves inline, \
-                     and leaf roots are intercepted by Svdag::build"
+                    "visit called on a leaf — parents must encode leaves inline, \
+                     and leaf roots are intercepted by Svdag::update"
                 );
             }
             Node::Interior { children, .. } => {
-                // Reserve our own slot before recursing so that cyclic refs (impossible here
-                // but conceptually clean) would be handled. Write a placeholder, record offset.
-                let my_offset = nodes.len() as u32;
-                // Guard against silent 31-bit overflow: interior offsets MUST fit
-                // strictly below LEAF_BIT or the GPU decoder misreads them as leaf
-                // words (hash-thing-x9r). Release-panic beats release-corruption.
-                // Empirically unreachable today — blowing this assert needs ~8 GB of
-                // node storage — but stays cheap as a sanity rail.
-                assert!(
-                    my_offset < LEAF_BIT,
-                    "SVDAG interior node count exceeded 31 bits ({}); \
-                     widen the encoding (hash-thing-x9r follow-up)",
-                    nodes.len()
-                );
-                id_to_offset.insert(id, my_offset);
-
-                // Reserve 9 slots: mask + 8 children
-                let header_start = nodes.len();
-                nodes.resize(header_start + 9, 0);
-
-                let mut mask: u32 = 0;
-                // Process children (copy to avoid borrow issues)
                 let children = *children;
-
+                let mut slot = [0u32; 9];
+                let mut mask: u32 = 0;
                 for (i, &child_id) in children.iter().enumerate() {
-                    let child_node = store.get(child_id);
-                    match child_node {
+                    match store.get(child_id) {
                         Node::Leaf(state) => {
-                            // Encode leaf inline: high bit set + state in low 16 bits.
-                            // State 0 = empty → don't set mask bit.
                             if *state != 0 {
                                 mask |= 1 << i;
                             }
-                            nodes[header_start + 1 + i] = LEAF_BIT | (*state as u32);
+                            slot[1 + i] = LEAF_BIT | (*state as u32);
                         }
                         Node::Interior { population, .. } => {
                             if *population > 0 {
                                 mask |= 1 << i;
-                                // Recurse
-                                let child_offset =
-                                    Self::write_node(nodes, id_to_offset, store, child_id);
-                                nodes[header_start + 1 + i] = child_offset; // high bit clear = interior
+                                let child_offset = self.visit(store, child_id, id_to_offset);
+                                slot[1 + i] = child_offset;
                             } else {
-                                // Empty interior subtree — encode as empty leaf
-                                nodes[header_start + 1 + i] = LEAF_BIT;
+                                slot[1 + i] = LEAF_BIT;
                             }
                         }
                     }
                 }
+                slot[0] = mask;
 
-                nodes[header_start] = mask;
-                my_offset
+                let offset = self.intern_slot(slot);
+                id_to_offset.insert(id, offset);
+                offset
             }
         }
     }
 
+    /// Intern a 9-u32 slot into the persistent cache. Returns the offset.
+    fn intern_slot(&mut self, slot: [u32; 9]) -> u32 {
+        if let Some(&existing) = self.offset_by_slot.get(&slot) {
+            return existing;
+        }
+        let new_offset = self.nodes.len() as u32;
+        assert!(
+            new_offset < LEAF_BIT,
+            "SVDAG interior node count exceeded 31 bits ({}); \
+             widen the encoding (hash-thing-x9r follow-up)",
+            self.nodes.len()
+        );
+        self.nodes.extend_from_slice(&slot);
+        self.offset_by_slot.insert(slot, new_offset);
+        new_offset
+    }
+
     pub fn byte_size(&self) -> usize {
         self.nodes.len() * 4
+    }
+
+    /// Absolute offset of the current root node in `nodes`. Mirrors `nodes[0]`.
+    #[cfg(test)]
+    pub fn root_offset(&self) -> u32 {
+        self.nodes[0]
+    }
+
+    /// Cumulative count of distinct slots interned over this builder's lifetime.
+    #[cfg(test)]
+    pub fn total_slot_count(&self) -> usize {
+        self.offset_by_slot.len()
+    }
+
+    /// Ratio of stale (unreachable) slots to total interned slots.
+    /// Returns 0.0 when `total_slot_count` is 0.
+    pub fn stale_ratio(&self) -> f64 {
+        let total = self.offset_by_slot.len();
+        if total == 0 {
+            return 0.0;
+        }
+        1.0 - (self.node_count as f64 / total as f64)
+    }
+
+    /// Compact the buffer by rebuilding from the current root into a fresh
+    /// Svdag, dropping unreachable slots and the stale cache entries that
+    /// pointed at them. The renderer must do a full re-upload after this
+    /// (the returned Svdag has a fresh buffer).
+    ///
+    /// Callers should check `stale_ratio()` first — compaction is O(reachable),
+    /// which is the same cost as `update()`, so running it every frame is
+    /// wasteful. A threshold of 0.5 (compact when >50% of buffer is stale)
+    /// is a reasonable default.
+    pub fn compact(&mut self, store: &NodeStore, root: NodeId) {
+        let root_level = self.root_level;
+        *self = Self::build(store, root, root_level);
     }
 }
 
@@ -402,7 +452,7 @@ pub mod cpu_trace {
         let mut stack_half = [0.0f32; MAX_DEPTH];
         let mut depth: usize = 0;
 
-        stack_node[0] = 0;
+        stack_node[0] = dag[0];
         stack_min[0] = [0.0; 3];
         stack_half[0] = 0.5;
 
@@ -880,14 +930,17 @@ mod tests {
         // node encoding.
         let dag = Svdag::build(&store, root, 5);
         assert_eq!(dag.node_count, 1, "degenerate leaf-root DAG is one node");
-        assert_eq!(dag.nodes.len(), 9, "one interior node = 9 u32s");
+        // 1 header word + 9 node u32s = 10
+        assert_eq!(dag.nodes.len(), 10, "header + one interior node = 10 u32s");
+        let root_off = dag.nodes[0] as usize;
+        assert_eq!(root_off, 1, "root offset points past header");
         assert_eq!(
-            dag.nodes[0], 0xffu32,
+            dag.nodes[root_off], 0xffu32,
             "all 8 octants populated for a nonzero leaf root"
         );
         for i in 0..8 {
             assert_eq!(
-                dag.nodes[1 + i],
+                dag.nodes[root_off + 1 + i],
                 LEAF_BIT | mat3 as u32,
                 "child slot {i} must encode the leaf state inline",
             );
@@ -916,10 +969,11 @@ mod tests {
         let root = store.leaf(0);
         let dag = Svdag::build(&store, root, 4);
         assert_eq!(dag.node_count, 1);
-        assert_eq!(dag.nodes[0], 0u32, "empty leaf root → zero mask");
+        let root_off = dag.nodes[0] as usize;
+        assert_eq!(dag.nodes[root_off], 0u32, "empty leaf root → zero mask");
         for i in 0..8 {
             assert_eq!(
-                dag.nodes[1 + i],
+                dag.nodes[root_off + 1 + i],
                 LEAF_BIT,
                 "empty leaf slot is LEAF_BIT with state=0"
             );
@@ -2051,6 +2105,168 @@ mod tests {
             cpu_trace::octant_of(below, [-1.0, -1.0, -1.0], node_min, half),
             0,
             "pos.x just below mid → LOW-x with rd.x < 0",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 5bb.5: Persistent content-addressed cache regression tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn update_is_idempotent_on_identical_input() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 10, 20, 30, mat(1));
+        root = store.set_cell(root, 40, 40, 40, mat(2));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 6);
+        let len_after_first = svdag.nodes.len();
+        let cached_after_first = svdag.total_slot_count();
+        let reachable_after_first = svdag.node_count;
+        let root_offset_after_first = svdag.root_offset();
+
+        svdag.update(&store, root, 6);
+
+        assert_eq!(
+            svdag.nodes.len(),
+            len_after_first,
+            "no new slots should be appended on a no-op update"
+        );
+        assert_eq!(
+            svdag.total_slot_count(),
+            cached_after_first,
+            "persistent cache size must be stable on a no-op update"
+        );
+        assert_eq!(
+            svdag.node_count, reachable_after_first,
+            "reachable node count must be stable on a no-op update"
+        );
+        assert_eq!(
+            svdag.root_offset(),
+            root_offset_after_first,
+            "root offset must match on a no-op update — same content, same slot"
+        );
+    }
+
+    #[test]
+    fn update_single_cell_edit_appends_few_slots() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 0, 0, 0, mat(1));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 6);
+        let len_before_edit = svdag.nodes.len();
+
+        // Flip one cell deep in the tree.
+        root = store.set_cell(root, 33, 17, 41, mat(1));
+        svdag.update(&store, root, 6);
+
+        let appended_u32 = svdag.nodes.len() - len_before_edit;
+        let appended_slots = appended_u32 / 9;
+
+        assert!(
+            appended_u32.is_multiple_of(9),
+            "appended u32 count must be a multiple of 9 (whole slots), got {appended_u32}"
+        );
+        assert!(
+            appended_slots <= 8,
+            "single-cell edit appended {appended_slots} slots; expected at most 8 \
+             (6 ancestors + slack)"
+        );
+        assert!(
+            appended_slots >= 1,
+            "single-cell edit appended zero slots; the edit is a no-op against cache"
+        );
+    }
+
+    #[test]
+    fn update_cross_epoch_cache_reuse() {
+        // Simulate a step cycle: build in store A, compact into store B.
+        // The Svdag should still recognize identical subtrees.
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 5, 5, 5, mat(1));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 6);
+        let len_after_first = svdag.nodes.len();
+
+        // "Compact" into a fresh store — NodeIds change, content doesn't.
+        let (store2, root2) = store.compacted(root);
+        svdag.update(&store2, root2, 6);
+
+        assert_eq!(
+            svdag.nodes.len(),
+            len_after_first,
+            "cross-epoch update with identical content must not grow the buffer"
+        );
+    }
+
+    #[test]
+    fn compact_reduces_buffer_after_edits() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 0, 0, 0, mat(1));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 6);
+
+        // Make several edits to accumulate stale slots.
+        for i in 1..10 {
+            root = store.set_cell(root, i * 5, i * 3, i * 4, mat(1));
+            svdag.update(&store, root, 6);
+        }
+
+        let pre_compact_len = svdag.nodes.len();
+        let pre_compact_total = svdag.total_slot_count();
+        assert!(
+            svdag.stale_ratio() > 0.0,
+            "edits should produce some stale slots"
+        );
+
+        svdag.compact(&store, root);
+
+        assert!(
+            svdag.nodes.len() <= pre_compact_len,
+            "compact must not grow the buffer"
+        );
+        assert!(
+            svdag.total_slot_count() <= pre_compact_total,
+            "compact must not grow the cache"
+        );
+        assert_eq!(
+            svdag.stale_ratio(),
+            0.0,
+            "after compact, every cached slot is reachable"
+        );
+    }
+
+    #[test]
+    fn root_header_word_points_at_root_node() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 10, 10, 10, mat(1));
+
+        let svdag = Svdag::build(&store, root, 6);
+        let root_offset = svdag.nodes[0] as usize;
+
+        // The root offset should point at a valid 9-u32 slot.
+        assert!(
+            root_offset > 0,
+            "root offset 0 would collide with the header word itself"
+        );
+        assert!(
+            root_offset + 9 <= svdag.nodes.len(),
+            "root offset {root_offset} points past buffer end {}",
+            svdag.nodes.len()
+        );
+        // The mask at the root offset should have at least one bit set.
+        let mask = svdag.nodes[root_offset];
+        assert!(
+            mask > 0,
+            "root mask should be nonzero for a non-empty world"
         );
     }
 }
