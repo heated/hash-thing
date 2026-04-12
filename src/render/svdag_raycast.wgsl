@@ -395,8 +395,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return hit;
     }
 
-    // Background gradient
+    // Sky gradient: lighter blue at top, desaturated at horizon.
     let t = in.uv.y * 0.5 + 0.5;
-    let bg = mix(vec3<f32>(0.05, 0.05, 0.08), vec3<f32>(0.1, 0.1, 0.15), t);
+    let sky_top = vec3<f32>(0.35, 0.55, 0.90);
+    let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
+    let bg = mix(sky_bot, sky_top, t);
     return vec4<f32>(bg, 1.0);
 }
