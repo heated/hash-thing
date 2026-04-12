@@ -316,12 +316,12 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **Octree extraction primitives (`6gf.6`)**: `extract_neighborhood` (26 Moore neighbors, toroidal wrap), `extract_block_2x2x2` (Margolus partition extraction), `flatten_region` (arbitrary AABB sub-box). Foundation for recursive Hashlife step.
 - ✅ **Lazy root expansion (`e9h`, `5qp`, `37r`)**: `World::ensure_contains(x,y,z)` grows root octree by wrapping in bigger parent nodes. `ensure_region([min],[max])` is the batch form. OOB bounds checking on set_cell/get_cell (`819`) also landed. Bidirectional growth (`37r`): `World.origin` tracks world-space offset; negative-direction growth places old root at appropriate octant and shifts origin.
 - ✅ **Out-of-bounds coordinate safety (`819`, `fb5`)**: `set_cell` panics on OOB with `#[track_caller]`; `get_cell` silently returns 0 for OOB (no storage growth). 7 boundary tests. `probe()` stepper-oriented read with OOB-empty promise (`90w`). `is_realized()` for boundary detection.
-- ✅ **Terrain generation (epic `3fq`, complete 10/10)**
+- ✅ **Terrain generation (epic `3fq`)**
   - Heightmap-based recursive octree gen with proof-based collapse (sky/deep-stone short-circuit)
   - Cave CA post-pass (B13/S13 majority-vote, stone-only mask, surface-preserving)
-  - Dungeon carving (3fq.3): room placement + L-shaped corridors in deep stone, `DungeonParams` wired through `TerrainParams` and `seed_terrain`. Key binding: D (caves + dungeons)
-  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, dungeon_us, node counts, noise bottleneck estimate (3fq.5)
-  - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap + caves + dungeons for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
+  - ⚠️ Dungeon carving (3fq.3): was built and landed, then **reverted** from main (hash-thing-t2n.1 — landed without design gate). Code lives on `feature/dungeons` branch pending edward's design approval.
+  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, node counts, noise bottleneck estimate (3fq.5)
+  - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap + caves for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
 - ✅ **RealizedRegion value type (`ica`)**: `RealizedRegion { origin: [i64; 3], level: u32 }` encapsulates the world's spatial extent. `contains()`, `side()`, `octant_of()`, `Display` impl. `World::region()` returns a derived view.
 - ✅ **WorldCoord/LocalCoord newtypes (`7zc`)**: `WorldCoord(i64)` for world-space, `LocalCoord(u64)` for octree-internal. Compiler-enforced separation prevents the coordinate-mixing bug class that 819 fixed. All World API methods migrated.
 - ✅ **CI + release (epic `xb7`, 3/6)**
@@ -336,11 +336,12 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **SVDAG continuation**: `5bb.4` per-leaf material attributes, `5bb.5` incremental edit uploads, `bx7` stale-slot compaction, `ll6` GPU palette buffer. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 
 - ✅ **Core engine validation** (epic `m1f`, complete): all 8 beads landed including `m1f.4` infinite world growth, `m1f.8` SVDAG depth 14→20, `m1f.7` end-to-end demo (material selection, auto-running sim, scroll-wheel material cycling).
+- ✅ **HUD overlay (`5bb.10`)**: GPU-side crosshair (4 thin rectangles) + material color indicator square, aspect-ratio corrected, alpha-blended, FPS mode only.
 
 ### Later (P2+, from bd)
 
 - ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
-- ✅ Terrain generation & infinite worlds (`3fq`): complete (10/10). Heightmap gen + cave CA + dungeon carving + lazy terrain expansion + perf tracking.
+- ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + cave CA + lazy terrain expansion + perf tracking. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`.
 - ☐ Cross-platform distribution (`xb7`, 4/7): ✅ CI matrix (`xb7.1`), ✅ macOS notarization (`xb7.2`), ✅ Linux AppImage (`xb7.3`), ✅ Windows exe (`xb7.4`), ✅ WASM/WebGPU (`xb7.5`). Remaining: `brt` AppImage branding (P4), `xb7.6` Steam (P4 deferred)
 - ☐ SVDAG research (`5bb.6`): SSVDAG / sparse-64 / LOD streaming once baseline is stable
 
