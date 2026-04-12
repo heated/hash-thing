@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Crew anti-stop nudger (hash-thing-69z).
+#
+# Checks each hash-thing crew workspace for idle surfaces and sends a
+# wake prompt. Run via cron every 30-60 minutes, or manually when you
+# notice a seat has gone quiet.
+#
+# Usage:
+#   .bin/crew-nudge              # nudge all idle crew surfaces
+#   .bin/crew-nudge --dry-run    # show what would be nudged
+#   .bin/crew-nudge onyx         # nudge only the onyx workspace
+
+set -euo pipefail
+
+DRY_RUN=false
+TARGET_SEAT=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        *) TARGET_SEAT="$arg" ;;
+    esac
+done
+
+# Crew seats to check (non-mayor working seats + codex)
+SEATS=(flint cairn onyx ember spark codex)
+
+nudge_count=0
+
+for seat in "${SEATS[@]}"; do
+    if [ -n "$TARGET_SEAT" ] && [ "$seat" != "$TARGET_SEAT" ]; then
+        continue
+    fi
+
+    # Find the workspace for this seat
+    ws=$(cmux list-workspaces 2>/dev/null | grep -i "$seat" | head -1 | awk '{print $1}')
+    if [ -z "$ws" ]; then
+        continue
+    fi
+
+    # List surfaces in the workspace
+    surfaces=$(cmux list-pane-surfaces --workspace "$ws" 2>/dev/null || true)
+    if [ -z "$surfaces" ]; then
+        continue
+    fi
+
+    # Check each surface for recent activity via screen content
+    while IFS= read -r line; do
+        surface_ref=$(echo "$line" | awk '{print $1}')
+        if [ -z "$surface_ref" ]; then
+            continue
+        fi
+
+        # Read the last few lines of screen content
+        screen=$(cmux read-screen --surface "$surface_ref" --lines 5 2>/dev/null || true)
+
+        # Heuristics for "idle": prompt waiting for input, or empty
+        is_idle=false
+        if echo "$screen" | grep -qE '^\$\s*$|^>\s*$|waiting for input|^human:'; then
+            is_idle=true
+        fi
+        # Also check if the screen shows a completed message with no follow-up
+        if echo "$screen" | grep -qE 'SHIP COMPLETE|session ended|exiting|goodbye'; then
+            is_idle=true
+        fi
+
+        if [ "$is_idle" = true ]; then
+            nudge_count=$((nudge_count + 1))
+            if [ "$DRY_RUN" = true ]; then
+                echo "[dry-run] Would nudge $seat ($surface_ref)"
+            else
+                # Send a wake prompt
+                cmux send --surface "$surface_ref" "Wake check: bd ready has work. Pull the top bead and /ship it."
+                cmux send --surface "$surface_ref" $'\n'
+                echo "Nudged $seat ($surface_ref)"
+            fi
+        fi
+    done <<< "$surfaces"
+done
+
+if [ "$nudge_count" -eq 0 ]; then
+    echo "All crew surfaces appear active (or no matching workspaces found)."
+fi

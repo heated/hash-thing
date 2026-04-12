@@ -2,6 +2,8 @@
 
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
+**Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper at `.bin/bd` retries on embedded Dolt lock contention (hash-thing-eg3) with exponential backoff. Without it, concurrent worktree agents hit `another process holds the exclusive lock` errors that require manual sleep-and-retry. The wrapper handles up to 5 retries transparently.
+
 Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` under "Gate Tiers." Default sensitivity applies here; amend the line below if the bar should move project-wide.
 
 ```
@@ -28,7 +30,9 @@ Named agents working on this repo. `BEADS_ACTOR` draws from a small pool of natu
 Auto-assign pool (used by the `claude -w` seat hook): `flint · cairn · onyx · ember · spark`
 Explicit-only seat: `mayor` — singular, never auto-assigned, see the mayor skill
 
-Seats are worktree labels, not specializations. Any non-mayor seat picks any ready bead. Reuse a name for the same worktree; don't rewrite historical assignees.
+Seats are worktree labels, not specializations. Any non-mayor seat picks any ready bead — including infra, tooling, process, and crew-coordination beads, not just codebase work. Reuse a name for the same worktree; don't rewrite historical assignees.
+
+**Infra/process beads gate on human.** Daemons, crew coordination, skill defs, workflow tooling — flag with a plan before implementing.
 
 ### Peer autonomy — no central orchestrator
 
@@ -55,7 +59,7 @@ If `.beads/actor` is missing, the worktree hasn't been assigned — ask edward o
 - If edward asks for a CLAUDE.md edit while you're mid-task, file it in the `claude-md-edit` queue and spawn a mayor background session to process it (see "Editing CLAUDE.md" below).
 - Never spawn a second mayor at the same time — singular seat.
 
-**All mayor process — starter queue, rules, pre-flight, drift-unparking, on-demand-only, anti-patterns — lives in `skills/mayor/SKILL.md`.** That skill is the authoritative source. This section is the minimum stub for non-mayor workers; if the two disagree, the skill wins.
+**All mayor process — rules, priority visibility routine, drift-unparking, anti-patterns — lives in `.agents/skills/mayor/SKILL.md`.** That skill is the authoritative source. This section is the minimum stub for non-mayor workers; if the two disagree, the skill wins.
 
 ## How the crew runs
 

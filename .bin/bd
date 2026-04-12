@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Retry wrapper for bd (beads) CLI.
+#
+# The embedded Dolt backend uses an exclusive file lock. In a multi-worktree
+# crew, concurrent bd calls collide regularly. This wrapper retries on the
+# specific lock-contention error with exponential backoff + jitter.
+#
+# Install: add .bin/ to PATH ahead of /usr/local/bin, or alias bd=.bin/bd
+# in your shell profile. Agents should use this wrapper instead of bare bd.
+#
+# hash-thing-eg3
+
+set -euo pipefail
+
+BD_REAL="/usr/local/bin/bd"
+MAX_RETRIES=5
+BASE_DELAY=1  # seconds
+
+for attempt in $(seq 0 "$MAX_RETRIES"); do
+    output=$("$BD_REAL" "$@" 2>&1) && {
+        printf '%s\n' "$output"
+        exit 0
+    }
+    rc=$?
+
+    if printf '%s' "$output" | grep -q "another process holds the exclusive lock"; then
+        if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+            printf '%s\n' "$output" >&2
+            exit "$rc"
+        fi
+        # Exponential backoff: 1, 2, 4, 8, 16 seconds + up to 1s jitter
+        delay=$(( BASE_DELAY << attempt ))
+        jitter=$(( RANDOM % 1000 ))
+        sleep "${delay}.${jitter}"
+    else
+        # Non-lock error — don't retry
+        printf '%s\n' "$output" >&2
+        exit "$rc"
+    fi
+done
