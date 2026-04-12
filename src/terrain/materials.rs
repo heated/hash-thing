@@ -8,7 +8,8 @@ use std::fmt;
 
 use crate::octree::{Cell, CellState};
 use crate::sim::margolus::FluidBlockRule;
-use crate::sim::rule::{BlockRule, CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
+use crate::sim::margolus::GravityBlockRule;
+use crate::sim::rule::{BlockRule, CaRule, FireRule, GameOfLife3D, LavaRule, NoopRule, WaterRule};
 
 pub type MaterialId = u16;
 
@@ -20,6 +21,8 @@ pub const DIRT_MATERIAL_ID: MaterialId = 2;
 pub const GRASS_MATERIAL_ID: MaterialId = 3;
 pub const FIRE_MATERIAL_ID: MaterialId = 4;
 pub const WATER_MATERIAL_ID: MaterialId = 5;
+pub const SAND_MATERIAL_ID: MaterialId = 6;
+pub const LAVA_MATERIAL_ID: MaterialId = 7;
 
 pub const AIR: CellState = Cell::EMPTY.raw();
 pub const STONE: CellState = Cell::pack(STONE_MATERIAL_ID, 0).raw();
@@ -27,6 +30,8 @@ pub const DIRT: CellState = Cell::pack(DIRT_MATERIAL_ID, 0).raw();
 pub const GRASS: CellState = Cell::pack(GRASS_MATERIAL_ID, 0).raw();
 pub const FIRE: CellState = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
 pub const WATER: CellState = Cell::pack(WATER_MATERIAL_ID, 0).raw();
+pub const SAND: CellState = Cell::pack(SAND_MATERIAL_ID, 0).raw();
+pub const LAVA: CellState = Cell::pack(LAVA_MATERIAL_ID, 0).raw();
 
 /// Density lookup for block rules (gravity, fluid). Maps material ID → density.
 ///
@@ -42,6 +47,8 @@ pub fn material_density(cell: Cell) -> f32 {
         GRASS_MATERIAL_ID => 1.2,
         WATER_MATERIAL_ID => 1.0,
         FIRE_MATERIAL_ID => 0.05,
+        SAND_MATERIAL_ID => 1.5,
+        LAVA_MATERIAL_ID => 3.0,
         _ => 0.0,
     }
 }
@@ -109,8 +116,16 @@ impl MaterialRegistry {
             reactive_material: FIRE_MATERIAL_ID,
             reaction_product: Cell::pack(STONE_MATERIAL_ID, 0),
         });
+        let lava_rule = registry.register_rule(LavaRule {
+            water_material: WATER_MATERIAL_ID,
+            solidify_product: Cell::pack(STONE_MATERIAL_ID, 0),
+        });
         let fluid_block_rule =
             registry.register_block_rule(FluidBlockRule::new(material_density, WATER_MATERIAL_ID));
+        let gravity_block_rule =
+            registry.register_block_rule(GravityBlockRule::new(material_density));
+        let lava_fluid_block_rule =
+            registry.register_block_rule(FluidBlockRule::new(material_density, LAVA_MATERIAL_ID));
 
         registry.insert(
             AIR_MATERIAL_ID,
@@ -212,6 +227,40 @@ impl MaterialRegistry {
                 },
                 rule_id: water_rule,
                 block_rule_id: Some(fluid_block_rule),
+            },
+        );
+        registry.insert(
+            SAND_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "sand",
+                    base_color: [0.87, 0.80, 0.55, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 1.5,
+                    flammability: 0.0,
+                    conductivity: 0.1,
+                },
+                rule_id: static_rule,
+                block_rule_id: Some(gravity_block_rule),
+            },
+        );
+        registry.insert(
+            LAVA_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "lava",
+                    base_color: [0.95, 0.25, 0.05, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 3.0,
+                    flammability: 0.0,
+                    conductivity: 0.9,
+                },
+                rule_id: lava_rule,
+                block_rule_id: Some(lava_fluid_block_rule),
             },
         );
 
@@ -499,6 +548,14 @@ mod tests {
             registry.entry(WATER_MATERIAL_ID).unwrap().visual.label,
             "water"
         );
+        assert_eq!(
+            registry.entry(SAND_MATERIAL_ID).unwrap().visual.label,
+            "sand"
+        );
+        assert_eq!(
+            registry.entry(LAVA_MATERIAL_ID).unwrap().visual.label,
+            "lava"
+        );
         assert!(registry.entry(42).is_none());
     }
 
@@ -514,6 +571,8 @@ mod tests {
         assert_eq!(palette[GRASS_MATERIAL_ID as usize], [0.22, 0.57, 0.19, 1.0]);
         assert_eq!(palette[FIRE_MATERIAL_ID as usize], [0.98, 0.43, 0.05, 1.0]);
         assert_eq!(palette[WATER_MATERIAL_ID as usize], [0.12, 0.35, 0.84, 1.0]);
+        assert_eq!(palette[SAND_MATERIAL_ID as usize], [0.87, 0.80, 0.55, 1.0]);
+        assert_eq!(palette[LAVA_MATERIAL_ID as usize], [0.95, 0.25, 0.05, 1.0]);
     }
 
     #[test]
@@ -673,6 +732,8 @@ mod tests {
             GRASS_MATERIAL_ID,
             FIRE_MATERIAL_ID,
             WATER_MATERIAL_ID,
+            SAND_MATERIAL_ID,
+            LAVA_MATERIAL_ID,
         ];
         for &id in &ids {
             let cell = if id == AIR_MATERIAL_ID {

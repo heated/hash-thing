@@ -292,9 +292,15 @@ impl Svdag {
 
             // Interior child — descend.
             offset = child_word as usize;
-            if ox == 1 { lx -= half; }
-            if oy == 1 { ly -= half; }
-            if oz == 1 { lz -= half; }
+            if ox == 1 {
+                lx -= half;
+            }
+            if oy == 1 {
+                ly -= half;
+            }
+            if oz == 1 {
+                lz -= half;
+            }
         }
         // Reached level 0 without hitting a leaf — shouldn't happen in
         // a well-formed SVDAG, but return 0 defensively.
@@ -2438,7 +2444,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(mismatches, 0, "{label}: {mismatches} voxel mismatches between octree and SVDAG");
+        assert_eq!(
+            mismatches, 0,
+            "{label}: {mismatches} voxel mismatches between octree and SVDAG"
+        );
     }
 
     #[test]

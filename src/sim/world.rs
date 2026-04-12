@@ -749,7 +749,7 @@ mod tests {
 
     use super::*;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
-    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, STONE, WATER};
+    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, WATER};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -2032,5 +2032,72 @@ mod tests {
             state: STONE,
         });
         world.step_ca(); // should panic
+    }
+
+    #[test]
+    fn sand_falls_under_gravity() {
+        let mut world = World::new(3);
+        // Sand is already registered with gravity_block_rule in terrain_defaults.
+        // Place sand at y=3, air below at y=2. Block-aligned at (2,2,2).
+        world.set(wc(2), wc(3), wc(2), SAND);
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), 0);
+
+        world.step();
+
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), SAND, "sand should fall");
+        assert_eq!(world.get(wc(2), wc(3), wc(2)), 0, "top should be air");
+    }
+
+    #[test]
+    fn sand_conserves_population() {
+        let mut world = World::new(3);
+        // Scatter sand cells at various positions.
+        world.set(wc(2), wc(3), wc(2), SAND);
+        world.set(wc(4), wc(5), wc(4), SAND);
+        world.set(wc(0), wc(1), wc(0), SAND);
+        let pop_before = world.population();
+
+        for _ in 0..4 {
+            world.step();
+        }
+
+        assert_eq!(
+            world.population(),
+            pop_before,
+            "sand gravity must conserve population"
+        );
+    }
+
+    #[test]
+    fn lava_solidifies_on_water_contact() {
+        let mut world = World::new(3);
+        // Place lava and water adjacent.
+        world.set(wc(3), wc(3), wc(3), LAVA);
+        world.set(wc(4), wc(3), wc(3), WATER);
+
+        world.step();
+
+        // Lava should have solidified to stone (its reaction product).
+        // Water should have also solidified (water reacts to... wait,
+        // water's reactive_material is FIRE, not LAVA). Water stays water
+        // unless fire-adjacent. Only lava solidifies.
+        assert_eq!(
+            world.get(wc(3), wc(3), wc(3)),
+            STONE,
+            "lava adjacent to water should solidify into stone"
+        );
+    }
+
+    #[test]
+    fn lava_persists_without_water() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), LAVA);
+
+        world.step();
+
+        // Lava without water should persist (LavaRule returns center).
+        // It may also move due to FluidBlockRule, but shouldn't disappear.
+        let pop = world.population();
+        assert!(pop > 0, "lava should not disappear without water");
     }
 }
