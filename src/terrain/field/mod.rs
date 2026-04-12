@@ -11,7 +11,7 @@
 //!
 //! The recursive builder in `terrain::gen` takes any `&impl RegionField` and
 //! emits a canonical `NodeId` without ever flattening to a grid. Heightmap,
-//! caves (3fq.2), dungeons (3fq.3), and SDF impls are all sibling structs in
+//! caves (3fq.2) and SDF impls are all sibling structs in
 //! this module tree.
 
 use crate::octree::CellState;

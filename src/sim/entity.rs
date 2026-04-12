@@ -23,11 +23,24 @@ pub struct EntityId(pub u64);
 /// 3D position/velocity as `[f64; 3]`. No external math lib needed yet.
 pub type Vec3 = [f64; 3];
 
-/// What kind of entity this is. Particles are the first and simplest.
+/// What kind of entity this is.
 #[derive(Clone, Debug)]
 pub enum EntityKind {
     /// Short-lived visual effect: sparks, smoke, debris.
     Particle(ParticleState),
+    /// The player — continuous position, input-driven movement.
+    Player(PlayerState),
+}
+
+/// Per-player state. Movement and camera are driven by input, not physics.
+#[derive(Clone, Debug)]
+pub struct PlayerState {
+    /// Horizontal look angle (radians).
+    pub yaw: f64,
+    /// Vertical look angle (radians), clamped to ±π/2.
+    pub pitch: f64,
+    /// Material to place when right-clicking.
+    pub held_material: u16,
 }
 
 /// Per-particle state.
@@ -76,12 +89,7 @@ impl EntityStore {
     pub fn add(&mut self, pos: Vec3, vel: Vec3, kind: EntityKind) -> EntityId {
         let id = EntityId(self.next_id);
         self.next_id += 1;
-        let entity = Entity {
-            id,
-            pos,
-            vel,
-            kind,
-        };
+        let entity = Entity { id, pos, vel, kind };
         // Find a free slot or push.
         if let Some(slot) = self.entities.iter_mut().find(|s| s.is_none()) {
             *slot = Some(entity);
@@ -102,6 +110,14 @@ impl EntityStore {
             }
         }
         false
+    }
+
+    /// Get a mutable reference to an entity by id.
+    pub fn get_mut(&mut self, id: EntityId) -> Option<&mut Entity> {
+        self.entities
+            .iter_mut()
+            .filter_map(|s| s.as_mut())
+            .find(|e| e.id == id)
     }
 
     /// Iterate over all live entities.
@@ -127,13 +143,18 @@ impl EntityStore {
         for slot in &mut self.entities {
             let Some(entity) = slot else { continue };
 
-            // Apply velocity.
-            entity.pos[0] += entity.vel[0];
-            entity.pos[1] += entity.vel[1];
-            entity.pos[2] += entity.vel[2];
-
             match &mut entity.kind {
+                EntityKind::Player(_) => {
+                    // Player movement is input-driven (handled in main.rs).
+                    // No velocity, gravity, or collision here.
+                    continue;
+                }
                 EntityKind::Particle(state) => {
+                    // Apply velocity.
+                    entity.pos[0] += entity.vel[0];
+                    entity.pos[1] += entity.vel[1];
+                    entity.pos[2] += entity.vel[2];
+
                     if state.ttl == 0 {
                         // Despawn: optionally write a cell.
                         if let Some(cell_state) = state.on_despawn {

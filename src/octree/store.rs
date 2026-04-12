@@ -1002,7 +1002,8 @@ mod tests {
         let (compacted, new_root) = store.compacted(NodeId::EMPTY);
         assert_eq!(new_root, NodeId::EMPTY);
         assert_eq!(
-            compacted.stats(), 1,
+            compacted.stats(),
+            1,
             "empty compaction should yield only the canonical empty leaf"
         );
     }

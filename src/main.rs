@@ -1,15 +1,20 @@
 use hash_thing::perf;
+use hash_thing::player;
 use hash_thing::render;
 use hash_thing::sim;
 use hash_thing::terrain;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::EventLoop,
+    keyboard::KeyCode,
     window::{Window, WindowAttributes},
 };
+
+use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
 
 const VOLUME_SIZE: u32 = 64;
 
@@ -43,12 +48,11 @@ fn log_gen_stats(
     };
     let gen_region_ms = stats.gen_region_us as f64 / 1_000.0;
     let cave_ms = stats.cave_us as f64 / 1_000.0;
-    let dungeon_ms = stats.dungeon_us as f64 / 1_000.0;
     log::info!(
         "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
          gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
-         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms dungeon={dungeon_ms:.2}ms) \
-         nodes_after_gen={nag} nodes_after_caves={nac} nodes_after_dungeons={nad} | \
+         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms) \
+         nodes_after_gen={nag} nodes_after_caves={nac} | \
          noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
         pop = population,
         delta = nodes_delta,
@@ -58,7 +62,6 @@ fn log_gen_stats(
         collapses = stats.total_collapses(),
         nag = stats.nodes_after_gen,
         nac = stats.nodes_after_caves,
-        nad = stats.nodes_after_dungeons,
         ns = noise_ns_per_sample,
     );
 }
@@ -81,6 +84,12 @@ struct App {
     // Mouse interaction state
     mouse_pressed: bool,
     last_mouse: Option<(f64, f64)>,
+    /// Currently held keyboard keys (for per-frame movement polling).
+    keys_held: HashSet<KeyCode>,
+    /// Camera mode: orbit (debug) or first-person (gameplay).
+    camera_mode: CameraMode,
+    /// The player entity, if spawned.
+    player_id: Option<sim::EntityId>,
     perf: perf::Perf,
     /// Memory-watchdog metric family — node-count + step-cache ratcheting
     /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
@@ -99,6 +108,9 @@ struct App {
     /// Used to estimate noise fraction of each gen pass (hash-thing-3fq.5).
     /// Refreshed on terrain reset so a wildly different param set reprobes.
     noise_ns_per_sample: f64,
+    /// Last frame timestamp for delta-time computation. Player movement
+    /// is multiplied by dt so speed is frame-rate-independent (xa7).
+    last_frame: std::time::Instant,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -117,7 +129,7 @@ impl App {
         // Start paused so the user opts into stepping explicitly. The
         // default scene is now a CA/materials showcase and should not
         // start evolving until requested.
-        Self {
+        let mut app = Self {
             window: None,
             renderer: None,
             world,
@@ -129,12 +141,104 @@ impl App {
             log_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
+            keys_held: HashSet::new(),
+            camera_mode: CameraMode::FirstPerson,
+            player_id: None,
             perf: perf::Perf::new(),
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
             noise_ns_per_sample: 0.0,
+            last_frame: std::time::Instant::now(),
             entities: sim::EntityStore::new(),
+        };
+
+        // Spawn the player entity at the world center, looking forward.
+        let center = VOLUME_SIZE as f64 / 2.0;
+        let player_id = app.entities.add(
+            [center, center + 2.0, center],
+            [0.0; 3],
+            sim::EntityKind::Player(sim::PlayerState {
+                yaw: std::f64::consts::FRAC_PI_4,
+                pitch: 0.0,
+                held_material: 1, // stone
+            }),
+        );
+        app.player_id = Some(player_id);
+        log::info!("Player spawned at ({center}, {}, {center})", center + 2.0);
+
+        app
+    }
+
+    /// Get the player's eye position and look direction.
+    fn player_eye_ray(&self) -> Option<([f64; 3], [f64; 3])> {
+        let pid = self.player_id?;
+        let p = self.entities.iter().find(|e| e.id == pid)?;
+        if let sim::EntityKind::Player(ref ps) = p.kind {
+            Some(player::eye_ray(&p.pos, ps.yaw, ps.pitch))
+        } else {
+            None
+        }
+    }
+
+    /// Break the block the player is looking at.
+    fn break_block(&mut self) {
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((hit, _prev)) = player::raycast_cells(&self.world, eye, dir) {
+            self.world.set(
+                sim::WorldCoord(hit[0]),
+                sim::WorldCoord(hit[1]),
+                sim::WorldCoord(hit[2]),
+                hash_thing::octree::Cell::EMPTY.raw(),
+            );
+            // Re-upload volume since we modified the world directly.
+            Self::upload_volume(
+                &mut self.renderer,
+                &self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
+        }
+    }
+
+    /// Place a block on the face the player is looking at.
+    fn place_block(&mut self) {
+        let pid = self.player_id;
+        let held_material = pid
+            .and_then(|id| self.entities.iter().find(|e| e.id == id))
+            .and_then(|e| {
+                if let sim::EntityKind::Player(ref ps) = e.kind {
+                    Some(ps.held_material)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1);
+
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((hit, prev)) = player::raycast_cells(&self.world, eye, dir) {
+            // Skip if origin is inside a solid cell (prev == hit on first step).
+            if prev == hit {
+                return;
+            }
+            // Place at the empty cell just before the hit.
+            let state = hash_thing::octree::Cell::pack(held_material, 0).raw();
+            self.world.set(
+                sim::WorldCoord(prev[0]),
+                sim::WorldCoord(prev[1]),
+                sim::WorldCoord(prev[2]),
+                state,
+            );
+            Self::upload_volume(
+                &mut self.renderer,
+                &self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
         }
     }
 
@@ -153,8 +257,6 @@ impl App {
         last_svdag_stats: &mut (usize, usize, u32),
     ) {
         if let Some(renderer) = renderer {
-            let data = world.flatten();
-            renderer.upload_volume(&data);
             // Incremental rebuild: reuses cached offsets for unchanged subtrees.
             svdag.update(&world.store, world.root, world.level);
             // Compact when >50% of the buffer is stale slots (hash-thing-bx7).
@@ -285,15 +387,45 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::Focused(false) => {
+                self.keys_held.clear();
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
+                // Track physical key state for per-frame movement polling.
+                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            self.keys_held.insert(code);
+                        }
+                        ElementState::Released => {
+                            self.keys_held.remove(&code);
+                        }
+                    }
+                }
                 if event.state == ElementState::Pressed {
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
-                            self.paused = !self.paused;
-                            log::info!("Paused: {}", self.paused);
+                            // In orbit mode, Space toggles pause.
+                            // In FPS mode, Space is fly-up (handled per-frame).
+                            if self.camera_mode == CameraMode::Orbit {
+                                self.paused = !self.paused;
+                                log::info!("Paused: {}", self.paused);
+                            }
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
                             event_loop.exit();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F5) => {
+                            self.paused = !self.paused;
+                            log::info!("Paused: {}", self.paused);
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                            self.camera_mode = match self.camera_mode {
+                                CameraMode::Orbit => CameraMode::FirstPerson,
+                                CameraMode::FirstPerson => CameraMode::Orbit,
+                            };
+                            log::info!("Camera mode: {:?}", self.camera_mode);
                         }
                         winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
@@ -327,19 +459,6 @@ impl ApplicationHandler for App {
                                 "Caves terrain",
                                 terrain::TerrainParams {
                                     caves: Some(terrain::CaveParams::default()),
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                        winit::keyboard::Key::Character("d") => {
-                            // Re-seed terrain with caves + dungeons. Stays paused.
-                            // hash-thing-3fq.8: drives the dungeon carving
-                            // post-pass end-to-end.
-                            self.load_terrain_scene(
-                                "Dungeon terrain",
-                                terrain::TerrainParams {
-                                    caves: Some(terrain::CaveParams::default()),
-                                    dungeons: Some(terrain::DungeonParams::default()),
                                     ..Default::default()
                                 },
                             );
@@ -392,15 +511,6 @@ impl ApplicationHandler for App {
                             // Burning room demo: fire + water + grass walls.
                             self.load_burning_room_demo("Reset burning room demo");
                         }
-                        winit::keyboard::Key::Character("v") => {
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.mode = match renderer.mode {
-                                    render::RenderMode::Flat3D => render::RenderMode::Svdag,
-                                    render::RenderMode::Svdag => render::RenderMode::Flat3D,
-                                };
-                                log::info!("Render mode: {:?}", renderer.mode);
-                            }
-                        }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
                         // cadence.
@@ -427,22 +537,48 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
-                    self.mouse_pressed = state == ElementState::Pressed;
-                    if !self.mouse_pressed {
-                        self.last_mouse = None;
+                    if self.camera_mode == CameraMode::Orbit {
+                        self.mouse_pressed = state == ElementState::Pressed;
+                        if !self.mouse_pressed {
+                            self.last_mouse = None;
+                        }
+                    } else if state == ElementState::Pressed {
+                        // FPS mode: left click = break block.
+                        self.break_block();
                     }
+                }
+                if button == MouseButton::Right
+                    && state == ElementState::Pressed
+                    && self.camera_mode == CameraMode::FirstPerson
+                {
+                    self.place_block();
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                if self.mouse_pressed {
+                let should_look = match self.camera_mode {
+                    CameraMode::Orbit => self.mouse_pressed,
+                    CameraMode::FirstPerson => true, // always look in FPS
+                };
+                if should_look {
                     if let Some((lx, ly)) = self.last_mouse {
-                        let dx = (position.x - lx) as f32;
-                        let dy = (position.y - ly) as f32;
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.camera_yaw += dx * 0.005;
+                        let dx = position.x - lx;
+                        let dy = position.y - ly;
+                        if self.camera_mode == CameraMode::FirstPerson {
+                            // Update player yaw/pitch directly.
+                            if let Some(pid) = self.player_id {
+                                if let Some(player) = self.entities.get_mut(pid) {
+                                    if let sim::EntityKind::Player(ref mut ps) = player.kind {
+                                        ps.yaw += dx * LOOK_SENSITIVITY;
+                                        ps.pitch =
+                                            (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
+                                    }
+                                }
+                            }
+                        } else if let Some(renderer) = &mut self.renderer {
+                            renderer.camera_yaw += dx as f32 * 0.005;
                             renderer.camera_pitch =
-                                (renderer.camera_pitch + dy * 0.005).clamp(-1.4, 1.4);
+                                (renderer.camera_pitch + dy as f32 * 0.005).clamp(-1.4, 1.4);
                         }
                     }
                     self.last_mouse = Some((position.x, position.y));
@@ -450,12 +586,15 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
-                };
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.camera_dist = (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
+                if self.camera_mode == CameraMode::Orbit {
+                    let scroll = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
+                    };
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.camera_dist =
+                            (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
+                    }
                 }
             }
 
@@ -467,6 +606,10 @@ impl ApplicationHandler for App {
                 if self.occluded {
                     return;
                 }
+
+                // Frame delta time for frame-rate-independent movement (xa7).
+                let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
+                self.last_frame = std::time::Instant::now();
 
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
@@ -482,11 +625,10 @@ impl ApplicationHandler for App {
                         self.entities.update(&self.world, &mut queue);
                         self.world.queue = queue;
                     }
-                    // Time upload as one aggregate (flatten + Svdag::build +
-                    // upload_volume + upload_svdag). CPU-side submit only —
-                    // wgpu queue writes are async. upload_volume takes
-                    // explicit field references (not &mut self) precisely
-                    // so the Timer can coexist with the call.
+                    // Time SVDAG rebuild + GPU upload. CPU-side submit
+                    // only — wgpu queue writes are async. upload_volume
+                    // takes explicit field references (not &mut self)
+                    // precisely so the Timer can coexist with the call.
                     {
                         let _t = self.perf.start("upload_cpu");
                         Self::upload_volume(
@@ -495,6 +637,28 @@ impl ApplicationHandler for App {
                             &mut self.svdag,
                             &mut self.last_svdag_stats,
                         );
+                        // Upload particle billboard data. Positions are in
+                        // world coords — normalize to [0,1]³ for the renderer.
+                        if let Some(renderer) = &mut self.renderer {
+                            let inv_size = 1.0 / self.world.side() as f32;
+                            let particle_data: Vec<[f32; 4]> = self
+                                .entities
+                                .iter()
+                                .filter_map(|e| {
+                                    let mat = match &e.kind {
+                                        sim::EntityKind::Particle(p) => p.material as u32,
+                                        sim::EntityKind::Player(_) => return None,
+                                    };
+                                    Some([
+                                        e.pos[0] as f32 * inv_size,
+                                        e.pos[1] as f32 * inv_size,
+                                        e.pos[2] as f32 * inv_size,
+                                        f32::from_bits(mat),
+                                    ])
+                                })
+                                .collect();
+                            renderer.upload_particles(&particle_data);
+                        }
                     }
 
                     self.step_timer = std::time::Instant::now();
@@ -520,6 +684,118 @@ impl ApplicationHandler for App {
                         self.perf.summary(),
                     );
                     self.log_timer = std::time::Instant::now();
+                }
+
+                // Player movement (per-frame, not per-tick) and camera sync.
+                if self.camera_mode == CameraMode::FirstPerson {
+                    if let Some(pid) = self.player_id {
+                        // Read player yaw for movement direction.
+                        let yaw = self
+                            .entities
+                            .get_mut(pid)
+                            .and_then(|e| match &e.kind {
+                                sim::EntityKind::Player(ps) => Some(ps.yaw),
+                                _ => None,
+                            })
+                            .unwrap_or(0.0);
+
+                        // Gather input axes from held keys.
+                        let fwd = if self.keys_held.contains(&KeyCode::KeyW) {
+                            1.0
+                        } else if self.keys_held.contains(&KeyCode::KeyS) {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+                        let right = if self.keys_held.contains(&KeyCode::KeyD) {
+                            1.0
+                        } else if self.keys_held.contains(&KeyCode::KeyA) {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+                        let up = if self.keys_held.contains(&KeyCode::Space) {
+                            1.0
+                        } else if self.keys_held.contains(&KeyCode::ShiftLeft)
+                            || self.keys_held.contains(&KeyCode::ShiftRight)
+                        {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+
+                        let speed = if self.keys_held.contains(&KeyCode::ControlLeft)
+                            || self.keys_held.contains(&KeyCode::ControlRight)
+                        {
+                            PLAYER_SPEED * PLAYER_SPRINT
+                        } else {
+                            PLAYER_SPEED
+                        };
+
+                        let delta = player::compute_move_delta(yaw, [fwd, right, up], speed, dt);
+
+                        if let Some(p) = self.entities.get_mut(pid) {
+                            p.pos = player::apply_movement(&self.world, &p.pos, &delta);
+                        }
+
+                        // hash-thing-m1f.4: grow the world when the player
+                        // approaches the boundary. Growth triggers when any
+                        // axis is within GROWTH_MARGIN cells of the edge.
+                        // ensure_contains is a no-op when already in-bounds.
+                        if let Some(p) = self.entities.get_mut(pid) {
+                            // Only grow toward +xyz (current root growth
+                            // direction). Negative-direction growth needs a
+                            // different root placement strategy.
+                            const GROWTH_MARGIN: f64 = 8.0;
+                            let side = self.world.side() as f64;
+                            let pos = p.pos;
+                            let needs_growth = pos.iter().any(|&c| c > side - GROWTH_MARGIN);
+                            if needs_growth {
+                                let margin = GROWTH_MARGIN as i64;
+                                let max = [
+                                    sim::WorldCoord(pos[0] as i64 + margin),
+                                    sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
+                                    sim::WorldCoord(pos[2] as i64 + margin),
+                                ];
+                                let old_level = self.world.level;
+                                self.world.ensure_region(
+                                    [sim::WorldCoord(0), sim::WorldCoord(0), sim::WorldCoord(0)],
+                                    max,
+                                );
+                                if self.world.level != old_level {
+                                    log::info!(
+                                        "World grew: level {} → {} (side {})",
+                                        old_level,
+                                        self.world.level,
+                                        self.world.side()
+                                    );
+                                    Self::upload_volume(
+                                        &mut self.renderer,
+                                        &self.world,
+                                        &mut self.svdag,
+                                        &mut self.last_svdag_stats,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Sync camera to player position and orientation.
+                        if let Some(player) = self.entities.get_mut(pid) {
+                            let inv_size = 1.0 / self.world.side() as f64;
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.camera_target = [
+                                    player.pos[0] as f32 * inv_size as f32,
+                                    (player.pos[1] + PLAYER_HEIGHT * 0.85) as f32 * inv_size as f32,
+                                    player.pos[2] as f32 * inv_size as f32,
+                                ];
+                                if let sim::EntityKind::Player(ref ps) = player.kind {
+                                    renderer.camera_yaw = ps.yaw as f32;
+                                    renderer.camera_pitch = ps.pitch as f32;
+                                }
+                                renderer.camera_dist = 0.0;
+                            }
+                        }
+                    }
                 }
 
                 // Time render. Disjoint-field borrows: the Timer holds
@@ -572,16 +848,24 @@ fn main() {
 
     log::info!("hash-thing: 3D Hashlife Engine");
     log::info!("Controls:");
+    log::info!("  Tab: toggle orbit / first-person camera");
+    log::info!("  --- Orbit mode ---");
     log::info!("  Mouse drag: orbit camera");
     log::info!("  Scroll: zoom");
     log::info!("  Space: pause/resume");
+    log::info!("  --- First-person mode ---");
+    log::info!("  WASD: move (relative to look direction)");
+    log::info!("  Mouse: look around");
+    log::info!("  Space: fly up   Shift: fly down");
+    log::info!("  Ctrl: sprint");
+    log::info!("  Left click: break block   Right click: place block");
+    log::info!("  --- Shared ---");
+    log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  C: reset terrain with caves (CA post-pass)");
-    log::info!("  D: reset terrain with caves + dungeons");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
-    log::info!("  V: toggle Flat3D / SVDAG rendering");
     log::info!("  P: dump perf + memory summary (on demand)");
     log::info!("  Esc: quit");
 
@@ -592,4 +876,3 @@ fn main() {
         .run_app(&mut app)
         .expect("event loop terminated with error");
 }
-

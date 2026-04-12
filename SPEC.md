@@ -55,6 +55,38 @@ Repo: `git@github.com:heated/ashfall.git`
 >
 > and then build it!
 
+### Product vision and demo direction (2026-04-12)
+
+> We definitely want it to be a game. It'd be great if the engine could support other games, a la the Metaverse thing. But definitely not a tech demo or just a basic toy — we'll try to shoot a little higher but I'm willing to walk it back a bit.
+>
+> When they launch it, we want to start with a basic voxel thing — like, okay this is normal — and then they walk around and start seeing crazier and crazier things. For a demo, maybe it starts looking like Minecraft, but I'm not married to that. I just want to say we could do other things. And as they keep moving and walking through the demo they start seeing the whole world come to life and crazy cool interactions and really novel shit.
+>
+> A character, and still able to interact with the world. Probably placing material, but definitely seeing stuff.
+>
+> For physics: primarily powder game stuff or maybe fire. Not really redstone to begin with.
+>
+> For terrain/dungeons: I could see a lot of different possible generation — a lot of different worlds to step into. I don't want terrain to just be one kind of terrain. I might want to start in an infinite 3D dungeon or whatever, but I'm also down to support the normal terrain.
+>
+> For materials: it could be good to have different material stacks — different namespaces of materials depending on the front end game on top of this. One of the sets should be whatever standard Minecraft-y materials, except more in the direction of powder game. Any sort of material stack should be a little more in the direction of powder game — stuff moving around by default, a little more alive.
+>
+> Done enough to show someone: it's fast enough, things are moving enough, it looks like a relatively complete thing. More of a complete thing than what it is now.
+>
+> I'm gonna want to talk more about what specific set of features we want to put in. There's a standard RPG stack, but I don't necessarily want to do that. I don't want it to look exactly like Minecraft. I don't know if I want crafting, stuff like that. So let's talk more about those.
+>
+> If it's clear from what my vision is, the answer to whatever downstream design question pops up — don't require a human gate. Only gate if it's not obvious from the spec.
+
+### World ideas (2026-04-12, to workshop further)
+
+> **Infinite 3D dungeon.** Infinite in all directions. You don't see much of it yet but it opens into big spaces periodically.
+>
+> **Natural megastructures.** Much more open space by default. Showcases big movement and the alive CA environment. Something that looks more natural and outdoorsy but with lots of 3D structure. The ground forms crazy 3D megastructures you can see up — maybe a world tree? Fine with it looking a little alien, but we'll have to workshop it. Worry: stuff that comes to mind might not look great.
+>
+> **Minecraft-style.** But might be strictly worse than the megastructure world. Talk more.
+>
+> **Tiny scale.** You are very small in a normal-sized world. Lots of stuff that's sized for you as well. Normal objects are huge terrain features.
+
+These are terrain/world presets — each would be a different terrain stack + material set + generation parameters. Still needs workshopping; don't build any of these without design conversation first.
+
 ---
 
 ## Extracted requirements (derived from the user's words above)
@@ -78,12 +110,38 @@ These are the operational specifications. If one of these ever disagrees with th
 - **Direct octree operation, avoiding flatten-to-grid for everything except testing/scaffolding.** (Verbatim: "I'm down to use this for testing, but definitely want to see if we can avoid this for every single aspect of the game.")
 - **Keep an eye on terrain-gen performance and surface issues early.**
 
+- **This is a game, not a tech demo.** The engine should support multiple games (metaverse direction), but the first product is a game with a player character. (Verbatim: "definitely not a tech demo or just a basic toy")
+- **Player character with world interaction.** First-person or third-person character that can walk around and place/interact with materials. Not god-mode-only. (Verbatim: "a character, and still able to interact with the world. Probably placing material, but definitely seeing stuff.")
+- **Demo experience: normal→extraordinary gradient.** Launch should look familiar (Minecraft-ish), then reveal increasingly alive/dynamic world as player explores. (Verbatim: "start with a basic voxel thing... then they start seeing crazier and crazier things")
+- **Powder-game physics first, not redstone.** Gravity, fluids, fire/temperature. Redstone-style logic comes later. (Verbatim: "primarily powder game stuff or maybe fire. Not really redstone to begin with.")
+- **Materials should feel alive.** Default behavior is movement/interaction, not static blocks. All material stacks lean powder-game. (Verbatim: "stuff moving around by default, a little more alive")
+- **Multiple terrain types / world presets.** Not locked to one biome. Could start in a dungeon, could start on terrain. Configurable. (Verbatim: "a lot of different worlds to step into")
+- **Material namespaces per game.** Engine supports different material stacks for different front-end games. One standard Minecraft-ish-but-alive set as baseline. (Verbatim: "different namespaces of materials depending on the front end game on top of this")
+- **Feature set TBD — not copying Minecraft.** Crafting, RPG mechanics, specific features not yet decided. Require human gate. (Verbatim: "I don't necessarily want to do that. I don't know if I want crafting.")
+
 ### Soft requirements
 
 - **More than 256 material types is desirable if performance allows.** (Verbatim: "I'm willing to start with 256 but it could be cool to just support more unless it becomes a performance issue")
 - **Fold metadata into material as tagged pointer space.** (Verbatim: "Maybe we fold meta into the material, some sort of tagged pointer space?")
 - **Experiment with physics.** (Verbatim: "physics: lets experiment")
 - **Emergent behavior is acceptable alongside hand-authored.** (Verbatim: "and im down to have a lot of this (and less, emergent. whatever works)")
+
+### Design gates (what needs edward vs what's clear from spec)
+
+**Autonomous (no gate needed):**
+- Powder-game physics: gravity, fluids, fire, temperature — this is the priority
+- Making materials feel alive / move by default
+- Multiple terrain presets / world types
+- Player character movement and camera
+- Performance work, engine internals, octree ops
+- Material interactions that are obvious powder-game staples (sand falls, water flows, fire spreads)
+
+**Requires human gate:**
+- Which specific features to build (crafting? inventory? RPG mechanics? building tools?)
+- What the game *is* beyond "walk around a living voxel world"
+- Specific material sets beyond the obvious powder-game baseline
+- Any user-visible interaction model beyond "walk + place materials + observe"
+- Anything that makes it look/feel like a specific existing game (Minecraft clone, Terraria clone, etc.)
 
 ### Questions the user raised that are not yet resolved
 
@@ -237,14 +295,17 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
   - 31-bit node-count overflow assertion at write time (x9r)
   - `padded_bytes_per_row` helper for COPY_BYTES_PER_ROW_ALIGNMENT (mys)
   - Material palette sync with registry (xev): both shaders now match `MaterialRegistry::terrain_defaults()` colors
-- ✅ **Material-type CA (epic `1v0`, partial — 9/10+)**
+- ✅ **Material-type CA (epic `1v0`, complete)**
   - `1v0.1` 16-bit tagged cell: `Cell` packs 10-bit `material_id` + 6-bit `metadata` into `u16`. `METADATA_BITS=6` is pinned by drift guard in both shaders.
   - `1v0.2` `MaterialRegistry` with per-material rules, visual properties (label, base_color, texture_ref), physical properties (density, flammability, conductivity). `terrain_defaults()` registers air/stone/dirt/grass/fire/water. `gol_smoke()` bridges legacy GoL presets. GPU palette export via `color_palette_rgba()`.
   - `1v0.3` Per-material `CaRule` dispatch in `World::step`: `trait CaRule { fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell; }`. `NoopRule` for static materials, `FireRule` (spreads from fuel, quenched by water), `WaterRule` (reacts with fire → stone). No central interaction table.
   - `1v0.4` Margolus 2×2×2 movement phase: `trait BlockRule { fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8]; }`. Alternating partition offset (even/odd gen). `GravityBlockRule` for density-based vertical swaps. Mass conservation enforced via debug_assert.
   - `1v0.5` `FluidBlockRule`: 2-phase block rule — gravity (vertical swaps by density) then lateral spread (fluid↔air swaps). Hashlife-compatible determinism via `rng_hash`.
+  - `1v0.6` Entity system: `EntityStore` with `EntityKind::Particle` (continuous position, velocity, TTL, collision, gravity). Mutation queue integration.
   - `1v0.7` Burning room demo scene: stone room with grass walls (fuel), fire corner, water pool. Key binding: B.
+  - `1v0.8` Cell/block granularity: `CELLS_PER_BLOCK_LOG2=3` (8³ cells per gameplay block), `World::set_block()` API with auto-grow.
   - `1v0.9` Mutation channel: `WorldMutation` enum + `apply_mutations()` for entity→world edit API with runtime guards.
+  - `1v0.10` Player entity: `EntityKind::Player(PlayerState)` with first-person camera (Tab toggle), WASD+mouse look, AABB collision, DDA raycast block place/break.
 - ✅ **Hash-cons compaction (`88d`)**: `NodeStore::compacted(root)` rebuilds reachable graph into a fresh store via iterative post-order traversal (`8m7`). Called after every `commit_step` and on `seed_terrain` epoch boundaries.
 - ✅ **Foundations progress (epic `h34`, 4/4 — complete)**
   - `h34.1` cell_hash PRNG: `hash(x, y, z, generation, seed) → u32` Hashlife-compatible deterministic source (src/rng.rs)
@@ -270,9 +331,11 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ### Next up (P1, from bd)
 
-- ☐ **Recursive Hashlife stepping** (epic `6gf`, 11/13): ✅ `6gf.1` recursive step, ✅ `6gf.2` memoization, ✅ `6gf.3` correctness harness, ✅ `6gf.4` Margolus parity, ✅ `6gf.5`-`6gf.6` tests + primitives, ✅ `6gf.7` exponential time-skip (macro step), ✅ `6gf.8` main loop switchover, ✅ `6gf.9` timing comparison, ✅ `6gf.10` defensive hardening (overflow guards, assert promotion), ✅ `6gf.11` deep recursion tests (level 5), ✅ `6gf.12` boundary BC analysis (closed not-a-bug). In progress: `6gf.13` remove vestigial step_cache (edward).
-- ☐ **Material-type CA continuation** (epic `1v0`, 15/18): ✅ `1v0.1`-`1v0.5`, `1v0.7`, `1v0.9` landed. Remaining: `1v0.6` entity system (design gate), `1v0.8` cell/block granularity (unblocked, assigned cedar), `1v0.10` player entity (blocked on 1v0.6 + 1v0.8).
+- ✅ **Recursive Hashlife stepping** (epic `6gf`, complete): all 13 beads landed including `6gf.8` main loop switchover, `6gf.10` defensive hardening, `6gf.11` deep recursion tests, `6gf.13` vestigial step_cache removal.
+- ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
 - ✅ **SVDAG continuation**: `5bb.4` per-leaf material attributes, `5bb.5` incremental edit uploads, `bx7` stale-slot compaction, `ll6` GPU palette buffer. Remaining: `5bb.6` SSVDAG/LOD research (P4).
+
+- ☐ **Core engine validation** (epic `m1f`): ✅ `m1f.2` SVDAG benchmark, ✅ `m1f.3` edit propagation measurement, ✅ `m1f.4` infinite world growth (player-triggered boundary expansion), ✅ `m1f.8` SVDAG depth 14→20 (1M^3 leaf grid). Remaining: `m1f.5` incremental SVDAG validation (in progress), `m1f.6` new CA rules, `m1f.7` end-to-end demo polish.
 
 ### Later (P2+, from bd)
 

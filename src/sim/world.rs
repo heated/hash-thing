@@ -2,10 +2,10 @@ use std::fmt;
 
 use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
-use crate::octree::{Cell, CellState, NodeId, NodeStore};
+use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
-use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
+use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
 
 /// The axis-aligned cube of world-space that the octree currently covers.
@@ -83,7 +83,7 @@ pub struct World {
     pub simulation_seed: u64,
     pub materials: MaterialRegistry,
     /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
-    /// `ensure_region` generates terrain (heightmap + caves + dungeons)
+    /// `ensure_region` generates terrain (heightmap + caves)
     /// for newly-created sibling octants instead of leaving them empty.
     terrain_params: Option<TerrainParams>,
     /// Memoization cache for the recursive Hashlife stepper (6gf.2).
@@ -247,7 +247,7 @@ impl World {
     }
 
     /// Generate a sibling octant for lazy expansion. If `terrain_params` is
-    /// set, produces terrain (heightmap + caves + dungeons) at the given
+    /// set, produces terrain (heightmap + caves) at the given
     /// world-space origin. Otherwise returns a canonical empty node.
     fn gen_sibling(&mut self, level: u32, origin: [i64; 3]) -> NodeId {
         let params = match &self.terrain_params {
@@ -260,11 +260,6 @@ impl World {
         if let Some(cave_params) = &params.caves {
             let mut grid = self.store.flatten(node, side);
             crate::terrain::caves::carve_caves_grid(&mut grid, side, origin, cave_params);
-            node = self.store.from_flat(&grid, side);
-        }
-        if let Some(dungeon_params) = &params.dungeons {
-            let mut grid = self.store.flatten(node, side);
-            crate::terrain::dungeons::carve_dungeons_grid(&mut grid, side, origin, dungeon_params);
             node = self.store.from_flat(&grid, side);
         }
         node
@@ -288,6 +283,27 @@ impl World {
             Self::local_from_world("set", z),
             state,
         );
+    }
+
+    /// Place a gameplay block at block coordinates `(bx, by, bz)`.
+    ///
+    /// Fills a `CELLS_PER_BLOCK³` region of cells with the given state.
+    /// Block coordinate `(bx, by, bz)` maps to cell region
+    /// `[bx*K .. bx*K+K-1]` on each axis, where `K = CELLS_PER_BLOCK`.
+    ///
+    /// Auto-grows the world to fit, then queues a `FillRegion` mutation —
+    /// call `apply_mutations` to flush.
+    pub fn set_block(&mut self, bx: i64, by: i64, bz: i64, state: CellState) {
+        let k = CELLS_PER_BLOCK as i64;
+        let min = [WorldCoord(bx * k), WorldCoord(by * k), WorldCoord(bz * k)];
+        let max = [
+            WorldCoord(bx * k + k - 1),
+            WorldCoord(by * k + k - 1),
+            WorldCoord(bz * k + k - 1),
+        ];
+        self.ensure_region(min, max);
+        self.queue
+            .push(WorldMutation::FillRegion { min, max, state });
     }
 
     /// Get a cell.
@@ -679,14 +695,6 @@ impl World {
             stats.cave_us = cave_start.elapsed().as_micros() as u64;
         }
         stats.nodes_after_caves = self.store.stats();
-        // Opt-in dungeon carving post-pass. Runs after caves so dungeons
-        // carve through already-opened cave networks.
-        if let Some(dungeon_params) = &params.dungeons {
-            let dungeon_start = std::time::Instant::now();
-            root = carve_dungeons(&mut self.store, root, self.level, dungeon_params);
-            stats.dungeon_us = dungeon_start.elapsed().as_micros() as u64;
-        }
-        stats.nodes_after_dungeons = self.store.stats();
         self.root = root;
         self.generation = 0;
         self.terrain_params = Some(*params);
@@ -741,7 +749,7 @@ mod tests {
 
     use super::*;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
-    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, STONE, WATER};
+    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, WATER};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -1380,49 +1388,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // seed_terrain with dungeons integration test (hash-thing-3fq.10).
-    // -----------------------------------------------------------------
-
-    use crate::terrain::DungeonParams;
-
-    #[test]
-    fn seed_terrain_with_dungeons_reduces_stone() {
-        let mut world_no_dungeons = World::new(6);
-        let params_no = TerrainParams::default();
-        let _ = world_no_dungeons.seed_terrain(&params_no);
-        let pop_no = world_no_dungeons.population();
-
-        let mut world_dungeons = World::new(6);
-        let params_yes = TerrainParams {
-            dungeons: Some(DungeonParams::default()),
-            ..Default::default()
-        };
-        let stats = world_dungeons.seed_terrain(&params_yes);
-        let pop_yes = world_dungeons.population();
-
-        assert!(
-            pop_yes < pop_no,
-            "dungeons must carve some stone: pop_no={pop_no}, pop_yes={pop_yes}",
-        );
-        assert!(
-            stats.dungeon_us > 0,
-            "dungeon_us must be populated when dungeons are enabled",
-        );
-        assert!(
-            stats.nodes_after_dungeons > 0,
-            "nodes_after_dungeons must be populated",
-        );
-    }
-
-    #[test]
-    fn seed_terrain_without_dungeons_has_zero_dungeon_stats() {
-        let mut world = World::new(6);
-        let params = TerrainParams::default();
-        let stats = world.seed_terrain(&params);
-        assert_eq!(stats.dungeon_us, 0);
-    }
-
     // ---- ensure_contains (hash-thing-e9h) ----
 
     #[test]
@@ -1917,6 +1882,136 @@ mod tests {
     }
 
     #[test]
+    fn set_block_fills_cells_per_block_cubed() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // World needs to be large enough: block at (1,0,0) spans cells [8..15]
+        // on x, so we need level >= 4 (side 16).
+        let mut world = World::new(4);
+        world.set_block(1, 0, 0, STONE);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        let mut filled = 0u32;
+        for z in 0..k {
+            for y in 0..k {
+                for x in k..(2 * k) {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(filled, CELLS_PER_BLOCK.pow(3));
+
+        // Cells just outside the block should be empty.
+        assert_eq!(world.get(wc(k - 1), wc(0), wc(0)), 0); // cell 7, just before block
+        assert_eq!(world.get(wc(2 * k), wc(0), wc(0)), 0); // cell 16, just after block
+    }
+
+    #[test]
+    fn set_block_at_origin() {
+        use crate::octree::CELLS_PER_BLOCK;
+        let mut world = World::new(4);
+        world.set_block(0, 0, 0, STONE);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        let mut filled = 0u32;
+        for z in 0..k {
+            for y in 0..k {
+                for x in 0..k {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(filled, CELLS_PER_BLOCK.pow(3));
+    }
+
+    #[test]
+    fn set_block_roundtrip_individual_cells() {
+        use crate::octree::CELLS_PER_BLOCK;
+        let mut world = World::new(4);
+        world.set_block(0, 0, 0, DIRT);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        for z in 0..k {
+            for y in 0..k {
+                for x in 0..k {
+                    assert_eq!(
+                        world.get(wc(x), wc(y), wc(z)),
+                        DIRT,
+                        "cell ({x},{y},{z}) should be DIRT"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_block_auto_grows_world() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // Start with a level-3 world (side=8). Block at (1,0,0) needs cells [8..15],
+        // which is out of bounds. set_block should auto-grow to fit.
+        let mut world = World::new(3);
+        world.set_block(1, 0, 0, STONE);
+        world.apply_mutations();
+
+        // World must have grown to at least level 4 (side=16).
+        assert!(
+            world.level >= 4,
+            "world should auto-grow for out-of-bounds block"
+        );
+
+        let k = CELLS_PER_BLOCK as u64;
+        for z in 0..k {
+            for y in 0..k {
+                for x in k..(2 * k) {
+                    assert_eq!(world.get(wc(x), wc(y), wc(z)), STONE);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_fill_vs_cell_fill_node_count() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // Fill a 16³ world with stone: once via set_block, once via individual set calls.
+        // Both should produce identical octrees (hash-consing deduplicates).
+        let k = CELLS_PER_BLOCK as u64;
+        let level = 4u32; // 16³ world
+
+        // Block fill: 2 blocks per axis at K=3 → (16/8)³ = 8 blocks
+        let mut world_block = World::new(level);
+        let blocks_per_axis = (1u64 << level) / k;
+        for bz in 0..blocks_per_axis as i64 {
+            for by in 0..blocks_per_axis as i64 {
+                for bx in 0..blocks_per_axis as i64 {
+                    world_block.set_block(bx, by, bz, STONE);
+                }
+            }
+        }
+        world_block.apply_mutations();
+
+        // Cell fill: 16³ = 4096 individual set calls
+        let mut world_cell = World::new(level);
+        let side = 1u64 << level;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    world_cell.set(wc(x), wc(y), wc(z), STONE);
+                }
+            }
+        }
+
+        // Both should produce the same root (hash-cons identity) — uniform
+        // stone compresses identically regardless of insertion order.
+        assert_eq!(world_block.root, world_cell.root);
+    }
+
+    #[test]
     fn step_ca_runs_clean_on_empty_queue() {
         let mut world = World::new(3);
         world.set(wc(3), wc(3), wc(3), STONE);
@@ -1937,5 +2032,72 @@ mod tests {
             state: STONE,
         });
         world.step_ca(); // should panic
+    }
+
+    #[test]
+    fn sand_falls_under_gravity() {
+        let mut world = World::new(3);
+        // Sand is already registered with gravity_block_rule in terrain_defaults.
+        // Place sand at y=3, air below at y=2. Block-aligned at (2,2,2).
+        world.set(wc(2), wc(3), wc(2), SAND);
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), 0);
+
+        world.step();
+
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), SAND, "sand should fall");
+        assert_eq!(world.get(wc(2), wc(3), wc(2)), 0, "top should be air");
+    }
+
+    #[test]
+    fn sand_conserves_population() {
+        let mut world = World::new(3);
+        // Scatter sand cells at various positions.
+        world.set(wc(2), wc(3), wc(2), SAND);
+        world.set(wc(4), wc(5), wc(4), SAND);
+        world.set(wc(0), wc(1), wc(0), SAND);
+        let pop_before = world.population();
+
+        for _ in 0..4 {
+            world.step();
+        }
+
+        assert_eq!(
+            world.population(),
+            pop_before,
+            "sand gravity must conserve population"
+        );
+    }
+
+    #[test]
+    fn lava_solidifies_on_water_contact() {
+        let mut world = World::new(3);
+        // Place lava and water adjacent.
+        world.set(wc(3), wc(3), wc(3), LAVA);
+        world.set(wc(4), wc(3), wc(3), WATER);
+
+        world.step();
+
+        // Lava should have solidified to stone (its reaction product).
+        // Water should have also solidified (water reacts to... wait,
+        // water's reactive_material is FIRE, not LAVA). Water stays water
+        // unless fire-adjacent. Only lava solidifies.
+        assert_eq!(
+            world.get(wc(3), wc(3), wc(3)),
+            STONE,
+            "lava adjacent to water should solidify into stone"
+        );
+    }
+
+    #[test]
+    fn lava_persists_without_water() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), LAVA);
+
+        world.step();
+
+        // Lava without water should persist (LavaRule returns center).
+        // It may also move due to FluidBlockRule, but shouldn't disappear.
+        let pop = world.population();
+        assert!(pop > 0, "lava should not disappear without water");
     }
 }
