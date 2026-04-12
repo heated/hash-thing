@@ -179,7 +179,7 @@ impl NodeStore {
         // node stands for a uniform 2^level × 2^level × 2^level block. Expand
         // it to 8 identical children at level-1 before descending, so we only
         // rewrite the one octant that actually changed.
-        let children = match self.get(node).clone() {
+        let children = match *self.get(node) {
             Node::Leaf(s) => {
                 let child = self.uniform(level - 1, s);
                 [child; 8]

@@ -60,10 +60,7 @@ impl World {
         self.root = result;
         self.generation += 1;
 
-        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
-        self.store = new_store;
-        self.root = new_root;
-        self.remap_caches(&remap);
+        self.maybe_compact();
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -95,10 +92,27 @@ impl World {
         self.root = result;
         self.generation += self.recursive_pow2_step_count();
 
+        self.maybe_compact();
+    }
+
+    /// Compact the store when it has grown past 2× its post-compaction size.
+    /// Deferred compaction (m1f.14) lets intermediate nodes from recursive
+    /// descent survive across frames, enabling cache hits at every recursion
+    /// level. Periodic compaction bounds memory growth.
+    fn maybe_compact(&mut self) {
+        let current_size = self.store.stats();
+        if self.store_size_at_last_compact == 0 {
+            self.store_size_at_last_compact = current_size;
+            return;
+        }
+        if current_size <= self.store_size_at_last_compact * 2 {
+            return;
+        }
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
+        self.store_size_at_last_compact = self.store.stats();
     }
 
     fn has_block_rule_cells(&mut self) -> bool {
