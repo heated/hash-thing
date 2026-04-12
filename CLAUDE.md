@@ -15,7 +15,9 @@ Prefer commands that finish in under ~60s. Benchmarks, large builds, long test s
 
 ## Build profiles
 
-Default to dev. `--profile bench` for perf work. `--release` only for distributable artifacts. sccache is the rustc wrapper (`.cargo/config.toml`) — per-worktree `target/`, no lock contention, cached artifacts shared across worktrees.
+Default to dev. `--profile bench` for perf work. `--release` only for distributable artifacts.
+
+**At session start, run:** `export RUSTC_WRAPPER=sccache` — enables cross-worktree compile caching. Each worktree has its own `target/`, no lock contention. Also pull main to stay current.
 
 ## Agent surface — where project skills and commands live
 
