@@ -925,4 +925,47 @@ mod tests {
 
         assert_eq!(world.store.get_cached_step(input), None);
     }
+
+    // -----------------------------------------------------------------
+    // seed_terrain with dungeons integration test (hash-thing-3fq.10).
+    // -----------------------------------------------------------------
+
+    use crate::terrain::DungeonParams;
+
+    #[test]
+    fn seed_terrain_with_dungeons_reduces_stone() {
+        let mut world_no_dungeons = World::new(6);
+        let params_no = TerrainParams::default();
+        let _ = world_no_dungeons.seed_terrain(&params_no);
+        let pop_no = world_no_dungeons.population();
+
+        let mut world_dungeons = World::new(6);
+        let params_yes = TerrainParams {
+            dungeons: Some(DungeonParams::default()),
+            ..Default::default()
+        };
+        let stats = world_dungeons.seed_terrain(&params_yes);
+        let pop_yes = world_dungeons.population();
+
+        assert!(
+            pop_yes < pop_no,
+            "dungeons must carve some stone: pop_no={pop_no}, pop_yes={pop_yes}",
+        );
+        assert!(
+            stats.dungeon_us > 0,
+            "dungeon_us must be populated when dungeons are enabled",
+        );
+        assert!(
+            stats.nodes_after_dungeons > 0,
+            "nodes_after_dungeons must be populated",
+        );
+    }
+
+    #[test]
+    fn seed_terrain_without_dungeons_has_zero_dungeon_stats() {
+        let mut world = World::new(6);
+        let params = TerrainParams::default();
+        let stats = world.seed_terrain(&params);
+        assert_eq!(stats.dungeon_us, 0);
+    }
 }
