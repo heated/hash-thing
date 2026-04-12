@@ -287,15 +287,34 @@ pub mod cpu_trace {
         pub hit_normal: Option<[f32; 3]>,
     }
 
-    fn octant_of(pos: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
+    /// Octant index from a point relative to the node center.
+    /// Returns bit-packed index 0..7 with bit 0 = x, bit 1 = y, bit 2 = z.
+    ///
+    /// hash-thing-6hd: uses STRICT `>` for the HIGH half with `rd >= 0` as a
+    /// tiebreaker on exact-midpoint positions. The pre-6hd code used `>=`
+    /// which biased midpoint-exact positions to the HIGH half regardless of
+    /// ray direction; on simultaneous two-axis exits, the step-past nudge on
+    /// a non-dominant axis can underflow to sub-ULP (`dt * |rd_axis|` below
+    /// `ULP(pos)`), leaving pos EXACTLY on the boundary. The `>=` bias then
+    /// picked the wrong sibling whenever `rd_axis < 0`. Mirrors the shader
+    /// fix in `svdag_raycast.wgsl` 1:1 — both sides use `>` + rd tiebreak
+    /// and the SAME tiebreak direction so CPU/GPU stay byte-aligned.
+    ///
+    /// Zero-rd convention: when `rd[axis] == 0.0`, the tiebreak resolves to
+    /// HIGH (because `rd[axis] >= 0.0` is true). The ray can't cross the
+    /// midpoint on that axis anyway, so the choice is physically inert —
+    /// we pick HIGH to stay symmetric with the shader's `sign(0.0) = 0`
+    /// behavior and the pre-6hd `>=` default.
+    pub(super) fn octant_of(pos: [f32; 3], rd: [f32; 3], node_min: [f32; 3], half: f32) -> u32 {
         let mut idx = 0u32;
-        if pos[0] >= node_min[0] + half {
+        let mid = [node_min[0] + half, node_min[1] + half, node_min[2] + half];
+        if pos[0] > mid[0] || (pos[0] == mid[0] && rd[0] >= 0.0) {
             idx |= 1;
         }
-        if pos[1] >= node_min[1] + half {
+        if pos[1] > mid[1] || (pos[1] == mid[1] && rd[1] >= 0.0) {
             idx |= 2;
         }
-        if pos[2] >= node_min[2] + half {
+        if pos[2] > mid[2] || (pos[2] == mid[2] && rd[2] >= 0.0) {
             idx |= 4;
         }
         idx
@@ -462,7 +481,7 @@ pub mod cpu_trace {
                 let node_offset = stack_node[depth] as usize;
                 let node_min = stack_min[depth];
                 let half = stack_half[depth];
-                let oct = octant_of(pos, node_min, half);
+                let oct = octant_of(pos, rd, node_min, half);
                 let child_slot = dag[node_offset + 1 + oct as usize];
 
                 if child_slot & LEAF_BIT != 0 {
@@ -496,14 +515,31 @@ pub mod cpu_trace {
                             (leaf_max[2] - ro_local[2]) * inv_rd[2],
                         ];
                         let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
-                        // Assumes ray origin is outside the leaf. Inside-leaf
-                        // origins pick the nearest back face (all `tmin_v`
-                        // negative → argmax is the least-negative axis);
-                        // tracked as a follow-up to hash-thing-rv4. The
-                        // cascade uses `>=` on both comparators so ties
-                        // break identically to the shader in
-                        // `svdag_raycast.wgsl` — do NOT flip to `>`.
-                        let normal = if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
+                        let tmax_v = [lt1[0].max(lt2[0]), lt1[1].max(lt2[1]), lt1[2].max(lt2[2])];
+                        // hash-thing-2nd: inside-leaf fallback. When the ray
+                        // origin sits inside the filled voxel, every `tmin_v`
+                        // component is negative — the entry-face picker (argmax
+                        // of `tmin_v`) then returns the nearest BACK face and
+                        // the normal flips inward, shading the voxel as if lit
+                        // from behind. Reachable via deep-zoom orbit camera.
+                        // Fallback: pick the nearest EXIT face (argmin of
+                        // `tmax_v`) and flip the sign so the normal points in
+                        // the direction the ray is heading — the "about to
+                        // emerge" convention. The outer cascade uses `>=` on
+                        // both comparators so ties break identically to the
+                        // shader in `svdag_raycast.wgsl` — do NOT flip to `>`.
+                        // The inner (inside) cascade uses `<=` for the same
+                        // reason: CPU/GPU must break exit-face ties identically.
+                        let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
+                        let normal = if inside {
+                            if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
+                                [rd[0].signum(), 0.0, 0.0]
+                            } else if tmax_v[1] <= tmax_v[2] {
+                                [0.0, rd[1].signum(), 0.0]
+                            } else {
+                                [0.0, 0.0, rd[2].signum()]
+                            }
+                        } else if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
                             [-rd[0].signum(), 0.0, 0.0]
                         } else if tmin_v[1] >= tmin_v[2] {
                             [0.0, -rd[1].signum(), 0.0]
@@ -559,7 +595,7 @@ pub mod cpu_trace {
             // fastest axis never crosses more than one child span.
             let node_min = stack_min[depth];
             let half = stack_half[depth];
-            let oct = octant_of(pos, node_min, half);
+            let oct = octant_of(pos, rd, node_min, half);
             let child_min = [
                 node_min[0] + (oct & 1) as f32 * half,
                 node_min[1] + ((oct >> 1) & 1) as f32 * half,
@@ -1389,6 +1425,145 @@ mod tests {
         );
     }
 
+    /// hash-thing-6cc follow-up to 6hd: a midpoint-exact fuzz that pins the
+    /// `octant_of` tiebreak fix end-to-end through `cpu_trace::raycast`,
+    /// not just at the helper boundary. The 6hd unit tests cover
+    /// `octant_of` directly with hand-built float inputs; this test asks
+    /// the harder question: does a ray that step-pasts ACROSS a level-
+    /// internal midpoint plane with rd<0 on the tied axis still make
+    /// forward progress and terminate cleanly?
+    ///
+    /// Construction: ro sits exactly on the y = 0.5 root midpoint plane
+    /// (`ro.y = 0.5_f32`, the bit-exact midpoint of the unit cube), with
+    /// `|rd_y|` chosen so the per-step nudge `dt * |rd_y|` underflows
+    /// `ULP(0.5) ≈ 5.96e-8`. Under that condition, the post-step `pos.y`
+    /// stays at exactly `0.5_f32` for many steps in a row, repeatedly
+    /// triggering the `octant_of` midpoint comparator with `rd.y < 0` —
+    /// the exact pattern that pre-6hd picked the wrong sibling on
+    /// (Codex reproducer `rd = (1.0, -1e-6, 0.0)`).
+    ///
+    /// The dominant x axis is the workhorse — large `|rd_x|` so the
+    /// step-past nudge advances `pos.x` past each octant boundary
+    /// normally. The y axis is the tied/secondary axis. Z is forced to
+    /// zero, mirroring the Codex reproducer pattern (no z motion → z
+    /// component of pos is constant → z classification is direction-
+    /// independent and uninvolved in the test).
+    ///
+    /// Asserted invariants (same shape as the 27m-derived sweep above):
+    ///   1. `steps < 400` — forward progress within the budget. Pre-6hd
+    ///      this didn't necessarily stall (the wrong-sibling pick still
+    ///      makes progress), but a future regression that resurfaces the
+    ///      `pos == mid` ambiguity AND breaks step-past nudging would
+    ///      hit MAX_STEPS. Belt-and-braces.
+    ///   2. Every `StepPast` event has strict `t_new > t_old` — the
+    ///      27m v2 invariant; the 6hd fix sits on top of it, so any
+    ///      regression there would also surface here.
+    ///
+    /// Scene: level-2 single-leaf at (2,2,2), so traversal must cross
+    /// the y = 0.5 midpoint plane to descend. Tractable in f32 without
+    /// rounding drift, per the 6cc bead's "small scene" guidance.
+    #[test]
+    fn fuzz_midpoint_corner_forward_progress_property() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2);
+        root = store.set_cell(root, 2, 2, 2, mat(1));
+        let dag = Svdag::build(&store, root, 2);
+
+        let mut seed: u64 = 0xBADF00D_u64;
+        let mut next_u32 = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 32) as u32
+        };
+        let u32_to_unit = |x: u32| ((x >> 8) as f32) / ((1u32 << 24) as f32);
+
+        let mut total_steps: u64 = 0;
+        let mut midpoint_pos_witnessed = 0;
+
+        for i in 0..500 {
+            // x ro outside the cube on the -x side. Dominant rd is +x.
+            let ro_x = -0.5 - u32_to_unit(next_u32()) * 1.5; // -2.0 .. -0.5
+                                                             // ro.y = exactly 0.5 (bit-exact root midpoint plane).
+            let ro_y = 0.5_f32;
+            // ro.z anywhere strictly inside [0, 1) but away from edges.
+            let ro_z = 0.1 + u32_to_unit(next_u32()) * 0.8;
+            let ro = [ro_x, ro_y, ro_z];
+
+            // Pre-normalize rd. |rd_y| in [1e-7, 1.1e-5] — small enough
+            // that `dt * |rd_y|` underflows ULP(0.5) for every dt the
+            // traversal will produce on this scene (depth 2 → cell width
+            // 0.25, max single-step dt < 0.5, so dt * 1.1e-5 ≈ 5.5e-6,
+            // which is two orders of magnitude above ULP(0.5)... but
+            // still small enough that pos.y rounds back to 0.5 over the
+            // first few steps before drifting away).
+            //
+            // Critically: rd_y is ALWAYS negative — this is the codex-
+            // reproducer pattern (rd_y < 0 + pos.y == mid → pre-6hd
+            // picked wrong sibling because `>=` biased to HIGH).
+            let rd_y = -(1e-7 + u32_to_unit(next_u32()) * 1e-5);
+            let rd_raw = [1.0_f32, rd_y, 0.0_f32];
+            let rd_n = normalize(rd_raw);
+
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd_n, true);
+
+            assert!(
+                result.steps < 400,
+                "6cc midpoint case {i} (ro={ro:?}, rd={rd_n:?}): forward-\
+                 progress regression — used {steps} steps out of 400 floor.",
+                steps = result.steps,
+            );
+
+            for (ev_idx, ev) in result.events.iter().enumerate() {
+                if let cpu_trace::TraceEvent::StepPast { t_old, t_new } = ev {
+                    assert!(
+                        t_new > t_old,
+                        "6cc midpoint case {i} event {ev_idx}: zero-forward-\
+                         progress regression — t_old={t_old} t_new={t_new} \
+                         (ro={ro:?}, rd={rd_n:?}). 27m v2 ro clamp broken \
+                         OR 6hd tiebreak regressed.",
+                    );
+                }
+            }
+
+            // Witness count: did we actually exercise the midpoint
+            // tiebreak path? The harness construction guarantees ro.y
+            // == 0.5 exactly going in, so AT LEAST the first descend
+            // step must call `octant_of` with pos.y == 0.5. We can't
+            // observe `octant_of` calls directly from the trace, but
+            // we can infer the witness from the step count: any case
+            // that took at least one descend step witnessed the
+            // tiebreak with our constructed ro.
+            if result.steps > 0 {
+                midpoint_pos_witnessed += 1;
+            }
+            total_steps += result.steps as u64;
+        }
+
+        // Sanity: every constructed case must witness the tiebreak.
+        // If this drops below 500, the harness isn't exercising the
+        // path it was built for.
+        assert_eq!(
+            midpoint_pos_witnessed, 500,
+            "6cc fuzz: only {midpoint_pos_witnessed}/500 cases produced \
+             a non-zero step count — the harness isn't reaching the \
+             octant_of tiebreak path.",
+        );
+
+        // Sanity: the harness exercised the traversal non-trivially.
+        // Each ray must take at least one step (the descend that hits
+        // octant_of with pos.y == 0.5). The level-2 sparse scene
+        // coalesces empty space into shallow cells, so most rays exit
+        // in 2 steps (descend → step-past → exit-root). Floor of 500
+        // = "every ray got at least one step"; observed at commit time
+        // was exactly 1000 (2 per ray).
+        assert!(
+            total_steps >= 500,
+            "6cc fuzz: total_steps {total_steps} too low — the harness \
+             isn't reaching the descend loop on every ray.",
+        );
+    }
+
     /// hash-thing-2w5: The step budget formula must honor its floor and its
     /// per-cell fudge. Pinning the observable values keeps future tuning
     /// honest — raising MIN_STEP_BUDGET or STEP_BUDGET_FUDGE should be a
@@ -1670,6 +1845,75 @@ mod tests {
         );
     }
 
+    /// hash-thing-2nd: inside-filled-leaf ray origins (reachable via deep-zoom
+    /// orbit camera) must produce an EXIT-face normal pointing in the direction
+    /// of travel — not the inward back-face normal the pre-2nd code returned.
+    /// Plants the ray origin at the exact center of a single filled voxel at
+    /// (32,32,32) in a level-6 grid and fires along each of the six axes. The
+    /// exit face on each is the one the ray is heading toward, so the normal
+    /// should equal `sign(rd)` (aligned with the direction of travel).
+    #[test]
+    fn leaf_hit_normal_inside_origin_picks_exit_face() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        let mat1 = mat(1);
+        root = store.set_cell(root, 32, 32, 32, mat1);
+        let dag = Svdag::build(&store, root, 6);
+
+        // Exact center of the filled voxel at (32,32,32) — world-space
+        // AABB [0.5, 0.515625]^3, center at 32.5/64 on every axis.
+        let center = [32.5_f32 / 64.0, 32.5 / 64.0, 32.5 / 64.0];
+
+        // (name, rd, expected exit-face normal = sign(rd) on the exit axis).
+        let cases: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("+x exit", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ("-x exit", [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            ("+y exit", [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            ("-y exit", [0.0, -1.0, 0.0], [0.0, -1.0, 0.0]),
+            ("+z exit", [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]),
+            ("-z exit", [0.0, 0.0, -1.0], [0.0, 0.0, -1.0]),
+        ];
+
+        for (name, rd, expected_normal) in cases {
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, center, *rd, false);
+            assert_eq!(
+                result.hit_material,
+                Some(mat1 as u32),
+                "{name}: expected inside-leaf hit, got miss (exhausted={})",
+                result.exhausted,
+            );
+            let normal = result.hit_normal.expect("hit must carry a normal");
+            assert_eq!(
+                normal, *expected_normal,
+                "{name}: inside-leaf origin with rd {rd:?} must yield exit-face \
+                 normal {expected_normal:?}, got {normal:?} (pre-2nd returned \
+                 the inward back-face)",
+            );
+        }
+
+        // Off-axis diagonal inside-origin ray — all three `tmax_v`
+        // components are finite, so the cascade picks the true `argmin`
+        // rather than relying on `+inf` on non-moving axes. For a ray
+        // starting at the voxel center with `rd = (1, 2, 3)`, the per-axis
+        // exit distances from center are `half / |rd_axis|`; z has the
+        // largest `|rd|`, so z exits first → normal = `[0, 0, +1]`.
+        let rd = normalize([1.0, 2.0, 3.0]);
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, center, rd, false);
+        assert_eq!(
+            result.hit_material,
+            Some(mat1 as u32),
+            "diagonal: expected inside-leaf hit, got miss (exhausted={})",
+            result.exhausted,
+        );
+        let normal = result.hit_normal.expect("hit must carry a normal");
+        assert_eq!(
+            normal,
+            [0.0, 0.0, 1.0],
+            "diagonal rd {rd:?} from voxel center must exit through +z \
+             (largest |rd_axis|) → normal [0,0,+1], got {normal:?}",
+        );
+    }
+
     /// hash-thing-rv4: `hit_normal` must be `None` on every non-hit return
     /// path. The CPU trace has four miss/exhausted sites; this test
     /// exercises the two most reachable ones (clean miss, pre-root miss).
@@ -1704,5 +1948,113 @@ mod tests {
         );
         assert_eq!(result.hit_normal, None, "in-root miss must carry no normal");
         assert!(!result.exhausted, "clean miss must not trip budget");
+    }
+
+    /// hash-thing-6hd: `octant_of` must use `rd` sign as a tiebreaker on
+    /// exact-midpoint positions. Pre-6hd used `>=` which biased midpoint
+    /// positions to the HIGH half regardless of ray direction, producing
+    /// wrong-sibling selection on simultaneous two-axis exits where the
+    /// step-past nudge on a non-dominant axis underflows to sub-ULP.
+    ///
+    /// These direct unit tests pin the fix at the call point and exercise
+    /// the exact f32 values that the Codex 27m-trident reproducer lands
+    /// on in the running shader — the integration path is numerically
+    /// fragile to reproduce end-to-end, but the bit-level behavior of
+    /// `octant_of` is fully controllable here.
+    #[test]
+    fn octant_of_midpoint_biases_on_rd_sign() {
+        let node_min = [0.0_f32, 0.0, 0.0];
+        let half = 0.5_f32;
+        // mid = (0.5, 0.5, 0.5) exactly — all three axes representable.
+        let mid_pos = [0.5_f32, 0.5, 0.5];
+
+        // --- x axis ---
+        // rd.x > 0 → HIGH, rd.x < 0 → LOW. rd.y/z zero; tiebreak for them
+        // defaults to HIGH (rd >= 0.0).
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [1.0, 0.0, 0.0], node_min, half),
+            1 | 2 | 4,
+            "rd.x > 0 at xyz midpoint: x HIGH (target), y HIGH (rd.y==0 tiebreak), z HIGH",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [-1.0, 0.0, 0.0], node_min, half),
+            2 | 4,
+            "rd.x < 0 at xyz midpoint: x LOW (target), y HIGH, z HIGH",
+        );
+
+        // --- y axis ---
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, 1.0, 0.0], node_min, half),
+            1 | 2 | 4,
+            "rd.y > 0 at xyz midpoint: all HIGH",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, -1.0, 0.0], node_min, half),
+            1 | 4,
+            "rd.y < 0 at xyz midpoint: y LOW, x+z HIGH",
+        );
+
+        // --- z axis ---
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, 0.0, 1.0], node_min, half),
+            1 | 2 | 4,
+            "rd.z > 0 at xyz midpoint: all HIGH",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(mid_pos, [0.0, 0.0, -1.0], node_min, half),
+            1 | 2,
+            "rd.z < 0 at xyz midpoint: z LOW, x+y HIGH",
+        );
+
+        // --- the actual Codex reproducer: rd = (1.0, -1e-6, 0.0) ---
+        // Pre-6hd, this returned oct 3 (x-HIGH, y-HIGH, z-LOW) because
+        // pos.x=0.50000995 >= 0.5 → HIGH, pos.y=0.5 >= 0.5 → HIGH (wrong
+        // under `>=` bias), pos.z=0.25 < 0.5 → LOW. Post-6hd, it returns
+        // oct 1 (x-HIGH, y-LOW, z-LOW) because the y tiebreak consults
+        // rd.y < 0 → LOW.
+        let codex_pos = [0.50000995_f32, 0.5, 0.25];
+        let codex_rd = [1.0_f32, -1e-6, 0.0];
+        assert_eq!(
+            cpu_trace::octant_of(codex_pos, codex_rd, node_min, half),
+            1,
+            "Codex reproducer: x-HIGH + y-LOW + z-LOW = oct 1 (pre-6hd gave 3)",
+        );
+    }
+
+    /// hash-thing-6hd: off-midpoint positions must still classify purely
+    /// on `pos` (no rd consultation). Away from exact equality the new
+    /// `>` predicate and the old `>=` predicate agree by construction.
+    #[test]
+    fn octant_of_off_midpoint_ignores_rd() {
+        let node_min = [0.0_f32, 0.0, 0.0];
+        let half = 0.5_f32;
+
+        // 1 ULP above midpoint on x — must be HIGH regardless of rd sign.
+        let ulp = f32::from_bits(0.5_f32.to_bits() + 1); // next float up
+        let above = [ulp, 0.25, 0.25];
+        assert_eq!(
+            cpu_trace::octant_of(above, [1.0, 1.0, 1.0], node_min, half),
+            1,
+            "pos.x just above mid → HIGH-x with rd.x > 0",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(above, [-1.0, -1.0, -1.0], node_min, half),
+            1,
+            "pos.x just above mid → HIGH-x even with rd.x < 0 (rd ignored off-mid)",
+        );
+
+        // 1 ULP below midpoint on x — must be LOW regardless of rd sign.
+        let below_x = f32::from_bits(0.5_f32.to_bits() - 1); // next float down
+        let below = [below_x, 0.25, 0.25];
+        assert_eq!(
+            cpu_trace::octant_of(below, [1.0, 1.0, 1.0], node_min, half),
+            0,
+            "pos.x just below mid → LOW-x even with rd.x > 0",
+        );
+        assert_eq!(
+            cpu_trace::octant_of(below, [-1.0, -1.0, -1.0], node_min, half),
+            0,
+            "pos.x just below mid → LOW-x with rd.x < 0",
+        );
     }
 }

@@ -1,6 +1,41 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+// GpuTiming state-machine states. Stored as AtomicU8 because the
+// map_async callback fires on whichever thread calls `device.poll`
+// (the main thread in our app, but the API signature demands a
+// `'static + WasmNotSend` callback, so we synchronize anyway).
+const GT_IDLE: u8 = 0;
+const GT_PENDING: u8 = 1;
+const GT_READY: u8 = 2;
+
+/// Two `u64`s (start + end timestamp) = 16 bytes. `QUERY_RESOLVE_BUFFER_ALIGNMENT`
+/// (256) applies to the *destination offset* of `resolve_query_set`, not the
+/// buffer size itself — we resolve at offset 0 which is trivially aligned, and
+/// `resolve_query_set` only requires the buffer to hold `query_count * 8`
+/// bytes (per wgpu-core/src/command/query.rs:475). 16 bytes is exactly that.
+const TIMESTAMP_BYTES: u64 = 16;
+
+/// Convert raw GPU timestamp ticks to a `Duration`, using the
+/// adapter-reported `timestamp_period` (nanoseconds per tick). Pure
+/// function — unit-testable without spinning up a real device.
+///
+/// Saturates end < start (should only happen if the backend reports
+/// non-monotonic ticks, which would be a driver bug, but we'd rather
+/// log a zero than underflow).
+fn ticks_to_duration(start_ticks: u64, end_ticks: u64, period_ns: f32) -> Duration {
+    let delta = end_ticks.saturating_sub(start_ticks);
+    // f64 multiply — f32 loses precision for large tick counts
+    // (periods are typically < 1000ns, ticks can be in the millions).
+    let ns = (delta as f64) * (period_ns as f64);
+    // u64 cast saturates on overflow in `as` for positive values on Rust
+    // stable. Ceiling it at u64::MAX is fine; such a value would be
+    // "absurdly large" per the test rubric and we'd catch it upstream.
+    Duration::from_nanos(ns as u64)
+}
 
 /// wgpu requires `bytes_per_row` on multi-row texture copies to be a multiple
 /// of `COPY_BYTES_PER_ROW_ALIGNMENT` (256). For a 64³ R8Uint volume the natural
@@ -52,6 +87,169 @@ pub enum FrameOutcome {
     Timeout,
 }
 
+/// GPU-side render pass timing via `wgpu::Features::TIMESTAMP_QUERY`.
+///
+/// Owns a 2-entry `QuerySet` (pass start + pass end), a resolve buffer
+/// (`QUERY_RESOLVE | COPY_SRC`), and a readback buffer (`MAP_READ |
+/// COPY_DST`). Each frame, if state == IDLE, the renderer attaches
+/// `timestamp_writes` to its render pass descriptor, resolves the set
+/// into the resolve buffer, copies to the readback buffer, submits, and
+/// issues `map_async`. The callback flips the state to READY. The next
+/// frame, `poll()` reads the two `u64`s, converts to `Duration`, unmaps,
+/// and returns the value.
+///
+/// **One readback in flight.** If the previous readback isn't done by
+/// the time the next frame hits `try_begin()`, we skip instrumentation
+/// for that frame (state != IDLE). That's the "drop samples that are
+/// still unmapped when the next frame lands" rule from hash-thing-6x3.
+/// Simpler than a ring of staging buffers, and the frames we do capture
+/// are still plenty for mean/p95 at winit-Poll cadence.
+///
+/// **Why AtomicU8 instead of a plain state field.** `map_async`'s
+/// callback is typed `impl FnOnce + WasmNotSend + 'static`, which means
+/// the closure can't borrow `&mut` anything from self. We need a way
+/// for the callback to signal "readback is now ready" back to the
+/// render thread. `Arc<AtomicU8>` is the minimum synchronization that
+/// lets the closure flip a shared bit.
+struct GpuTiming {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
+    /// Nanoseconds per tick, from `Queue::get_timestamp_period()`.
+    /// Varies by adapter; some report 1ns, others 100ns or more.
+    period_ns: f32,
+    /// Shared state flag. `GT_IDLE`/`GT_PENDING`/`GT_READY`. The
+    /// `map_async` callback transitions PENDING → READY on success or
+    /// PENDING → IDLE on failure. The render thread transitions IDLE →
+    /// PENDING (in `request_readback`) and READY → IDLE (in `poll`).
+    state: Arc<AtomicU8>,
+}
+
+impl GpuTiming {
+    fn new(device: &wgpu::Device, period_ns: f32) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("gpu_timing_qs"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        // wgpu requires resolve buffer size to be at least 16 bytes (2
+        // u64 timestamps). `QUERY_RESOLVE_BUFFER_ALIGNMENT` is 256; the
+        // allocator rounds up anyway so a 16-byte request is fine.
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_timing_resolve"),
+            size: TIMESTAMP_BYTES,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_timing_readback"),
+            size: TIMESTAMP_BYTES,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            query_set,
+            resolve_buffer,
+            readback_buffer,
+            period_ns,
+            state: Arc::new(AtomicU8::new(GT_IDLE)),
+        }
+    }
+
+    /// If idle, return a `RenderPassTimestampWrites` that captures
+    /// pass start + pass end. Returns `None` if a prior readback is
+    /// still in flight.
+    ///
+    /// Does NOT transition state — state stays IDLE until
+    /// `request_readback` fires after submit. This lets the caller
+    /// back out if it ends up not submitting (e.g. surface occluded
+    /// between the check and the draw).
+    fn pass_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        if self.state.load(Ordering::Acquire) == GT_IDLE {
+            Some(wgpu::RenderPassTimestampWrites {
+                query_set: &self.query_set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Append `resolve_query_set` + `copy_buffer_to_buffer` commands to
+    /// `encoder`. Call only when `pass_writes()` returned `Some` AND the
+    /// pass actually submitted (i.e. encoder is about to be finished).
+    fn encode_resolve(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.resolve_query_set(&self.query_set, 0..2, &self.resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            0,
+            &self.readback_buffer,
+            0,
+            TIMESTAMP_BYTES,
+        );
+    }
+
+    /// Start async readback. Transitions IDLE → PENDING and issues
+    /// `map_async`; the callback later flips PENDING → READY (success)
+    /// or PENDING → IDLE (failure). Call exactly once per `encode_resolve`.
+    fn request_readback(&self) {
+        if self
+            .state
+            .compare_exchange(GT_IDLE, GT_PENDING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Someone else already queued a readback. Shouldn't happen
+            // with our single-render-thread model, but silently skip
+            // rather than panic.
+            return;
+        }
+        let state = self.state.clone();
+        self.readback_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| match result {
+                Ok(()) => state.store(GT_READY, Ordering::Release),
+                Err(e) => {
+                    log::warn!("gpu timing readback failed: {e:?}");
+                    state.store(GT_IDLE, Ordering::Release);
+                }
+            });
+    }
+
+    /// Pump `map_async` callbacks via `device.poll`, then consume a
+    /// pending readback if one just became ready. Returns the
+    /// resolved `Duration` for the most recently completed frame, or
+    /// `None` if no readback is ready.
+    ///
+    /// Transitions READY → IDLE on success.
+    fn poll(&self, device: &wgpu::Device) -> Option<Duration> {
+        // Pump callbacks. `PollType::Poll` is non-blocking: it processes
+        // whatever's ready and returns immediately. Cheap when there's
+        // nothing in flight.
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        if self.state.load(Ordering::Acquire) != GT_READY {
+            return None;
+        }
+
+        let slice = self.readback_buffer.slice(..);
+        let data = slice.get_mapped_range();
+        // Two little-endian u64s. wgpu reports timestamps in the
+        // backend's native byte order, which on every platform we care
+        // about is LE. Use from_le_bytes to be explicit.
+        let start = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let end = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        drop(data);
+        self.readback_buffer.unmap();
+
+        // State transitions to IDLE *after* the unmap call, since
+        // request_readback asserts the buffer is not already mapped.
+        self.state.store(GT_IDLE, Ordering::Release);
+
+        Some(ticks_to_duration(start, end, self.period_ns))
+    }
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -82,6 +280,17 @@ pub struct Renderer {
     pub camera_pitch: f32,
     pub camera_dist: f32,
     pub camera_target: [f32; 3],
+
+    // GPU-timestamp instrumentation. `None` on adapters without
+    // `Features::TIMESTAMP_QUERY` — all timing falls back to the CPU
+    // ring in that case (see `hash-thing-6x3`).
+    gpu_timing: Option<GpuTiming>,
+    /// Most recently resolved GPU render-pass duration. Set by `render()`
+    /// when a readback completes, consumed by `take_last_gpu_frame_time()`.
+    /// `None` means no new sample since the last take (or the adapter
+    /// lacks TIMESTAMP_QUERY entirely). Consume-on-read avoids
+    /// double-recording the same duration across frames.
+    last_gpu_frame_time: Option<Duration>,
 }
 
 impl Renderer {
@@ -107,10 +316,32 @@ impl Renderer {
             .await
             .expect("Failed to find a suitable GPU adapter");
 
+        // hash-thing-6x3: TIMESTAMP_QUERY is a soft requirement — we
+        // enable it when the adapter supports it, fall back to CPU-only
+        // perf when not. The feature is missing on some older MoltenVK
+        // setups and on WebGPU adapters where the spec hasn't stabilized
+        // the capability yet. Falling back gracefully keeps the app
+        // running on every adapter wgpu can talk to.
+        //
+        // We check `adapter.features()` (what the adapter *can* expose)
+        // not `adapter.limits()` — the latter is the defaults, not the
+        // capabilities. `required_features` must be a subset of
+        // `adapter.features()` or `request_device` fails.
+        let mut required_features = wgpu::Features::empty();
+        let adapter_features = adapter.features();
+        let timestamp_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        if timestamp_supported {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        } else {
+            log::info!(
+                "GPU adapter lacks TIMESTAMP_QUERY — perf will report CPU submit overhead only"
+            );
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("hash-thing device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })
@@ -322,6 +553,13 @@ impl Renderer {
             cache: None,
         });
 
+        let gpu_timing = if timestamp_supported {
+            let period_ns = queue.get_timestamp_period();
+            Some(GpuTiming::new(&device, period_ns))
+        } else {
+            None
+        };
+
         Self {
             surface,
             device,
@@ -345,7 +583,22 @@ impl Renderer {
             camera_pitch: 0.4,
             camera_dist: 2.0,
             camera_target: [0.5, 0.5, 0.5],
+            gpu_timing,
+            last_gpu_frame_time: None,
         }
+    }
+
+    /// Consume and return the most recently resolved GPU render-pass
+    /// duration, or `None` if no new sample has been captured since the
+    /// last call. Call once per frame after `render()` returns; the
+    /// value is intended to be fed into `Perf` as the `render_gpu`
+    /// metric (see `hash-thing-6x3`).
+    ///
+    /// Adapters without `Features::TIMESTAMP_QUERY` always return
+    /// `None` — in that case the only render metric is the CPU-submit
+    /// `render_cpu` from `main.rs`.
+    pub fn take_last_gpu_frame_time(&mut self) -> Option<Duration> {
+        self.last_gpu_frame_time.take()
     }
 
     /// Upload (or re-upload) a serialized SVDAG to the GPU.
@@ -387,10 +640,14 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.svdag_buffer = Some(buffer);
-            self.svdag_buffer_cap = cap;
 
-            // Rebuild bind group
+            // Build the bind group against the local `buffer` before moving it
+            // into `self.svdag_buffer`. Prior form did `self.svdag_buffer =
+            // Some(buffer)` first and then reached back in via
+            // `self.svdag_buffer.as_ref().unwrap()`, a provably-safe but
+            // refactor-fragile pattern: a future reorder that moved the
+            // `Some(buffer)` assignment would silently break the unwrap site
+            // (hash-thing-8zl).
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("svdag_bg"),
                 layout: &self.svdag_bind_group_layout,
@@ -401,10 +658,12 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: self.svdag_buffer.as_ref().unwrap().as_entire_binding(),
+                        resource: buffer.as_entire_binding(),
                     },
                 ],
             });
+            self.svdag_buffer = Some(buffer);
+            self.svdag_buffer_cap = cap;
             self.svdag_bind_group = Some(bg);
         }
 
@@ -476,6 +735,19 @@ impl Renderer {
 
     pub fn render(&mut self) -> FrameOutcome {
         use wgpu::CurrentSurfaceTexture;
+
+        // hash-thing-6x3: pump `map_async` callbacks and consume any
+        // GPU-timestamp readback that landed since the last frame.
+        // `GpuTiming::poll` calls `device.poll(Poll)` internally, so this
+        // is the single place we drive wgpu's main-thread callback pump.
+        // Must happen before we potentially skip the frame on surface
+        // failures — otherwise a long run of Occluded frames would
+        // accumulate un-polled callbacks.
+        if let Some(gt) = &self.gpu_timing {
+            if let Some(d) = gt.poll(&self.device) {
+                self.last_gpu_frame_time = Some(d);
+            }
+        }
 
         // No catch-all: `CurrentSurfaceTexture` is not `#[non_exhaustive]`, so
         // any future wgpu variant becomes a compile error pointing here,
@@ -549,6 +821,17 @@ impl Renderer {
                 label: Some("render encoder"),
             });
 
+        // hash-thing-6x3: if the previous frame's readback is done,
+        // instrument this frame. Otherwise skip — one readback in flight
+        // is enough for the mean/p95 the perf line reports.
+        //
+        // The `Option<RenderPassTimestampWrites>` holds a `&QuerySet`
+        // borrowed from `self.gpu_timing`, so it must live across the
+        // render-pass scope but can be dropped before the post-pass
+        // `encode_resolve` call.
+        let timestamp_writes = self.gpu_timing.as_ref().and_then(|gt| gt.pass_writes());
+        let captured_this_frame = timestamp_writes.is_some();
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
@@ -567,7 +850,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -593,8 +876,20 @@ impl Renderer {
             }
         }
 
+        if captured_this_frame {
+            if let Some(gt) = &self.gpu_timing {
+                gt.encode_resolve(&mut encoder);
+            }
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+
+        if captured_this_frame {
+            if let Some(gt) = &self.gpu_timing {
+                gt.request_readback();
+            }
+        }
 
         FrameOutcome::Rendered
     }
@@ -602,9 +897,46 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{padded_bytes_per_row, FrameOutcome};
+    use super::{padded_bytes_per_row, ticks_to_duration, FrameOutcome};
+    use std::time::Duration;
 
     const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+    #[test]
+    fn ticks_to_duration_period_one_is_identity() {
+        // period=1ns → 1 tick is 1ns. Lets the test read as a
+        // "literal tick count is ns count" identity check.
+        assert_eq!(
+            ticks_to_duration(0, 1_000, 1.0),
+            Duration::from_nanos(1_000)
+        );
+    }
+
+    #[test]
+    fn ticks_to_duration_scales_by_period() {
+        // 1000 ticks × 100ns/tick = 100_000 ns = 100 µs.
+        assert_eq!(
+            ticks_to_duration(0, 1_000, 100.0),
+            Duration::from_nanos(100_000),
+        );
+    }
+
+    #[test]
+    fn ticks_to_duration_handles_offset_pair() {
+        // Adapters don't reset the tick counter at frame start — end_ticks
+        // is a large absolute value, duration comes from the delta.
+        let dur = ticks_to_duration(10_000_000, 10_001_000, 1.0);
+        assert_eq!(dur, Duration::from_nanos(1_000));
+    }
+
+    #[test]
+    fn ticks_to_duration_saturates_on_inverted_pair() {
+        // Driver bug or wraparound: end < start. We return zero rather
+        // than underflow. Inverted samples are still recorded (as
+        // zero), which shows up in the `render_gpu` summary as a
+        // suspiciously-low mean that the user can investigate.
+        assert_eq!(ticks_to_duration(500, 100, 1.0), Duration::ZERO);
+    }
 
     #[test]
     fn frame_outcome_variants_are_distinct() {

@@ -6,11 +6,32 @@
 //!
 //! ## Important caveats
 //!
-//! 1. **CPU-side timings only.** `wgpu` queue submissions and `Queue::write_*`
-//!    calls return immediately while the GPU does work later, so `Instant`
-//!    around them measures *CPU submit overhead*, not GPU execution time.
-//!    Metrics whose work runs on the GPU are named `*_cpu` to make this
-//!    explicit. Real GPU timing belongs in a future bead with timestamp queries.
+//! 1. **CPU `*_cpu` vs GPU `*_gpu` — read the suffix.** `wgpu` queue
+//!    submissions and `Queue::write_*` calls return immediately while
+//!    the GPU does work later, so an `Instant` around them measures
+//!    *CPU submit overhead*, not GPU execution time. Metrics whose
+//!    work runs on the GPU are named `*_cpu` to make this explicit
+//!    (e.g. `render_cpu`, `upload_cpu`).
+//!
+//!    On adapters that support `wgpu::Features::TIMESTAMP_QUERY`,
+//!    `render_gpu` is populated from `Renderer::take_last_gpu_frame_time()`
+//!    — the actual delta between the GPU-side begin- and
+//!    end-of-pass timestamps, converted to a `Duration` via the
+//!    adapter-reported `timestamp_period`. The `_gpu` family is
+//!    staged one frame behind because `map_async` readback is async
+//!    (this frame's timestamps are recorded and resolved, next frame
+//!    polls and feeds the ring). Frames where the previous readback
+//!    isn't done yet are silently dropped — the surviving samples
+//!    are still dense enough for mean/p95. On adapters without
+//!    TIMESTAMP_QUERY, `render_gpu` simply never appears in the
+//!    summary line.
+//!
+//!    `upload_cpu` has no GPU counterpart yet: `Queue::write_*`
+//!    happens outside any command encoder, so it can't be wrapped in
+//!    pass-scoped timestamps. If `upload_gpu` is ever needed the
+//!    upload path has to move into the render encoder via a staging
+//!    buffer + `copy_buffer_to_buffer`, which is a larger refactor.
+//!    See `hash-thing-6x3` for the full GPU-timing pipeline.
 //!
 //! 2. **Mixed cadences in one summary.** `step` and `upload_cpu` only run on
 //!    a generation tick (~ every 200ms). `render_cpu` runs every redraw, which

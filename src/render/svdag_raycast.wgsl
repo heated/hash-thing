@@ -80,11 +80,28 @@ fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box
 
 // Octant index from a point relative to the node center.
 // Returns bit-packed index 0..7 with bit 0 = x, bit 1 = y, bit 2 = z.
-fn octant_of(pos: vec3<f32>, node_min: vec3<f32>, half: f32) -> u32 {
+//
+// hash-thing-6hd: uses STRICT `>` for the HIGH half with `rd >= 0` as a
+// tiebreaker on exact-midpoint positions. The pre-6hd code used `>=` which
+// biased midpoint-exact positions to the HIGH half regardless of ray
+// direction; on simultaneous two-axis exits, the step-past nudge on a
+// non-dominant axis can underflow to sub-ULP (dt * |rd_axis| < ULP(pos)),
+// leaving pos EXACTLY on the boundary. The `>=` bias then picked the
+// wrong sibling whenever `rd_axis < 0`. Codex reproducer (float32):
+// rd = (1.0, -1e-6, 0.0). Post-step pos.x = 0.50000995, pos.y = 0.5
+// (unchanged by the sub-ULP nudge on y), pos.z = 0.25 — old code returned
+// oct 3 (x-HIGH, y-HIGH), physically correct is oct 1 (x-HIGH, y-LOW)
+// because rd.y < 0.
+//
+// Zero-rd convention: when rd.axis == 0.0, the tiebreak resolves to HIGH
+// (the ray can't cross the midpoint on that axis, so the choice is
+// physically inert). Must match the CPU oracle in svdag.rs.
+fn octant_of(pos: vec3<f32>, rd: vec3<f32>, node_min: vec3<f32>, half: f32) -> u32 {
     var idx: u32 = 0u;
-    if pos.x >= node_min.x + half { idx |= 1u; }
-    if pos.y >= node_min.y + half { idx |= 2u; }
-    if pos.z >= node_min.z + half { idx |= 4u; }
+    let mid = node_min + vec3<f32>(half);
+    if pos.x > mid.x || (pos.x == mid.x && rd.x >= 0.0) { idx |= 1u; }
+    if pos.y > mid.y || (pos.y == mid.y && rd.y >= 0.0) { idx |= 2u; }
+    if pos.z > mid.z || (pos.z == mid.z && rd.z >= 0.0) { idx |= 4u; }
     return idx;
 }
 
@@ -199,7 +216,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let node_offset = stack_node[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
-            let oct = octant_of(pos, node_min, half);
+            let oct = octant_of(pos, rd, node_min, half);
             let child_slot = dag_nodes[node_offset + 1u + oct];
 
             if (child_slot & LEAF_BIT) != 0u {
@@ -228,18 +245,35 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     // axes at entry, and the axis holding that max is the
                     // last face the ray crossed to get inside the voxel.
                     //
-                    // Assumes the ray origin is outside the leaf. Inside-leaf
-                    // origins produce an inward-facing normal (all `tmin_v`
-                    // negative → picker returns the nearest back face); the
-                    // orbit camera can reach this case on deep zoom. Tracked
-                    // as a follow-up to hash-thing-rv4. The cascade below
-                    // uses `>=` on both comparators so ties break identically
-                    // to the CPU oracle in svdag.rs — do NOT flip to `>`.
+                    // hash-thing-2nd: inside-leaf fallback. When the ray
+                    // origin sits inside the filled voxel, every `tmin_v`
+                    // component is negative — the entry-face picker then
+                    // returns the nearest back face and the normal flips
+                    // inward, shading the voxel as if lit from behind. The
+                    // orbit camera reaches this case on deep zoom. Fallback:
+                    // pick the nearest exit face (argmin of `tmax_v`) and
+                    // flip the sign so the normal points in the direction
+                    // the ray is heading — the "about to emerge" convention.
+                    // The outer cascade uses `>=` on both comparators so
+                    // entry-face ties break identically to the CPU oracle
+                    // in svdag.rs — do NOT flip to `>`. The inner (inside)
+                    // cascade uses `<=` for the same reason: CPU/GPU must
+                    // break exit-face ties identically.
                     let lt1 = (leaf_min - ro_local) * inv_rd;
                     let lt2 = (leaf_max - ro_local) * inv_rd;
                     let tmin_v = min(lt1, lt2);
+                    let tmax_v = max(lt1, lt2);
                     var normal = vec3<f32>(0.0);
-                    if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
+                    let inside = tmin_v.x < 0.0 && tmin_v.y < 0.0 && tmin_v.z < 0.0;
+                    if inside {
+                        if tmax_v.x <= tmax_v.y && tmax_v.x <= tmax_v.z {
+                            normal = vec3<f32>(sign(rd.x), 0.0, 0.0);
+                        } else if tmax_v.y <= tmax_v.z {
+                            normal = vec3<f32>(0.0, sign(rd.y), 0.0);
+                        } else {
+                            normal = vec3<f32>(0.0, 0.0, sign(rd.z));
+                        }
+                    } else if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
                         normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);
                     } else if tmin_v.y >= tmin_v.z {
                         normal = vec3<f32>(0.0, -sign(rd.y), 0.0);
@@ -283,7 +317,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // resulting per-axis pos advance was sub-ULP near pos ~ 0.5.
         let node_min = stack_min[depth];
         let half = stack_half[depth];
-        let oct = octant_of(pos, node_min, half);
+        let oct = octant_of(pos, rd, node_min, half);
         let child_min = vec3<f32>(
             node_min.x + f32(oct & 1u) * half,
             node_min.y + f32((oct >> 1u) & 1u) * half,
