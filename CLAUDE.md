@@ -24,7 +24,7 @@ This project is designed to work with **any of three CLI agents**: Claude Code (
 
 **Why this matters for cost**: edward's Claude Code $200/month plan is maxing out. Shifting review workload from all-Claude trident (9 Claude agents) to real-trident (3 Claude + 3 Codex + 3 Gemini) saves ~2/3 of Claude token spend. That only works if Codex and Gemini sessions can read the same project instructions and workflows — which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
 
-**When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). The `/ship` skill itself may still hardcode the user-global path — if so, file a bead or fix it inline. Until then, splicing the project-local file into the prompt is sufficient.
+**When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
 
 ## The crew
 
@@ -224,4 +224,3 @@ CI failures on main are P1 — they block every other seat's validation step.
 - NEVER stop before landing — that leaves work stranded locally or on a feature branch.
 - NEVER say "ready to push when you are" — you land main yourself.
 - If landing main fails, resolve and retry until it succeeds. If you hit a genuine merge conflict you can't resolve, file a bead with the conflict surface and park at a design gate — don't just leave the branch dangling.
-
