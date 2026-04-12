@@ -51,21 +51,6 @@ impl Default for TerrainParams {
 }
 
 impl TerrainParams {
-    /// Terrain params that scale with world size. Surface sits at mid-world
-    /// height with proportional amplitude and wavelength.
-    pub fn for_level(level: u32) -> Self {
-        let side = (1u64 << level) as f32;
-        Self {
-            seed: 1,
-            base_y: side / 2.0,
-            amplitude: side / 8.0,
-            wavelength: side * 3.0 / 8.0,
-            octaves: 4,
-            sea_level: Some(side / 2.0 - side / 16.0),
-            caves: None,
-        }
-    }
-
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.wavelength <= 0.0 {
             return Err("wavelength must be > 0");
