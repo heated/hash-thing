@@ -87,6 +87,18 @@ impl World {
     /// Pipeline: flatten → cell-wise CaRule pass → block-wise BlockRule pass → rebuild.
     /// Single flatten/rebuild per tick. This is the brute-force path — true Hashlife
     /// recursive stepping replaces it later.
+    ///
+    /// **Phase ordering:** CaRule runs first (react), then BlockRule (move). This means:
+    /// - CaRule deletions are invisible to BlockRule (the cell is already gone).
+    /// - CaRule births are movable by BlockRule in the same tick.
+    ///
+    /// This is an intentional "react then move" physics model.
+    ///
+    /// **Boundary asymmetry:** CaRule wraps toroidally (`rem_euclid`); BlockRule
+    /// skips partial blocks at world edges (clipping). This is deliberate — Margolus
+    /// blocks must not straddle the world boundary. Cells at the boundary participate
+    /// in CaRule every tick but only in BlockRule on generations where the partition
+    /// offset aligns them away from the edge.
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
@@ -181,12 +193,33 @@ impl World {
 
         let result = rule.step_block(&block, &ctx);
 
-        // Write back the 8 cells.
+        // Mass conservation assertion: output must be a permutation of input.
+        debug_assert!(
+            {
+                let mut inp: Vec<u16> = block.iter().map(|c| c.raw()).collect();
+                let mut out: Vec<u16> = result.iter().map(|c| c.raw()).collect();
+                inp.sort();
+                out.sort();
+                inp == out
+            },
+            "block rule violated mass conservation at ({bx}, {by}, {bz})"
+        );
+
+        // Write back, but anchor cells that didn't opt into this block rule.
+        // A cell with block_rule_id == None is immovable — it stays in its
+        // original position even if the rule tried to swap it elsewhere.
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
+                    let i = block_index(dx, dy, dz);
+                    let original = block[i];
+                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    grid[idx] = result[block_index(dx, dy, dz)].raw();
+                    if has_rule || original.is_empty() {
+                        // Opted-in cells and empty cells can be moved by the rule.
+                        grid[idx] = result[i].raw();
+                    }
+                    // else: non-participating cell stays put (anchored).
                 }
             }
         }
@@ -783,6 +816,32 @@ mod tests {
             world.flatten(),
             flat_before,
             "mixed-rule block should be skipped (identity)"
+        );
+    }
+
+    #[test]
+    fn static_material_not_moved_by_other_materials_rule() {
+        // B1 fix: stone (no block rule) shares a block with dirt (has gravity).
+        // Stone must NOT be swapped downward by dirt's gravity rule.
+        let mut world = gravity_world(&[DIRT_MATERIAL_ID]);
+        // Block at (0,0,0): stone at bottom, dirt at top of same column.
+        // Gravity would swap them if stone were participating, but stone
+        // has no block_rule_id so it should be anchored.
+        world.set(0, 0, 0, Cell::pack(STONE_MATERIAL_ID, 0).raw());
+        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+
+        world.step();
+
+        // Stone stays at (0,0,0) — anchored. Dirt can't displace it.
+        assert_eq!(
+            world.get(0, 0, 0),
+            Cell::pack(STONE_MATERIAL_ID, 0).raw(),
+            "stone (no block rule) must not be moved by dirt's gravity"
+        );
+        assert_eq!(
+            world.get(0, 1, 0),
+            Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
+            "dirt should stay since stone below is anchored"
         );
     }
 

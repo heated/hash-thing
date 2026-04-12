@@ -253,7 +253,9 @@ impl MaterialRegistry {
     pub fn assign_block_rule(&mut self, material_id: MaterialId, block_rule_id: BlockRuleId) {
         self.entries[material_id as usize]
             .as_mut()
-            .expect("material must exist before assigning a block rule")
+            .unwrap_or_else(|| {
+                panic!("material {material_id} must exist before assigning a block rule")
+            })
             .block_rule_id = Some(block_rule_id);
     }
 
