@@ -7,6 +7,7 @@
 //! `terrain::gen`.
 
 pub mod caves;
+pub mod dungeons;
 pub mod field;
 pub mod gen;
 pub mod materials;
@@ -14,6 +15,8 @@ pub mod noise;
 
 #[allow(unused_imports)]
 pub use caves::{carve_caves, carve_caves_grid, CaveParams};
+#[allow(unused_imports)]
+pub use dungeons::{carve_dungeons, carve_dungeons_grid, DungeonParams};
 pub use field::HeightmapField;
 pub use gen::{gen_region, probe_sample_ns, GenStats};
 

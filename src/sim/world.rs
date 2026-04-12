@@ -528,4 +528,22 @@ mod tests {
         assert_eq!(world.get(4, 4, 4), FIRE);
         assert_eq!(world.get(5, 4, 4), GRASS);
     }
+
+    #[test]
+    fn step_dispatches_fire_and_water_rules_independently() {
+        let mut world = empty_world();
+
+        world.set(2, 2, 2, FIRE);
+        world.set(3, 2, 2, GRASS);
+
+        world.set(5, 5, 5, WATER);
+        world.set(6, 5, 5, FIRE);
+
+        world.step();
+
+        assert_eq!(world.get(2, 2, 2), FIRE);
+        assert_eq!(world.get(3, 2, 2), GRASS);
+        assert_eq!(world.get(5, 5, 5), STONE);
+        assert_eq!(world.get(6, 5, 5), 0);
+    }
 }
