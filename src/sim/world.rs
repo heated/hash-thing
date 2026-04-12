@@ -1,4 +1,4 @@
-use super::rule::{block_index, BlockContext, ALIVE};
+use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore};
 use crate::rng::cell_hash;
 use crate::terrain::materials::{BlockRuleId, MaterialRegistry, FIRE, WATER};
@@ -48,6 +48,24 @@ impl World {
 
     pub fn side(&self) -> usize {
         1 << self.level
+    }
+
+    /// Invalidate caches whose keys depend on the active CA rule.
+    ///
+    /// Today this only clears `NodeStore::step_cache`, whose key is `NodeId`
+    /// only. Call this before or immediately after any rule swap so future
+    /// memoized stepping cannot reuse results from a different ruleset.
+    pub fn invalidate_rule_caches(&mut self) {
+        self.store.clear_step_cache();
+    }
+
+    /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
+    ///
+    /// This also invalidates rule-dependent caches because the CA dispatch
+    /// table changes even though the octree content does not.
+    pub fn set_gol_smoke_rule(&mut self, rule: GameOfLife3D) {
+        self.materials = MaterialRegistry::gol_smoke_with_rule(rule);
+        self.invalidate_rule_caches();
     }
 
     /// Set a cell.
@@ -893,5 +911,18 @@ mod tests {
             b.flatten(),
             "block stepping must be deterministic"
         );
+    }
+
+    #[test]
+    fn invalidate_rule_caches_clears_step_cache() {
+        let mut world = World::new(3);
+        let input = world.store.leaf(Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        let output = world.store.leaf(Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.store.cache_step(input, output);
+        assert_eq!(world.store.get_cached_step(input), Some(output));
+
+        world.invalidate_rule_caches();
+
+        assert_eq!(world.store.get_cached_step(input), None);
     }
 }
