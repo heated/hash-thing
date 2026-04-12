@@ -83,12 +83,23 @@ impl World {
     /// valid and still steps to the same result. The new parent has no
     /// cached entry yet and will be computed fresh on first step.
     pub fn ensure_contains(&mut self, x: u64, y: u64, z: u64) {
+        self.ensure_region([x, y, z], [x, y, z]);
+    }
+
+    /// Grow the root octree until the axis-aligned box `[min, max]` is
+    /// fully in-bounds (inclusive on both ends).
+    ///
+    /// Since growth only extends in the +x, +y, +z direction (the existing
+    /// root stays at octant 0), it is sufficient to grow until `max` is
+    /// contained — `min` is automatically in-bounds once `max` is.
+    ///
+    /// No-op when the region is already in-bounds.
+    pub fn ensure_region(&mut self, _min: [u64; 3], max: [u64; 3]) {
         loop {
             let side = 1u64 << self.level;
-            if x < side && y < side && z < side {
+            if max[0] < side && max[1] < side && max[2] < side {
                 return;
             }
-            // Wrap: old root → octant 0, 7 empty siblings at the old level.
             let empty_sibling = self.store.empty(self.level);
             let new_level = self.level + 1;
             let new_root = self.store.interior(
@@ -1154,5 +1165,45 @@ mod tests {
         let pop_before = world.population();
         world.ensure_contains(100, 100, 100);
         assert_eq!(world.population(), pop_before);
+    }
+
+    // ---- ensure_region (hash-thing-5qp) ----
+
+    #[test]
+    fn ensure_region_noop_when_in_bounds() {
+        let mut world = World::new(3);
+        let level_before = world.level;
+        world.ensure_region([0, 0, 0], [7, 7, 7]);
+        assert_eq!(world.level, level_before);
+    }
+
+    #[test]
+    fn ensure_region_grows_for_max_corner() {
+        let mut world = World::new(3); // 8x8x8
+        world.set(2, 3, 4, STONE);
+        world.ensure_region([0, 0, 0], [20, 20, 20]);
+        assert!(world.side() > 20);
+        // Existing cell survives.
+        assert_eq!(world.get(2, 3, 4), STONE);
+    }
+
+    #[test]
+    fn ensure_region_then_set_covers_full_box() {
+        let mut world = World::new(3);
+        world.ensure_region([10, 10, 10], [20, 20, 20]);
+        // Can set cells at both min and max of the region.
+        world.set(10, 10, 10, FIRE);
+        world.set(20, 20, 20, WATER);
+        assert_eq!(world.get(10, 10, 10), FIRE);
+        assert_eq!(world.get(20, 20, 20), WATER);
+    }
+
+    #[test]
+    fn ensure_region_single_point_matches_ensure_contains() {
+        let mut w1 = World::new(3);
+        let mut w2 = World::new(3);
+        w1.ensure_contains(50, 50, 50);
+        w2.ensure_region([50, 50, 50], [50, 50, 50]);
+        assert_eq!(w1.level, w2.level);
     }
 }
