@@ -40,7 +40,7 @@
 //!    others. Compare metrics within a category, not across.
 //!
 //! 3. **Don't call from sim/render/octree code.** Instrumentation lives at
-//!    call sites in `main.rs`. Threading `&mut Perf` through `step_flat` or
+//!    call sites in `main.rs`. Threading `&mut Perf` through `step` or
 //!    the render path would touch the determinism contract under h34.1 / h34.2.
 //!
 //! 4. **p95 collapses to max during warmup.** The p95 index is

@@ -167,11 +167,14 @@ pub fn carve_caves_grid(
     origin: [i64; 3],
     params: &CaveParams,
 ) {
-    debug_assert_eq!(grid.len(), side * side * side, "grid is not side^3");
-    debug_assert!(
-        params.validate().is_ok(),
-        "carve_caves_grid called with invalid params",
-    );
+    let expected_len = side
+        .checked_mul(side)
+        .and_then(|n| n.checked_mul(side))
+        .expect("carve_caves_grid: side^3 overflowed usize");
+    assert_eq!(grid.len(), expected_len, "grid is not side^3");
+    params
+        .validate()
+        .expect("carve_caves_grid: invalid CaveParams");
 
     // Cave mask: cells that start as STONE. This is the only region the CA
     // is allowed to touch; everything else (AIR, DIRT, GRASS) passes through
@@ -515,5 +518,26 @@ mod tests {
         for &c in &grid {
             assert_eq!(c, AIR);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "grid is not side^3")]
+    fn carve_caves_grid_rejects_mismatched_grid_len() {
+        let side = 2usize;
+        let mut grid = vec![AIR; 7];
+        let params = CaveParams::default();
+        carve_caves_grid(&mut grid, side, [0, 0, 0], &params);
+    }
+
+    #[test]
+    #[should_panic(expected = "carve_caves_grid: invalid CaveParams")]
+    fn carve_caves_grid_rejects_invalid_params() {
+        let side = 2usize;
+        let mut grid = vec![STONE; side * side * side];
+        let params = CaveParams {
+            birth_threshold: 27,
+            ..Default::default()
+        };
+        carve_caves_grid(&mut grid, side, [0, 0, 0], &params);
     }
 }

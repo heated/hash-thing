@@ -156,7 +156,7 @@ pub fn gen_region<F: RegionField>(
 /// asked for. Use it from `main.rs` at terrain reset time and log the
 /// estimated sample fraction alongside total gen time.
 pub fn probe_sample_ns<F: RegionField>(field: &F, samples: u64) -> f64 {
-    debug_assert!(samples >= 1, "probe_sample_ns needs at least one sample");
+    assert!(samples >= 1, "probe_sample_ns needs at least one sample");
     let start = std::time::Instant::now();
     let mut sink: i64 = 0;
     for i in 0..samples {
@@ -524,6 +524,13 @@ mod tests {
         let field = ConstField::new(STONE);
         let ns = probe_sample_ns(&field, 1_000);
         assert!(ns > 0.0, "probe must measure something nonzero: {ns}");
+    }
+
+    #[test]
+    #[should_panic(expected = "probe_sample_ns needs at least one sample")]
+    fn probe_sample_ns_rejects_zero_samples() {
+        let field = ConstField::new(AIR);
+        let _ = probe_sample_ns(&field, 0);
     }
 
     // Helps the dead-code lint not complain about Node when only used here.

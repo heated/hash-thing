@@ -21,7 +21,7 @@ pub struct NodeStore {
     /// The key is `NodeId` only. Rule identity is *not* part of the key.
     /// Callers must invoke [`Self::clear_step_cache`] whenever the active
     /// rule changes, or the cache will return stale results from the
-    /// previous rule. The brute-force `World::step_flat` path bypasses this
+    /// previous rule. The brute-force `World::step` path bypasses this
     /// cache entirely, so today the contract is dormant — but the moment
     /// hash-thing-6gf.1 lands a memoized recursive stepper, every code path
     /// that swaps rules must clear the cache.

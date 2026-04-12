@@ -1,17 +1,69 @@
-use crate::octree::CellState;
+use crate::octree::Cell;
 use std::fmt;
 
-/// Default "alive" cell word: material id 1, metadata 0. Raw value
-/// `1 << METADATA_BITS`. Used as the reborn-cell payload by the binary
-/// Game-of-Life step and as the ground truth for "a live cell" in tests.
-/// Lives at module scope (not inside `step_cell`) so test modules in
-/// `rule.rs` and `world.rs` can reach it without duplicating the constant.
-pub(crate) const ALIVE: CellState = 1 << crate::octree::Cell::METADATA_BITS;
+/// Default "alive" cell payload used by the legacy GoL smoke scene.
+pub(crate) const ALIVE: Cell = Cell::pack(1, 0);
 
 /// A cellular automaton rule operating on the 26-cell Moore neighborhood in 3D.
+///
+/// Rules are pure local transforms: they inspect only the center cell and its
+/// neighbors and return the next cell state for that center.
 pub trait CaRule {
-    /// Given a cell's current state and its 26 neighbors, return the next state.
-    fn step_cell(&self, center: CellState, neighbors: &[CellState; 26]) -> CellState;
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
+}
+
+/// Identity rule for static materials. Returns the center cell unchanged.
+pub struct NoopRule;
+
+impl CaRule for NoopRule {
+    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+        center
+    }
+}
+
+/// Fire persists while fuel is adjacent, and is quenched by water.
+pub struct FireRule {
+    pub fuel_material: u16,
+    pub quencher_material: u16,
+}
+
+impl CaRule for FireRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "FireRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|neighbor| neighbor.material() == self.quencher_material)
+        {
+            Cell::EMPTY
+        } else if neighbors
+            .iter()
+            .any(|neighbor| neighbor.material() == self.fuel_material)
+        {
+            center
+        } else {
+            Cell::EMPTY
+        }
+    }
+}
+
+/// Water solidifies into a configured product when the reactive material is adjacent.
+pub struct WaterRule {
+    pub reactive_material: u16,
+    pub reaction_product: Cell,
+}
+
+impl CaRule for WaterRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "WaterRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|neighbor| neighbor.material() == self.reactive_material)
+        {
+            self.reaction_product
+        } else {
+            center
+        }
+    }
 }
 
 /// 3D Game of Life (outer totalistic).
@@ -32,6 +84,7 @@ pub trait CaRule {
 /// [`crystal`]: GameOfLife3D::crystal
 /// [`rule445`]: GameOfLife3D::rule445
 /// [`pyroclastic`]: GameOfLife3D::pyroclastic
+#[derive(Clone, Copy)]
 pub struct GameOfLife3D {
     /// survive_min..=survive_max: cell stays alive if neighbor count is in this range
     pub survive_min: u8,
@@ -83,41 +136,45 @@ impl fmt::Display for GameOfLife3D {
 }
 
 impl CaRule for GameOfLife3D {
-    fn step_cell(&self, center: CellState, neighbors: &[CellState; 26]) -> CellState {
-        // Binary GoL: any non-zero cell counts as "alive", regardless of
-        // material ID or metadata. Reborn cells use the default "alive"
-        // material ID 1 (will become meaningful once the material registry
-        // lands in 1v0.2).
-        let alive_count: u8 = neighbors.iter().map(|&n| if n > 0 { 1u8 } else { 0 }).sum();
-        if center > 0 {
-            // alive: survive?
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        let alive_count: u8 = neighbors
+            .iter()
+            .map(|neighbor| if neighbor.is_empty() { 0u8 } else { 1u8 })
+            .sum();
+        if !center.is_empty() {
             if alive_count >= self.survive_min && alive_count <= self.survive_max {
                 center
             } else {
-                0
+                Cell::EMPTY
             }
+        } else if alive_count >= self.birth_min && alive_count <= self.birth_max {
+            ALIVE
         } else {
-            // dead: birth?
-            if alive_count >= self.birth_min && alive_count <= self.birth_max {
-                ALIVE
-            } else {
-                0
-            }
+            Cell::EMPTY
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Unit coverage for `GameOfLife3D`:
-    //!   - Preset numeric ranges (hash-thing-pbx): source of truth for doc
-    //!     comments and main.rs display labels.
-    //!   - `step_cell` boundary conditions (hash-thing-1di): survive/birth
-    //!     range edges, preset quirks, and the payload-transparency
-    //!     invariant that survival returns `center` unchanged. Pinned
-    //!     before any refactor touches the module (material tags,
-    //!     recursive Hashlife stepper, etc.).
+    //! Unit coverage for `GameOfLife3D` and the first registry-backed rules.
+
     use super::*;
+
+    fn mat(material: u16) -> Cell {
+        Cell::pack(material, 0)
+    }
+
+    /// Construct a 26-neighbor array with exactly `count` live cells
+    /// (using material id 1) and the rest empty.
+    fn neighbors_with_alive(count: usize) -> [Cell; 26] {
+        assert!(count <= 26);
+        let mut n = [Cell::EMPTY; 26];
+        for slot in n.iter_mut().take(count) {
+            *slot = ALIVE;
+        }
+        n
+    }
 
     /// Lock in the numeric ranges of every preset. This test is the source
     /// of truth for hash-thing-pbx — if you change a preset's numbers, this
@@ -146,103 +203,135 @@ mod tests {
         assert_eq!(format!("{}", pyro), "S4-7/B6-8");
     }
 
-    /// Construct a 26-neighbor array with exactly `count` live cells
-    /// (using material id 1) and the rest empty.
-    fn neighbors_with_alive(count: usize) -> [CellState; 26] {
-        assert!(count <= 26);
-        let mut n = [0 as CellState; 26];
-        for slot in n.iter_mut().take(count) {
-            *slot = 1;
-        }
-        n
-    }
-
-    /// Dead cell with zero neighbors stays dead under every preset.
-    /// All presets have `birth_min >= 1`, so zero neighbors never births.
     #[test]
     fn dead_with_zero_neighbors_stays_dead_all_presets() {
         let zero = neighbors_with_alive(0);
-        assert_eq!(GameOfLife3D::amoeba().step_cell(0, &zero), 0);
-        assert_eq!(GameOfLife3D::crystal().step_cell(0, &zero), 0);
-        assert_eq!(GameOfLife3D::rule445().step_cell(0, &zero), 0);
-        assert_eq!(GameOfLife3D::pyroclastic().step_cell(0, &zero), 0);
+        assert_eq!(
+            GameOfLife3D::amoeba().step_cell(Cell::EMPTY, &zero),
+            Cell::EMPTY
+        );
+        assert_eq!(
+            GameOfLife3D::crystal().step_cell(Cell::EMPTY, &zero),
+            Cell::EMPTY
+        );
+        assert_eq!(
+            GameOfLife3D::rule445().step_cell(Cell::EMPTY, &zero),
+            Cell::EMPTY
+        );
+        assert_eq!(
+            GameOfLife3D::pyroclastic().step_cell(Cell::EMPTY, &zero),
+            Cell::EMPTY
+        );
     }
 
-    /// Crystal preset quirk: `survive_min = 0` — a live cell with zero
-    /// neighbors actually survives. Pin the behavior so a future author
-    /// doesn't "fix" it into a death.
     #[test]
     fn crystal_isolated_live_cell_survives() {
         let zero = neighbors_with_alive(0);
-        assert_eq!(GameOfLife3D::crystal().step_cell(1, &zero), 1);
+        assert_eq!(GameOfLife3D::crystal().step_cell(ALIVE, &zero), ALIVE);
     }
 
-    /// Amoeba `survive_min = 9`: isolated live cells die immediately.
     #[test]
     fn amoeba_isolated_live_cell_dies() {
         let zero = neighbors_with_alive(0);
-        assert_eq!(GameOfLife3D::amoeba().step_cell(1, &zero), 0);
+        assert_eq!(GameOfLife3D::amoeba().step_cell(ALIVE, &zero), Cell::EMPTY);
     }
 
-    /// rule445 survive range is `4..=4`. Check both sides of the boundary
-    /// plus the hit to catch any off-by-one in the inclusive range check.
     #[test]
     fn rule445_survive_range_boundary() {
         let rule = GameOfLife3D::rule445();
-        assert_eq!(rule.step_cell(1, &neighbors_with_alive(3)), 0);
-        assert_eq!(rule.step_cell(1, &neighbors_with_alive(4)), 1);
-        assert_eq!(rule.step_cell(1, &neighbors_with_alive(5)), 0);
+        assert_eq!(rule.step_cell(ALIVE, &neighbors_with_alive(3)), Cell::EMPTY);
+        assert_eq!(rule.step_cell(ALIVE, &neighbors_with_alive(4)), ALIVE);
+        assert_eq!(rule.step_cell(ALIVE, &neighbors_with_alive(5)), Cell::EMPTY);
     }
 
-    /// rule445 birth range is `4..=4`. Same three cases, center dead.
     #[test]
     fn rule445_birth_range_boundary() {
         let rule = GameOfLife3D::rule445();
-        assert_eq!(rule.step_cell(0, &neighbors_with_alive(3)), 0);
-        assert_eq!(rule.step_cell(0, &neighbors_with_alive(4)), ALIVE);
-        assert_eq!(rule.step_cell(0, &neighbors_with_alive(5)), 0);
+        assert_eq!(
+            rule.step_cell(Cell::EMPTY, &neighbors_with_alive(3)),
+            Cell::EMPTY
+        );
+        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors_with_alive(4)), ALIVE);
+        assert_eq!(
+            rule.step_cell(Cell::EMPTY, &neighbors_with_alive(5)),
+            Cell::EMPTY
+        );
     }
 
-    /// Survival returns `center` unchanged — *not* a constant "alive"
-    /// value. This is the payload-transparency invariant that 1v0.2 will
-    /// rely on when CellState carries material tags.
     #[test]
     fn survival_preserves_center_payload() {
         let rule = GameOfLife3D::crystal();
-        // crystal S(0..=6): zero neighbors still survives, so center=42
-        // round-trips through step_cell unchanged.
         let zero = neighbors_with_alive(0);
-        assert_eq!(rule.step_cell(42, &zero), 42);
+        let tagged = Cell::pack(5, 42);
+        assert_eq!(rule.step_cell(tagged, &zero), tagged);
     }
 
-    /// Any nonzero neighbor counts as alive — guards against a future
-    /// refactor that compares against a specific material ID.
-    ///
-    /// The neighbor slots hold bare `u16` values, not validated `Cell`
-    /// words, because `step_cell` only reads them via `n > 0`. The only
-    /// assertion that has to be a valid Cell is the **output** of
-    /// `step_cell`, and that's always `ALIVE` on birth.
     #[test]
-    fn nonzero_neighbors_all_count_as_alive() {
-        // Place 4 distinct nonzero values, rest zero. Under rule445 a
-        // dead center with exactly 4 alive neighbors births.
-        let mut n = [0 as CellState; 26];
-        n[0] = 1;
-        n[1] = 7;
-        n[2] = 42;
-        n[3] = 255;
+    fn nonempty_neighbors_all_count_as_alive() {
+        let mut n = [Cell::EMPTY; 26];
+        n[0] = Cell::pack(1, 0);
+        n[1] = Cell::pack(2, 0);
+        n[2] = Cell::pack(7, 3);
+        n[3] = Cell::pack(8, 12);
         let rule = GameOfLife3D::rule445();
-        assert_eq!(rule.step_cell(0, &n), ALIVE);
+        assert_eq!(rule.step_cell(Cell::EMPTY, &n), ALIVE);
     }
 
-    /// With all 26 neighbors alive: amoeba (S 9..=26) survives; the other
-    /// three presets have upper survive bounds below 26 so they die.
+    #[test]
+    fn noop_rule_preserves_center_exactly() {
+        let rule = NoopRule;
+        let neighbors = [ALIVE; 26];
+        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::EMPTY);
+        assert_eq!(
+            rule.step_cell(Cell::pack(11, 1), &neighbors),
+            Cell::pack(11, 1)
+        );
+    }
+
+    #[test]
+    fn fire_rule_burns_out_without_fuel() {
+        let rule = FireRule {
+            fuel_material: 3,
+            quencher_material: 5,
+        };
+        assert_eq!(
+            rule.step_cell(mat(4), &[Cell::EMPTY; 26]),
+            Cell::EMPTY,
+            "isolated fire should burn out"
+        );
+    }
+
+    #[test]
+    fn fire_rule_survives_when_fuel_is_adjacent() {
+        let rule = FireRule {
+            fuel_material: 3,
+            quencher_material: 5,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(3);
+        assert_eq!(rule.step_cell(mat(4), &neighbors), mat(4));
+    }
+
+    #[test]
+    fn water_rule_reacts_to_configured_neighbor() {
+        let rule = WaterRule {
+            reactive_material: 4,
+            reaction_product: mat(1),
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(4);
+        assert_eq!(rule.step_cell(mat(5), &neighbors), mat(1));
+    }
+
     #[test]
     fn all_26_neighbors_alive_survival_by_preset() {
         let full = neighbors_with_alive(26);
-        assert_eq!(GameOfLife3D::amoeba().step_cell(1, &full), 1);
-        assert_eq!(GameOfLife3D::crystal().step_cell(1, &full), 0);
-        assert_eq!(GameOfLife3D::rule445().step_cell(1, &full), 0);
-        assert_eq!(GameOfLife3D::pyroclastic().step_cell(1, &full), 0);
+        assert_eq!(GameOfLife3D::amoeba().step_cell(ALIVE, &full), ALIVE);
+        assert_eq!(GameOfLife3D::crystal().step_cell(ALIVE, &full), Cell::EMPTY);
+        assert_eq!(GameOfLife3D::rule445().step_cell(ALIVE, &full), Cell::EMPTY);
+        assert_eq!(
+            GameOfLife3D::pyroclastic().step_cell(ALIVE, &full),
+            Cell::EMPTY
+        );
     }
 }

@@ -26,7 +26,7 @@
 //!
 //! ## Incremental uploads (hash-thing-5bb.5)
 //!
-//! `World::step_flat` calls `NodeStore::compacted()` every step, so `NodeId`s are
+//! `World::step` calls `NodeStore::compacted()` every step, so `NodeId`s are
 //! **not** stable across simulation steps — a NodeId-keyed cache is invalidated on
 //! every step. Content identity is stable, though: two subtrees with the same
 //! `(mask, child_slots)` tuple represent the same voxel volume regardless of which
@@ -2183,7 +2183,7 @@ mod tests {
 
     #[test]
     fn update_cross_epoch_cache_reuse() {
-        // Simulate a step_flat cycle: build in store A, compact into store B.
+        // Simulate a step cycle: build in store A, compact into store B.
         // The Svdag should still recognize identical subtrees.
         let mut store = NodeStore::new();
         let mut root = store.empty(6);

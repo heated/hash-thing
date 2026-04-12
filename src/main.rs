@@ -68,6 +68,7 @@ struct App {
     renderer: Option<render::Renderer>,
     world: sim::World,
     rule: sim::GameOfLife3D,
+    legacy_gol_smoke: bool,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -115,6 +116,7 @@ impl App {
         // called outside the timed gen region so it does not pollute
         // the gen measurement. See hash-thing-3fq.5.
         let noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+        let material_palette_len = world.materials.color_palette_rgba().len();
 
         let (nodes_after, _) = world.store.stats();
         let nodes_delta = nodes_after.saturating_sub(nodes_before);
@@ -128,15 +130,17 @@ impl App {
             elapsed,
             noise_ns_per_sample,
         );
+        log::debug!("Material registry palette slots={material_palette_len}");
 
-        // Start paused so the active CA rule (legacy GoL) does not
-        // immediately treat solid terrain as alive and destroy it. Press
-        // Space to step.
+        // Start paused so the user opts into stepping explicitly. Terrain
+        // defaults are mostly static, but the reactive material rules are
+        // now live and should not advance until requested.
         Self {
             window: None,
             renderer: None,
             world,
             rule: sim::GameOfLife3D::amoeba(),
+            legacy_gol_smoke: false,
             svdag: render::Svdag::new(),
             paused: true,
             step_timer: std::time::Instant::now(),
@@ -246,7 +250,7 @@ impl ApplicationHandler for App {
                             // path (hash-thing-5qh + hash-thing-yri).
                             {
                                 let _t = self.perf.start("step");
-                                self.world.step_flat(&self.rule);
+                                self.world.step();
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
@@ -275,6 +279,7 @@ impl ApplicationHandler for App {
                             let elapsed = start.elapsed();
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+                            self.legacy_gol_smoke = false;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -309,6 +314,7 @@ impl ApplicationHandler for App {
                             // Re-probe in case params drifted. Cheap (~1ms).
                             self.noise_ns_per_sample =
                                 terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
+                            self.legacy_gol_smoke = false;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -334,7 +340,10 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("g") => {
                             // Swap to legacy GoL sphere seed (kept for CA scaffold demos).
                             self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+                            self.world.materials =
+                                terrain::materials::MaterialRegistry::gol_smoke(self.rule);
                             self.world.seed_center(12, 0.35);
+                            self.legacy_gol_smoke = true;
                             self.paused = true;
                             self.perf.clear();
                             self.mem_stats.reset_peaks();
@@ -352,21 +361,37 @@ impl ApplicationHandler for App {
                         // without clearing yields stale results from the previous rule.
                         winit::keyboard::Key::Character("1") => {
                             self.rule = sim::GameOfLife3D::amoeba();
+                            if self.legacy_gol_smoke {
+                                self.world.materials =
+                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                            }
                             log::info!("Rule: Amoeba ({})", self.rule);
                         }
                         // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("2") => {
                             self.rule = sim::GameOfLife3D::crystal();
+                            if self.legacy_gol_smoke {
+                                self.world.materials =
+                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                            }
                             log::info!("Rule: Crystal ({})", self.rule);
                         }
                         // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("3") => {
                             self.rule = sim::GameOfLife3D::rule445();
+                            if self.legacy_gol_smoke {
+                                self.world.materials =
+                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                            }
                             log::info!("Rule: 445 ({})", self.rule);
                         }
                         // TODO(hash-thing-6gf.1): clear_step_cache on rule swap (see above).
                         winit::keyboard::Key::Character("4") => {
                             self.rule = sim::GameOfLife3D::pyroclastic();
+                            if self.legacy_gol_smoke {
+                                self.world.materials =
+                                    terrain::materials::MaterialRegistry::gol_smoke(self.rule);
+                            }
                             log::info!("Rule: Pyroclastic ({})", self.rule);
                         }
                         winit::keyboard::Key::Character("v") => {
@@ -448,12 +473,12 @@ impl ApplicationHandler for App {
                 // Step simulation
                 if !self.paused && self.step_timer.elapsed().as_millis() > 200 {
                     // Time the step. `perf.start` returns a Timer that
-                    // borrows only self.perf; self.world and self.rule
-                    // are disjoint fields, so the borrow checker lets
-                    // step_flat proceed while the Timer is alive.
+                    // borrows only self.perf; self.world is disjoint, so
+                    // the borrow checker lets the step proceed while the
+                    // Timer is alive.
                     {
                         let _t = self.perf.start("step");
-                        self.world.step_flat(&self.rule);
+                        self.world.step();
                     }
                     // Time upload as one aggregate (flatten + Svdag::build +
                     // upload_volume + upload_svdag). CPU-side submit only —
