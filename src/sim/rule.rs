@@ -12,23 +12,11 @@ pub trait CaRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
 }
 
-/// Context passed to block rules for deterministic RNG and position awareness.
-///
-/// All fields are pure functions of position + generation + seed, so block rules
-/// remain Hashlife-compatible (no global mutable state).
-#[derive(Clone, Copy, Debug)]
-pub struct BlockContext {
-    /// World-space origin of the block's (0,0,0) corner.
-    pub block_origin: [i64; 3],
-    /// Current simulation generation.
-    pub generation: u64,
-    /// Per-world seed for deterministic randomness.
-    pub world_seed: u64,
-    /// Pre-computed RNG hash from `rng::cell_hash(origin, generation, seed)`.
-    pub rng_hash: u64,
-}
-
 /// A block-based CA rule operating on 2x2x2 cell blocks.
+///
+/// Block rules are **pure functions of block contents only** — no position,
+/// generation, or seed context. This enables spatial memoization in hashlife:
+/// identical blocks anywhere in the world produce identical results.
 ///
 /// Block rules implement mass-conserving permutations: the output must be a
 /// rearrangement of the input cells (multiset equality). This invariant enables
@@ -39,7 +27,7 @@ pub struct BlockContext {
 ///   `block_index(dx, dy, dz) = dx + dy*2 + dz*4`
 /// matching `octant_index` in `src/octree/node.rs`.
 pub trait BlockRule {
-    fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8];
+    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8];
 }
 
 /// Map local (dx, dy, dz) offsets (each 0 or 1) to an index in `[Cell; 8]`.
@@ -414,7 +402,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // BlockRule / BlockContext / block_index tests
+    // BlockRule / block_index tests
     // ---------------------------------------------------------------
 
     #[test]

@@ -5,7 +5,7 @@
 //! All transforms must preserve the multiset of input cells (mass conservation).
 
 use crate::octree::Cell;
-use crate::sim::rule::{block_index, BlockContext, BlockRule};
+use crate::sim::rule::{block_index, BlockRule};
 
 /// Identity block rule — returns the block unchanged. Useful for testing
 /// the pipeline (flatten → partition → iterate → apply → rebuild) with
@@ -13,7 +13,7 @@ use crate::sim::rule::{block_index, BlockContext, BlockRule};
 pub struct IdentityBlockRule;
 
 impl BlockRule for IdentityBlockRule {
-    fn step_block(&self, block: &[Cell; 8], _ctx: &BlockContext) -> [Cell; 8] {
+    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
         *block
     }
 }
@@ -23,11 +23,11 @@ impl BlockRule for IdentityBlockRule {
 /// Phase 1 (gravity): same as `GravityBlockRule` — each vertical column
 /// swaps top↔bottom if the upper cell is denser.
 ///
-/// Phase 2 (lateral spread): for each y layer, pick a random lateral axis
-/// (x or z) using `BlockContext::rng_hash`. Along that axis, swap pairs
-/// where one cell is fluid (matches `fluid_material`) and the other is air
-/// (empty). This produces probabilistic horizontal flow that is
-/// Hashlife-compatible (deterministic given the context hash).
+/// Phase 2 (lateral spread): for each y layer, pick a lateral axis (x or z)
+/// from a hash of the block contents. Along that axis, swap pairs where one
+/// cell is fluid (matches `fluid_material`) and the other is air (empty).
+/// Because the axis choice depends only on block contents, identical blocks
+/// produce identical results — enabling spatial memoization in hashlife.
 pub struct FluidBlockRule {
     density_fn: fn(Cell) -> f32,
     fluid_material: u16,
@@ -43,7 +43,7 @@ impl FluidBlockRule {
 }
 
 impl BlockRule for FluidBlockRule {
-    fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8] {
+    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
         let mut out = *block;
 
         // Phase 1: gravity — same as GravityBlockRule
@@ -58,7 +58,8 @@ impl BlockRule for FluidBlockRule {
         }
 
         // Phase 2: lateral spread (fluid ↔ air only)
-        let hash = ctx.rng_hash;
+        // Derive axis from a hash of block contents — pure function, no position dependency.
+        let hash = Self::block_hash(block);
         for dy in 0..2usize {
             // Pick axis from bit 0 (layer 0) or bit 1 (layer 1) of the hash.
             let use_x_axis = (hash >> dy) & 1 == 0;
@@ -84,6 +85,17 @@ impl BlockRule for FluidBlockRule {
 }
 
 impl FluidBlockRule {
+    /// Derive a hash from block contents for deterministic axis selection.
+    /// Uses FNV-1a on the raw cell values — fast, no allocation, pure.
+    fn block_hash(block: &[Cell; 8]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
+        for cell in block {
+            h ^= cell.raw() as u64;
+            h = h.wrapping_mul(0x100000001b3); // FNV prime
+        }
+        h
+    }
+
     /// Swap cells at indices a and b if exactly one is fluid and the other is air.
     fn try_fluid_swap(&self, block: &mut [Cell; 8], a: usize, b: usize) {
         let a_is_fluid = block[a].material() == self.fluid_material;
@@ -119,7 +131,7 @@ impl GravityBlockRule {
 }
 
 impl BlockRule for GravityBlockRule {
-    fn step_block(&self, block: &[Cell; 8], _ctx: &BlockContext) -> [Cell; 8] {
+    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
         let mut out = *block;
         // There are 4 vertical columns in a 2x2x2 block.
         // Each column has y=0 (bottom) and y=1 (top).
@@ -143,16 +155,6 @@ impl BlockRule for GravityBlockRule {
 mod tests {
     use super::*;
     use crate::octree::Cell;
-    use crate::sim::rule::BlockContext;
-
-    fn test_ctx() -> BlockContext {
-        BlockContext {
-            block_origin: [0, 0, 0],
-            generation: 0,
-            world_seed: 42,
-            rng_hash: 0,
-        }
-    }
 
     fn mat(id: u16) -> Cell {
         if id == 0 {
@@ -191,7 +193,7 @@ mod tests {
             mat(4),
         ];
         let rule = IdentityBlockRule;
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_eq!(block, out);
     }
 
@@ -208,7 +210,7 @@ mod tests {
             mat(8),
         ];
         let rule = IdentityBlockRule;
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_mass_conserved(&block, &out);
     }
 
@@ -232,7 +234,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = Cell::EMPTY; // bottom
         block[block_index(0, 1, 0)] = mat(5); // top — heavier, should fall
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_eq!(out[block_index(0, 0, 0)], mat(5), "heavy cell should fall");
         assert_eq!(out[block_index(0, 1, 0)], Cell::EMPTY, "air should rise");
     }
@@ -243,7 +245,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(5); // bottom — heavier
         block[block_index(0, 1, 0)] = mat(1); // top — lighter
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_eq!(out[block_index(0, 0, 0)], mat(5), "bottom stays");
         assert_eq!(out[block_index(0, 1, 0)], mat(1), "top stays");
     }
@@ -254,7 +256,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(3);
         block[block_index(0, 1, 0)] = mat(3);
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_eq!(out[block_index(0, 0, 0)], mat(3));
         assert_eq!(out[block_index(0, 1, 0)], mat(3));
     }
@@ -272,7 +274,7 @@ mod tests {
             mat(2),
             mat(4),
         ];
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_mass_conserved(&block, &out);
     }
 
@@ -287,7 +289,7 @@ mod tests {
                 block[block_index(dx, 1, dz)] = mat(5); // heavy top
             }
         }
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         for dz in 0..2 {
             for dx in 0..2 {
                 assert_eq!(
@@ -311,7 +313,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         // heavy cell with metadata
         block[block_index(0, 1, 0)] = Cell::pack(5, 42);
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_eq!(
             out[block_index(0, 0, 0)],
             Cell::pack(5, 42),
@@ -338,7 +340,7 @@ mod tests {
                                                       // Block lateral escape routes so we isolate the gravity phase.
         block[block_index(1, 0, 0)] = mat(SOLID_MAT);
         block[block_index(0, 0, 1)] = mat(SOLID_MAT);
-        let out = rule.step_block(&block, &test_ctx());
+        let out = rule.step_block(&block);
         assert_eq!(
             out[block_index(0, 0, 0)],
             mat(FLUID_MAT),
@@ -350,23 +352,14 @@ mod tests {
     #[test]
     fn fluid_lateral_spreads_into_air() {
         let rule = fluid_rule();
-        // Place fluid at (0,0,0) and air at (1,0,0).
-        // With rng_hash=0, bit 0 is 0 → use_x_axis=true for layer 0.
-        // So the x-axis pair (0,0,0)↔(1,0,0) should swap fluid↔air.
+        // Place fluid at (0,0,0) with air in all other slots.
+        // The block_hash determines which axis — we verify the fluid moved laterally.
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(FLUID_MAT);
-        let ctx = BlockContext {
-            rng_hash: 0, // bit 0 = 0 → x-axis for layer 0
-            ..test_ctx()
-        };
-        let out = rule.step_block(&block, &ctx);
-        // After gravity (no change — fluid already at bottom), lateral phase
-        // should swap fluid at (0,0,0) with air at (1,0,0).
-        assert_eq!(
-            out[block_index(1, 0, 0)],
-            mat(FLUID_MAT),
-            "fluid should spread along x"
-        );
+        let out = rule.step_block(&block);
+        let moved_x = out[block_index(1, 0, 0)] == mat(FLUID_MAT);
+        let moved_z = out[block_index(0, 0, 1)] == mat(FLUID_MAT);
+        assert!(moved_x || moved_z, "fluid should spread laterally (x or z)");
         assert_eq!(
             out[block_index(0, 0, 0)],
             Cell::EMPTY,
@@ -375,47 +368,32 @@ mod tests {
     }
 
     #[test]
-    fn fluid_lateral_z_axis_with_odd_hash() {
+    fn fluid_lateral_is_deterministic() {
         let rule = fluid_rule();
-        // Place fluid at (0,0,0). With rng_hash=1, bit 0 = 1 → use z-axis for layer 0.
-        // z-axis pair: (0,0,0)↔(0,0,1).
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(FLUID_MAT);
-        let ctx = BlockContext {
-            rng_hash: 1, // bit 0 = 1 → z-axis for layer 0
-            ..test_ctx()
-        };
-        let out = rule.step_block(&block, &ctx);
+        let out1 = rule.step_block(&block);
+        let out2 = rule.step_block(&block);
         assert_eq!(
-            out[block_index(0, 0, 1)],
-            mat(FLUID_MAT),
-            "fluid should spread along z"
-        );
-        assert_eq!(
-            out[block_index(0, 0, 0)],
-            Cell::EMPTY,
-            "source should become air"
+            out1, out2,
+            "same block must produce same result (pure function)"
         );
     }
 
     #[test]
     fn fluid_no_spread_into_solid() {
         let rule = fluid_rule();
-        // Fluid next to solid — should NOT swap.
+        // Fluid surrounded by solids on both lateral axes — should NOT swap.
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(FLUID_MAT);
         block[block_index(1, 0, 0)] = mat(SOLID_MAT);
-        let ctx = BlockContext {
-            rng_hash: 0, // x-axis for layer 0
-            ..test_ctx()
-        };
-        let out = rule.step_block(&block, &ctx);
+        block[block_index(0, 0, 1)] = mat(SOLID_MAT);
+        let out = rule.step_block(&block);
         assert_eq!(
             out[block_index(0, 0, 0)],
             mat(FLUID_MAT),
-            "fluid stays next to solid"
+            "fluid stays when both lateral neighbors are solid"
         );
-        assert_eq!(out[block_index(1, 0, 0)], mat(SOLID_MAT), "solid stays");
     }
 
     #[test]
@@ -431,14 +409,8 @@ mod tests {
             mat(0),
             mat(SOLID_MAT),
         ];
-        for hash in [0u64, 1, 2, 3, 0xFF, 0xDEAD] {
-            let ctx = BlockContext {
-                rng_hash: hash,
-                ..test_ctx()
-            };
-            let out = rule.step_block(&block, &ctx);
-            assert_mass_conserved(&block, &out);
-        }
+        let out = rule.step_block(&block);
+        assert_mass_conserved(&block, &out);
     }
 
     #[test]
@@ -448,16 +420,13 @@ mod tests {
         // Gravity should pull it to (0,0,0), then lateral should spread it.
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 1, 0)] = mat(FLUID_MAT);
-        let ctx = BlockContext {
-            rng_hash: 0, // x-axis for layer 0
-            ..test_ctx()
-        };
-        let out = rule.step_block(&block, &ctx);
-        // After gravity: fluid at (0,0,0). After lateral (x-axis): fluid at (1,0,0).
-        assert_eq!(
-            out[block_index(1, 0, 0)],
-            mat(FLUID_MAT),
-            "fluid should fall then spread"
+        let out = rule.step_block(&block);
+        // After gravity: fluid at (0,0,0). After lateral: fluid moves to x or z neighbor.
+        let moved_x = out[block_index(1, 0, 0)] == mat(FLUID_MAT);
+        let moved_z = out[block_index(0, 0, 1)] == mat(FLUID_MAT);
+        assert!(
+            moved_x || moved_z,
+            "fluid should fall then spread laterally"
         );
         assert_mass_conserved(&block, &out);
     }

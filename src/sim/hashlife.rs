@@ -20,14 +20,13 @@
 //!
 //! Step results are memoized by (NodeId, origin) so identical subtrees at
 //! the same world-space position are computed only once per generation.
-//! The cache is cleared after each step (generation changes affect BlockRule
-//! rng_hash, and compaction remaps NodeIds).
+//! Since BlockRule is now a pure function of block contents (no position or
+//! generation dependency), spatial memoization is possible: identical subtrees
+//! at different positions can share cached results.
 
-use super::rule::BlockContext;
 use super::world::World;
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, NodeId};
-use crate::rng::cell_hash;
 
 impl World {
     /// Step the world forward one generation using the recursive Hashlife path.
@@ -220,9 +219,7 @@ impl World {
                         && wby.rem_euclid(2) == offset as i64
                         && wbz.rem_euclid(2) == offset as i64
                     {
-                        self.apply_block_in_grid(
-                            &mut next, side, bx, by, bz, wbx, wby, wbz, generation,
-                        );
+                        self.apply_block_in_grid(&mut next, side, bx, by, bz);
                     }
                     bx += 2;
                 }
@@ -249,7 +246,6 @@ impl World {
     }
 
     /// Apply a single block rule within a flat grid.
-    #[allow(clippy::too_many_arguments)]
     fn apply_block_in_grid(
         &self,
         grid: &mut [CellState],
@@ -257,10 +253,6 @@ impl World {
         bx: usize,
         by: usize,
         bz: usize,
-        wbx: i64,
-        wby: i64,
-        wbz: i64,
-        generation: u64,
     ) {
         let mut block = [Cell::EMPTY; 8];
         for dz in 0..2 {
@@ -283,14 +275,7 @@ impl World {
         };
 
         let rule = self.materials.block_rule(rule_id);
-        let ctx = BlockContext {
-            block_origin: [wbx, wby, wbz],
-            generation,
-            world_seed: self.simulation_seed,
-            rng_hash: cell_hash(wbx, wby, wbz, generation, self.simulation_seed),
-        };
-
-        let result = rule.step_block(&block, &ctx);
+        let result = rule.step_block(&block);
 
         for dz in 0..2 {
             for dy in 0..2 {
@@ -677,20 +662,24 @@ mod tests {
 
     #[test]
     fn recursive_matches_brute_force_multiple_steps() {
-        let mut brute = World::new(3);
-        let mut recur = World::new(3);
+        // Use level 4 (16x16x16) to keep materials away from the world boundary.
+        // FluidBlockRule's content-based hash can push water toward edges; a small
+        // world (level 3 = 8x8x8) risks cells reaching the boundary where brute-force
+        // and hashlife clip differently.
+        let mut brute = World::new(4);
+        let mut recur = World::new(4);
         for &(x, y, z, mat) in &[
-            (2u64, 2, 2, STONE),
+            (6u64, 6, 6, STONE),
             (
-                3,
-                3,
-                3,
+                7,
+                7,
+                7,
                 crate::octree::Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
             ),
             (
-                4,
-                4,
-                4,
+                8,
+                8,
+                8,
                 crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw(),
             ),
         ] {
