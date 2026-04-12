@@ -57,7 +57,7 @@ If `.beads/actor` is missing, the worktree hasn't been assigned — ask edward o
 - If edward asks for a CLAUDE.md edit while you're mid-task, file it in the `claude-md-edit` queue and spawn a mayor background session to process it (see "Editing CLAUDE.md" below).
 - Never spawn a second mayor at the same time — singular seat.
 
-**All mayor process — starter queue, rules, pre-flight, drift-unparking, on-demand-only, anti-patterns — lives in `skills/mayor/SKILL.md`.** That skill is the authoritative source. This section is the minimum stub for non-mayor workers; if the two disagree, the skill wins.
+**All mayor process — rules, priority visibility routine, drift-unparking, anti-patterns — lives in `.agents/skills/mayor/SKILL.md`.** That skill is the authoritative source. This section is the minimum stub for non-mayor workers; if the two disagree, the skill wins.
 
 ## How the crew runs
 
