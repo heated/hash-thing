@@ -71,6 +71,7 @@ pub struct LocalCoord(pub u64);
 /// For now, stepping works by flattening to a grid, applying rules, and
 /// rebuilding the octree. This is O(n³) but correct, and lets us validate
 /// the full pipeline. True Hashlife recursive stepping comes next.
+#[derive(Clone)]
 pub struct World {
     pub store: NodeStore,
     pub root: NodeId,

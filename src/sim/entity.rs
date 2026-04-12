@@ -66,6 +66,7 @@ pub struct Entity {
 /// Storage for all entities. Slab-style: entities indexed by id, with a
 /// free list for reuse. For the initial particle-only implementation,
 /// a simple Vec + generation counter is sufficient.
+#[derive(Clone)]
 pub struct EntityStore {
     entities: Vec<Option<Entity>>,
     next_id: u64,

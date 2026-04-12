@@ -731,8 +731,7 @@ impl ApplicationHandler for App {
                                 self.world = world;
                                 // Entity update on main thread (needs both
                                 // &World and &mut EntityStore).
-                                let mut queue =
-                                    std::mem::take(&mut self.world.queue);
+                                let mut queue = std::mem::take(&mut self.world.queue);
                                 self.entities.update(&self.world, &mut queue);
                                 self.world.queue = queue;
                                 self.sync_render_cache();
@@ -756,17 +755,12 @@ impl ApplicationHandler for App {
                                                     sim::EntityKind::Particle(p) => {
                                                         p.material as u32
                                                     }
-                                                    sim::EntityKind::Player(_) => {
-                                                        return None
-                                                    }
+                                                    sim::EntityKind::Player(_) => return None,
                                                 };
                                                 Some([
-                                                    (e.pos[0] - wo[0] as f64) as f32
-                                                        * inv_size,
-                                                    (e.pos[1] - wo[1] as f64) as f32
-                                                        * inv_size,
-                                                    (e.pos[2] - wo[2] as f64) as f32
-                                                        * inv_size,
+                                                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
+                                                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
+                                                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
                                                     f32::from_bits(mat),
                                                 ])
                                             })
