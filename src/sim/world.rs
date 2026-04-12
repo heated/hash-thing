@@ -594,6 +594,7 @@ impl World {
 
     /// Find the unique BlockRuleId across all non-empty cells in a block.
     /// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
+    #[inline]
     pub(crate) fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
         let mut found: Option<BlockRuleId> = None;
         for cell in block {
@@ -760,6 +761,7 @@ impl World {
 /// Get the 26 Moore neighbors of a cell. Out-of-bounds neighbors are
 /// `Cell::EMPTY` (absorbing boundary), matching hashlife's infinite-world
 /// semantics.
+#[inline]
 fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [Cell; 26] {
     let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;

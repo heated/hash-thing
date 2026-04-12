@@ -605,6 +605,7 @@ fn source_index(p: usize, s: usize) -> (usize, usize) {
     }
 }
 
+#[inline]
 fn get_neighbors_from_grid(
     grid: &[CellState],
     side: usize,
@@ -1210,5 +1211,67 @@ mod tests {
     #[should_panic]
     fn source_index_out_of_range_panics() {
         source_index(3, 0);
+    }
+
+    /// Verify spatial memoization produces identical results to origin-keyed caching.
+    /// This is the correctness invariant that makes spatial memo safe for CaRule-only worlds.
+    fn assert_spatial_matches_origin(level: u32, steps: usize, label: &str) {
+        use crate::terrain::TerrainParams;
+        let params = TerrainParams::default();
+
+        let mut origin_keyed = World::new(level);
+        let mut spatial = World::new(level);
+        origin_keyed.seed_terrain(&params);
+        spatial.seed_terrain(&params);
+
+        origin_keyed.spatial_memo = false;
+        spatial.spatial_memo = true;
+
+        for step in 0..steps {
+            origin_keyed.step_recursive();
+            spatial.step_recursive();
+            assert_eq!(
+                origin_keyed.flatten(),
+                spatial.flatten(),
+                "{label}: spatial memo diverged from origin-keyed at step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn spatial_memo_matches_origin_keyed_level3() {
+        assert_spatial_matches_origin(3, 4, "level3-terrain");
+    }
+
+    #[test]
+    fn spatial_memo_matches_origin_keyed_level4() {
+        assert_spatial_matches_origin(4, 3, "level4-terrain");
+    }
+
+    #[test]
+    fn spatial_memo_matches_origin_keyed_level5() {
+        assert_spatial_matches_origin(5, 2, "level5-terrain");
+    }
+
+    #[test]
+    fn spatial_memo_matches_origin_keyed_gol() {
+        let rule = GameOfLife3D::rule445();
+        let mut origin_keyed = gol_world(4, rule, 0xbeef_u64);
+        let mut spatial = gol_world(4, rule, 0xbeef_u64);
+        seed_random_alive_cells(&mut origin_keyed, 0xbeef_u64 ^ 0xa11ce, 0);
+        seed_random_alive_cells(&mut spatial, 0xbeef_u64 ^ 0xa11ce, 0);
+
+        origin_keyed.spatial_memo = false;
+        spatial.spatial_memo = true;
+
+        for step in 0..3 {
+            origin_keyed.step_recursive();
+            spatial.step_recursive();
+            assert_eq!(
+                origin_keyed.flatten(),
+                spatial.flatten(),
+                "GoL spatial memo diverged at step {step}"
+            );
+        }
     }
 }
