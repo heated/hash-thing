@@ -118,6 +118,26 @@ impl LatticeDemoBeat {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LatticeShortDemoCut {
+    started_at: std::time::Instant,
+}
+
+impl LatticeShortDemoCut {
+    fn beat_for_elapsed(elapsed: std::time::Duration) -> Option<LatticeDemoBeat> {
+        let secs = elapsed.as_secs_f32();
+        if secs < 2.0 {
+            Some(LatticeDemoBeat::Intro)
+        } else if secs < 4.5 {
+            Some(LatticeDemoBeat::Interior)
+        } else if secs < 8.0 {
+            Some(LatticeDemoBeat::Panorama)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DemoWaypoint {
     label: &'static str,
@@ -245,6 +265,8 @@ struct App {
     legend_dirty: bool,
     /// Last lattice debug-jump preset used from orbit mode.
     current_demo_beat: Option<LatticeDemoBeat>,
+    /// Timed intro -> interior -> reveal cut for the short-form demo.
+    short_demo_cut: Option<LatticeShortDemoCut>,
 }
 
 impl App {
@@ -300,6 +322,7 @@ impl App {
             legend_visible: true,
             legend_dirty: true,
             current_demo_beat: None,
+            short_demo_cut: None,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -485,6 +508,7 @@ impl App {
     }
 
     fn cycle_lattice_demo_beat(&mut self, step: i32) {
+        self.short_demo_cut = None;
         let current = self.current_demo_beat.unwrap_or(LatticeDemoBeat::Intro);
         let next = if step >= 0 {
             current.next()
@@ -495,7 +519,30 @@ impl App {
     }
 
     fn select_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
+        self.short_demo_cut = None;
         self.load_lattice_demo_beat(beat);
+    }
+
+    fn start_lattice_short_demo_cut(&mut self) {
+        self.short_demo_cut = Some(LatticeShortDemoCut {
+            started_at: std::time::Instant::now(),
+        });
+        self.load_lattice_demo_beat(LatticeDemoBeat::Intro);
+        log::info!("Lattice short cut: intro -> interior -> reveal");
+    }
+
+    fn update_lattice_short_demo_cut(&mut self) {
+        let Some(cut) = self.short_demo_cut else {
+            return;
+        };
+        match LatticeShortDemoCut::beat_for_elapsed(cut.started_at.elapsed()) {
+            Some(beat) => {
+                if self.current_demo_beat != Some(beat) {
+                    self.load_lattice_demo_beat(beat);
+                }
+            }
+            None => self.short_demo_cut = None,
+        }
     }
 
     /// Break the block the player is looking at.
@@ -828,6 +875,7 @@ impl App {
         );
         self.sync_render_cache();
         self.current_demo_beat = None;
+        self.short_demo_cut = None;
         log::info!(
             "Lattice progression demo: pop={} gen={:.1}ms reveal={:?}",
             self.world.population(),
@@ -837,7 +885,7 @@ impl App {
     }
 
     fn load_lattice_panorama_demo(&mut self) {
-        self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
+        self.start_lattice_short_demo_cut();
     }
 
     fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
@@ -878,6 +926,7 @@ impl App {
         );
         self.sync_render_cache();
         self.current_demo_beat = None;
+        self.short_demo_cut = None;
     }
 }
 
@@ -1289,6 +1338,7 @@ impl ApplicationHandler for App {
                 // Frame delta time for frame-rate-independent movement (xa7).
                 let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
                 self.last_frame = std::time::Instant::now();
+                self.update_lattice_short_demo_cut();
 
                 // Update window title with FPS + resolution.
                 if let Some(window) = &self.window {
@@ -1748,6 +1798,28 @@ mod tests {
         assert_eq!(LatticeDemoBeat::Intro.label(), "intro");
         assert_eq!(LatticeDemoBeat::Interior.label(), "interior");
         assert_eq!(LatticeDemoBeat::Panorama.label(), "panorama");
+    }
+
+    #[test]
+    fn lattice_short_demo_cut_advances_in_story_order() {
+        use std::time::Duration;
+
+        assert_eq!(
+            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(0.0)),
+            Some(LatticeDemoBeat::Intro)
+        );
+        assert_eq!(
+            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(2.1)),
+            Some(LatticeDemoBeat::Interior)
+        );
+        assert_eq!(
+            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(5.0)),
+            Some(LatticeDemoBeat::Panorama)
+        );
+        assert_eq!(
+            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(8.1)),
+            None
+        );
     }
 
     #[test]
