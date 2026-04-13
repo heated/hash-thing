@@ -200,3 +200,124 @@ impl<S: ScalarField> WorldGen for ImplicitField<S> {
             .classify(self.shape.scalar_bounds(lo, hi), self.solid)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::materials::STONE;
+
+    #[derive(Clone, Copy, Debug)]
+    struct ConstantShape(f32);
+
+    impl ScalarField for ConstantShape {
+        fn sample_scalar(&self, _point: [f32; 3]) -> f32 {
+            self.0
+        }
+
+        fn scalar_bounds(&self, _lo: [f32; 3], _hi: [f32; 3]) -> (f32, f32) {
+            (self.0, self.0)
+        }
+    }
+
+    fn solid_field(value: f32) -> ImplicitField<ConstantShape> {
+        ImplicitField {
+            seed: 7,
+            lo: [0, 0, 0],
+            hi: [8, 8, 8],
+            shape: ConstantShape(value),
+            band: ScalarBand {
+                min: -0.5,
+                max: 0.5,
+            },
+            solid: STONE,
+            warp: NoiseWarp::default(),
+        }
+    }
+
+    #[test]
+    fn scalar_band_classifies_air_solid_and_mixed_ranges() {
+        let band = ScalarBand {
+            min: -0.25,
+            max: 0.25,
+        };
+
+        assert_eq!(band.classify((-1.0, -0.5), STONE), Some(AIR));
+        assert_eq!(band.classify((-0.1, 0.2), STONE), Some(STONE));
+        assert_eq!(band.classify((-0.5, 0.5), STONE), None);
+    }
+
+    #[test]
+    fn noise_warp_validate_rejects_invalid_enabled_params() {
+        assert_eq!(
+            NoiseWarp {
+                amplitude: -1.0,
+                wavelength: 4.0,
+                octaves: 1,
+            }
+            .validate(),
+            Err("warp amplitude must be finite and >= 0")
+        );
+        assert_eq!(
+            NoiseWarp {
+                amplitude: 1.0,
+                wavelength: 0.0,
+                octaves: 1,
+            }
+            .validate(),
+            Err("warp wavelength must be finite and > 0")
+        );
+        assert_eq!(
+            NoiseWarp {
+                amplitude: 1.0,
+                wavelength: 4.0,
+                octaves: 0,
+            }
+            .validate(),
+            Err("warp octaves must be >= 1 when warp is enabled")
+        );
+    }
+
+    #[test]
+    fn noise_warp_validate_allows_disabled_warp() {
+        let warp = NoiseWarp {
+            amplitude: 0.0,
+            wavelength: 0.0,
+            octaves: 0,
+        };
+        assert_eq!(warp.validate(), Ok(()));
+    }
+
+    #[test]
+    fn sample_outside_world_bounds_returns_air() {
+        let field = solid_field(0.0);
+        assert_eq!(field.sample([-1, 0, 0]), AIR);
+        assert_eq!(field.sample([0, 8, 0]), AIR);
+        assert_eq!(field.sample([0, 0, 8]), AIR);
+    }
+
+    #[test]
+    fn sample_inside_world_uses_band_membership() {
+        assert_eq!(solid_field(0.0).sample([1, 1, 1]), STONE);
+        assert_eq!(solid_field(2.0).sample([1, 1, 1]), AIR);
+    }
+
+    #[test]
+    fn classify_box_fully_outside_world_returns_air() {
+        let field = solid_field(0.0);
+        assert_eq!(field.classify([-4, 0, 0], 2), Some(AIR));
+        assert_eq!(field.classify([8, 0, 0], 0), Some(AIR));
+    }
+
+    #[test]
+    fn classify_box_partially_overlapping_world_forces_recursion() {
+        let field = solid_field(0.0);
+        assert_eq!(field.classify([-1, 0, 0], 1), None);
+        assert_eq!(field.classify([7, 0, 0], 1), None);
+    }
+
+    #[test]
+    fn classify_inside_world_collapses_to_solid_or_air() {
+        assert_eq!(solid_field(0.0).classify([0, 0, 0], 2), Some(STONE));
+        assert_eq!(solid_field(2.0).classify([0, 0, 0], 2), Some(AIR));
+    }
+}

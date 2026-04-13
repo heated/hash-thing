@@ -44,6 +44,27 @@ pub struct HeightmapField {
 }
 
 impl HeightmapField {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.wavelength.is_finite() || self.wavelength <= 0.0 {
+            return Err("wavelength must be finite and > 0");
+        }
+        if self.octaves == 0 {
+            return Err("octaves must be >= 1");
+        }
+        if !self.amplitude.is_finite() || self.amplitude < 0.0 {
+            return Err("amplitude must be finite and >= 0");
+        }
+        if !self.base_y.is_finite() {
+            return Err("base_y must be finite");
+        }
+        if let Some(sea_level) = self.sea_level {
+            if !sea_level.is_finite() {
+                return Err("sea_level must be finite when present");
+            }
+        }
+        Ok(())
+    }
+
     /// Surface y at world `(x, z)`. Always in
     /// `[base_y - amplitude, base_y + amplitude]`.
     #[inline]
@@ -167,6 +188,7 @@ impl PrecomputedHeightmapField {
     /// Precompute heights and build the min/max mipmap.
     /// `side_log2` is the world level (e.g. 9 for 512³).
     pub fn new(field: HeightmapField, side_log2: u32) -> Self {
+        field.validate().expect("invalid heightmap field");
         let side = 1usize << side_log2;
         let n = side * side;
 
@@ -541,6 +563,20 @@ mod tests {
         assert_eq!(f2.classify([0, 42, 0], 2), Some(WATER));
     }
 
+    #[test]
+    fn validate_rejects_non_finite_sea_level() {
+        let mut f = test_field();
+        f.sea_level = Some(f32::NAN);
+        assert_eq!(f.validate(), Err("sea_level must be finite when present"));
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_wavelength() {
+        let mut f = test_field();
+        f.wavelength = 0.0;
+        assert_eq!(f.validate(), Err("wavelength must be finite and > 0"));
+    }
+
     // -----------------------------------------------------------------
     // PrecomputedHeightmapField — correctness and performance tests.
     // -----------------------------------------------------------------
@@ -639,5 +675,13 @@ mod tests {
             stats_local.leaves,
             stats_global.leaves,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid heightmap field")]
+    fn precomputed_rejects_invalid_field() {
+        let mut field = test_field();
+        field.wavelength = f32::NAN;
+        let _ = PrecomputedHeightmapField::new(field, 6);
     }
 }
