@@ -1612,8 +1612,7 @@ impl Renderer {
             // Hotbar overlay (e7k.6).
             if self.hotbar_visible {
                 let aspect = self.config.width as f32 / self.config.height as f32;
-                let hotbar_data: [f32; 4] =
-                    [aspect, self.hotbar_selected_slot as f32, 0.0, 0.0];
+                let hotbar_data: [f32; 4] = [aspect, self.hotbar_selected_slot as f32, 0.0, 0.0];
                 self.queue.write_buffer(
                     &self.hotbar_uniform_buffer,
                     0,

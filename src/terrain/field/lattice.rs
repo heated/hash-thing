@@ -429,9 +429,7 @@ mod tests {
         for oz in (0..side).step_by(4) {
             for oy in (0..side).step_by(4) {
                 for ox in (0..side).step_by(4) {
-                    if let Some(state) =
-                        f.classify([ox as i64, oy as i64, oz as i64], 2)
-                    {
+                    if let Some(state) = f.classify([ox as i64, oy as i64, oz as i64], 2) {
                         for z in oz..oz + 4 {
                             for y in oy..oy + 4 {
                                 for x in ox..ox + 4 {

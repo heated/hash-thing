@@ -1194,7 +1194,8 @@ impl ApplicationHandler for App {
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
-                                    renderer.hotbar_selected_slot = ps.held_material.saturating_sub(1) as u32;
+                                    renderer.hotbar_selected_slot =
+                                        ps.held_material.saturating_sub(1) as u32;
                                     if !stepping {
                                         let palette = self.world.materials.color_palette_rgba();
                                         let mat = ps.held_material as usize;

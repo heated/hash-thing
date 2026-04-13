@@ -2500,7 +2500,7 @@ mod tests {
     #[test]
     fn water_block_no_checkerboard_gaps() {
         let mut world = World::new(5); // 32³
-        // Place a 6×6×6 water block in the center, well away from boundaries.
+                                       // Place a 6×6×6 water block in the center, well away from boundaries.
         for z in 10..16 {
             for y in 16..22 {
                 for x in 10..16 {
@@ -2529,7 +2529,9 @@ mod tests {
         for y in 0..side {
             for z in 0..side {
                 for x in 0..side {
-                    let idx = x as usize + y as usize * side as usize + z as usize * side as usize * side as usize;
+                    let idx = x as usize
+                        + y as usize * side as usize
+                        + z as usize * side as usize * side as usize;
                     if Cell::from_raw(grid[idx]).material() == WATER_MATERIAL_ID {
                         water_by_y[y as usize] += 1;
                     }
