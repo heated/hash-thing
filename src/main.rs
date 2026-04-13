@@ -612,6 +612,31 @@ impl App {
         log::info!("Rule: {label}");
     }
 
+    fn load_demo_spectacle(&mut self, label: &str) {
+        if self.is_stepping() {
+            return;
+        }
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.seed_demo_spectacle();
+        self.reset_scene_entities();
+        self.gol_smoke_scene = false;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!("{label}: pop={}", self.world.population());
+    }
+
     fn select_held_material(&mut self, material_id: u16) {
         let name = match material_id {
             1 => "Stone",
@@ -695,6 +720,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn load_burning_room_demo(&mut self, label: &str) {
         if self.is_stepping() {
             return;
@@ -984,8 +1010,12 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Reset the default CA/materials demo.
-                            self.load_burning_room_demo("Reset burning room demo");
+                            self.load_terrain_scene(
+                                "Reset terrain",
+                                terrain::TerrainParams::for_level(
+                                    self.volume_size.trailing_zeros(),
+                                ),
+                            );
                         }
                         winit::keyboard::Key::Character("t") => {
                             // Plain terrain remains available as an explicit
@@ -1066,8 +1096,9 @@ impl ApplicationHandler for App {
                             }
                         }
                         winit::keyboard::Key::Character("b") => {
-                            // Burning room demo: fire + water + grass walls.
-                            self.load_burning_room_demo("Reset burning room demo");
+                            // Default demo gallery: deterministic local fire/water set pieces
+                            // staged around the beat waypoints.
+                            self.load_demo_spectacle("Reset spectacle gallery");
                         }
                         winit::keyboard::Key::Character("h") => {
                             // Toggle step-count heatmap debug mode.
@@ -1591,6 +1622,7 @@ fn main() {
     log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
+    log::info!("  B: reset spectacle gallery");
     log::info!("  M: reset gyroid megastructure");
     log::info!("  N: lattice megastructure demo");
     log::info!("  [: previous demo beat   ]: next demo beat");
@@ -1686,5 +1718,24 @@ mod tests {
         assert_eq!(LatticeDemoBeat::Intro.label(), "intro");
         assert_eq!(LatticeDemoBeat::Interior.label(), "interior");
         assert_eq!(LatticeDemoBeat::Panorama.label(), "panorama");
+    }
+
+    #[test]
+    fn demo_reset_restores_active_materials_near_each_waypoint() {
+        let demo_size = 64;
+        let mut app = App::new(demo_size);
+        app.world = sim::World::new(demo_size.trailing_zeros());
+
+        app.load_demo_spectacle("test reset");
+
+        for waypoint in app.world.demo_waypoints() {
+            assert!(
+                app.world
+                    .count_active_material_cells_near(waypoint.center, waypoint.radius)
+                    > 0,
+                "reset should restore spectacle at waypoint {}",
+                waypoint.label
+            );
+        }
     }
 }

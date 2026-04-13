@@ -161,7 +161,7 @@ mod validation_tests {
             amplitude: 3.25,
             wavelength: 19.0,
             octaves: 6,
-            sea_level: Some(9.0),
+            sea_level: Some(7.5),
         };
 
         let field = params.to_heightmap();
@@ -170,6 +170,6 @@ mod validation_tests {
         assert_eq!(field.amplitude, 3.25);
         assert_eq!(field.wavelength, 19.0);
         assert_eq!(field.octaves, 6);
-        assert_eq!(field.sea_level, Some(9.0));
+        assert_eq!(field.sea_level, Some(7.5));
     }
 }
