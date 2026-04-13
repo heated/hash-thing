@@ -92,7 +92,7 @@ impl TerrainParams {
 }
 
 #[cfg(test)]
-mod tests {
+mod validation_tests {
     use super::*;
 
     #[test]
@@ -166,8 +166,7 @@ mod tests {
             amplitude: 3.25,
             wavelength: 19.0,
             octaves: 6,
-            caves: Some(CaveParams::default()),
-            dungeons: Some(DungeonParams::default()),
+            sea_level: Some(28.0),
         };
 
         let field = params.to_heightmap();
