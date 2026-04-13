@@ -672,6 +672,8 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "env_logger",
+ "ht-octree",
+ "ht-render",
  "log",
  "pollster",
  "rustc-hash 2.1.2",
@@ -713,6 +715,25 @@ name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+
+[[package]]
+name = "ht-octree"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash 2.1.2",
+]
+
+[[package]]
+name = "ht-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "ht-octree",
+ "log",
+ "rustc-hash 2.1.2",
+ "wgpu",
+ "winit",
+]
 
 [[package]]
 name = "indexmap"

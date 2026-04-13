@@ -1,0 +1,702 @@
+// SVDAG raycasting compute shader (hash-thing-5bb.6.1).
+//
+// Iterative descent through a sparse voxel DAG, dispatched as a compute shader
+// writing to a storage texture. Converted from fragment shader to enable future
+// workgroup-cooperative optimizations (tile early-exit, shared DAG cache).
+//
+// Buffer layout (dag_nodes: array<u32>):
+//   [0]:     root_offset — absolute index of the current root node's slot
+//   [1..]:   append-only stream of 9-u32 interior-node slots
+//
+// Interior node slot (9 u32s):
+//   [0]: child_mask (low 8 bits = octant occupancy, bits 8-23 = representative material)
+//   [1..=8]: child entries, where each entry is:
+//     - bit 31 set → leaf, low 16 bits = material state
+//     - bit 31 clear → interior, value = absolute offset of child node in buffer
+//
+// Root lives at `dag_nodes[dag_nodes[0]]` — the root header updates every frame
+// while all other reachable slots stay stable, letting the CPU-side builder
+// serve incremental edits without rewriting the buffer. Root bounds are [0,1]^3.
+//
+// Traversal: explicit stack with depth capped at MAX_DEPTH (24 levels → 16M^3).
+// At each step we descend into the octant the ray is currently in. If empty,
+// we step the ray to the next octant boundary using DDA on the current level's
+// cell size. If leaf, shade it. If interior, push and descend.
+
+struct Uniforms {
+    camera_pos: vec4<f32>,
+    camera_dir: vec4<f32>,
+    camera_up: vec4<f32>,
+    camera_right: vec4<f32>,
+    // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: screen_height
+    params: vec4<f32>,
+    // x: debug_mode (0=normal, 1=step-count heatmap), y: lod_bias, z: output_width, w: output_height
+    debug: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> dag_nodes: array<u32>;
+@group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
+@group(0) @binding(3) var output: texture_storage_2d<rgba16float, write>;
+
+// Material color palette. Input is the packed 16-bit cell word:
+//   bits 15..6 material_id (10 bits)
+//   bits  5..0 metadata    ( 6 bits)
+// We index by material_id; metadata is reserved for future per-cell variation.
+//
+// DRIFT GUARD: the shift amount `6u` below mirrors `Cell::METADATA_BITS`
+// in src/octree/node.rs. If that constant ever changes, update this
+// shader accordingly. There is a pinning
+// test in src/render/mod.rs (test `wgsl_metadata_shift_matches_rust`).
+fn material_color(packed: u32) -> vec3<f32> {
+    let mat_id = packed >> 6u;
+    // Look up from GPU palette buffer uploaded by Renderer::upload_palette
+    // from MaterialRegistry::color_palette_rgba(). No more hardcoded switch —
+    // palette is always in sync with the Rust registry (hash-thing-5bb.7).
+    if mat_id < arrayLength(&palette) {
+        return palette[mat_id].xyz;
+    }
+    return vec3<f32>(0.6, 0.7, 0.8); // fallback for out-of-range mat_id
+}
+
+// ---------------------------------------------------------------------------
+// Procedural surface detail (hash-thing-e7k.2)
+//
+// Per-material shading variation using world-space position as noise seed.
+// No textures or CPU-side changes — pure shader-side procedural detail.
+// ---------------------------------------------------------------------------
+
+// Hash-based pseudo-random: fast, deterministic, no texture fetch.
+fn hash3(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Value noise: smooth random field from world-space position.
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f); // smoothstep
+
+    let n000 = hash3(i);
+    let n100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
+    let n010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0));
+    let n110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
+    let n001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0));
+    let n101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
+    let n011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
+
+    let nx00 = mix(n000, n100, u.x);
+    let nx10 = mix(n010, n110, u.x);
+    let nx01 = mix(n001, n101, u.x);
+    let nx11 = mix(n011, n111, u.x);
+    let nxy0 = mix(nx00, nx10, u.y);
+    let nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+
+// Per-material surface properties returned by material_shade.
+struct SurfaceProps {
+    color: vec3<f32>,      // modulated base color with procedural detail
+    roughness: f32,        // 0 = mirror, 1 = fully diffuse
+    emissive: vec3<f32>,   // additive glow (fire, lava)
+};
+
+// Shade a material with procedural detail based on world-space position.
+// `world_pos` is in [0,1]^3 voxel space scaled to root_side cells.
+// `time` is elapsed seconds from u.camera_pos.w.
+fn material_shade(packed: u32, world_pos: vec3<f32>, normal: vec3<f32>, time: f32) -> SurfaceProps {
+    let mat_id = packed >> 6u;
+    var base = material_color(packed);
+    var props: SurfaceProps;
+    props.roughness = 0.85;
+    props.emissive = vec3<f32>(0.0);
+
+    // Scale world_pos to voxel-cell coordinates for noise sampling.
+    let root_side = u.params.x;
+    let vox = world_pos * root_side;
+
+    // Material-specific procedural detail. IDs match MaterialRegistry:
+    // 0=air, 1=stone, 2=dirt, 3=grass, 4=fire, 5=water, 6=sand, 7=lava
+    switch mat_id {
+        case 1u: {
+            // Stone: layered noise for mineral veins + subtle color variation.
+            let coarse = value_noise(vox * 0.3);
+            let fine = value_noise(vox * 1.7);
+            let vein = smoothstep(0.42, 0.48, value_noise(vox * vec3<f32>(0.5, 0.2, 0.5)));
+            base = base * (0.85 + 0.3 * coarse) * (0.92 + 0.16 * fine);
+            // Dark veins
+            base = mix(base, base * 0.55, vein * 0.6);
+            props.roughness = 0.95;
+        }
+        case 2u: {
+            // Dirt: chunky low-frequency variation, warm-cool shift.
+            let n = value_noise(vox * 0.5);
+            let detail = value_noise(vox * 2.0);
+            base = base * (0.8 + 0.4 * n);
+            // Warm/cool variation: shift hue slightly
+            base.r += 0.04 * detail;
+            base.b -= 0.03 * detail;
+            props.roughness = 1.0;
+        }
+        case 3u: {
+            // Grass: fine detail, yellow-green variation.
+            let n = value_noise(vox * 1.5);
+            let fine = value_noise(vox * 4.0);
+            base = base * (0.85 + 0.3 * n);
+            // Shift toward yellow or deeper green per-voxel
+            base.r += 0.06 * fine;
+            base.g += 0.04 * (fine - 0.5);
+            // Top-face brightness boost (grass is brighter on top)
+            let top_factor = max(normal.y, 0.0);
+            base *= (0.9 + 0.15 * top_factor);
+            props.roughness = 0.9;
+        }
+        case 4u: {
+            // Fire: animated emissive flicker.
+            let flicker = value_noise(vox * 2.0 + vec3<f32>(0.0, time * 4.0, 0.0));
+            let pulse = 0.6 + 0.4 * flicker;
+            base *= pulse;
+            // Orange-to-yellow core
+            let core = value_noise(vox * 3.0 + vec3<f32>(time * 2.0, time * 5.0, 0.0));
+            props.emissive = base * (1.5 + core * 1.5);
+            props.roughness = 0.5;
+        }
+        case 5u: {
+            // Water: subtle depth-based tint, slight shimmer.
+            let shimmer = value_noise(vox * 2.0 + vec3<f32>(time * 0.3, 0.0, time * 0.2));
+            base *= (0.9 + 0.15 * shimmer);
+            // Slight specular sheen
+            props.roughness = 0.3;
+        }
+        case 6u: {
+            // Sand: fine speckle, warm granular texture.
+            let grain = value_noise(vox * 5.0);
+            let coarse = value_noise(vox * 0.8);
+            base *= (0.88 + 0.24 * grain);
+            base.r += 0.03 * coarse;
+            props.roughness = 0.92;
+        }
+        case 7u: {
+            // Lava: pulsing emissive glow, molten surface.
+            let flow = value_noise(vox * 0.8 + vec3<f32>(time * 0.1, time * -0.15, time * 0.05));
+            let hot = value_noise(vox * 2.0 + vec3<f32>(time * 0.3, time * 0.5, 0.0));
+            base *= (0.7 + 0.5 * flow);
+            // Hot spots glow brighter orange-yellow
+            let glow_color = mix(vec3<f32>(1.0, 0.3, 0.0), vec3<f32>(1.0, 0.8, 0.2), hot);
+            props.emissive = glow_color * (0.8 + 0.6 * flow);
+            props.roughness = 0.6;
+        }
+        default: {
+            // Unknown materials: subtle noise to avoid dead-flat appearance.
+            let n = value_noise(vox * 1.0);
+            base *= (0.9 + 0.2 * n);
+        }
+    }
+
+    props.color = base;
+    return props;
+}
+
+// Enhanced lighting with per-material roughness and specular.
+fn shade_surface(props: SurfaceProps, normal: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
+    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+    let diffuse = max(dot(normal, light_dir), 0.0);
+
+    // Blinn-Phong specular, modulated by roughness.
+    let half_vec = normalize(light_dir - rd);
+    let spec_power = mix(64.0, 2.0, props.roughness);
+    let spec = pow(max(dot(normal, half_vec), 0.0), spec_power);
+    let spec_strength = (1.0 - props.roughness) * 0.4;
+
+    // Ambient with subtle directional fill from below
+    let ambient = 0.25 + 0.05 * max(-normal.y, 0.0);
+
+    let lit = props.color * (ambient + diffuse * 0.7) + vec3<f32>(spec * spec_strength);
+    return lit + props.emissive;
+}
+
+fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec2<f32> {
+    let t1 = (box_min - origin) * inv_dir;
+    let t2 = (box_max - origin) * inv_dir;
+    let tmin = min(t1, t2);
+    let tmax = max(t1, t2);
+    let t_near = max(max(tmin.x, tmin.y), tmin.z);
+    let t_far = min(min(tmax.x, tmax.y), tmax.z);
+    return vec2<f32>(t_near, t_far);
+}
+
+// Octant index from a point relative to the node center.
+// Returns bit-packed index 0..7 with bit 0 = x, bit 1 = y, bit 2 = z.
+//
+// hash-thing-6hd: uses STRICT `>` for the HIGH half with `rd >= 0` as a
+// tiebreaker on exact-midpoint positions. The pre-6hd code used `>=` which
+// biased midpoint-exact positions to the HIGH half regardless of ray
+// direction; on simultaneous two-axis exits, the step-past nudge on a
+// non-dominant axis can underflow to sub-ULP (dt * |rd_axis| < ULP(pos)),
+// leaving pos EXACTLY on the boundary. The `>=` bias then picked the
+// wrong sibling whenever `rd_axis < 0`. Codex reproducer (float32):
+// rd = (1.0, -1e-6, 0.0). Post-step pos.x = 0.50000995, pos.y = 0.5
+// (unchanged by the sub-ULP nudge on y), pos.z = 0.25 — old code returned
+// oct 3 (x-HIGH, y-HIGH), physically correct is oct 1 (x-HIGH, y-LOW)
+// because rd.y < 0.
+//
+// Zero-rd convention: when rd.axis == 0.0, the tiebreak resolves to HIGH
+// (the ray can't cross the midpoint on that axis, so the choice is
+// physically inert). Must match the CPU oracle in svdag.rs.
+fn octant_of(pos: vec3<f32>, rd: vec3<f32>, node_min: vec3<f32>, half: f32) -> u32 {
+    var idx: u32 = 0u;
+    let mid = node_min + vec3<f32>(half);
+    if pos.x > mid.x || (pos.x == mid.x && rd.x >= 0.0) { idx |= 1u; }
+    if pos.y > mid.y || (pos.y == mid.y && rd.y >= 0.0) { idx |= 2u; }
+    if pos.z > mid.z || (pos.z == mid.z && rd.z >= 0.0) { idx |= 4u; }
+    return idx;
+}
+
+const MAX_DEPTH: u32 = 24u;
+const LEAF_BIT: u32 = 0x80000000u;
+// Integer DDA (hash-thing-pck): leaf-resolution grid.
+// At MAX_DEPTH=24, RESOLUTION = 2^24 = 16M. Exact in f32 (24-bit mantissa),
+// so DDA boundary computation stays precise. Supports 16M^3 worlds — enough
+// for any practical hashlife scale. Pinned by cpu_trace::integer_dda_exact.
+const RESOLUTION: u32 = 1u << MAX_DEPTH;
+const INV_RES: f32 = 1.0 / f32(RESOLUTION);
+// hash-thing-m1f.7.3: stack depth is decoupled from DDA resolution.
+// MAX_DEPTH (24) drives RESOLUTION for DDA precision; MAX_STACK (16) caps
+// the actual descent depth and stack array size. Reducing from 24 to 16
+// saves ~160 bytes of per-thread register space (3 arrays × 8 fewer slots),
+// improving GPU occupancy and latency hiding. Supports worlds up to
+// 2^16 = 65536 cells/side — well beyond any practical Hashlife scale.
+const MAX_STACK: u32 = 16u;
+
+// hash-thing-2w5: step budget scales with root_level so deep scenes don't
+// silently black out on long sparse traversals. Must stay in lockstep with
+// `render::svdag::tests::step_budget` on the CPU replica.
+//   MIN_STEP_BUDGET = 1024  (floor for shallow demo worlds)
+//   STEP_BUDGET_FUDGE = 8   (per-cell multiplier above the 3*root_side
+//                            diagonal worst case)
+const MIN_STEP_BUDGET: u32 = 1024u;
+const STEP_BUDGET_FUDGE: u32 = 8u;
+
+struct RayResult {
+    color: vec4<f32>,
+    steps: u32,
+    max_steps: u32,
+};
+
+// Step-count heatmap: green (0%) → yellow (50%) → red (100%).
+fn heatmap_color(ratio: f32) -> vec3<f32> {
+    let t = clamp(ratio, 0.0, 1.0);
+    if t < 0.5 {
+        return mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), t * 2.0);
+    }
+    return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+}
+
+// Iterative DAG descent.
+//
+// Strategy: for each ray, start at root. At each level, compute which octant
+// the ray is currently in, look at the child. If leaf non-empty → hit.
+// If empty → step ray past the octant boundary and re-test. If interior →
+// descend. When we exit the node, pop the stack.
+//
+// This is a straightforward first implementation — not Laine-Karras optimal,
+// but correct enough to prove the pipeline works and reserve the complexity
+// budget. Optimizations (ray-octant mirroring, ancestor memoization, bitmask
+// coalescing) can be layered on later.
+fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
+    // Laine-Karras Stage 2: mirror ray so rd is componentwise non-negative.
+    // Octant child indices are XORed with mirror_mask during DAG lookup.
+    let neg = rd < vec3<f32>(0.0);
+    let mirror_mask = select(0u, 1u, neg.x) | select(0u, 2u, neg.y) | select(0u, 4u, neg.z);
+    let rd_m = abs(rd);
+    let ro_m = select(ro, vec3<f32>(1.0) - ro, neg);
+
+    // Guard zero ray-direction components (hash-thing-5bb.8).
+    let rd_eps = vec3<f32>(1e-30);
+    let safe_rd = max(rd_m, rd_eps);
+    let inv_rd = 1.0 / safe_rd;
+
+    // Per-ray step budget (hash-thing-2w5). Derived from u.params.x which the
+    // host sets to `1 << dag.root_level` cells per side. Must stay in
+    // lockstep with `cpu_trace::step_budget` in svdag.rs — the clamp at
+    // `1 << 29` mirrors the CPU replica's `root_level.min(30)` +
+    // `saturating_mul` guard so a pathological root_level can't overflow
+    // `root_side * STEP_BUDGET_FUDGE` silently in u32. At the upper clamp
+    // (root_side = 2^29), `* 8 = 2^32` would wrap — so the clamp is one
+    // notch tighter than the CPU to leave headroom in u32.
+    let root_side_raw = u32(u.params.x);
+    let root_side = min(root_side_raw, 1u << 28u);
+    let max_steps = max(MIN_STEP_BUDGET, root_side * STEP_BUDGET_FUDGE);
+
+    // Intersect mirrored ray with root cube [0,1]^3
+    let root_hit = intersect_aabb(ro_m, inv_rd, vec3<f32>(0.0), vec3<f32>(1.0));
+    if root_hit.x > root_hit.y || root_hit.y < 0.0 {
+        return RayResult(vec4<f32>(0.0), 0u, 1u);
+    }
+
+    // hash-thing-27m v2: clamp ro to the root-cube entry (Laine-Karras).
+    let entry = max(root_hit.x, 0.0);
+    let ro_local = ro_m + rd_m * entry;
+    let t_exit = root_hit.y - entry;
+
+    // LOD (x5w): pixel angular size in [0,1]³ world-space. A voxel smaller
+    // than ~1 pixel isn't visually distinguishable — we can stop descending
+    // and treat it as a hit. `pixel_world` is the world-space size of one
+    // pixel at distance 1.0 from the camera.
+    let screen_height = u.params.w;
+    let fov_tan = u.params.z;
+    let pixel_world = select(0.0, 2.0 * fov_tan / screen_height, screen_height > 0.0);
+
+    // Integer DDA state (hash-thing-pck).
+    var int_pos: vec3<u32> = vec3<u32>(
+        u32(clamp(floor(ro_local.x * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
+        u32(clamp(floor(ro_local.y * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
+        u32(clamp(floor(ro_local.z * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
+    );
+
+    // Stack of (node_offset, node_min, half_size, child_mask).
+    // child_mask is cached on push to avoid re-reading the buffer during
+    // the skip loop and descent empty-checks (hash-thing-m1f.7.3).
+    var stack_node: array<u32, MAX_STACK>;
+    var stack_min: array<vec3<f32>, MAX_STACK>;
+    var stack_half: array<f32, MAX_STACK>;
+    var stack_cmask: array<u32, MAX_STACK>;
+    var depth: u32 = 0u;
+
+    // Slot 0 of the buffer holds the current root offset; real slots start at 1.
+    let root_offset = dag_nodes[0];
+    stack_node[0] = root_offset;
+    stack_min[0] = vec3<f32>(0.0);
+    stack_half[0] = 0.5;
+    stack_cmask[0] = dag_nodes[root_offset];
+
+    // Local-frame starting t — just past the root entry. `ro_local`
+    // already sits on the root face, so we nudge forward by EPS.
+    var t = 1e-5;
+
+    var step = 0u;
+    loop {
+        if step >= max_steps { break; }
+        // Normal miss path: walked past the root exit cleanly. Must be an
+        // explicit background return, NOT a `break` — the post-loop
+        // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
+        // so any `break` here would render every clean root-exit as magenta.
+        if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
+        // Integer DDA (hash-thing-pck): pos from integer cell center.
+        var pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
+
+        // If the current top-of-stack no longer contains `pos`, pop.
+        // NOTE: STRICT bounds (no EPS slack). Integer DDA (hash-thing-pck)
+        // derives t from exact cell boundaries, so pos = ro_local + rd_m * t
+        // always advances strictly past the octant boundary.
+        var top = depth;
+        loop {
+            let node_min = stack_min[top];
+            let h2 = stack_half[top] * 2.0;
+            if all(pos >= node_min) && all(pos < node_min + h2) {
+                break;
+            }
+            if top == 0u {
+                // Exited root
+                return RayResult(vec4<f32>(0.0), step, max_steps);
+            }
+            top = top - 1u;
+        }
+        depth = top;
+
+        // Descend until leaf or empty
+        var descended = false;
+        for (var d = 0u; d < MAX_STACK; d = d + 1u) {
+            let node_offset = stack_node[depth];
+            let node_min = stack_min[depth];
+            let half = stack_half[depth];
+            let cmask = stack_cmask[depth];
+
+            // LOD cutoff (x5w): if this voxel is sub-pixel, use the
+            // representative material packed in bits 8-23 of child_mask
+            // (m1f.7.3.2). No child scan needed — 0 buffer reads.
+            // LOD bias (m1f.7.3.3): multiply threshold by debug.y (default 1.0)
+            // to allow runtime LOD tuning. Higher = more aggressive = faster.
+            let lod_bias = max(u.debug.y, 1.0);
+            let t_dist = max(t + entry, 1e-4);
+            if pixel_world > 0.0 && half < pixel_world * t_dist * lod_bias {
+                let lod_mat = (cmask >> 8u) & 0xFFFFu;
+                if lod_mat > 0u {
+                    // Shade with procedural detail at LOD node center.
+                    // Approximate normal: use the entry face of this node.
+                    let nmin = node_min;
+                    let nmax = node_min + vec3<f32>(half * 2.0);
+                    let nt1 = (nmin - ro_local) * inv_rd;
+                    let nt2 = (nmax - ro_local) * inv_rd;
+                    let ntmin_v = min(nt1, nt2);
+                    var normal = vec3<f32>(0.0, 1.0, 0.0);
+                    if ntmin_v.x >= ntmin_v.y && ntmin_v.x >= ntmin_v.z {
+                        normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);
+                    } else if ntmin_v.y >= ntmin_v.z {
+                        normal = vec3<f32>(0.0, -sign(rd.y), 0.0);
+                    } else {
+                        normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
+                    }
+                    let lod_center = node_min + vec3<f32>(half);
+                    let lod_time = u.camera_pos.w;
+                    let lod_props = material_shade(lod_mat, lod_center, normal, lod_time);
+                    let lit = shade_surface(lod_props, normal, rd);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
+                }
+                // All children empty — step past this node
+                break;
+            }
+
+            let oct = octant_of(pos, rd_m, node_min, half);
+            // Stage 2: XOR to un-mirror the octant for DAG lookup.
+            let mirrored_oct = oct ^ mirror_mask;
+
+            // m1f.7.3: check cached child_mask before reading child_slot.
+            // If the octant is empty, skip the buffer read entirely.
+            if (cmask & (1u << mirrored_oct)) == 0u {
+                break; // empty child — go to DDA
+            }
+
+            let child_slot = dag_nodes[node_offset + 1u + mirrored_oct];
+
+            if (child_slot & LEAF_BIT) != 0u {
+                let mat = child_slot & 0xFFFFu;
+                if mat > 0u {
+                    // HIT — analytical face normal from the leaf AABB.
+                    //
+                    // hash-thing-rv4: pre-rv4 the shade was
+                    //   `0.35 + 0.65 * abs(rd.y)`
+                    // which depends only on ray direction, not surface
+                    // orientation — every cube face got the same shade,
+                    // collapsing all depth cues. Edward: "it's like weirdly
+                    // flat." This block derives the true surface normal
+                    // from which axis of the leaf AABB the ray entered
+                    // through (textbook voxel raycaster normal), then
+                    // applies Lambertian shading.
+                    let leaf_min = vec3<f32>(
+                        node_min.x + f32(oct & 1u) * half,
+                        node_min.y + f32((oct >> 1u) & 1u) * half,
+                        node_min.z + f32((oct >> 2u) & 1u) * half,
+                    );
+                    let leaf_max = leaf_min + vec3<f32>(half);
+                    // Per-axis slab entry times. `tmin_v` is the max-across
+                    // axes at entry, and the axis holding that max is the
+                    // last face the ray crossed to get inside the voxel.
+                    //
+                    // hash-thing-2nd: inside-leaf fallback. When the ray
+                    // origin sits inside the filled voxel, every `tmin_v`
+                    // component is negative — the entry-face picker then
+                    // returns the nearest back face and the normal flips
+                    // inward, shading the voxel as if lit from behind. The
+                    // orbit camera reaches this case on deep zoom. Fallback:
+                    // pick the nearest exit face (argmin of `tmax_v`) and
+                    // flip the sign so the normal points in the direction
+                    // the ray is heading — the "about to emerge" convention.
+                    // The outer cascade uses `>=` on both comparators so
+                    // entry-face ties break identically to the CPU oracle
+                    // in svdag.rs — do NOT flip to `>`. The inner (inside)
+                    // cascade uses `<=` for the same reason: CPU/GPU must
+                    // break exit-face ties identically.
+                    let lt1 = (leaf_min - ro_local) * inv_rd;
+                    let lt2 = (leaf_max - ro_local) * inv_rd;
+                    let tmin_v = min(lt1, lt2);
+                    let tmax_v = max(lt1, lt2);
+                    var normal = vec3<f32>(0.0);
+                    let inside = tmin_v.x < 0.0 && tmin_v.y < 0.0 && tmin_v.z < 0.0;
+                    if inside {
+                        if tmax_v.x <= tmax_v.y && tmax_v.x <= tmax_v.z {
+                            normal = vec3<f32>(sign(rd.x), 0.0, 0.0);
+                        } else if tmax_v.y <= tmax_v.z {
+                            normal = vec3<f32>(0.0, sign(rd.y), 0.0);
+                        } else {
+                            normal = vec3<f32>(0.0, 0.0, sign(rd.z));
+                        }
+                    } else if tmin_v.x >= tmin_v.y && tmin_v.x >= tmin_v.z {
+                        normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);
+                    } else if tmin_v.y >= tmin_v.z {
+                        normal = vec3<f32>(0.0, -sign(rd.y), 0.0);
+                    } else {
+                        normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
+                    }
+                    // Procedural surface detail should follow the actual
+                    // surface hit point, not the leaf center, or large
+                    // collapsed leaves show up as floating rectangular
+                    // shading patches. Bias a fraction of a cell inward so
+                    // the sample stays inside the hit voxel on the chosen face.
+                    let hit_t = select(
+                        max(max(tmin_v.x, tmin_v.y), tmin_v.z),
+                        min(min(tmax_v.x, tmax_v.y), tmax_v.z),
+                        inside,
+                    );
+                    let hit_pos =
+                        ro_local + rd * max(hit_t, 0.0) - normal * (INV_RES * 0.25);
+                    let hit_time = u.camera_pos.w;
+                    let surf = material_shade(mat, hit_pos, normal, hit_time);
+                    let lit = shade_surface(surf, normal, rd);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
+                }
+                // Empty leaf — break to step ray
+                break;
+            } else {
+                // Interior node — descend
+                if depth + 1u >= MAX_STACK { break; }
+                let child_min = vec3<f32>(
+                    node_min.x + f32(oct & 1u) * half,
+                    node_min.y + f32((oct >> 1u) & 1u) * half,
+                    node_min.z + f32((oct >> 2u) & 1u) * half,
+                );
+                depth = depth + 1u;
+                stack_node[depth] = child_slot;
+                stack_min[depth] = child_min;
+                stack_half[depth] = half * 0.5;
+                stack_cmask[depth] = dag_nodes[child_slot];
+                descended = true;
+            }
+        }
+
+        // Step past the current (empty) octant, then skip consecutive empty
+        // siblings using the parent's child_mask (hash-thing-x5w.1). Without
+        // this inner loop, each empty sibling costs a full outer-loop
+        // iteration (pop + descend + DDA). With it, the ray jumps across all
+        // empty children of a node in one pass — major win for sparse scenes.
+        // Hoist invariants — depth doesn't change within the inner loop.
+        // m1f.7.3: use cached child_mask instead of re-reading from buffer.
+        let skip_mask = stack_cmask[depth];
+        let node_min_s = stack_min[depth];
+        let half_s = stack_half[depth];
+        loop {
+            let pos_s = (vec3<f32>(int_pos) + 0.5) * INV_RES;
+            let oct_s = octant_of(pos_s, rd_m, node_min_s, half_s);
+            let child_min_s = vec3<f32>(
+                node_min_s.x + f32(oct_s & 1u) * half_s,
+                node_min_s.y + f32((oct_s >> 1u) & 1u) * half_s,
+                node_min_s.z + f32((oct_s >> 2u) & 1u) * half_s,
+            );
+            let child_max_s = child_min_s + vec3<f32>(half_s);
+            // Stage 2: rd_m is all non-negative, so t2 > t1 on every axis.
+            let t2_s = (child_max_s - ro_local) * inv_rd;
+            // Find exit axis (smallest exit time).
+            var exit_axis: u32 = 0u;
+            if t2_s.y < t2_s.x {
+                exit_axis = 1u;
+            }
+            if t2_s.z < select(t2_s.x, t2_s.y, exit_axis == 1u) {
+                exit_axis = 2u;
+            }
+            // Integer DDA: advance int_pos on exit axis.
+            let step_cells = 1u << (MAX_DEPTH - 1u - depth);
+            let cmin_exit = select(select(child_min_s.x, child_min_s.y, exit_axis == 1u), child_min_s.z, exit_axis == 2u);
+            let octant_base = u32(cmin_exit * f32(RESOLUTION));
+            let boundary_cell = octant_base + step_cells;
+            if boundary_cell >= RESOLUTION {
+                return RayResult(vec4<f32>(0.0), step, max_steps); // exited volume
+            }
+            if exit_axis == 0u { int_pos.x = boundary_cell; }
+            else if exit_axis == 1u { int_pos.y = boundary_cell; }
+            else { int_pos.z = boundary_cell; }
+            // Derive t from exact exit-axis boundary. Monotonicity
+            // guaranteed: if boundary t doesn't advance (rare corner case),
+            // nudge by 1 ULP via bitcast. Safe because pos comes from int_pos.
+            let boundary = f32(boundary_cell) * INV_RES;
+            let ro_exit = select(select(ro_local.x, ro_local.y, exit_axis == 1u), ro_local.z, exit_axis == 2u);
+            let inv_rd_exit = select(select(inv_rd.x, inv_rd.y, exit_axis == 1u), inv_rd.z, exit_axis == 2u);
+            let t_boundary = (boundary - ro_exit) * inv_rd_exit;
+            if t_boundary > t {
+                t = t_boundary;
+            } else {
+                t = bitcast<f32>(bitcast<u32>(t) + 1u);
+            }
+
+            step += 1u;
+
+            // hash-thing-x5w.1: check if the next octant is also empty and
+            // still inside the same parent. If so, skip it without going
+            // through the outer loop's pop+descend overhead.
+            if step >= max_steps { break; }
+            if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
+            pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
+            let h2_s = half_s * 2.0;
+            if !(all(pos >= node_min_s) && all(pos < node_min_s + h2_s)) {
+                break; // exited parent — outer loop will pop
+            }
+            let next_oct = octant_of(pos, rd_m, node_min_s, half_s);
+            if (skip_mask & (1u << (next_oct ^ mirror_mask))) != 0u {
+                break; // next octant is occupied — outer loop will descend
+            }
+            // Next octant is empty — continue inner DDA loop to skip it
+        }
+    }
+
+    // hash-thing-2w5: post-loop fall-through means we blew the step budget
+    // while still inside the root cube (neither hit nor exited). Pre-2w5
+    // this returned a silent black pixel indistinguishable from the real
+    // background — budget exhaustion would just visually black out deep
+    // worlds. Now we surface it as a magenta sentinel so the failure mode
+    // is impossible to miss on screen. The CPU replica sets
+    // `TraceResult.exhausted = true` for the same condition so tests can
+    // assert on it directly.
+    return RayResult(vec4<f32>(1.0, 0.0, 1.0, 1.0), step, max_steps);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let width = u32(u.debug.z);
+    let height = u32(u.debug.w);
+
+    // OOB guard: edge workgroups may dispatch threads beyond the output
+    // texture dimensions when width/height aren't multiples of 8.
+    if gid.x >= width || gid.y >= height {
+        return;
+    }
+
+    // Compute UV in [-1, 1] range matching the old vertex shader output.
+    let uv = vec2<f32>(
+        (f32(gid.x) + 0.5) / f32(width) * 2.0 - 1.0,
+        // Flip Y: gid.y=0 is top of screen, but UV.y=1 should be top
+        1.0 - (f32(gid.y) + 0.5) / f32(height) * 2.0,
+    );
+
+    let aspect = u.params.y;
+    let fov_tan = u.params.z;
+
+    let rd = normalize(
+        u.camera_dir.xyz +
+        u.camera_right.xyz * uv.x * aspect * fov_tan +
+        u.camera_up.xyz * uv.y * fov_tan
+    );
+    let ro = u.camera_pos.xyz;
+
+    let result = raycast(ro, rd);
+    let debug_mode = u32(u.debug.x);
+
+    var final_color: vec4<f32>;
+
+    // Debug mode 1: step-count heatmap. Shows traversal cost per pixel.
+    if debug_mode == 1u {
+        let ratio = f32(result.steps) / f32(result.max_steps);
+        let hm = heatmap_color(ratio);
+        // Dim background rays (no hit) to distinguish sky from geometry.
+        if result.color.a == 0.0 {
+            final_color = vec4<f32>(hm * 0.3, 1.0);
+        } else {
+            final_color = vec4<f32>(hm, 1.0);
+        }
+    } else if result.color.a > 0.0 {
+        final_color = result.color;
+    } else {
+        // Sky gradient: lighter blue at top, desaturated at horizon.
+        let sky_t = uv.y * 0.5 + 0.5;
+        let sky_top = vec3<f32>(0.35, 0.55, 0.90);
+        let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
+        let bg = mix(sky_bot, sky_top, sky_t);
+        final_color = vec4<f32>(bg, 1.0);
+    }
+
+    // Store linear color — the blit shader writes to an sRGB swapchain surface,
+    // so hardware sRGB encoding happens at the final render pass output.
+    // No manual conversion needed here; rgba16float stores linear values losslessly.
+    textureStore(output, vec2<i32>(gid.xy), final_color);
+}
