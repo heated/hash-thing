@@ -441,6 +441,69 @@ impl App {
         log::info!("Spawned environmental demo entities: geyser, volcano, whirlpool, critters");
     }
 
+    fn renderer_camera_world_pos(&self, renderer: &render::Renderer) -> [f64; 3] {
+        let target = [
+            self.render_origin[0] as f64
+                + renderer.camera_target[0] as f64 / self.render_inv_size as f64,
+            self.render_origin[1] as f64
+                + renderer.camera_target[1] as f64 / self.render_inv_size as f64,
+            self.render_origin[2] as f64
+                + renderer.camera_target[2] as f64 / self.render_inv_size as f64,
+        ];
+        let (sin_yaw, cos_yaw) = renderer.camera_yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = renderer.camera_pitch.sin_cos();
+        let cam_dir = [-cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw];
+        [
+            target[0]
+                - cam_dir[0] as f64 * renderer.camera_dist as f64 / self.render_inv_size as f64,
+            target[1]
+                - cam_dir[1] as f64 * renderer.camera_dist as f64 / self.render_inv_size as f64,
+            target[2]
+                - cam_dir[2] as f64 * renderer.camera_dist as f64 / self.render_inv_size as f64,
+        ]
+    }
+
+    fn upload_visible_particles(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let Some(camera_pos) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| self.renderer_camera_world_pos(renderer))
+        else {
+            return;
+        };
+
+        let inv_size = self.render_inv_size;
+        let wo = self.render_origin;
+        let particle_data: Vec<[f32; 4]> = self
+            .entities
+            .iter()
+            .filter_map(|e| {
+                let mat = match &e.kind {
+                    sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
+                    sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
+                        e.render_material().unwrap() as u32
+                    }
+                };
+                if !player::has_line_of_sight(&self.world, camera_pos, e.pos) {
+                    return None;
+                }
+                Some([
+                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
+                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
+                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
+                    f32::from_bits(mat),
+                ])
+            })
+            .collect();
+
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_particles(&particle_data);
+        }
+    }
+
     /// True while the sim step is running on a background thread.
     fn is_stepping(&self) -> bool {
         self.step_handle.is_some()
@@ -1443,31 +1506,6 @@ impl ApplicationHandler for App {
                                         &mut self.svdag,
                                         &mut self.last_svdag_stats,
                                     );
-                                    if let Some(renderer) = &mut self.renderer {
-                                        let inv_size = self.render_inv_size;
-                                        let wo = self.render_origin;
-                                        let particle_data: Vec<[f32; 4]> = self
-                                            .entities
-                                            .iter()
-                                            .filter_map(|e| {
-                                                let mat = match &e.kind {
-                                                    sim::EntityKind::Player(_)
-                                                    | sim::EntityKind::Emitter(_) => return None,
-                                                    sim::EntityKind::Particle(_)
-                                                    | sim::EntityKind::Critter(_) => {
-                                                        e.render_material().unwrap() as u32
-                                                    }
-                                                };
-                                                Some([
-                                                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
-                                                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
-                                                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
-                                                    f32::from_bits(mat),
-                                                ])
-                                            })
-                                            .collect();
-                                        renderer.upload_particles(&particle_data);
-                                    }
                                 }
                             }
                             Err(msg) => {
@@ -1725,6 +1763,8 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+
+                self.upload_visible_particles();
 
                 // Time render. Disjoint-field borrows: the Timer holds
                 // self.perf, renderer borrows self.renderer — orthogonal.
