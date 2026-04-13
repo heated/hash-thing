@@ -8,8 +8,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, VINE,
-    WATER,
+    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, FIREWORK, GRASS, SAND,
+    STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -1354,6 +1354,7 @@ impl World {
         self.fill_box(atrium, AIR);
         self.fill_box(balcony, AIR);
         self.fill_box(panorama, AIR);
+        self.seed_reveal_fireworks(balcony.center());
         self.seed_progression_break_trigger(tease_a);
 
         let player_pos = [
@@ -1493,6 +1494,19 @@ impl World {
             Self::spectacle_box(waypoint.center, [0, 1, 0], [1, 2, 0]),
             FIRE,
         );
+    }
+
+    fn seed_reveal_fireworks(&mut self, center: [i64; 3]) {
+        for &(dx, dz) in &[(-4, -3), (-4, 2), (-1, -3), (-1, 2)] {
+            self.fill_box(
+                Self::spectacle_box(center, [dx, -1, dz], [dx + 1, 0, dz + 1]),
+                STONE,
+            );
+            self.fill_box(
+                Self::spectacle_box(center, [dx, 1, dz], [dx, 2, dz]),
+                FIREWORK,
+            );
+        }
     }
 
     fn commit_step(&mut self, next: &[CellState], side: usize) {
@@ -1647,7 +1661,9 @@ mod tests {
     use super::*;
     use crate::player;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
-    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, VINE, WATER};
+    use crate::terrain::materials::{
+        MaterialRegistry, FIRE, FIREWORK, GRASS, LAVA, SAND, STONE, VINE, WATER,
+    };
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -2056,6 +2072,18 @@ mod tests {
                 "checkpoint must be air: {checkpoint:?}"
             );
         }
+    }
+
+    #[test]
+    fn lattice_progression_demo_stages_fireworks_near_reveal() {
+        let mut w = World::new(6); // side 64
+        let layout = w.seed_lattice_progression_demo();
+        let snapshot = local_snapshot(&w, layout.reveal_center, 5);
+        assert!(
+            snapshot.contains(&FIREWORK),
+            "reveal should stage firework launchers near {:?}",
+            layout.reveal_center
+        );
     }
 
     #[test]
