@@ -241,7 +241,7 @@ struct App {
     legend_visible: bool,
     /// True when the legend texture needs re-upload (mode change or toggle).
     legend_dirty: bool,
-    /// Active named lattice beat, if the user is in the curated demo flow.
+    /// Last lattice debug-jump preset used from orbit mode.
     current_demo_beat: Option<LatticeDemoBeat>,
 }
 
@@ -397,10 +397,7 @@ impl App {
                 "",
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Lattice",
-                "  [/] Prev/Next beat",
-                "  U/I/O Intro/Interior/Reveal",
-                "  V  Tweet reveal",
+                "  M  Gyroid     N  Walk lattice",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
@@ -418,16 +415,20 @@ impl App {
                 "",
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Lattice",
-                "  [/] Prev/Next beat",
-                "  U/I/O Intro/Interior/Reveal",
-                "  V  Tweet reveal",
+                "  M  Gyroid     N  Walk lattice",
+                "  [/] DEV prev/next jump",
+                "  U/I/O DEV intro/interior/reveal",
+                "  V  DEV tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
                 "  Esc Quit",
             ],
         }
+    }
+
+    fn lattice_debug_jumps_enabled(&self) -> bool {
+        self.camera_mode == CameraMode::Orbit
     }
 
     /// Update cached render-side world geometry after world changes.
@@ -476,7 +477,7 @@ impl App {
         self.apply_player_pose(waypoint.player);
         self.apply_orbit_camera_pose(waypoint.camera);
         self.current_demo_beat = Some(beat);
-        log::info!("Lattice demo preset: {} ({})", waypoint.label, beat.label());
+        log::info!("Lattice debug jump: {} ({})", waypoint.label, beat.label());
     }
 
     fn cycle_lattice_demo_beat(&mut self, step: i32) {
@@ -1054,22 +1055,34 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("n") => {
                             self.load_lattice_demo();
                         }
-                        winit::keyboard::Key::Character("[") => {
+                        winit::keyboard::Key::Character("[")
+                            if self.lattice_debug_jumps_enabled() =>
+                        {
                             self.cycle_lattice_demo_beat(-1);
                         }
-                        winit::keyboard::Key::Character("]") => {
+                        winit::keyboard::Key::Character("]")
+                            if self.lattice_debug_jumps_enabled() =>
+                        {
                             self.cycle_lattice_demo_beat(1);
                         }
-                        winit::keyboard::Key::Character("u") => {
+                        winit::keyboard::Key::Character("u")
+                            if self.lattice_debug_jumps_enabled() =>
+                        {
                             self.select_lattice_demo_beat(LatticeDemoBeat::Intro);
                         }
-                        winit::keyboard::Key::Character("i") => {
+                        winit::keyboard::Key::Character("i")
+                            if self.lattice_debug_jumps_enabled() =>
+                        {
                             self.select_lattice_demo_beat(LatticeDemoBeat::Interior);
                         }
-                        winit::keyboard::Key::Character("o") => {
+                        winit::keyboard::Key::Character("o")
+                            if self.lattice_debug_jumps_enabled() =>
+                        {
                             self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
                         }
-                        winit::keyboard::Key::Character("v") => {
+                        winit::keyboard::Key::Character("v")
+                            if self.lattice_debug_jumps_enabled() =>
+                        {
                             self.load_lattice_panorama_demo();
                         }
                         winit::keyboard::Key::Character(
@@ -1624,10 +1637,10 @@ fn main() {
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  B: reset spectacle gallery");
     log::info!("  M: reset gyroid megastructure");
-    log::info!("  N: lattice megastructure demo");
-    log::info!("  [: previous demo beat   ]: next demo beat");
-    log::info!("  U/I/O: intro/interior/reveal demo beats");
-    log::info!("  V: panoramic lattice reveal preset");
+    log::info!("  N: lattice walk-through demo");
+    log::info!("  [/] DEV previous/next lattice jump (orbit mode)");
+    log::info!("  U/I/O: DEV intro/interior/reveal lattice jumps (orbit mode)");
+    log::info!("  V: DEV panoramic lattice reveal jump (orbit mode)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
@@ -1718,6 +1731,24 @@ mod tests {
         assert_eq!(LatticeDemoBeat::Intro.label(), "intro");
         assert_eq!(LatticeDemoBeat::Interior.label(), "interior");
         assert_eq!(LatticeDemoBeat::Panorama.label(), "panorama");
+    }
+
+    #[test]
+    fn first_person_legend_hides_lattice_debug_jumps() {
+        let lines = App::legend_lines(CameraMode::FirstPerson);
+        assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
+        assert!(!lines.iter().any(|line| line.contains("DEV intro/interior/reveal")));
+        assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
+        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
+    }
+
+    #[test]
+    fn orbit_legend_marks_lattice_jumps_as_debug() {
+        let lines = App::legend_lines(CameraMode::Orbit);
+        assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
+        assert!(lines.iter().any(|line| line.contains("DEV intro/interior/reveal")));
+        assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
+        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
     }
 
     #[test]
