@@ -187,8 +187,8 @@ pub struct PrecomputedHeightmapField {
 impl PrecomputedHeightmapField {
     /// Precompute heights and build the min/max mipmap.
     /// `side_log2` is the world level (e.g. 9 for 512³).
-    pub fn new(field: HeightmapField, side_log2: u32) -> Self {
-        field.validate().expect("invalid heightmap field");
+    pub fn new(field: HeightmapField, side_log2: u32) -> Result<Self, &'static str> {
+        field.validate()?;
         let side = 1usize << side_log2;
         let n = side * side;
 
@@ -258,13 +258,13 @@ impl PrecomputedHeightmapField {
             }
         }
 
-        Self {
+        Ok(Self {
             inner: field,
             side,
             mip_min,
             mip_max,
             is_sandy,
-        }
+        })
     }
 
     /// Look up local min/max surface height for the XZ projection of a box
@@ -587,7 +587,8 @@ mod tests {
         use crate::octree::NodeStore;
 
         let field = test_field();
-        let precomputed = PrecomputedHeightmapField::new(field, 6);
+        let precomputed = PrecomputedHeightmapField::new(field, 6)
+            .expect("test heightmap field should precompute successfully");
 
         let mut store1 = NodeStore::new();
         let mut store2 = NodeStore::new();
@@ -616,7 +617,8 @@ mod tests {
     #[test]
     fn precomputed_classify_is_conservative() {
         let field = test_field();
-        let precomputed = PrecomputedHeightmapField::new(field, 6);
+        let precomputed = PrecomputedHeightmapField::new(field, 6)
+            .expect("test heightmap field should precompute successfully");
 
         // Check a grid of boxes at level 3 (8×8×8).
         for oz in (0..64).step_by(8) {
@@ -649,7 +651,8 @@ mod tests {
         use crate::octree::NodeStore;
 
         let field = test_field();
-        let precomputed = PrecomputedHeightmapField::new(field, 6);
+        let precomputed = PrecomputedHeightmapField::new(field, 6)
+            .expect("test heightmap field should precompute successfully");
 
         let (_, stats_global) = gen_region(&mut NodeStore::new(), &field, [0, 0, 0], 6);
         let (_, stats_local) = gen_region(&mut NodeStore::new(), &precomputed, [0, 0, 0], 6);
@@ -678,10 +681,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invalid heightmap field")]
     fn precomputed_rejects_invalid_field() {
         let mut field = test_field();
         field.wavelength = f32::NAN;
-        let _ = PrecomputedHeightmapField::new(field, 6);
+        assert!(
+            matches!(
+                PrecomputedHeightmapField::new(field, 6),
+                Err("wavelength must be finite and > 0")
+            ),
+            "invalid heightmap params should be rejected without panicking"
+        );
     }
 }
