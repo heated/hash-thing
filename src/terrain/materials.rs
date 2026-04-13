@@ -10,8 +10,8 @@ use crate::octree::{Cell, CellState};
 use crate::sim::margolus::FluidBlockRule;
 use crate::sim::margolus::GravityBlockRule;
 use crate::sim::rule::{
-    AcidRule, BlockRule, CaRule, DissolvableRule, FireRule, FireworkRule, FlammableRule,
-    GameOfLife3D, IceRule, LavaRule, NoopRule, SteamRule, WaterRule,
+    AcidRule, AirVineGrowthRule, BlockRule, CaRule, DissolvableRule, FireRule, FireworkRule,
+    FlammableRule, GameOfLife3D, IceRule, LavaRule, NoopRule, SteamRule, VineRule, WaterRule,
 };
 
 pub type MaterialId = u16;
@@ -154,6 +154,25 @@ impl MaterialRegistry {
     pub fn terrain_defaults() -> Self {
         let mut registry = Self::new();
         let static_rule = registry.register_rule(NoopRule);
+        let vine_rule = registry.register_rule(VineRule {
+            fire_material: FIRE_MATERIAL_ID,
+            acid_material: ACID_MATERIAL_ID,
+            max_age: 3,
+        });
+        let air_vine_rule = registry.register_rule(AirVineGrowthRule {
+            vine_material: VINE_MATERIAL_ID,
+            support_materials: vec![
+                STONE_MATERIAL_ID,
+                DIRT_MATERIAL_ID,
+                GRASS_MATERIAL_ID,
+                SAND_MATERIAL_ID,
+                METAL_MATERIAL_ID,
+                ICE_MATERIAL_ID,
+                FAN_MATERIAL_ID,
+                CLONE_MATERIAL_ID,
+            ],
+            spread_age: 2,
+        });
 
         // Materials that acid dissolves.
         let acid_dissolvable = vec![
@@ -234,7 +253,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.0,
                 },
-                rule_id: static_rule,
+                rule_id: air_vine_rule,
                 block_rule_id: None,
             },
         );
@@ -492,7 +511,7 @@ impl MaterialRegistry {
                     flammability: 0.6,
                     conductivity: 0.03,
                 },
-                rule_id: dissolvable_rule,
+                rule_id: vine_rule,
                 block_rule_id: None,
             },
         );
@@ -924,6 +943,28 @@ mod tests {
                 .unwrap()
                 .step_cell(Cell::pack(STONE_MATERIAL_ID, 0), &neighbors),
             Cell::pack(STONE_MATERIAL_ID, 0),
+        );
+    }
+
+    #[test]
+    fn terrain_defaults_wire_air_and_vine_growth_rules() {
+        let registry = MaterialRegistry::terrain_defaults();
+        let mut growth_neighbors = [Cell::pack(STONE_MATERIAL_ID, 0); 26];
+        growth_neighbors[12] = Cell::pack(VINE_MATERIAL_ID, 2);
+
+        assert_eq!(
+            registry
+                .rule_for_cell(Cell::EMPTY)
+                .unwrap()
+                .step_cell(Cell::EMPTY, &growth_neighbors),
+            Cell::pack(VINE_MATERIAL_ID, 0),
+        );
+        assert_eq!(
+            registry
+                .rule_for_cell(Cell::pack(VINE_MATERIAL_ID, 0))
+                .unwrap()
+                .step_cell(Cell::pack(VINE_MATERIAL_ID, 0), &[Cell::EMPTY; 26]),
+            Cell::pack(VINE_MATERIAL_ID, 1),
         );
     }
 
