@@ -78,9 +78,11 @@ pub mod const_field;
 pub mod density;
 pub mod half_space;
 pub mod heightmap;
+pub mod lattice;
 
 pub use density::DensityField;
 pub use heightmap::HeightmapField;
+pub use lattice::LatticeField;
 
 #[cfg(test)]
 mod tests {
