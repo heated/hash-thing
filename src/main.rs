@@ -297,7 +297,7 @@ impl App {
             // Re-upload volume since we modified the world directly.
             Self::upload_volume(
                 &mut self.renderer,
-                &self.world,
+                &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
@@ -339,7 +339,7 @@ impl App {
             );
             Self::upload_volume(
                 &mut self.renderer,
-                &self.world,
+                &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
@@ -356,11 +356,18 @@ impl App {
     /// not — this is precisely the `hash-thing-yri` fix.
     fn upload_volume(
         renderer: &mut Option<render::Renderer>,
-        world: &sim::World,
+        world: &mut sim::World,
         svdag: &mut render::Svdag,
         last_svdag_stats: &mut (usize, usize, u32),
     ) {
         if let Some(renderer) = renderer {
+            // Apply the NodeId remap from the last compaction so the SVDAG's
+            // persistent cache stays valid. This turns update() from O(reachable)
+            // to O(changed) — unchanged subtrees hit the cache in O(1)
+            // (hash-thing-5bb.11).
+            if let Some(remap) = world.last_compaction_remap.take() {
+                svdag.apply_remap(&remap);
+            }
             // Incremental rebuild: reuses cached offsets for unchanged subtrees.
             svdag.update(&world.store, world.root, world.level);
             // Compact when >50% of the buffer is stale slots (hash-thing-bx7).
@@ -424,7 +431,7 @@ impl App {
         }
         Self::upload_volume(
             &mut self.renderer,
-            &self.world,
+            &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
         );
@@ -450,7 +457,7 @@ impl App {
         }
         Self::upload_volume(
             &mut self.renderer,
-            &self.world,
+            &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
         );
@@ -477,7 +484,7 @@ impl App {
         self.mem_stats.reset_peaks();
         Self::upload_volume(
             &mut self.renderer,
-            &self.world,
+            &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
         );
@@ -518,7 +525,7 @@ impl ApplicationHandler for App {
             // loop yet and there's no perf summary to feed.
             Self::upload_volume(
                 &mut self.renderer,
-                &self.world,
+                &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
@@ -623,7 +630,7 @@ impl ApplicationHandler for App {
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
-                                &self.world,
+                                &mut self.world,
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
@@ -662,7 +669,7 @@ impl ApplicationHandler for App {
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
-                                &self.world,
+                                &mut self.world,
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
@@ -891,7 +898,7 @@ impl ApplicationHandler for App {
                                     let _t = self.perf.start("upload_cpu");
                                     Self::upload_volume(
                                         &mut self.renderer,
-                                        &self.world,
+                                        &mut self.world,
                                         &mut self.svdag,
                                         &mut self.last_svdag_stats,
                                     );
@@ -1101,7 +1108,7 @@ impl ApplicationHandler for App {
                                         );
                                         Self::upload_volume(
                                             &mut self.renderer,
-                                            &self.world,
+                                            &mut self.world,
                                             &mut self.svdag,
                                             &mut self.last_svdag_stats,
                                         );

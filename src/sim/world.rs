@@ -113,6 +113,11 @@ pub struct World {
     /// grows in the negative direction, origin shifts to keep the old
     /// root's cells at the same world-space positions.
     pub origin: [i64; 3],
+    /// Old→new NodeId remap from the most recent store compaction.
+    /// Consumed by `Svdag::apply_remap()` to keep its persistent cache
+    /// valid across compaction epochs (hash-thing-5bb.11).
+    /// `None` after scene resets (the cache should be fully invalidated).
+    pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
 }
 
 /// Cache performance statistics from a single hashlife step.
@@ -159,6 +164,7 @@ impl World {
             block_rule_present: None,
             queue: MutationQueue::new(),
             origin: [0, 0, 0],
+            last_compaction_remap: None,
         }
     }
 
@@ -185,6 +191,7 @@ impl World {
             block_rule_present: None,
             queue: MutationQueue::new(),
             origin: [0, 0, 0],
+            last_compaction_remap: None,
         }
     }
 
@@ -927,9 +934,12 @@ impl World {
         //
         // Brute-force compaction remaps all NodeIds without updating
         // hashlife_cache, so clear it to prevent stale cross-path hits.
-        let (new_store, new_root) = self.store.compacted(self.root);
+        // Keep the remap so Svdag can update its persistent NodeId cache
+        // (hash-thing-5bb.11: O(changed) instead of O(reachable)).
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.last_compaction_remap = Some(remap);
         self.hashlife_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
