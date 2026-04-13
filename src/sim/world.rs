@@ -1362,16 +1362,8 @@ impl World {
 
     fn spectacle_box(center: [i64; 3], min: [i64; 3], max: [i64; 3]) -> Box3 {
         Box3::new(
-            [
-                center[0] + min[0],
-                center[1] + min[1],
-                center[2] + min[2],
-            ],
-            [
-                center[0] + max[0],
-                center[1] + max[1],
-                center[2] + max[2],
-            ],
+            [center[0] + min[0], center[1] + min[1], center[2] + min[2]],
+            [center[0] + max[0], center[1] + max[1], center[2] + max[2]],
         )
     }
 
@@ -1381,7 +1373,10 @@ impl World {
         let floor_y = cy - 1;
         let ceiling_y = cy + 4;
 
-        self.fill_box(Box3::new([cx - r, floor_y, cz - r], [cx + r, floor_y, cz + r]), DIRT);
+        self.fill_box(
+            Box3::new([cx - r, floor_y, cz - r], [cx + r, floor_y, cz + r]),
+            DIRT,
+        );
         self.fill_box(
             Box3::new([cx - r, floor_y + 1, cz - r], [cx - r, ceiling_y, cz + r]),
             STONE,
