@@ -2588,7 +2588,7 @@ mod tests {
     fn water_and_sand_scene_keeps_svdag_in_sync_across_steps() {
         let mut world = World::new(6); // 64^3 is still practical for exhaustive Svdag checks.
         let params = TerrainParams::for_level(6);
-        world.seed_terrain(&params);
+        let _ = world.seed_terrain(&params);
         world.seed_water_and_sand();
 
         let mut svdag = Svdag::new();
