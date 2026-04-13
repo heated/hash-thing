@@ -34,9 +34,7 @@ The octree is hash-consed: identical subtrees share storage. This is the foundat
 | **Scroll** | Zoom in/out |
 | **Space** | Pause / resume simulation |
 | **S** | Single step |
-| **R** | Reset terrain (heightmap only) |
-| **C** | Reset terrain with caves (CA post-pass) |
-| **D** | Reset terrain with caves + dungeons |
+| **R** | Reset terrain (heightmap) |
 | **G** | Switch to legacy Game of Life sphere seed |
 | **1-4** | Switch CA rule (Amoeba, Crystal, Rule445, Pyroclastic) |
 | **V** | Toggle render mode (Flat3D / SVDAG) |
@@ -49,7 +47,7 @@ The octree is hash-consed: identical subtrees share storage. This is the foundat
 src/
   octree/       Hash-consed octree (node.rs, store.rs)
   sim/          Simulation: CaRule + BlockRule dispatch, Margolus 2x2x2
-  terrain/      Procedural generation: heightmap, caves, dungeons, noise
+  terrain/      Procedural generation: heightmap, noise
   render/       wgpu renderer: flat 3D texture + SVDAG raycaster
   rng.rs        Deterministic per-cell PRNG (Hashlife-compatible)
   perf.rs       Ring-buffer latency tracker + memory watchdog

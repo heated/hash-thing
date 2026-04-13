@@ -69,23 +69,35 @@ impl BlockRule for FluidBlockRule {
         }
 
         // Phase 2: lateral spread (fluid ↔ air only).
-        // Derive axis choice from block contents so the rule is a pure
-        // function of state — enables spatial memoization in hashlife.
+        // Try BOTH axes per y-layer — the content hash determines which
+        // axis has priority when a cell could spread in either direction.
+        // This eliminates the directional bias of single-axis selection
+        // while remaining a pure function of block state (hashlife-safe).
         let hash = Self::content_hash(block);
         for dy in 0..2usize {
-            let use_x_axis = (hash >> dy) & 1 == 0;
-            if use_x_axis {
-                // Swap along x: (0,dy,dz) ↔ (1,dy,dz) for each dz
+            let x_first = (hash >> dy) & 1 == 0;
+            if x_first {
+                // X-axis first, then Z-axis
                 for dz in 0..2 {
                     let a = block_index(0, dy, dz);
                     let b = block_index(1, dy, dz);
                     self.try_fluid_swap(&mut out, a, b);
                 }
-            } else {
-                // Swap along z: (dx,dy,0) ↔ (dx,dy,1) for each dx
                 for dx in 0..2 {
                     let a = block_index(dx, dy, 0);
                     let b = block_index(dx, dy, 1);
+                    self.try_fluid_swap(&mut out, a, b);
+                }
+            } else {
+                // Z-axis first, then X-axis
+                for dx in 0..2 {
+                    let a = block_index(dx, dy, 0);
+                    let b = block_index(dx, dy, 1);
+                    self.try_fluid_swap(&mut out, a, b);
+                }
+                for dz in 0..2 {
+                    let a = block_index(0, dy, dz);
+                    let b = block_index(1, dy, dz);
                     self.try_fluid_swap(&mut out, a, b);
                 }
             }

@@ -2,9 +2,9 @@
 //! oracle: the builder recursing against `ConstField { AIR }` must produce
 //! exactly `store.uniform(level, AIR)`.
 
-// Test-only fixture — the trivial RegionField for builder regression tests.
+// Test-only fixture — the trivial WorldGen for builder regression tests.
 
-use super::RegionField;
+use super::WorldGen;
 use crate::octree::CellState;
 
 #[derive(Debug)]
@@ -18,14 +18,14 @@ impl ConstField {
     }
 }
 
-impl RegionField for ConstField {
+impl WorldGen for ConstField {
     #[inline]
     fn sample(&self, _point: [i64; 3]) -> CellState {
         self.state
     }
 
     #[inline]
-    fn classify_box(&self, _origin: [i64; 3], _size_log2: u32) -> Option<CellState> {
+    fn classify(&self, _origin: [i64; 3], _level: u32) -> Option<CellState> {
         Some(self.state)
     }
 }
@@ -44,14 +44,14 @@ mod tests {
     #[test]
     fn classify_always_returns_some() {
         let f = ConstField::new(7);
-        assert_eq!(f.classify_box([0, 0, 0], 0), Some(7));
-        assert_eq!(f.classify_box([-100, 50, 0], 10), Some(7));
+        assert_eq!(f.classify([0, 0, 0], 0), Some(7));
+        assert_eq!(f.classify([-100, 50, 0], 10), Some(7));
     }
 
     #[test]
     fn empty_field_is_zero() {
         let f = ConstField::new(0);
         assert_eq!(f.sample([0, 0, 0]), 0);
-        assert_eq!(f.classify_box([0, 0, 0], 5), Some(0));
+        assert_eq!(f.classify([0, 0, 0], 5), Some(0));
     }
 }

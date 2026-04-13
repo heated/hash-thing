@@ -2,7 +2,7 @@
 //! with architectural proportions and active materials (water, lava, fire).
 //!
 //! Replaces the O(n^3) `seed_lattice_megastructure` with an octree-native
-//! `RegionField`. `classify_box` collapses large uniform regions (corridor
+//! `WorldGen`. `classify` collapses large uniform regions (corridor
 //! AIR, pillar STONE) without visiting individual cells.
 //!
 //! The lattice is a repeating grid with period `cell_size` on all axes.
@@ -17,7 +17,7 @@
 //! Room height varies per grid cell via a deterministic hash, giving visual
 //! variety while remaining fully deterministic for `classify_box`.
 
-use super::RegionField;
+use super::WorldGen;
 use crate::octree::CellState;
 use crate::terrain::materials::{AIR, FIRE, GRASS, LAVA, SAND, STONE, WATER};
 
@@ -214,7 +214,7 @@ impl LatticeField {
     }
 }
 
-impl RegionField for LatticeField {
+impl WorldGen for LatticeField {
     fn sample(&self, point: [i64; 3]) -> CellState {
         // Outside the active region: AIR.
         if point[0] < self.lo[0]
@@ -233,7 +233,7 @@ impl RegionField for LatticeField {
         self.sample_inner(lx, ly, lz)
     }
 
-    fn classify_box(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
+    fn classify(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
         let size = 1i64 << size_log2;
 
         // Box corners (inclusive lo, exclusive hi).
@@ -415,7 +415,7 @@ mod tests {
     fn classify_box_outside_is_air() {
         let f = test_lattice();
         // Box entirely below lo on the y axis.
-        assert_eq!(f.classify_box([0, 0, 0], 1), Some(AIR));
+        assert_eq!(f.classify([0, 0, 0], 1), Some(AIR));
     }
 
     #[test]
@@ -430,7 +430,7 @@ mod tests {
             for oy in (0..side).step_by(4) {
                 for ox in (0..side).step_by(4) {
                     if let Some(state) =
-                        f.classify_box([ox as i64, oy as i64, oz as i64], 2)
+                        f.classify([ox as i64, oy as i64, oz as i64], 2)
                     {
                         for z in oz..oz + 4 {
                             for y in oy..oy + 4 {
