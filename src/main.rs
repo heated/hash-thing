@@ -1726,7 +1726,9 @@ fn main() {
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
         event_loop_builder.with_activate_ignoring_other_apps(true);
     }
-    let event_loop = event_loop_builder.build().expect("failed to create event loop");
+    let event_loop = event_loop_builder
+        .build()
+        .expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
     event_loop

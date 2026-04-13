@@ -114,6 +114,23 @@ mod wgsl_drift_guard {
     }
 
     #[test]
+    fn wgsl_lod_shading_uses_surface_hit_position() {
+        let expected_lines = [
+            "let lod_hit_t = select(",
+            "ro_local + rd * max(lod_hit_t, 0.0) - normal * (INV_RES * 0.25);",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` — representative-\
+                 material LOD hits should shade the actual surface hit position \
+                 (nudged inward), not the node center, or coarse interiors turn \
+                 into rectangular ghost patches."
+            );
+        }
+    }
+
+    #[test]
     fn wgsl_svdag_octant_of_tiebreak_matches_rust() {
         let expected_lines = [
             "if pos.x > mid.x || (pos.x == mid.x && rd.x >= 0.0) { idx |= 1u; }",
