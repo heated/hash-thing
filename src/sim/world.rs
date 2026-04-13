@@ -158,7 +158,7 @@ struct ProgressionWaterfallLayout {
     shaft: Box3,
     curtain: Box3,
     source_x: [i64; 2],
-    source_y: i64,
+    source_y: [i64; 2],
     source_z: i64,
     focus: [i64; 3],
 }
@@ -1432,6 +1432,7 @@ impl World {
     ) -> ProgressionWaterfallLayout {
         let source_z = tease_b.min[2] - 2;
         let curtain_z = source_z + 1;
+        let curtain_front_z = tease_b.min[2];
         let shaft_bottom = ground_y - 2;
         let shaft_top = corridor.max[1] + 4;
         let source_x = [tease_b.min[0], tease_b.max[0]];
@@ -1443,16 +1444,16 @@ impl World {
             ),
             shaft: Box3::new(
                 [source_x[0], shaft_bottom, curtain_z],
-                [source_x[1], shaft_top, curtain_z],
+                [source_x[1], shaft_top, curtain_front_z],
             ),
             curtain: Box3::new(
                 [source_x[0], shaft_bottom, curtain_z],
-                [source_x[1], shaft_top - 1, curtain_z],
+                [source_x[1], shaft_top - 1, curtain_front_z],
             ),
             source_x,
-            source_y: shaft_top,
+            source_y: [shaft_bottom, shaft_top],
             source_z,
-            focus: [tease_b.center()[0], corridor.center()[1], curtain_z],
+            focus: [tease_b.center()[0], corridor.center()[1], curtain_front_z],
         }
     }
 
@@ -1479,8 +1480,10 @@ impl World {
         self.fill_box(layout.shell, STONE);
         self.fill_box(layout.shaft, AIR);
         self.fill_box(layout.curtain, WATER);
-        for x in layout.source_x[0]..=layout.source_x[1] {
-            self.place_clone_source([x, layout.source_y, layout.source_z], water_material);
+        for y in layout.source_y[0]..=layout.source_y[1] {
+            for x in layout.source_x[0]..=layout.source_x[1] {
+                self.place_clone_source([x, y, layout.source_z], water_material);
+            }
         }
 
         layout
@@ -2726,22 +2729,24 @@ mod tests {
             "corridor side gap should frame a visible waterfall near {:?}",
             waterfall.focus
         );
-        for x in waterfall.source_x[0]..=waterfall.source_x[1] {
-            let state = Cell::from_raw(w.get(
-                WorldCoord(x),
-                WorldCoord(waterfall.source_y),
-                WorldCoord(waterfall.source_z),
-            ));
-            assert_eq!(
-                state.material(),
-                CLONE_MATERIAL_ID,
-                "waterfall source row should be clone blocks"
-            );
-            assert_eq!(
-                state.metadata(),
-                water_material,
-                "waterfall clone blocks should encode water as their source material"
-            );
+        for y in waterfall.source_y[0]..=waterfall.source_y[1] {
+            for x in waterfall.source_x[0]..=waterfall.source_x[1] {
+                let state = Cell::from_raw(w.get(
+                    WorldCoord(x),
+                    WorldCoord(y),
+                    WorldCoord(waterfall.source_z),
+                ));
+                assert_eq!(
+                    state.material(),
+                    CLONE_MATERIAL_ID,
+                    "waterfall source wall should be clone blocks"
+                );
+                assert_eq!(
+                    state.metadata(),
+                    water_material,
+                    "waterfall clone blocks should encode water as their source material"
+                );
+            }
         }
         assert_eq!(
             w.get(
@@ -2763,7 +2768,8 @@ mod tests {
             corridor, tease_b, ..
         } = World::progression_boxes(&field);
         let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
-        let expected_sources = (waterfall.source_x[1] - waterfall.source_x[0] + 1) as usize;
+        let expected_sources = ((waterfall.source_x[1] - waterfall.source_x[0] + 1)
+            * (waterfall.source_y[1] - waterfall.source_y[0] + 1)) as usize;
 
         w.seed_lattice_progression_demo();
         assert_eq!(w.clone_sources.len(), expected_sources);
@@ -4240,6 +4246,56 @@ mod tests {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+
+    #[test]
+    fn progression_waterfall_stays_visually_contiguous() {
+        let mut world = World::new(6);
+        world.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(world.level, 42);
+        let ground_y = field.lo[1] + field.floor_thick;
+        let ProgressionBoxes {
+            corridor, tease_b, ..
+        } = World::progression_boxes(&field);
+        let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
+
+        for _ in 0..6 {
+            world.spawn_clones();
+            world.step();
+        }
+
+        let mut occupied = Vec::new();
+        for y in waterfall.shaft.min[1]..=waterfall.shaft.max[1] {
+            let mut xs = Vec::new();
+            for x in waterfall.curtain.min[0]..=waterfall.curtain.max[0] {
+                let has_water = (waterfall.curtain.min[2]..=waterfall.curtain.max[2]).any(|z| {
+                    Cell::from_raw(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z))).material()
+                        == WATER_MATERIAL_ID
+                });
+                if has_water {
+                    xs.push(x);
+                }
+            }
+            if !xs.is_empty() {
+                occupied.push((y, xs));
+            }
+        }
+
+        assert!(
+            occupied.len() >= 4,
+            "waterfall should remain visible across multiple projected rows"
+        );
+        for (y, xs) in occupied {
+            for pair in xs.windows(2) {
+                assert_eq!(
+                    pair[1] - pair[0],
+                    1,
+                    "waterfall developed a projected gap at y={y}, x={}..{}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
     }
 

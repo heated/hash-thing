@@ -3,6 +3,7 @@ use std::fmt;
 
 /// Default "alive" cell payload used by the legacy GoL smoke scene.
 pub(crate) const ALIVE: Cell = Cell::pack(1, 0);
+const FACE_NEIGHBOR_INDICES: [usize; 6] = [4, 10, 12, 13, 15, 21];
 
 /// A cellular automaton rule operating on the 26-cell Moore neighborhood in 3D.
 ///
@@ -225,6 +226,71 @@ impl CaRule for FlammableRule {
             fire_material: self.fire_material,
             fire_product: self.fire_product,
         })
+    }
+}
+
+/// Vine ages slowly, ignites next to fire, and dissolves next to acid.
+#[derive(Debug, Clone)]
+pub struct VineRule {
+    pub fire_material: u16,
+    pub acid_material: u16,
+    pub max_age: u16,
+}
+
+impl CaRule for VineRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "VineRule should not dispatch for AIR");
+        if neighbors.iter().any(|n| n.material() == self.acid_material) {
+            Cell::EMPTY
+        } else if neighbors.iter().any(|n| n.material() == self.fire_material) {
+            Cell::pack(self.fire_material, 0)
+        } else {
+            Cell::pack(
+                center.material(),
+                center.metadata().saturating_add(1).min(self.max_age),
+            )
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
+    }
+}
+
+/// Air is inert unless a mature vine can creep onto a supported face-adjacent cell.
+#[derive(Debug, Clone)]
+pub struct AirVineGrowthRule {
+    pub vine_material: u16,
+    pub support_materials: Vec<u16>,
+    pub spread_age: u16,
+}
+
+impl CaRule for AirVineGrowthRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(
+            center.is_empty(),
+            "AirVineGrowthRule should dispatch only for AIR"
+        );
+        let has_mature_vine = FACE_NEIGHBOR_INDICES.iter().any(|&i| {
+            let neighbor = neighbors[i];
+            neighbor.material() == self.vine_material && neighbor.metadata() >= self.spread_age
+        });
+        let has_support = FACE_NEIGHBOR_INDICES
+            .iter()
+            .any(|&i| self.support_materials.contains(&neighbors[i].material()));
+        if has_mature_vine && has_support {
+            Cell::pack(self.vine_material, 0)
+        } else {
+            center
+        }
+    }
+
+    fn is_self_inert(&self) -> bool {
+        true
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
     }
 }
 
@@ -671,6 +737,62 @@ mod tests {
         let mut neighbors = [Cell::EMPTY; 26];
         neighbors[0] = mat(5);
         assert_eq!(rule.step_cell(mat(7), &neighbors), product);
+    }
+
+    #[test]
+    fn vine_rule_ages_when_undisturbed() {
+        let rule = VineRule {
+            fire_material: 4,
+            acid_material: 9,
+            max_age: 3,
+        };
+        assert_eq!(
+            rule.step_cell(Cell::pack(15, 0), &[Cell::EMPTY; 26]),
+            Cell::pack(15, 1)
+        );
+        assert_eq!(
+            rule.step_cell(Cell::pack(15, 3), &[Cell::EMPTY; 26]),
+            Cell::pack(15, 3)
+        );
+    }
+
+    #[test]
+    fn vine_rule_burns_or_dissolves_from_face_neighbors() {
+        let rule = VineRule {
+            fire_material: 4,
+            acid_material: 9,
+            max_age: 3,
+        };
+        let mut fire_neighbors = [Cell::EMPTY; 26];
+        fire_neighbors[12] = mat(4);
+        assert_eq!(rule.step_cell(Cell::pack(15, 2), &fire_neighbors), mat(4));
+
+        let mut acid_neighbors = [Cell::EMPTY; 26];
+        acid_neighbors[21] = mat(9);
+        assert_eq!(
+            rule.step_cell(Cell::pack(15, 2), &acid_neighbors),
+            Cell::EMPTY
+        );
+    }
+
+    #[test]
+    fn air_vine_growth_rule_requires_mature_vine_and_support() {
+        let rule = AirVineGrowthRule {
+            vine_material: 15,
+            support_materials: vec![1, 2],
+            spread_age: 2,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[12] = Cell::pack(15, 2);
+        neighbors[10] = mat(1);
+        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), mat(15));
+
+        neighbors[12] = Cell::pack(15, 1);
+        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::EMPTY);
+
+        neighbors[12] = Cell::pack(15, 2);
+        neighbors[10] = Cell::EMPTY;
+        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::EMPTY);
     }
 
     #[test]
