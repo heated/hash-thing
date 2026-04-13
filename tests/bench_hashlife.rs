@@ -61,12 +61,16 @@ fn bench_step(label: &str, level: u32, generations: usize) {
                 hit_rate,
             );
             // Print per-level miss distribution
-            let level_misses: Vec<(usize, u64)> = s.misses_by_level.iter().enumerate()
+            let level_misses: Vec<(usize, u64)> = s
+                .misses_by_level
+                .iter()
+                .enumerate()
                 .filter(|(_, &c)| c > 0)
                 .map(|(i, &c)| (i + 3, c))
                 .collect();
             if !level_misses.is_empty() {
-                let parts: Vec<String> = level_misses.iter()
+                let parts: Vec<String> = level_misses
+                    .iter()
                     .map(|(lvl, cnt)| format!("L{lvl}={cnt}"))
                     .collect();
                 eprintln!("    misses by level: {}", parts.join(", "));

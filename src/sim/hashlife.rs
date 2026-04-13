@@ -250,7 +250,6 @@ impl World {
                 self.hashlife_all_inert_cache.insert(new_node, inert);
             }
         }
-
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -1217,9 +1216,14 @@ mod tests {
     fn water_column_mass_conservation() {
         use crate::terrain::materials::WATER_MATERIAL_ID;
         let mut world = World::new(5); // 32³
-        // Place a column of water at (16, y, 16) for y in 8..24.
+                                       // Place a column of water at (16, y, 16) for y in 8..24.
         for y in 8..24 {
-            world.set(wc(16), wc(y), wc(16), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+            world.set(
+                wc(16),
+                wc(y),
+                wc(16),
+                Cell::pack(WATER_MATERIAL_ID, 0).raw(),
+            );
         }
         let initial_water = count_material(&world, 32, WATER_MATERIAL_ID);
         assert_eq!(initial_water, 16);
@@ -1242,11 +1246,8 @@ mod tests {
         for z in 0..side {
             for y in 0..side {
                 for x in 0..side {
-                    let cell = Cell::from_raw(world.get(
-                        WorldCoord(x),
-                        WorldCoord(y),
-                        WorldCoord(z),
-                    ));
+                    let cell =
+                        Cell::from_raw(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)));
                     if cell.material() == material_id {
                         count += 1;
                     }
