@@ -76,12 +76,15 @@ impl WorldGen for ComposedWorldGen {
 
 pub mod const_field;
 pub mod density;
+pub mod gyroid;
 pub mod half_space;
 pub mod heightmap;
+pub mod implicit;
 pub mod lattice;
 pub mod terrain_blend;
 
 pub use density::DensityField;
+pub use gyroid::{GyroidField, GyroidParams};
 pub use heightmap::HeightmapField;
 pub use lattice::LatticeField;
 pub use terrain_blend::{TerrainBlendField, TerrainSurface};

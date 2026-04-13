@@ -343,10 +343,11 @@ impl WorldGen for LatticeField {
         }
 
         // Wall (not pillar, not floor): GRASS if below room height.
-        if all_above_floor && cy_hi_incl < room_h {
-            if (all_in_x_wall && all_out_z_wall) || (all_in_z_wall && all_out_x_wall) {
-                return Some(GRASS);
-            }
+        if all_above_floor
+            && cy_hi_incl < room_h
+            && ((all_in_x_wall && all_out_z_wall) || (all_in_z_wall && all_out_x_wall))
+        {
+            return Some(GRASS);
         }
 
         // Open corridor above feature ceiling → AIR.

@@ -12,7 +12,8 @@ pub mod materials;
 pub mod noise;
 
 pub use field::{
-    ComposedWorldGen, DensityField, HeightmapField, TerrainBlendField, TerrainSurface, WorldGen,
+    ComposedWorldGen, DensityField, GyroidField, GyroidParams, HeightmapField, TerrainBlendField,
+    TerrainSurface, WorldGen,
 };
 pub use gen::{gen_region, probe_sample_ns, GenStats};
 

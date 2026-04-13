@@ -3,6 +3,7 @@ use std::fmt;
 use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
+use crate::terrain::field::gyroid::GyroidField;
 use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
@@ -889,6 +890,25 @@ impl World {
         self.block_rule_present = None;
     }
 
+    /// Seed a warped gyroid megastructure tuned for a walkable demo zone.
+    ///
+    /// Uses `GyroidField` + `gen_region` for octree-native generation with
+    /// proof-based collapse. The gyroid stays parameterized so later
+    /// megastructure experiments can reuse the same implicit-field path.
+    pub fn seed_gyroid_megastructure(&mut self) -> GenStats {
+        self.store = NodeStore::new();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        let field = GyroidField::for_world(self.level, 42);
+        let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        self.root = root;
+        self.generation = 0;
+        self.block_rule_present = None;
+        stats
+    }
+
     pub fn population(&self) -> u64 {
         self.store.population(self.root)
     }
@@ -1303,6 +1323,23 @@ mod tests {
         assert_eq!(
             world.get(wc(point_world[0]), wc(point_world[1]), wc(point_world[2])),
             crate::terrain::WorldGen::sample(&terrain, point)
+        );
+    }
+
+    #[test]
+    fn seed_gyroid_megastructure_produces_walkable_structure() {
+        let mut w = World::new(6); // side 64
+        let stats = w.seed_gyroid_megastructure();
+        assert!(w.population() > 100, "gyroid must have content");
+        assert!(
+            stats.total_collapses() > 0,
+            "gyroid should collapse some uniform regions: {stats:?}"
+        );
+        let grid = w.flatten();
+        assert!(grid.contains(&STONE), "gyroid must contain stone");
+        assert!(
+            grid.contains(&0),
+            "gyroid must leave air voids to walk through"
         );
     }
 

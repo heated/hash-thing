@@ -223,7 +223,7 @@ impl App {
                 "",
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
-                "  M  Lattice    0  Recenter",
+                "  M  Gyroid     0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
                 "  Esc Quit",
@@ -240,7 +240,7 @@ impl App {
                 "",
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
-                "  M  Lattice    0  Recenter",
+                "  M  Gyroid     0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
                 "  Esc Quit",
@@ -491,13 +491,13 @@ impl App {
         log::info!("{label}: pop={}", self.world.population());
     }
 
-    fn load_lattice_demo(&mut self) {
+    fn load_gyroid_demo(&mut self) {
         if self.is_stepping() {
             return;
         }
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
-        self.world.seed_lattice_megastructure();
+        let stats = self.world.seed_gyroid_megastructure();
         let elapsed = start.elapsed();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
@@ -515,9 +515,11 @@ impl App {
         );
         self.sync_render_cache();
         log::info!(
-            "Lattice megastructure: pop={} gen={:.1}ms",
+            "Gyroid megastructure: pop={} gen={:.1}ms collapses={} classifies={}",
             self.world.population(),
-            elapsed.as_secs_f64() * 1000.0
+            elapsed.as_secs_f64() * 1000.0,
+            stats.total_collapses(),
+            stats.classify_calls,
         );
     }
 
@@ -728,7 +730,7 @@ impl ApplicationHandler for App {
                             log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
                         winit::keyboard::Key::Character("m") => {
-                            self.load_lattice_demo();
+                            self.load_gyroid_demo();
                         }
                         winit::keyboard::Key::Character(
                             n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
@@ -1277,6 +1279,7 @@ fn main() {
     log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
+    log::info!("  M: reset gyroid megastructure");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
