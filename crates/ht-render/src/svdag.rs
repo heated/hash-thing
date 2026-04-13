@@ -207,13 +207,15 @@ impl Svdag {
                 let mut slot = [0u32; 9];
                 let mut mask: u32 = 0;
                 let mut rep_mat: u32 = 0;
+                let mut rep_pop: u64 = 0;
                 for (i, &child_id) in children.iter().enumerate() {
                     match store.get(child_id) {
                         Node::Leaf(state) => {
                             if *state != 0 {
                                 mask |= 1 << i;
-                                if rep_mat == 0 {
+                                if rep_mat == 0 || rep_pop == 0 {
                                     rep_mat = *state as u32;
+                                    rep_pop = 1;
                                 }
                             }
                             slot[1 + i] = LEAF_BIT | (*state as u32);
@@ -223,11 +225,16 @@ impl Svdag {
                                 mask |= 1 << i;
                                 let child_offset = self.visit(store, child_id);
                                 slot[1 + i] = child_offset;
-                                // Propagate representative material from child
-                                // (m1f.7.3.2: packed into bits 8-23 of child_mask).
-                                if rep_mat == 0 {
+                                // Propagate representative material from the
+                                // largest populated child, not the first
+                                // occupied octant. Water-heavy scenes often
+                                // create tiny active pockets in low-index
+                                // octants; "first occupied wins" turns whole
+                                // coarse LOD nodes into arbitrary materials.
+                                if *population > rep_pop {
                                     let child_cmask = self.nodes[child_offset as usize];
                                     rep_mat = (child_cmask >> 8) & 0xFFFF;
+                                    rep_pop = *population;
                                 }
                             } else {
                                 slot[1 + i] = LEAF_BIT;
@@ -1207,6 +1214,34 @@ mod tests {
             Some(mat3 as u32),
             "ray through a uniform leaf-root world must hit, events: {:#?}",
             result.events,
+        );
+    }
+
+    #[test]
+    fn representative_material_prefers_largest_populated_child() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // 4^3
+        let water = mat(5);
+        let stone = mat(1);
+
+        // A single early-octant water voxel should not dominate the coarse LOD
+        // material when a later octant holds a much larger solid mass.
+        root = store.set_cell(root, 0, 0, 0, water);
+        for z in 2..4u64 {
+            for y in 2..4u64 {
+                for x in 2..4u64 {
+                    root = store.set_cell(root, x, y, z, stone);
+                }
+            }
+        }
+
+        let dag = Svdag::build(&store, root, 2);
+        let root_off = dag.nodes[0] as usize;
+        let rep_mat = (dag.nodes[root_off] >> 8) & 0xFFFF;
+        assert_eq!(
+            rep_mat, stone as u32,
+            "representative material should follow the largest populated child, \
+             not the first occupied octant"
         );
     }
 
