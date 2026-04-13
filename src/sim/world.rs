@@ -2558,7 +2558,9 @@ mod tests {
         let _layout = w.seed_lattice_progression_demo();
         let field = LatticeField::for_world(w.level, 42);
         let ground_y = field.lo[1] + field.floor_thick;
-        let (_, _, _, corridor, _, tease_b, _, _, _) = World::progression_boxes(&field);
+        let ProgressionBoxes {
+            corridor, tease_b, ..
+        } = World::progression_boxes(&field);
         let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
         let water_material = Cell::from_raw(WATER).material();
 
@@ -2600,7 +2602,9 @@ mod tests {
         let mut w = World::new(6);
         let field = LatticeField::for_world(w.level, 42);
         let ground_y = field.lo[1] + field.floor_thick;
-        let (_, _, _, corridor, _, tease_b, _, _, _) = World::progression_boxes(&field);
+        let ProgressionBoxes {
+            corridor, tease_b, ..
+        } = World::progression_boxes(&field);
         let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
         let expected_sources = (waterfall.source_x[1] - waterfall.source_x[0] + 1) as usize;
 
