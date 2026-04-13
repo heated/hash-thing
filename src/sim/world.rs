@@ -436,11 +436,21 @@ impl World {
 
     /// Set a cell.
     ///
-    /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). For writes to
-    /// coordinates outside the current realized root, call `ensure_contains`
-    /// first to grow the tree.
+    /// **Panics** on out-of-bounds coordinates (hash-thing-fb5) or when `state`
+    /// encodes an unregistered material ID. For writes to coordinates outside
+    /// the current realized root, call `ensure_contains` first to grow the tree.
+    #[track_caller]
+    fn assert_registered_state(&self, state: CellState) {
+        let material_id = Cell::from_raw(state).material();
+        assert!(
+            self.materials.entry(material_id).is_some(),
+            "World write uses unregistered material {material_id} (raw state {state})",
+        );
+    }
+
     #[track_caller]
     pub fn set(&mut self, x: WorldCoord, y: WorldCoord, z: WorldCoord, state: CellState) {
+        self.assert_registered_state(state);
         self.set_local(
             self.local_from_world(0, x),
             self.local_from_world(1, y),
@@ -455,9 +465,12 @@ impl World {
     /// Block coordinate `(bx, by, bz)` maps to cell region
     /// `[bx*K .. bx*K+K-1]` on each axis, where `K = CELLS_PER_BLOCK`.
     ///
-    /// Auto-grows the world to fit, then queues a `FillRegion` mutation —
-    /// call `apply_mutations` to flush.
+    /// Auto-grows the world to fit, then queues a `FillRegion` mutation.
+    ///
+    /// **Panics** when `state` encodes an unregistered material ID.
+    /// Call `apply_mutations` to flush.
     pub fn set_block(&mut self, bx: i64, by: i64, bz: i64, state: CellState) {
+        self.assert_registered_state(state);
         let k = CELLS_PER_BLOCK as i64;
         let min = [WorldCoord(bx * k), WorldCoord(by * k), WorldCoord(bz * k)];
         let max = [
@@ -3364,5 +3377,28 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "World write uses unregistered material")]
+    fn set_rejects_unregistered_material_id() {
+        let mut world = World::new(3);
+        let invalid = Cell::pack(1023, 0).raw();
+        world.set(wc(0), wc(0), wc(0), invalid);
+    }
+
+    #[test]
+    #[should_panic(expected = "World write uses unregistered material")]
+    fn apply_mutations_rejects_unregistered_material_id() {
+        let mut world = World::new(3);
+        let invalid = Cell::pack(1023, 0).raw();
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(0),
+            y: wc(0),
+            z: wc(0),
+            state: invalid,
+        });
+
+        world.apply_mutations();
     }
 }
