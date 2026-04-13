@@ -127,6 +127,8 @@ pub struct HashlifeStats {
     pub cache_misses: u64,
     pub empty_skips: u64,
     pub fixed_point_skips: u64,
+    /// Per-level cache miss counts (index = level - 3, since base case is level 3).
+    pub misses_by_level: [u64; 32],
 }
 
 impl World {
