@@ -464,8 +464,12 @@ impl Renderer {
         // Storage texture for compute output. Dimensions match the scaled
         // surface config (already half-res from render_scale).
         let raycast_tex_format = wgpu::TextureFormat::Rgba16Float;
-        let (raycast_texture, raycast_texture_view) =
-            Self::create_raycast_texture_static(&device, config.width, config.height, raycast_tex_format);
+        let (raycast_texture, raycast_texture_view) = Self::create_raycast_texture_static(
+            &device,
+            config.width,
+            config.height,
+            raycast_tex_format,
+        );
 
         let svdag_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -588,12 +592,11 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("svdag_blit.wgsl").into()),
         });
 
-        let blit_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("blit_pl"),
-                bind_group_layouts: &[Some(&blit_bind_group_layout)],
-                immediate_size: 0,
-            });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit_pl"),
+            bind_group_layouts: &[Some(&blit_bind_group_layout)],
+            immediate_size: 0,
+        });
 
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("blit_rp"),
@@ -1067,9 +1070,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.raycast_texture_view,
-                        ),
+                        resource: wgpu::BindingResource::TextureView(&self.raycast_texture_view),
                     },
                 ],
             });
@@ -1413,11 +1414,10 @@ impl Renderer {
 
         // --- Compute pass: SVDAG raycast → storage texture ---
         if let Some(bg) = &self.svdag_compute_bind_group {
-            let mut compute_pass =
-                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("svdag raycast compute"),
-                    timestamp_writes: compute_timestamp_writes,
-                });
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("svdag raycast compute"),
+                timestamp_writes: compute_timestamp_writes,
+            });
             compute_pass.set_pipeline(&self.svdag_compute_pipeline);
             compute_pass.set_bind_group(0, bg, &[]);
             let wg_x = self.config.width.div_ceil(8);
