@@ -148,6 +148,7 @@ impl App {
             ..terrain::TerrainParams::for_level(level)
         };
         let stats = world.seed_terrain(&terrain_params);
+        world.seed_water_and_sand();
         let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
         let material_palette_len = world.materials.color_palette_rgba().len();
 
@@ -234,12 +235,12 @@ impl App {
                 "  1-7         Material",
                 "  Tab         Orbit mode",
                 "",
-                "  C/T/B/R/G/M Load scene",
-                "  H           Step heatmap",
-                "  +/-         Render scale",
-                "  F5          Pause",
-                "  F1          Toggle help",
-                "  Esc         Quit",
+                "  T  Terrain    B  Burning room",
+                "  R  Reset      G  GoL sphere",
+                "  M  Lattice    0  Recenter",
+                "  H  Heatmap    +/-  Resolution",
+                "  F5 Pause      F1  Toggle help",
+                "  Esc Quit",
             ],
             CameraMode::Orbit => vec![
                 "  ORBIT MODE",
@@ -251,12 +252,12 @@ impl App {
                 "  1-4         CA rule",
                 "  Tab         FPS mode",
                 "",
-                "  C/T/B/R/G/M Load scene",
-                "  H           Step heatmap",
-                "  +/-         Render scale",
-                "  F5          Pause",
-                "  F1          Toggle help",
-                "  Esc         Quit",
+                "  T  Terrain    B  Burning room",
+                "  R  Reset      G  GoL sphere",
+                "  M  Lattice    0  Recenter",
+                "  H  Heatmap    +/-  Resolution",
+                "  F5 Pause      F1  Toggle help",
+                "  Esc Quit",
             ],
         }
     }
@@ -501,7 +502,7 @@ impl ApplicationHandler for App {
         if self.window.is_none() {
             let attrs = WindowAttributes::default()
                 .with_title("hash-thing | 3D Hashlife Engine")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+                .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080));
             let window = Arc::new(
                 event_loop
                     .create_window(attrs)
@@ -585,6 +586,16 @@ impl ApplicationHandler for App {
                             self.paused = !self.paused;
                             log::info!("Paused: {}", self.paused);
                         }
+                        winit::keyboard::Key::Character("0") => {
+                            // Recenter player at world center.
+                            if let Some(pid) = self.player_id {
+                                let center = self.world.side() as f64 / 2.0;
+                                if let Some(p) = self.entities.get_mut(pid) {
+                                    p.pos = [center, center + 2.0, center];
+                                    log::info!("Player recentered");
+                                }
+                            }
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F1) => {
                             self.legend_visible = !self.legend_visible;
                             self.legend_dirty = true;
@@ -597,7 +608,9 @@ impl ApplicationHandler for App {
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
-                        winit::keyboard::Key::Character("s") if !self.is_stepping() => {
+                        winit::keyboard::Key::Character("s")
+                            if self.camera_mode == CameraMode::Orbit && !self.is_stepping() =>
+                        {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
@@ -620,21 +633,7 @@ impl ApplicationHandler for App {
                                 self.world.population()
                             );
                         }
-                        winit::keyboard::Key::Character("c") => {
-                            // Re-seed terrain with caves enabled. Stays paused.
-                            // hash-thing-3fq.2: drives the cave-CA post-pass
-                            // end-to-end so the effect is visible without
-                            // editing source.
-                            self.load_terrain_scene(
-                                "Caves terrain",
-                                terrain::TerrainParams {
-                                    caves: Some(terrain::CaveParams::default()),
-                                    ..terrain::TerrainParams::for_level(
-                                        self.volume_size.trailing_zeros(),
-                                    )
-                                },
-                            );
-                        }
+                        // C (caves terrain) removed — cave carving too slow at scale.
                         winit::keyboard::Key::Character("r") => {
                             // Reset the default CA/materials demo.
                             self.load_burning_room_demo("Reset burning room demo");
@@ -860,6 +859,18 @@ impl ApplicationHandler for App {
                 // Frame delta time for frame-rate-independent movement (xa7).
                 let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
                 self.last_frame = std::time::Instant::now();
+
+                // Update window title with FPS + resolution.
+                if let Some(window) = &self.window {
+                    let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+                    if let Some(renderer) = &self.renderer {
+                        let scale_pct = (renderer.render_scale * 100.0) as u32;
+                        window.set_title(&format!(
+                            "hash-thing | {:.0} FPS | {}³ | scale {}%",
+                            fps, self.volume_size, scale_pct,
+                        ));
+                    }
+                }
 
                 // --- Background step: collect completed result (x5w) ---
                 if let Some(ref handle) = self.step_handle {

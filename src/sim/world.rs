@@ -733,6 +733,46 @@ impl World {
         }
     }
 
+    /// Add water and sand to an existing terrain — water pools on a
+    /// hilltop (so it cascades down) and sand dunes on one side.
+    /// Call after `seed_terrain`.
+    pub fn seed_water_and_sand(&mut self) {
+        let side = self.side() as u64;
+        let center = side / 2;
+        // Water: a wide pool above center, near the high terrain.
+        // Place at 75% height in a ~side/4 square.
+        let water_y = center + center / 4;
+        let pool_radius = side / 6;
+        let pool_depth = (side / 32).max(2);
+        let lo_x = center.saturating_sub(pool_radius);
+        let hi_x = (center + pool_radius).min(side);
+        let lo_z = center.saturating_sub(pool_radius);
+        let hi_z = (center + pool_radius).min(side);
+        for z in lo_z..hi_z {
+            for x in lo_x..hi_x {
+                for dy in 0..pool_depth {
+                    let y = water_y + dy;
+                    if y < side {
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), WATER);
+                    }
+                }
+            }
+        }
+        // Sand: a dune field on one edge, at terrain surface level.
+        let sand_width = side / 8;
+        let sand_depth = (side / 64).max(2);
+        for z in 0..side / 3 {
+            for x in 0..sand_width {
+                for dy in 0..sand_depth {
+                    let y = center + dy;
+                    if y < side {
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), SAND);
+                    }
+                }
+            }
+        }
+    }
+
     /// Seed a lattice megastructure with active materials.
     ///
     /// A 3D grid of corridors carved from stone, with grass-covered pillars,
