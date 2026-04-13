@@ -1388,6 +1388,7 @@ impl World {
             balcony,
             panorama,
         );
+        self.seed_reveal_fireworks(balcony.center());
         self.seed_progression_break_trigger(tease_a);
 
         let player_pos = [
@@ -1501,8 +1502,9 @@ impl World {
             FAN,
         );
 
-        // Reveal: water curtains framing the balcony plus fireworks staged
-        // just above the platform so they immediately rise and burst.
+        // Reveal: water curtains framing the balcony. Fireworks are staged
+        // by the shared reveal helper so this route-specific pass only owns
+        // the geometry-aware framing.
         self.fill_box(
             Box3::new(
                 [panorama.min[0] + 1, balcony.min[1], balcony.min[2]],
@@ -1516,18 +1518,6 @@ impl World {
                 [panorama.min[0] + 1, balcony.max[1] + 3, balcony.max[2]],
             ),
             WATER,
-        );
-        let reveal_center = balcony.center();
-        self.fill_box(
-            Box3::new(
-                [reveal_center[0] - 1, balcony.max[1], reveal_center[2] - 1],
-                [
-                    reveal_center[0] + 1,
-                    balcony.max[1] + 1,
-                    reveal_center[2] + 1,
-                ],
-            ),
-            FIREWORK,
         );
     }
 
@@ -1653,6 +1643,19 @@ impl World {
             Self::spectacle_box(waypoint.center, [0, 1, 0], [1, 2, 0]),
             FIRE,
         );
+    }
+
+    fn seed_reveal_fireworks(&mut self, center: [i64; 3]) {
+        for &(dx, dz) in &[(-4, -3), (-4, 2), (-1, -3), (-1, 2)] {
+            self.fill_box(
+                Self::spectacle_box(center, [dx, -1, dz], [dx + 1, 0, dz + 1]),
+                STONE,
+            );
+            self.fill_box(
+                Self::spectacle_box(center, [dx, 1, dz], [dx, 2, dz]),
+                FIREWORK,
+            );
+        }
     }
 
     fn commit_step(&mut self, next: &[CellState], side: usize) {
@@ -2218,6 +2221,18 @@ mod tests {
                 "checkpoint must be air: {checkpoint:?}"
             );
         }
+    }
+
+    #[test]
+    fn lattice_progression_demo_stages_fireworks_near_reveal() {
+        let mut w = World::new(6); // side 64
+        let layout = w.seed_lattice_progression_demo();
+        let snapshot = local_snapshot(&w, layout.reveal_center, 5);
+        assert!(
+            snapshot.contains(&FIREWORK),
+            "reveal should stage firework launchers near {:?}",
+            layout.reveal_center
+        );
     }
 
     #[test]

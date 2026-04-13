@@ -7,6 +7,8 @@ use hash_thing::terrain;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
@@ -165,13 +167,13 @@ fn lattice_demo_waypoint(side: usize, beat: LatticeDemoBeat) -> DemoWaypoint {
                 player: PlayerPose {
                     pos: [center + offset, side * 0.58, center + offset],
                     yaw: std::f64::consts::FRAC_PI_4,
-                    pitch: -0.22,
+                    pitch: 0.24,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.5, 0.46, 0.5],
+                    target: [0.62, 0.72, 0.62],
                     yaw: std::f32::consts::FRAC_PI_4,
-                    pitch: 0.18,
-                    dist: 1.05,
+                    pitch: 0.32,
+                    dist: 0.82,
                 },
             }
         }
@@ -885,6 +887,9 @@ impl ApplicationHandler for App {
                     .create_window(attrs)
                     .expect("failed to create main window"),
             );
+            // Agent/CLI launches on macOS can leave the app alive but unfocused.
+            window.set_visible(true);
+            window.focus_window();
             self.window = Some(window.clone());
 
             let mut renderer =
@@ -1664,7 +1669,16 @@ fn main() {
         volume_size.trailing_zeros()
     );
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let mut event_loop_builder = EventLoop::builder();
+    #[cfg(target_os = "macos")]
+    {
+        // Make launch behavior explicit instead of depending on bundle/agent defaults.
+        event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
+        event_loop_builder.with_activate_ignoring_other_apps(true);
+    }
+    let event_loop = event_loop_builder
+        .build()
+        .expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
     event_loop
@@ -1692,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn lattice_panorama_waypoint_faces_inward_and_downward() {
+    fn lattice_panorama_waypoint_faces_inward_and_upward() {
         let waypoint = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
         let (_eye, dir) = player::eye_ray(
             &waypoint.player.pos,
@@ -1700,7 +1714,7 @@ mod tests {
             waypoint.player.pitch,
         );
         assert!(dir[0] < 0.0);
-        assert!(dir[1] < 0.0);
+        assert!(dir[1] > 0.0);
         assert!(dir[2] < 0.0);
     }
 
