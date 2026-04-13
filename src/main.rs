@@ -274,7 +274,9 @@ impl App {
         let mut world = sim::World::new(volume_size.trailing_zeros());
         let level = volume_size.trailing_zeros();
         let terrain_params = terrain::TerrainParams::for_level(level);
-        let stats = world.seed_terrain(&terrain_params);
+        let stats = world
+            .seed_terrain(&terrain_params)
+            .expect("level-derived terrain params must validate");
         world.seed_water_and_sand();
         let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
         let material_palette_len = world.materials.color_palette_rgba().len();
@@ -892,7 +894,10 @@ impl App {
         }
         let nodes_before = self.world.store.stats();
         let start = std::time::Instant::now();
-        let stats = self.world.seed_terrain(&params);
+        let stats = self
+            .world
+            .seed_terrain(&params)
+            .expect("UI-generated terrain params must validate");
         self.reset_scene_entities();
         self.spawn_demo_entities();
         let elapsed = start.elapsed();
@@ -1726,7 +1731,9 @@ fn main() {
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
         event_loop_builder.with_activate_ignoring_other_apps(true);
     }
-    let event_loop = event_loop_builder.build().expect("failed to create event loop");
+    let event_loop = event_loop_builder
+        .build()
+        .expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
     event_loop

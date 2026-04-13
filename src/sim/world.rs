@@ -8,8 +8,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, FIREWORK, GRASS, LAVA, OIL,
-    SAND, STONE, VINE, WATER,
+    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE, FIREWORK, GRASS, LAVA,
+    OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -130,6 +130,19 @@ impl Box3 {
             (self.min[2] + self.max[2]) / 2,
         ]
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProgressionBoxes {
+    start_shell: Box3,
+    start_room: Box3,
+    corridor_shell: Box3,
+    corridor: Box3,
+    tease_a: Box3,
+    tease_b: Box3,
+    atrium: Box3,
+    balcony: Box3,
+    panorama: Box3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1154,7 +1167,8 @@ impl World {
         self.hashlife_all_inert_cache.clear();
         self.clone_sources.clear();
         let terrain_params = TerrainParams::for_level(self.level);
-        let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level);
+        let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level)
+            .expect("TerrainParams::for_level must yield a valid heightmap field");
         let lattice = LatticeField::for_world(self.level, 42);
         let edge_blend = (lattice.cell_size / 2).max(2);
         let field = TerrainBlendField::new(
@@ -1203,6 +1217,20 @@ impl World {
         }
     }
 
+    #[cfg(test)]
+    fn box_contains_material(&self, volume: Box3, state: CellState) -> bool {
+        for z in volume.min[2]..=volume.max[2] {
+            for y in volume.min[1]..=volume.max[1] {
+                for x in volume.min[0]..=volume.max[0] {
+                    if self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) == state {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn fill_floor(&mut self, volume: Box3, state: CellState) {
         self.fill_box(
             Box3::new(
@@ -1237,9 +1265,7 @@ impl World {
         }
     }
 
-    fn progression_boxes(
-        field: &LatticeField,
-    ) -> (Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3) {
+    fn progression_boxes(field: &LatticeField) -> ProgressionBoxes {
         let lo = field.lo;
         let hi = field.hi;
         let ground_y = lo[1] + field.floor_thick;
@@ -1357,7 +1383,7 @@ impl World {
             ],
         );
 
-        (
+        ProgressionBoxes {
             start_shell,
             start_room,
             corridor_shell,
@@ -1367,7 +1393,7 @@ impl World {
             atrium,
             balcony,
             panorama,
-        )
+        }
     }
 
     fn lattice_progression_spectacle_anchors(
@@ -1464,7 +1490,7 @@ impl World {
         self.seed_lattice_megastructure();
         let field = LatticeField::for_world(self.level, 42);
         let ground_y = field.lo[1] + field.floor_thick;
-        let (
+        let ProgressionBoxes {
             start_shell,
             start_room,
             corridor_shell,
@@ -1474,7 +1500,7 @@ impl World {
             atrium,
             balcony,
             panorama,
-        ) = Self::progression_boxes(&field);
+        } = Self::progression_boxes(&field);
 
         self.fill_box(start_shell, STONE);
         self.fill_box(start_room, AIR);
@@ -1500,6 +1526,15 @@ impl World {
         self.fill_floor(atrium, STONE);
         self.fill_box(balcony, AIR);
         self.fill_box(panorama, AIR);
+        self.stage_lattice_progression_materials(
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            balcony,
+            panorama,
+        );
         self.fill_floor(
             Box3::new(
                 [panorama.min[0], balcony.min[1], balcony.min[2]],
@@ -1554,6 +1589,121 @@ impl World {
             reveal_center,
             panorama_center,
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the route beats are named scene volumes, not anonymous coordinates"
+    )]
+    fn stage_lattice_progression_materials(
+        &mut self,
+        start_room: Box3,
+        corridor_shell: Box3,
+        corridor: Box3,
+        tease_a: Box3,
+        tease_b: Box3,
+        balcony: Box3,
+        panorama: Box3,
+    ) {
+        // Room: vine-draped entry wall and ceiling lip so the start reads
+        // organic rather than bare debug architecture.
+        self.fill_box(
+            Box3::new(
+                [
+                    start_room.min[0] + 1,
+                    start_room.min[1],
+                    start_room.min[2] + 1,
+                ],
+                [
+                    start_room.min[0] + 3,
+                    start_room.max[1] - 1,
+                    start_room.min[2] + 1,
+                ],
+            ),
+            VINE,
+        );
+        self.fill_box(
+            Box3::new(
+                [
+                    start_room.min[0] + 2,
+                    start_room.max[1] - 1,
+                    start_room.min[2] + 1,
+                ],
+                [
+                    start_room.min[0] + 5,
+                    start_room.max[1] - 1,
+                    start_room.min[2] + 2,
+                ],
+            ),
+            VINE,
+        );
+
+        // Corridor: carve a side opening and hang a thin waterfall through it.
+        let corridor_mid = corridor.center();
+        let gap_z = corridor_shell.max[2];
+        self.fill_box(
+            Box3::new(
+                [corridor_mid[0] - 1, corridor.min[1], gap_z],
+                [corridor_mid[0] + 1, corridor.max[1], gap_z],
+            ),
+            AIR,
+        );
+        self.fill_box(
+            Box3::new(
+                [corridor_mid[0], corridor.min[1] + 2, corridor.max[2] - 1],
+                [corridor_mid[0], corridor.max[1], corridor.max[2]],
+            ),
+            WATER,
+        );
+
+        // Tease: sand spill on one branch, fan props on the other so the
+        // player reads "something strange is happening ahead" before the reveal.
+        let tease_a_center = tease_a.center();
+        self.fill_box(
+            Box3::new(
+                [tease_a.min[0] + 1, tease_a.min[1], tease_a_center[2] - 1],
+                [
+                    tease_a.min[0] + 4,
+                    tease_a.min[1] + 1,
+                    tease_a_center[2] + 1,
+                ],
+            ),
+            SAND,
+        );
+        let tease_b_center = tease_b.center();
+        self.fill_box(
+            Box3::new(
+                [
+                    tease_b.max[0] - 1,
+                    tease_b.min[1] + 1,
+                    tease_b_center[2] - 1,
+                ],
+                [
+                    tease_b.max[0] - 1,
+                    tease_b.min[1] + 2,
+                    tease_b_center[2] + 1,
+                ],
+            ),
+            FAN,
+        );
+
+        // Reveal: water curtains framing the balcony. Fireworks are staged
+        // by the shared reveal helper so this route-specific pass only owns
+        // the geometry-aware framing.
+        self.fill_box(
+            Box3::new(
+                [panorama.min[0] + 1, balcony.min[1], balcony.min[2]],
+                [panorama.min[0] + 1, balcony.max[1] + 3, balcony.min[2] + 1],
+            ),
+            WATER,
+        );
+        self.fill_box(
+            Box3::new(
+                [panorama.min[0] + 1, balcony.min[1], balcony.max[2] - 1],
+                [panorama.min[0] + 1, balcony.max[1] + 3, balcony.max[2]],
+            ),
+            WATER,
+        );
     }
 
     fn seed_progression_break_trigger(&mut self, tease_a: Box3) {
@@ -1746,8 +1896,8 @@ impl World {
     /// node counts honest, and makes the epoch boundary explicit.
     ///
     /// **The caller MUST keep the simulation paused around this call.**
-    pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
-        params.validate().expect("invalid TerrainParams");
+    pub fn seed_terrain(&mut self, params: &TerrainParams) -> Result<GenStats, &'static str> {
+        params.validate()?;
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
@@ -1755,7 +1905,8 @@ impl World {
         self.hashlife_all_inert_cache.clear();
         let heightmap = params.to_heightmap();
         let precompute_start = std::time::Instant::now();
-        let field = PrecomputedHeightmapField::new(heightmap, self.level);
+        let field = PrecomputedHeightmapField::new(heightmap, self.level)
+            .expect("validated TerrainParams must yield a valid heightmap field");
         let precompute_us = precompute_start.elapsed().as_micros() as u64;
         let gen_start = std::time::Instant::now();
         let (root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
@@ -1766,7 +1917,7 @@ impl World {
         self.generation = 0;
         self.terrain_params = Some(*params);
         self.block_rule_present = None;
-        stats
+        Ok(stats)
     }
 }
 
@@ -1862,7 +2013,7 @@ mod tests {
     use crate::player;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
-        MaterialRegistry, FIRE, FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
+        MaterialRegistry, FAN, FIRE, FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
     };
     use std::collections::{HashSet, VecDeque};
 
@@ -2306,7 +2457,8 @@ mod tests {
         world.seed_lattice_megastructure();
 
         let params = TerrainParams::for_level(6);
-        let terrain = PrecomputedHeightmapField::new(params.to_heightmap(), 6);
+        let terrain = PrecomputedHeightmapField::new(params.to_heightmap(), 6)
+            .expect("TerrainParams::for_level must yield a valid heightmap field");
         let point = [0i64, 20, 20];
         let point_world = [0u64, 20, 20];
 
@@ -2530,11 +2682,65 @@ mod tests {
     }
 
     #[test]
+    fn lattice_progression_demo_stages_route_specific_materials() {
+        let mut w = World::new(6);
+        let _layout = w.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(w.level, 42);
+        let ProgressionBoxes {
+            start_shell: _start_shell,
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            atrium: _atrium,
+            balcony,
+            panorama,
+        } = World::progression_boxes(&field);
+
+        assert!(
+            w.box_contains_material(start_room, VINE),
+            "start room should stage vine detail"
+        );
+        assert!(
+            w.box_contains_material(corridor_shell, WATER),
+            "corridor should stage a waterfall/gap read"
+        );
+        assert!(
+            w.box_contains_material(tease_a, SAND),
+            "tease branch should contain sand staging"
+        );
+        assert!(
+            w.box_contains_material(tease_b, FAN),
+            "tease branch should contain fan props"
+        );
+        assert!(
+            w.box_contains_material(balcony, FIREWORK)
+                || w.box_contains_material(panorama, FIREWORK),
+            "reveal should stage fireworks"
+        );
+        assert!(
+            w.box_contains_material(panorama, WATER),
+            "reveal should keep water framing"
+        );
+
+        // Sanity: the corridor still remains traversable through its center.
+        assert_eq!(
+            w.get(
+                WorldCoord(corridor.center()[0]),
+                WorldCoord(corridor.center()[1]),
+                WorldCoord(corridor.center()[2]),
+            ),
+            AIR
+        );
+    }
+
+    #[test]
     fn lattice_progression_demo_stages_optional_break_trigger_off_main_route() {
         let mut w = World::new(6);
         let _layout = w.seed_lattice_progression_demo();
         let field = LatticeField::for_world(w.level, 42);
-        let (_, _, _, _, tease_a, _, _, _, _) = World::progression_boxes(&field);
+        let ProgressionBoxes { tease_a, .. } = World::progression_boxes(&field);
         let center_x = tease_a.center()[0];
         let mut vine_cells = 0;
 
@@ -2600,10 +2806,10 @@ mod tests {
         let mut world = World::new(6);
         let params = TerrainParams::default();
 
-        let _ = world.seed_terrain(&params);
+        let _ = world.seed_terrain(&params).unwrap();
         let nodes_after_first = world.store.stats();
 
-        let _ = world.seed_terrain(&params);
+        let _ = world.seed_terrain(&params).unwrap();
         let nodes_after_second = world.store.stats();
 
         assert_eq!(
@@ -2612,6 +2818,25 @@ mod tests {
              from {nodes_after_first} to {nodes_after_second} across a \
              deterministic re-seed",
         );
+    }
+
+    #[test]
+    fn seed_terrain_rejects_invalid_params_without_mutating_world() {
+        let mut world = World::new(6);
+        let nodes_before = world.store.stats();
+        let root_before = world.root;
+        let invalid = TerrainParams {
+            wavelength: 0.0,
+            ..TerrainParams::default()
+        };
+
+        assert!(matches!(
+            world.seed_terrain(&invalid),
+            Err("wavelength must be finite and > 0")
+        ));
+        assert_eq!(world.store.stats(), nodes_before);
+        assert_eq!(world.root, root_before);
+        assert!(world.terrain_params.is_none());
     }
 
     #[test]
@@ -3242,7 +3467,7 @@ mod tests {
     fn expand_with_terrain_populates_new_octants() {
         let mut world = World::new(3); // side=8
         let params = TerrainParams::default();
-        world.seed_terrain(&params);
+        world.seed_terrain(&params).unwrap();
         let pop_initial = world.population();
         assert!(pop_initial > 0, "terrain should produce non-empty world");
 
@@ -3261,11 +3486,11 @@ mod tests {
         let params = TerrainParams::default();
 
         let mut w1 = World::new(3);
-        w1.seed_terrain(&params);
+        w1.seed_terrain(&params).unwrap();
         w1.ensure_contains(wc(10), wc(0), wc(0));
 
         let mut w2 = World::new(3);
-        w2.seed_terrain(&params);
+        w2.seed_terrain(&params).unwrap();
         w2.ensure_contains(wc(10), wc(0), wc(0));
 
         // Same params + same expansion → same world.
@@ -3279,7 +3504,7 @@ mod tests {
     fn expand_terrain_preserves_original_cells() {
         let mut world = World::new(3);
         let params = TerrainParams::default();
-        world.seed_terrain(&params);
+        world.seed_terrain(&params).unwrap();
 
         // Record some cells from the original region.
         let cells_before: Vec<_> = (0..8u64).map(|x| world.get(wc(x), wc(3), wc(3))).collect();
@@ -3305,12 +3530,12 @@ mod tests {
 
         // Path A: generate at level 3, then expand to level 4.
         let mut grown = World::new(3);
-        grown.seed_terrain(&params);
+        grown.seed_terrain(&params).unwrap();
         grown.ensure_contains(wc(10), wc(0), wc(0)); // grows to level 4
 
         // Path B: generate at level 4 directly.
         let mut direct = World::new(4);
-        direct.seed_terrain(&params);
+        direct.seed_terrain(&params).unwrap();
 
         // Spot-check cells across the expansion boundary (x=8 is the seam).
         for x in 0..16u64 {
