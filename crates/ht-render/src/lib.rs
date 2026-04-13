@@ -74,6 +74,29 @@ mod wgsl_drift_guard {
     }
 
     #[test]
+    fn wgsl_svdag_inside_lod_node_normal_fallback_matches_rust() {
+        let expected_lines = [
+            "let ntmax_v = max(nt1, nt2);",
+            "let inside_node = ntmin_v.x < 0.0 && ntmin_v.y < 0.0 && ntmin_v.z < 0.0;",
+            "if ntmax_v.x <= ntmax_v.y && ntmax_v.x <= ntmax_v.z {",
+            "normal = vec3<f32>(sign(rd.x), 0.0, 0.0);",
+            "} else if ntmax_v.y <= ntmax_v.z {",
+            "normal = vec3<f32>(0.0, sign(rd.y), 0.0);",
+            "normal = vec3<f32>(0.0, 0.0, sign(rd.z));",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` verbatim — \
+                 the representative-material LOD path must detect inside-node \
+                 origins via `all(ntmin_v < 0)` and pick the nearest exit face \
+                 with `sign(rd)` on that axis (hash-thing-p9dd). Update \
+                 whichever side is wrong so CPU and WGSL stay aligned."
+            );
+        }
+    }
+
+    #[test]
     fn wgsl_leaf_shading_uses_surface_hit_position() {
         let expected_lines = [
             "let hit_t = select(",
