@@ -18,6 +18,10 @@ pub enum CameraMode {
 pub const PLAYER_SPEED: f64 = 9.0;
 /// Sprint multiplier.
 pub const PLAYER_SPRINT: f64 = 2.5;
+/// Jump launch speed in cells per second.
+pub const PLAYER_JUMP_SPEED: f64 = 8.5;
+/// Downward acceleration in cells per second squared.
+pub const PLAYER_GRAVITY: f64 = 28.0;
 /// Player bounding box half-width on X/Z (cells).
 pub const PLAYER_HALF_W: f64 = 0.3;
 /// Player height (cells).
@@ -26,6 +30,27 @@ pub const PLAYER_HEIGHT: f64 = 1.6;
 pub const LOOK_SENSITIVITY: f64 = 0.003;
 /// Maximum raycast range for block place/break (in cells).
 pub const INTERACT_RANGE: f64 = 40.0;
+
+const GROUND_PROBE_EPSILON: f64 = 0.05;
+const VERTICAL_COLLISION_STEPS: usize = 12;
+
+/// Result of one grounded-movement step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroundedMoveResult {
+    pub pos: [f64; 3],
+    pub vertical_velocity: f64,
+    pub grounded: bool,
+}
+
+/// Per-frame inputs for grounded first-person movement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroundedMoveInput {
+    pub yaw: f64,
+    pub move_input: [f64; 2],
+    pub speed: f64,
+    pub dt: f64,
+    pub jump_requested: bool,
+}
 
 /// Check if the player's AABB at `pos` overlaps any solid cell.
 pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
@@ -161,6 +186,92 @@ pub fn apply_movement(world: &World, pos: &[f64; 3], delta: &[f64; 3]) -> [f64; 
     new_pos
 }
 
+/// True when the player is standing on solid ground (or within a tiny
+/// settling epsilon of it).
+pub fn is_grounded(world: &World, pos: &[f64; 3]) -> bool {
+    let mut probe = *pos;
+    probe[1] -= GROUND_PROBE_EPSILON;
+    player_collides(world, &probe)
+}
+
+fn apply_vertical_movement(world: &World, pos: &[f64; 3], delta_y: f64) -> ([f64; 3], bool) {
+    if delta_y.abs() < 1e-9 {
+        return (*pos, false);
+    }
+
+    let mut target = *pos;
+    target[1] += delta_y;
+    if !player_collides(world, &target) {
+        return (target, false);
+    }
+
+    let mut settled = *pos;
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..VERTICAL_COLLISION_STEPS {
+        let mid = (low + high) * 0.5;
+        let mut probe = *pos;
+        probe[1] += delta_y * mid;
+        if player_collides(world, &probe) {
+            high = mid;
+        } else {
+            low = mid;
+            settled = probe;
+        }
+    }
+    (settled, true)
+}
+
+/// Apply one grounded first-person movement step with jump/gravity.
+pub fn step_grounded_movement(
+    world: &World,
+    pos: &[f64; 3],
+    vertical_velocity: f64,
+    input: GroundedMoveInput,
+) -> GroundedMoveResult {
+    let horizontal = compute_move_delta(
+        input.yaw,
+        [input.move_input[0], input.move_input[1], 0.0],
+        input.speed,
+        input.dt,
+    );
+    let mut new_pos = apply_movement(world, pos, &horizontal);
+    let mut grounded = is_grounded(world, &new_pos);
+    let mut vertical_velocity = if grounded && vertical_velocity < 0.0 {
+        0.0
+    } else {
+        vertical_velocity
+    };
+
+    if grounded {
+        if input.jump_requested {
+            vertical_velocity = PLAYER_JUMP_SPEED;
+            grounded = false;
+        } else {
+            vertical_velocity = 0.0;
+        }
+    } else {
+        vertical_velocity -= PLAYER_GRAVITY * input.dt;
+    }
+
+    let (vertical_pos, blocked) =
+        apply_vertical_movement(world, &new_pos, vertical_velocity * input.dt);
+    new_pos = vertical_pos;
+    if blocked {
+        grounded = vertical_velocity <= 0.0 && is_grounded(world, &new_pos);
+        vertical_velocity = 0.0;
+    } else if vertical_velocity <= 0.0 && is_grounded(world, &new_pos) {
+        grounded = true;
+        vertical_velocity = 0.0;
+    }
+
+    GroundedMoveResult {
+        pos: new_pos,
+        vertical_velocity,
+        grounded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +281,17 @@ mod tests {
         let mut world = World::new(3); // 8³
         let material = Cell::pack(1, 0).raw();
         world.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), material);
+        world
+    }
+
+    fn world_with_floor() -> World {
+        let mut world = World::new(3);
+        let material = Cell::pack(1, 0).raw();
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set(WorldCoord(x), WorldCoord(0), WorldCoord(z), material);
+            }
+        }
         world
     }
 
@@ -281,5 +403,77 @@ mod tests {
         let new_pos = apply_movement(&world, &pos, &delta);
         assert!((new_pos[0] - 5.0).abs() < 1e-9);
         assert!((new_pos[2] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn grounded_step_jumps_only_when_supported() {
+        let world = world_with_floor();
+        let dt = 1.0 / 60.0;
+        let start = [4.0, 1.0, 4.0];
+
+        let jumped = step_grounded_movement(
+            &world,
+            &start,
+            0.0,
+            GroundedMoveInput {
+                yaw: 0.0,
+                move_input: [0.0, 0.0],
+                speed: PLAYER_SPEED,
+                dt,
+                jump_requested: true,
+            },
+        );
+        assert!(jumped.pos[1] > start[1]);
+        assert!(jumped.vertical_velocity > 0.0);
+        assert!(!jumped.grounded);
+
+        let midair = step_grounded_movement(
+            &world,
+            &jumped.pos,
+            jumped.vertical_velocity,
+            GroundedMoveInput {
+                yaw: 0.0,
+                move_input: [0.0, 0.0],
+                speed: PLAYER_SPEED,
+                dt,
+                jump_requested: true,
+            },
+        );
+        assert!(midair.pos[1] > jumped.pos[1]);
+        assert!(midair.vertical_velocity < jumped.vertical_velocity);
+    }
+
+    #[test]
+    fn grounded_step_gravity_lands_back_on_floor() {
+        let world = world_with_floor();
+        let dt = 1.0 / 60.0;
+        let mut pos = [4.0, 4.0, 4.0];
+        let mut vertical_velocity = 0.0;
+        let mut grounded = false;
+
+        for _ in 0..240 {
+            let step = step_grounded_movement(
+                &world,
+                &pos,
+                vertical_velocity,
+                GroundedMoveInput {
+                    yaw: 0.0,
+                    move_input: [0.0, 0.0],
+                    speed: PLAYER_SPEED,
+                    dt,
+                    jump_requested: false,
+                },
+            );
+            pos = step.pos;
+            vertical_velocity = step.vertical_velocity;
+            grounded = step.grounded;
+            if grounded {
+                break;
+            }
+        }
+
+        assert!(grounded);
+        assert!((pos[1] - 1.0).abs() < 0.01);
+        assert!(vertical_velocity.abs() < 1e-9);
     }
 }
