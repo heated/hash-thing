@@ -26,12 +26,16 @@ pub const PLAYER_GRAVITY: f64 = 28.0;
 pub const PLAYER_HALF_W: f64 = 0.3;
 /// Player height (cells).
 pub const PLAYER_HEIGHT: f64 = 1.6;
+/// Maximum vertical lift the collision solver will try to clear a low ledge.
+const STEP_UP_HEIGHT: f64 = 1.0;
+/// Maximum drop to snap down to a nearby floor when moving horizontally.
+const GROUND_SNAP_HEIGHT: f64 = 0.35;
 /// Mouse look sensitivity (radians per pixel).
 pub const LOOK_SENSITIVITY: f64 = 0.003;
 /// Maximum raycast range for block place/break (in cells).
 pub const INTERACT_RANGE: f64 = 40.0;
 
-const GROUND_PROBE_EPSILON: f64 = 0.05;
+const GROUND_CONTACT_EPSILON: f64 = 0.05;
 const VERTICAL_COLLISION_STEPS: usize = 12;
 
 /// Result of one grounded-movement step.
@@ -50,6 +54,95 @@ pub struct GroundedMoveInput {
     pub speed: f64,
     pub dt: f64,
     pub jump_requested: bool,
+}
+
+/// Camera-space offsets layered on top of the first-person eye position.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FirstPersonCameraOffset {
+    pub vertical: f64,
+    pub lateral: f64,
+    pub forward: f64,
+}
+
+/// Small deterministic state machine that adds weight to first-person camera
+/// motion without entangling renderer-side camera math.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FirstPersonCameraFeel {
+    phase: f64,
+    vertical: f64,
+    lateral: f64,
+    impulse: f64,
+    moving: bool,
+    grounded: bool,
+    initialized: bool,
+}
+
+impl FirstPersonCameraFeel {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn tick(
+        &mut self,
+        planar_speed: f64,
+        sprinting: bool,
+        grounded: bool,
+        dt: f64,
+    ) -> FirstPersonCameraOffset {
+        if dt <= 0.0 {
+            return FirstPersonCameraOffset {
+                vertical: self.vertical + self.impulse,
+                lateral: self.lateral,
+                forward: -self.impulse * 0.5,
+            };
+        }
+
+        let active = grounded && planar_speed > 0.1;
+        if !self.initialized {
+            self.moving = active;
+            self.grounded = grounded;
+            self.initialized = true;
+        }
+        if active {
+            let cadence_hz = 1.2 + planar_speed * 0.12;
+            self.phase = (self.phase + dt * cadence_hz * std::f64::consts::TAU)
+                .rem_euclid(std::f64::consts::TAU);
+        }
+
+        let speed_ratio = (planar_speed / (PLAYER_SPEED * PLAYER_SPRINT)).clamp(0.0, 1.0);
+        let bob_gain = if sprinting { 1.3 } else { 1.0 };
+        let target_vertical = if active {
+            -self.phase.sin().abs() * (0.012 + 0.014 * speed_ratio) * bob_gain
+        } else {
+            0.0
+        };
+        let target_lateral = if active {
+            self.phase.cos() * (0.005 + 0.007 * speed_ratio) * bob_gain
+        } else {
+            0.0
+        };
+
+        let smoothing = 1.0 - (-dt * 12.0).exp();
+        self.vertical += (target_vertical - self.vertical) * smoothing;
+        self.lateral += (target_lateral - self.lateral) * smoothing;
+
+        if self.initialized && active != self.moving {
+            self.impulse = if active { 0.010 } else { -0.012 };
+        }
+        if self.initialized && grounded && !self.grounded {
+            self.impulse = self.impulse.min(-0.016);
+        }
+        self.impulse *= (-dt * 10.0).exp();
+
+        self.moving = active;
+        self.grounded = grounded;
+
+        FirstPersonCameraOffset {
+            vertical: self.vertical + self.impulse,
+            lateral: self.lateral,
+            forward: -self.impulse * 0.5,
+        }
+    }
 }
 
 /// Check if the player's AABB at `pos` overlaps any solid cell.
@@ -72,6 +165,72 @@ pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
         }
     }
     false
+}
+
+fn player_supported_at_y(world: &World, pos: &[f64; 3], support_y: i64) -> bool {
+    let hw = PLAYER_HALF_W;
+    let x_min = (pos[0] - hw).floor() as i64;
+    let x_max = (pos[0] + hw).floor() as i64;
+    let z_min = (pos[2] - hw).floor() as i64;
+    let z_max = (pos[2] + hw).floor() as i64;
+    for cx in x_min..=x_max {
+        for cz in z_min..=z_max {
+            if world.get(WorldCoord(cx), WorldCoord(support_y), WorldCoord(cz)) != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn snap_down_to_support(world: &World, pos: &[f64; 3], max_drop: f64) -> Option<[f64; 3]> {
+    let top_support = pos[1].floor() as i64 - 1;
+    let bottom_support = (pos[1] - max_drop).floor() as i64 - 1;
+    for support_y in (bottom_support..=top_support).rev() {
+        let candidate_y = support_y as f64 + 1.0;
+        if pos[1] - candidate_y < -1e-9 || pos[1] - candidate_y > max_drop + 1e-9 {
+            continue;
+        }
+        let mut candidate = *pos;
+        candidate[1] = candidate_y;
+        if !player_collides(world, &candidate)
+            && player_supported_at_y(world, &candidate, support_y)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn try_step_move(world: &World, pos: &[f64; 3], axis: usize, delta: f64) -> Option<[f64; 3]> {
+    if axis == 1 || delta.abs() < 1e-9 {
+        return None;
+    }
+    snap_down_to_support(world, pos, GROUND_SNAP_HEIGHT)?;
+    let mut raised = *pos;
+    raised[1] += STEP_UP_HEIGHT;
+    if player_collides(world, &raised) {
+        return None;
+    }
+    raised[axis] += delta;
+    if player_collides(world, &raised) {
+        return None;
+    }
+    snap_down_to_support(world, &raised, STEP_UP_HEIGHT)
+}
+
+fn is_contact_grounded(world: &World, pos: &[f64; 3]) -> bool {
+    let mut probe = *pos;
+    probe[1] -= GROUND_CONTACT_EPSILON;
+    player_collides(world, &probe)
+}
+
+/// Report whether the player is standing on support or close enough to snap
+/// onto it; camera feel should read those states as grounded locomotion.
+pub fn is_grounded(world: &World, pos: &[f64; 3]) -> bool {
+    let support_y = pos[1].floor() as i64 - 1;
+    player_supported_at_y(world, pos, support_y)
+        || snap_down_to_support(world, pos, GROUND_SNAP_HEIGHT).is_some()
 }
 
 /// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
@@ -174,24 +333,35 @@ pub fn compute_move_delta(yaw: f64, input: [f64; 3], speed: f64, dt: f64) -> [f6
 
 /// Apply a movement delta with per-axis collision resolution.
 /// Returns the new position after sliding along walls.
-pub fn apply_movement(world: &World, pos: &[f64; 3], delta: &[f64; 3]) -> [f64; 3] {
+fn apply_movement_internal(
+    world: &World,
+    pos: &[f64; 3],
+    delta: &[f64; 3],
+    grounded: bool,
+) -> [f64; 3] {
     let mut new_pos = *pos;
     for axis in 0..3 {
         let old = new_pos[axis];
         new_pos[axis] += delta[axis];
         if player_collides(world, &new_pos) {
             new_pos[axis] = old;
+            if grounded {
+                if let Some(stepped) = try_step_move(world, &new_pos, axis, delta[axis]) {
+                    new_pos = stepped;
+                }
+            }
+        }
+    }
+    if grounded && delta[1] <= 0.0 {
+        if let Some(snapped) = snap_down_to_support(world, &new_pos, GROUND_SNAP_HEIGHT) {
+            new_pos = snapped;
         }
     }
     new_pos
 }
 
-/// True when the player is standing on solid ground (or within a tiny
-/// settling epsilon of it).
-pub fn is_grounded(world: &World, pos: &[f64; 3]) -> bool {
-    let mut probe = *pos;
-    probe[1] -= GROUND_PROBE_EPSILON;
-    player_collides(world, &probe)
+pub fn apply_movement(world: &World, pos: &[f64; 3], delta: &[f64; 3]) -> [f64; 3] {
+    apply_movement_internal(world, pos, delta, true)
 }
 
 fn apply_vertical_movement(world: &World, pos: &[f64; 3], delta_y: f64) -> ([f64; 3], bool) {
@@ -229,14 +399,15 @@ pub fn step_grounded_movement(
     vertical_velocity: f64,
     input: GroundedMoveInput,
 ) -> GroundedMoveResult {
+    let grounded_before = is_contact_grounded(world, pos);
     let horizontal = compute_move_delta(
         input.yaw,
         [input.move_input[0], input.move_input[1], 0.0],
         input.speed,
         input.dt,
     );
-    let mut new_pos = apply_movement(world, pos, &horizontal);
-    let mut grounded = is_grounded(world, &new_pos);
+    let mut new_pos = apply_movement_internal(world, pos, &horizontal, grounded_before);
+    let mut grounded = is_contact_grounded(world, &new_pos);
     let mut vertical_velocity = if grounded && vertical_velocity < 0.0 {
         0.0
     } else {
@@ -258,9 +429,9 @@ pub fn step_grounded_movement(
         apply_vertical_movement(world, &new_pos, vertical_velocity * input.dt);
     new_pos = vertical_pos;
     if blocked {
-        grounded = vertical_velocity <= 0.0 && is_grounded(world, &new_pos);
+        grounded = vertical_velocity <= 0.0 && is_contact_grounded(world, &new_pos);
         vertical_velocity = 0.0;
-    } else if vertical_velocity <= 0.0 && is_grounded(world, &new_pos) {
+    } else if vertical_velocity <= 0.0 && is_contact_grounded(world, &new_pos) {
         grounded = true;
         vertical_velocity = 0.0;
     }
@@ -284,12 +455,12 @@ mod tests {
         world
     }
 
-    fn world_with_floor() -> World {
+    fn world_with_floor(y: i64, x0: i64, x1: i64, z0: i64, z1: i64) -> World {
         let mut world = World::new(3);
         let material = Cell::pack(1, 0).raw();
-        for x in 0..8 {
-            for z in 0..8 {
-                world.set(WorldCoord(x), WorldCoord(0), WorldCoord(z), material);
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                world.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), material);
             }
         }
         world
@@ -383,6 +554,54 @@ mod tests {
     }
 
     #[test]
+    fn camera_feel_idle_stays_neutral() {
+        let mut feel = FirstPersonCameraFeel::default();
+        for _ in 0..30 {
+            let offset = feel.tick(0.0, false, true, 1.0 / 60.0);
+            assert!(offset.vertical.abs() < 1e-6);
+            assert!(offset.lateral.abs() < 1e-6);
+            assert!(offset.forward.abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn camera_feel_sprint_bobs_more_than_walk() {
+        let mut walk = FirstPersonCameraFeel::default();
+        let mut sprint = FirstPersonCameraFeel::default();
+        let mut walk_peak = 0.0f64;
+        let mut sprint_peak = 0.0f64;
+
+        for _ in 0..90 {
+            let walk_offset = walk.tick(PLAYER_SPEED, false, true, 1.0 / 60.0);
+            let sprint_offset = sprint.tick(PLAYER_SPEED * PLAYER_SPRINT, true, true, 1.0 / 60.0);
+            walk_peak = walk_peak.max(walk_offset.vertical.abs() + walk_offset.lateral.abs());
+            sprint_peak =
+                sprint_peak.max(sprint_offset.vertical.abs() + sprint_offset.lateral.abs());
+        }
+
+        assert!(
+            sprint_peak > walk_peak,
+            "sprint bob should read stronger than walk bob"
+        );
+    }
+
+    #[test]
+    fn camera_feel_landing_adds_downward_impulse() {
+        let mut feel = FirstPersonCameraFeel::default();
+        let airborne = feel.tick(PLAYER_SPEED, false, false, 1.0 / 60.0);
+        let landing = feel.tick(PLAYER_SPEED, false, true, 1.0 / 60.0);
+
+        assert!(
+            landing.vertical < airborne.vertical,
+            "landing should add a downward camera response"
+        );
+        assert!(
+            landing.forward > 0.0,
+            "landing should add a small forward settle cue"
+        );
+    }
+
+    #[test]
     fn apply_movement_slides_along_wall() {
         // Wall at z=2, player at z=3.5 moving into it on Z
         let world = world_with_wall(5, 4, 2);
@@ -407,7 +626,7 @@ mod tests {
 
     #[test]
     fn grounded_step_jumps_only_when_supported() {
-        let world = world_with_floor();
+        let world = world_with_floor(0, 0, 7, 0, 7);
         let dt = 1.0 / 60.0;
         let start = [4.0, 1.0, 4.0];
 
@@ -445,7 +664,7 @@ mod tests {
 
     #[test]
     fn grounded_step_gravity_lands_back_on_floor() {
-        let world = world_with_floor();
+        let world = world_with_floor(0, 0, 7, 0, 7);
         let dt = 1.0 / 60.0;
         let mut pos = [4.0, 4.0, 4.0];
         let mut vertical_velocity = 0.0;
@@ -475,5 +694,39 @@ mod tests {
         assert!(grounded);
         assert!((pos[1] - 1.0).abs() < 0.01);
         assert!(vertical_velocity.abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_movement_steps_up_one_block_ledge() {
+        let mut world = world_with_floor(0, 0, 7, 0, 7);
+        let material = Cell::pack(1, 0).raw();
+        world.set(WorldCoord(4), WorldCoord(1), WorldCoord(3), material);
+        let pos = [3.5, 1.0, 3.5];
+        let delta = [0.8, 0.0, 0.0];
+        let new_pos = apply_movement(&world, &pos, &delta);
+        assert!(
+            (new_pos[0] - 4.3).abs() < 1e-9,
+            "horizontal move should clear the ledge"
+        );
+        assert!(
+            (new_pos[1] - 2.0).abs() < 1e-9,
+            "step-up should land the player on top of the ledge"
+        );
+    }
+
+    #[test]
+    fn apply_movement_snaps_down_small_floor_gap() {
+        let world = world_with_floor(0, 0, 7, 0, 7);
+        let pos = [3.5, 1.2, 3.5];
+        let delta = [0.4, 0.0, 0.0];
+        let new_pos = apply_movement(&world, &pos, &delta);
+        assert!(
+            (new_pos[0] - 3.9).abs() < 1e-9,
+            "horizontal movement should still apply"
+        );
+        assert!(
+            (new_pos[1] - 1.0).abs() < 1e-9,
+            "small drops should snap back onto the floor"
+        );
     }
 }

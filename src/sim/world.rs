@@ -3007,6 +3007,27 @@ mod tests {
     }
 
     #[test]
+    fn fan_pushes_sand_across_floor_in_recursive_runtime_path() {
+        let mut world = empty_world();
+        for x in 0..5 {
+            world.set(wc(x), wc(0), wc(2), STONE);
+        }
+        world.set(wc(1), wc(1), wc(2), FAN);
+        world.set(wc(2), wc(1), wc(2), SAND);
+
+        world.step_recursive();
+        assert_eq!(
+            Cell::from_raw(world.get(wc(2), wc(1), wc(2))).material(),
+            Cell::from_raw(SAND).material()
+        );
+        assert_eq!(world.get(wc(3), wc(1), wc(2)), AIR);
+
+        world.step_recursive();
+        assert_eq!(world.get(wc(2), wc(1), wc(2)), AIR);
+        assert_eq!(world.get(wc(3), wc(1), wc(2)), SAND);
+    }
+
+    #[test]
     fn water_turns_to_stone_when_fire_is_adjacent() {
         let mut world = empty_world();
         world.set(wc(4), wc(4), wc(4), WATER);

@@ -25,6 +25,7 @@ const DEFAULT_VOLUME_SIZE: u32 = 2048;
 /// `world.generation` so the log keeps ticking even when the sim is paused
 /// or stepping slowly — see hash-thing-q63.
 const LOG_INTERVAL_SECS: f64 = 2.0;
+const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
 /// One-line gen summary. Centralised so the `App::new` startup path and the
 /// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
@@ -261,6 +262,8 @@ struct App {
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
     render_inv_size: f32,
+    /// Log the slow-debug-build advisory at most once per run.
+    warned_dev_profile_perf: bool,
     /// Legend (keybindings help) overlay toggle (m1f.7.2).
     legend_visible: bool,
     /// True when the legend texture needs re-upload (mode change or toggle).
@@ -269,27 +272,26 @@ struct App {
     current_demo_beat: Option<LatticeDemoBeat>,
     /// Timed intro -> interior -> reveal cut for the short-form demo.
     short_demo_cut: Option<LatticeShortDemoCut>,
+    /// Deterministic first-person camera motion layer (bob, settle, sprint cue).
+    camera_feel: player::FirstPersonCameraFeel,
+    /// Defer expensive initial scene generation until after the window exists.
+    startup_scene_pending: bool,
+}
+
+fn should_warn_about_slow_dev_step(
+    debug_build: bool,
+    volume_size: u32,
+    step_elapsed: std::time::Duration,
+) -> bool {
+    debug_build
+        && volume_size >= 256
+        && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
 impl App {
     fn new(volume_size: u32) -> Self {
-        let mut world = sim::World::new(volume_size.trailing_zeros());
         let level = volume_size.trailing_zeros();
-        let terrain_params = terrain::TerrainParams::for_level(level);
-        let stats = world
-            .seed_terrain(&terrain_params)
-            .expect("level-derived terrain params must validate");
-        world.seed_water_and_sand();
-        let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
-        let material_palette_len = world.materials.color_palette_rgba().len();
-
-        log::info!(
-            "Initial scene: terrain pop={} nodes={} gen={}µs",
-            world.population(),
-            world.store.stats(),
-            stats.gen_region_us,
-        );
-        log::debug!("Material registry palette slots={material_palette_len}");
+        let world = sim::World::new(level);
 
         // Start running so materials interact immediately (powder-game feel).
         // F5 or Space (orbit mode) toggles pause.
@@ -314,7 +316,7 @@ impl App {
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
-            noise_ns_per_sample: noise_ns,
+            noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
             entities: sim::EntityStore::new(),
             volume_size,
@@ -322,10 +324,13 @@ impl App {
             step_start: std::time::Instant::now(),
             render_origin,
             render_inv_size,
+            warned_dev_profile_perf: false,
             legend_visible: true,
             legend_dirty: true,
             current_demo_beat: None,
             short_demo_cut: None,
+            camera_feel: player::FirstPersonCameraFeel::default(),
+            startup_scene_pending: true,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -339,6 +344,41 @@ impl App {
         log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
 
         app
+    }
+
+    fn load_initial_scene(&mut self) {
+        let terrain_params = terrain::TerrainParams::for_level(self.volume_size.trailing_zeros());
+        let stats = self
+            .world
+            .seed_terrain(&terrain_params)
+            .expect("level-derived terrain params must validate");
+        self.world.seed_water_and_sand();
+        self.noise_ns_per_sample = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
+        self.reset_scene_entities();
+        self.spawn_demo_entities();
+        self.paused = false;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!(
+            "Initial scene: terrain pop={} nodes={} gen={}µs",
+            self.world.population(),
+            self.world.store.stats(),
+            stats.gen_region_us,
+        );
+        log::debug!(
+            "Material registry palette slots={}",
+            self.world.materials.color_palette_rgba().len()
+        );
     }
 
     fn world_center(&self) -> [f64; 3] {
@@ -491,6 +531,7 @@ impl App {
 
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
         self.camera_mode = CameraMode::Orbit;
+        self.camera_feel.reset();
         self.legend_dirty = true;
         if let Some(renderer) = &mut self.renderer {
             renderer.camera_target = pose.target;
@@ -615,6 +656,9 @@ impl App {
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
@@ -1044,6 +1088,9 @@ impl ApplicationHandler for App {
                                 CameraMode::Orbit => CameraMode::FirstPerson,
                                 CameraMode::FirstPerson => CameraMode::Orbit,
                             };
+                            if self.camera_mode == CameraMode::Orbit {
+                                self.camera_feel.reset();
+                            }
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
@@ -1338,6 +1385,11 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                if self.startup_scene_pending {
+                    self.startup_scene_pending = false;
+                    self.load_initial_scene();
+                }
+
                 // Frame delta time for frame-rate-independent movement (xa7).
                 let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
                 self.last_frame = std::time::Instant::now();
@@ -1359,7 +1411,23 @@ impl ApplicationHandler for App {
                 if let Some(ref handle) = self.step_handle {
                     if handle.is_finished() {
                         let handle = self.step_handle.take().unwrap();
-                        self.perf.record("step", self.step_start.elapsed());
+                        let step_elapsed = self.step_start.elapsed();
+                        self.perf.record("step", step_elapsed);
+                        if !self.warned_dev_profile_perf
+                            && should_warn_about_slow_dev_step(
+                                cfg!(debug_assertions),
+                                self.volume_size,
+                                step_elapsed,
+                            )
+                        {
+                            log::warn!(
+                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile bench -- {}` for interactive playtesting.",
+                                step_elapsed.as_secs_f64() * 1000.0,
+                                self.volume_size,
+                                self.volume_size,
+                            );
+                            self.warned_dev_profile_perf = true;
+                        }
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
@@ -1527,17 +1595,20 @@ impl ApplicationHandler for App {
                             0.0
                         };
 
-                        let speed = if self.keys_held.contains(&KeyCode::ControlLeft)
-                            || self.keys_held.contains(&KeyCode::ControlRight)
-                        {
+                        let sprinting = self.keys_held.contains(&KeyCode::ControlLeft)
+                            || self.keys_held.contains(&KeyCode::ControlRight);
+                        let speed = if sprinting {
                             PLAYER_SPEED * PLAYER_SPRINT
                         } else {
                             PLAYER_SPEED
                         };
 
                         let delta = player::compute_move_delta(yaw, [fwd, right, up], speed, dt);
+                        let camera_planar_speed =
+                            (delta[0] * delta[0] + delta[2] * delta[2]).sqrt() / dt.max(1e-6);
 
                         let stepping = self.is_stepping();
+                        let mut camera_grounded = false;
                         if let Some(p) = self.entities.get_mut(pid) {
                             if stepping {
                                 // Free-fly: no collision while world is on
@@ -1562,6 +1633,12 @@ impl ApplicationHandler for App {
                                 p.vel[1] = step.vertical_velocity;
                             }
                         }
+                        if !stepping {
+                            if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
+                                camera_grounded = player::is_grounded(&self.world, &p.pos);
+                            }
+                        }
+                        let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
                         // hash-thing-m1f.4 / 37r: grow the world when the
                         // player approaches any boundary (positive or negative).
                         // Skipped during background step — world is placeholder.
@@ -1620,13 +1697,32 @@ impl ApplicationHandler for App {
                         let wo = self.render_origin;
                         if let Some(player) = self.entities.get_mut(pid) {
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.camera_target = [
-                                    (player.pos[0] - wo[0] as f64) as f32 * inv_size as f32,
-                                    (player.pos[1] - wo[1] as f64 + PLAYER_HEIGHT * 0.85) as f32
-                                        * inv_size as f32,
-                                    (player.pos[2] - wo[2] as f64) as f32 * inv_size as f32,
-                                ];
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
+                                    let (camera_planar_speed, camera_sprinting, camera_grounded) =
+                                        camera_motion;
+                                    let motion = self.camera_feel.tick(
+                                        camera_planar_speed,
+                                        camera_sprinting,
+                                        camera_grounded,
+                                        dt,
+                                    );
+                                    let (sin_yaw, cos_yaw) = ps.yaw.sin_cos();
+                                    let right = [cos_yaw, 0.0, -sin_yaw];
+                                    let forward = [-sin_yaw, 0.0, -cos_yaw];
+                                    let eye = [
+                                        player.pos[0]
+                                            + right[0] * motion.lateral
+                                            + forward[0] * motion.forward,
+                                        player.pos[1] + PLAYER_HEIGHT * 0.85 + motion.vertical,
+                                        player.pos[2]
+                                            + right[2] * motion.lateral
+                                            + forward[2] * motion.forward,
+                                    ];
+                                    renderer.camera_target = [
+                                        (eye[0] - wo[0] as f64) as f32 * inv_size as f32,
+                                        (eye[1] - wo[1] as f64) as f32 * inv_size as f32,
+                                        (eye[2] - wo[2] as f64) as f32 * inv_size as f32,
+                                    ];
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
                                     renderer.hotbar_selected_slot =
@@ -1761,6 +1857,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
@@ -1842,6 +1939,13 @@ mod tests {
     }
 
     #[test]
+    fn app_new_defers_initial_scene_generation_until_window_loop() {
+        let app = App::new(256);
+        assert!(app.startup_scene_pending);
+        assert_eq!(app.world.population(), 0);
+    }
+
+    #[test]
     fn first_person_legend_hides_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
         assert!(lines.iter().any(|line| line.contains("Space       Jump")));
@@ -1883,5 +1987,29 @@ mod tests {
                 waypoint.label
             );
         }
+    }
+
+    #[test]
+    fn slow_dev_step_warning_requires_debug_large_world_and_slow_step() {
+        assert!(should_warn_about_slow_dev_step(
+            true,
+            256,
+            Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            false,
+            256,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            true,
+            128,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            true,
+            256,
+            Duration::from_millis(DEV_PROFILE_STEP_WARN_MS - 1)
+        ));
     }
 }
