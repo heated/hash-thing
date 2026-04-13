@@ -8,8 +8,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, FIREWORK, GRASS, LAVA,
-    OIL, SAND, STONE, WATER,
+    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, FIREWORK, GRASS, LAVA, OIL,
+    SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -1354,6 +1354,8 @@ impl World {
         self.fill_box(atrium, AIR);
         self.fill_box(balcony, AIR);
         self.fill_box(panorama, AIR);
+        self.seed_reveal_fireworks(balcony.center());
+        self.seed_progression_break_trigger(tease_a);
 
         let player_pos = [
             start_room.center()[0] as f64 + 0.5,
@@ -1368,6 +1370,15 @@ impl World {
             atrium_center: atrium.center(),
             reveal_center: balcony.center(),
         }
+    }
+
+    fn seed_progression_break_trigger(&mut self, tease_a: Box3) {
+        let center_x = tease_a.center()[0];
+        let curtain = Box3::new(
+            [center_x - 1, tease_a.min[1], tease_a.min[2]],
+            [center_x + 1, tease_a.min[1] + 2, tease_a.min[2]],
+        );
+        self.fill_box(curtain, VINE);
     }
 
     pub fn population(&self) -> u64 {
@@ -1499,6 +1510,19 @@ impl World {
             Self::spectacle_box(waypoint.center, [0, 1, 1], [0, 2, 1]),
             FIRE,
         );
+    }
+
+    fn seed_reveal_fireworks(&mut self, center: [i64; 3]) {
+        for &(dx, dz) in &[(-4, -3), (-4, 2), (-1, -3), (-1, 2)] {
+            self.fill_box(
+                Self::spectacle_box(center, [dx, -1, dz], [dx + 1, 0, dz + 1]),
+                STONE,
+            );
+            self.fill_box(
+                Self::spectacle_box(center, [dx, 1, dz], [dx, 2, dz]),
+                FIREWORK,
+            );
+        }
     }
 
     fn commit_step(&mut self, next: &[CellState], side: usize) {
@@ -1654,7 +1678,7 @@ mod tests {
     use crate::player;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
-        MaterialRegistry, FIRE, FIREWORK, LAVA, OIL, SAND, STONE, WATER,
+        MaterialRegistry, FIRE, FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
     };
 
     /// Helper: build an empty 8^3 world (level=3).
@@ -2067,6 +2091,18 @@ mod tests {
     }
 
     #[test]
+    fn lattice_progression_demo_stages_fireworks_near_reveal() {
+        let mut w = World::new(6); // side 64
+        let layout = w.seed_lattice_progression_demo();
+        let snapshot = local_snapshot(&w, layout.reveal_center, 5);
+        assert!(
+            snapshot.contains(&FIREWORK),
+            "reveal should stage firework launchers near {:?}",
+            layout.reveal_center
+        );
+    }
+
+    #[test]
     fn demo_spectacle_seed_is_deterministic() {
         let mut a = World::new(6);
         let mut b = World::new(6);
@@ -2129,6 +2165,38 @@ mod tests {
         assert!(
             has(FIRE),
             "progression demo must still preserve fire accents"
+        );
+    }
+
+    #[test]
+    fn lattice_progression_demo_stages_optional_break_trigger_off_main_route() {
+        let mut w = World::new(6);
+        let _layout = w.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(w.level, 42);
+        let (_, _, _, _, tease_a, _, _, _, _) = World::progression_boxes(&field);
+        let center_x = tease_a.center()[0];
+        let mut vine_cells = 0;
+
+        for y in tease_a.min[1]..=(tease_a.min[1] + 2).min(tease_a.max[1]) {
+            for x in (center_x - 1)..=(center_x + 1) {
+                if w.get(WorldCoord(x), WorldCoord(y), WorldCoord(tease_a.min[2])) == VINE {
+                    vine_cells += 1;
+                }
+            }
+        }
+
+        assert!(
+            vine_cells > 0,
+            "progression demo should place a breakable vine curtain in the tease alcove"
+        );
+        assert_eq!(
+            w.get(
+                WorldCoord(tease_a.center()[0]),
+                WorldCoord(tease_a.center()[1]),
+                WorldCoord(tease_a.min[2] - 1),
+            ),
+            AIR,
+            "main corridor mouth should stay open even with the optional break trigger nearby"
         );
     }
 
