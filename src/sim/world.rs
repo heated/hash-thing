@@ -4,8 +4,9 @@ use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
 use crate::terrain::field::heightmap::PrecomputedHeightmapField;
+use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, LAVA, SAND, STONE, WATER,
+    BlockRuleId, MaterialRegistry, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -597,6 +598,11 @@ impl World {
         // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
         self.step_blocks(&mut next, side);
 
+        // Phase 3: gravity gap-fill — prevents Margolus rarefaction.
+        // Fills air gaps within gravity-bearing bodies by cascading cells
+        // down, but only at positions with gravity cells on both sides.
+        gravity_gap_fill(&mut next, side, &self.materials);
+
         self.commit_step(&next, side);
     }
 
@@ -852,134 +858,20 @@ impl World {
     /// periodic lattice compresses well in the octree (hashlife sharing)
     /// while the active materials (fire consuming grass, water flowing,
     /// lava solidifying) create dynamic visual interest.
+    ///
+    /// Uses `LatticeField` + `gen_region` for octree-native generation
+    /// with proof-based collapse (no O(n^3) per-voxel loop).
     pub fn seed_lattice_megastructure(&mut self) {
-        let side = self.side() as u64;
-        let margin = side / 16;
-        let lo = margin;
-        let hi = side - margin;
-        let extent = hi - lo;
-
-        // Lattice cell size — corridors are `cell_size` wide, walls are
-        // `wall_thickness` thick. Scale with world size.
-        let cell_size = (extent / 8).max(4);
-        let wall_thickness = (cell_size / 4).max(1);
-
-        for z in lo..hi {
-            for y in lo..hi {
-                for x in lo..hi {
-                    let lx = x - lo;
-                    let ly = y - lo;
-                    let lz = z - lo;
-
-                    // Which lattice cell are we in?
-                    let cx = lx % cell_size;
-                    let cy = ly % cell_size;
-                    let cz = lz % cell_size;
-
-                    // Is this a wall position? Walls on each axis boundary.
-                    let x_wall = cx < wall_thickness;
-                    let y_wall = cy < wall_thickness;
-                    let z_wall = cz < wall_thickness;
-
-                    // At least 2 axes must be in a wall region for a pillar/beam.
-                    let wall_count = x_wall as u8 + y_wall as u8 + z_wall as u8;
-
-                    if wall_count >= 2 {
-                        // Pillars and beams. Bottom layer is stone,
-                        // rest is grass (flammable).
-                        if y_wall && cy == 0 {
-                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), STONE);
-                        } else {
-                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), GRASS);
-                        }
-                    } else if y_wall && cy == 0 {
-                        // Floor slabs — alternating stone and sand.
-                        let grid_x = lx / cell_size;
-                        let grid_z = lz / cell_size;
-                        if (grid_x + grid_z).is_multiple_of(2) {
-                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), STONE);
-                        } else {
-                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), SAND);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Water channels: every other corridor on the ground floor.
-        let water_depth = (wall_thickness + 1).min(cell_size / 2);
-        for z in lo..hi {
-            for x in lo..hi {
-                let lx = x - lo;
-                let lz = z - lo;
-                let grid_z = lz / cell_size;
-                let cx = lx % cell_size;
-                let cz = lz % cell_size;
-
-                if grid_z.is_multiple_of(2) && cx >= wall_thickness && cz >= wall_thickness {
-                    for dy in 1..=water_depth {
-                        let y = lo + dy;
-                        if y < hi {
-                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), WATER);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Lava pools: center of every 4th grid cell, elevated.
-        for z in lo..hi {
-            for x in lo..hi {
-                let lx = x - lo;
-                let lz = z - lo;
-                let grid_x = lx / cell_size;
-                let grid_z = lz / cell_size;
-                let cx = lx % cell_size;
-                let cz = lz % cell_size;
-
-                if grid_x % 4 == 2
-                    && grid_z % 4 == 2
-                    && cx > wall_thickness
-                    && cx < cell_size - 1
-                    && cz > wall_thickness
-                    && cz < cell_size - 1
-                {
-                    let elev = cell_size * 2 + lo; // 2nd floor
-                    for dy in 0..2 {
-                        let y = elev + dy;
-                        if y < hi {
-                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), LAVA);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fire sources: corners of every 3rd grid cell.
-        for gz in 0..(extent / cell_size) {
-            for gx in 0..(extent / cell_size) {
-                if (gx + gz) % 3 != 0 {
-                    continue;
-                }
-                let base_x = lo + gx * cell_size + wall_thickness + 1;
-                let base_z = lo + gz * cell_size + wall_thickness + 1;
-                let fire_y = lo + wall_thickness + 1;
-                for dz in 0..2u64.min(cell_size / 4) {
-                    for dx in 0..2u64.min(cell_size / 4) {
-                        let fx = base_x + dx;
-                        let fz = base_z + dz;
-                        if fx < hi && fz < hi && fire_y < hi {
-                            self.set_local(
-                                LocalCoord(fx),
-                                LocalCoord(fire_y),
-                                LocalCoord(fz),
-                                FIRE,
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        self.store = NodeStore::new();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        let field = LatticeField::for_world(self.level, 42);
+        let (root, _stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        self.root = root;
+        self.generation = 0;
+        self.block_rule_present = None;
     }
 
     pub fn population(&self) -> u64 {
@@ -1044,6 +936,40 @@ impl World {
         self.terrain_params = Some(*params);
         self.block_rule_present = None;
         stats
+    }
+}
+
+/// Gravity gap-fill: cascading bottom-to-top sweep that fills air gaps
+/// WITHIN gravity-bearing bodies, preventing Margolus rarefaction.
+///
+/// Only swaps cell[y] (air) with cell[y+1] (gravity-bearing) when cell[y-1]
+/// is also gravity-bearing — i.e., only fills internal gaps, never extends
+/// the falling front. This prevents isolated cells from cascading to the
+/// bottom while still compacting bodies after block-rule gravity creates gaps.
+///
+/// Mass-conserving: only swaps, never creates or destroys cells.
+pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &MaterialRegistry) {
+    for z in 0..side {
+        for x in 0..side {
+            for y in 1..side.saturating_sub(1) {
+                let idx_below = x + (y - 1) * side + z * side * side;
+                let idx_cur = x + y * side + z * side * side;
+                let idx_above = x + (y + 1) * side + z * side * side;
+                let below = Cell::from_raw(grid[idx_below]);
+                let cur = Cell::from_raw(grid[idx_cur]);
+                let above = Cell::from_raw(grid[idx_above]);
+                // Only fill gap if: current is air, above is gravity-bearing,
+                // AND below is gravity-bearing (this is an internal gap).
+                if cur.is_empty()
+                    && !above.is_empty()
+                    && materials.block_rule_id_for_cell(above).is_some()
+                    && !below.is_empty()
+                    && materials.block_rule_id_for_cell(below).is_some()
+                {
+                    grid.swap(idx_cur, idx_above);
+                }
+            }
+        }
     }
 }
 
@@ -2567,5 +2493,79 @@ mod tests {
         assert!(world.is_realized(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3)));
         assert!(world.is_realized(wc(0), wc(0), wc(0)));
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
+    }
+
+    /// Reproduction test for hash-thing-u4w: checkerboard density bug.
+    /// A solid block of water should not develop every-other-column air gaps.
+    #[test]
+    fn water_block_no_checkerboard_gaps() {
+        let mut world = World::new(5); // 32³
+        // Place a 6×6×6 water block in the center, well away from boundaries.
+        for z in 10..16 {
+            for y in 16..22 {
+                for x in 10..16 {
+                    world.set(wc(x), wc(y), wc(z), WATER);
+                }
+            }
+        }
+        let pop_before = world.population();
+
+        // Step 6 times — enough for the falling front to develop.
+        for step in 0..6 {
+            world.step();
+            let pop_after = world.population();
+            assert_eq!(
+                pop_before, pop_after,
+                "population changed at step {} ({} → {})",
+                step, pop_before, pop_after
+            );
+        }
+
+        // Check: for each y-level that contains water, count water cells.
+        // If there's a checkerboard, some y-levels will have ~50% of expected.
+        let side = world.side() as u64;
+        let grid = world.flatten();
+        let mut water_by_y = vec![0u64; side as usize];
+        for y in 0..side {
+            for z in 0..side {
+                for x in 0..side {
+                    let idx = x as usize + y as usize * side as usize + z as usize * side as usize * side as usize;
+                    if Cell::from_raw(grid[idx]).material() == WATER_MATERIAL_ID {
+                        water_by_y[y as usize] += 1;
+                    }
+                }
+            }
+        }
+
+        // Print water distribution for diagnosis
+        eprintln!("Water cells per y-level:");
+        for (y, &count) in water_by_y.iter().enumerate() {
+            if count > 0 {
+                eprintln!("  y={y}: {count} water cells");
+            }
+        }
+
+        // Water should occupy CONTIGUOUS y-levels (no alternating gaps).
+        // Count how many y-levels have water and check for gaps.
+        let water_levels: Vec<usize> = water_by_y
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(y, _)| y)
+            .collect();
+        assert!(
+            !water_levels.is_empty(),
+            "water should still exist after stepping"
+        );
+        // Check for gaps: consecutive water levels should differ by 1.
+        for pair in water_levels.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                1,
+                "gap between y={} and y={} — checkerboard rarefaction bug",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

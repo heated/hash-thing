@@ -1,5 +1,5 @@
 //! Procedural terrain generation. v1: heightfield seeder built on the
-//! `RegionField` trait + recursive direct-octree builder.
+//! `WorldGen` trait + recursive direct-octree builder.
 //!
 //! The trait abstraction is the load-bearing part. Infinite
 //! worlds (3fq.4) and HashDAG edits all reuse the
@@ -11,7 +11,7 @@ pub mod gen;
 pub mod materials;
 pub mod noise;
 
-pub use field::HeightmapField;
+pub use field::{ComposedWorldGen, DensityField, HeightmapField, WorldGen};
 pub use gen::{gen_region, probe_sample_ns, GenStats};
 
 /// Parameters for the v1 heightmap seeder. Lifted into a struct so the

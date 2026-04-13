@@ -7,7 +7,7 @@
 
 // Test-only fixture — used for builder regression tests.
 
-use super::RegionField;
+use super::WorldGen;
 use crate::octree::CellState;
 
 #[derive(Clone, Copy, Debug)]
@@ -36,7 +36,7 @@ impl HalfSpaceField {
     }
 }
 
-impl RegionField for HalfSpaceField {
+impl WorldGen for HalfSpaceField {
     #[inline]
     fn sample(&self, point: [i64; 3]) -> CellState {
         if self.coord(point) < self.threshold {
@@ -46,8 +46,8 @@ impl RegionField for HalfSpaceField {
         }
     }
 
-    fn classify_box(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
-        let size = 1i64 << size_log2;
+    fn classify(&self, origin: [i64; 3], level: u32) -> Option<CellState> {
+        let size = 1i64 << level;
         let lo = self.coord(origin);
         let hi = lo + size; // exclusive: cells are [lo, hi)
                             // Box is fully on the `below` side iff every cell coord < threshold,
@@ -94,35 +94,35 @@ mod tests {
     fn classify_fully_below() {
         let f = y_split(10);
         // Box [0, 0, 0] size=8 → y ∈ [0, 8). Threshold 10 → hi=8 ≤ 10 → below.
-        assert_eq!(f.classify_box([0, 0, 0], 3), Some(100));
+        assert_eq!(f.classify([0, 0, 0], 3), Some(100));
     }
 
     #[test]
     fn classify_fully_above() {
         let f = y_split(10);
         // Box [0, 16, 0] size=8 → y ∈ [16, 24). lo=16 ≥ 10 → above.
-        assert_eq!(f.classify_box([0, 16, 0], 3), Some(0));
+        assert_eq!(f.classify([0, 16, 0], 3), Some(0));
     }
 
     #[test]
     fn classify_straddle_returns_none() {
         let f = y_split(10);
         // Box [0, 8, 0] size=8 → y ∈ [8, 16). lo=8 < 10 and hi=16 > 10 → mixed.
-        assert_eq!(f.classify_box([0, 8, 0], 3), None);
+        assert_eq!(f.classify([0, 8, 0], 3), None);
     }
 
     #[test]
     fn classify_boundary_exact_hi_equals_threshold() {
         let f = y_split(8);
         // Box [0, 0, 0] size=8 → hi=8, threshold=8 → hi ≤ threshold → fully below.
-        assert_eq!(f.classify_box([0, 0, 0], 3), Some(100));
+        assert_eq!(f.classify([0, 0, 0], 3), Some(100));
     }
 
     #[test]
     fn classify_boundary_lo_equals_threshold() {
         let f = y_split(8);
         // Box [0, 8, 0] size=4 → lo=8 ≥ 8 → fully above.
-        assert_eq!(f.classify_box([0, 8, 0], 2), Some(0));
+        assert_eq!(f.classify([0, 8, 0], 2), Some(0));
     }
 
     #[test]
@@ -135,9 +135,9 @@ mod tests {
         };
         assert_eq!(f.sample([4, 0, 0]), 42);
         assert_eq!(f.sample([5, 0, 0]), 0);
-        assert_eq!(f.classify_box([0, 0, 0], 2), Some(42)); // x ∈ [0, 4) < 5
-        assert_eq!(f.classify_box([8, 0, 0], 2), Some(0)); // x ∈ [8, 12) ≥ 5
-        assert_eq!(f.classify_box([4, 0, 0], 2), None); // x ∈ [4, 8) straddles 5
+        assert_eq!(f.classify([0, 0, 0], 2), Some(42)); // x ∈ [0, 4) < 5
+        assert_eq!(f.classify([8, 0, 0], 2), Some(0)); // x ∈ [8, 12) ≥ 5
+        assert_eq!(f.classify([4, 0, 0], 2), None); // x ∈ [4, 8) straddles 5
     }
 
     #[test]
@@ -150,7 +150,7 @@ mod tests {
         };
         assert_eq!(f.sample([0, 0, 15]), 77);
         assert_eq!(f.sample([0, 0, 16]), 0);
-        assert_eq!(f.classify_box([0, 0, 0], 4), Some(77)); // z ∈ [0, 16) → hi=16 ≤ 16
-        assert_eq!(f.classify_box([0, 0, 16], 3), Some(0)); // z ∈ [16, 24) ≥ 16
+        assert_eq!(f.classify([0, 0, 0], 4), Some(77)); // z ∈ [0, 16) → hi=16 ≤ 16
+        assert_eq!(f.classify([0, 0, 16], 3), Some(0)); // z ∈ [16, 24) ≥ 16
     }
 }
