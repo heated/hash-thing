@@ -250,6 +250,7 @@ impl World {
                 self.hashlife_all_inert_cache.insert(new_node, inert);
             }
         }
+
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -301,6 +302,9 @@ impl World {
             return cached;
         }
         self.hashlife_stats.cache_misses += 1;
+        if (level as usize) >= 3 {
+            self.hashlife_stats.misses_by_level[(level - 3) as usize] += 1;
+        }
 
         let result = if level == 3 {
             self.step_base_case(node, parity)
