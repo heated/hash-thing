@@ -82,6 +82,32 @@ pub struct DemoLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DemoSpectacleProfile {
+    Cascade,
+    Hearth,
+    Clash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DemoSpectacleAnchor {
+    pub label: &'static str,
+    pub center: [i64; 3],
+    pub profile: DemoSpectacleProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveMaterialStats {
+    pub fire_cells: u32,
+    pub water_cells: u32,
+}
+
+impl ActiveMaterialStats {
+    pub fn active_cells(self) -> u32 {
+        self.fire_cells + self.water_cells
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Box3 {
     min: [i64; 3],
     max: [i64; 3],
@@ -101,6 +127,13 @@ impl Box3 {
             (self.min[2] + self.max[2]) / 2,
         ]
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DemoWaypoint {
+    pub label: &'static str,
+    pub center: [i64; 3],
+    pub radius: i64,
 }
 
 /// The simulation world. Owns the octree store and manages stepping.
@@ -492,6 +525,58 @@ impl World {
         self.store.flatten(self.root, self.side())
     }
 
+    pub fn demo_waypoints(&self) -> Vec<DemoWaypoint> {
+        let side = self.side() as i64;
+        assert!(side >= 48, "demo spectacle requires side >= 48");
+        let floor_y = (side / 4).max(6);
+        let center_z = side / 2;
+        let start_x = (side / 6).max(8);
+        let end_x = side.saturating_sub(start_x + 2);
+        let span = end_x.saturating_sub(start_x);
+        let step = (span / 3).max(8);
+        let radius = (side / 12).clamp(4, 6);
+        let labels = ["ember", "spring", "quench", "cascade"];
+
+        labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| DemoWaypoint {
+                label,
+                center: [start_x + step * i as i64, floor_y + 1, center_z],
+                radius,
+            })
+            .collect()
+    }
+
+    pub fn count_active_material_cells_near(&self, center: [i64; 3], radius: i64) -> usize {
+        let side = self.side() as i64;
+        let x0 = center[0].saturating_sub(radius).max(self.origin[0]);
+        let y0 = center[1].saturating_sub(radius).max(self.origin[1]);
+        let z0 = center[2].saturating_sub(radius).max(self.origin[2]);
+        let x1 = center[0]
+            .saturating_add(radius)
+            .min(self.origin[0] + side - 1);
+        let y1 = center[1]
+            .saturating_add(radius)
+            .min(self.origin[1] + side - 1);
+        let z1 = center[2]
+            .saturating_add(radius)
+            .min(self.origin[2] + side - 1);
+
+        let mut count = 0;
+        for z in z0..=z1 {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let cell = self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z));
+                    if cell == FIRE || cell == WATER {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
     /// Drain the mutation queue and apply every pending mutation to the
     /// octree in arrival order. This is the only path for entity-produced
     /// edits to reach the world (closed-world invariant, hash-thing-1v0.9).
@@ -537,7 +622,6 @@ impl World {
             [0, 0, -1],
         ];
 
-        // Snapshot and validate: collect (pos, source_material) for live clones.
         let mut live_sources: Vec<([i64; 3], u16)> = Vec::new();
         for &pos in &self.clone_sources {
             let cell = Cell::from_raw(self.get(
@@ -550,12 +634,11 @@ impl World {
             }
         }
 
-        // Prune stale entries.
         self.clone_sources = live_sources.iter().map(|&(pos, _)| pos).collect();
 
         for (pos, source_material_id) in live_sources {
             if source_material_id == 0 {
-                continue; // metadata 0 = no source configured
+                continue;
             }
             let spawn_state = Cell::pack(source_material_id, 0).raw();
             for dir in &DIRS {
@@ -574,7 +657,6 @@ impl World {
             }
         }
 
-        // Apply the spawned cells.
         if !self.queue.is_empty() {
             self.apply_mutations();
         }
@@ -787,10 +869,118 @@ impl World {
         }
     }
 
+    /// Stamp deterministic active-material set pieces around named anchors.
+    ///
+    /// This is deliberately scene-local plumbing: callers provide the
+    /// anchor positions, while the helper provides reproducible spectacle
+    /// primitives that survive scene resets without hard-coding a route.
+    pub fn stage_demo_spectacles(&mut self, anchors: &[DemoSpectacleAnchor]) {
+        for &anchor in anchors {
+            self.stage_demo_spectacle(anchor);
+        }
+    }
+
+    /// Count active materials in a local box around `center`. Tests and
+    /// future scene validators use this to assert spectacle presence
+    /// after a reset without depending on exact voxel-for-voxel layouts.
+    pub fn active_material_stats_near(&self, center: [i64; 3], radius: u64) -> ActiveMaterialStats {
+        let radius = i64::try_from(radius).expect("demo spectacle radius must fit in i64");
+        let mut stats = ActiveMaterialStats::default();
+        for z in (center[2] - radius)..=(center[2] + radius) {
+            for y in (center[1] - radius)..=(center[1] + radius) {
+                for x in (center[0] - radius)..=(center[0] + radius) {
+                    match self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) {
+                        FIRE => stats.fire_cells += 1,
+                        WATER => stats.water_cells += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        stats
+    }
+
+    fn stage_demo_spectacle(&mut self, anchor: DemoSpectacleAnchor) {
+        match anchor.profile {
+            DemoSpectacleProfile::Cascade => self.stage_cascade(anchor.center),
+            DemoSpectacleProfile::Hearth => self.stage_hearth(anchor.center),
+            DemoSpectacleProfile::Clash => self.stage_clash(anchor.center),
+        }
+    }
+
+    fn stage_cascade(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box_clamped([cx - 3, cy - 2, cz - 3], [cx + 4, cy + 5, cz + 4], AIR);
+        self.fill_box_clamped([cx - 2, cy - 2, cz - 3], [cx + 3, cy, cz + 3], DIRT);
+        self.fill_box_clamped([cx - 2, cy - 1, cz + 2], [cx + 3, cy + 4, cz + 3], STONE);
+        self.fill_box_clamped([cx - 1, cy + 2, cz], [cx + 2, cy + 4, cz + 1], WATER);
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 1], [cx - 2, cy + 1, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 2, cy - 1, cz - 1], [cx + 3, cy + 1, cz + 1], FIRE);
+    }
+
+    fn stage_hearth(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 3], [cx + 4, cy + 4, cz + 4], AIR);
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 3], [cx + 4, cy, cz + 4], STONE);
+        self.fill_box_clamped([cx - 2, cy, cz + 2], [cx + 3, cy + 3, cz + 3], GRASS);
+        self.fill_box_clamped([cx - 1, cy, cz - 1], [cx + 1, cy + 2, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 1, cy, cz - 1], [cx + 2, cy + 2, cz + 1], WATER);
+    }
+
+    fn stage_clash(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box_clamped([cx - 4, cy - 2, cz - 3], [cx + 5, cy + 4, cz + 4], AIR);
+        self.fill_box_clamped([cx - 4, cy - 2, cz - 3], [cx + 5, cy, cz + 4], DIRT);
+        self.fill_box_clamped([cx - 4, cy - 1, cz + 2], [cx - 1, cy + 2, cz + 3], GRASS);
+        self.fill_box_clamped([cx - 3, cy, cz - 1], [cx - 1, cy + 2, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 1, cy + 1, cz - 1], [cx + 4, cy + 3, cz + 1], WATER);
+        self.fill_box_clamped([cx + 1, cy - 1, cz + 2], [cx + 4, cy + 3, cz + 3], STONE);
+    }
+
+    fn fill_box_clamped(&mut self, min: [i64; 3], max: [i64; 3], state: CellState) {
+        let region = self.region();
+        for z in min[2]..max[2] {
+            for y in min[1]..max[1] {
+                for x in min[0]..max[0] {
+                    if region.contains(x, y, z) {
+                        self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                    }
+                }
+            }
+        }
+    }
+
+    fn burning_room_demo_spectacle_anchors(&self) -> [DemoSpectacleAnchor; 3] {
+        let side = self.side() as i64;
+        let margin = side / 8;
+        let lo = margin + 6;
+        let hi = side - margin - 7;
+        let mid = side / 2;
+        [
+            DemoSpectacleAnchor {
+                label: "intro",
+                center: [lo, margin + 2, lo + 4],
+                profile: DemoSpectacleProfile::Hearth,
+            },
+            DemoSpectacleAnchor {
+                label: "interior",
+                center: [mid, margin + 3, mid],
+                profile: DemoSpectacleProfile::Clash,
+            },
+            DemoSpectacleAnchor {
+                label: "panorama",
+                center: [hi, margin + 3, hi],
+                profile: DemoSpectacleProfile::Cascade,
+            },
+        ]
+    }
+
     /// Seed a demo scene: stone room with grass walls (fuel), fire, and water.
     ///
     /// Demonstrates reaction phase (fire spreads to grass, water quenches fire)
     /// plus movement phase (water falls and spreads via FluidBlockRule).
+    /// The room now carries three named spectacle anchors so resets keep
+    /// active-material read points available in the same local pockets.
     pub fn seed_burning_room(&mut self) {
         let side = self.side() as u64;
         let margin = side / 8;
@@ -814,35 +1004,68 @@ impl World {
                 }
             }
         }
+        self.stage_demo_spectacles(&self.burning_room_demo_spectacle_anchors());
+    }
 
-        // Fire source: small cluster in one corner
-        let fire_x = lo + 2;
-        let fire_z = lo + 2;
-        for dy in 1..4u64 {
-            for dx in 0..2u64 {
-                for dz in 0..2u64 {
-                    let y = lo + dy;
-                    let x = fire_x + dx;
-                    let z = fire_z + dz;
-                    if x < hi && y < hi && z < hi {
-                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), FIRE);
-                    }
-                }
+    /// Seed a deterministic four-stop demo gallery with local fire/water
+    /// spectacle around each waypoint. The exact route/controls stay external;
+    /// this just makes the content reproducible for whichever beat loader
+    /// consumes it.
+    pub fn seed_demo_spectacle(&mut self) {
+        let waypoints = self.demo_waypoints();
+        let first = waypoints
+            .first()
+            .expect("demo spectacle requires at least one waypoint");
+        let last = waypoints
+            .last()
+            .expect("demo spectacle requires at least one waypoint");
+        let floor_y = first.center[1].saturating_sub(1);
+        let ceiling_y = floor_y + 6;
+        let corridor_z = first.center[2];
+        let corridor_half_width = 3;
+        let span_lo = first.center[0].saturating_sub(first.radius + 4);
+        let span_hi = last.center[0] + last.radius + 4;
+
+        self.fill_box(
+            Box3::new(
+                [span_lo, floor_y, corridor_z - corridor_half_width],
+                [span_hi, floor_y, corridor_z + corridor_half_width],
+            ),
+            DIRT,
+        );
+        self.fill_box(
+            Box3::new(
+                [span_lo, floor_y + 1, corridor_z - corridor_half_width - 1],
+                [span_hi, ceiling_y, corridor_z - corridor_half_width - 1],
+            ),
+            STONE,
+        );
+        self.fill_box(
+            Box3::new(
+                [span_lo, floor_y + 1, corridor_z + corridor_half_width + 1],
+                [span_hi, ceiling_y, corridor_z + corridor_half_width + 1],
+            ),
+            STONE,
+        );
+        self.fill_box(
+            Box3::new(
+                [span_lo, ceiling_y, corridor_z - corridor_half_width],
+                [span_hi, ceiling_y, corridor_z + corridor_half_width],
+            ),
+            STONE,
+        );
+
+        for (idx, waypoint) in waypoints.into_iter().enumerate() {
+            self.seed_waypoint_frame(waypoint);
+            match idx {
+                0 => self.seed_ember_set_piece(waypoint),
+                1 => self.seed_spring_set_piece(waypoint),
+                2 => self.seed_quench_set_piece(waypoint),
+                3 => self.seed_cascade_set_piece(waypoint),
+                _ => unreachable!("demo spectacle defines exactly four waypoints"),
             }
         }
-
-        // Water pool: opposite corner, a few layers deep
-        let water_hi_x = hi - 2;
-        let water_hi_z = hi - 2;
-        let water_lo_x = water_hi_x.saturating_sub(6);
-        let water_lo_z = water_hi_z.saturating_sub(6);
-        for y in (lo + 1)..(lo + 4).min(hi) {
-            for z in water_lo_z..water_hi_z {
-                for x in water_lo_x..water_hi_x {
-                    self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), WATER);
-                }
-            }
-        }
+        self.block_rule_present = None;
     }
 
     /// Add water and sand to an existing terrain — water pools on a
@@ -1137,6 +1360,117 @@ impl World {
         self.store.population(self.root)
     }
 
+    fn spectacle_box(center: [i64; 3], min: [i64; 3], max: [i64; 3]) -> Box3 {
+        Box3::new(
+            [center[0] + min[0], center[1] + min[1], center[2] + min[2]],
+            [center[0] + max[0], center[1] + max[1], center[2] + max[2]],
+        )
+    }
+
+    fn seed_waypoint_frame(&mut self, waypoint: DemoWaypoint) {
+        let [cx, cy, cz] = waypoint.center;
+        let r = waypoint.radius;
+        let floor_y = cy - 1;
+        let ceiling_y = cy + 4;
+
+        self.fill_box(
+            Box3::new([cx - r, floor_y, cz - r], [cx + r, floor_y, cz + r]),
+            DIRT,
+        );
+        self.fill_box(
+            Box3::new([cx - r, floor_y + 1, cz - r], [cx - r, ceiling_y, cz + r]),
+            STONE,
+        );
+        self.fill_box(
+            Box3::new([cx + r, floor_y + 1, cz - r], [cx + r, ceiling_y, cz + r]),
+            STONE,
+        );
+        self.fill_box(
+            Box3::new([cx - r, floor_y + 1, cz + r], [cx + r, ceiling_y, cz + r]),
+            STONE,
+        );
+        self.fill_box(
+            Box3::new([cx - r, ceiling_y, cz - r], [cx + r, ceiling_y, cz + r]),
+            STONE,
+        );
+    }
+
+    fn seed_ember_set_piece(&mut self, waypoint: DemoWaypoint) {
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-2, 0, 0], [2, 2, 0]),
+            GRASS,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-1, 1, -1], [1, 2, 1]),
+            FIRE,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-3, 0, -2], [-2, 2, -1]),
+            GRASS,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [2, 0, 1], [3, 2, 2]),
+            GRASS,
+        );
+    }
+
+    fn seed_spring_set_piece(&mut self, waypoint: DemoWaypoint) {
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-2, 3, -1], [2, 4, 1]),
+            STONE,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-1, 4, -1], [1, 4, 1]),
+            WATER,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-2, 0, 2], [2, 0, 3]),
+            STONE,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-1, 1, 2], [1, 1, 3]),
+            WATER,
+        );
+    }
+
+    fn seed_quench_set_piece(&mut self, waypoint: DemoWaypoint) {
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-3, 0, -1], [-1, 2, 1]),
+            GRASS,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-3, 1, -1], [-2, 2, 1]),
+            FIRE,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [1, 3, -1], [3, 4, 1]),
+            STONE,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [1, 4, -1], [2, 4, 1]),
+            WATER,
+        );
+    }
+
+    fn seed_cascade_set_piece(&mut self, waypoint: DemoWaypoint) {
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-2, 4, -2], [2, 4, -1]),
+            STONE,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-1, 4, -2], [1, 4, -1]),
+            WATER,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-1, 0, 1], [1, 2, 1]),
+            GRASS,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [0, 1, 0], [1, 2, 0]),
+            FIRE,
+        );
+    }
+
     fn commit_step(&mut self, next: &[CellState], side: usize) {
         self.root = self.store.from_flat(next, side);
         self.generation += 1;
@@ -1304,6 +1638,39 @@ mod tests {
 
     fn wc(coord: u64) -> WorldCoord {
         WorldCoord(coord as i64)
+    }
+
+    fn demo_spectacle_anchors() -> [DemoSpectacleAnchor; 3] {
+        [
+            DemoSpectacleAnchor {
+                label: "intro",
+                center: [16, 10, 16],
+                profile: DemoSpectacleProfile::Hearth,
+            },
+            DemoSpectacleAnchor {
+                label: "interior",
+                center: [32, 12, 32],
+                profile: DemoSpectacleProfile::Clash,
+            },
+            DemoSpectacleAnchor {
+                label: "panorama",
+                center: [48, 14, 48],
+                profile: DemoSpectacleProfile::Cascade,
+            },
+        ]
+    }
+
+    fn local_snapshot(world: &World, center: [i64; 3], radius: u64) -> Vec<CellState> {
+        let radius = i64::try_from(radius).expect("demo spectacle radius must fit in i64");
+        let mut cells = Vec::new();
+        for z in (center[2] - radius)..=(center[2] + radius) {
+            for y in (center[1] - radius)..=(center[1] + radius) {
+                for x in (center[0] - radius)..=(center[0] + radius) {
+                    cells.push(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)));
+                }
+            }
+        }
+        cells
     }
 
     // -----------------------------------------------------------------
@@ -1523,6 +1890,77 @@ mod tests {
     }
 
     #[test]
+    fn demo_spectacle_populates_each_waypoint_with_active_materials() {
+        let mut world = World::new(6);
+        world.seed_demo_spectacle();
+
+        for waypoint in world.demo_waypoints() {
+            assert!(
+                world.count_active_material_cells_near(waypoint.center, waypoint.radius) > 0,
+                "waypoint {} should have local fire/water spectacle",
+                waypoint.label
+            );
+        }
+    }
+
+    #[test]
+    fn demo_spectacles_seed_active_materials_near_every_anchor() {
+        let mut world = World::new(6);
+        let anchors = demo_spectacle_anchors();
+        world.stage_demo_spectacles(&anchors);
+
+        for anchor in anchors {
+            let stats = world.active_material_stats_near(anchor.center, 4);
+            assert!(
+                stats.fire_cells > 0,
+                "{} must include fire near {:?}",
+                anchor.label,
+                anchor.center
+            );
+            assert!(
+                stats.water_cells > 0,
+                "{} must include water near {:?}",
+                anchor.label,
+                anchor.center
+            );
+        }
+    }
+
+    #[test]
+    fn burning_room_reset_reseeds_identical_spectacle_pockets() {
+        let mut first = World::new(6);
+        first.seed_burning_room();
+        let anchors = first.burning_room_demo_spectacle_anchors();
+
+        let expected: Vec<_> = anchors
+            .iter()
+            .map(|anchor| {
+                (
+                    anchor.label,
+                    first.active_material_stats_near(anchor.center, 5),
+                    local_snapshot(&first, anchor.center, 5),
+                )
+            })
+            .collect();
+
+        let mut second = World::new(6);
+        second.seed_burning_room();
+        for (anchor, (label, stats, snapshot)) in anchors.iter().zip(expected.iter()) {
+            let actual_stats = second.active_material_stats_near(anchor.center, 5);
+            assert_eq!(actual_stats, *stats, "{label} stats drifted across reset");
+            assert!(
+                actual_stats.active_cells() > 0,
+                "{label} must retain active materials after reset"
+            );
+            assert_eq!(
+                local_snapshot(&second, anchor.center, 5),
+                *snapshot,
+                "{label} local snapshot drifted across reset"
+            );
+        }
+    }
+
+    #[test]
     fn seed_lattice_megastructure_produces_active_materials() {
         let mut w = World::new(6); // side 64
         w.seed_lattice_megastructure();
@@ -1594,6 +2032,20 @@ mod tests {
                 "checkpoint must be air: {checkpoint:?}"
             );
         }
+    }
+
+    #[test]
+    fn demo_spectacle_seed_is_deterministic() {
+        let mut a = World::new(6);
+        let mut b = World::new(6);
+        a.seed_demo_spectacle();
+        b.seed_demo_spectacle();
+
+        assert_eq!(
+            a.flatten(),
+            b.flatten(),
+            "scene reset should reproduce the same staged set pieces"
+        );
     }
 
     #[test]

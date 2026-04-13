@@ -88,6 +88,34 @@ enum LatticeDemoBeat {
     Panorama,
 }
 
+impl LatticeDemoBeat {
+    const ALL: [Self; 3] = [Self::Intro, Self::Interior, Self::Panorama];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Intro => "intro",
+            Self::Interior => "interior",
+            Self::Panorama => "panorama",
+        }
+    }
+
+    fn next(self) -> Self {
+        let idx = Self::ALL
+            .iter()
+            .position(|beat| *beat == self)
+            .expect("current beat must exist in the beat list");
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    fn previous(self) -> Self {
+        let idx = Self::ALL
+            .iter()
+            .position(|beat| *beat == self)
+            .expect("current beat must exist in the beat list");
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DemoWaypoint {
     label: &'static str,
@@ -213,6 +241,8 @@ struct App {
     legend_visible: bool,
     /// True when the legend texture needs re-upload (mode change or toggle).
     legend_dirty: bool,
+    /// Active named lattice beat, if the user is in the curated demo flow.
+    current_demo_beat: Option<LatticeDemoBeat>,
 }
 
 impl App {
@@ -265,6 +295,7 @@ impl App {
             render_inv_size,
             legend_visible: true,
             legend_dirty: true,
+            current_demo_beat: None,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -364,9 +395,11 @@ impl App {
                 "  1-7         Material",
                 "  Tab         Orbit mode",
                 "",
-                "  T  Terrain    B  Burning room",
+                "  T  Terrain    B  Spectacle",
                 "  R  Reset      G  GoL sphere",
                 "  M  Gyroid     N  Lattice",
+                "  [/] Prev/Next beat",
+                "  U/I/O Intro/Interior/Reveal",
                 "  V  Tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
@@ -383,9 +416,11 @@ impl App {
                 "  1-4         CA rule",
                 "  Tab         FPS mode",
                 "",
-                "  T  Terrain    B  Burning room",
+                "  T  Terrain    B  Spectacle",
                 "  R  Reset      G  GoL sphere",
                 "  M  Gyroid     N  Lattice",
+                "  [/] Prev/Next beat",
+                "  U/I/O Intro/Interior/Reveal",
                 "  V  Tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
@@ -440,7 +475,22 @@ impl App {
         let waypoint = lattice_demo_waypoint(self.world.side(), beat);
         self.apply_player_pose(waypoint.player);
         self.apply_orbit_camera_pose(waypoint.camera);
-        log::info!("Lattice demo preset: {}", waypoint.label);
+        self.current_demo_beat = Some(beat);
+        log::info!("Lattice demo preset: {} ({})", waypoint.label, beat.label());
+    }
+
+    fn cycle_lattice_demo_beat(&mut self, step: i32) {
+        let current = self.current_demo_beat.unwrap_or(LatticeDemoBeat::Intro);
+        let next = if step >= 0 {
+            current.next()
+        } else {
+            current.previous()
+        };
+        self.load_lattice_demo_beat(next);
+    }
+
+    fn select_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
+        self.load_lattice_demo_beat(beat);
     }
 
     /// Break the block the player is looking at.
@@ -562,6 +612,31 @@ impl App {
         log::info!("Rule: {label}");
     }
 
+    fn load_demo_spectacle(&mut self, label: &str) {
+        if self.is_stepping() {
+            return;
+        }
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.seed_demo_spectacle();
+        self.reset_scene_entities();
+        self.gol_smoke_scene = false;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!("{label}: pop={}", self.world.population());
+    }
+
     fn select_held_material(&mut self, material_id: u16) {
         let name = match material_id {
             1 => "Stone",
@@ -645,6 +720,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn load_burning_room_demo(&mut self, label: &str) {
         if self.is_stepping() {
             return;
@@ -667,6 +743,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.current_demo_beat = None;
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -709,6 +786,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.current_demo_beat = None;
         log::info!(
             "Gyroid megastructure: pop={} gen={:.1}ms collapses={} classifies={}",
             self.world.population(),
@@ -744,6 +822,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.current_demo_beat = None;
         log::info!(
             "Lattice progression demo: pop={} gen={:.1}ms reveal={:?}",
             self.world.population(),
@@ -753,7 +832,7 @@ impl App {
     }
 
     fn load_lattice_panorama_demo(&mut self) {
-        self.load_lattice_demo_beat(LatticeDemoBeat::Panorama);
+        self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
     }
 
     fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
@@ -790,6 +869,7 @@ impl App {
             self.noise_ns_per_sample,
         );
         self.sync_render_cache();
+        self.current_demo_beat = None;
     }
 }
 
@@ -930,8 +1010,12 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
-                            // Reset the default CA/materials demo.
-                            self.load_burning_room_demo("Reset burning room demo");
+                            self.load_terrain_scene(
+                                "Reset terrain",
+                                terrain::TerrainParams::for_level(
+                                    self.volume_size.trailing_zeros(),
+                                ),
+                            );
                         }
                         winit::keyboard::Key::Character("t") => {
                             // Plain terrain remains available as an explicit
@@ -970,6 +1054,21 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("n") => {
                             self.load_lattice_demo();
                         }
+                        winit::keyboard::Key::Character("[") => {
+                            self.cycle_lattice_demo_beat(-1);
+                        }
+                        winit::keyboard::Key::Character("]") => {
+                            self.cycle_lattice_demo_beat(1);
+                        }
+                        winit::keyboard::Key::Character("u") => {
+                            self.select_lattice_demo_beat(LatticeDemoBeat::Intro);
+                        }
+                        winit::keyboard::Key::Character("i") => {
+                            self.select_lattice_demo_beat(LatticeDemoBeat::Interior);
+                        }
+                        winit::keyboard::Key::Character("o") => {
+                            self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
+                        }
                         winit::keyboard::Key::Character("v") => {
                             self.load_lattice_panorama_demo();
                         }
@@ -997,8 +1096,9 @@ impl ApplicationHandler for App {
                             }
                         }
                         winit::keyboard::Key::Character("b") => {
-                            // Burning room demo: fire + water + grass walls.
-                            self.load_burning_room_demo("Reset burning room demo");
+                            // Default demo gallery: deterministic local fire/water set pieces
+                            // staged around the beat waypoints.
+                            self.load_demo_spectacle("Reset spectacle gallery");
                         }
                         winit::keyboard::Key::Character("h") => {
                             // Toggle step-count heatmap debug mode.
@@ -1522,8 +1622,11 @@ fn main() {
     log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
+    log::info!("  B: reset spectacle gallery");
     log::info!("  M: reset gyroid megastructure");
     log::info!("  N: lattice megastructure demo");
+    log::info!("  [: previous demo beat   ]: next demo beat");
+    log::info!("  U/I/O: intro/interior/reveal demo beats");
     log::info!("  V: panoramic lattice reveal preset");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
@@ -1596,5 +1699,43 @@ mod tests {
         assert_ne!(intro.label, interior.label);
         assert_ne!(interior.label, panorama.label);
         assert_ne!(intro.player.pos, panorama.player.pos);
+    }
+
+    #[test]
+    fn lattice_demo_beats_cycle_in_story_order() {
+        assert_eq!(LatticeDemoBeat::Intro.next(), LatticeDemoBeat::Interior);
+        assert_eq!(LatticeDemoBeat::Interior.next(), LatticeDemoBeat::Panorama);
+        assert_eq!(LatticeDemoBeat::Panorama.next(), LatticeDemoBeat::Intro);
+        assert_eq!(LatticeDemoBeat::Intro.previous(), LatticeDemoBeat::Panorama);
+        assert_eq!(
+            LatticeDemoBeat::Panorama.previous(),
+            LatticeDemoBeat::Interior
+        );
+    }
+
+    #[test]
+    fn lattice_demo_beats_have_stable_labels() {
+        assert_eq!(LatticeDemoBeat::Intro.label(), "intro");
+        assert_eq!(LatticeDemoBeat::Interior.label(), "interior");
+        assert_eq!(LatticeDemoBeat::Panorama.label(), "panorama");
+    }
+
+    #[test]
+    fn demo_reset_restores_active_materials_near_each_waypoint() {
+        let demo_size = 64;
+        let mut app = App::new(demo_size);
+        app.world = sim::World::new(demo_size.trailing_zeros());
+
+        app.load_demo_spectacle("test reset");
+
+        for waypoint in app.world.demo_waypoints() {
+            assert!(
+                app.world
+                    .count_active_material_cells_near(waypoint.center, waypoint.radius)
+                    > 0,
+                "reset should restore spectacle at waypoint {}",
+                waypoint.label
+            );
+        }
     }
 }

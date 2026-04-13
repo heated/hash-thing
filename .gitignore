@@ -7,5 +7,6 @@
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
+.beads/actor
 .beads-credential-key
 notes/.tmp/

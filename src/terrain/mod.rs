@@ -59,6 +59,11 @@ impl TerrainParams {
         if !self.base_y.is_finite() {
             return Err("base_y must be finite");
         }
+        if let Some(sea_level) = self.sea_level {
+            if !sea_level.is_finite() {
+                return Err("sea_level must be finite when present");
+            }
+        }
         Ok(())
     }
 
@@ -92,7 +97,7 @@ impl TerrainParams {
 }
 
 #[cfg(test)]
-mod tests {
+mod validation_tests {
     use super::*;
 
     #[test]
@@ -154,6 +159,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_non_finite_sea_level() {
+        for sea_level in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let params = TerrainParams {
+                sea_level: Some(sea_level),
+                ..Default::default()
+            };
+            assert_eq!(
+                params.validate(),
+                Err("sea_level must be finite when present"),
+                "unexpected validation result for sea_level={sea_level:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_allows_missing_or_finite_sea_level() {
+        for sea_level in [None, Some(0.0), Some(28.0)] {
+            let params = TerrainParams {
+                sea_level,
+                ..Default::default()
+            };
+            assert!(
+                params.validate().is_ok(),
+                "expected valid params for sea_level={sea_level:?}",
+            );
+        }
+    }
+
+    #[test]
     fn to_heightmap_copies_shape_fields() {
         let params = TerrainParams {
             seed: 42,
@@ -161,7 +195,7 @@ mod tests {
             amplitude: 3.25,
             wavelength: 19.0,
             octaves: 6,
-            sea_level: Some(9.0),
+            sea_level: Some(7.5),
         };
 
         let field = params.to_heightmap();
@@ -170,6 +204,6 @@ mod tests {
         assert_eq!(field.amplitude, 3.25);
         assert_eq!(field.wavelength, 19.0);
         assert_eq!(field.octaves, 6);
-        assert_eq!(field.sea_level, Some(9.0));
+        assert_eq!(field.sea_level, Some(7.5));
     }
 }
