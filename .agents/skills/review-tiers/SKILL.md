@@ -22,8 +22,9 @@ Gemini is rate-limited and fails ~50% of the time. If Gemini fails, proceed with
 ### Step 1: Compute diff stats
 
 ```bash
-git diff origin/master...HEAD --stat
-git diff origin/master...HEAD --numstat
+BASE_BRANCH=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)
+git diff "$BASE_BRANCH"...HEAD --stat
+git diff "$BASE_BRANCH"...HEAD --numstat
 ```
 
 Extract: **lines added**, **lines deleted**, **files changed**.
@@ -58,6 +59,29 @@ Extract: **lines added**, **lines deleted**, **files changed**.
 
 - Mass deletion (deletions > 5x additions AND > 100 deletions) -> cap at Triple
 - Promotion MRs ("promote approved changes to production", "dump-db") -> skip review entirely
+
+### Step 6: Project-specific risk signals (hash-thing)
+
+The generic signals in Step 3 target enterprise webapps. For this game engine, use these instead:
+
+| Signal | Trigger | Risk level |
+|--------|---------|------------|
+| shader-parity | `*.wgsl` AND `svdag.rs` both in diff | HIGH |
+| hashlife-invariants | `hashlife.rs` or `store.rs` compaction/memoization paths | HIGH |
+| buffer-layout | `svdag.rs` serialization + `renderer.rs` upload changed together | MODERATE |
+| rule-system | `rule.rs` or `margolus.rs` | MODERATE |
+
+Apply the same bump logic as Step 4: any HIGH/MODERATE on Dual -> Triple, 2+ HIGH on Triple -> Trident.
+
+### Step 7: Log review cost (observational)
+
+After each review completes, append a JSONL line to `.ship-notes/review-cost-log.jsonl`:
+
+```json
+{"bead":"hash-thing-xxx","tier":"dual","agents":2,"output_bytes":12345,"timestamp":"2026-04-12T14:00:00Z"}
+```
+
+This is data collection only — used to calibrate thresholds over time.
 
 ### Default bias
 

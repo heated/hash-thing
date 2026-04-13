@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/ht-octree", "crates/ht-render"]
+
 [package]
 name = "hash-thing"
 version = "0.1.0"
@@ -7,6 +10,8 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+ht-octree = { path = "crates/ht-octree" }
+ht-render = { path = "crates/ht-render" }
 wgpu = "29"
 winit = "0.30"
 pollster = "0.4"
@@ -29,6 +34,13 @@ opt-level = 2
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Fast-compile benchmark profile: representative for relative perf comparisons
+# without LTO cost. Usage: cargo test --profile bench ...
+[profile.bench]
+inherits = "release"
+lto = false
+debug = 1
 
 # First-party warning gating. Keeps unused imports / variables / etc. as hard
 # errors so they do not drift, but dead_code stays at warn-level: in a binary
