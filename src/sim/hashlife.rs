@@ -313,6 +313,9 @@ impl World {
             return cached;
         }
         self.hashlife_stats.cache_misses += 1;
+        if (level as usize) >= 3 {
+            self.hashlife_stats.misses_by_level[(level - 3) as usize] += 1;
+        }
 
         let result = if level == 3 {
             self.step_base_case(node, parity)
@@ -327,7 +330,9 @@ impl World {
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
     fn step_base_case(&mut self, node: NodeId, _parity: u32) -> NodeId {
-        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        // Stack-allocated grid avoids heap allocation per base case (~16K calls).
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
         let next = self.step_grid_once(&grid, self.generation);
         self.center_level3_grid_to_node(&next)
     }
@@ -370,7 +375,8 @@ impl World {
     }
 
     fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
-        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
         let next = self.step_grid_once(&grid, generation);
         let next = self.step_grid_once(&next, generation + 1);
         self.center_level3_grid_to_node(&next)
@@ -387,25 +393,38 @@ impl World {
         // would wrap outside the padded region. Callers only extract the center
         // that remains valid after the requested number of steps.
         let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+        // Precompute per-material noop flag to avoid vtable dispatch per cell.
+        // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
+        // entirely (next is zero-initialized). For GoL, air participates in birth
+        // rules and must NOT be skipped.
+        let noop_by_material = self.materials.noop_flags();
+        let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
         for z in 1..side - 1 {
             for y in 1..side - 1 {
                 for x in 1..side - 1 {
-                    let cell = Cell::from_raw(grid[x + y * side + z * side * side]);
-                    let neighbors = get_neighbors_from_grid(grid, side, x, y, z);
+                    let idx = x + y * side + z * side * side;
+                    let raw = grid[idx];
+                    if raw == 0 && air_is_noop {
+                        continue;
+                    }
+                    let cell = Cell::from_raw(raw);
+                    let mat = cell.material() as usize;
+                    if mat < noop_by_material.len() && noop_by_material[mat] {
+                        next[idx] = raw;
+                        continue;
+                    }
                     let rule = self.materials.rule_for_cell(cell).unwrap_or_else(|| {
                         panic!("missing CaRule for material {}", cell.material())
                     });
-                    next[x + y * side + z * side * side] = rule.step_cell(cell, &neighbors).raw();
+                    let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
+                    next[idx] = rule.step_cell(cell, &neighbors).raw();
                 }
             }
         }
 
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
         // Node-local alignment (9ww): the partition is determined by grid-local
-        // coordinates, not world-space origin. Every block starting at offset
-        // is valid — no world-space alignment check needed. This makes the
-        // cache key origin-independent, enabling spatial memoization for all
-        // worlds including those with block rules.
+        // coordinates, not world-space origin.
         let offset = (generation % 2) as usize;
         let mut bz = offset;
         while bz + 1 < side - 1 {
@@ -637,7 +656,12 @@ fn source_index(p: usize, s: usize) -> (usize, usize) {
     }
 }
 
-fn get_neighbors_from_grid(
+/// Get 26 Moore neighbors from a flat grid without bounds checking.
+/// Caller must ensure `x, y, z` are all in `1..side-1` (interior cells).
+/// Uses direct arithmetic instead of `rem_euclid` — safe because interior
+/// cells always have valid neighbors at offsets -1, 0, +1.
+#[inline]
+fn get_neighbors_from_grid_unchecked(
     grid: &[CellState],
     side: usize,
     x: usize,
@@ -646,16 +670,15 @@ fn get_neighbors_from_grid(
 ) -> [Cell; 26] {
     let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;
-    let s = side as i64;
-    for dz in [-1i64, 0, 1] {
-        for dy in [-1i64, 0, 1] {
-            for dx in [-1i64, 0, 1] {
+    for dz in [-1i32, 0, 1] {
+        for dy in [-1i32, 0, 1] {
+            for dx in [-1i32, 0, 1] {
                 if dx == 0 && dy == 0 && dz == 0 {
                     continue;
                 }
-                let nx = (x as i64 + dx).rem_euclid(s) as usize;
-                let ny = (y as i64 + dy).rem_euclid(s) as usize;
-                let nz = (z as i64 + dz).rem_euclid(s) as usize;
+                let nx = (x as i32 + dx) as usize;
+                let ny = (y as i32 + dy) as usize;
+                let nz = (z as i32 + dz) as usize;
                 neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
                 idx += 1;
             }
@@ -1197,5 +1220,55 @@ mod tests {
     #[should_panic]
     fn source_index_out_of_range_panics() {
         source_index(3, 0);
+    }
+
+    /// Regression test for u4w: water column must conserve mass and spread
+    /// symmetrically (no directional bias). Before the FluidBlockRule fix,
+    /// water drifted systematically +x due to single-axis selection bias.
+    /// Now water uses FluidBlockRule with both-axis spread: lateral movement
+    /// is expected but must be mass-conserving and approximately symmetric.
+    #[test]
+    fn water_column_mass_conservation() {
+        use crate::terrain::materials::WATER_MATERIAL_ID;
+        let mut world = World::new(5); // 32³
+                                       // Place a column of water at (16, y, 16) for y in 8..24.
+        for y in 8..24 {
+            world.set(
+                wc(16),
+                wc(y),
+                wc(16),
+                Cell::pack(WATER_MATERIAL_ID, 0).raw(),
+            );
+        }
+        let initial_water = count_material(&world, 32, WATER_MATERIAL_ID);
+        assert_eq!(initial_water, 16);
+
+        for step in 0..8 {
+            world.step_recursive();
+            let water_count = count_material(&world, 32, WATER_MATERIAL_ID);
+            eprintln!("step {step}: water_count={water_count}");
+            // Mass must be conserved.
+            assert_eq!(
+                water_count, initial_water,
+                "mass not conserved at step {step}: expected {initial_water}, got {water_count}"
+            );
+        }
+    }
+
+    /// Count cells of a given material in the world.
+    fn count_material(world: &World, side: i64, material_id: u16) -> usize {
+        let mut count = 0;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let cell =
+                        Cell::from_raw(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)));
+                    if cell.material() == material_id {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
 }

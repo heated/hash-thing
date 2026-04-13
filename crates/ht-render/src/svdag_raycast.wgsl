@@ -1,6 +1,8 @@
-// SVDAG raycasting shader.
+// SVDAG raycasting compute shader (hash-thing-5bb.6.1).
 //
-// Iterative descent through a sparse voxel DAG, rendered via a fullscreen pass.
+// Iterative descent through a sparse voxel DAG, dispatched as a compute shader
+// writing to a storage texture. Converted from fragment shader to enable future
+// workgroup-cooperative optimizations (tile early-exit, shared DAG cache).
 //
 // Buffer layout (dag_nodes: array<u32>):
 //   [0]:     root_offset — absolute index of the current root node's slot
@@ -28,32 +30,14 @@ struct Uniforms {
     camera_right: vec4<f32>,
     // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: screen_height
     params: vec4<f32>,
+    // x: debug_mode (0=normal, 1=step-count heatmap), y: lod_bias, z: output_width, w: output_height
+    debug: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> dag_nodes: array<u32>;
 @group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
-    let positions = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
-    );
-    var out: VertexOutput;
-    out.position = vec4<f32>(positions[id], 0.0, 1.0);
-    out.uv = positions[id];
-    return out;
-}
+@group(0) @binding(3) var output: texture_storage_2d<rgba16float, write>;
 
 // Material color palette. Input is the packed 16-bit cell word:
 //   bits 15..6 material_id (10 bits)
@@ -73,6 +57,165 @@ fn material_color(packed: u32) -> vec3<f32> {
         return palette[mat_id].xyz;
     }
     return vec3<f32>(0.6, 0.7, 0.8); // fallback for out-of-range mat_id
+}
+
+// ---------------------------------------------------------------------------
+// Procedural surface detail (hash-thing-e7k.2)
+//
+// Per-material shading variation using world-space position as noise seed.
+// No textures or CPU-side changes — pure shader-side procedural detail.
+// ---------------------------------------------------------------------------
+
+// Hash-based pseudo-random: fast, deterministic, no texture fetch.
+fn hash3(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Value noise: smooth random field from world-space position.
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f); // smoothstep
+
+    let n000 = hash3(i);
+    let n100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
+    let n010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0));
+    let n110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
+    let n001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0));
+    let n101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
+    let n011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
+
+    let nx00 = mix(n000, n100, u.x);
+    let nx10 = mix(n010, n110, u.x);
+    let nx01 = mix(n001, n101, u.x);
+    let nx11 = mix(n011, n111, u.x);
+    let nxy0 = mix(nx00, nx10, u.y);
+    let nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+
+// Per-material surface properties returned by material_shade.
+struct SurfaceProps {
+    color: vec3<f32>,      // modulated base color with procedural detail
+    roughness: f32,        // 0 = mirror, 1 = fully diffuse
+    emissive: vec3<f32>,   // additive glow (fire, lava)
+};
+
+// Shade a material with procedural detail based on world-space position.
+// `world_pos` is in [0,1]^3 voxel space scaled to root_side cells.
+// `time` is elapsed seconds from u.camera_pos.w.
+fn material_shade(packed: u32, world_pos: vec3<f32>, normal: vec3<f32>, time: f32) -> SurfaceProps {
+    let mat_id = packed >> 6u;
+    var base = material_color(packed);
+    var props: SurfaceProps;
+    props.roughness = 0.85;
+    props.emissive = vec3<f32>(0.0);
+
+    // Scale world_pos to voxel-cell coordinates for noise sampling.
+    let root_side = u.params.x;
+    let vox = world_pos * root_side;
+
+    // Material-specific procedural detail. IDs match MaterialRegistry:
+    // 0=air, 1=stone, 2=dirt, 3=grass, 4=fire, 5=water, 6=sand, 7=lava
+    switch mat_id {
+        case 1u: {
+            // Stone: layered noise for mineral veins + subtle color variation.
+            let coarse = value_noise(vox * 0.3);
+            let fine = value_noise(vox * 1.7);
+            let vein = smoothstep(0.42, 0.48, value_noise(vox * vec3<f32>(0.5, 0.2, 0.5)));
+            base = base * (0.85 + 0.3 * coarse) * (0.92 + 0.16 * fine);
+            // Dark veins
+            base = mix(base, base * 0.55, vein * 0.6);
+            props.roughness = 0.95;
+        }
+        case 2u: {
+            // Dirt: chunky low-frequency variation, warm-cool shift.
+            let n = value_noise(vox * 0.5);
+            let detail = value_noise(vox * 2.0);
+            base = base * (0.8 + 0.4 * n);
+            // Warm/cool variation: shift hue slightly
+            base.r += 0.04 * detail;
+            base.b -= 0.03 * detail;
+            props.roughness = 1.0;
+        }
+        case 3u: {
+            // Grass: fine detail, yellow-green variation.
+            let n = value_noise(vox * 1.5);
+            let fine = value_noise(vox * 4.0);
+            base = base * (0.85 + 0.3 * n);
+            // Shift toward yellow or deeper green per-voxel
+            base.r += 0.06 * fine;
+            base.g += 0.04 * (fine - 0.5);
+            // Top-face brightness boost (grass is brighter on top)
+            let top_factor = max(normal.y, 0.0);
+            base *= (0.9 + 0.15 * top_factor);
+            props.roughness = 0.9;
+        }
+        case 4u: {
+            // Fire: animated emissive flicker.
+            let flicker = value_noise(vox * 2.0 + vec3<f32>(0.0, time * 4.0, 0.0));
+            let pulse = 0.6 + 0.4 * flicker;
+            base *= pulse;
+            // Orange-to-yellow core
+            let core = value_noise(vox * 3.0 + vec3<f32>(time * 2.0, time * 5.0, 0.0));
+            props.emissive = base * (1.5 + core * 1.5);
+            props.roughness = 0.5;
+        }
+        case 5u: {
+            // Water: subtle depth-based tint, slight shimmer.
+            let shimmer = value_noise(vox * 2.0 + vec3<f32>(time * 0.3, 0.0, time * 0.2));
+            base *= (0.9 + 0.15 * shimmer);
+            // Slight specular sheen
+            props.roughness = 0.3;
+        }
+        case 6u: {
+            // Sand: fine speckle, warm granular texture.
+            let grain = value_noise(vox * 5.0);
+            let coarse = value_noise(vox * 0.8);
+            base *= (0.88 + 0.24 * grain);
+            base.r += 0.03 * coarse;
+            props.roughness = 0.92;
+        }
+        case 7u: {
+            // Lava: pulsing emissive glow, molten surface.
+            let flow = value_noise(vox * 0.8 + vec3<f32>(time * 0.1, time * -0.15, time * 0.05));
+            let hot = value_noise(vox * 2.0 + vec3<f32>(time * 0.3, time * 0.5, 0.0));
+            base *= (0.7 + 0.5 * flow);
+            // Hot spots glow brighter orange-yellow
+            let glow_color = mix(vec3<f32>(1.0, 0.3, 0.0), vec3<f32>(1.0, 0.8, 0.2), hot);
+            props.emissive = glow_color * (0.8 + 0.6 * flow);
+            props.roughness = 0.6;
+        }
+        default: {
+            // Unknown materials: subtle noise to avoid dead-flat appearance.
+            let n = value_noise(vox * 1.0);
+            base *= (0.9 + 0.2 * n);
+        }
+    }
+
+    props.color = base;
+    return props;
+}
+
+// Enhanced lighting with per-material roughness and specular.
+fn shade_surface(props: SurfaceProps, normal: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
+    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+    let diffuse = max(dot(normal, light_dir), 0.0);
+
+    // Blinn-Phong specular, modulated by roughness.
+    let half_vec = normalize(light_dir - rd);
+    let spec_power = mix(64.0, 2.0, props.roughness);
+    let spec = pow(max(dot(normal, half_vec), 0.0), spec_power);
+    let spec_strength = (1.0 - props.roughness) * 0.4;
+
+    // Ambient with subtle directional fill from below
+    let ambient = 0.25 + 0.05 * max(-normal.y, 0.0);
+
+    let lit = props.color * (ambient + diffuse * 0.7) + vec3<f32>(spec * spec_strength);
+    return lit + props.emissive;
 }
 
 fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec2<f32> {
@@ -137,6 +280,21 @@ const MAX_STACK: u32 = 16u;
 const MIN_STEP_BUDGET: u32 = 1024u;
 const STEP_BUDGET_FUDGE: u32 = 8u;
 
+struct RayResult {
+    color: vec4<f32>,
+    steps: u32,
+    max_steps: u32,
+};
+
+// Step-count heatmap: green (0%) → yellow (50%) → red (100%).
+fn heatmap_color(ratio: f32) -> vec3<f32> {
+    let t = clamp(ratio, 0.0, 1.0);
+    if t < 0.5 {
+        return mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), t * 2.0);
+    }
+    return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+}
+
 // Iterative DAG descent.
 //
 // Strategy: for each ray, start at root. At each level, compute which octant
@@ -148,7 +306,7 @@ const STEP_BUDGET_FUDGE: u32 = 8u;
 // but correct enough to prove the pipeline works and reserve the complexity
 // budget. Optimizations (ray-octant mirroring, ancestor memoization, bitmask
 // coalescing) can be layered on later.
-fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     // Laine-Karras Stage 2: mirror ray so rd is componentwise non-negative.
     // Octant child indices are XORed with mirror_mask during DAG lookup.
     let neg = rd < vec3<f32>(0.0);
@@ -176,7 +334,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // Intersect mirrored ray with root cube [0,1]^3
     let root_hit = intersect_aabb(ro_m, inv_rd, vec3<f32>(0.0), vec3<f32>(1.0));
     if root_hit.x > root_hit.y || root_hit.y < 0.0 {
-        return vec4<f32>(0.0);
+        return RayResult(vec4<f32>(0.0), 0u, 1u);
     }
 
     // hash-thing-27m v2: clamp ro to the root-cube entry (Laine-Karras).
@@ -226,7 +384,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // explicit background return, NOT a `break` — the post-loop
         // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
         // so any `break` here would render every clean root-exit as magenta.
-        if t > t_exit { return vec4<f32>(0.0); }
+        if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
         // Integer DDA (hash-thing-pck): pos from integer cell center.
         var pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
 
@@ -243,7 +401,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             }
             if top == 0u {
                 // Exited root
-                return vec4<f32>(0.0);
+                return RayResult(vec4<f32>(0.0), step, max_steps);
             }
             top = top - 1u;
         }
@@ -260,13 +418,14 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             // LOD cutoff (x5w): if this voxel is sub-pixel, use the
             // representative material packed in bits 8-23 of child_mask
             // (m1f.7.3.2). No child scan needed — 0 buffer reads.
+            // LOD bias (m1f.7.3.3): multiply threshold by debug.y (default 1.0)
+            // to allow runtime LOD tuning. Higher = more aggressive = faster.
+            let lod_bias = max(u.debug.y, 1.0);
             let t_dist = max(t + entry, 1e-4);
-            if pixel_world > 0.0 && half < pixel_world * t_dist {
+            if pixel_world > 0.0 && half < pixel_world * t_dist * lod_bias {
                 let lod_mat = (cmask >> 8u) & 0xFFFFu;
                 if lod_mat > 0u {
-                    // Shade as a flat-color hit at node center.
-                    let base = material_color(lod_mat);
-                    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+                    // Shade with procedural detail at LOD node center.
                     // Approximate normal: use the entry face of this node.
                     let nmin = node_min;
                     let nmax = node_min + vec3<f32>(half * 2.0);
@@ -281,9 +440,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     } else {
                         normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
                     }
-                    let diffuse = max(dot(normal, light_dir), 0.0);
-                    let lit = base * (0.3 + diffuse * 0.7);
-                    return vec4<f32>(lit, 1.0);
+                    let lod_center = node_min + vec3<f32>(half);
+                    let lod_time = u.camera_pos.w;
+                    let lod_props = material_shade(lod_mat, lod_center, normal, lod_time);
+                    let lit = shade_surface(lod_props, normal, rd);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // All children empty — step past this node
                 break;
@@ -360,13 +521,12 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     } else {
                         normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
                     }
-                    // Lambertian + ambient + fog.
-                    let base = material_color(mat);
-                    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-                    let diffuse = max(dot(normal, light_dir), 0.0);
-                    let ambient = 0.3;
-                    let lit = base * (ambient + diffuse * 0.7);
-                    return vec4<f32>(lit, 1.0);
+                    // Procedural surface detail + enhanced lighting (e7k.2).
+                    let hit_pos = leaf_min + vec3<f32>(half * 0.5);
+                    let hit_time = u.camera_pos.w;
+                    let surf = material_shade(mat, hit_pos, normal, hit_time);
+                    let lit = shade_surface(surf, normal, rd);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // Empty leaf — break to step ray
                 break;
@@ -422,7 +582,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let octant_base = u32(cmin_exit * f32(RESOLUTION));
             let boundary_cell = octant_base + step_cells;
             if boundary_cell >= RESOLUTION {
-                return vec4<f32>(0.0); // exited volume
+                return RayResult(vec4<f32>(0.0), step, max_steps); // exited volume
             }
             if exit_axis == 0u { int_pos.x = boundary_cell; }
             else if exit_axis == 1u { int_pos.y = boundary_cell; }
@@ -446,7 +606,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             // still inside the same parent. If so, skip it without going
             // through the outer loop's pop+descend overhead.
             if step >= max_steps { break; }
-            if t > t_exit { return vec4<f32>(0.0); }
+            if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
             pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
             let h2_s = half_s * 2.0;
             if !(all(pos >= node_min_s) && all(pos < node_min_s + h2_s)) {
@@ -468,30 +628,65 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // is impossible to miss on screen. The CPU replica sets
     // `TraceResult.exhausted = true` for the same condition so tests can
     // assert on it directly.
-    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    return RayResult(vec4<f32>(1.0, 0.0, 1.0, 1.0), step, max_steps);
 }
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let width = u32(u.debug.z);
+    let height = u32(u.debug.w);
+
+    // OOB guard: edge workgroups may dispatch threads beyond the output
+    // texture dimensions when width/height aren't multiples of 8.
+    if gid.x >= width || gid.y >= height {
+        return;
+    }
+
+    // Compute UV in [-1, 1] range matching the old vertex shader output.
+    let uv = vec2<f32>(
+        (f32(gid.x) + 0.5) / f32(width) * 2.0 - 1.0,
+        // Flip Y: gid.y=0 is top of screen, but UV.y=1 should be top
+        1.0 - (f32(gid.y) + 0.5) / f32(height) * 2.0,
+    );
+
     let aspect = u.params.y;
     let fov_tan = u.params.z;
 
     let rd = normalize(
         u.camera_dir.xyz +
-        u.camera_right.xyz * in.uv.x * aspect * fov_tan +
-        u.camera_up.xyz * in.uv.y * fov_tan
+        u.camera_right.xyz * uv.x * aspect * fov_tan +
+        u.camera_up.xyz * uv.y * fov_tan
     );
     let ro = u.camera_pos.xyz;
 
-    let hit = raycast(ro, rd);
-    if hit.a > 0.0 {
-        return hit;
+    let result = raycast(ro, rd);
+    let debug_mode = u32(u.debug.x);
+
+    var final_color: vec4<f32>;
+
+    // Debug mode 1: step-count heatmap. Shows traversal cost per pixel.
+    if debug_mode == 1u {
+        let ratio = f32(result.steps) / f32(result.max_steps);
+        let hm = heatmap_color(ratio);
+        // Dim background rays (no hit) to distinguish sky from geometry.
+        if result.color.a == 0.0 {
+            final_color = vec4<f32>(hm * 0.3, 1.0);
+        } else {
+            final_color = vec4<f32>(hm, 1.0);
+        }
+    } else if result.color.a > 0.0 {
+        final_color = result.color;
+    } else {
+        // Sky gradient: lighter blue at top, desaturated at horizon.
+        let sky_t = uv.y * 0.5 + 0.5;
+        let sky_top = vec3<f32>(0.35, 0.55, 0.90);
+        let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
+        let bg = mix(sky_bot, sky_top, sky_t);
+        final_color = vec4<f32>(bg, 1.0);
     }
 
-    // Sky gradient: lighter blue at top, desaturated at horizon.
-    let t = in.uv.y * 0.5 + 0.5;
-    let sky_top = vec3<f32>(0.35, 0.55, 0.90);
-    let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
-    let bg = mix(sky_bot, sky_top, t);
-    return vec4<f32>(bg, 1.0);
+    // Store linear color — the blit shader writes to an sRGB swapchain surface,
+    // so hardware sRGB encoding happens at the final render pass output.
+    // No manual conversion needed here; rgba16float stores linear values losslessly.
+    textureStore(output, vec2<i32>(gid.xy), final_color);
 }

@@ -184,6 +184,10 @@ The prior divergence backlog (18 commits on `worktree-vast-leaping-allen`, 9 on 
 
 Measure warm frames only (skip cold startup generations). Cold frame cost is one-time; interactive feel depends on steady-state.
 
+## Perf tracking
+
+On perf-relevant bead close, `bd comments add` with before/after latencies (world size, release). Latency is the priority metric — memory secondary. Key latencies: `render_gpu`, `upload_cpu`, `step`, terrain gen.
+
 ## Quick Reference
 
 ```bash

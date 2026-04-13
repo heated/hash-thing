@@ -4,8 +4,10 @@ use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
 use crate::terrain::field::heightmap::PrecomputedHeightmapField;
-use crate::terrain::materials::{BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, STONE, WATER};
-use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
+use crate::terrain::materials::{
+    BlockRuleId, MaterialRegistry, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, LAVA, SAND, STONE, WATER,
+};
+use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
 
 /// The axis-aligned cube of world-space that the octree currently covers.
@@ -80,7 +82,7 @@ pub struct World {
     pub simulation_seed: u64,
     pub materials: MaterialRegistry,
     /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
-    /// `ensure_region` generates terrain (heightmap + caves)
+    /// `ensure_region` generates terrain (heightmap)
     /// for newly-created sibling octants instead of leaving them empty.
     terrain_params: Option<TerrainParams>,
     /// Spatial memoization cache for the recursive Hashlife stepper.
@@ -107,10 +109,20 @@ pub struct World {
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
+    /// Positions of clone blocks in world coordinates. Each tick,
+    /// clone blocks spawn their encoded material into adjacent air cells.
+    /// Validated lazily — stale entries (destroyed by acid/etc.) are pruned
+    /// on `spawn_clones`.
+    pub clone_sources: Vec<[i64; 3]>,
     /// World-space origin of local coordinate (0,0,0). When the world
     /// grows in the negative direction, origin shifts to keep the old
     /// root's cells at the same world-space positions.
     pub origin: [i64; 3],
+    /// Old→new NodeId remap from the most recent store compaction.
+    /// Consumed by `Svdag::apply_remap()` to keep its persistent cache
+    /// valid across compaction epochs (hash-thing-5bb.11).
+    /// `None` after scene resets (the cache should be fully invalidated).
+    pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
 }
 
 /// Cache performance statistics from a single hashlife step.
@@ -120,6 +132,8 @@ pub struct HashlifeStats {
     pub cache_misses: u64,
     pub empty_skips: u64,
     pub fixed_point_skips: u64,
+    /// Per-level cache miss counts (index = level - 3, since base case is level 3).
+    pub misses_by_level: [u64; 32],
 }
 
 impl World {
@@ -156,7 +170,9 @@ impl World {
             hashlife_all_inert_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
+            clone_sources: Vec::new(),
             origin: [0, 0, 0],
+            last_compaction_remap: None,
         }
     }
 
@@ -182,7 +198,9 @@ impl World {
             hashlife_all_inert_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
+            clone_sources: Vec::new(),
             origin: [0, 0, 0],
+            last_compaction_remap: None,
         }
     }
 
@@ -336,21 +354,15 @@ impl World {
     }
 
     /// Generate a sibling octant for lazy expansion. If `terrain_params` is
-    /// set, produces terrain (heightmap + caves) at the given
-    /// world-space origin. Otherwise returns a canonical empty node.
+    /// set, produces terrain (heightmap) at the given world-space origin.
+    /// Otherwise returns a canonical empty node.
     fn gen_sibling(&mut self, level: u32, origin: [i64; 3]) -> NodeId {
         let params = match &self.terrain_params {
             Some(p) => *p,
             None => return self.store.empty(level),
         };
         let field = params.to_heightmap();
-        let (mut node, _stats) = gen_region(&mut self.store, &field, origin, level);
-        let side = 1usize << level;
-        if let Some(cave_params) = &params.caves {
-            let mut grid = self.store.flatten(node, side);
-            crate::terrain::caves::carve_caves_grid(&mut grid, side, origin, cave_params);
-            node = self.store.from_flat(&grid, side);
-        }
+        let (node, _stats) = gen_region(&mut self.store, &field, origin, level);
         node
     }
 
@@ -468,6 +480,68 @@ impl World {
                     }
                 }
             }
+        }
+    }
+
+    /// Spawn materials from clone blocks into adjacent air cells.
+    ///
+    /// For each tracked clone source, verify it still exists (prune stale entries),
+    /// then write the encoded source material into the 6 cardinal neighbors that
+    /// are currently air. Mutations are applied immediately.
+    pub fn spawn_clones(&mut self) {
+        if self.clone_sources.is_empty() {
+            return;
+        }
+
+        const DIRS: [[i64; 3]; 6] = [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ];
+
+        // Snapshot and validate: collect (pos, source_material) for live clones.
+        let mut live_sources: Vec<([i64; 3], u16)> = Vec::new();
+        for &pos in &self.clone_sources {
+            let cell = Cell::from_raw(self.get(
+                WorldCoord(pos[0]),
+                WorldCoord(pos[1]),
+                WorldCoord(pos[2]),
+            ));
+            if cell.material() == CLONE_MATERIAL_ID {
+                live_sources.push((pos, cell.metadata()));
+            }
+        }
+
+        // Prune stale entries.
+        self.clone_sources = live_sources.iter().map(|&(pos, _)| pos).collect();
+
+        for (pos, source_material_id) in live_sources {
+            if source_material_id == 0 {
+                continue; // metadata 0 = no source configured
+            }
+            let spawn_state = Cell::pack(source_material_id, 0).raw();
+            for dir in &DIRS {
+                let nx = pos[0] + dir[0];
+                let ny = pos[1] + dir[1];
+                let nz = pos[2] + dir[2];
+                let neighbor = self.get(WorldCoord(nx), WorldCoord(ny), WorldCoord(nz));
+                if neighbor == 0 {
+                    self.queue.push(WorldMutation::SetCell {
+                        x: WorldCoord(nx),
+                        y: WorldCoord(ny),
+                        z: WorldCoord(nz),
+                        state: spawn_state,
+                    });
+                }
+            }
+        }
+
+        // Apply the spawned cells.
+        if !self.queue.is_empty() {
+            self.apply_mutations();
         }
     }
 
@@ -736,6 +810,183 @@ impl World {
         }
     }
 
+    /// Add water and sand to an existing terrain — water pools on a
+    /// hilltop (so it cascades down) and sand dunes on one side.
+    /// Call after `seed_terrain`.
+    pub fn seed_water_and_sand(&mut self) {
+        let side = self.side() as u64;
+        let center = side / 2;
+        // Water: a wide pool above center, near the high terrain.
+        // Place at 75% height in a ~side/4 square.
+        let water_y = center + center / 4;
+        let pool_radius = side / 6;
+        let pool_depth = (side / 32).max(2);
+        let lo_x = center.saturating_sub(pool_radius);
+        let hi_x = (center + pool_radius).min(side);
+        let lo_z = center.saturating_sub(pool_radius);
+        let hi_z = (center + pool_radius).min(side);
+        for z in lo_z..hi_z {
+            for x in lo_x..hi_x {
+                for dy in 0..pool_depth {
+                    let y = water_y + dy;
+                    if y < side {
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), WATER);
+                    }
+                }
+            }
+        }
+        // Sand: a dune field on one edge, at terrain surface level.
+        let sand_width = side / 8;
+        let sand_depth = (side / 64).max(2);
+        for z in 0..side / 3 {
+            for x in 0..sand_width {
+                for dy in 0..sand_depth {
+                    let y = center + dy;
+                    if y < side {
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), SAND);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seed a lattice megastructure with active materials.
+    ///
+    /// A 3D grid of corridors carved from stone, with grass-covered pillars,
+    /// water channels, lava pools, fire sources, and sand dunes. The
+    /// periodic lattice compresses well in the octree (hashlife sharing)
+    /// while the active materials (fire consuming grass, water flowing,
+    /// lava solidifying) create dynamic visual interest.
+    pub fn seed_lattice_megastructure(&mut self) {
+        let side = self.side() as u64;
+        let margin = side / 16;
+        let lo = margin;
+        let hi = side - margin;
+        let extent = hi - lo;
+
+        // Lattice cell size — corridors are `cell_size` wide, walls are
+        // `wall_thickness` thick. Scale with world size.
+        let cell_size = (extent / 8).max(4);
+        let wall_thickness = (cell_size / 4).max(1);
+
+        for z in lo..hi {
+            for y in lo..hi {
+                for x in lo..hi {
+                    let lx = x - lo;
+                    let ly = y - lo;
+                    let lz = z - lo;
+
+                    // Which lattice cell are we in?
+                    let cx = lx % cell_size;
+                    let cy = ly % cell_size;
+                    let cz = lz % cell_size;
+
+                    // Is this a wall position? Walls on each axis boundary.
+                    let x_wall = cx < wall_thickness;
+                    let y_wall = cy < wall_thickness;
+                    let z_wall = cz < wall_thickness;
+
+                    // At least 2 axes must be in a wall region for a pillar/beam.
+                    let wall_count = x_wall as u8 + y_wall as u8 + z_wall as u8;
+
+                    if wall_count >= 2 {
+                        // Pillars and beams. Bottom layer is stone,
+                        // rest is grass (flammable).
+                        if y_wall && cy == 0 {
+                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), STONE);
+                        } else {
+                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), GRASS);
+                        }
+                    } else if y_wall && cy == 0 {
+                        // Floor slabs — alternating stone and sand.
+                        let grid_x = lx / cell_size;
+                        let grid_z = lz / cell_size;
+                        if (grid_x + grid_z).is_multiple_of(2) {
+                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), STONE);
+                        } else {
+                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), SAND);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Water channels: every other corridor on the ground floor.
+        let water_depth = (wall_thickness + 1).min(cell_size / 2);
+        for z in lo..hi {
+            for x in lo..hi {
+                let lx = x - lo;
+                let lz = z - lo;
+                let grid_z = lz / cell_size;
+                let cx = lx % cell_size;
+                let cz = lz % cell_size;
+
+                if grid_z.is_multiple_of(2) && cx >= wall_thickness && cz >= wall_thickness {
+                    for dy in 1..=water_depth {
+                        let y = lo + dy;
+                        if y < hi {
+                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), WATER);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Lava pools: center of every 4th grid cell, elevated.
+        for z in lo..hi {
+            for x in lo..hi {
+                let lx = x - lo;
+                let lz = z - lo;
+                let grid_x = lx / cell_size;
+                let grid_z = lz / cell_size;
+                let cx = lx % cell_size;
+                let cz = lz % cell_size;
+
+                if grid_x % 4 == 2
+                    && grid_z % 4 == 2
+                    && cx > wall_thickness
+                    && cx < cell_size - 1
+                    && cz > wall_thickness
+                    && cz < cell_size - 1
+                {
+                    let elev = cell_size * 2 + lo; // 2nd floor
+                    for dy in 0..2 {
+                        let y = elev + dy;
+                        if y < hi {
+                            self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), LAVA);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fire sources: corners of every 3rd grid cell.
+        for gz in 0..(extent / cell_size) {
+            for gx in 0..(extent / cell_size) {
+                if (gx + gz) % 3 != 0 {
+                    continue;
+                }
+                let base_x = lo + gx * cell_size + wall_thickness + 1;
+                let base_z = lo + gz * cell_size + wall_thickness + 1;
+                let fire_y = lo + wall_thickness + 1;
+                for dz in 0..2u64.min(cell_size / 4) {
+                    for dx in 0..2u64.min(cell_size / 4) {
+                        let fx = base_x + dx;
+                        let fz = base_z + dz;
+                        if fx < hi && fz < hi && fire_y < hi {
+                            self.set_local(
+                                LocalCoord(fx),
+                                LocalCoord(fire_y),
+                                LocalCoord(fz),
+                                FIRE,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn population(&self) -> u64 {
         self.store.population(self.root)
     }
@@ -753,9 +1004,12 @@ impl World {
         //
         // Brute-force compaction remaps all NodeIds without updating
         // hashlife_cache, so clear it to prevent stale cross-path hits.
-        let (new_store, new_root) = self.store.compacted(self.root);
+        // Keep the remap so Svdag can update its persistent NodeId cache
+        // (hash-thing-5bb.11: O(changed) instead of O(reachable)).
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.last_compaction_remap = Some(remap);
         self.hashlife_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -786,20 +1040,10 @@ impl World {
         let field = PrecomputedHeightmapField::new(heightmap, self.level);
         let precompute_us = precompute_start.elapsed().as_micros() as u64;
         let gen_start = std::time::Instant::now();
-        let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        let (root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
         stats.precompute_us = precompute_us;
         stats.gen_region_us = gen_start.elapsed().as_micros() as u64;
         stats.nodes_after_gen = self.store.stats();
-        // Opt-in cave-CA post-pass. Runs as a separate stage after the
-        // heightmap recursion so the baseline perf path (and every
-        // pre-caves test) sees identical work when `params.caves` is
-        // `None`.
-        if let Some(cave_params) = params.caves {
-            let cave_start = std::time::Instant::now();
-            root = carve_caves(&mut self.store, root, self.level, &cave_params);
-            stats.cave_us = cave_start.elapsed().as_micros() as u64;
-        }
-        stats.nodes_after_caves = self.store.stats();
         self.root = root;
         self.generation = 0;
         self.terrain_params = Some(*params);
@@ -1129,6 +1373,19 @@ mod tests {
             w.population() > 100,
             "burning room should have substantial content"
         );
+    }
+
+    #[test]
+    fn seed_lattice_megastructure_produces_active_materials() {
+        let mut w = World::new(6); // side 64
+        w.seed_lattice_megastructure();
+        assert!(w.population() > 100, "lattice must have content");
+        let grid = w.flatten();
+        let has = |mat: CellState| grid.contains(&mat);
+        assert!(has(STONE), "lattice must have stone");
+        assert!(has(GRASS), "lattice must have grass pillars");
+        assert!(has(WATER), "lattice must have water channels");
+        assert!(has(FIRE), "lattice must have fire sources");
     }
 
     // -----------------------------------------------------------------
@@ -1864,31 +2121,6 @@ mod tests {
                 "cell at ({x}, 3, 3) changed after expansion"
             );
         }
-    }
-
-    #[test]
-    fn expand_terrain_with_caves() {
-        use crate::terrain::CaveParams;
-        let params = TerrainParams {
-            caves: Some(CaveParams::default()),
-            ..Default::default()
-        };
-
-        let mut w_caves = World::new(3);
-        w_caves.seed_terrain(&params);
-        w_caves.ensure_contains(wc(10), wc(0), wc(0));
-
-        let mut w_plain = World::new(3);
-        w_plain.seed_terrain(&TerrainParams::default());
-        w_plain.ensure_contains(wc(10), wc(0), wc(0));
-
-        // Caves should carve out some material — fewer populated cells.
-        assert!(
-            w_caves.population() < w_plain.population(),
-            "caves should reduce population: caves={}, plain={}",
-            w_caves.population(),
-            w_plain.population()
-        );
     }
 
     #[test]

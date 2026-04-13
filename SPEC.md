@@ -330,10 +330,10 @@ Gravity, fluid flow, particle displacement. The world is partitioned into non-ov
 
 ### Terrain generation
 
-- **Multi-resolution procedural generation at octree node granularity.** Not cell-by-cell — `gen(node_region) → NodeId` evaluates noise at region corners; if the region is uniform, return a uniform node without descending. Only subdivide where noise transitions occur (surface, caves, biome boundaries).
+- **Multi-resolution procedural generation at octree node granularity.** Not cell-by-cell — `gen(node_region) → NodeId` evaluates noise at region corners; if the region is uniform, return a uniform node without descending. Only subdivide where noise transitions occur (surface, biome boundaries).
 - **Lineage:** similar to how SVO terrain engines work; different from Minecraft's flat-chunk approach.
 - **Noise functions (Perlin / simplex / 3D Voronoi) for macro structure.** Heightmap, biomes, continents, ore distribution.
-- **CA for micro refinement.** Cave smoothing ("4-5 rule" for organic caves), erosion, vegetation spread. Lineage: classic technique going back to the 1990s, used in Dwarf Fortress, Terraria, many roguelikes.
+- **CA for micro refinement.** Erosion, vegetation spread. Lineage: classic technique going back to the 1990s, used in Dwarf Fortress, Terraria, many roguelikes.
 - **Dungeon generation as a layer on top.** Carve rooms/corridors, via procedural placement or WFC/graph grammars.
 - **Infinite worlds via lazy octree expansion.** When the player/simulation reaches the edge of the current root, wrap the root in a bigger parent node whose other 7 children are "default terrain" nodes, generated lazily as needed.
 - **Watch item:** monitor generation performance early. If per-chunk noise evaluation becomes the bottleneck, consider CA-based generation or SIMD noise.
@@ -439,10 +439,9 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **Out-of-bounds coordinate safety (`819`, `fb5`)**: `set_cell` panics on OOB with `#[track_caller]`; `get_cell` silently returns 0 for OOB (no storage growth). 7 boundary tests. `probe()` stepper-oriented read with OOB-empty promise (`90w`). `is_realized()` for boundary detection.
 - ✅ **Terrain generation (epic `3fq`)**
   - Heightmap-based recursive octree gen with proof-based collapse (sky/deep-stone short-circuit)
-  - Cave CA post-pass (B13/S13 majority-vote, stone-only mask, surface-preserving)
   - ⚠️ Dungeon carving (3fq.3): was built and landed, then **reverted** from main (hash-thing-t2n.1 — landed without design gate). Code lives on `feature/dungeons` branch pending edward's design approval.
-  - Per-phase perf tracking in GenStats: gen_region_us, cave_us, node counts, noise bottleneck estimate (3fq.5)
-  - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap + caves for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
+  - Per-phase perf tracking in GenStats: gen_region_us, node counts, noise bottleneck estimate (3fq.5)
+  - Lazy terrain expansion (3fq.4): `ensure_region` generates heightmap for new sibling octants when `terrain_params` is set. Non-terrain worlds expand with empty nodes.
 - ✅ **RealizedRegion value type (`ica`)**: `RealizedRegion { origin: [i64; 3], level: u32 }` encapsulates the world's spatial extent. `contains()`, `side()`, `octant_of()`, `Display` impl. `World::region()` returns a derived view.
 - ✅ **WorldCoord/LocalCoord newtypes (`7zc`)**: `WorldCoord(i64)` for world-space, `LocalCoord(u64)` for octree-internal. Compiler-enforced separation prevents the coordinate-mixing bug class that 819 fixed. All World API methods migrated.
 - ✅ **CI + release (epic `xb7`, 5/7)**
@@ -456,15 +455,16 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **Material-type CA** (epic `1v0`, complete): all 18 beads landed including `1v0.1` 16-bit cells, `1v0.6` entity system, `1v0.8` cell/block granularity, `1v0.10` player entity with first-person camera + AABB collision + DDA raycast block interaction.
 - ✅ **SVDAG rendering** (epic `5bb`, 10/11): `5bb.1`–`5bb.5` serialization through incremental uploads, `bx7` stale-slot compaction, `5bb.7` palette sync, `5bb.8` zero-direction guard, `5bb.9` particle renderer, `5bb.10` HUD overlay. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 - ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
-- ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + cave CA + lazy terrain expansion + perf tracking. Sand biomes (`y2s`): low-freq noise selects sandy regions where grass/dirt → sand (gravity block rule). Sea-level water (`4t6`): `HeightmapField.sea_level` fills air below sea level with water; `classify_box` proof updated. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`. `l1t` terrain gen 15× speedup via `PrecomputedHeightmapField`: 2D heightmap + min/max mipmap for O(1) `classify_box` bounds + precomputed biome grid. `m1f.7.1` scale-aware `TerrainParams::for_level()`.
+- ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + lazy terrain expansion + perf tracking. Cave CA removed (72s — O(n³) bottleneck). Sand biomes (`y2s`): low-freq noise selects sandy regions where grass/dirt → sand (gravity block rule). Sea-level water (`4t6`): `HeightmapField.sea_level` fills air below sea level with water; `classify_box` proof updated. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`. `l1t` terrain gen 15× speedup via `PrecomputedHeightmapField`: 2D heightmap + min/max mipmap for O(1) `classify_box` bounds + precomputed biome grid. `m1f.7.1` scale-aware `TerrainParams::for_level()`.
 - ✅ **Build infra (`4yb`, `3sw`)**: shared `CARGO_TARGET_DIR` across worktrees (saves ~15GB), `[profile.bench]` for fast representative builds, benchmarks use `--profile bench` instead of `--release`. `3sw`: sccache + per-worktree target dirs to eliminate cargo lock contention.
 - ✅ **Bug fixes**: `0xq` BlockRule boundary asymmetry (absorbing BCs instead of clipping), `08c` has_block_rule_cells O(n³)→O(nodes) walk, `bhi` NodeStore/SVDAG overflow diagnostics.
 - ✅ **Demo playability (`x5w`)**: sim step moved to background thread (render loop unblocked), SVDAG raycast LOD cutoff (sub-pixel voxels short-circuit to nearest color, cutting GPU step count for complex/distant geometry).
 
-### In progress (P0-P1, from bd)
+### Recently completed
 
-- ☐ **Core engine validation** (epic `m1f`, 14/15): proving the full loop works at scale. Landed: `m1f.1` hashlife benchmarks, `m1f.2` SVDAG benchmark, `m1f.3` edit propagation, `m1f.4` infinite world, `m1f.5` SVDAG edit sync, `m1f.6` new CA rules (sand/lava), `m1f.8` SVDAG depth 24 (16M³), `m1f.9` content-only Margolus (pure BlockRule), `m1f.10` PRNG research, `m1f.11` incremental cache invalidation, `m1f.12` stable NodeIds, `m1f.13` spatial memoization enabled, `m1f.15` performance epic (10/10 sub-beads, see below), `m1f.16` dirty-region tracking. Also: `99o` cache invalidation on direct edits, `7cz` terrain default scene, `9ww` node-local Margolus alignment (spatial memo for all worlds), `m1f.7.2` HUD keybindings legend overlay (F1 toggle, mode-aware). Open: `m1f.7` end-to-end demo.
-  - **Hashlife performance (m1f.15, complete):** 512³ terrain went from 7147ms mean / 0% warm cache hits to 192ms mean / 100% warm cache hits (37x). Settled worlds reach 0.0ms/frame (single cache lookup). Key fixes: `76a9446` preserve padded root through compaction, `ee49888` deferred compaction on inert frames, `a239d33` inert uniform subtree skip, `095c164` all-inert mixed-material detection, `71a411b` node-local Margolus. Threshold-based periodic compaction (`31bce90`, m1f.14 re-land) preserves intermediate nodes across frames for cache hits at all recursion levels. Active CA cold frames still ~1.5s at 512³ — next frontier is dirty-region tracking or GPU compute.
+- ✅ **Core engine validation** (epic `m1f`, 15/15 complete): full loop works at scale. Hashlife stepping, SVDAG rendering, player interaction, edits — all validated. Key milestones: hashlife 37x speedup via spatial memoization, SVDAG depth 24 (16M³), half-res rendering for 60fps at 512-1024³, lattice megastructure demo scene with active materials. Renderer: step-count heatmap debug (H key), runtime LOD bias (L), render scale (+/-).
+  - **Hashlife performance (m1f.15):** 512³ terrain 7147ms→192ms mean (37x), settled worlds 0.0ms/frame.
+  - **Renderer performance (m1f.7.3):** 512³ render_gpu 49ms→14ms via half-res. 1024³ terrain at 17ms GPU.
 
 ### Later (P2+, from bd)
 

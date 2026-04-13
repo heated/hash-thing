@@ -2,16 +2,16 @@
 //! fractal in `[base_y - amplitude, base_y + amplitude]`. Material is chosen
 //! by depth below the surface (see `terrain::materials::material_from_depth`).
 //!
-//! `classify_box` is **proof-based only**: a y-band check that uses the
+//! `classify` is **proof-based only**: a y-band check that uses the
 //! global noise bounds (not sampled corners) to declare entire boxes above
 //! `surface_max + SURFACE_MARGIN` as `AIR`, and entire boxes below
 //! `surface_min - DEPTH_MARGIN` as `STONE`. No corner-agreement heuristic.
 //!
 //! `PrecomputedHeightmapField` wraps a `HeightmapField` with a precomputed
-//! 2D height grid + min/max mipmap. `classify_box` uses exact local surface
+//! 2D height grid + min/max mipmap. `classify` uses exact local surface
 //! bounds instead of global amplitude bounds — still proof-based, much tighter.
 
-use super::RegionField;
+use super::WorldGen;
 use crate::octree::CellState;
 use crate::terrain::materials::{material_from_depth, AIR, SAND, STONE, WATER};
 use crate::terrain::noise::{biome_2d, fractal_2d};
@@ -66,7 +66,7 @@ const SAND_BIOME_THRESHOLD: f32 = 0.3;
 /// Wavelength for biome noise (cells). Large value → big biome regions.
 const BIOME_WAVELENGTH: f32 = 64.0;
 
-impl RegionField for HeightmapField {
+impl WorldGen for HeightmapField {
     fn sample(&self, p: [i64; 3]) -> CellState {
         let surface = self.surface_y(p[0] as f32, p[2] as f32);
         let depth = surface - p[1] as f32;
@@ -95,7 +95,7 @@ impl RegionField for HeightmapField {
         base
     }
 
-    fn classify_box(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
+    fn classify(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
         let size = 1i64 << size_log2;
         let y_min = origin[1] as f32; // inclusive
         let y_max = (origin[1] + size) as f32; // exclusive
@@ -134,10 +134,10 @@ impl RegionField for HeightmapField {
 }
 
 // ---------------------------------------------------------------------------
-// PrecomputedHeightmapField — mipmap-accelerated classify_box
+// PrecomputedHeightmapField — mipmap-accelerated classify
 // ---------------------------------------------------------------------------
 
-/// Precomputed 2D surface heights + min/max mipmap for fast `classify_box`.
+/// Precomputed 2D surface heights + min/max mipmap for fast `classify`.
 ///
 /// The mipmap stores min and max surface_y for every power-of-2-aligned XZ
 /// region. At octree level k, the builder's XZ projection is always a
@@ -266,7 +266,7 @@ impl PrecomputedHeightmapField {
     }
 }
 
-impl RegionField for PrecomputedHeightmapField {
+impl WorldGen for PrecomputedHeightmapField {
     #[inline]
     fn sample(&self, p: [i64; 3]) -> CellState {
         let surface = self.precomputed_surface_y(p[0], p[2]);
@@ -299,7 +299,7 @@ impl RegionField for PrecomputedHeightmapField {
         base
     }
 
-    fn classify_box(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
+    fn classify(&self, origin: [i64; 3], size_log2: u32) -> Option<CellState> {
         let size = 1i64 << size_log2;
         let y_min = origin[1] as f32;
         let y_max = (origin[1] + size) as f32;
@@ -330,7 +330,7 @@ impl RegionField for PrecomputedHeightmapField {
 mod tests {
     use super::*;
 
-    /// Deterministic field with known bounds for testing classify_box.
+    /// Deterministic field with known bounds for testing classify.
     /// base_y=32, amplitude=8 → surface ∈ [24, 40].
     fn test_field() -> HeightmapField {
         HeightmapField {
@@ -349,7 +349,7 @@ mod tests {
         // surface_max = 32 + 8 = 40, SURFACE_MARGIN = 2 → threshold = 42.
         // Box at y_min=42: entirely above maximum surface.
         assert_eq!(
-            f.classify_box([0, 42, 0], 2),
+            f.classify([0, 42, 0], 2),
             Some(AIR),
             "box above surface_max + margin must be AIR",
         );
@@ -361,7 +361,7 @@ mod tests {
         // Box at y_min=41, size=4 (size_log2=2) → y in [41, 45).
         // Threshold is 42 (surface_max + margin). y_min=41 < 42 → not provably AIR.
         assert_eq!(
-            f.classify_box([0, 41, 0], 2),
+            f.classify([0, 41, 0], 2),
             None,
             "box with y_min below sky threshold must not short-circuit",
         );
@@ -373,7 +373,7 @@ mod tests {
         // surface_min = 32 - 8 = 24, DEPTH_MARGIN = 4 → threshold = 20.
         // Box y_max must be ≤ 20. With size_log2=2 (size=4): origin y=16 → y_max=20.
         assert_eq!(
-            f.classify_box([0, 16, 0], 2),
+            f.classify([0, 16, 0], 2),
             Some(STONE),
             "box fully below surface_min - DEPTH_MARGIN must be STONE",
         );
@@ -384,7 +384,7 @@ mod tests {
         let f = test_field();
         // origin y=17, size=4 → y_max=21 > 20 → not provably all STONE.
         assert_eq!(
-            f.classify_box([0, 17, 0], 2),
+            f.classify([0, 17, 0], 2),
             None,
             "box with y_max above deep-stone threshold must not short-circuit",
         );
@@ -395,7 +395,7 @@ mod tests {
         let f = test_field();
         // Box around y=32 (base_y) — clearly straddles the surface.
         assert_eq!(
-            f.classify_box([0, 30, 0], 3),
+            f.classify([0, 30, 0], 3),
             None,
             "box straddling the surface band must return None",
         );
@@ -406,7 +406,7 @@ mod tests {
         let f = test_field();
         // size_log2=5 (size=32), origin y=48 → y_min=48 ≥ 42 → AIR.
         assert_eq!(
-            f.classify_box([0, 48, 0], 5),
+            f.classify([0, 48, 0], 5),
             Some(AIR),
             "large box well above surface must collapse to AIR",
         );
@@ -417,7 +417,7 @@ mod tests {
         let f = test_field();
         // size_log2=3 (size=8), origin y=0 → y_max=8 ≤ 20 → STONE.
         assert_eq!(
-            f.classify_box([0, 0, 0], 3),
+            f.classify([0, 0, 0], 3),
             Some(STONE),
             "large box well below surface must collapse to STONE",
         );
@@ -516,17 +516,17 @@ mod tests {
     }
 
     #[test]
-    fn classify_box_water_above_surface_below_sea() {
+    fn classify_water_above_surface_below_sea() {
         let mut f = test_field();
         f.sea_level = Some(28.0);
         // Box fully above surface_max (42) and above sea level → AIR
-        assert_eq!(f.classify_box([0, 42, 0], 2), Some(AIR));
+        assert_eq!(f.classify([0, 42, 0], 2), Some(AIR));
         // Box fully above surface_max but fully below sea level:
         // surface_max + margin = 42. If we had sea_level = 50 (above the box),
         // and the box is above the surface, it should be WATER.
         let mut f2 = test_field();
         f2.sea_level = Some(50.0);
-        assert_eq!(f2.classify_box([0, 42, 0], 2), Some(WATER));
+        assert_eq!(f2.classify([0, 42, 0], 2), Some(WATER));
     }
 
     // -----------------------------------------------------------------
@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn precomputed_classify_box_is_conservative() {
+    fn precomputed_classify_is_conservative() {
         let field = test_field();
         let precomputed = PrecomputedHeightmapField::new(field, 6);
 
@@ -574,8 +574,7 @@ mod tests {
         for oz in (0..64).step_by(8) {
             for oy in (0..64).step_by(8) {
                 for ox in (0..64).step_by(8) {
-                    if let Some(state) =
-                        precomputed.classify_box([ox as i64, oy as i64, oz as i64], 3)
+                    if let Some(state) = precomputed.classify([ox as i64, oy as i64, oz as i64], 3)
                     {
                         // Verify every cell in this box matches.
                         for z in oz..oz + 8 {
@@ -584,7 +583,7 @@ mod tests {
                                     let s = precomputed.sample([x as i64, y as i64, z as i64]);
                                     assert_eq!(
                                         s, state,
-                                        "classify_box said {:?} but sample({},{},{}) = {:?}",
+                                        "classify said {:?} but sample({},{},{}) = {:?}",
                                         state, x, y, z, s,
                                     );
                                 }

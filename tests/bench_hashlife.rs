@@ -51,14 +51,30 @@ fn bench_step(label: &str, level: u32, generations: usize) {
 
         if gen < 3 || gen == generations - 1 {
             eprintln!(
-                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, rate={:.1}%",
+                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
                 us as f64 / 1000.0,
                 world.population(),
                 s.cache_hits,
                 s.cache_misses,
                 s.empty_skips,
+                s.fixed_point_skips,
                 hit_rate,
             );
+            // Print per-level miss distribution
+            let level_misses: Vec<(usize, u64)> = s
+                .misses_by_level
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(i, &c)| (i + 3, c))
+                .collect();
+            if !level_misses.is_empty() {
+                let parts: Vec<String> = level_misses
+                    .iter()
+                    .map(|(lvl, cnt)| format!("L{lvl}={cnt}"))
+                    .collect();
+                eprintln!("    misses by level: {}", parts.join(", "));
+            }
         } else if gen == 3 {
             eprintln!("  ...");
         }

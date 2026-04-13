@@ -10,7 +10,7 @@ cargo build --release 2>&1 | tail -1
 
 echo ""
 echo "Controls: mouse-drag to orbit, scroll to zoom, Space to pause/resume,"
-echo "  S=step, R=reset, C=caves, D=dungeons, G=GoL, 1-4=rules, V=toggle render, Esc=quit"
+echo "  S=step, R=reset, G=GoL, 1-4=rules, V=toggle render, Esc=quit"
 echo ""
 
 exec cargo run --release

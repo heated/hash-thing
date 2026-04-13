@@ -48,12 +48,11 @@ fn log_gen_stats(
         0.0
     };
     let gen_region_ms = stats.gen_region_us as f64 / 1_000.0;
-    let cave_ms = stats.cave_us as f64 / 1_000.0;
     log::info!(
         "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
          gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
-         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms) \
-         nodes_after_gen={nag} nodes_after_caves={nac} | \
+         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms) \
+         nodes_after_gen={nag} | \
          noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
         pop = population,
         delta = nodes_delta,
@@ -62,7 +61,6 @@ fn log_gen_stats(
         classifies = stats.classify_calls,
         collapses = stats.total_collapses(),
         nag = stats.nodes_after_gen,
-        nac = stats.nodes_after_caves,
         ns = noise_ns_per_sample,
     );
 }
@@ -77,7 +75,6 @@ struct App {
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
     paused: bool,
-    step_timer: std::time::Instant,
     /// Wall-clock checkpoint for the next perf summary line. Reset each
     /// time the line fires so cadence stays ~LOG_INTERVAL_SECS regardless
     /// of sim/step rate.
@@ -136,20 +133,18 @@ struct App {
 impl App {
     fn new(volume_size: u32) -> Self {
         let mut world = sim::World::new(volume_size.trailing_zeros());
-        let terrain_params = terrain::TerrainParams {
-            caves: Some(terrain::CaveParams::default()),
-            ..terrain::TerrainParams::for_level(volume_size.trailing_zeros())
-        };
+        let level = volume_size.trailing_zeros();
+        let terrain_params = terrain::TerrainParams::for_level(level);
         let stats = world.seed_terrain(&terrain_params);
+        world.seed_water_and_sand();
         let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
         let material_palette_len = world.materials.color_palette_rgba().len();
 
         log::info!(
-            "Initial scene: terrain+caves pop={} nodes={} gen={}µs cave={}µs",
+            "Initial scene: terrain pop={} nodes={} gen={}µs",
             world.population(),
             world.store.stats(),
             stats.gen_region_us,
-            stats.cave_us,
         );
         log::debug!("Material registry palette slots={material_palette_len}");
 
@@ -165,7 +160,6 @@ impl App {
             gol_smoke_scene: false,
             svdag: render::Svdag::new(),
             paused: false,
-            step_timer: std::time::Instant::now(),
             log_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
@@ -201,7 +195,7 @@ impl App {
         );
         app.player_id = Some(player_id);
         log::info!("Player spawned at ({center}, {}, {center})", center + 2.0);
-        log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-7=material, F5=pause, Tab=orbit");
+        log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
 
         app
     }
@@ -227,10 +221,12 @@ impl App {
                 "  1-7         Material",
                 "  Tab         Orbit mode",
                 "",
-                "  C/T/B/R/G   Load scene",
-                "  F5          Pause",
-                "  F1          Toggle help",
-                "  Esc         Quit",
+                "  T  Terrain    B  Burning room",
+                "  R  Reset      G  GoL sphere",
+                "  M  Lattice    0  Recenter",
+                "  H  Heatmap    +/-  Resolution",
+                "  F5 Pause      F1  Toggle help",
+                "  Esc Quit",
             ],
             CameraMode::Orbit => vec![
                 "  ORBIT MODE",
@@ -242,10 +238,12 @@ impl App {
                 "  1-4         CA rule",
                 "  Tab         FPS mode",
                 "",
-                "  C/T/B/R/G   Load scene",
-                "  F5          Pause",
-                "  F1          Toggle help",
-                "  Esc         Quit",
+                "  T  Terrain    B  Burning room",
+                "  R  Reset      G  GoL sphere",
+                "  M  Lattice    0  Recenter",
+                "  H  Heatmap    +/-  Resolution",
+                "  F5 Pause      F1  Toggle help",
+                "  Esc Quit",
             ],
         }
     }
@@ -276,6 +274,10 @@ impl App {
             return;
         };
         if let Some((hit, _prev)) = player::raycast_cells(&self.world, eye, dir) {
+            // Remove from clone_sources if this was a clone block.
+            self.world
+                .clone_sources
+                .retain(|pos| pos != &[hit[0], hit[1], hit[2]]);
             self.world.set(
                 sim::WorldCoord(hit[0]),
                 sim::WorldCoord(hit[1]),
@@ -285,7 +287,7 @@ impl App {
             // Re-upload volume since we modified the world directly.
             Self::upload_volume(
                 &mut self.renderer,
-                &self.world,
+                &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
@@ -327,7 +329,7 @@ impl App {
             );
             Self::upload_volume(
                 &mut self.renderer,
-                &self.world,
+                &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
@@ -344,11 +346,18 @@ impl App {
     /// not — this is precisely the `hash-thing-yri` fix.
     fn upload_volume(
         renderer: &mut Option<render::Renderer>,
-        world: &sim::World,
+        world: &mut sim::World,
         svdag: &mut render::Svdag,
         last_svdag_stats: &mut (usize, usize, u32),
     ) {
         if let Some(renderer) = renderer {
+            // Apply the NodeId remap from the last compaction so the SVDAG's
+            // persistent cache stays valid. This turns update() from O(reachable)
+            // to O(changed) — unchanged subtrees hit the cache in O(1)
+            // (hash-thing-5bb.11).
+            if let Some(remap) = world.last_compaction_remap.take() {
+                svdag.apply_remap(&remap);
+            }
             // Incremental rebuild: reuses cached offsets for unchanged subtrees.
             svdag.update(&world.store, world.root, world.level);
             // Compact when >50% of the buffer is stale slots (hash-thing-bx7).
@@ -384,6 +393,16 @@ impl App {
             5 => "Water",
             6 => "Sand",
             7 => "Lava",
+            8 => "Ice",
+            9 => "Acid",
+            10 => "Oil",
+            11 => "Gunpowder",
+            12 => "Steam",
+            13 => "Gas",
+            14 => "Metal",
+            15 => "Vine",
+            16 => "Fan",
+            17 => "Firework",
             _ => return,
         };
         if let Some(pid) = self.player_id {
@@ -393,6 +412,58 @@ impl App {
                     log::info!("Held: {name} ({material_id})");
                 }
             }
+        }
+    }
+
+    /// Place a clone block that continuously spawns the currently held material.
+    /// The source material ID is encoded in the clone cell's metadata.
+    fn place_clone_block(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let held_material = self
+            .player_id
+            .and_then(|id| self.entities.iter().find(|e| e.id == id))
+            .and_then(|e| {
+                if let sim::EntityKind::Player(ref ps) = e.kind {
+                    Some(ps.held_material)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1);
+
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((hit, prev)) = player::raycast_cells(&self.world, eye, dir) {
+            if prev == hit {
+                return;
+            }
+            // Encode the source material in clone block metadata.
+            let state = hash_thing::octree::Cell::pack(
+                hash_thing::terrain::materials::CLONE_MATERIAL_ID,
+                held_material,
+            )
+            .raw();
+            let pos = [prev[0], prev[1], prev[2]];
+            self.world.set(
+                sim::WorldCoord(pos[0]),
+                sim::WorldCoord(pos[1]),
+                sim::WorldCoord(pos[2]),
+                state,
+            );
+            self.world.clone_sources.push(pos);
+            log::info!(
+                "Placed clone block (spawns material {held_material}) at {:?}",
+                pos
+            );
+            Self::upload_volume(
+                &mut self.renderer,
+                &mut self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
         }
     }
 
@@ -412,12 +483,42 @@ impl App {
         }
         Self::upload_volume(
             &mut self.renderer,
-            &self.world,
+            &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
         log::info!("{label}: pop={}", self.world.population());
+    }
+
+    fn load_lattice_demo(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.seed_lattice_megastructure();
+        let elapsed = start.elapsed();
+        self.gol_smoke_scene = false;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = false; // Let materials interact immediately.
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!(
+            "Lattice megastructure: pop={} gen={:.1}ms",
+            self.world.population(),
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 
     fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
@@ -435,7 +536,7 @@ impl App {
         self.mem_stats.reset_peaks();
         Self::upload_volume(
             &mut self.renderer,
-            &self.world,
+            &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
         );
@@ -460,7 +561,7 @@ impl ApplicationHandler for App {
         if self.window.is_none() {
             let attrs = WindowAttributes::default()
                 .with_title("hash-thing | 3D Hashlife Engine")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+                .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080));
             let window = Arc::new(
                 event_loop
                     .create_window(attrs)
@@ -476,7 +577,7 @@ impl ApplicationHandler for App {
             // loop yet and there's no perf summary to feed.
             Self::upload_volume(
                 &mut self.renderer,
-                &self.world,
+                &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
@@ -544,6 +645,16 @@ impl ApplicationHandler for App {
                             self.paused = !self.paused;
                             log::info!("Paused: {}", self.paused);
                         }
+                        winit::keyboard::Key::Character("0") => {
+                            // Recenter player at world center.
+                            if let Some(pid) = self.player_id {
+                                let center = self.world.side() as f64 / 2.0;
+                                if let Some(p) = self.entities.get_mut(pid) {
+                                    p.pos = [center, center + 2.0, center];
+                                    log::info!("Player recentered");
+                                }
+                            }
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F1) => {
                             self.legend_visible = !self.legend_visible;
                             self.legend_dirty = true;
@@ -556,7 +667,9 @@ impl ApplicationHandler for App {
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
-                        winit::keyboard::Key::Character("s") if !self.is_stepping() => {
+                        winit::keyboard::Key::Character("s")
+                            if self.camera_mode == CameraMode::Orbit && !self.is_stepping() =>
+                        {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
@@ -569,7 +682,7 @@ impl ApplicationHandler for App {
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
-                                &self.world,
+                                &mut self.world,
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
@@ -577,21 +690,6 @@ impl ApplicationHandler for App {
                                 "Gen {}: pop={}",
                                 self.world.generation,
                                 self.world.population()
-                            );
-                        }
-                        winit::keyboard::Key::Character("c") => {
-                            // Re-seed terrain with caves enabled. Stays paused.
-                            // hash-thing-3fq.2: drives the cave-CA post-pass
-                            // end-to-end so the effect is visible without
-                            // editing source.
-                            self.load_terrain_scene(
-                                "Caves terrain",
-                                terrain::TerrainParams {
-                                    caves: Some(terrain::CaveParams::default()),
-                                    ..terrain::TerrainParams::for_level(
-                                        self.volume_size.trailing_zeros(),
-                                    )
-                                },
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
@@ -622,15 +720,18 @@ impl ApplicationHandler for App {
                             }
                             Self::upload_volume(
                                 &mut self.renderer,
-                                &self.world,
+                                &mut self.world,
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
                             );
                             self.sync_render_cache();
                             log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
+                        winit::keyboard::Key::Character("m") => {
+                            self.load_lattice_demo();
+                        }
                         winit::keyboard::Key::Character(
-                            n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7"),
+                            n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
                         ) => {
                             let digit: u16 = n.parse().unwrap();
                             if self.camera_mode == CameraMode::FirstPerson {
@@ -655,6 +756,52 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("b") => {
                             // Burning room demo: fire + water + grass walls.
                             self.load_burning_room_demo("Reset burning room demo");
+                        }
+                        winit::keyboard::Key::Character("h") => {
+                            // Toggle step-count heatmap debug mode.
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.debug_mode = if renderer.debug_mode == 1 { 0 } else { 1 };
+                                log::info!(
+                                    "Debug mode: {}",
+                                    if renderer.debug_mode == 1 {
+                                        "step heatmap"
+                                    } else {
+                                        "normal"
+                                    }
+                                );
+                            }
+                        }
+                        winit::keyboard::Key::Character("l") => {
+                            // Cycle LOD bias: 1 → 2 → 4 → 8 → 1.
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.lod_bias = if renderer.lod_bias >= 8.0 {
+                                    1.0
+                                } else {
+                                    renderer.lod_bias * 2.0
+                                };
+                                log::info!("LOD bias: {}x", renderer.lod_bias);
+                            }
+                        }
+                        winit::keyboard::Key::Character("=")
+                        | winit::keyboard::Key::Character("+") => {
+                            // Increase render scale (sharper, slower).
+                            if let Some(renderer) = &mut self.renderer {
+                                let w = self.window.as_ref().unwrap();
+                                let size = w.inner_size();
+                                renderer.render_scale = (renderer.render_scale + 0.25).min(1.0);
+                                renderer.resize(size.width, size.height);
+                                log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
+                            }
+                        }
+                        winit::keyboard::Key::Character("-") => {
+                            // Decrease render scale (blurrier, faster).
+                            if let Some(renderer) = &mut self.renderer {
+                                let w = self.window.as_ref().unwrap();
+                                let size = w.inner_size();
+                                renderer.render_scale = (renderer.render_scale - 0.25).max(0.25);
+                                renderer.resize(size.width, size.height);
+                                log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
+                            }
                         }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
@@ -696,7 +843,13 @@ impl ApplicationHandler for App {
                     && state == ElementState::Pressed
                     && self.camera_mode == CameraMode::FirstPerson
                 {
-                    self.place_block();
+                    if self.keys_held.contains(&KeyCode::ControlLeft)
+                        || self.keys_held.contains(&KeyCode::ControlRight)
+                    {
+                        self.place_clone_block();
+                    } else {
+                        self.place_block();
+                    }
                 }
             }
 
@@ -741,13 +894,13 @@ impl ApplicationHandler for App {
                             (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
                     }
                 } else if scroll.abs() > 0.01 {
-                    // FPS mode: scroll cycles held material (1-7).
+                    // FPS mode: scroll cycles held material (1-17).
                     let next = self.player_id.and_then(|pid| {
                         let entity = self.entities.get_mut(pid)?;
                         if let sim::EntityKind::Player(ref ps) = entity.kind {
                             let dir = if scroll > 0.0 { 1i16 } else { -1 };
                             let cur = ps.held_material as i16;
-                            Some(((cur - 1 + dir).rem_euclid(7) + 1) as u16)
+                            Some(((cur - 1 + dir).rem_euclid(17) + 1) as u16)
                         } else {
                             None
                         }
@@ -771,6 +924,18 @@ impl ApplicationHandler for App {
                 let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
                 self.last_frame = std::time::Instant::now();
 
+                // Update window title with FPS + resolution.
+                if let Some(window) = &self.window {
+                    let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+                    if let Some(renderer) = &self.renderer {
+                        let scale_pct = (renderer.render_scale * 100.0) as u32;
+                        window.set_title(&format!(
+                            "hash-thing | {:.0} FPS | {}³ | scale {}%",
+                            fps, self.volume_size, scale_pct,
+                        ));
+                    }
+                }
+
                 // --- Background step: collect completed result (x5w) ---
                 if let Some(ref handle) = self.step_handle {
                     if handle.is_finished() {
@@ -790,7 +955,7 @@ impl ApplicationHandler for App {
                                     let _t = self.perf.start("upload_cpu");
                                     Self::upload_volume(
                                         &mut self.renderer,
-                                        &self.world,
+                                        &mut self.world,
                                         &mut self.svdag,
                                         &mut self.last_svdag_stats,
                                     );
@@ -827,15 +992,16 @@ impl ApplicationHandler for App {
                                 self.paused = true;
                             }
                         }
-                        self.step_timer = std::time::Instant::now();
                     }
                 }
 
                 // --- Kick off background step if due (x5w) ---
-                if !self.paused
-                    && self.step_timer.elapsed().as_millis() > 200
-                    && !self.is_stepping()
-                {
+                // Step as fast as the background thread can go — no artificial
+                // throttle. The step runs off-thread (x5w) so it doesn't
+                // block rendering. Previous 200ms interval was a conservative
+                // default that limited CA to ~5 steps/sec even though the
+                // stepper can do ~16/sec at 512³ (hash-thing-cbu).
+                if !self.paused && !self.is_stepping() {
                     self.step_start = std::time::Instant::now();
                     // Move world to background thread; replace with tiny
                     // placeholder so self.world remains valid (but inert).
@@ -843,6 +1009,7 @@ impl ApplicationHandler for App {
                     self.step_handle = Some(std::thread::spawn(move || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             world.apply_mutations();
+                            world.spawn_clones();
                             world.step_recursive();
                             world
                         }))
@@ -1000,7 +1167,7 @@ impl ApplicationHandler for App {
                                         );
                                         Self::upload_volume(
                                             &mut self.renderer,
-                                            &self.world,
+                                            &mut self.world,
                                             &mut self.svdag,
                                             &mut self.last_svdag_stats,
                                         );
@@ -1106,7 +1273,6 @@ fn main() {
     log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
-    log::info!("  C: reset terrain with caves (CA post-pass)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
