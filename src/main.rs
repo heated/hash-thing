@@ -25,6 +25,7 @@ const DEFAULT_VOLUME_SIZE: u32 = 2048;
 /// `world.generation` so the log keeps ticking even when the sim is paused
 /// or stepping slowly — see hash-thing-q63.
 const LOG_INTERVAL_SECS: f64 = 2.0;
+const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
 /// One-line gen summary. Centralised so the `App::new` startup path and the
 /// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
@@ -259,6 +260,8 @@ struct App {
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
     render_inv_size: f32,
+    /// Log the slow-debug-build advisory at most once per run.
+    warned_dev_profile_perf: bool,
     /// Legend (keybindings help) overlay toggle (m1f.7.2).
     legend_visible: bool,
     /// True when the legend texture needs re-upload (mode change or toggle).
@@ -271,6 +274,16 @@ struct App {
     camera_feel: player::FirstPersonCameraFeel,
     /// Defer expensive initial scene generation until after the window exists.
     startup_scene_pending: bool,
+}
+
+fn should_warn_about_slow_dev_step(
+    debug_build: bool,
+    volume_size: u32,
+    step_elapsed: std::time::Duration,
+) -> bool {
+    debug_build
+        && volume_size >= 256
+        && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
 impl App {
@@ -308,6 +321,7 @@ impl App {
             step_start: std::time::Instant::now(),
             render_origin,
             render_inv_size,
+            warned_dev_profile_perf: false,
             legend_visible: true,
             legend_dirty: true,
             current_demo_beat: None,
@@ -1394,7 +1408,23 @@ impl ApplicationHandler for App {
                 if let Some(ref handle) = self.step_handle {
                     if handle.is_finished() {
                         let handle = self.step_handle.take().unwrap();
-                        self.perf.record("step", self.step_start.elapsed());
+                        let step_elapsed = self.step_start.elapsed();
+                        self.perf.record("step", step_elapsed);
+                        if !self.warned_dev_profile_perf
+                            && should_warn_about_slow_dev_step(
+                                cfg!(debug_assertions),
+                                self.volume_size,
+                                step_elapsed,
+                            )
+                        {
+                            log::warn!(
+                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile bench -- {}` for interactive playtesting.",
+                                step_elapsed.as_secs_f64() * 1000.0,
+                                self.volume_size,
+                                self.volume_size,
+                            );
+                            self.warned_dev_profile_perf = true;
+                        }
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
@@ -1810,6 +1840,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
@@ -1936,5 +1967,29 @@ mod tests {
                 waypoint.label
             );
         }
+    }
+
+    #[test]
+    fn slow_dev_step_warning_requires_debug_large_world_and_slow_step() {
+        assert!(should_warn_about_slow_dev_step(
+            true,
+            256,
+            Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            false,
+            256,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            true,
+            128,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            true,
+            256,
+            Duration::from_millis(DEV_PROFILE_STEP_WARN_MS - 1)
+        ));
     }
 }
