@@ -8,7 +8,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, WATER,
+    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, FIREWORK, GRASS, LAVA,
+    OIL, SAND, STONE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -1475,11 +1476,27 @@ impl World {
             WATER,
         );
         self.fill_box(
-            Self::spectacle_box(waypoint.center, [-1, 0, 1], [1, 2, 1]),
-            GRASS,
+            Self::spectacle_box(waypoint.center, [-2, 0, 1], [2, 0, 2]),
+            LAVA,
         );
         self.fill_box(
-            Self::spectacle_box(waypoint.center, [0, 1, 0], [1, 2, 0]),
+            Self::spectacle_box(waypoint.center, [-2, 1, 2], [-1, 2, 2]),
+            OIL,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [1, 1, 2], [2, 2, 2]),
+            OIL,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [-1, 1, 0], [-1, 3, 0]),
+            FIREWORK,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [1, 1, 0], [1, 3, 0]),
+            FIREWORK,
+        );
+        self.fill_box(
+            Self::spectacle_box(waypoint.center, [0, 1, 1], [0, 2, 1]),
             FIRE,
         );
     }
@@ -1636,7 +1653,9 @@ mod tests {
     use super::*;
     use crate::player;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
-    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, WATER};
+    use crate::terrain::materials::{
+        MaterialRegistry, FIRE, FIREWORK, LAVA, OIL, SAND, STONE, WATER,
+    };
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -2058,6 +2077,36 @@ mod tests {
             a.flatten(),
             b.flatten(),
             "scene reset should reproduce the same staged set pieces"
+        );
+    }
+
+    #[test]
+    fn demo_cascade_finale_uses_expanded_material_palette() {
+        let mut world = World::new(6);
+        world.seed_demo_spectacle();
+
+        let cascade = world
+            .demo_waypoints()
+            .into_iter()
+            .last()
+            .expect("demo spectacle defines a finale waypoint");
+        let snapshot = local_snapshot(&world, cascade.center, 5);
+
+        assert!(
+            snapshot.contains(&WATER),
+            "cascade finale should keep the water curtain"
+        );
+        assert!(
+            snapshot.contains(&FIREWORK),
+            "cascade finale should stage firework launchers"
+        );
+        assert!(
+            snapshot.contains(&LAVA),
+            "cascade finale should add a lava basin under the reveal"
+        );
+        assert!(
+            snapshot.contains(&OIL),
+            "cascade finale should add oil channels for extra spectacle"
         );
     }
 
