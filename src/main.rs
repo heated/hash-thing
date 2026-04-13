@@ -65,6 +65,24 @@ fn log_gen_stats(
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlayerPose {
+    pos: [f64; 3],
+    yaw: f64,
+    pitch: f64,
+}
+
+fn lattice_panorama_player_pose(side: usize) -> PlayerPose {
+    let side = side as f64;
+    let center = side * 0.5;
+    let offset = side * 0.22;
+    PlayerPose {
+        pos: [center + offset, side * 0.58, center + offset],
+        yaw: std::f64::consts::FRAC_PI_4,
+        pitch: -0.22,
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
@@ -224,6 +242,7 @@ impl App {
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
                 "  M  Gyroid     N  Lattice",
+                "  V  Tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
@@ -242,6 +261,7 @@ impl App {
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
                 "  M  Gyroid     N  Lattice",
+                "  V  Tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
@@ -264,6 +284,29 @@ impl App {
             Some(player::eye_ray(&p.pos, ps.yaw, ps.pitch))
         } else {
             None
+        }
+    }
+
+    fn apply_player_pose(&mut self, pose: PlayerPose) {
+        if let Some(pid) = self.player_id {
+            if let Some(entity) = self.entities.get_mut(pid) {
+                entity.pos = pose.pos;
+                if let sim::EntityKind::Player(ref mut ps) = entity.kind {
+                    ps.yaw = pose.yaw;
+                    ps.pitch = pose.pitch;
+                }
+            }
+        }
+    }
+
+    fn set_lattice_panorama_camera(&mut self) {
+        self.camera_mode = CameraMode::Orbit;
+        self.legend_dirty = true;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.camera_target = [0.5, 0.46, 0.5];
+            renderer.camera_yaw = std::f32::consts::FRAC_PI_4;
+            renderer.camera_pitch = 0.18;
+            renderer.camera_dist = 1.05;
         }
     }
 
@@ -571,6 +614,13 @@ impl App {
         );
     }
 
+    fn load_lattice_panorama_demo(&mut self) {
+        self.load_lattice_demo();
+        self.apply_player_pose(lattice_panorama_player_pose(self.world.side()));
+        self.set_lattice_panorama_camera();
+        log::info!("Panoramic lattice demo: orbit reveal preset loaded");
+    }
+
     fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
         if self.is_stepping() {
             return;
@@ -782,6 +832,9 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("n") => {
                             self.load_lattice_demo();
+                        }
+                        winit::keyboard::Key::Character("v") => {
+                            self.load_lattice_panorama_demo();
                         }
                         winit::keyboard::Key::Character(
                             n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
@@ -1331,6 +1384,8 @@ fn main() {
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  M: reset gyroid megastructure");
+    log::info!("  N: lattice megastructure demo");
+    log::info!("  V: panoramic lattice reveal preset");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
@@ -1360,4 +1415,27 @@ fn main() {
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lattice_panorama_pose_stays_inside_world() {
+        let pose = lattice_panorama_player_pose(2048);
+        for axis in [0, 1, 2] {
+            assert!(pose.pos[axis] > 0.0);
+            assert!(pose.pos[axis] < 2048.0);
+        }
+    }
+
+    #[test]
+    fn lattice_panorama_pose_faces_inward_and_downward() {
+        let pose = lattice_panorama_player_pose(512);
+        let (_eye, dir) = player::eye_ray(&pose.pos, pose.yaw, pose.pitch);
+        assert!(dir[0] < 0.0);
+        assert!(dir[1] < 0.0);
+        assert!(dir[2] < 0.0);
+    }
 }
