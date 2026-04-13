@@ -10,8 +10,9 @@ use crate::octree::{Cell, CellState};
 use crate::sim::margolus::FluidBlockRule;
 use crate::sim::margolus::GravityBlockRule;
 use crate::sim::rule::{
-    AcidRule, AirVineGrowthRule, BlockRule, CaRule, DissolvableRule, FireRule, FireworkRule,
-    FlammableRule, GameOfLife3D, IceRule, LavaRule, NoopRule, SteamRule, VineRule, WaterRule,
+    AcidRule, AirRule, AirVineGrowthRule, BlockRule, CaRule, DissolvableRule, FanDrivenRule,
+    FanRule, FireRule, FireworkRule, FlammableRule, GameOfLife3D, IceRule, LavaRule, NoopRule,
+    SteamRule, VineRule, WaterRule,
 };
 
 pub type MaterialId = u16;
@@ -153,57 +154,44 @@ impl MaterialRegistry {
 
     pub fn terrain_defaults() -> Self {
         let mut registry = Self::new();
+        let air_rule = registry.register_rule(AirRule {
+            fan_material: FAN_MATERIAL_ID,
+            vine_growth: Some(AirVineGrowthRule {
+                vine_material: VINE_MATERIAL_ID,
+                support_materials: vec![
+                    STONE_MATERIAL_ID,
+                    DIRT_MATERIAL_ID,
+                    GRASS_MATERIAL_ID,
+                    SAND_MATERIAL_ID,
+                    METAL_MATERIAL_ID,
+                    ICE_MATERIAL_ID,
+                    FAN_MATERIAL_ID,
+                    CLONE_MATERIAL_ID,
+                ],
+                spread_age: 2,
+            }),
+        });
         let static_rule = registry.register_rule(NoopRule);
+        let fan_rule = registry.register_rule(FanRule);
+        let fan_static_rule = registry.register_rule(FanDrivenRule::new(NoopRule, FAN_MATERIAL_ID));
         let vine_rule = registry.register_rule(VineRule {
             fire_material: FIRE_MATERIAL_ID,
             acid_material: ACID_MATERIAL_ID,
             max_age: 3,
         });
-        let air_vine_rule = registry.register_rule(AirVineGrowthRule {
-            vine_material: VINE_MATERIAL_ID,
-            support_materials: vec![
-                STONE_MATERIAL_ID,
-                DIRT_MATERIAL_ID,
-                GRASS_MATERIAL_ID,
-                SAND_MATERIAL_ID,
-                METAL_MATERIAL_ID,
-                ICE_MATERIAL_ID,
-                FAN_MATERIAL_ID,
-                CLONE_MATERIAL_ID,
-            ],
-            spread_age: 2,
-        });
-
-        // Materials that acid dissolves.
-        let acid_dissolvable = vec![
-            STONE_MATERIAL_ID,
-            DIRT_MATERIAL_ID,
-            GRASS_MATERIAL_ID,
-            ICE_MATERIAL_ID,
-            METAL_MATERIAL_ID,
-            VINE_MATERIAL_ID,
-            OIL_MATERIAL_ID,
-        ];
 
         // Stone/dirt/grass dissolve when adjacent to acid.
         let dissolvable_rule = registry.register_rule(DissolvableRule {
             acid_material: ACID_MATERIAL_ID,
         });
 
-        let fire_rule = registry.register_rule(FireRule {
-            fuel_materials: vec![
-                GRASS_MATERIAL_ID,
-                OIL_MATERIAL_ID,
-                GAS_MATERIAL_ID,
-                GUNPOWDER_MATERIAL_ID,
-                VINE_MATERIAL_ID,
-            ],
-            quencher_material: WATER_MATERIAL_ID,
-        });
-        let water_rule = registry.register_rule(WaterRule {
-            reactive_material: FIRE_MATERIAL_ID,
-            reaction_product: Cell::pack(STONE_MATERIAL_ID, 0),
-        });
+        let fan_water_rule = registry.register_rule(FanDrivenRule::new(
+            WaterRule {
+                reactive_material: FIRE_MATERIAL_ID,
+                reaction_product: Cell::pack(STONE_MATERIAL_ID, 0),
+            },
+            FAN_MATERIAL_ID,
+        ));
         let lava_rule = registry.register_rule(LavaRule {
             water_material: WATER_MATERIAL_ID,
             solidify_product: Cell::pack(STONE_MATERIAL_ID, 0),
@@ -212,13 +200,27 @@ impl MaterialRegistry {
             heat_materials: vec![FIRE_MATERIAL_ID, LAVA_MATERIAL_ID],
             melt_product: Cell::pack(WATER_MATERIAL_ID, 0),
         });
-        let acid_rule = registry.register_rule(AcidRule {
-            dissolvable_materials: acid_dissolvable,
-        });
-        let flammable_rule = registry.register_rule(FlammableRule {
-            fire_material: FIRE_MATERIAL_ID,
-            fire_product: Cell::pack(FIRE_MATERIAL_ID, 0),
-        });
+        let fan_acid_rule = registry.register_rule(FanDrivenRule::new(
+            AcidRule {
+                dissolvable_materials: vec![
+                    STONE_MATERIAL_ID,
+                    DIRT_MATERIAL_ID,
+                    GRASS_MATERIAL_ID,
+                    ICE_MATERIAL_ID,
+                    METAL_MATERIAL_ID,
+                    VINE_MATERIAL_ID,
+                    OIL_MATERIAL_ID,
+                ],
+            },
+            FAN_MATERIAL_ID,
+        ));
+        let fan_flammable_rule = registry.register_rule(FanDrivenRule::new(
+            FlammableRule {
+                fire_material: FIRE_MATERIAL_ID,
+                fire_product: Cell::pack(FIRE_MATERIAL_ID, 0),
+            },
+            FAN_MATERIAL_ID,
+        ));
         let steam_rule = registry.register_rule(SteamRule {
             condense_product: Cell::pack(WATER_MATERIAL_ID, 0),
             max_age: 20,
@@ -227,6 +229,19 @@ impl MaterialRegistry {
             explode_product: Cell::pack(FIRE_MATERIAL_ID, 0),
             fuse_length: 12,
         });
+        let fan_fire_rule = registry.register_rule(FanDrivenRule::new(
+            FireRule {
+                fuel_materials: vec![
+                    GRASS_MATERIAL_ID,
+                    OIL_MATERIAL_ID,
+                    GAS_MATERIAL_ID,
+                    GUNPOWDER_MATERIAL_ID,
+                    VINE_MATERIAL_ID,
+                ],
+                quencher_material: WATER_MATERIAL_ID,
+            },
+            FAN_MATERIAL_ID,
+        ));
 
         // Block rules.
         let gravity_block_rule =
@@ -253,7 +268,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.0,
                 },
-                rule_id: air_vine_rule,
+                rule_id: air_rule,
                 block_rule_id: None,
             },
         );
@@ -321,7 +336,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.0,
                 },
-                rule_id: fire_rule,
+                rule_id: fan_fire_rule,
                 block_rule_id: None,
             },
         );
@@ -338,7 +353,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.6,
                 },
-                rule_id: water_rule,
+                rule_id: fan_water_rule,
                 block_rule_id: Some(water_fluid_block_rule),
             },
         );
@@ -355,7 +370,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.1,
                 },
-                rule_id: static_rule,
+                rule_id: fan_static_rule,
                 block_rule_id: Some(gravity_block_rule),
             },
         );
@@ -409,7 +424,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.4,
                 },
-                rule_id: acid_rule,
+                rule_id: fan_acid_rule,
                 block_rule_id: Some(acid_fluid_block_rule),
             },
         );
@@ -426,7 +441,7 @@ impl MaterialRegistry {
                     flammability: 0.9,
                     conductivity: 0.01,
                 },
-                rule_id: flammable_rule,
+                rule_id: fan_flammable_rule,
                 block_rule_id: Some(oil_fluid_block_rule),
             },
         );
@@ -443,7 +458,7 @@ impl MaterialRegistry {
                     flammability: 1.0,
                     conductivity: 0.05,
                 },
-                rule_id: flammable_rule,
+                rule_id: fan_flammable_rule,
                 block_rule_id: Some(gravity_block_rule),
             },
         );
@@ -477,7 +492,7 @@ impl MaterialRegistry {
                     flammability: 0.95,
                     conductivity: 0.02,
                 },
-                rule_id: flammable_rule,
+                rule_id: fan_flammable_rule,
                 block_rule_id: Some(gravity_block_rule),
             },
         );
@@ -528,7 +543,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.1,
                 },
-                rule_id: static_rule,
+                rule_id: fan_rule,
                 block_rule_id: None,
             },
         );

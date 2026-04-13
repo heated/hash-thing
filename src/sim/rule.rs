@@ -66,6 +66,216 @@ pub const fn block_index(dx: usize, dy: usize, dz: usize) -> usize {
     dx + dy * 2 + dz * 4
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FanDirection {
+    PosX,
+    NegX,
+    PosZ,
+    NegZ,
+}
+
+impl FanDirection {
+    const ALL: [Self; 4] = [Self::PosX, Self::NegX, Self::PosZ, Self::NegZ];
+    const ARMED_METADATA_BASE: u16 = 60;
+
+    fn delta(self) -> (i32, i32, i32) {
+        match self {
+            Self::PosX => (1, 0, 0),
+            Self::NegX => (-1, 0, 0),
+            Self::PosZ => (0, 0, 1),
+            Self::NegZ => (0, 0, -1),
+        }
+    }
+
+    fn from_fan_metadata(metadata: u16) -> Option<Self> {
+        match metadata {
+            1 => Some(Self::PosX),
+            2 => Some(Self::NegX),
+            3 => Some(Self::PosZ),
+            4 => Some(Self::NegZ),
+            _ => None,
+        }
+    }
+
+    fn armed_metadata(self) -> u16 {
+        Self::ARMED_METADATA_BASE
+            + match self {
+                Self::PosX => 0,
+                Self::NegX => 1,
+                Self::PosZ => 2,
+                Self::NegZ => 3,
+            }
+    }
+
+    fn from_armed_metadata(metadata: u16) -> Option<Self> {
+        match metadata {
+            60 => Some(Self::PosX),
+            61 => Some(Self::NegX),
+            62 => Some(Self::PosZ),
+            63 => Some(Self::NegZ),
+            _ => None,
+        }
+    }
+}
+
+fn neighbor_at(neighbors: &[Cell; 26], dx: i32, dy: i32, dz: i32) -> Cell {
+    debug_assert!((-1..=1).contains(&dx));
+    debug_assert!((-1..=1).contains(&dy));
+    debug_assert!((-1..=1).contains(&dz));
+    debug_assert!(dx != 0 || dy != 0 || dz != 0);
+
+    let mut idx = 0;
+    for ndz in [-1, 0, 1] {
+        for ndy in [-1, 0, 1] {
+            for ndx in [-1, 0, 1] {
+                if ndx == 0 && ndy == 0 && ndz == 0 {
+                    continue;
+                }
+                if ndx == dx && ndy == dy && ndz == dz {
+                    return neighbors[idx];
+                }
+                idx += 1;
+            }
+        }
+    }
+    unreachable!("neighbor offset must resolve to one of the 26 Moore neighbors");
+}
+
+fn clear_push_metadata(cell: Cell) -> Cell {
+    if cell.is_empty() || FanDirection::from_armed_metadata(cell.metadata()).is_none() {
+        cell
+    } else {
+        Cell::pack(cell.material(), 0)
+    }
+}
+
+fn fan_pushes_direction(fan: Cell, fan_material: u16, dir: FanDirection) -> bool {
+    fan.material() == fan_material
+        && (fan.metadata() == 0 || FanDirection::from_fan_metadata(fan.metadata()) == Some(dir))
+}
+
+fn arming_direction(neighbors: &[Cell; 26], fan_material: u16) -> Option<FanDirection> {
+    FanDirection::ALL.into_iter().find(|&dir| {
+        let (dx, dy, dz) = dir.delta();
+        let behind = neighbor_at(neighbors, -dx, -dy, -dz);
+        let ahead = neighbor_at(neighbors, dx, dy, dz);
+        fan_pushes_direction(behind, fan_material, dir) && ahead.is_empty()
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct AirRule {
+    pub fan_material: u16,
+    pub vine_growth: Option<AirVineGrowthRule>,
+}
+
+impl CaRule for AirRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(center.is_empty(), "AirRule should only dispatch for AIR");
+        for dir in FanDirection::ALL {
+            let (dx, dy, dz) = dir.delta();
+            let source = neighbor_at(neighbors, -dx, -dy, -dz);
+            if source.material() == self.fan_material {
+                continue;
+            }
+            if FanDirection::from_armed_metadata(source.metadata()) == Some(dir) {
+                return Cell::pack(source.material(), 0);
+            }
+        }
+        self.vine_growth
+            .as_ref()
+            .map(|rule| rule.step_cell(center, neighbors))
+            .unwrap_or(Cell::EMPTY)
+    }
+
+    fn is_self_inert(&self) -> bool {
+        true
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
+    }
+}
+
+/// Fan cells are static, but their metadata stores optional facing:
+/// 0 = omni, 1 = +X, 2 = -X, 3 = +Z, 4 = -Z.
+#[derive(Clone, Copy, Debug)]
+pub struct FanRule;
+
+impl CaRule for FanRule {
+    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+        center
+    }
+
+    fn is_noop(&self) -> bool {
+        true
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(*self)
+    }
+}
+
+/// Wrap an existing rule with one-tick fan transport using the high metadata band.
+pub struct FanDrivenRule {
+    base: Box<dyn CaRule + Send>,
+    fan_material: u16,
+}
+
+impl fmt::Debug for FanDrivenRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FanDrivenRule")
+            .field("fan_material", &self.fan_material)
+            .finish()
+    }
+}
+
+impl FanDrivenRule {
+    pub fn new<R>(base: R, fan_material: u16) -> Self
+    where
+        R: CaRule + Send + 'static,
+    {
+        Self {
+            base: Box::new(base),
+            fan_material,
+        }
+    }
+}
+
+impl CaRule for FanDrivenRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        let base_next = self.base.step_cell(clear_push_metadata(center), neighbors);
+        if base_next.is_empty() || base_next.material() != center.material() {
+            return base_next;
+        }
+
+        if let Some(dir) = FanDirection::from_armed_metadata(center.metadata()) {
+            let (dx, dy, dz) = dir.delta();
+            if neighbor_at(neighbors, dx, dy, dz).is_empty() {
+                return Cell::EMPTY;
+            }
+            return Cell::pack(base_next.material(), 0);
+        }
+
+        if let Some(dir) = arming_direction(neighbors, self.fan_material) {
+            return Cell::pack(base_next.material(), dir.armed_metadata());
+        }
+
+        Cell::pack(base_next.material(), 0)
+    }
+
+    fn is_self_inert(&self) -> bool {
+        self.base.is_self_inert()
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(Self {
+            base: self.base.clone_box(),
+            fan_material: self.fan_material,
+        })
+    }
+}
+
 /// Identity rule for static materials. Returns the center cell unchanged.
 #[derive(Debug)]
 pub struct NoopRule;
@@ -737,6 +947,84 @@ mod tests {
         let mut neighbors = [Cell::EMPTY; 26];
         neighbors[0] = mat(5);
         assert_eq!(rule.step_cell(mat(7), &neighbors), product);
+    }
+
+    fn set_neighbor(neighbors: &mut [Cell; 26], dx: i32, dy: i32, dz: i32, cell: Cell) {
+        let mut idx = 0;
+        for ndz in [-1, 0, 1] {
+            for ndy in [-1, 0, 1] {
+                for ndx in [-1, 0, 1] {
+                    if ndx == 0 && ndy == 0 && ndz == 0 {
+                        continue;
+                    }
+                    if ndx == dx && ndy == dy && ndz == dz {
+                        neighbors[idx] = cell;
+                        return;
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        panic!("invalid neighbor offset ({dx}, {dy}, {dz})");
+    }
+
+    #[test]
+    fn air_rule_accepts_armed_incoming_material() {
+        let rule = AirRule {
+            fan_material: 16,
+            vine_growth: None,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        set_neighbor(
+            &mut neighbors,
+            -1,
+            0,
+            0,
+            Cell::pack(6, FanDirection::PosX.armed_metadata()),
+        );
+
+        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::pack(6, 0));
+    }
+
+    #[test]
+    fn fan_driven_rule_arms_material_when_fan_has_space_to_blow_into() {
+        let rule = FanDrivenRule::new(NoopRule, 16);
+        let mut neighbors = [Cell::EMPTY; 26];
+        set_neighbor(&mut neighbors, -1, 0, 0, Cell::pack(16, 0));
+
+        assert_eq!(
+            rule.step_cell(Cell::pack(6, 0), &neighbors),
+            Cell::pack(6, FanDirection::PosX.armed_metadata())
+        );
+    }
+
+    #[test]
+    fn fan_driven_rule_vacates_after_being_armed() {
+        let rule = FanDrivenRule::new(NoopRule, 16);
+        let neighbors = [Cell::EMPTY; 26];
+
+        assert_eq!(
+            rule.step_cell(
+                Cell::pack(6, FanDirection::PosX.armed_metadata()),
+                &neighbors
+            ),
+            Cell::EMPTY
+        );
+    }
+
+    #[test]
+    fn fan_driven_rule_respects_fan_facing_metadata() {
+        let rule = FanDrivenRule::new(NoopRule, 16);
+        let mut neighbors = [Cell::EMPTY; 26];
+        set_neighbor(
+            &mut neighbors,
+            1,
+            0,
+            0,
+            Cell::pack(16, 1),
+        );
+
+        assert_eq!(rule.step_cell(Cell::pack(6, 0), &neighbors), Cell::pack(6, 0));
     }
 
     #[test]
