@@ -29,5 +29,7 @@ pub trait RegionField {
 pub mod const_field;
 pub mod half_space;
 pub mod heightmap;
+pub mod lattice;
 
 pub use heightmap::HeightmapField;
+pub use lattice::LatticeField;
