@@ -10,25 +10,36 @@ pub(crate) const ALIVE: Cell = Cell::pack(1, 0);
 /// neighbors and return the next cell state for that center.
 pub trait CaRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
-}
 
-/// Context passed to block rules for deterministic RNG and position awareness.
-///
-/// All fields are pure functions of position + generation + seed, so block rules
-/// remain Hashlife-compatible (no global mutable state).
-#[derive(Clone, Copy, Debug)]
-pub struct BlockContext {
-    /// World-space origin of the block's (0,0,0) corner.
-    pub block_origin: [i64; 3],
-    /// Current simulation generation.
-    pub generation: u64,
-    /// Per-world seed for deterministic randomness.
-    pub world_seed: u64,
-    /// Pre-computed RNG hash from `rng::cell_hash(origin, generation, seed)`.
-    pub rng_hash: u64,
+    /// True if this rule always returns the center cell unchanged (identity).
+    /// Used in the base-case inner loop to skip neighbor collection.
+    fn is_noop(&self) -> bool {
+        false
+    }
+
+    /// True if this rule is identity when all neighbors are the same material
+    /// (self-inert). Used by hashlife subtree-level short-circuit: a subtree
+    /// of uniform material with `is_self_inert() == true` can skip stepping
+    /// because internal cells never have cross-material neighbors. Boundary
+    /// interactions are handled by the 27-intermediate overlap in the parent.
+    ///
+    /// Default: delegates to `is_noop()`. Override for conditionally-noop rules
+    /// like DissolvableRule (identity unless acid is adjacent).
+    fn is_self_inert(&self) -> bool {
+        self.is_noop()
+    }
+
+    /// Clone into a boxed trait object. Enables Clone for MaterialRegistry
+    /// (and transitively World) for snapshots, undo, and testing.
+    fn clone_box(&self) -> Box<dyn CaRule + Send>;
 }
 
 /// A block-based CA rule operating on 2x2x2 cell blocks.
+///
+/// Block rules are pure functions of block contents — no position, generation,
+/// or RNG context. This enables spatial memoization: identical blocks at
+/// different positions produce identical results, so hashlife can cache and
+/// reuse block-rule outputs across the entire tree.
 ///
 /// Block rules implement mass-conserving permutations: the output must be a
 /// rearrangement of the input cells (multiset equality). This invariant enables
@@ -39,7 +50,10 @@ pub struct BlockContext {
 ///   `block_index(dx, dy, dz) = dx + dy*2 + dz*4`
 /// matching `octant_index` in `src/octree/node.rs`.
 pub trait BlockRule {
-    fn step_block(&self, block: &[Cell; 8], ctx: &BlockContext) -> [Cell; 8];
+    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8];
+
+    /// Clone into a boxed trait object.
+    fn clone_box(&self) -> Box<dyn BlockRule + Send>;
 }
 
 /// Map local (dx, dy, dz) offsets (each 0 or 1) to an index in `[Cell; 8]`.
@@ -59,12 +73,20 @@ impl CaRule for NoopRule {
     fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
         center
     }
+
+    fn is_noop(&self) -> bool {
+        true
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(NoopRule)
+    }
 }
 
 /// Fire persists while fuel is adjacent, and is quenched by water.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FireRule {
-    pub fuel_material: u16,
+    pub fuel_materials: Vec<u16>,
     pub quencher_material: u16,
 }
 
@@ -78,12 +100,16 @@ impl CaRule for FireRule {
             Cell::EMPTY
         } else if neighbors
             .iter()
-            .any(|neighbor| neighbor.material() == self.fuel_material)
+            .any(|neighbor| self.fuel_materials.contains(&neighbor.material()))
         {
             center
         } else {
             Cell::EMPTY
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
     }
 }
 
@@ -105,6 +131,211 @@ impl CaRule for WaterRule {
         } else {
             center
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(WaterRule {
+            reactive_material: self.reactive_material,
+            reaction_product: self.reaction_product,
+        })
+    }
+}
+
+/// Lava converts adjacent water to stone and adjacent grass to fire.
+///
+/// If any neighbor is water, this cell becomes stone (lava solidifies).
+/// Otherwise the lava persists, and any adjacent grass/flammable material
+/// is expected to catch fire via the terrain's FireRule on the next tick.
+/// The CaRule only transforms the center cell — neighbor ignition is a
+/// side-effect of the fire rule's fuel check seeing lava-heated grass.
+#[derive(Debug)]
+pub struct LavaRule {
+    pub water_material: u16,
+    pub solidify_product: Cell,
+}
+
+impl CaRule for LavaRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "LavaRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|neighbor| neighbor.material() == self.water_material)
+        {
+            self.solidify_product
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(LavaRule {
+            water_material: self.water_material,
+            solidify_product: self.solidify_product,
+        })
+    }
+}
+
+/// Ice melts into water when fire or lava is adjacent.
+#[derive(Debug, Clone)]
+pub struct IceRule {
+    pub heat_materials: Vec<u16>,
+    pub melt_product: Cell,
+}
+
+impl CaRule for IceRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "IceRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|n| self.heat_materials.contains(&n.material()))
+        {
+            self.melt_product
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
+    }
+}
+
+/// Flammable material catches fire from adjacent fire.
+#[derive(Debug)]
+pub struct FlammableRule {
+    pub fire_material: u16,
+    pub fire_product: Cell,
+}
+
+impl CaRule for FlammableRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(
+            !center.is_empty(),
+            "FlammableRule should not dispatch for AIR"
+        );
+        if neighbors.iter().any(|n| n.material() == self.fire_material) {
+            self.fire_product
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(FlammableRule {
+            fire_material: self.fire_material,
+            fire_product: self.fire_product,
+        })
+    }
+}
+
+/// Acid is consumed when touching a dissolvable material.
+/// Both acid and the target dissolve (target handled by DissolvableRule).
+#[derive(Debug, Clone)]
+pub struct AcidRule {
+    pub dissolvable_materials: Vec<u16>,
+}
+
+impl CaRule for AcidRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "AcidRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|n| self.dissolvable_materials.contains(&n.material()))
+        {
+            Cell::EMPTY
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
+    }
+}
+
+/// Material dissolves when adjacent to acid.
+#[derive(Debug)]
+pub struct DissolvableRule {
+    pub acid_material: u16,
+}
+
+impl CaRule for DissolvableRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(
+            !center.is_empty(),
+            "DissolvableRule should not dispatch for AIR"
+        );
+        if neighbors.iter().any(|n| n.material() == self.acid_material) {
+            Cell::EMPTY
+        } else {
+            center
+        }
+    }
+
+    fn is_self_inert(&self) -> bool {
+        true
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(DissolvableRule {
+            acid_material: self.acid_material,
+        })
+    }
+}
+
+/// Steam ages via metadata and condenses to water after a threshold.
+#[derive(Debug)]
+pub struct SteamRule {
+    pub condense_product: Cell,
+    pub max_age: u16,
+}
+
+impl CaRule for SteamRule {
+    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "SteamRule should not dispatch for AIR");
+        let age = center.metadata();
+        if age >= self.max_age {
+            self.condense_product
+        } else {
+            Cell::pack(center.material(), age + 1)
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(SteamRule {
+            condense_product: self.condense_product,
+            max_age: self.max_age,
+        })
+    }
+}
+
+/// Firework rises (via negative density in block rule) and explodes into fire
+/// after reaching a metadata age threshold.
+#[derive(Debug)]
+pub struct FireworkRule {
+    pub explode_product: Cell,
+    pub fuse_length: u16,
+}
+
+impl CaRule for FireworkRule {
+    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(
+            !center.is_empty(),
+            "FireworkRule should not dispatch for AIR"
+        );
+        let age = center.metadata();
+        if age >= self.fuse_length {
+            self.explode_product
+        } else {
+            Cell::pack(center.material(), age + 1)
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(FireworkRule {
+            explode_product: self.explode_product,
+            fuse_length: self.fuse_length,
+        })
     }
 }
 
@@ -175,6 +406,10 @@ impl CaRule for GameOfLife3D {
         } else {
             Cell::EMPTY
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(*self)
     }
 }
 
@@ -311,7 +546,7 @@ mod tests {
     #[test]
     fn fire_rule_burns_out_without_fuel() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         assert_eq!(
@@ -324,7 +559,7 @@ mod tests {
     #[test]
     fn fire_rule_survives_when_fuel_is_adjacent() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         let mut neighbors = [Cell::EMPTY; 26];
@@ -335,7 +570,7 @@ mod tests {
     #[test]
     fn fire_rule_quencher_beats_fuel_and_extinguishes() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         let mut neighbors = [Cell::EMPTY; 26];
@@ -348,7 +583,7 @@ mod tests {
     #[test]
     fn fire_rule_preserves_center_payload_when_fueled() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         let mut neighbors = [Cell::EMPTY; 26];
@@ -393,6 +628,49 @@ mod tests {
             rule.step_cell(Cell::pack(5, 2), &neighbors),
             Cell::pack(8, 13)
         );
+    }
+
+    #[test]
+    fn lava_rule_solidifies_on_water_contact() {
+        let rule = LavaRule {
+            water_material: 5,
+            solidify_product: mat(1),
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[3] = mat(5); // water neighbor
+        assert_eq!(
+            rule.step_cell(mat(7), &neighbors),
+            mat(1),
+            "lava adjacent to water should solidify into stone"
+        );
+    }
+
+    #[test]
+    fn lava_rule_persists_without_water() {
+        let rule = LavaRule {
+            water_material: 5,
+            solidify_product: mat(1),
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(3); // grass, not water
+        let lava = Cell::pack(7, 4);
+        assert_eq!(
+            rule.step_cell(lava, &neighbors),
+            lava,
+            "lava without water neighbors should persist unchanged"
+        );
+    }
+
+    #[test]
+    fn lava_rule_solidifies_to_configured_product() {
+        let product = Cell::pack(2, 5);
+        let rule = LavaRule {
+            water_material: 5,
+            solidify_product: product,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        neighbors[0] = mat(5);
+        assert_eq!(rule.step_cell(mat(7), &neighbors), product);
     }
 
     #[test]

@@ -42,6 +42,7 @@ env:
   # gating lives in [lints.rust] in Cargo.toml, not workflow RUSTFLAGS,
   # so the release cache fingerprint stays clean.
   CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: ""
 
 jobs:
   actionlint:
@@ -90,7 +91,6 @@ jobs:
           MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
           MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
         run: |
-          # shellcheck disable=SC2086
           set -euo pipefail
 
           for var in \
@@ -127,6 +127,8 @@ jobs:
             "$keychain_path"
 
           existing_keychains=$(security list-keychains -d user | tr -d '"')
+          # shellcheck disable=SC2086
+          # Intentional word splitting for multiple keychain paths.
           security list-keychains -d user -s "$keychain_path" $existing_keychains
           security default-keychain -d user -s "$keychain_path"
 

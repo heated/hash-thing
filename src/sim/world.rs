@@ -1,23 +1,84 @@
-use super::rule::{block_index, BlockContext, GameOfLife3D, ALIVE};
-use crate::octree::{Cell, CellState, NodeId, NodeStore};
-use crate::rng::cell_hash;
-use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, DIRT, FIRE, GRASS, STONE, WATER,
-};
-use crate::terrain::{carve_caves, carve_dungeons, gen_region, GenStats, TerrainParams};
+use std::fmt;
 
-/// The simulation world. Owns the octree store and manages stepping.
+use super::mutation::{MutationQueue, WorldMutation};
+use super::rule::{block_index, GameOfLife3D, ALIVE};
+use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
+use crate::terrain::field::gyroid::GyroidField;
+use crate::terrain::field::heightmap::PrecomputedHeightmapField;
+use crate::terrain::field::lattice::LatticeField;
+use crate::terrain::field::TerrainBlendField;
+use crate::terrain::materials::{
+    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, WATER,
+};
+use crate::terrain::{gen_region, GenStats, TerrainParams};
+use rustc_hash::FxHashMap;
+
+/// The axis-aligned cube of world-space that the octree currently covers.
 ///
-/// For now, stepping works by flattening to a grid, applying rules, and
-/// rebuilding the octree. This is O(n³) but correct, and lets us validate
-/// the full pipeline. True Hashlife recursive stepping comes next.
-pub struct World {
-    pub store: NodeStore,
-    pub root: NodeId,
-    pub level: u32, // root level — grid is 2^level per side
-    pub generation: u64,
-    pub simulation_seed: u64,
-    pub materials: MaterialRegistry,
+/// Origin is always (0,0,0) today (unsigned coords), but will shift once
+/// signed world coordinates and recentering land. The type exists now so
+/// call sites can migrate incrementally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealizedRegion {
+    pub origin: [i64; 3],
+    pub level: u32,
+}
+
+impl RealizedRegion {
+    /// Side length of the realized cube.
+    pub fn side(&self) -> u64 {
+        1u64 << self.level
+    }
+
+    /// True if the world-space coordinate `(x, y, z)` is inside the region.
+    pub fn contains(&self, x: i64, y: i64, z: i64) -> bool {
+        let s = self.side() as i64;
+        x >= self.origin[0]
+            && x < self.origin[0] + s
+            && y >= self.origin[1]
+            && y < self.origin[1] + s
+            && z >= self.origin[2]
+            && z < self.origin[2] + s
+    }
+
+    /// Map a world-space point to the octant index (0–7) within the root node.
+    ///
+    /// Panics if the point is outside the region.
+    pub fn octant_of(&self, x: i64, y: i64, z: i64) -> usize {
+        assert!(self.contains(x, y, z), "point outside realized region");
+        let half = self.side() as i64 / 2;
+        let dx = if x - self.origin[0] >= half { 1 } else { 0 };
+        let dy = if y - self.origin[1] >= half { 1 } else { 0 };
+        let dz = if z - self.origin[2] >= half { 1 } else { 0 };
+        dx + dy * 2 + dz * 4
+    }
+}
+
+impl fmt::Display for RealizedRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.side();
+        write!(
+            f,
+            "realized: origin=({},{},{}) level={} ({s}³)",
+            self.origin[0], self.origin[1], self.origin[2], self.level
+        )
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct WorldCoord(pub i64);
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct LocalCoord(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DemoLayout {
+    pub player_pos: [f64; 3],
+    pub player_yaw: f64,
+    pub player_pitch: f64,
+    pub corridor_mid: [i64; 3],
+    pub atrium_center: [i64; 3],
+    pub reveal_center: [i64; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +91,7 @@ pub enum DemoSpectacleProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DemoSpectacleAnchor {
     pub label: &'static str,
-    pub center: [u64; 3],
+    pub center: [i64; 3],
     pub profile: DemoSpectacleProfile,
 }
 
@@ -44,6 +105,96 @@ impl ActiveMaterialStats {
     pub fn active_cells(self) -> u32 {
         self.fire_cells + self.water_cells
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Box3 {
+    min: [i64; 3],
+    max: [i64; 3],
+}
+
+impl Box3 {
+    #[inline]
+    const fn new(min: [i64; 3], max: [i64; 3]) -> Self {
+        Self { min, max }
+    }
+
+    #[inline]
+    fn center(self) -> [i64; 3] {
+        [
+            (self.min[0] + self.max[0]) / 2,
+            (self.min[1] + self.max[1]) / 2,
+            (self.min[2] + self.max[2]) / 2,
+        ]
+    }
+}
+
+/// The simulation world. Owns the octree store and manages stepping.
+///
+/// For now, stepping works by flattening to a grid, applying rules, and
+/// rebuilding the octree. This is O(n³) but correct, and lets us validate
+/// the full pipeline. True Hashlife recursive stepping comes next.
+#[derive(Clone)]
+pub struct World {
+    pub store: NodeStore,
+    pub root: NodeId,
+    pub level: u32, // root level — grid is 2^level per side
+    pub generation: u64,
+    pub simulation_seed: u64,
+    pub materials: MaterialRegistry,
+    /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
+    /// `ensure_region` generates terrain (heightmap)
+    /// for newly-created sibling octants instead of leaving them empty.
+    terrain_params: Option<TerrainParams>,
+    /// Spatial memoization cache for the recursive Hashlife stepper.
+    /// Key: (NodeId, parity). Identical subtrees anywhere in the world
+    /// share a single cache entry — block-rule partition uses node-local
+    /// alignment so origin is no longer in the key (9ww).
+    pub(crate) hashlife_cache: FxHashMap<(NodeId, u32), NodeId>,
+    /// Memoization cache for the exponential Hashlife macro-stepper (6gf.7).
+    /// Key: (NodeId, starting generation).
+    pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, u64), NodeId>,
+    /// Hashlife cache statistics from the most recent step.
+    pub hashlife_stats: HashlifeStats,
+    /// Store size after the last compaction, used to trigger periodic GC.
+    pub(crate) store_size_at_last_compact: usize,
+    /// Cache for `inert_uniform_state`: NodeId → Option<CellState>.
+    /// `Some(state)` = all leaves are the same inert material; `None` = mixed or active.
+    pub(crate) hashlife_inert_cache: FxHashMap<NodeId, Option<CellState>>,
+    /// Cache for `is_all_inert`: NodeId → bool.
+    /// True if every leaf in the subtree has CaRule::Noop and no BlockRule.
+    pub(crate) hashlife_all_inert_cache: FxHashMap<NodeId, bool>,
+    /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
+    /// Avoids O(n³) flatten-and-scan on every `step_recursive_pow2` call.
+    pub(crate) block_rule_present: Option<bool>,
+    /// Pending world mutations. Entities push here; `apply_mutations`
+    /// drains and applies in arrival order at tick boundary.
+    pub queue: MutationQueue,
+    /// Positions of clone blocks in world coordinates. Each tick,
+    /// clone blocks spawn their encoded material into adjacent air cells.
+    /// Validated lazily — stale entries (destroyed by acid/etc.) are pruned
+    /// on `spawn_clones`.
+    pub clone_sources: Vec<[i64; 3]>,
+    /// World-space origin of local coordinate (0,0,0). When the world
+    /// grows in the negative direction, origin shifts to keep the old
+    /// root's cells at the same world-space positions.
+    pub origin: [i64; 3],
+    /// Old→new NodeId remap from the most recent store compaction.
+    /// Consumed by `Svdag::apply_remap()` to keep its persistent cache
+    /// valid across compaction epochs (hash-thing-5bb.11).
+    /// `None` after scene resets (the cache should be fully invalidated).
+    pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
+}
+
+/// Cache performance statistics from a single hashlife step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HashlifeStats {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub empty_skips: u64,
+    pub fixed_point_skips: u64,
+    /// Per-level cache miss counts (index = level - 3, since base case is level 3).
+    pub misses_by_level: [u64; 32],
 }
 
 impl World {
@@ -71,6 +222,46 @@ impl World {
             generation: 0,
             simulation_seed: 0,
             materials,
+            terrain_params: None,
+            hashlife_cache: FxHashMap::default(),
+            hashlife_macro_cache: FxHashMap::default(),
+            hashlife_stats: HashlifeStats::default(),
+            store_size_at_last_compact: 0,
+            hashlife_inert_cache: FxHashMap::default(),
+            hashlife_all_inert_cache: FxHashMap::default(),
+            block_rule_present: None,
+            queue: MutationQueue::new(),
+            clone_sources: Vec::new(),
+            origin: [0, 0, 0],
+            last_compaction_remap: None,
+        }
+    }
+
+    /// Lightweight placeholder world for use as a temporary swap target
+    /// (e.g. while the real world is on a background thread). Skips
+    /// material registry setup — NOT valid for simulation.
+    pub fn placeholder() -> Self {
+        let mut store = NodeStore::new();
+        let root = store.empty(1);
+        Self {
+            store,
+            root,
+            level: 1,
+            generation: 0,
+            simulation_seed: 0,
+            materials: MaterialRegistry::new(),
+            terrain_params: None,
+            hashlife_cache: FxHashMap::default(),
+            hashlife_macro_cache: FxHashMap::default(),
+            hashlife_stats: HashlifeStats::default(),
+            store_size_at_last_compact: 0,
+            hashlife_inert_cache: FxHashMap::default(),
+            hashlife_all_inert_cache: FxHashMap::default(),
+            block_rule_present: None,
+            queue: MutationQueue::new(),
+            clone_sources: Vec::new(),
+            origin: [0, 0, 0],
+            last_compaction_remap: None,
         }
     }
 
@@ -78,13 +269,20 @@ impl World {
         1 << self.level
     }
 
+    /// The realized region as a value type.
+    pub fn region(&self) -> RealizedRegion {
+        RealizedRegion {
+            origin: self.origin,
+            level: self.level,
+        }
+    }
+
     /// Invalidate caches whose keys depend on the active CA rule.
-    ///
-    /// Today this only clears `NodeStore::step_cache`, whose key is `NodeId`
-    /// only. Call this before or immediately after any rule swap so future
-    /// memoized stepping cannot reuse results from a different ruleset.
     pub fn invalidate_rule_caches(&mut self) {
-        self.store.clear_step_cache();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
@@ -96,13 +294,44 @@ impl World {
         self.invalidate_rule_caches();
     }
 
+    /// Convert world coordinate to local on a specific axis index (0=x, 1=y, 2=z).
+    /// Panics if the result is negative (coordinate is below the world origin).
+    fn local_from_world(&self, axis: usize, coord: WorldCoord) -> LocalCoord {
+        let local = coord.0 - self.origin[axis];
+        LocalCoord(u64::try_from(local).unwrap_or_else(|_| {
+            panic!(
+                "World: world coord {} maps to negative local coord {} \
+                 (origin[{axis}]={})",
+                coord.0, local, self.origin[axis]
+            )
+        }))
+    }
+
+    fn set_local(&mut self, x: LocalCoord, y: LocalCoord, z: LocalCoord, state: CellState) {
+        let side = self.side() as u64;
+        assert!(
+            x.0 < side && y.0 < side && z.0 < side,
+            "World::set_local: coord ({}, {}, {}) out of bounds for side {side}",
+            x.0,
+            y.0,
+            z.0,
+        );
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        self.root = self.store.set_cell(self.root, x.0, y.0, z.0, state);
+        self.block_rule_present = None; // invalidate cache
+    }
+
+    fn get_local(&self, x: LocalCoord, y: LocalCoord, z: LocalCoord) -> CellState {
+        self.store.get_cell(self.root, x.0, y.0, z.0)
+    }
+
     /// Grow the root octree until `(x, y, z)` is in-bounds.
     ///
-    /// Wraps the current root in successively bigger parent nodes. The
-    /// existing root becomes octant 0 (the −x,−y,−z corner child) of
-    /// each new parent; the other 7 children are canonical empty nodes.
-    /// This preserves all existing cell coordinates — the world grows
-    /// in the +x, +y, +z direction only.
+    /// Supports growth in all directions — negative coordinates shift
+    /// the origin while preserving existing cell positions.
     ///
     /// No-op when the coordinate is already in-bounds.
     ///
@@ -110,71 +339,285 @@ impl World {
     /// they are keyed by `NodeId`, and the old root's `NodeId` is still
     /// valid and still steps to the same result. The new parent has no
     /// cached entry yet and will be computed fresh on first step.
-    pub fn ensure_contains(&mut self, x: u64, y: u64, z: u64) {
+    pub fn ensure_contains(&mut self, x: WorldCoord, y: WorldCoord, z: WorldCoord) {
         self.ensure_region([x, y, z], [x, y, z]);
     }
 
     /// Grow the root octree until the axis-aligned box `[min, max]` is
     /// fully in-bounds (inclusive on both ends).
     ///
-    /// Since growth only extends in the +x, +y, +z direction (the existing
-    /// root stays at octant 0), it is sufficient to grow until `max` is
-    /// contained — `min` is automatically in-bounds once `max` is.
+    /// Supports growth in all directions. For each axis needing negative
+    /// growth, the old root is placed in the positive half of the new
+    /// parent and origin shifts by −half. For positive growth, the old
+    /// root stays in the negative half.
     ///
     /// No-op when the region is already in-bounds.
-    pub fn ensure_region(&mut self, _min: [u64; 3], max: [u64; 3]) {
+    pub fn ensure_region(&mut self, min: [WorldCoord; 3], max: [WorldCoord; 3]) {
         loop {
-            let side = 1u64 << self.level;
-            if max[0] < side && max[1] < side && max[2] < side {
-                return;
+            let side = 1i64 << self.level;
+            let origin = self.origin;
+
+            // Check which axes need growth and in which direction.
+            let need_neg = [
+                min[0].0 < origin[0],
+                min[1].0 < origin[1],
+                min[2].0 < origin[2],
+            ];
+            let need_pos = [
+                max[0].0 >= origin[0] + side,
+                max[1].0 >= origin[1] + side,
+                max[2].0 >= origin[2] + side,
+            ];
+
+            if !need_neg.iter().any(|&b| b) && !need_pos.iter().any(|&b| b) {
+                return; // everything fits
             }
-            let empty_sibling = self.store.empty(self.level);
+
+            // Determine which octant the old root goes into.
+            // Negative growth on axis → old root in + half (bit=1), origin shifts.
+            // Positive growth → old root in - half (bit=0).
+            let old_octant = (if need_neg[0] { 1 } else { 0 })
+                + (if need_neg[1] { 2 } else { 0 })
+                + (if need_neg[2] { 4 } else { 0 });
+
+            let half = side; // half of the NEW size = old side
+            let sibling_level = self.level;
             let new_level = self.level + 1;
-            let new_root = self.store.interior(
-                new_level,
-                [
-                    self.root,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                    empty_sibling,
-                ],
-            );
-            self.root = new_root;
+
+            // Compute new origin — shift negative on axes that need it.
+            let mut new_origin = origin;
+            for axis in 0..3 {
+                if need_neg[axis] {
+                    new_origin[axis] -= half;
+                }
+            }
+
+            // Build children array.
+            let mut children = [NodeId::EMPTY; 8];
+            children[old_octant] = self.root;
+            for (oct, child) in children.iter_mut().enumerate() {
+                if oct == old_octant {
+                    continue;
+                }
+                let (cx, cy, cz) = crate::octree::node::octant_coords(oct);
+                let sibling_origin = [
+                    new_origin[0] + cx as i64 * half,
+                    new_origin[1] + cy as i64 * half,
+                    new_origin[2] + cz as i64 * half,
+                ];
+                *child = self.gen_sibling(sibling_level, sibling_origin);
+            }
+
+            self.root = self.store.interior(new_level, children);
             self.level = new_level;
+            self.origin = new_origin;
         }
+    }
+
+    /// Generate a sibling octant for lazy expansion. If `terrain_params` is
+    /// set, produces terrain (heightmap) at the given world-space origin.
+    /// Otherwise returns a canonical empty node.
+    fn gen_sibling(&mut self, level: u32, origin: [i64; 3]) -> NodeId {
+        let params = match &self.terrain_params {
+            Some(p) => *p,
+            None => return self.store.empty(level),
+        };
+        let field = params.to_heightmap();
+        let (node, _stats) = gen_region(&mut self.store, &field, origin, level);
+        node
     }
 
     /// Set a cell.
     ///
-    /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). For
-    /// writes to coordinates outside the current root, call
-    /// `ensure_contains` first to grow the tree.
+    /// **Panics** on out-of-bounds coordinates (hash-thing-fb5). For writes to
+    /// coordinates outside the current realized root, call `ensure_contains`
+    /// first to grow the tree.
     #[track_caller]
-    pub fn set(&mut self, x: u64, y: u64, z: u64, state: CellState) {
-        let side = self.side() as u64;
-        assert!(
-            x < side && y < side && z < side,
-            "World::set: coord ({x}, {y}, {z}) out of bounds for side {side}",
+    pub fn set(&mut self, x: WorldCoord, y: WorldCoord, z: WorldCoord, state: CellState) {
+        self.set_local(
+            self.local_from_world(0, x),
+            self.local_from_world(1, y),
+            self.local_from_world(2, z),
+            state,
         );
-        self.root = self.store.set_cell(self.root, x, y, z, state);
+    }
+
+    /// Place a gameplay block at block coordinates `(bx, by, bz)`.
+    ///
+    /// Fills a `CELLS_PER_BLOCK³` region of cells with the given state.
+    /// Block coordinate `(bx, by, bz)` maps to cell region
+    /// `[bx*K .. bx*K+K-1]` on each axis, where `K = CELLS_PER_BLOCK`.
+    ///
+    /// Auto-grows the world to fit, then queues a `FillRegion` mutation —
+    /// call `apply_mutations` to flush.
+    pub fn set_block(&mut self, bx: i64, by: i64, bz: i64, state: CellState) {
+        let k = CELLS_PER_BLOCK as i64;
+        let min = [WorldCoord(bx * k), WorldCoord(by * k), WorldCoord(bz * k)];
+        let max = [
+            WorldCoord(bx * k + k - 1),
+            WorldCoord(by * k + k - 1),
+            WorldCoord(bz * k + k - 1),
+        ];
+        self.ensure_region(min, max);
+        self.queue
+            .push(WorldMutation::FillRegion { min, max, state });
     }
 
     /// Get a cell.
     ///
     /// Out-of-bounds reads return `0` silently (hash-thing-fb5). `get` is a
     /// pure query over the realized region — outside that region is
-    /// conceptually unrealized empty space.
-    pub fn get(&self, x: u64, y: u64, z: u64) -> CellState {
-        self.store.get_cell(self.root, x, y, z)
+    /// conceptually unrealized empty space. This includes negative world
+    /// coordinates until signed-region realization lands.
+    pub fn get(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = self.side() as i64;
+        if lx < 0 || ly < 0 || lz < 0 || lx >= side || ly >= side || lz >= side {
+            return 0;
+        }
+        self.get_local(
+            LocalCoord(lx as u64),
+            LocalCoord(ly as u64),
+            LocalCoord(lz as u64),
+        )
+    }
+
+    /// Stepper-oriented read: "what is this cell right now?"
+    ///
+    /// Semantic alias for [`get`](Self::get) that signals the caller accepts
+    /// OOB-empty semantics without reservation. Hashlife steppers reading a
+    /// 3×3×3 neighborhood call `probe` — the unrealized world *is* empty
+    /// from the stepper's perspective, so returning 0 for out-of-bounds is
+    /// the correct physical answer, not a lossy fallback.
+    ///
+    /// Use [`is_realized`](Self::is_realized) when you need to distinguish
+    /// "genuinely empty" from "outside the realized region."
+    #[inline]
+    pub fn probe(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        self.get(x, y, z)
+    }
+
+    /// Is the coordinate inside the realized region?
+    ///
+    /// Returns `false` for negative coordinates and for positions beyond
+    /// the current octree extent. Use this alongside [`get`](Self::get)
+    /// when distinguishing "realized empty" from "unrealized" matters
+    /// (e.g. debug overlays rendering the region boundary).
+    pub fn is_realized(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> bool {
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = self.side() as i64;
+        lx >= 0 && ly >= 0 && lz >= 0 && lx < side && ly < side && lz < side
     }
 
     /// Flatten to a 3D grid for rendering.
     pub fn flatten(&self) -> Vec<CellState> {
         self.store.flatten(self.root, self.side())
+    }
+
+    /// Drain the mutation queue and apply every pending mutation to the
+    /// octree in arrival order. This is the only path for entity-produced
+    /// edits to reach the world (closed-world invariant, hash-thing-1v0.9).
+    pub fn apply_mutations(&mut self) {
+        for m in self.queue.take() {
+            match m {
+                WorldMutation::SetCell { x, y, z, state } => {
+                    self.set(x, y, z, state);
+                }
+                WorldMutation::FillRegion { min, max, state } => {
+                    debug_assert!(
+                        min[0].0 <= max[0].0 && min[1].0 <= max[1].0 && min[2].0 <= max[2].0,
+                        "FillRegion: min must be <= max on every axis"
+                    );
+                    for z in min[2].0..=max[2].0 {
+                        for y in min[1].0..=max[1].0 {
+                            for x in min[0].0..=max[0].0 {
+                                self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawn materials from clone blocks into adjacent air cells.
+    ///
+    /// For each tracked clone source, verify it still exists (prune stale entries),
+    /// then write the encoded source material into the 6 cardinal neighbors that
+    /// are currently air. Mutations are applied immediately.
+    pub fn spawn_clones(&mut self) {
+        if self.clone_sources.is_empty() {
+            return;
+        }
+
+        const DIRS: [[i64; 3]; 6] = [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ];
+
+        // Snapshot and validate: collect (pos, source_material) for live clones.
+        let mut live_sources: Vec<([i64; 3], u16)> = Vec::new();
+        for &pos in &self.clone_sources {
+            let cell = Cell::from_raw(self.get(
+                WorldCoord(pos[0]),
+                WorldCoord(pos[1]),
+                WorldCoord(pos[2]),
+            ));
+            if cell.material() == CLONE_MATERIAL_ID {
+                live_sources.push((pos, cell.metadata()));
+            }
+        }
+
+        // Prune stale entries.
+        self.clone_sources = live_sources.iter().map(|&(pos, _)| pos).collect();
+
+        for (pos, source_material_id) in live_sources {
+            if source_material_id == 0 {
+                continue; // metadata 0 = no source configured
+            }
+            let spawn_state = Cell::pack(source_material_id, 0).raw();
+            for dir in &DIRS {
+                let nx = pos[0] + dir[0];
+                let ny = pos[1] + dir[1];
+                let nz = pos[2] + dir[2];
+                let neighbor = self.get(WorldCoord(nx), WorldCoord(ny), WorldCoord(nz));
+                if neighbor == 0 {
+                    self.queue.push(WorldMutation::SetCell {
+                        x: WorldCoord(nx),
+                        y: WorldCoord(ny),
+                        z: WorldCoord(nz),
+                        state: spawn_state,
+                    });
+                }
+            }
+        }
+
+        // Apply the spawned cells.
+        if !self.queue.is_empty() {
+            self.apply_mutations();
+        }
+    }
+
+    /// Advance the CA by one generation with mutation-queue guard.
+    ///
+    /// Debug-asserts that the queue is empty on entry — if it isn't,
+    /// the caller forgot `apply_mutations` and the step cache would
+    /// see stale world state.
+    pub fn step_ca(&mut self) {
+        debug_assert!(
+            self.queue.is_empty(),
+            "step_ca called with {} pending mutations — call apply_mutations first",
+            self.queue.len()
+        );
+        self.step_recursive();
     }
 
     /// Step the simulation forward one generation.
@@ -189,11 +632,10 @@ impl World {
     ///
     /// This is an intentional "react then move" physics model.
     ///
-    /// **Boundary asymmetry:** CaRule wraps toroidally (`rem_euclid`); BlockRule
-    /// skips partial blocks at world edges (clipping). This is deliberate — Margolus
-    /// blocks must not straddle the world boundary. Cells at the boundary participate
-    /// in CaRule every tick but only in BlockRule on generations where the partition
-    /// offset aligns them away from the edge.
+    /// **Boundary conditions:** Both CaRule and BlockRule use absorbing boundaries
+    /// (out-of-bounds = empty), matching hashlife's infinite-world semantics.
+    /// BlockRule additionally skips partial blocks at world edges (clipping) —
+    /// Margolus blocks must not straddle the world boundary.
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
@@ -216,13 +658,19 @@ impl World {
         // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
         self.step_blocks(&mut next, side);
 
+        // Phase 3: gravity gap-fill — prevents Margolus rarefaction.
+        // Fills air gaps within gravity-bearing bodies by cascading cells
+        // down, but only at positions with gravity cells on both sides.
+        gravity_gap_fill(&mut next, side, &self.materials);
+
         self.commit_step(&next, side);
     }
 
     /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
     ///
     /// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
-    /// Blocks at the edges that would extend past the grid boundary are skipped.
+    /// Blocks at edges use absorbing boundary conditions: out-of-bounds cells
+    /// are treated as empty, matching hashlife's pad-with-empty semantics.
     ///
     /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
     /// distinct rule exists, run it. If zero or multiple: skip (identity).
@@ -234,11 +682,11 @@ impl World {
         };
 
         let mut bz = offset;
-        while bz + 1 < side {
+        while bz < side {
             let mut by = offset;
-            while by + 1 < side {
+            while by < side {
                 let mut bx = offset;
-                while bx + 1 < side {
+                while bx < side {
                     self.apply_block(grid, side, bx, by, bz);
                     bx += 2;
                 }
@@ -249,14 +697,21 @@ impl World {
     }
 
     /// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
+    ///
+    /// Cells outside the grid boundary are treated as empty (absorbing BC).
     fn apply_block(&self, grid: &mut [CellState], side: usize, bx: usize, by: usize, bz: usize) {
-        // Read the 8 cells.
+        // Read the 8 cells. OOB → empty (absorbing boundary).
         let mut block = [Cell::EMPTY; 8];
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
+                    let x = bx + dx;
+                    let y = by + dy;
+                    let z = bz + dz;
+                    if x < side && y < side && z < side {
+                        let idx = x + y * side + z * side * side;
+                        block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
+                    }
                 }
             }
         }
@@ -273,20 +728,7 @@ impl World {
         };
 
         let rule = self.materials.block_rule(rule_id);
-        let ctx = BlockContext {
-            block_origin: [bx as i64, by as i64, bz as i64],
-            generation: self.generation,
-            world_seed: self.simulation_seed,
-            rng_hash: cell_hash(
-                bx as i64,
-                by as i64,
-                bz as i64,
-                self.generation,
-                self.simulation_seed,
-            ),
-        };
-
-        let result = rule.step_block(&block, &ctx);
+        let result = rule.step_block(&block);
 
         // Mass conservation assertion: output must be a permutation of input.
         debug_assert!(
@@ -303,13 +745,20 @@ impl World {
         // Write back, but anchor cells that didn't opt into this block rule.
         // A cell with block_rule_id == None is immovable — it stays in its
         // original position even if the rule tried to swap it elsewhere.
+        // OOB positions are silently skipped (absorbing boundary).
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
+                    let x = bx + dx;
+                    let y = by + dy;
+                    let z = bz + dz;
+                    if x >= side || y >= side || z >= side {
+                        continue;
+                    }
                     let i = block_index(dx, dy, dz);
                     let original = block[i];
                     let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                    let idx = x + y * side + z * side * side;
                     if has_rule || original.is_empty() {
                         // Opted-in cells and empty cells can be moved by the rule.
                         grid[idx] = result[i].raw();
@@ -322,7 +771,7 @@ impl World {
 
     /// Find the unique BlockRuleId across all non-empty cells in a block.
     /// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
-    fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
+    pub(crate) fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
         let mut found: Option<BlockRuleId> = None;
         for cell in block {
             if let Some(id) = self.materials.block_rule_id_for_cell(*cell) {
@@ -357,7 +806,7 @@ impl World {
                     if dx * dx + dy * dy + dz * dz < (radius as f64 * radius as f64)
                         && rng.next_f64() < density
                     {
-                        self.set(x, y, z, ALIVE.raw());
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), ALIVE.raw());
                     }
                 }
             }
@@ -378,23 +827,13 @@ impl World {
     /// Count active materials in a local box around `center`. Tests and
     /// future scene validators use this to assert spectacle presence
     /// after a reset without depending on exact voxel-for-voxel layouts.
-    pub fn active_material_stats_near(&self, center: [u64; 3], radius: u64) -> ActiveMaterialStats {
-        let side = self.side() as u64;
-        let min = [
-            center[0].saturating_sub(radius),
-            center[1].saturating_sub(radius),
-            center[2].saturating_sub(radius),
-        ];
-        let max = [
-            center[0].saturating_add(radius + 1).min(side),
-            center[1].saturating_add(radius + 1).min(side),
-            center[2].saturating_add(radius + 1).min(side),
-        ];
+    pub fn active_material_stats_near(&self, center: [i64; 3], radius: u64) -> ActiveMaterialStats {
+        let radius = i64::try_from(radius).expect("demo spectacle radius must fit in i64");
         let mut stats = ActiveMaterialStats::default();
-        for z in min[2]..max[2] {
-            for y in min[1]..max[1] {
-                for x in min[0]..max[0] {
-                    match self.get(x, y, z) {
+        for z in (center[2] - radius)..=(center[2] + radius) {
+            for y in (center[1] - radius)..=(center[1] + radius) {
+                for x in (center[0] - radius)..=(center[0] + radius) {
+                    match self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) {
                         FIRE => stats.fire_cells += 1,
                         WATER => stats.water_cells += 1,
                         _ => {}
@@ -413,152 +852,53 @@ impl World {
         }
     }
 
-    fn stage_cascade(&mut self, center: [u64; 3]) {
+    fn stage_cascade(&mut self, center: [i64; 3]) {
         let [cx, cy, cz] = center;
-        self.fill_box_clamped(
-            [
-                cx.saturating_sub(3),
-                cy.saturating_sub(2),
-                cz.saturating_sub(3),
-            ],
-            [cx + 4, cy + 5, cz + 4],
-            AIR,
-        );
-        self.fill_box_clamped(
-            [
-                cx.saturating_sub(2),
-                cy.saturating_sub(2),
-                cz.saturating_sub(3),
-            ],
-            [cx + 3, cy.saturating_sub(1) + 1, cz + 3],
-            DIRT,
-        );
-        self.fill_box_clamped(
-            [cx.saturating_sub(2), cy.saturating_sub(1), cz + 2],
-            [cx + 3, cy + 4, cz + 3],
-            STONE,
-        );
-        self.fill_box_clamped(
-            [cx.saturating_sub(1), cy + 2, cz],
-            [cx + 2, cy + 4, cz + 1],
-            WATER,
-        );
-        self.fill_box_clamped(
-            [
-                cx.saturating_sub(3),
-                cy.saturating_sub(1),
-                cz.saturating_sub(1),
-            ],
-            [cx.saturating_sub(2), cy + 1, cz + 1],
-            FIRE,
-        );
-        self.fill_box_clamped(
-            [cx + 2, cy.saturating_sub(1), cz.saturating_sub(1)],
-            [cx + 3, cy + 1, cz + 1],
-            FIRE,
-        );
+        self.fill_box_clamped([cx - 3, cy - 2, cz - 3], [cx + 4, cy + 5, cz + 4], AIR);
+        self.fill_box_clamped([cx - 2, cy - 2, cz - 3], [cx + 3, cy, cz + 3], DIRT);
+        self.fill_box_clamped([cx - 2, cy - 1, cz + 2], [cx + 3, cy + 4, cz + 3], STONE);
+        self.fill_box_clamped([cx - 1, cy + 2, cz], [cx + 2, cy + 4, cz + 1], WATER);
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 1], [cx - 2, cy + 1, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 2, cy - 1, cz - 1], [cx + 3, cy + 1, cz + 1], FIRE);
     }
 
-    fn stage_hearth(&mut self, center: [u64; 3]) {
+    fn stage_hearth(&mut self, center: [i64; 3]) {
         let [cx, cy, cz] = center;
-        self.fill_box_clamped(
-            [
-                cx.saturating_sub(3),
-                cy.saturating_sub(1),
-                cz.saturating_sub(3),
-            ],
-            [cx + 4, cy + 4, cz + 4],
-            AIR,
-        );
-        self.fill_box_clamped(
-            [
-                cx.saturating_sub(3),
-                cy.saturating_sub(1),
-                cz.saturating_sub(3),
-            ],
-            [cx + 4, cy, cz + 4],
-            STONE,
-        );
-        self.fill_box_clamped(
-            [cx.saturating_sub(2), cy, cz + 2],
-            [cx + 3, cy + 3, cz + 3],
-            GRASS,
-        );
-        self.fill_box_clamped(
-            [cx.saturating_sub(1), cy, cz.saturating_sub(1)],
-            [cx + 1, cy + 2, cz + 1],
-            FIRE,
-        );
-        self.fill_box_clamped(
-            [cx + 1, cy, cz.saturating_sub(1)],
-            [cx + 2, cy + 2, cz + 1],
-            WATER,
-        );
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 3], [cx + 4, cy + 4, cz + 4], AIR);
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 3], [cx + 4, cy, cz + 4], STONE);
+        self.fill_box_clamped([cx - 2, cy, cz + 2], [cx + 3, cy + 3, cz + 3], GRASS);
+        self.fill_box_clamped([cx - 1, cy, cz - 1], [cx + 1, cy + 2, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 1, cy, cz - 1], [cx + 2, cy + 2, cz + 1], WATER);
     }
 
-    fn stage_clash(&mut self, center: [u64; 3]) {
+    fn stage_clash(&mut self, center: [i64; 3]) {
         let [cx, cy, cz] = center;
-        self.fill_box_clamped(
-            [
-                cx.saturating_sub(4),
-                cy.saturating_sub(2),
-                cz.saturating_sub(3),
-            ],
-            [cx + 5, cy + 4, cz + 4],
-            AIR,
-        );
-        self.fill_box_clamped(
-            [
-                cx.saturating_sub(4),
-                cy.saturating_sub(2),
-                cz.saturating_sub(3),
-            ],
-            [cx + 5, cy.saturating_sub(1) + 1, cz + 4],
-            DIRT,
-        );
-        self.fill_box_clamped(
-            [cx.saturating_sub(4), cy.saturating_sub(1), cz + 2],
-            [cx.saturating_sub(1), cy + 2, cz + 3],
-            GRASS,
-        );
-        self.fill_box_clamped(
-            [cx.saturating_sub(3), cy, cz.saturating_sub(1)],
-            [cx.saturating_sub(1), cy + 2, cz + 1],
-            FIRE,
-        );
-        self.fill_box_clamped(
-            [cx + 1, cy + 1, cz.saturating_sub(1)],
-            [cx + 4, cy + 3, cz + 1],
-            WATER,
-        );
-        self.fill_box_clamped(
-            [cx + 1, cy.saturating_sub(1), cz + 2],
-            [cx + 4, cy + 3, cz + 3],
-            STONE,
-        );
+        self.fill_box_clamped([cx - 4, cy - 2, cz - 3], [cx + 5, cy + 4, cz + 4], AIR);
+        self.fill_box_clamped([cx - 4, cy - 2, cz - 3], [cx + 5, cy, cz + 4], DIRT);
+        self.fill_box_clamped([cx - 4, cy - 1, cz + 2], [cx - 1, cy + 2, cz + 3], GRASS);
+        self.fill_box_clamped([cx - 3, cy, cz - 1], [cx - 1, cy + 2, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 1, cy + 1, cz - 1], [cx + 4, cy + 3, cz + 1], WATER);
+        self.fill_box_clamped([cx + 1, cy - 1, cz + 2], [cx + 4, cy + 3, cz + 3], STONE);
     }
 
-    fn fill_box_clamped(&mut self, min: [u64; 3], max: [u64; 3], state: CellState) {
-        let side = self.side() as u64;
-        let min = [min[0].min(side), min[1].min(side), min[2].min(side)];
-        let max = [max[0].min(side), max[1].min(side), max[2].min(side)];
-        if min[0] >= max[0] || min[1] >= max[1] || min[2] >= max[2] {
-            return;
-        }
+    fn fill_box_clamped(&mut self, min: [i64; 3], max: [i64; 3], state: CellState) {
+        let region = self.region();
         for z in min[2]..max[2] {
             for y in min[1]..max[1] {
                 for x in min[0]..max[0] {
-                    self.set(x, y, z, state);
+                    if region.contains(x, y, z) {
+                        self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                    }
                 }
             }
         }
     }
 
     fn burning_room_demo_spectacle_anchors(&self) -> [DemoSpectacleAnchor; 3] {
-        let side = self.side() as u64;
+        let side = self.side() as i64;
         let margin = side / 8;
         let lo = margin + 6;
-        let hi = side.saturating_sub(margin + 7);
+        let hi = side - margin - 7;
         let mid = side / 2;
         [
             DemoSpectacleAnchor {
@@ -599,16 +939,304 @@ impl World {
                     let on_ceiling = y == hi - 1;
 
                     if on_floor {
-                        self.set(x, y, z, DIRT);
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), DIRT);
                     } else if on_ceiling {
-                        self.set(x, y, z, STONE);
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), STONE);
                     } else if on_wall {
-                        self.set(x, y, z, GRASS);
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), GRASS);
                     }
                 }
             }
         }
         self.stage_demo_spectacles(&self.burning_room_demo_spectacle_anchors());
+    }
+
+    /// Add water and sand to an existing terrain — water pools on a
+    /// hilltop (so it cascades down) and sand dunes on one side.
+    /// Call after `seed_terrain`.
+    pub fn seed_water_and_sand(&mut self) {
+        let side = self.side() as u64;
+        let center = side / 2;
+        // Water: a wide pool above center, near the high terrain.
+        // Place at 75% height in a ~side/4 square.
+        let water_y = center + center / 4;
+        let pool_radius = side / 6;
+        let pool_depth = (side / 32).max(2);
+        let lo_x = center.saturating_sub(pool_radius);
+        let hi_x = (center + pool_radius).min(side);
+        let lo_z = center.saturating_sub(pool_radius);
+        let hi_z = (center + pool_radius).min(side);
+        for z in lo_z..hi_z {
+            for x in lo_x..hi_x {
+                for dy in 0..pool_depth {
+                    let y = water_y + dy;
+                    if y < side {
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), WATER);
+                    }
+                }
+            }
+        }
+        // Sand: a dune field on one edge, at terrain surface level.
+        let sand_width = side / 8;
+        let sand_depth = (side / 64).max(2);
+        for z in 0..side / 3 {
+            for x in 0..sand_width {
+                for dy in 0..sand_depth {
+                    let y = center + dy;
+                    if y < side {
+                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), SAND);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seed a lattice megastructure embedded in natural terrain.
+    ///
+    /// A 3D grid of corridors carved from stone, with grass-covered pillars,
+    /// water channels, lava pools, fire sources, and sand dunes. The
+    /// periodic lattice compresses well in the octree (hashlife sharing).
+    /// A heightmap terrain fills the outside world, and the outer shell of
+    /// the lattice tapers into that terrain so the seam reads less like a
+    /// hard cuboid cutout.
+    ///
+    /// Uses `LatticeField` + `TerrainBlendField` + `gen_region` for
+    /// octree-native generation with proof-based collapse.
+    pub fn seed_lattice_megastructure(&mut self) {
+        self.store = NodeStore::new();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        let terrain_params = TerrainParams::for_level(self.level);
+        let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level);
+        let lattice = LatticeField::for_world(self.level, 42);
+        let edge_blend = (lattice.cell_size / 2).max(2);
+        let field = TerrainBlendField::new(
+            lattice.clone(),
+            terrain,
+            lattice.lo,
+            lattice.hi,
+            edge_blend,
+            (lattice.cell_size / 3).max(4) as f32,
+            3.0,
+        );
+        let (root, _stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        self.root = root;
+        self.generation = 0;
+        self.terrain_params = Some(terrain_params);
+        self.block_rule_present = None;
+    }
+
+    /// Seed a warped gyroid megastructure tuned for a walkable demo zone.
+    ///
+    /// Uses `GyroidField` + `gen_region` for octree-native generation with
+    /// proof-based collapse. The gyroid stays parameterized so later
+    /// megastructure experiments can reuse the same implicit-field path.
+    pub fn seed_gyroid_megastructure(&mut self) -> GenStats {
+        self.store = NodeStore::new();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        let field = GyroidField::for_world(self.level, 42);
+        let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        self.root = root;
+        self.generation = 0;
+        self.block_rule_present = None;
+        stats
+    }
+
+    fn fill_box(&mut self, volume: Box3, state: CellState) {
+        for z in volume.min[2]..=volume.max[2] {
+            for y in volume.min[1]..=volume.max[1] {
+                for x in volume.min[0]..=volume.max[0] {
+                    self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                }
+            }
+        }
+    }
+
+    fn progression_boxes(
+        field: &LatticeField,
+    ) -> (Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3) {
+        let lo = field.lo;
+        let hi = field.hi;
+        let ground_y = lo[1] + field.floor_thick;
+        let room_height = (field.cell_size / 2).max(4);
+        let tunnel_half_w = (field.wall_thick + 1).max(2);
+
+        let start_shell = Box3::new(
+            [lo[0] + 1, ground_y, lo[2] + 1],
+            [
+                lo[0] + field.cell_size + 2,
+                ground_y + room_height + 2,
+                lo[2] + field.cell_size + 2,
+            ],
+        );
+        let start_room = Box3::new(
+            [
+                start_shell.min[0] + 1,
+                start_shell.min[1] + 1,
+                start_shell.min[2] + 1,
+            ],
+            [
+                start_shell.max[0] - 1,
+                start_shell.max[1] - 1,
+                start_shell.max[2] - 1,
+            ],
+        );
+
+        let corridor_z = (start_room.min[2] + start_room.max[2]) / 2;
+        let corridor_end_x = (lo[0] + field.cell_size * 3).min(hi[0] - field.cell_size * 2);
+        let corridor_shell = Box3::new(
+            [
+                start_shell.max[0] - 1,
+                ground_y,
+                corridor_z - tunnel_half_w - 1,
+            ],
+            [
+                corridor_end_x,
+                ground_y + room_height + 1,
+                corridor_z + tunnel_half_w + 1,
+            ],
+        );
+        let corridor = Box3::new(
+            [
+                corridor_shell.min[0] + 1,
+                corridor_shell.min[1] + 1,
+                corridor_shell.min[2] + 1,
+            ],
+            [
+                corridor_shell.max[0],
+                corridor_shell.max[1] - 1,
+                corridor_shell.max[2] - 1,
+            ],
+        );
+
+        let tease_a = Box3::new(
+            [
+                corridor.min[0] + field.cell_size / 2,
+                corridor.min[1],
+                corridor.max[2] + 1,
+            ],
+            [
+                corridor.min[0] + field.cell_size,
+                corridor.max[1] + 1,
+                (corridor.max[2] + field.cell_size).min(hi[2] - 2),
+            ],
+        );
+        let tease_b = Box3::new(
+            [
+                corridor.max[0] - field.cell_size,
+                corridor.min[1],
+                (corridor.min[2] - field.cell_size).max(lo[2] + 1),
+            ],
+            [
+                corridor.max[0] - field.cell_size / 2,
+                corridor.max[1] + 1,
+                corridor.min[2] - 1,
+            ],
+        );
+
+        let atrium = Box3::new(
+            [
+                corridor.max[0] - field.cell_size / 2,
+                ground_y + 1,
+                lo[2] + field.cell_size,
+            ],
+            [
+                (corridor.max[0] + field.cell_size * 2).min(hi[0] - 3),
+                (ground_y + field.cell_size + 2).min(hi[1] - 3),
+                (lo[2] + field.cell_size * 4).min(hi[2] - 3),
+            ],
+        );
+
+        let balcony = Box3::new(
+            [
+                atrium.max[0] - field.cell_size,
+                ground_y + room_height / 2,
+                atrium.center()[2] - tunnel_half_w - 1,
+            ],
+            [
+                hi[0] - 2,
+                ground_y + room_height / 2 + 3,
+                atrium.center()[2] + tunnel_half_w + 1,
+            ],
+        );
+        let panorama = Box3::new(
+            [
+                atrium.max[0] - field.cell_size / 2,
+                ground_y,
+                lo[2] + field.cell_size / 2,
+            ],
+            [
+                hi[0] - 1,
+                hi[1] - 2,
+                (lo[2] + field.cell_size * 5).min(hi[2] - 2),
+            ],
+        );
+
+        (
+            start_shell,
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            atrium,
+            balcony,
+            panorama,
+        )
+    }
+
+    pub fn seed_lattice_progression_demo(&mut self) -> DemoLayout {
+        self.seed_lattice_megastructure();
+        let field = LatticeField::for_world(self.level, 42);
+        let ground_y = field.lo[1] + field.floor_thick;
+        let (
+            start_shell,
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            atrium,
+            balcony,
+            panorama,
+        ) = Self::progression_boxes(&field);
+
+        self.fill_box(start_shell, STONE);
+        self.fill_box(start_room, AIR);
+        self.fill_box(
+            Box3::new(
+                [start_room.min[0], start_shell.min[1], start_room.min[2]],
+                [start_room.max[0], start_shell.min[1], start_room.max[2]],
+            ),
+            DIRT,
+        );
+
+        self.fill_box(corridor_shell, STONE);
+        self.fill_box(corridor, AIR);
+        self.fill_box(tease_a, AIR);
+        self.fill_box(tease_b, AIR);
+        self.fill_box(atrium, AIR);
+        self.fill_box(balcony, AIR);
+        self.fill_box(panorama, AIR);
+
+        let player_pos = [
+            start_room.center()[0] as f64 + 0.5,
+            (ground_y + 1) as f64,
+            start_room.center()[2] as f64 + 0.5,
+        ];
+        DemoLayout {
+            player_pos,
+            player_yaw: -std::f64::consts::FRAC_PI_2,
+            player_pitch: 0.0,
+            corridor_mid: corridor.center(),
+            atrium_center: atrium.center(),
+            reveal_center: balcony.center(),
+        }
     }
 
     pub fn population(&self) -> u64 {
@@ -618,15 +1246,25 @@ impl World {
     fn commit_step(&mut self, next: &[CellState], side: usize) {
         self.root = self.store.from_flat(next, side);
         self.generation += 1;
+        self.block_rule_present = None;
 
         // Fresh-store compaction: `from_flat` interned a brand new generation
         // into the append-only store, leaving the previous generation's
         // subtrees unreachable but still present. Rebuild into a fresh store
         // so memory tracks live-scene size, not cumulative history.
         // See hash-thing-88d.
-        let (new_store, new_root) = self.store.compacted(self.root);
+        //
+        // Brute-force compaction remaps all NodeIds without updating
+        // hashlife_cache, so clear it to prevent stale cross-path hits.
+        // Keep the remap so Svdag can update its persistent NodeId cache
+        // (hash-thing-5bb.11: O(changed) instead of O(reachable)).
+        let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
+        self.last_compaction_remap = Some(remap);
+        self.hashlife_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
     }
 
     /// Replace the world with terrain generated from `params`. Uses
@@ -645,50 +1283,84 @@ impl World {
     pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
         params.validate().expect("invalid TerrainParams");
         self.store = NodeStore::new();
-        self.store.clear_step_cache();
-        let field = params.to_heightmap();
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        let heightmap = params.to_heightmap();
+        let precompute_start = std::time::Instant::now();
+        let field = PrecomputedHeightmapField::new(heightmap, self.level);
+        let precompute_us = precompute_start.elapsed().as_micros() as u64;
         let gen_start = std::time::Instant::now();
-        let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        let (root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        stats.precompute_us = precompute_us;
         stats.gen_region_us = gen_start.elapsed().as_micros() as u64;
-        stats.nodes_after_gen = self.store.stats().0;
-        // Opt-in cave-CA post-pass. Runs as a separate stage after the
-        // heightmap recursion so the baseline perf path (and every
-        // pre-caves test) sees identical work when `params.caves` is
-        // `None`.
-        if let Some(cave_params) = params.caves {
-            let cave_start = std::time::Instant::now();
-            root = carve_caves(&mut self.store, root, self.level, &cave_params);
-            stats.cave_us = cave_start.elapsed().as_micros() as u64;
-        }
-        stats.nodes_after_caves = self.store.stats().0;
-        // Opt-in dungeon carving post-pass. Runs after caves so dungeons
-        // carve through already-opened cave networks.
-        if let Some(dungeon_params) = &params.dungeons {
-            let dungeon_start = std::time::Instant::now();
-            root = carve_dungeons(&mut self.store, root, self.level, dungeon_params);
-            stats.dungeon_us = dungeon_start.elapsed().as_micros() as u64;
-        }
-        stats.nodes_after_dungeons = self.store.stats().0;
+        stats.nodes_after_gen = self.store.stats();
         self.root = root;
         self.generation = 0;
+        self.terrain_params = Some(*params);
+        self.block_rule_present = None;
         stats
     }
 }
 
-/// Get the 26 Moore neighbors of a cell, wrapping at boundaries.
+/// Gravity gap-fill: cascading bottom-to-top sweep that fills air gaps
+/// WITHIN gravity-bearing bodies, preventing Margolus rarefaction.
+///
+/// Only swaps cell[y] (air) with cell[y+1] (gravity-bearing) when cell[y-1]
+/// is also gravity-bearing — i.e., only fills internal gaps, never extends
+/// the falling front. This prevents isolated cells from cascading to the
+/// bottom while still compacting bodies after block-rule gravity creates gaps.
+///
+/// Mass-conserving: only swaps, never creates or destroys cells.
+pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &MaterialRegistry) {
+    for z in 0..side {
+        for x in 0..side {
+            for y in 1..side.saturating_sub(1) {
+                let idx_below = x + (y - 1) * side + z * side * side;
+                let idx_cur = x + y * side + z * side * side;
+                let idx_above = x + (y + 1) * side + z * side * side;
+                let below = Cell::from_raw(grid[idx_below]);
+                let cur = Cell::from_raw(grid[idx_cur]);
+                let above = Cell::from_raw(grid[idx_above]);
+                // Only fill gap if: current is air, above is gravity-bearing,
+                // AND below is gravity-bearing (this is an internal gap).
+                if cur.is_empty()
+                    && !above.is_empty()
+                    && materials.block_rule_id_for_cell(above).is_some()
+                    && !below.is_empty()
+                    && materials.block_rule_id_for_cell(below).is_some()
+                {
+                    grid.swap(idx_cur, idx_above);
+                }
+            }
+        }
+    }
+}
+
+/// Get the 26 Moore neighbors of a cell. Out-of-bounds neighbors are
+/// `Cell::EMPTY` (absorbing boundary), matching hashlife's infinite-world
+/// semantics.
 fn get_neighbors(grid: &[CellState], side: usize, x: usize, y: usize, z: usize) -> [Cell; 26] {
     let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;
+    let s = side as i32;
     for dz in [-1i32, 0, 1] {
         for dy in [-1i32, 0, 1] {
             for dx in [-1i32, 0, 1] {
                 if dx == 0 && dy == 0 && dz == 0 {
                     continue;
                 }
-                let nx = (x as i32 + dx).rem_euclid(side as i32) as usize;
-                let ny = (y as i32 + dy).rem_euclid(side as i32) as usize;
-                let nz = (z as i32 + dz).rem_euclid(side as i32) as usize;
-                neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                let nz = z as i32 + dz;
+                if nx >= 0 && nx < s && ny >= 0 && ny < s && nz >= 0 && nz < s {
+                    let nx = nx as usize;
+                    let ny = ny as usize;
+                    let nz = nz as usize;
+                    neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
+                }
+                // else: stays Cell::EMPTY (absorbing boundary)
                 idx += 1;
             }
         }
@@ -721,8 +1393,9 @@ mod tests {
     //! Reference tests for the brute-force dispatch step.
 
     use super::*;
+    use crate::player;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
-    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, STONE, WATER};
+    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, WATER};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -733,6 +1406,10 @@ mod tests {
         let mut world = empty_world();
         world.materials = MaterialRegistry::gol_smoke_with_rule(rule);
         world
+    }
+
+    fn wc(coord: u64) -> WorldCoord {
+        WorldCoord(coord as i64)
     }
 
     fn demo_spectacle_anchors() -> [DemoSpectacleAnchor; 3] {
@@ -755,23 +1432,13 @@ mod tests {
         ]
     }
 
-    fn local_snapshot(world: &World, center: [u64; 3], radius: u64) -> Vec<CellState> {
-        let side = world.side() as u64;
-        let min = [
-            center[0].saturating_sub(radius),
-            center[1].saturating_sub(radius),
-            center[2].saturating_sub(radius),
-        ];
-        let max = [
-            center[0].saturating_add(radius + 1).min(side),
-            center[1].saturating_add(radius + 1).min(side),
-            center[2].saturating_add(radius + 1).min(side),
-        ];
+    fn local_snapshot(world: &World, center: [i64; 3], radius: u64) -> Vec<CellState> {
+        let radius = i64::try_from(radius).expect("demo spectacle radius must fit in i64");
         let mut cells = Vec::new();
-        for z in min[2]..max[2] {
-            for y in min[1]..max[1] {
-                for x in min[0]..max[0] {
-                    cells.push(world.get(x, y, z));
+        for z in (center[2] - radius)..=(center[2] + radius) {
+            for y in (center[1] - radius)..=(center[1] + radius) {
+                for x in (center[0] - radius)..=(center[0] + radius) {
+                    cells.push(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)));
                 }
             }
         }
@@ -803,7 +1470,7 @@ mod tests {
     #[test]
     fn single_cell_dies_under_amoeba() {
         let mut world = gol_world(GameOfLife3D::new(9, 26, 5, 7));
-        world.set(4, 4, 4, ALIVE.raw());
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
         assert_eq!(world.population(), 1);
         world.step();
 
@@ -820,7 +1487,7 @@ mod tests {
     #[test]
     fn single_cell_grows_to_3x3x3_cube_under_crystal() {
         let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
-        world.set(4, 4, 4, ALIVE.raw());
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
         world.step();
 
         assert_eq!(
@@ -833,7 +1500,7 @@ mod tests {
             for y in 3..=5u64 {
                 for x in 3..=5u64 {
                     assert_eq!(
-                        world.get(x, y, z),
+                        world.get(wc(x), wc(y), wc(z)),
                         ALIVE.raw(),
                         "cell ({},{},{}) must be alive inside the expected 3x3x3 cube",
                         x,
@@ -845,12 +1512,12 @@ mod tests {
         }
 
         // Spot-check that cells just outside the cube are still dead.
-        assert_eq!(world.get(2, 4, 4), 0);
-        assert_eq!(world.get(6, 4, 4), 0);
-        assert_eq!(world.get(4, 2, 4), 0);
-        assert_eq!(world.get(4, 6, 4), 0);
-        assert_eq!(world.get(4, 4, 2), 0);
-        assert_eq!(world.get(4, 4, 6), 0);
+        assert_eq!(world.get(wc(2), wc(4), wc(4)), 0);
+        assert_eq!(world.get(wc(6), wc(4), wc(4)), 0);
+        assert_eq!(world.get(wc(4), wc(2), wc(4)), 0);
+        assert_eq!(world.get(wc(4), wc(6), wc(4)), 0);
+        assert_eq!(world.get(wc(4), wc(4), wc(2)), 0);
+        assert_eq!(world.get(wc(4), wc(4), wc(6)), 0);
     }
 
     // -----------------------------------------------------------------
@@ -862,7 +1529,7 @@ mod tests {
         for z in 3..=4u64 {
             for y in 3..=4u64 {
                 for x in 3..=4u64 {
-                    world.set(x, y, z, ALIVE.raw());
+                    world.set(wc(x), wc(y), wc(z), ALIVE.raw());
                 }
             }
         }
@@ -888,7 +1555,7 @@ mod tests {
                                 0
                             };
                         assert_eq!(
-                            world.get(x, y, z),
+                            world.get(wc(x), wc(y), wc(z)),
                             expected,
                             "cell ({},{},{}) has wrong state at gen {}",
                             x,
@@ -912,8 +1579,8 @@ mod tests {
 
         let seeds: &[(u64, u64, u64)] = &[(4, 4, 4), (3, 4, 5), (5, 2, 4)];
         for &(x, y, z) in seeds {
-            world_a.set(x, y, z, ALIVE.raw());
-            world_b.set(x, y, z, ALIVE.raw());
+            world_a.set(wc(x), wc(y), wc(z), ALIVE.raw());
+            world_b.set(wc(x), wc(y), wc(z), ALIVE.raw());
         }
 
         for _ in 0..3 {
@@ -941,7 +1608,7 @@ mod tests {
     fn corner_single_cell_dies_under_amoeba() {
         let mut world = gol_world(GameOfLife3D::new(9, 26, 5, 7));
         let side = world.side() as u64;
-        world.set(side - 1, side - 1, side - 1, ALIVE.raw());
+        world.set(wc(side - 1), wc(side - 1), wc(side - 1), ALIVE.raw());
         assert_eq!(world.population(), 1);
         world.step();
 
@@ -1051,6 +1718,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn seed_lattice_megastructure_produces_active_materials() {
+        let mut w = World::new(6); // side 64
+        w.seed_lattice_megastructure();
+        assert!(w.population() > 100, "lattice must have content");
+        let grid = w.flatten();
+        let has = |mat: CellState| grid.contains(&mat);
+        assert!(has(STONE), "lattice must have stone");
+        assert!(has(GRASS), "lattice must have grass pillars");
+        assert!(has(WATER), "lattice must have water channels");
+        assert!(has(FIRE), "lattice must have fire sources");
+    }
+
+    #[test]
+    fn seed_lattice_megastructure_matches_terrain_outside_structure_zone() {
+        let mut world = World::new(6);
+        world.seed_lattice_megastructure();
+
+        let params = TerrainParams::for_level(6);
+        let terrain = PrecomputedHeightmapField::new(params.to_heightmap(), 6);
+        let point = [0i64, 20, 20];
+        let point_world = [0u64, 20, 20];
+
+        assert_eq!(
+            world.get(wc(point_world[0]), wc(point_world[1]), wc(point_world[2])),
+            crate::terrain::WorldGen::sample(&terrain, point)
+        );
+    }
+
+    #[test]
+    fn seed_gyroid_megastructure_produces_walkable_structure() {
+        let mut w = World::new(6); // side 64
+        let stats = w.seed_gyroid_megastructure();
+        assert!(w.population() > 100, "gyroid must have content");
+        assert!(
+            stats.total_collapses() > 0,
+            "gyroid should collapse some uniform regions: {stats:?}"
+        );
+        let grid = w.flatten();
+        assert!(grid.contains(&STONE), "gyroid must contain stone");
+        assert!(
+            grid.contains(&0),
+            "gyroid must leave air voids to walk through"
+        );
+    }
+
+    #[test]
+    fn lattice_progression_demo_spawn_and_waypoints_are_open() {
+        let mut w = World::new(6); // side 64
+        let layout = w.seed_lattice_progression_demo();
+
+        assert!(
+            !player::player_collides(&w, &layout.player_pos),
+            "demo spawn must be walkable: {:?}",
+            layout.player_pos
+        );
+
+        for checkpoint in [
+            layout.corridor_mid,
+            layout.atrium_center,
+            layout.reveal_center,
+        ] {
+            assert_eq!(
+                w.get(
+                    WorldCoord(checkpoint[0]),
+                    WorldCoord(checkpoint[1]),
+                    WorldCoord(checkpoint[2]),
+                ),
+                AIR,
+                "checkpoint must be air: {checkpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lattice_progression_demo_preserves_lattice_materials() {
+        let mut w = World::new(6); // side 64
+        let _layout = w.seed_lattice_progression_demo();
+        let grid = w.flatten();
+        let has = |mat: CellState| grid.contains(&mat);
+
+        assert!(
+            has(STONE),
+            "progression demo must still have stone structure"
+        );
+        assert!(has(GRASS), "progression demo must still have lattice walls");
+        assert!(
+            has(WATER),
+            "progression demo must still preserve water channels"
+        );
+        assert!(
+            has(FIRE),
+            "progression demo must still preserve fire accents"
+        );
+    }
+
     // -----------------------------------------------------------------
     // 9-11. Bounds check on World::set / World::get (hash-thing-fb5).
     // -----------------------------------------------------------------
@@ -1059,27 +1822,27 @@ mod tests {
     #[should_panic(expected = "out of bounds")]
     fn world_set_panics_oob() {
         let mut w = World::new(2); // side 4
-        w.set(4, 0, 0, ALIVE.raw());
+        w.set(wc(4), wc(0), wc(0), ALIVE.raw());
     }
 
     #[test]
     fn world_set_in_bounds_at_max_corner() {
         let mut w = World::new(2); // side 4
-        w.set(3, 3, 3, ALIVE.raw());
-        assert_eq!(w.get(3, 3, 3), ALIVE.raw());
+        w.set(wc(3), wc(3), wc(3), ALIVE.raw());
+        assert_eq!(w.get(wc(3), wc(3), wc(3)), ALIVE.raw());
         // And the complementary corner — distinct material id 2, metadata 0.
         let mat2 = Cell::pack(2, 0).raw();
-        w.set(0, 0, 0, mat2);
-        assert_eq!(w.get(0, 0, 0), mat2);
+        w.set(wc(0), wc(0), wc(0), mat2);
+        assert_eq!(w.get(wc(0), wc(0), wc(0)), mat2);
     }
 
     #[test]
     fn world_get_returns_zero_oob() {
         let w = World::new(2); // side 4
-        assert_eq!(w.get(4, 0, 0), 0);
-        assert_eq!(w.get(0, 4, 0), 0);
-        assert_eq!(w.get(0, 0, 4), 0);
-        assert_eq!(w.get(u64::MAX, 0, 0), 0);
+        assert_eq!(w.get(wc(4), wc(0), wc(0)), 0);
+        assert_eq!(w.get(wc(0), wc(4), wc(0)), 0);
+        assert_eq!(w.get(wc(0), wc(0), wc(4)), 0);
+        assert_eq!(w.get(WorldCoord(-1), wc(0), wc(0)), 0);
     }
 
     // -----------------------------------------------------------------
@@ -1091,10 +1854,10 @@ mod tests {
         let params = TerrainParams::default();
 
         let _ = world.seed_terrain(&params);
-        let nodes_after_first = world.store.stats().0;
+        let nodes_after_first = world.store.stats();
 
         let _ = world.seed_terrain(&params);
-        let nodes_after_second = world.store.stats().0;
+        let nodes_after_second = world.store.stats();
 
         assert_eq!(
             nodes_after_first, nodes_after_second,
@@ -1107,52 +1870,52 @@ mod tests {
     #[test]
     fn water_turns_to_stone_when_fire_is_adjacent() {
         let mut world = empty_world();
-        world.set(4, 4, 4, WATER);
-        world.set(5, 4, 4, FIRE);
+        world.set(wc(4), wc(4), wc(4), WATER);
+        world.set(wc(5), wc(4), wc(4), FIRE);
 
         world.step();
 
-        assert_eq!(world.get(4, 4, 4), STONE);
+        assert_eq!(world.get(wc(4), wc(4), wc(4)), STONE);
     }
 
     #[test]
     fn isolated_fire_burns_out() {
         let mut world = empty_world();
-        world.set(4, 4, 4, FIRE);
+        world.set(wc(4), wc(4), wc(4), FIRE);
 
         world.step();
 
-        assert_eq!(world.get(4, 4, 4), 0);
+        assert_eq!(world.get(wc(4), wc(4), wc(4)), 0);
     }
 
     #[test]
     fn fire_persists_next_to_grass_fuel() {
         let mut world = empty_world();
-        world.set(4, 4, 4, FIRE);
-        world.set(5, 4, 4, GRASS);
+        world.set(wc(4), wc(4), wc(4), FIRE);
+        world.set(wc(5), wc(4), wc(4), GRASS);
 
         world.step();
 
-        assert_eq!(world.get(4, 4, 4), FIRE);
-        assert_eq!(world.get(5, 4, 4), GRASS);
+        assert_eq!(world.get(wc(4), wc(4), wc(4)), FIRE);
+        assert_eq!(world.get(wc(5), wc(4), wc(4)), GRASS);
     }
 
     #[test]
     fn step_dispatches_fire_and_water_rules_independently() {
         let mut world = empty_world();
 
-        world.set(2, 2, 2, FIRE);
-        world.set(3, 2, 2, GRASS);
+        world.set(wc(2), wc(2), wc(2), FIRE);
+        world.set(wc(3), wc(2), wc(2), GRASS);
 
-        world.set(5, 5, 5, WATER);
-        world.set(6, 5, 5, FIRE);
+        world.set(wc(5), wc(5), wc(5), WATER);
+        world.set(wc(6), wc(5), wc(5), FIRE);
 
         world.step();
 
-        assert_eq!(world.get(2, 2, 2), FIRE);
-        assert_eq!(world.get(3, 2, 2), GRASS);
-        assert_eq!(world.get(5, 5, 5), STONE);
-        assert_eq!(world.get(6, 5, 5), 0);
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), FIRE);
+        assert_eq!(world.get(wc(3), wc(2), wc(2)), GRASS);
+        assert_eq!(world.get(wc(5), wc(5), wc(5)), STONE);
+        assert_eq!(world.get(wc(6), wc(5), wc(5)), 0);
     }
 
     // -----------------------------------------------------------------
@@ -1197,8 +1960,8 @@ mod tests {
             .assign_block_rule(STONE_MATERIAL_ID, identity_id);
 
         // Place some stone cells.
-        world.set(2, 4, 2, STONE);
-        world.set(3, 4, 2, STONE);
+        world.set(wc(2), wc(4), wc(2), STONE);
+        world.set(wc(3), wc(4), wc(2), STONE);
         let pop_before = world.population();
         let flat_before = world.flatten();
 
@@ -1216,10 +1979,14 @@ mod tests {
         // Place dirt at y=3 (top of block), air at y=2 (bottom of block).
         // Block origin = (2,2,2), so positions (2,2,2) and (2,3,2) are
         // in the same block column.
-        world.set(2, 3, 2, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
-        assert_eq!(world.get(2, 2, 2), 0, "bottom should be air initially");
+        world.set(wc(2), wc(3), wc(2), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
         assert_eq!(
-            world.get(2, 3, 2),
+            world.get(wc(2), wc(2), wc(2)),
+            0,
+            "bottom should be air initially"
+        );
+        assert_eq!(
+            world.get(wc(2), wc(3), wc(2)),
             Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
             "top should be dirt initially"
         );
@@ -1228,20 +1995,20 @@ mod tests {
 
         // After step, dirt should have fallen from y=3 to y=2.
         assert_eq!(
-            world.get(2, 2, 2),
+            world.get(wc(2), wc(2), wc(2)),
             Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
             "dirt should have fallen to bottom"
         );
-        assert_eq!(world.get(2, 3, 2), 0, "top should now be air");
+        assert_eq!(world.get(wc(2), wc(3), wc(2)), 0, "top should now be air");
     }
 
     #[test]
     fn gravity_conserves_population() {
         let mut world = gravity_world(&[DIRT_MATERIAL_ID, WATER_MATERIAL_ID]);
         // Scatter some cells in even-aligned positions.
-        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
-        world.set(2, 1, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
-        world.set(4, 3, 4, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(wc(0), wc(1), wc(0), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(wc(2), wc(1), wc(2), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.set(wc(4), wc(3), wc(4), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
         let pop_before = world.population();
 
         for _ in 0..4 {
@@ -1261,17 +2028,17 @@ mod tests {
         // A cell at (1,1,1) is in the even block but NOT the odd block's origin.
         let mut world = gravity_world(&[DIRT_MATERIAL_ID]);
         // Place dirt at (0, 1, 0) — in even block (0,0,0), column (0,_,0).
-        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(wc(0), wc(1), wc(0), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
         assert_eq!(world.generation, 0);
 
         // Gen 0 (even offset=0): block (0,0,0) is active → dirt falls from y=1 to y=0.
         world.step();
         assert_eq!(
-            world.get(0, 0, 0),
+            world.get(wc(0), wc(0), wc(0)),
             Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
             "dirt should fall on even generation"
         );
-        assert_eq!(world.get(0, 1, 0), 0);
+        assert_eq!(world.get(wc(0), wc(1), wc(0)), 0);
     }
 
     #[test]
@@ -1292,8 +2059,8 @@ mod tests {
             .assign_block_rule(WATER_MATERIAL_ID, gravity_b);
 
         // Place dirt and water in the same block — different rule IDs.
-        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
-        world.set(1, 0, 0, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.set(wc(0), wc(1), wc(0), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(wc(1), wc(0), wc(0), Cell::pack(WATER_MATERIAL_ID, 0).raw());
 
         let flat_before = world.flatten();
         world.step();
@@ -1314,19 +2081,19 @@ mod tests {
         // Block at (0,0,0): stone at bottom, dirt at top of same column.
         // Gravity would swap them if stone were participating, but stone
         // has no block_rule_id so it should be anchored.
-        world.set(0, 0, 0, Cell::pack(STONE_MATERIAL_ID, 0).raw());
-        world.set(0, 1, 0, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(wc(0), wc(0), wc(0), Cell::pack(STONE_MATERIAL_ID, 0).raw());
+        world.set(wc(0), wc(1), wc(0), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
 
         world.step();
 
         // Stone stays at (0,0,0) — anchored. Dirt can't displace it.
         assert_eq!(
-            world.get(0, 0, 0),
+            world.get(wc(0), wc(0), wc(0)),
             Cell::pack(STONE_MATERIAL_ID, 0).raw(),
             "stone (no block rule) must not be moved by dirt's gravity"
         );
         assert_eq!(
-            world.get(0, 1, 0),
+            world.get(wc(0), wc(1), wc(0)),
             Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
             "dirt should stay since stone below is anchored"
         );
@@ -1337,8 +2104,8 @@ mod tests {
         let make_world = || {
             let mut w = gravity_world(&[DIRT_MATERIAL_ID]);
             w.simulation_seed = 12345;
-            w.set(2, 3, 2, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
-            w.set(4, 5, 4, Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+            w.set(wc(2), wc(3), wc(2), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+            w.set(wc(4), wc(5), wc(4), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
             w
         };
 
@@ -1356,19 +2123,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn invalidate_rule_caches_clears_step_cache() {
-        let mut world = World::new(3);
-        let input = world.store.leaf(Cell::pack(DIRT_MATERIAL_ID, 0).raw());
-        let output = world.store.leaf(Cell::pack(WATER_MATERIAL_ID, 0).raw());
-        world.store.cache_step(input, output);
-        assert_eq!(world.store.get_cached_step(input), Some(output));
-
-        world.invalidate_rule_caches();
-
-        assert_eq!(world.store.get_cached_step(input), None);
-    }
-
     // -----------------------------------------------------------------
     // FluidBlockRule integration tests (hash-thing-1v0.18).
     // -----------------------------------------------------------------
@@ -1377,8 +2131,12 @@ mod tests {
     fn fluid_water_falls_under_gravity() {
         let mut world = World::new(3); // 8x8x8, terrain_defaults includes FluidBlockRule
                                        // Place water at y=3, air at y=2 — same block column at even offset.
-        world.set(2, 3, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
-        assert_eq!(world.get(2, 2, 2), 0, "bottom should be air initially");
+        world.set(wc(2), wc(3), wc(2), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        assert_eq!(
+            world.get(wc(2), wc(2), wc(2)),
+            0,
+            "bottom should be air initially"
+        );
 
         world.step();
 
@@ -1387,7 +2145,7 @@ mod tests {
         // depending on rng_hash, so we don't assert the exact landing position.
         assert_eq!(world.population(), 1, "exactly one water cell must survive");
         assert_eq!(
-            world.get(2, 3, 2),
+            world.get(wc(2), wc(3), wc(2)),
             0,
             "water must have left its original position at y=3"
         );
@@ -1395,9 +2153,11 @@ mod tests {
 
     #[test]
     fn fluid_conserves_population() {
-        let mut world = World::new(3);
-        world.set(2, 3, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
-        world.set(4, 5, 4, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        // Level 4 (16³) keeps cells well inside the absorbing boundary
+        // over 6 steps so mass conservation holds.
+        let mut world = World::new(4);
+        world.set(wc(5), wc(6), wc(5), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.set(wc(8), wc(9), wc(8), Cell::pack(WATER_MATERIAL_ID, 0).raw());
         let pop_before = world.population();
 
         for _ in 0..6 {
@@ -1419,7 +2179,7 @@ mod tests {
         world.simulation_seed = 42;
         // Place water at (2,2,2) — bottom-left of block at (2,2,2).
         // Positions (3,2,2) and (2,2,3) are in the same block and are air.
-        world.set(2, 2, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        world.set(wc(2), wc(2), wc(2), Cell::pack(WATER_MATERIAL_ID, 0).raw());
 
         // Run several steps. Lateral spread is probabilistic (depends on
         // rng_hash), but over multiple steps with alternating offsets the
@@ -1443,8 +2203,8 @@ mod tests {
         let make = || {
             let mut w = World::new(3);
             w.simulation_seed = 999;
-            w.set(2, 3, 2, Cell::pack(WATER_MATERIAL_ID, 0).raw());
-            w.set(4, 5, 4, Cell::pack(WATER_MATERIAL_ID, 0).raw());
+            w.set(wc(2), wc(3), wc(2), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+            w.set(wc(4), wc(5), wc(4), Cell::pack(WATER_MATERIAL_ID, 0).raw());
             w
         };
 
@@ -1462,49 +2222,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // seed_terrain with dungeons integration test (hash-thing-3fq.10).
-    // -----------------------------------------------------------------
-
-    use crate::terrain::DungeonParams;
-
-    #[test]
-    fn seed_terrain_with_dungeons_reduces_stone() {
-        let mut world_no_dungeons = World::new(6);
-        let params_no = TerrainParams::default();
-        let _ = world_no_dungeons.seed_terrain(&params_no);
-        let pop_no = world_no_dungeons.population();
-
-        let mut world_dungeons = World::new(6);
-        let params_yes = TerrainParams {
-            dungeons: Some(DungeonParams::default()),
-            ..Default::default()
-        };
-        let stats = world_dungeons.seed_terrain(&params_yes);
-        let pop_yes = world_dungeons.population();
-
-        assert!(
-            pop_yes < pop_no,
-            "dungeons must carve some stone: pop_no={pop_no}, pop_yes={pop_yes}",
-        );
-        assert!(
-            stats.dungeon_us > 0,
-            "dungeon_us must be populated when dungeons are enabled",
-        );
-        assert!(
-            stats.nodes_after_dungeons > 0,
-            "nodes_after_dungeons must be populated",
-        );
-    }
-
-    #[test]
-    fn seed_terrain_without_dungeons_has_zero_dungeon_stats() {
-        let mut world = World::new(6);
-        let params = TerrainParams::default();
-        let stats = world.seed_terrain(&params);
-        assert_eq!(stats.dungeon_us, 0);
-    }
-
     // ---- ensure_contains (hash-thing-e9h) ----
 
     #[test]
@@ -1512,7 +2229,7 @@ mod tests {
         let mut world = World::new(3); // 8x8x8
         let level_before = world.level;
         let root_before = world.root;
-        world.ensure_contains(7, 7, 7);
+        world.ensure_contains(wc(7), wc(7), wc(7));
         assert_eq!(world.level, level_before);
         assert_eq!(world.root, root_before);
     }
@@ -1520,38 +2237,38 @@ mod tests {
     #[test]
     fn ensure_contains_grows_root_once() {
         let mut world = World::new(3); // 8x8x8, side=8
-        world.set(5, 3, 2, STONE);
-        world.ensure_contains(8, 0, 0); // just past the edge
+        world.set(wc(5), wc(3), wc(2), STONE);
+        world.ensure_contains(wc(8), wc(0), wc(0)); // just past the edge
         assert_eq!(world.level, 4); // grew once: side=16
         assert_eq!(world.side(), 16);
         // Original cell survives at its original coordinate.
-        assert_eq!(world.get(5, 3, 2), STONE);
+        assert_eq!(world.get(wc(5), wc(3), wc(2)), STONE);
         // The newly accessible region is empty.
-        assert_eq!(world.get(8, 0, 0), 0);
-        assert_eq!(world.get(15, 15, 15), 0);
+        assert_eq!(world.get(wc(8), wc(0), wc(0)), 0);
+        assert_eq!(world.get(wc(15), wc(15), wc(15)), 0);
     }
 
     #[test]
     fn ensure_contains_grows_multiple_levels() {
         let mut world = World::new(2); // 4x4x4
-        world.set(1, 2, 3, FIRE);
+        world.set(wc(1), wc(2), wc(3), FIRE);
         // Coordinate 100 requires level >= 7 (side=128).
-        world.ensure_contains(100, 0, 0);
+        world.ensure_contains(wc(100), wc(0), wc(0));
         assert!(world.level >= 7);
         assert!(world.side() > 100);
         // Original cell survives.
-        assert_eq!(world.get(1, 2, 3), FIRE);
+        assert_eq!(world.get(wc(1), wc(2), wc(3)), FIRE);
     }
 
     #[test]
     fn ensure_contains_works_on_all_axes() {
         let mut world = World::new(3); // 8x8x8
                                        // Grow for Y axis.
-        world.ensure_contains(0, 10, 0);
+        world.ensure_contains(wc(0), wc(10), wc(0));
         assert!(world.side() > 10);
         let level_after_y = world.level;
         // Grow for Z axis (further).
-        world.ensure_contains(0, 0, 100);
+        world.ensure_contains(wc(0), wc(0), wc(100));
         assert!(world.level > level_after_y);
         assert!(world.side() > 100);
     }
@@ -1559,20 +2276,20 @@ mod tests {
     #[test]
     fn ensure_contains_then_set_roundtrips() {
         let mut world = World::new(3); // 8x8x8
-        world.ensure_contains(20, 20, 20);
-        world.set(20, 20, 20, WATER);
-        assert_eq!(world.get(20, 20, 20), WATER);
+        world.ensure_contains(wc(20), wc(20), wc(20));
+        world.set(wc(20), wc(20), wc(20), WATER);
+        assert_eq!(world.get(wc(20), wc(20), wc(20)), WATER);
         // Other cells in the expanded region remain empty.
-        assert_eq!(world.get(19, 20, 20), 0);
+        assert_eq!(world.get(wc(19), wc(20), wc(20)), 0);
     }
 
     #[test]
     fn ensure_contains_preserves_population() {
         let mut world = World::new(3);
-        world.set(0, 0, 0, STONE);
-        world.set(7, 7, 7, FIRE);
+        world.set(wc(0), wc(0), wc(0), STONE);
+        world.set(wc(7), wc(7), wc(7), FIRE);
         let pop_before = world.population();
-        world.ensure_contains(100, 100, 100);
+        world.ensure_contains(wc(100), wc(100), wc(100));
         assert_eq!(world.population(), pop_before);
     }
 
@@ -1582,37 +2299,49 @@ mod tests {
     fn ensure_region_noop_when_in_bounds() {
         let mut world = World::new(3);
         let level_before = world.level;
-        world.ensure_region([0, 0, 0], [7, 7, 7]);
+        world.ensure_region(
+            [WorldCoord(0), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(7), WorldCoord(7), WorldCoord(7)],
+        );
         assert_eq!(world.level, level_before);
     }
 
     #[test]
     fn ensure_region_grows_for_max_corner() {
         let mut world = World::new(3); // 8x8x8
-        world.set(2, 3, 4, STONE);
-        world.ensure_region([0, 0, 0], [20, 20, 20]);
+        world.set(wc(2), wc(3), wc(4), STONE);
+        world.ensure_region(
+            [WorldCoord(0), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(20), WorldCoord(20), WorldCoord(20)],
+        );
         assert!(world.side() > 20);
         // Existing cell survives.
-        assert_eq!(world.get(2, 3, 4), STONE);
+        assert_eq!(world.get(wc(2), wc(3), wc(4)), STONE);
     }
 
     #[test]
     fn ensure_region_then_set_covers_full_box() {
         let mut world = World::new(3);
-        world.ensure_region([10, 10, 10], [20, 20, 20]);
+        world.ensure_region(
+            [WorldCoord(10), WorldCoord(10), WorldCoord(10)],
+            [WorldCoord(20), WorldCoord(20), WorldCoord(20)],
+        );
         // Can set cells at both min and max of the region.
-        world.set(10, 10, 10, FIRE);
-        world.set(20, 20, 20, WATER);
-        assert_eq!(world.get(10, 10, 10), FIRE);
-        assert_eq!(world.get(20, 20, 20), WATER);
+        world.set(wc(10), wc(10), wc(10), FIRE);
+        world.set(wc(20), wc(20), wc(20), WATER);
+        assert_eq!(world.get(wc(10), wc(10), wc(10)), FIRE);
+        assert_eq!(world.get(wc(20), wc(20), wc(20)), WATER);
     }
 
     #[test]
     fn ensure_region_single_point_matches_ensure_contains() {
         let mut w1 = World::new(3);
         let mut w2 = World::new(3);
-        w1.ensure_contains(50, 50, 50);
-        w2.ensure_region([50, 50, 50], [50, 50, 50]);
+        w1.ensure_contains(wc(50), wc(50), wc(50));
+        w2.ensure_region(
+            [WorldCoord(50), WorldCoord(50), WorldCoord(50)],
+            [WorldCoord(50), WorldCoord(50), WorldCoord(50)],
+        );
         assert_eq!(w1.level, w2.level);
     }
 
@@ -1626,21 +2355,25 @@ mod tests {
         let mut world = World::new(3); // 8x8x8
                                        // Place water at y=3 with air below. Block lateral escape routes
                                        // with stone so we isolate the gravity behavior.
-        world.set(2, 3, 2, WATER);
-        world.set(3, 2, 2, STONE); // block x-spread
-        world.set(2, 2, 3, STONE); // block z-spread
-        assert_eq!(world.get(2, 3, 2), WATER);
-        assert_eq!(world.get(2, 2, 2), 0);
+        world.set(wc(2), wc(3), wc(2), WATER);
+        world.set(wc(3), wc(2), wc(2), STONE); // block x-spread
+        world.set(wc(2), wc(2), wc(3), STONE); // block z-spread
+        assert_eq!(world.get(wc(2), wc(3), wc(2)), WATER);
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), 0);
 
         world.step(); // gen 0 → 1 (even offset=0, block at (2,2,2))
 
         // Water should have fallen from y=3 to y=2 via FluidBlockRule gravity.
         assert_eq!(
-            world.get(2, 2, 2),
+            world.get(wc(2), wc(2), wc(2)),
             WATER,
             "water should fall to y=2 via FluidBlockRule"
         );
-        assert_eq!(world.get(2, 3, 2), 0, "y=3 should be air after water fell");
+        assert_eq!(
+            world.get(wc(2), wc(3), wc(2)),
+            0,
+            "y=3 should be air after water fell"
+        );
     }
 
     #[test]
@@ -1661,5 +2394,719 @@ mod tests {
             world.population() > 0,
             "world should still have cells after stepping"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // RealizedRegion (hash-thing-ica).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn region_side_matches_world() {
+        let world = World::new(5);
+        let r = world.region();
+        assert_eq!(r.side(), 32);
+        assert_eq!(r.side() as usize, world.side());
+        assert_eq!(r.level, 5);
+        assert_eq!(r.origin, [0, 0, 0]);
+    }
+
+    #[test]
+    fn region_contains_boundary() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 3,
+        }; // side=8
+        assert!(r.contains(0, 0, 0));
+        assert!(r.contains(7, 7, 7));
+        assert!(!r.contains(8, 0, 0));
+        assert!(!r.contains(0, 8, 0));
+        assert!(!r.contains(0, 0, 8));
+    }
+
+    #[test]
+    fn region_contains_with_origin() {
+        let r = RealizedRegion {
+            origin: [10, 20, 30],
+            level: 2,
+        }; // side=4
+        assert!(r.contains(10, 20, 30));
+        assert!(r.contains(13, 23, 33));
+        assert!(!r.contains(14, 20, 30)); // just past
+        assert!(!r.contains(9, 20, 30)); // just before
+    }
+
+    #[test]
+    fn region_octant_of_corners() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 4,
+        }; // side=16, half=8
+        assert_eq!(r.octant_of(0, 0, 0), 0); // (0,0,0)
+        assert_eq!(r.octant_of(8, 0, 0), 1); // (1,0,0)
+        assert_eq!(r.octant_of(0, 8, 0), 2); // (0,1,0)
+        assert_eq!(r.octant_of(8, 8, 0), 3); // (1,1,0)
+        assert_eq!(r.octant_of(0, 0, 8), 4); // (0,0,1)
+        assert_eq!(r.octant_of(15, 15, 15), 7); // (1,1,1)
+    }
+
+    #[test]
+    #[should_panic(expected = "outside realized region")]
+    fn region_octant_of_oob_panics() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 3,
+        };
+        r.octant_of(8, 0, 0);
+    }
+
+    #[test]
+    fn region_display() {
+        let r = RealizedRegion {
+            origin: [0, 0, 0],
+            level: 6,
+        };
+        let s = format!("{r}");
+        assert!(s.contains("level=6"), "display should show level");
+        assert!(s.contains("64³"), "display should show side cubed");
+    }
+
+    #[test]
+    fn region_tracks_ensure_contains_growth() {
+        let mut world = World::new(3); // side=8
+        assert_eq!(world.region().side(), 8);
+        world.ensure_contains(wc(20), wc(0), wc(0));
+        assert!(world.region().side() > 20);
+        assert_eq!(world.region().level, world.level);
+    }
+
+    // ── Lazy terrain expansion (3fq.4) ────────────────────────────
+
+    #[test]
+    fn expand_without_terrain_produces_empty_siblings() {
+        let mut world = World::new(3); // side=8
+        world.set(wc(0), wc(0), wc(0), ALIVE.raw());
+        let pop_before = world.population();
+        world.ensure_contains(wc(10), wc(0), wc(0));
+        // Only the original cell survives — new octants are empty.
+        assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn expand_with_terrain_populates_new_octants() {
+        let mut world = World::new(3); // side=8
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+        let pop_initial = world.population();
+        assert!(pop_initial > 0, "terrain should produce non-empty world");
+
+        // Expand into +x. The new octant at (8..16, 0..8, 0..8) should
+        // have generated terrain, not empty space.
+        world.ensure_contains(wc(10), wc(0), wc(0));
+        let pop_after = world.population();
+        assert!(
+            pop_after > pop_initial,
+            "expansion should add terrain: before={pop_initial}, after={pop_after}"
+        );
+    }
+
+    #[test]
+    fn expand_terrain_is_deterministic() {
+        let params = TerrainParams::default();
+
+        let mut w1 = World::new(3);
+        w1.seed_terrain(&params);
+        w1.ensure_contains(wc(10), wc(0), wc(0));
+
+        let mut w2 = World::new(3);
+        w2.seed_terrain(&params);
+        w2.ensure_contains(wc(10), wc(0), wc(0));
+
+        // Same params + same expansion → same world.
+        assert_eq!(w1.level, w2.level);
+        assert_eq!(w1.population(), w2.population());
+        // Spot-check a cell in the expanded region.
+        assert_eq!(w1.get(wc(10), wc(3), wc(3)), w2.get(wc(10), wc(3), wc(3)));
+    }
+
+    #[test]
+    fn expand_terrain_preserves_original_cells() {
+        let mut world = World::new(3);
+        let params = TerrainParams::default();
+        world.seed_terrain(&params);
+
+        // Record some cells from the original region.
+        let cells_before: Vec<_> = (0..8u64).map(|x| world.get(wc(x), wc(3), wc(3))).collect();
+
+        world.ensure_contains(wc(10), wc(0), wc(0));
+
+        // Original region cells are unchanged.
+        for (x, &expected) in cells_before.iter().enumerate() {
+            assert_eq!(
+                world.get(wc(x as u64), wc(3), wc(3)),
+                expected,
+                "cell at ({x}, 3, 3) changed after expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_terrain_matches_direct_gen() {
+        // A world grown by expansion should produce the same terrain
+        // as one generated at the larger size from the start. This
+        // verifies there are no seams at expansion boundaries.
+        let params = TerrainParams::default();
+
+        // Path A: generate at level 3, then expand to level 4.
+        let mut grown = World::new(3);
+        grown.seed_terrain(&params);
+        grown.ensure_contains(wc(10), wc(0), wc(0)); // grows to level 4
+
+        // Path B: generate at level 4 directly.
+        let mut direct = World::new(4);
+        direct.seed_terrain(&params);
+
+        // Spot-check cells across the expansion boundary (x=8 is the seam).
+        for x in 0..16u64 {
+            for yz in [0u64, 3, 7] {
+                assert_eq!(
+                    grown.get(wc(x), wc(yz), wc(yz)),
+                    direct.get(wc(x), wc(yz), wc(yz)),
+                    "seam mismatch at ({x}, {yz}, {yz})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gol_world_expand_stays_empty() {
+        // GoL smoke worlds don't set terrain_params, so expansion is empty.
+        let mut world = World::new(3);
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        assert!(world.terrain_params.is_none());
+        world.ensure_contains(wc(20), wc(0), wc(0));
+        // Only the single cell we placed.
+        assert_eq!(world.population(), 1);
+    }
+
+    #[test]
+    fn probe_matches_get() {
+        let mut world = World::new(3);
+        let stone = crate::terrain::materials::STONE;
+        world.set(wc(1), wc(2), wc(3), stone);
+        assert_eq!(
+            world.probe(wc(1), wc(2), wc(3)),
+            world.get(wc(1), wc(2), wc(3))
+        );
+        // OOB returns 0 from both
+        assert_eq!(world.probe(WorldCoord(-1), wc(0), wc(0)), 0);
+        assert_eq!(world.probe(wc(100), wc(0), wc(0)), 0);
+    }
+
+    #[test]
+    fn is_realized_inside() {
+        let world = World::new(3); // side=8
+        assert!(world.is_realized(wc(0), wc(0), wc(0)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
+        assert!(world.is_realized(wc(4), wc(2), wc(6)));
+    }
+
+    #[test]
+    fn is_realized_outside() {
+        let world = World::new(3); // side=8
+        assert!(!world.is_realized(WorldCoord(-1), wc(0), wc(0)));
+        assert!(!world.is_realized(wc(8), wc(0), wc(0)));
+        assert!(!world.is_realized(wc(0), wc(100), wc(0)));
+    }
+
+    // --- Mutation channel tests (hash-thing-1v0.9) ---
+
+    #[test]
+    fn apply_mutations_drains_and_applies() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(1),
+            y: wc(2),
+            z: wc(3),
+            state: STONE,
+        });
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(4),
+            y: wc(5),
+            z: wc(6),
+            state: STONE,
+        });
+        assert_eq!(world.queue.len(), 2);
+        world.apply_mutations();
+        assert!(world.queue.is_empty());
+        assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
+        assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    #[test]
+    fn direct_set_clears_hashlife_caches() {
+        let mut world = World::new(3);
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+
+        world.set(wc(3), wc(3), wc(3), STONE);
+
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "direct edits must drop stale recursive cache entries"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "direct edits must drop stale macro-step cache entries"
+        );
+    }
+
+    #[test]
+    fn apply_mutations_clears_hashlife_caches() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(2),
+            y: wc(2),
+            z: wc(2),
+            state: STONE,
+        });
+
+        world.apply_mutations();
+
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "mutation flush must clear stale recursive cache entries"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "mutation flush must clear stale macro-step cache entries"
+        );
+    }
+
+    #[test]
+    fn apply_mutations_last_write_wins() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(3),
+            y: wc(3),
+            z: wc(3),
+            state: STONE,
+        });
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(3),
+            y: wc(3),
+            z: wc(3),
+            state: Cell::pack(WATER_MATERIAL_ID, 0).raw(),
+        });
+        world.apply_mutations();
+        assert_eq!(
+            world.get(wc(3), wc(3), wc(3)),
+            Cell::pack(WATER_MATERIAL_ID, 0).raw()
+        );
+    }
+
+    #[test]
+    fn fill_region_covers_inclusive_box() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::FillRegion {
+            min: [wc(1), wc(1), wc(1)],
+            max: [wc(3), wc(3), wc(3)],
+            state: STONE,
+        });
+        world.apply_mutations();
+        // All 27 cells (3×3×3) should be stone.
+        let mut count = 0;
+        for z in 1..=3 {
+            for y in 1..=3 {
+                for x in 1..=3 {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 27);
+    }
+
+    #[test]
+    fn set_block_fills_cells_per_block_cubed() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // World needs to be large enough: block at (1,0,0) spans cells [8..15]
+        // on x, so we need level >= 4 (side 16).
+        let mut world = World::new(4);
+        world.set_block(1, 0, 0, STONE);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        let mut filled = 0u32;
+        for z in 0..k {
+            for y in 0..k {
+                for x in k..(2 * k) {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(filled, CELLS_PER_BLOCK.pow(3));
+
+        // Cells just outside the block should be empty.
+        assert_eq!(world.get(wc(k - 1), wc(0), wc(0)), 0); // cell 7, just before block
+        assert_eq!(world.get(wc(2 * k), wc(0), wc(0)), 0); // cell 16, just after block
+    }
+
+    #[test]
+    fn set_block_at_origin() {
+        use crate::octree::CELLS_PER_BLOCK;
+        let mut world = World::new(4);
+        world.set_block(0, 0, 0, STONE);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        let mut filled = 0u32;
+        for z in 0..k {
+            for y in 0..k {
+                for x in 0..k {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(filled, CELLS_PER_BLOCK.pow(3));
+    }
+
+    #[test]
+    fn set_block_roundtrip_individual_cells() {
+        use crate::octree::CELLS_PER_BLOCK;
+        let mut world = World::new(4);
+        world.set_block(0, 0, 0, DIRT);
+        world.apply_mutations();
+
+        let k = CELLS_PER_BLOCK as u64;
+        for z in 0..k {
+            for y in 0..k {
+                for x in 0..k {
+                    assert_eq!(
+                        world.get(wc(x), wc(y), wc(z)),
+                        DIRT,
+                        "cell ({x},{y},{z}) should be DIRT"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_block_auto_grows_world() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // Start with a level-3 world (side=8). Block at (1,0,0) needs cells [8..15],
+        // which is out of bounds. set_block should auto-grow to fit.
+        let mut world = World::new(3);
+        world.set_block(1, 0, 0, STONE);
+        world.apply_mutations();
+
+        // World must have grown to at least level 4 (side=16).
+        assert!(
+            world.level >= 4,
+            "world should auto-grow for out-of-bounds block"
+        );
+
+        let k = CELLS_PER_BLOCK as u64;
+        for z in 0..k {
+            for y in 0..k {
+                for x in k..(2 * k) {
+                    assert_eq!(world.get(wc(x), wc(y), wc(z)), STONE);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_fill_vs_cell_fill_node_count() {
+        use crate::octree::CELLS_PER_BLOCK;
+        // Fill a 16³ world with stone: once via set_block, once via individual set calls.
+        // Both should produce identical octrees (hash-consing deduplicates).
+        let k = CELLS_PER_BLOCK as u64;
+        let level = 4u32; // 16³ world
+
+        // Block fill: 2 blocks per axis at K=3 → (16/8)³ = 8 blocks
+        let mut world_block = World::new(level);
+        let blocks_per_axis = (1u64 << level) / k;
+        for bz in 0..blocks_per_axis as i64 {
+            for by in 0..blocks_per_axis as i64 {
+                for bx in 0..blocks_per_axis as i64 {
+                    world_block.set_block(bx, by, bz, STONE);
+                }
+            }
+        }
+        world_block.apply_mutations();
+
+        // Cell fill: 16³ = 4096 individual set calls
+        let mut world_cell = World::new(level);
+        let side = 1u64 << level;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    world_cell.set(wc(x), wc(y), wc(z), STONE);
+                }
+            }
+        }
+
+        // Both should produce the same root (hash-cons identity) — uniform
+        // stone compresses identically regardless of insertion order.
+        assert_eq!(world_block.root, world_cell.root);
+    }
+
+    #[test]
+    fn step_ca_runs_clean_on_empty_queue() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), STONE);
+        world.step_ca(); // should not panic
+        assert_eq!(world.generation, 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pending mutations")]
+    fn step_ca_panics_with_pending_mutations() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(1),
+            y: wc(1),
+            z: wc(1),
+            state: STONE,
+        });
+        world.step_ca(); // should panic
+    }
+
+    #[test]
+    fn sand_falls_under_gravity() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(2), SAND);
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), 0);
+
+        world.step();
+
+        assert_eq!(world.get(wc(2), wc(2), wc(2)), SAND, "sand should fall");
+        assert_eq!(world.get(wc(2), wc(3), wc(2)), 0, "top should be air");
+    }
+
+    #[test]
+    fn sand_conserves_population() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(2), SAND);
+        world.set(wc(4), wc(5), wc(4), SAND);
+        world.set(wc(0), wc(1), wc(0), SAND);
+        let pop_before = world.population();
+
+        for _ in 0..4 {
+            world.step();
+        }
+
+        assert_eq!(
+            world.population(),
+            pop_before,
+            "sand gravity must conserve population"
+        );
+    }
+
+    #[test]
+    fn lava_solidifies_on_water_contact() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), LAVA);
+        world.set(wc(4), wc(3), wc(3), WATER);
+
+        world.step();
+
+        assert_eq!(
+            world.get(wc(3), wc(3), wc(3)),
+            STONE,
+            "lava adjacent to water should solidify into stone"
+        );
+    }
+
+    #[test]
+    fn lava_persists_without_water() {
+        let mut world = World::new(3);
+        world.set(wc(3), wc(3), wc(3), LAVA);
+
+        world.step();
+
+        let pop = world.population();
+        assert!(pop > 0, "lava should not disappear without water");
+    }
+
+    // -----------------------------------------------------------------
+    // Negative-direction world growth (hash-thing-37r).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ensure_contains_negative_shifts_origin() {
+        let mut world = World::new(3);
+        world.set(wc(4), wc(4), wc(4), STONE);
+        world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
+        assert!(
+            world.origin[0] < 0,
+            "origin[0] should be negative after negative growth"
+        );
+        assert_eq!(world.get(wc(4), wc(4), wc(4)), STONE);
+    }
+
+    #[test]
+    fn ensure_contains_negative_preserves_population() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(5), STONE);
+        world.set(wc(6), wc(1), wc(7), WATER);
+        let pop_before = world.population();
+        world.ensure_contains(WorldCoord(-10), WorldCoord(-10), WorldCoord(-10));
+        assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn ensure_contains_negative_then_set_roundtrips() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5));
+        world.set(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5), STONE);
+        assert_eq!(
+            world.get(WorldCoord(-5), WorldCoord(-5), WorldCoord(-5)),
+            STONE
+        );
+    }
+
+    #[test]
+    fn ensure_region_negative_min_grows_correctly() {
+        let mut world = World::new(3);
+        world.ensure_region(
+            [WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)],
+            [WorldCoord(7), WorldCoord(7), WorldCoord(7)],
+        );
+        assert!(world.is_realized(WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
+    }
+
+    #[test]
+    fn negative_growth_origin_tracks_correctly() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
+        let o = world.origin;
+        let side = world.side() as i64;
+        assert!(o[0] <= 0);
+        assert!(o[0] + side >= 8);
+    }
+
+    #[test]
+    fn get_returns_zero_below_origin() {
+        let world = World::new(3);
+        assert_eq!(world.get(WorldCoord(-1), wc(0), wc(0)), 0);
+    }
+
+    #[test]
+    fn mixed_direction_growth_preserves_cells() {
+        let mut world = World::new(3);
+        world.set(wc(2), wc(3), wc(4), STONE);
+        world.set(wc(6), wc(1), wc(7), WATER);
+        world.ensure_region([WorldCoord(-5), wc(0), wc(0)], [wc(0), wc(0), wc(20)]);
+        assert_eq!(world.get(wc(2), wc(3), wc(4)), STONE);
+        assert_eq!(world.get(wc(6), wc(1), wc(7)), WATER);
+    }
+
+    #[test]
+    fn is_realized_works_after_negative_growth() {
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3));
+        assert!(world.is_realized(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3)));
+        assert!(world.is_realized(wc(0), wc(0), wc(0)));
+        assert!(world.is_realized(wc(7), wc(7), wc(7)));
+    }
+
+    /// Reproduction test for hash-thing-u4w: checkerboard density bug.
+    /// A solid block of water should not develop every-other-column air gaps.
+    #[test]
+    fn water_block_no_checkerboard_gaps() {
+        let mut world = World::new(5); // 32³
+                                       // Place a 6×6×6 water block in the center, well away from boundaries.
+        for z in 10..16 {
+            for y in 16..22 {
+                for x in 10..16 {
+                    world.set(wc(x), wc(y), wc(z), WATER);
+                }
+            }
+        }
+        let pop_before = world.population();
+
+        // Step 6 times — enough for the falling front to develop.
+        for step in 0..6 {
+            world.step();
+            let pop_after = world.population();
+            assert_eq!(
+                pop_before, pop_after,
+                "population changed at step {} ({} → {})",
+                step, pop_before, pop_after
+            );
+        }
+
+        // Check: for each y-level that contains water, count water cells.
+        // If there's a checkerboard, some y-levels will have ~50% of expected.
+        let side = world.side() as u64;
+        let grid = world.flatten();
+        let mut water_by_y = vec![0u64; side as usize];
+        for y in 0..side {
+            for z in 0..side {
+                for x in 0..side {
+                    let idx = x as usize
+                        + y as usize * side as usize
+                        + z as usize * side as usize * side as usize;
+                    if Cell::from_raw(grid[idx]).material() == WATER_MATERIAL_ID {
+                        water_by_y[y as usize] += 1;
+                    }
+                }
+            }
+        }
+
+        // Print water distribution for diagnosis
+        eprintln!("Water cells per y-level:");
+        for (y, &count) in water_by_y.iter().enumerate() {
+            if count > 0 {
+                eprintln!("  y={y}: {count} water cells");
+            }
+        }
+
+        // Water should occupy CONTIGUOUS y-levels (no alternating gaps).
+        // Count how many y-levels have water and check for gaps.
+        let water_levels: Vec<usize> = water_by_y
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(y, _)| y)
+            .collect();
+        assert!(
+            !water_levels.is_empty(),
+            "water should still exist after stepping"
+        );
+        // Check for gaps: consecutive water levels should differ by 1.
+        for pair in water_levels.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                1,
+                "gap between y={} and y={} — checkerboard rarefaction bug",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

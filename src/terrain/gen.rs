@@ -1,18 +1,18 @@
 //! Recursive direct-octree builder.
 //!
-//! Recurses against any `&impl RegionField`, short-circuits on proof-based
+//! Recurses against any `&impl WorldGen`, short-circuits on proof-based
 //! uniform classification, and interns through `NodeStore`. The recursion
 //! shape is the load-bearing pattern for every future direct-octree generator
-//! in this codebase (caves 3fq.2, dungeons 3fq.3, infinite worlds 3fq.4,
-//! HashDAG edits) — keep it small and uniform.
+//! in this codebase (infinite worlds 3fq.4, HashDAG edits) — keep it small
+//! and uniform.
 //!
-//! There is exactly one short-circuit path: `RegionField::classify_box`. No
+//! There is exactly one short-circuit path: `WorldGen::classify`. No
 //! corner-agreement heuristic. Heuristic collapse is not allowed in the first
 //! direct-octree generator; it would set the wrong project convention.
 
 use rustc_hash::FxHashMap;
 
-use super::field::RegionField;
+use super::field::WorldGen;
 use crate::octree::node::octant_coords;
 use crate::octree::{CellState, NodeId, NodeStore};
 
@@ -20,10 +20,10 @@ use crate::octree::{CellState, NodeId, NodeStore};
 /// to verify that proof-based collapses actually fire.
 ///
 /// **Field semantics for the "is noise the bottleneck?" question**
-/// (tracked in hash-thing-3fq.5): `leaves` counts `RegionField::sample()`
+/// (tracked in hash-thing-3fq.5): `leaves` counts `WorldGen::sample()`
 /// calls one-for-one — every level-0 build dispatches exactly one sample,
 /// and sampling is the only place noise evaluation lives. `classify_calls`
-/// counts `RegionField::classify_box()` invocations regardless of outcome
+/// counts `WorldGen::classify()` invocations regardless of outcome
 /// (collapse or descent). Together with a one-time `probe_sample_ns`
 /// microbenchmark, you can estimate `sample_time ≈ leaves * ns_per_sample`
 /// and read off the noise fraction of a gen pass without per-call timing
@@ -34,25 +34,19 @@ pub struct GenStats {
     pub calls_per_level: [u64; 32],
     pub collapses_by_proof: [u64; 32],
     pub leaves: u64,
-    /// Total `RegionField::classify_box` invocations, whether they
+    /// Total `WorldGen::classify` invocations, whether they
     /// collapsed or not. Equals `calls_total - leaves` by construction in
     /// the current builder; stored explicitly so a future restructure of
     /// the recursion (e.g. early-outs, lazy child generation) can't silently
     /// break the invariant without a test failing.
     pub classify_calls: u64,
     pub interiors_interned: u64,
+    /// Wall-clock time for the heightmap precomputation pass (set by seed_terrain).
+    pub precompute_us: u64,
     /// Wall-clock time for the heightmap gen_region pass (set by seed_terrain).
     pub gen_region_us: u64,
-    /// Wall-clock time for the cave CA post-pass, 0 if caves disabled.
-    pub cave_us: u64,
-    /// Wall-clock time for the dungeon carving post-pass, 0 if dungeons disabled.
-    pub dungeon_us: u64,
-    /// Node count in the store after gen_region (before caves).
+    /// Node count in the store after gen_region.
     pub nodes_after_gen: usize,
-    /// Node count after cave carving (or same as nodes_after_gen if no caves).
-    pub nodes_after_caves: usize,
-    /// Node count after dungeon carving.
-    pub nodes_after_dungeons: usize,
 }
 
 impl GenStats {
@@ -61,7 +55,7 @@ impl GenStats {
     }
 }
 
-struct Builder<'a, F: RegionField> {
+struct Builder<'a, F: WorldGen> {
     store: &'a mut NodeStore,
     field: &'a F,
     /// Cached canonical uniform NodeIds per `(size_log2, state)`. Avoids
@@ -72,7 +66,7 @@ struct Builder<'a, F: RegionField> {
     stats: GenStats,
 }
 
-impl<'a, F: RegionField> Builder<'a, F> {
+impl<'a, F: WorldGen> Builder<'a, F> {
     fn new(store: &'a mut NodeStore, field: &'a F) -> Self {
         Self {
             store,
@@ -108,7 +102,7 @@ impl<'a, F: RegionField> Builder<'a, F> {
 
         // Proof-based collapse — the only short-circuit.
         self.stats.classify_calls += 1;
-        if let Some(state) = self.field.classify_box(origin, size_log2) {
+        if let Some(state) = self.field.classify(origin, size_log2) {
             self.stats.collapses_by_proof[size_log2 as usize] += 1;
             return self.uniform(size_log2, state);
         }
@@ -130,9 +124,9 @@ impl<'a, F: RegionField> Builder<'a, F> {
     }
 }
 
-/// Build a canonical `NodeId` directly from a `RegionField` over the cube
+/// Build a canonical `NodeId` directly from a `WorldGen` over the cube
 /// `[origin, origin + 2^size_log2)`. World-absolute coordinates.
-pub fn gen_region<F: RegionField>(
+pub fn gen_region<F: WorldGen>(
     store: &mut NodeStore,
     field: &F,
     origin: [i64; 3],
@@ -143,7 +137,7 @@ pub fn gen_region<F: RegionField>(
     (root, builder.stats)
 }
 
-/// Micro-probe for `RegionField::sample()` cost. Runs `samples` sample
+/// Micro-probe for `WorldGen::sample()` cost. Runs `samples` sample
 /// calls over a 64×64×64 coordinate walk and returns `ns/call`. Multiply
 /// by `GenStats::leaves` to estimate how much of a gen pass was spent
 /// inside `sample()` — i.e. "is noise the bottleneck?" — without paying
@@ -159,7 +153,7 @@ pub fn gen_region<F: RegionField>(
 /// This is the "is this thing slow?" signal the hash-thing-3fq.5 bead
 /// asked for. Use it from `main.rs` at terrain reset time and log the
 /// estimated sample fraction alongside total gen time.
-pub fn probe_sample_ns<F: RegionField>(field: &F, samples: u64) -> f64 {
+pub fn probe_sample_ns<F: WorldGen>(field: &F, samples: u64) -> f64 {
     assert!(samples >= 1, "probe_sample_ns needs at least one sample");
     let start = std::time::Instant::now();
     let mut sink: i64 = 0;
@@ -298,6 +292,7 @@ mod tests {
             amplitude: 8.0,
             wavelength: 24.0,
             octaves: 4,
+            sea_level: None,
         }
     }
 
@@ -449,7 +444,7 @@ mod tests {
 
     #[test]
     fn proof_collapses_actually_fire() {
-        // Sanity: on a default heightmap at 64^3, classify_box must short-
+        // Sanity: on a default heightmap at 64^3, classify must short-
         // circuit at least once. Otherwise the trait isn't earning its keep.
         let mut store = NodeStore::new();
         let field = default_heightmap(1);

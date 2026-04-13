@@ -75,19 +75,22 @@ Run these commands to build the complete context:
 ```bash
 # Branch info
 git branch --show-current
-git fetch origin master
 
 # Determine base branch
-git merge-base HEAD origin/master
+BASE_BRANCH=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)
+git fetch origin "${BASE_BRANCH#origin/}"
+
+# Merge-base against the repo default branch
+git merge-base HEAD "$BASE_BRANCH"
 
 # Commits on this branch
-git log --oneline origin/master..HEAD
+git log --oneline "$BASE_BRANCH"..HEAD
 
 # Full diff (not just stat)
-git diff origin/master...HEAD
+git diff "$BASE_BRANCH"...HEAD
 
 # File change summary
-git diff origin/master...HEAD --stat
+git diff "$BASE_BRANCH"...HEAD --stat
 ```
 
 Derive `REVIEW_ID` from the branch name, including enough path context to prevent collisions:
@@ -114,7 +117,7 @@ If no relevant context is found, set `CONTEXT_NOTE` to empty.
 Detect which services were changed by looking at the diff:
 
 ```bash
-git diff origin/master...HEAD --stat
+git diff "$BASE_BRANCH"...HEAD --stat
 ```
 
 Run checks only for changed services:
@@ -144,7 +147,7 @@ Write `notes/.tmp/trident-{REVIEW_ID}/team-review-context.md` with all gathered 
 ## Branch Information
 - **Branch:** {branch name}
 - **Review ID:** {REVIEW_ID}
-- **Base:** origin/master at {merge-base hash}
+- **Base:** {BASE_BRANCH} at {merge-base hash}
 - **Latest Commit:** {HEAD hash}
 
 ## Test Results (Baseline)
@@ -181,12 +184,12 @@ First, concatenate the canonical review prompts with the context document:
 
 ```bash
 # Standard prompt
-cat ~/.claude/commands/code_review.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
+cat .agents/commands/code_review.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 
 # Critical prompt
-cat ~/.claude/commands/code_review_critical.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
+cat .agents/commands/code_review_critical.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 
@@ -216,8 +219,8 @@ PROMPT_EOF
 
 For Gemini, also copy the prompt framework files into the workspace (Gemini sandboxes reads to the workspace):
 ```bash
-cp ~/.claude/commands/code_review.md notes/.tmp/trident-{REVIEW_ID}/
-cp ~/.claude/commands/code_review_critical.md notes/.tmp/trident-{REVIEW_ID}/
+cp .agents/commands/code_review.md notes/.tmp/trident-{REVIEW_ID}/
+cp .agents/commands/code_review_critical.md notes/.tmp/trident-{REVIEW_ID}/
 cp ~/.claude/agents/CodeReview-Evolutionary.md notes/.tmp/trident-{REVIEW_ID}/
 ```
 

@@ -8,7 +8,11 @@ use std::fmt;
 
 use crate::octree::{Cell, CellState};
 use crate::sim::margolus::FluidBlockRule;
-use crate::sim::rule::{BlockRule, CaRule, FireRule, GameOfLife3D, NoopRule, WaterRule};
+use crate::sim::margolus::GravityBlockRule;
+use crate::sim::rule::{
+    AcidRule, BlockRule, CaRule, DissolvableRule, FireRule, FireworkRule, FlammableRule,
+    GameOfLife3D, IceRule, LavaRule, NoopRule, SteamRule, WaterRule,
+};
 
 pub type MaterialId = u16;
 
@@ -20,6 +24,19 @@ pub const DIRT_MATERIAL_ID: MaterialId = 2;
 pub const GRASS_MATERIAL_ID: MaterialId = 3;
 pub const FIRE_MATERIAL_ID: MaterialId = 4;
 pub const WATER_MATERIAL_ID: MaterialId = 5;
+pub const SAND_MATERIAL_ID: MaterialId = 6;
+pub const LAVA_MATERIAL_ID: MaterialId = 7;
+pub const ICE_MATERIAL_ID: MaterialId = 8;
+pub const ACID_MATERIAL_ID: MaterialId = 9;
+pub const OIL_MATERIAL_ID: MaterialId = 10;
+pub const GUNPOWDER_MATERIAL_ID: MaterialId = 11;
+pub const STEAM_MATERIAL_ID: MaterialId = 12;
+pub const GAS_MATERIAL_ID: MaterialId = 13;
+pub const METAL_MATERIAL_ID: MaterialId = 14;
+pub const VINE_MATERIAL_ID: MaterialId = 15;
+pub const FAN_MATERIAL_ID: MaterialId = 16;
+pub const FIREWORK_MATERIAL_ID: MaterialId = 17;
+pub const CLONE_MATERIAL_ID: MaterialId = 18;
 
 pub const AIR: CellState = Cell::EMPTY.raw();
 pub const STONE: CellState = Cell::pack(STONE_MATERIAL_ID, 0).raw();
@@ -27,6 +44,19 @@ pub const DIRT: CellState = Cell::pack(DIRT_MATERIAL_ID, 0).raw();
 pub const GRASS: CellState = Cell::pack(GRASS_MATERIAL_ID, 0).raw();
 pub const FIRE: CellState = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
 pub const WATER: CellState = Cell::pack(WATER_MATERIAL_ID, 0).raw();
+pub const SAND: CellState = Cell::pack(SAND_MATERIAL_ID, 0).raw();
+pub const LAVA: CellState = Cell::pack(LAVA_MATERIAL_ID, 0).raw();
+pub const ICE: CellState = Cell::pack(ICE_MATERIAL_ID, 0).raw();
+pub const ACID: CellState = Cell::pack(ACID_MATERIAL_ID, 0).raw();
+pub const OIL: CellState = Cell::pack(OIL_MATERIAL_ID, 0).raw();
+pub const GUNPOWDER: CellState = Cell::pack(GUNPOWDER_MATERIAL_ID, 0).raw();
+pub const STEAM: CellState = Cell::pack(STEAM_MATERIAL_ID, 0).raw();
+pub const GAS: CellState = Cell::pack(GAS_MATERIAL_ID, 0).raw();
+pub const METAL: CellState = Cell::pack(METAL_MATERIAL_ID, 0).raw();
+pub const VINE: CellState = Cell::pack(VINE_MATERIAL_ID, 0).raw();
+pub const FAN: CellState = Cell::pack(FAN_MATERIAL_ID, 0).raw();
+pub const FIREWORK: CellState = Cell::pack(FIREWORK_MATERIAL_ID, 0).raw();
+pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
 
 /// Density lookup for block rules (gravity, fluid). Maps material ID → density.
 ///
@@ -42,6 +72,19 @@ pub fn material_density(cell: Cell) -> f32 {
         GRASS_MATERIAL_ID => 1.2,
         WATER_MATERIAL_ID => 1.0,
         FIRE_MATERIAL_ID => 0.05,
+        SAND_MATERIAL_ID => 1.5,
+        LAVA_MATERIAL_ID => 3.0,
+        ICE_MATERIAL_ID => 0.9,
+        ACID_MATERIAL_ID => 1.1,
+        OIL_MATERIAL_ID => 0.8,
+        GUNPOWDER_MATERIAL_ID => 1.4,
+        STEAM_MATERIAL_ID => -0.1,
+        GAS_MATERIAL_ID => -0.2,
+        METAL_MATERIAL_ID => 7.0,
+        VINE_MATERIAL_ID => 1.1,
+        FAN_MATERIAL_ID => 1.0,
+        FIREWORK_MATERIAL_ID => -0.3,
+        CLONE_MATERIAL_ID => 10.0, // immovable
         _ => 0.0,
     }
 }
@@ -76,8 +119,18 @@ pub struct MaterialEntry {
 
 pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
-    rules: Vec<Box<dyn CaRule>>,
-    block_rules: Vec<Box<dyn BlockRule>>,
+    rules: Vec<Box<dyn CaRule + Send>>,
+    block_rules: Vec<Box<dyn BlockRule + Send>>,
+}
+
+impl Clone for MaterialRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            rules: self.rules.iter().map(|r| r.clone_box()).collect(),
+            block_rules: self.block_rules.iter().map(|r| r.clone_box()).collect(),
+        }
+    }
 }
 
 impl fmt::Debug for MaterialRegistry {
@@ -101,16 +154,72 @@ impl MaterialRegistry {
     pub fn terrain_defaults() -> Self {
         let mut registry = Self::new();
         let static_rule = registry.register_rule(NoopRule);
+
+        // Materials that acid dissolves.
+        let acid_dissolvable = vec![
+            STONE_MATERIAL_ID,
+            DIRT_MATERIAL_ID,
+            GRASS_MATERIAL_ID,
+            ICE_MATERIAL_ID,
+            METAL_MATERIAL_ID,
+            VINE_MATERIAL_ID,
+            OIL_MATERIAL_ID,
+        ];
+
+        // Stone/dirt/grass dissolve when adjacent to acid.
+        let dissolvable_rule = registry.register_rule(DissolvableRule {
+            acid_material: ACID_MATERIAL_ID,
+        });
+
         let fire_rule = registry.register_rule(FireRule {
-            fuel_material: GRASS_MATERIAL_ID,
+            fuel_materials: vec![
+                GRASS_MATERIAL_ID,
+                OIL_MATERIAL_ID,
+                GAS_MATERIAL_ID,
+                GUNPOWDER_MATERIAL_ID,
+                VINE_MATERIAL_ID,
+            ],
             quencher_material: WATER_MATERIAL_ID,
         });
         let water_rule = registry.register_rule(WaterRule {
             reactive_material: FIRE_MATERIAL_ID,
             reaction_product: Cell::pack(STONE_MATERIAL_ID, 0),
         });
-        let fluid_block_rule =
+        let lava_rule = registry.register_rule(LavaRule {
+            water_material: WATER_MATERIAL_ID,
+            solidify_product: Cell::pack(STONE_MATERIAL_ID, 0),
+        });
+        let ice_rule = registry.register_rule(IceRule {
+            heat_materials: vec![FIRE_MATERIAL_ID, LAVA_MATERIAL_ID],
+            melt_product: Cell::pack(WATER_MATERIAL_ID, 0),
+        });
+        let acid_rule = registry.register_rule(AcidRule {
+            dissolvable_materials: acid_dissolvable,
+        });
+        let flammable_rule = registry.register_rule(FlammableRule {
+            fire_material: FIRE_MATERIAL_ID,
+            fire_product: Cell::pack(FIRE_MATERIAL_ID, 0),
+        });
+        let steam_rule = registry.register_rule(SteamRule {
+            condense_product: Cell::pack(WATER_MATERIAL_ID, 0),
+            max_age: 20,
+        });
+        let firework_rule = registry.register_rule(FireworkRule {
+            explode_product: Cell::pack(FIRE_MATERIAL_ID, 0),
+            fuse_length: 12,
+        });
+
+        // Block rules.
+        let gravity_block_rule =
+            registry.register_block_rule(GravityBlockRule::new(material_density));
+        let water_fluid_block_rule =
             registry.register_block_rule(FluidBlockRule::new(material_density, WATER_MATERIAL_ID));
+        let lava_fluid_block_rule =
+            registry.register_block_rule(FluidBlockRule::new(material_density, LAVA_MATERIAL_ID));
+        let acid_fluid_block_rule =
+            registry.register_block_rule(FluidBlockRule::new(material_density, ACID_MATERIAL_ID));
+        let oil_fluid_block_rule =
+            registry.register_block_rule(FluidBlockRule::new(material_density, OIL_MATERIAL_ID));
 
         registry.insert(
             AIR_MATERIAL_ID,
@@ -142,7 +251,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.2,
                 },
-                rule_id: static_rule,
+                rule_id: dissolvable_rule,
                 block_rule_id: None,
             },
         );
@@ -159,7 +268,7 @@ impl MaterialRegistry {
                     flammability: 0.0,
                     conductivity: 0.08,
                 },
-                rule_id: static_rule,
+                rule_id: dissolvable_rule,
                 block_rule_id: None,
             },
         );
@@ -176,7 +285,7 @@ impl MaterialRegistry {
                     flammability: 0.35,
                     conductivity: 0.04,
                 },
-                rule_id: static_rule,
+                rule_id: dissolvable_rule,
                 block_rule_id: None,
             },
         );
@@ -211,7 +320,231 @@ impl MaterialRegistry {
                     conductivity: 0.6,
                 },
                 rule_id: water_rule,
-                block_rule_id: Some(fluid_block_rule),
+                block_rule_id: Some(water_fluid_block_rule),
+            },
+        );
+        registry.insert(
+            SAND_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "sand",
+                    base_color: [0.87, 0.80, 0.55, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 1.5,
+                    flammability: 0.0,
+                    conductivity: 0.1,
+                },
+                rule_id: static_rule,
+                block_rule_id: Some(gravity_block_rule),
+            },
+        );
+        registry.insert(
+            LAVA_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "lava",
+                    base_color: [0.95, 0.25, 0.05, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 3.0,
+                    flammability: 0.0,
+                    conductivity: 0.9,
+                },
+                rule_id: lava_rule,
+                block_rule_id: Some(lava_fluid_block_rule),
+            },
+        );
+
+        // --- New Powder Game materials ---
+
+        registry.insert(
+            ICE_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "ice",
+                    base_color: [0.7, 0.88, 0.97, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 0.9,
+                    flammability: 0.0,
+                    conductivity: 0.5,
+                },
+                rule_id: ice_rule,
+                block_rule_id: None,
+            },
+        );
+        registry.insert(
+            ACID_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "acid",
+                    base_color: [0.4, 0.95, 0.1, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 1.1,
+                    flammability: 0.0,
+                    conductivity: 0.4,
+                },
+                rule_id: acid_rule,
+                block_rule_id: Some(acid_fluid_block_rule),
+            },
+        );
+        registry.insert(
+            OIL_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "oil",
+                    base_color: [0.15, 0.1, 0.05, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 0.8,
+                    flammability: 0.9,
+                    conductivity: 0.01,
+                },
+                rule_id: flammable_rule,
+                block_rule_id: Some(oil_fluid_block_rule),
+            },
+        );
+        registry.insert(
+            GUNPOWDER_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "gunpowder",
+                    base_color: [0.3, 0.3, 0.28, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 1.4,
+                    flammability: 1.0,
+                    conductivity: 0.05,
+                },
+                rule_id: flammable_rule,
+                block_rule_id: Some(gravity_block_rule),
+            },
+        );
+        registry.insert(
+            STEAM_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "steam",
+                    base_color: [0.85, 0.85, 0.9, 0.6],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: -0.1,
+                    flammability: 0.0,
+                    conductivity: 0.3,
+                },
+                rule_id: steam_rule,
+                block_rule_id: Some(gravity_block_rule),
+            },
+        );
+        registry.insert(
+            GAS_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "gas",
+                    base_color: [0.6, 0.75, 0.3, 0.5],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: -0.2,
+                    flammability: 0.95,
+                    conductivity: 0.02,
+                },
+                rule_id: flammable_rule,
+                block_rule_id: Some(gravity_block_rule),
+            },
+        );
+        registry.insert(
+            METAL_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "metal",
+                    base_color: [0.6, 0.62, 0.65, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 7.0,
+                    flammability: 0.0,
+                    conductivity: 0.95,
+                },
+                rule_id: dissolvable_rule,
+                block_rule_id: None,
+            },
+        );
+        registry.insert(
+            VINE_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "vine",
+                    base_color: [0.13, 0.42, 0.1, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 1.1,
+                    flammability: 0.6,
+                    conductivity: 0.03,
+                },
+                rule_id: dissolvable_rule,
+                block_rule_id: None,
+            },
+        );
+        registry.insert(
+            FAN_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "fan",
+                    base_color: [0.5, 0.7, 0.9, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 1.0,
+                    flammability: 0.0,
+                    conductivity: 0.1,
+                },
+                rule_id: static_rule,
+                block_rule_id: None,
+            },
+        );
+        registry.insert(
+            FIREWORK_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "firework",
+                    base_color: [0.9, 0.2, 0.5, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: -0.3,
+                    flammability: 0.8,
+                    conductivity: 0.0,
+                },
+                rule_id: firework_rule,
+                block_rule_id: Some(gravity_block_rule),
+            },
+        );
+        registry.insert(
+            CLONE_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "clone",
+                    base_color: [0.95, 0.85, 0.2, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 10.0,
+                    flammability: 0.0,
+                    conductivity: 0.0,
+                },
+                rule_id: static_rule,
+                block_rule_id: None,
             },
         );
 
@@ -228,6 +561,13 @@ impl MaterialRegistry {
         registry.assign_rule(AIR_MATERIAL_ID, rule_id);
         registry.assign_rule(STONE_MATERIAL_ID, rule_id);
         registry
+    }
+
+    /// True if any registered material has a BlockRule. O(materials), not O(volume).
+    pub fn has_any_block_rules(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.as_ref().is_some_and(|e| e.block_rule_id.is_some()))
     }
 
     pub fn entry(&self, material_id: MaterialId) -> Option<&MaterialEntry> {
@@ -251,6 +591,31 @@ impl MaterialRegistry {
         self.entry(cell.material())?.block_rule_id
     }
 
+    /// True if this cell has no block rule and its CA rule is noop (identity).
+    /// Such cells never change state — hashlife can skip stepping entire
+    /// subtrees composed of these materials.
+    pub fn cell_is_inert_fixed_point(&self, cell: Cell) -> bool {
+        self.block_rule_id_for_cell(cell).is_none()
+            && self
+                .rule_for_cell(cell)
+                .is_some_and(|rule| rule.is_self_inert())
+    }
+
+    /// Precomputed per-material-ID noop flag for hot-loop CaRule skipping.
+    /// `result[material_id] == true` iff the material's CaRule is noop (identity).
+    /// Avoids vtable dispatch per cell in the base-case inner loop.
+    pub fn noop_flags(&self) -> Vec<bool> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|e| self.rules[e.rule_id.0].is_noop())
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     pub fn color_palette_rgba(&self) -> Vec<[f32; 4]> {
         let mut palette =
             vec![[0.0, 0.0, 0.0, 0.0]; self.entries.len().max(INITIAL_MATERIAL_SLOTS)];
@@ -264,7 +629,7 @@ impl MaterialRegistry {
 
     fn register_rule<R>(&mut self, rule: R) -> RuleId
     where
-        R: CaRule + 'static,
+        R: CaRule + Send + 'static,
     {
         let rule_id = RuleId(self.rules.len());
         self.rules.push(Box::new(rule));
@@ -273,7 +638,7 @@ impl MaterialRegistry {
 
     pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
     where
-        R: BlockRule + 'static,
+        R: BlockRule + Send + 'static,
     {
         let id = BlockRuleId(self.block_rules.len());
         self.block_rules.push(Box::new(rule));
@@ -450,7 +815,10 @@ mod tests {
 
     #[test]
     fn materials_are_distinct() {
-        let mats = [AIR, STONE, DIRT, GRASS, FIRE, WATER];
+        let mats = [
+            AIR, STONE, DIRT, GRASS, FIRE, WATER, SAND, LAVA, ICE, ACID, OIL, GUNPOWDER, STEAM,
+            GAS, METAL, VINE, FAN, FIREWORK, CLONE,
+        ];
         for (i, &a) in mats.iter().enumerate() {
             for (j, &b) in mats.iter().enumerate() {
                 if i != j {
@@ -472,16 +840,15 @@ mod tests {
     }
 
     #[test]
-    fn terrain_defaults_share_static_rule_for_terrain_solids() {
+    fn terrain_defaults_share_dissolvable_rule_for_terrain_solids() {
         let registry = MaterialRegistry::terrain_defaults();
-        let air = registry.entry(AIR_MATERIAL_ID).unwrap();
         let stone = registry.entry(STONE_MATERIAL_ID).unwrap();
         let dirt = registry.entry(DIRT_MATERIAL_ID).unwrap();
         let grass = registry.entry(GRASS_MATERIAL_ID).unwrap();
         let fire = registry.entry(FIRE_MATERIAL_ID).unwrap();
         let water = registry.entry(WATER_MATERIAL_ID).unwrap();
 
-        assert_eq!(air.rule_id, stone.rule_id);
+        // Stone, dirt, grass share DissolvableRule (react to acid).
         assert_eq!(stone.rule_id, dirt.rule_id);
         assert_eq!(dirt.rule_id, grass.rule_id);
         assert_ne!(grass.rule_id, fire.rule_id);
@@ -499,6 +866,14 @@ mod tests {
             registry.entry(WATER_MATERIAL_ID).unwrap().visual.label,
             "water"
         );
+        assert_eq!(
+            registry.entry(SAND_MATERIAL_ID).unwrap().visual.label,
+            "sand"
+        );
+        assert_eq!(
+            registry.entry(LAVA_MATERIAL_ID).unwrap().visual.label,
+            "lava"
+        );
         assert!(registry.entry(42).is_none());
     }
 
@@ -514,6 +889,8 @@ mod tests {
         assert_eq!(palette[GRASS_MATERIAL_ID as usize], [0.22, 0.57, 0.19, 1.0]);
         assert_eq!(palette[FIRE_MATERIAL_ID as usize], [0.98, 0.43, 0.05, 1.0]);
         assert_eq!(palette[WATER_MATERIAL_ID as usize], [0.12, 0.35, 0.84, 1.0]);
+        assert_eq!(palette[SAND_MATERIAL_ID as usize], [0.87, 0.80, 0.55, 1.0]);
+        assert_eq!(palette[LAVA_MATERIAL_ID as usize], [0.95, 0.25, 0.05, 1.0]);
     }
 
     #[test]
@@ -673,6 +1050,19 @@ mod tests {
             GRASS_MATERIAL_ID,
             FIRE_MATERIAL_ID,
             WATER_MATERIAL_ID,
+            SAND_MATERIAL_ID,
+            LAVA_MATERIAL_ID,
+            ICE_MATERIAL_ID,
+            ACID_MATERIAL_ID,
+            OIL_MATERIAL_ID,
+            GUNPOWDER_MATERIAL_ID,
+            STEAM_MATERIAL_ID,
+            GAS_MATERIAL_ID,
+            METAL_MATERIAL_ID,
+            VINE_MATERIAL_ID,
+            FAN_MATERIAL_ID,
+            FIREWORK_MATERIAL_ID,
+            CLONE_MATERIAL_ID,
         ];
         for &id in &ids {
             let cell = if id == AIR_MATERIAL_ID {

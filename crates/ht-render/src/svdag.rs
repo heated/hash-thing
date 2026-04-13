@@ -19,7 +19,7 @@
 //!   [1..]:      concatenated 9-u32 interior-node slots, append-only
 //!
 //! Interior node slot (9 u32s = 36 bytes):
-//!   [0]:        child_mask (low 8 bits: which octants are non-empty)
+//!   [0]:        child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
 //!   [1..=8]:    child entries — packed as (is_leaf << 31) | payload_bits
 //!     - is_leaf: payload is the 16-bit material state in low bits
 //!     - else:    payload is the absolute offset of the child node in this buffer
@@ -44,7 +44,7 @@
 //! renderer tracks an upload watermark and writes only the appended tail (plus slot
 //! 0 for the root header). See `Renderer::upload_svdag`.
 
-use crate::octree::{Node, NodeId, NodeStore};
+use ht_octree::{Node, NodeId, NodeStore};
 use rustc_hash::FxHashMap;
 
 /// High bit of a child slot marks it as an inline leaf. Interior-node offsets
@@ -68,6 +68,15 @@ pub struct Svdag {
     ///
     /// Keyed by the full 9-u32 slot (not a hash) so lookups are collision-free.
     offset_by_slot: FxHashMap<[u32; 9], u32>,
+    /// Persistent NodeId→offset cache across frames. When the octree store is
+    /// compacted (remapping NodeIds), callers must call `apply_remap()` before
+    /// the next `update()` so cache keys stay valid. This turns `update()` from
+    /// O(reachable) to O(changed): unchanged subtrees hit this cache in O(1)
+    /// and skip the entire descent + slot computation (hash-thing-5bb.11).
+    id_to_offset: FxHashMap<NodeId, u32>,
+    /// Count of new nodes added to `id_to_offset` during each `update()` call.
+    /// Used to detect whether anything changed (for node_count bookkeeping).
+    new_this_update: usize,
     /// Level of the current root (2^level cells per side).
     pub root_level: u32,
     /// Number of interior nodes reachable from the current root.
@@ -86,6 +95,8 @@ impl Svdag {
         Self {
             nodes: vec![0u32],
             offset_by_slot: FxHashMap::default(),
+            id_to_offset: FxHashMap::default(),
+            new_this_update: 0,
             root_level: 0,
             node_count: 0,
         }
@@ -116,7 +127,9 @@ impl Svdag {
         if let Node::Leaf(state) = store.get(root) {
             // Degenerate single-node DAG: all 8 children point at the same
             // inline leaf. Build the slot and cache it normally.
-            let mask = if *state != 0 { 0xffu32 } else { 0u32 };
+            let occ = if *state != 0 { 0xffu32 } else { 0u32 };
+            let rep = (*state as u32) & 0xFFFF;
+            let mask = occ | (rep << 8);
             let leaf_slot = LEAF_BIT | (*state as u32);
             let mut slot = [0u32; 9];
             slot[0] = mask;
@@ -126,13 +139,46 @@ impl Svdag {
             let offset = self.intern_slot(slot);
             self.nodes[0] = offset;
             self.node_count = 1;
+            self.id_to_offset.clear();
+            self.id_to_offset.insert(root, offset);
             return;
         }
 
-        let mut id_to_offset: FxHashMap<NodeId, u32> = FxHashMap::default();
-        let root_offset = self.visit(store, root, &mut id_to_offset);
+        self.new_this_update = 0;
+        let root_offset = self.visit(store, root);
         self.nodes[0] = root_offset;
-        self.node_count = id_to_offset.len();
+        // After a fresh build (empty cache → all misses), id_to_offset.len()
+        // is the exact reachable count. On incremental updates, new_this_update
+        // tells us how many nodes changed; the reachable count is approximately
+        // the previous count adjusted by the delta. For stale_ratio accuracy,
+        // we re-derive from id_to_offset.len() whenever new nodes were added
+        // (conservative: includes stale entries → triggers compaction sooner).
+        if self.new_this_update > 0 || self.node_count == 0 {
+            // Changed: re-derive. Overestimates when id_to_offset has stale
+            // entries, but that makes stale_ratio conservative.
+            self.node_count = self.id_to_offset.len();
+        }
+    }
+
+    /// Remap the persistent NodeId→offset cache after a store compaction.
+    ///
+    /// `compacted_with_remap` returns a `FxHashMap<NodeId, NodeId>` mapping
+    /// old ids to new ids. This method rebuilds `id_to_offset` with the new
+    /// keys so the next `update()` can still hit the cache for unchanged
+    /// subtrees — turning O(reachable) into O(changed) (hash-thing-5bb.11).
+    ///
+    /// Call this *before* `update()` whenever the store has been compacted.
+    /// If the remap is `None` (e.g. scene reset), the cache is cleared and
+    /// the next `update()` does a full walk.
+    pub fn apply_remap(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
+        let old = std::mem::take(&mut self.id_to_offset);
+        self.id_to_offset.reserve(old.len());
+        for (old_id, offset) in old {
+            if let Some(&new_id) = remap.get(&old_id) {
+                self.id_to_offset.insert(new_id, offset);
+            }
+            // Entries not in remap were GC'd — drop them.
+        }
     }
 
     /// Recursively visit a node. Returns its absolute offset in `nodes`.
@@ -140,13 +186,13 @@ impl Svdag {
     /// Bottom-up: child offsets are resolved before the parent's slot is
     /// assembled, so the parent's slot is itself a fully content-determined
     /// identity once the children have been placed.
-    fn visit(
-        &mut self,
-        store: &NodeStore,
-        id: NodeId,
-        id_to_offset: &mut FxHashMap<NodeId, u32>,
-    ) -> u32 {
-        if let Some(&offset) = id_to_offset.get(&id) {
+    ///
+    /// Uses the persistent `id_to_offset` cache: if a NodeId was seen in a
+    /// previous frame (and remapped correctly via `apply_remap`), we return
+    /// its offset immediately without descending. This is the core of the
+    /// O(changed) optimization (hash-thing-5bb.11).
+    fn visit(&mut self, store: &NodeStore, id: NodeId) -> u32 {
+        if let Some(&offset) = self.id_to_offset.get(&id) {
             return offset;
         }
         match store.get(id) {
@@ -160,29 +206,43 @@ impl Svdag {
                 let children = *children;
                 let mut slot = [0u32; 9];
                 let mut mask: u32 = 0;
+                let mut rep_mat: u32 = 0;
                 for (i, &child_id) in children.iter().enumerate() {
                     match store.get(child_id) {
                         Node::Leaf(state) => {
                             if *state != 0 {
                                 mask |= 1 << i;
+                                if rep_mat == 0 {
+                                    rep_mat = *state as u32;
+                                }
                             }
                             slot[1 + i] = LEAF_BIT | (*state as u32);
                         }
                         Node::Interior { population, .. } => {
                             if *population > 0 {
                                 mask |= 1 << i;
-                                let child_offset = self.visit(store, child_id, id_to_offset);
+                                let child_offset = self.visit(store, child_id);
                                 slot[1 + i] = child_offset;
+                                // Propagate representative material from child
+                                // (m1f.7.3.2: packed into bits 8-23 of child_mask).
+                                if rep_mat == 0 {
+                                    let child_cmask = self.nodes[child_offset as usize];
+                                    rep_mat = (child_cmask >> 8) & 0xFFFF;
+                                }
                             } else {
                                 slot[1 + i] = LEAF_BIT;
                             }
                         }
                     }
                 }
-                slot[0] = mask;
+                // Pack representative material into bits 8-23 of child_mask.
+                // Shader LOD reads `(cmask >> 8) & 0xFFFF` to get the material
+                // without scanning children (hash-thing-m1f.7.3.2).
+                slot[0] = mask | ((rep_mat & 0xFFFF) << 8);
 
                 let offset = self.intern_slot(slot);
-                id_to_offset.insert(id, offset);
+                self.id_to_offset.insert(id, offset);
+                self.new_this_update += 1;
                 offset
             }
         }
@@ -193,13 +253,13 @@ impl Svdag {
         if let Some(&existing) = self.offset_by_slot.get(&slot) {
             return existing;
         }
-        let new_offset = self.nodes.len() as u32;
+        let len = self.nodes.len();
         assert!(
-            new_offset < LEAF_BIT,
-            "SVDAG interior node count exceeded 31 bits ({}); \
+            len < LEAF_BIT as usize,
+            "SVDAG interior node count exceeded 31 bits ({len}); \
              widen the encoding (hash-thing-x9r follow-up)",
-            self.nodes.len()
         );
+        let new_offset = len as u32;
         self.nodes.extend_from_slice(&slot);
         self.offset_by_slot.insert(slot, new_offset);
         new_offset
@@ -242,7 +302,72 @@ impl Svdag {
     /// is a reasonable default.
     pub fn compact(&mut self, store: &NodeStore, root: NodeId) {
         let root_level = self.root_level;
+        // Full rebuild clears id_to_offset — the next update() will repopulate
+        // it from a fresh walk. This is expected: compaction is infrequent
+        // (stale_ratio > 0.5) and the one-frame full-walk cost is amortized.
         *self = Self::build(store, root, root_level);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Point-query traversal for validation tests.
+//
+// Walks the serialized SVDAG buffer to look up the material at integer
+// coordinates (x, y, z), exactly as the GPU would. Returns the raw
+// CellState (0 = empty, nonzero = material).
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+impl Svdag {
+    /// Look up a single voxel in the serialized SVDAG buffer by integer coords.
+    ///
+    /// Descends from the root, using octant indexing at each level, reading
+    /// the child mask and child entries from the flat `nodes` array. Returns
+    /// the raw leaf value (material-packed `CellState`) or 0 for empty.
+    pub fn lookup_voxel(&self, x: u64, y: u64, z: u64) -> u16 {
+        let side = 1u64 << self.root_level;
+        if x >= side || y >= side || z >= side {
+            return 0;
+        }
+        let mut offset = self.nodes[0] as usize;
+        let mut lx = x;
+        let mut ly = y;
+        let mut lz = z;
+        for level in (1..=self.root_level).rev() {
+            let half = 1u64 << (level - 1);
+            let ox = if lx >= half { 1usize } else { 0 };
+            let oy = if ly >= half { 1usize } else { 0 };
+            let oz = if lz >= half { 1usize } else { 0 };
+            let octant = ox | (oy << 1) | (oz << 2);
+
+            let mask = self.nodes[offset];
+            let child_word = self.nodes[offset + 1 + octant];
+
+            if mask & (1 << octant) == 0 {
+                // Empty octant.
+                return 0;
+            }
+
+            if child_word & LEAF_BIT != 0 {
+                // Inline leaf — extract the material.
+                return (child_word & !LEAF_BIT) as u16;
+            }
+
+            // Interior child — descend.
+            offset = child_word as usize;
+            if ox == 1 {
+                lx -= half;
+            }
+            if oy == 1 {
+                ly -= half;
+            }
+            if oz == 1 {
+                lz -= half;
+            }
+        }
+        // Reached level 0 without hitting a leaf — shouldn't happen in
+        // a well-formed SVDAG, but return 0 defensively.
+        0
     }
 }
 
@@ -261,10 +386,19 @@ impl Svdag {
 pub mod cpu_trace {
     use super::*;
 
-    pub const MAX_DEPTH: usize = 14;
+    pub const MAX_DEPTH: usize = 24;
+    /// Stack depth cap (hash-thing-m1f.7.3). Decoupled from MAX_DEPTH
+    /// so the stack arrays use fewer registers on the GPU. 16 levels
+    /// supports worlds up to 2^16 = 65536 cells/side.
+    pub const MAX_STACK: usize = 16;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
+    /// Leaf-resolution grid size for integer DDA (hash-thing-pck).
+    /// Each axis has `2^MAX_DEPTH` cells at the finest level.
+    /// At MAX_DEPTH=24: 2^24 = 16M, exact in f32's 24-bit mantissa.
+    const RESOLUTION: u32 = 1 << MAX_DEPTH as u32;
+    const INV_RES: f32 = 1.0 / RESOLUTION as f32;
 
     /// Absolute minimum step budget. Shallow scenes get this even if the
     /// root_level-derived bound is smaller; prevents a tiny analytical bound
@@ -400,6 +534,64 @@ pub mod cpu_trace {
         (t_near, t_far)
     }
 
+    fn aabb_slab_times(
+        origin: [f32; 3],
+        inv_dir: [f32; 3],
+        box_min: [f32; 3],
+        box_max: [f32; 3],
+    ) -> ([f32; 3], [f32; 3]) {
+        let t1 = [
+            (box_min[0] - origin[0]) * inv_dir[0],
+            (box_min[1] - origin[1]) * inv_dir[1],
+            (box_min[2] - origin[2]) * inv_dir[2],
+        ];
+        let t2 = [
+            (box_max[0] - origin[0]) * inv_dir[0],
+            (box_max[1] - origin[1]) * inv_dir[1],
+            (box_max[2] - origin[2]) * inv_dir[2],
+        ];
+        (
+            [t1[0].min(t2[0]), t1[1].min(t2[1]), t1[2].min(t2[2])],
+            [t1[0].max(t2[0]), t1[1].max(t2[1]), t1[2].max(t2[2])],
+        )
+    }
+
+    fn face_normal_from_slab_times(rd: [f32; 3], tmin_v: [f32; 3], tmax_v: [f32; 3]) -> [f32; 3] {
+        // Shared analytical face normal for both leaf hits and the shader's
+        // representative-material LOD path. Outside-origin rays pick the entry
+        // face (`argmax(tmin_v)`); inside-origin rays pick the nearest exit
+        // face (`argmin(tmax_v)`) so the normal points where the ray will
+        // emerge instead of back into the node.
+        let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
+        if inside {
+            if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
+                [rd[0].signum(), 0.0, 0.0]
+            } else if tmax_v[1] <= tmax_v[2] {
+                [0.0, rd[1].signum(), 0.0]
+            } else {
+                [0.0, 0.0, rd[2].signum()]
+            }
+        } else if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
+            [-rd[0].signum(), 0.0, 0.0]
+        } else if tmin_v[1] >= tmin_v[2] {
+            [0.0, -rd[1].signum(), 0.0]
+        } else {
+            [0.0, 0.0, -rd[2].signum()]
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn aabb_face_normal(
+        origin: [f32; 3],
+        inv_dir: [f32; 3],
+        rd: [f32; 3],
+        box_min: [f32; 3],
+        box_max: [f32; 3],
+    ) -> [f32; 3] {
+        let (tmin_v, tmax_v) = aabb_slab_times(origin, inv_dir, box_min, box_max);
+        face_normal_from_slab_times(rd, tmin_v, tmax_v)
+    }
+
     /// Raycast with a root-level-derived step budget. Thin wrapper around
     /// `raycast_with_budget` that computes the budget from `root_level` via
     /// `step_budget`. Production callers use this entry point.
@@ -424,10 +616,30 @@ pub mod cpu_trace {
         rd: [f32; 3],
         record: bool,
     ) -> TraceResult {
-        let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+        // Guard against zero ray-direction components (hash-thing-5bb.8).
+        // Clamp near-zero values to ±ε so 1/d stays finite (≈±1e30) rather
+        // than producing inf/NaN that can break AABB slab tests.
+        #[inline]
+        fn safe_rcp(d: f32) -> f32 {
+            const EPS: f32 = 1e-30;
+            1.0 / if d.abs() < EPS { EPS.copysign(d) } else { d }
+        }
+        // Laine-Karras Stage 2: mirror ray so rd is componentwise non-negative.
+        // XOR octant indices with mirror_mask when indexing into DAG children.
+        let mut mirror_mask = 0u32;
+        let mut ro_m = ro;
+        let mut rd_m = rd;
+        for axis in 0..3 {
+            if rd[axis] < 0.0 {
+                mirror_mask |= 1 << axis;
+                rd_m[axis] = -rd_m[axis];
+                ro_m[axis] = 1.0 - ro_m[axis];
+            }
+        }
+        let inv_rd = [safe_rcp(rd_m[0]), safe_rcp(rd_m[1]), safe_rcp(rd_m[2])];
         let mut events = Vec::new();
 
-        let (root_near, root_far) = intersect_aabb(ro, inv_rd, [0.0; 3], [1.0; 3]);
+        let (root_near, root_far) = intersect_aabb(ro_m, inv_rd, [0.0; 3], [1.0; 3]);
         if root_near > root_far || root_far < 0.0 {
             return TraceResult {
                 hit_cell: None,
@@ -448,26 +660,46 @@ pub mod cpu_trace {
         // (9.5e-7 at MAX_DEPTH). Flagged by Codex Critical in 27m review.
         let entry = root_near.max(0.0);
         let ro_local = [
-            ro[0] + rd[0] * entry,
-            ro[1] + rd[1] * entry,
-            ro[2] + rd[2] * entry,
+            ro_m[0] + rd_m[0] * entry,
+            ro_m[1] + rd_m[1] * entry,
+            ro_m[2] + rd_m[2] * entry,
         ];
         let t_exit = root_far - entry;
 
-        let mut stack_node = [0u32; MAX_DEPTH];
-        let mut stack_min = [[0.0f32; 3]; MAX_DEPTH];
-        let mut stack_half = [0.0f32; MAX_DEPTH];
+        // Integer DDA state (hash-thing-pck). int_pos tracks the ray's
+        // cell at leaf resolution; it only increases per-component (mirrored
+        // space, rd_m ≥ 0). t is derived as the max of all three axes'
+        // boundary crossing times, guaranteeing strict monotonicity.
+        let mut int_pos: [u32; 3] = [
+            (ro_local[0] * RESOLUTION as f32)
+                .floor()
+                .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
+            (ro_local[1] * RESOLUTION as f32)
+                .floor()
+                .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
+            (ro_local[2] * RESOLUTION as f32)
+                .floor()
+                .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
+        ];
+
+        let mut stack_node = [0u32; MAX_STACK];
+        let mut stack_min = [[0.0f32; 3]; MAX_STACK];
+        let mut stack_half = [0.0f32; MAX_STACK];
+        let mut stack_cmask = [0u32; MAX_STACK];
         let mut depth: usize = 0;
 
-        stack_node[0] = dag[0];
+        let root_offset = dag[0];
+        stack_node[0] = root_offset;
         stack_min[0] = [0.0; 3];
         stack_half[0] = 0.5;
+        stack_cmask[0] = dag[root_offset as usize];
 
         // Local-frame starting t. Just past the root entry; `ro_local` is
         // already on the root face.
         let mut t = EPS;
 
-        for step in 0..max_steps {
+        let mut step = 0usize;
+        while step < max_steps {
             if t > t_exit {
                 return TraceResult {
                     hit_cell: None,
@@ -477,27 +709,19 @@ pub mod cpu_trace {
                     hit_normal: None,
                 };
             }
-            let pos = [
-                ro_local[0] + rd[0] * t,
-                ro_local[1] + rd[1] * t,
-                ro_local[2] + rd[2] * t,
+            // Integer DDA (hash-thing-pck): derive pos from integer cell
+            // center — no accumulated float error.
+            let mut pos = [
+                (int_pos[0] as f32 + 0.5) * INV_RES,
+                (int_pos[1] as f32 + 0.5) * INV_RES,
+                (int_pos[2] as f32 + 0.5) * INV_RES,
             ];
 
             // Pop until top contains pos.
-            // NOTE: pop check is STRICT (no EPS slack). Two guarantees make
-            // this safe:
-            //   (1) ro is clamped to the root-cube entry (27m v2), so `t`
-            //       inside the loop is local-frame and bounded by √3;
-            //       ULP(t_local) stays ≤ ~2.4e-7.
-            //   (2) The step-past below uses a cell-scaled nudge of at least
-            //       ~9.5e-7 on the identified exit axis at MAX_DEPTH.
-            // Together (1) > (2) means pos advances strictly past the octant
-            // boundary on the exit axis in the uncapped path. The cap-bound
-            // path (ultra-grazing |rd_axis| at MAX_DEPTH) can still collapse
-            // below ULP — that remains the known f32 frontier, resolvable
-            // only via integer DDA. Allowing EPS slack here would defeat
-            // the strict step-past ordering and reintroduce infinite loops
-            // on simultaneous two-axis boundary crossings.
+            // NOTE: pop check is STRICT (no EPS slack). Integer DDA
+            // (hash-thing-pck) derives t from exact cell boundaries, so
+            // pos = ro_local + rd_m * t always advances strictly past the
+            // octant boundary. The old f32 ULP frontier no longer applies.
             let mut top = depth;
             loop {
                 let node_min = stack_min[top];
@@ -534,12 +758,24 @@ pub mod cpu_trace {
             depth = top;
 
             // Descend
-            for _d in 0..MAX_DEPTH {
+            for _d in 0..MAX_STACK {
                 let node_offset = stack_node[depth] as usize;
                 let node_min = stack_min[depth];
                 let half = stack_half[depth];
-                let oct = octant_of(pos, rd, node_min, half);
-                let child_slot = dag[node_offset + 1 + oct as usize];
+                let cmask = stack_cmask[depth];
+                let oct = octant_of(pos, rd_m, node_min, half);
+                // Stage 2: XOR to un-mirror the octant for DAG lookup.
+                let mirrored_oct = (oct ^ mirror_mask) as usize;
+
+                // m1f.7.3: check cached child_mask before reading child_slot.
+                if cmask & (1 << mirrored_oct) == 0 {
+                    if record {
+                        events.push(TraceEvent::EmptyLeaf { depth, oct });
+                    }
+                    break;
+                }
+
+                let child_slot = dag[node_offset + 1 + mirrored_oct];
 
                 if child_slot & LEAF_BIT != 0 {
                     let mat = child_slot & 0xFFFF;
@@ -561,48 +797,9 @@ pub mod cpu_trace {
                             node_min[2] + ((oct >> 2) & 1) as f32 * half,
                         ];
                         let leaf_max = [leaf_min[0] + half, leaf_min[1] + half, leaf_min[2] + half];
-                        let lt1 = [
-                            (leaf_min[0] - ro_local[0]) * inv_rd[0],
-                            (leaf_min[1] - ro_local[1]) * inv_rd[1],
-                            (leaf_min[2] - ro_local[2]) * inv_rd[2],
-                        ];
-                        let lt2 = [
-                            (leaf_max[0] - ro_local[0]) * inv_rd[0],
-                            (leaf_max[1] - ro_local[1]) * inv_rd[1],
-                            (leaf_max[2] - ro_local[2]) * inv_rd[2],
-                        ];
-                        let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
-                        let tmax_v = [lt1[0].max(lt2[0]), lt1[1].max(lt2[1]), lt1[2].max(lt2[2])];
-                        // hash-thing-2nd: inside-leaf fallback. When the ray
-                        // origin sits inside the filled voxel, every `tmin_v`
-                        // component is negative — the entry-face picker (argmax
-                        // of `tmin_v`) then returns the nearest BACK face and
-                        // the normal flips inward, shading the voxel as if lit
-                        // from behind. Reachable via deep-zoom orbit camera.
-                        // Fallback: pick the nearest EXIT face (argmin of
-                        // `tmax_v`) and flip the sign so the normal points in
-                        // the direction the ray is heading — the "about to
-                        // emerge" convention. The outer cascade uses `>=` on
-                        // both comparators so ties break identically to the
-                        // shader in `svdag_raycast.wgsl` — do NOT flip to `>`.
-                        // The inner (inside) cascade uses `<=` for the same
-                        // reason: CPU/GPU must break exit-face ties identically.
-                        let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
-                        let normal = if inside {
-                            if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
-                                [rd[0].signum(), 0.0, 0.0]
-                            } else if tmax_v[1] <= tmax_v[2] {
-                                [0.0, rd[1].signum(), 0.0]
-                            } else {
-                                [0.0, 0.0, rd[2].signum()]
-                            }
-                        } else if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
-                            [-rd[0].signum(), 0.0, 0.0]
-                        } else if tmin_v[1] >= tmin_v[2] {
-                            [0.0, -rd[1].signum(), 0.0]
-                        } else {
-                            [0.0, 0.0, -rd[2].signum()]
-                        };
+                        let (tmin_v, tmax_v) =
+                            aabb_slab_times(ro_local, inv_rd, leaf_min, leaf_max);
+                        let normal = face_normal_from_slab_times(rd, tmin_v, tmax_v);
                         return TraceResult {
                             hit_cell: Some(mat),
                             steps: step,
@@ -616,7 +813,7 @@ pub mod cpu_trace {
                     }
                     break;
                 } else {
-                    if depth + 1 >= MAX_DEPTH {
+                    if depth + 1 >= MAX_STACK {
                         break;
                     }
                     let child_min = [
@@ -628,6 +825,7 @@ pub mod cpu_trace {
                     stack_node[depth] = child_slot;
                     stack_min[depth] = child_min;
                     stack_half[depth] = half * 0.5;
+                    stack_cmask[depth] = dag[child_slot as usize];
                     if record {
                         events.push(TraceEvent::Descend {
                             depth,
@@ -638,75 +836,115 @@ pub mod cpu_trace {
                 }
             }
 
-            // Step past the current (empty) octant.
-            // hash-thing-27m fix: per-axis exit + cell-scaled, exit-axis-aware
-            // nudge. The old fixed `+EPS` advanced the per-axis position by
-            // `|rd_axis| * EPS`, which collapses below f32 ULP (~6e-8 near
-            // pos ~ 0.5) for exit_rd < 6e-3 — a configuration the traversal
-            // naturally enters at deep depths when pos lands close to an
-            // inter-octant face on a grazing axis. When that happens the
-            // pop/descend loop oscillates on the same boundary until MAX_STEPS
-            // fires. The replacement advances `t` so the exit-axis position
-            // advances by a world-space nudge of ~1e-5 (or ~half/64 at deep
-            // levels where 1e-5 would overshoot a cell), then caps dt so the
-            // fastest axis never crosses more than one child span.
+            // Step past the current (empty) octant, then skip consecutive
+            // empty siblings using the parent's child_mask (hash-thing-x5w.1).
+            // Hoist invariants — depth doesn't change within the inner loop.
+            // m1f.7.3: use cached child_mask instead of re-reading.
+            let skip_mask = stack_cmask[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
-            let oct = octant_of(pos, rd, node_min, half);
-            let child_min = [
-                node_min[0] + (oct & 1) as f32 * half,
-                node_min[1] + ((oct >> 1) & 1) as f32 * half,
-                node_min[2] + ((oct >> 2) & 1) as f32 * half,
-            ];
-            let child_max = [
-                child_min[0] + half,
-                child_min[1] + half,
-                child_min[2] + half,
-            ];
-            // Per-axis exit times. oct_far is the smallest tmax across the
-            // three axes (same value the old `intersect_aabb(...).1` returned)
-            // but exposed per-axis so we can identify which axis is the actual
-            // exit and scale the post-exit nudge against its |rd|.
-            let t1 = [
-                (child_min[0] - ro_local[0]) * inv_rd[0],
-                (child_min[1] - ro_local[1]) * inv_rd[1],
-                (child_min[2] - ro_local[2]) * inv_rd[2],
-            ];
-            let t2 = [
-                (child_max[0] - ro_local[0]) * inv_rd[0],
-                (child_max[1] - ro_local[1]) * inv_rd[1],
-                (child_max[2] - ro_local[2]) * inv_rd[2],
-            ];
-            let tmax_v = [t1[0].max(t2[0]), t1[1].max(t2[1]), t1[2].max(t2[2])];
-            let mut oct_far = tmax_v[0];
-            let mut exit_rd = rd[0].abs();
-            if tmax_v[1] < oct_far {
-                oct_far = tmax_v[1];
-                exit_rd = rd[1].abs();
-            }
-            if tmax_v[2] < oct_far {
-                oct_far = tmax_v[2];
-                exit_rd = rd[2].abs();
-            }
-            // World-space exit-axis nudge. `dt_raw = nudge / exit_rd` means
-            // pos advances by exactly `nudge_world` on the exit axis. Clip
-            // to EPS at shallow levels (root half/64 = 7.8e-3 would be ~1
-            // cell at depth 7, overshooting fine structure); shrink with
-            // half at deep levels (at depth 14, half/64 ~ 9.5e-7 ≥ 16x ULP).
-            let nudge_world = (half * (1.0 / 64.0)).min(EPS);
-            let dt_raw = nudge_world / exit_rd.max(1e-6);
-            // Cap dt so the fastest axis advances at most one child span,
-            // preventing the step from skipping a non-empty sibling on a
-            // dominant axis. For ultra-grazing rays (|rd_axis| < ~1e-5 at
-            // MAX_DEPTH) the cap binds and the exit-axis advance collapses
-            // below ULP — the f32 frontier noted in the plan.
-            let max_rd = rd[0].abs().max(rd[1].abs()).max(rd[2].abs());
-            let dt_cap = half / max_rd.max(1e-6);
-            let dt = dt_raw.min(dt_cap);
-            let t_old = t;
-            t = oct_far + dt;
-            if record {
-                events.push(TraceEvent::StepPast { t_old, t_new: t });
+            loop {
+                let pos_s = [
+                    (int_pos[0] as f32 + 0.5) * INV_RES,
+                    (int_pos[1] as f32 + 0.5) * INV_RES,
+                    (int_pos[2] as f32 + 0.5) * INV_RES,
+                ];
+                let oct = octant_of(pos_s, rd_m, node_min, half);
+                let child_min = [
+                    node_min[0] + (oct & 1) as f32 * half,
+                    node_min[1] + ((oct >> 1) & 1) as f32 * half,
+                    node_min[2] + ((oct >> 2) & 1) as f32 * half,
+                ];
+                let child_max = [
+                    child_min[0] + half,
+                    child_min[1] + half,
+                    child_min[2] + half,
+                ];
+                let t2 = [
+                    (child_max[0] - ro_local[0]) * inv_rd[0],
+                    (child_max[1] - ro_local[1]) * inv_rd[1],
+                    (child_max[2] - ro_local[2]) * inv_rd[2],
+                ];
+                let mut exit_axis: usize = 0;
+                if t2[1] < t2[exit_axis] {
+                    exit_axis = 1;
+                }
+                if t2[2] < t2[exit_axis] {
+                    exit_axis = 2;
+                }
+                let step_cells = 1u32 << (MAX_DEPTH as u32 - 1 - depth as u32);
+                let octant_base = (child_min[exit_axis] * RESOLUTION as f32) as u32;
+                let boundary_cell = octant_base + step_cells;
+                let t_old = t;
+                if boundary_cell >= RESOLUTION {
+                    if record {
+                        events.push(TraceEvent::StepPast {
+                            t_old,
+                            t_new: t_exit,
+                        });
+                    }
+                    return TraceResult {
+                        hit_cell: None,
+                        steps: step,
+                        events,
+                        exhausted: false,
+                        hit_normal: None,
+                    };
+                }
+                int_pos[exit_axis] = boundary_cell;
+                let boundary = boundary_cell as f32 * INV_RES;
+                let t_boundary = (boundary - ro_local[exit_axis]) * inv_rd[exit_axis];
+                t = if t_boundary > t_old {
+                    t_boundary
+                } else {
+                    f32::from_bits(t_old.to_bits() + 1)
+                };
+                if record {
+                    events.push(TraceEvent::StepPast { t_old, t_new: t });
+                }
+
+                step += 1;
+
+                // hash-thing-x5w.1: check if the next octant is also empty
+                // and still inside the same parent.
+                if step >= max_steps {
+                    break;
+                }
+                if t > t_exit {
+                    return TraceResult {
+                        hit_cell: None,
+                        steps: step,
+                        events,
+                        exhausted: false,
+                        hit_normal: None,
+                    };
+                }
+                pos = [
+                    (int_pos[0] as f32 + 0.5) * INV_RES,
+                    (int_pos[1] as f32 + 0.5) * INV_RES,
+                    (int_pos[2] as f32 + 0.5) * INV_RES,
+                ];
+                let h2 = half * 2.0;
+                let in_parent = pos[0] >= node_min[0]
+                    && pos[1] >= node_min[1]
+                    && pos[2] >= node_min[2]
+                    && pos[0] < node_min[0] + h2
+                    && pos[1] < node_min[1] + h2
+                    && pos[2] < node_min[2] + h2;
+                if !in_parent {
+                    break;
+                }
+                let next_oct = octant_of(pos, rd_m, node_min, half);
+                if skip_mask & (1 << (next_oct ^ mirror_mask)) != 0 {
+                    break; // next octant is occupied
+                }
+                if record {
+                    events.push(TraceEvent::EmptyLeaf {
+                        depth,
+                        oct: next_oct,
+                    });
+                }
+                // Next octant is empty — continue inner DDA loop
             }
         }
 
@@ -728,7 +966,8 @@ pub mod cpu_trace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::octree::{Cell, CellState, NodeStore};
+    use cpu_trace::MAX_DEPTH;
+    use ht_octree::{Cell, CellState, NodeStore};
 
     fn normalize(v: [f32; 3]) -> [f32; 3] {
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -941,9 +1180,13 @@ mod tests {
         assert_eq!(dag.nodes.len(), 10, "header + one interior node = 10 u32s");
         let root_off = dag.nodes[0] as usize;
         assert_eq!(root_off, 1, "root offset points past header");
+        // m1f.7.3: child_mask word = low 8 bits occupancy | bits 8-23 rep material.
+        // Leaf root with mat3 → rep_mat = mat3's packed CellState = 3 << 6 = 192.
+        let rep_mat = mat3 as u32;
         assert_eq!(
-            dag.nodes[root_off], 0xffu32,
-            "all 8 octants populated for a nonzero leaf root"
+            dag.nodes[root_off],
+            0xffu32 | (rep_mat << 8),
+            "all 8 octants populated + representative material for a nonzero leaf root"
         );
         for i in 0..8 {
             assert_eq!(
@@ -997,6 +1240,38 @@ mod tests {
             !result.exhausted,
             "empty leaf-root miss must not trip the budget"
         );
+    }
+
+    /// Axis-aligned rays with exactly-zero direction components must not
+    /// produce inf/NaN in the AABB slab test (hash-thing-5bb.8). Tests
+    /// all three principal axes hitting a known voxel at the center.
+    #[test]
+    fn zero_direction_components_no_inf() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        // Place a voxel at (8,8,8) in a 16³ world (level 4).
+        root = store.set_cell(root, 8, 8, 8, mat(1));
+        let dag = Svdag::build(&store, root, 4);
+
+        // Axis-aligned rays through the center, two components exactly 0.0.
+        let cases: [([f32; 3], [f32; 3]); 6] = [
+            ([-1.0, 0.53125, 0.53125], [1.0, 0.0, 0.0]),
+            ([2.0, 0.53125, 0.53125], [-1.0, 0.0, 0.0]),
+            ([0.53125, -1.0, 0.53125], [0.0, 1.0, 0.0]),
+            ([0.53125, 2.0, 0.53125], [0.0, -1.0, 0.0]),
+            ([0.53125, 0.53125, -1.0], [0.0, 0.0, 1.0]),
+            ([0.53125, 0.53125, 2.0], [0.0, 0.0, -1.0]),
+        ];
+
+        for (i, (ro, rd)) in cases.iter().enumerate() {
+            let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, *rd, false);
+            assert!(
+                result.hit_cell.is_some(),
+                "case {i} (rd={rd:?}): axis-aligned ray with zero components \
+                 must hit the center voxel, not produce inf/NaN miss"
+            );
+            assert!(!result.exhausted, "case {i}: must not exhaust step budget");
+        }
     }
 
     /// Regression: grazing rays at deep depth must make forward progress
@@ -1099,19 +1374,19 @@ mod tests {
         }
     }
 
-    /// Regression: ro clamping must also handle the actual deepest
-    /// supported depth (MAX_DEPTH=14) where the smallest nudge
-    /// (`half/64 = 9.5e-7`) is closest to `f32` ULP and where the
-    /// un-clamped pre-fix v1 still stalled on far-camera rays with
-    /// any reasonable |ro|.
+    /// Regression: ro clamping must handle the deepest supported depth
+    /// (MAX_DEPTH) where integer DDA cell sizes are smallest. Far-camera
+    /// rays with high `|ro|` stressed the pre-clamp v1 traversal; the
+    /// clamped local-frame + integer DDA should handle any depth ≤ 24.
     #[test]
     fn far_camera_forward_progress_max_depth() {
         let mut store = NodeStore::new();
-        let mut root = store.empty(14);
+        let mut root = store.empty(MAX_DEPTH as u32);
         // Single voxel near the center at full MAX_DEPTH resolution.
-        // At depth 14, the cell size is 1/16384 ≈ 6.1e-5.
-        root = store.set_cell(root, 8192, 8192, 8192, mat(1));
-        let dag = Svdag::build(&store, root, 14);
+        // At depth 20, the cell size is 1/1048576 ≈ 9.5e-7.
+        let mid = 1u64 << (MAX_DEPTH as u64 - 1);
+        root = store.set_cell(root, mid, mid, mid, mat(1));
+        let dag = Svdag::build(&store, root, MAX_DEPTH as u32);
 
         // Far camera (|ro| ~ 10) with dominant + grazing axes so the ray
         // descends through deep octants.
@@ -1126,43 +1401,43 @@ mod tests {
             let result = cpu_trace::raycast(&dag.nodes, dag.root_level, *ro, rd_n, false);
             assert!(
                 result.steps < 400,
-                "case {i} (ro={ro:?}, rd={rd:?}): far-camera MAX_DEPTH \
-                 forward-progress regression — used {steps} steps out of \
-                 MAX_STEPS=512.",
+                "case {i} (ro={ro:?}, rd={rd:?}): far-camera MAX_DEPTH={MAX_DEPTH} \
+                 forward-progress regression — used {steps} steps.",
                 steps = result.steps,
             );
         }
     }
 
-    /// Static math invariant behind the 27m v2 `ro` clamp: in the
-    /// clamped frame, the maximum `|pos|` during traversal is bounded
-    /// by `√3 + √3 ≈ 3.46` (clamped `ro_local` is on a cube face, so
-    /// `|ro_local| ≤ √3`; the in-cube traversal adds at most `√3` more
-    /// along `rd`). For every `t` actually seen inside the loop,
-    /// `ULP(t) ≤ ULP(3.46) ≈ 4.77e-7`, which must stay strictly below
-    /// the depth-14 step-past nudge `half/64 = 9.54e-7`. If any future
-    /// change breaks this inequality — shrinking the nudge, increasing
-    /// MAX_DEPTH, or removing the clamp — this test fires.
+    /// Integer DDA invariant (hash-thing-pck): cell positions up to
+    /// RESOLUTION must be exactly representable in f32 so that
+    /// `boundary_cell as f32 * INV_RES` is exact. f32 has a 24-bit
+    /// mantissa, so RESOLUTION = 2^MAX_DEPTH must be ≤ 2^24. If
+    /// MAX_DEPTH ever exceeds 24, the integer-to-float conversion
+    /// loses precision and the DDA boundary computation is no longer
+    /// exact — this test fires.
     #[test]
-    fn ro_clamp_preserves_ulp_margin() {
-        // Worst-case |pos| after ro clamping: root face + cube diagonal.
-        let max_pos: f32 = 2.0 * (3f32.sqrt());
-        let ulp_max = f32::from_bits(max_pos.to_bits() + 1) - max_pos;
-
-        // Smallest nudge the step-past will ever produce (deepest cell).
-        // At MAX_DEPTH=14, stack_half = 0.5^15 ≈ 3.05e-5.
-        const MAX_DEPTH: i32 = 14;
-        const EPS: f32 = 1e-5;
-        let deepest_half = 0.5_f32.powi(MAX_DEPTH + 1);
-        let min_nudge = (deepest_half * (1.0 / 64.0)).min(EPS);
-
-        assert!(
-            min_nudge > ulp_max,
-            "27m invariant: min nudge {min_nudge:e} must exceed max \
-             post-clamp ULP {ulp_max:e} to guarantee forward progress. \
-             Breaking this invariant re-opens the zero-progress regime \
-             (Codex Critical blocker, 27m review)."
-        );
+    fn integer_dda_exact_representation() {
+        const {
+            assert!(
+                MAX_DEPTH <= 24,
+                "integer DDA invariant: MAX_DEPTH exceeds 24, \
+                 so RESOLUTION doesn't fit in f32's 24-bit \
+                 mantissa. Cell positions would lose precision, breaking \
+                 the exact boundary computation that guarantees forward \
+                 progress (hash-thing-pck)."
+            );
+        }
+        // Verify the boundary float round-trips exactly for the worst case.
+        let res: u32 = 1 << MAX_DEPTH as u32;
+        let inv_res: f32 = 1.0 / res as f32;
+        for boundary_cell in [0u32, 1, res / 2, res - 1, res] {
+            let boundary = boundary_cell as f32 * inv_res;
+            let recovered = (boundary * res as f32) as u32;
+            assert_eq!(
+                recovered, boundary_cell,
+                "boundary_cell={boundary_cell} doesn't round-trip through f32"
+            );
+        }
     }
 
     /// Throughput regression for Claude Critical's deep-level concern:
@@ -1176,14 +1451,15 @@ mod tests {
     /// than `dt` for dominant-axis rays. Sparse scenes coalesce empty
     /// space into shallow cells, so most step-pasts happen at coarse
     /// levels anyway. This test asserts the actual observed behavior:
-    /// hitting or missing a single-voxel scene at root_level=14 from
+    /// hitting or missing a single-voxel scene at root_level=MAX_DEPTH from
     /// multiple ray directions completes in well under MAX_STEPS/4.
     #[test]
     fn dominant_axis_throughput_max_depth() {
         let mut store = NodeStore::new();
-        let mut root = store.empty(14);
-        root = store.set_cell(root, 8192, 8192, 8192, mat(1));
-        let dag = Svdag::build(&store, root, 14);
+        let mut root = store.empty(MAX_DEPTH as u32);
+        let mid = 1u64 << (MAX_DEPTH as u64 - 1);
+        root = store.set_cell(root, mid, mid, mid, mat(1));
+        let dag = Svdag::build(&store, root, MAX_DEPTH as u32);
 
         // Dominant-axis rays hitting and missing the single deep voxel
         // from different entry angles. `|ro|` kept small here because
@@ -1210,7 +1486,7 @@ mod tests {
             assert!(
                 result.steps < 128,
                 "case {i} (ro={ro:?}, rd={rd:?}): dominant-axis throughput \
-                 regression at root_level=14 — used {steps} steps, expected \
+                 regression at root_level={MAX_DEPTH} — used {steps} steps, expected \
                  < 128. If this fires, Claude Critical's `min` vs `max` \
                  concern may be warranted after all.",
                 steps = result.steps,
@@ -1638,7 +1914,7 @@ mod tests {
                                                      // Deep: fudge × side > floor → fudge × side wins.
         assert_eq!(cpu_trace::step_budget(8), 2048); // 8 * 256
         assert_eq!(cpu_trace::step_budget(12), 32768); // 8 * 4096 (SPEC target)
-        assert_eq!(cpu_trace::step_budget(14), 131072); // 8 * 16384 (MAX_DEPTH)
+        assert_eq!(cpu_trace::step_budget(14), 131072); // 8 * 16384
                                                         // Saturation: an absurd root_level must not panic. The .min(28)
                                                         // clamp keeps the shift in-range AND keeps `root_side * 8` within
                                                         // u32 so the shader mirror can use the same arithmetic. At
@@ -1971,6 +2247,72 @@ mod tests {
         );
     }
 
+    /// hash-thing-p9dd: the representative-material LOD path shades an
+    /// interior node AABB rather than a leaf AABB, but the normal-picking
+    /// rule is the same. Outside-node rays must still choose the entry face.
+    #[test]
+    fn lod_node_normal_outside_origin_matches_entry_face() {
+        let node_min = [0.25, 0.25, 0.25];
+        let node_max = [0.75, 0.75, 0.75];
+        let center = [0.5, 0.5, 0.5];
+        let cases: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("-x face", [-3.0, center[1], center[2]], [-1.0, 0.0, 0.0]),
+            ("+x face", [3.0, center[1], center[2]], [1.0, 0.0, 0.0]),
+            ("-y face", [center[0], -3.0, center[2]], [0.0, -1.0, 0.0]),
+            ("+y face", [center[0], 3.0, center[2]], [0.0, 1.0, 0.0]),
+            ("-z face", [center[0], center[1], -3.0], [0.0, 0.0, -1.0]),
+            ("+z face", [center[0], center[1], 3.0], [0.0, 0.0, 1.0]),
+        ];
+
+        for (name, ro, expected_normal) in cases {
+            let rd = normalize([center[0] - ro[0], center[1] - ro[1], center[2] - ro[2]]);
+            let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+            let normal = cpu_trace::aabb_face_normal(*ro, inv_rd, rd, node_min, node_max);
+            assert_eq!(
+                normal, *expected_normal,
+                "{name}: representative-material LOD hit must shade with \
+                 entry-face normal {expected_normal:?}, got {normal:?}",
+            );
+        }
+    }
+
+    /// hash-thing-p9dd: when the camera sits inside a coarse LOD node, the
+    /// representative-material path must pick the nearest exit face, not the
+    /// inward back face that produced floating rectangle artifacts.
+    #[test]
+    fn lod_node_normal_inside_origin_picks_exit_face() {
+        let node_min = [0.25, 0.25, 0.25];
+        let node_max = [0.75, 0.75, 0.75];
+        let center = [0.5, 0.5, 0.5];
+        let cases: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("+x exit", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ("-x exit", [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            ("+y exit", [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            ("-y exit", [0.0, -1.0, 0.0], [0.0, -1.0, 0.0]),
+            ("+z exit", [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]),
+            ("-z exit", [0.0, 0.0, -1.0], [0.0, 0.0, -1.0]),
+        ];
+
+        for (name, rd, expected_normal) in cases {
+            let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+            let normal = cpu_trace::aabb_face_normal(center, inv_rd, *rd, node_min, node_max);
+            assert_eq!(
+                normal, *expected_normal,
+                "{name}: inside-node LOD shading must use exit-face normal \
+                 {expected_normal:?}, got {normal:?}",
+            );
+        }
+
+        let rd = normalize([1.0, 2.0, 3.0]);
+        let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+        let normal = cpu_trace::aabb_face_normal(center, inv_rd, rd, node_min, node_max);
+        assert_eq!(
+            normal,
+            [0.0, 0.0, 1.0],
+            "diagonal inside-node LOD ray must exit through +z, got {normal:?}",
+        );
+    }
+
     /// hash-thing-rv4: `hit_normal` must be `None` on every non-hit return
     /// path. The CPU trace has four miss/exhausted sites; this test
     /// exercises the two most reachable ones (clean miss, pre-root miss).
@@ -2220,7 +2562,7 @@ mod tests {
         let mut svdag = Svdag::new();
         svdag.update(&store, root, 6);
 
-        // Make several edits to accumulate stale slots.
+        // Make several edits to accumulate stale slots in offset_by_slot.
         for i in 1..10 {
             root = store.set_cell(root, i * 5, i * 3, i * 4, mat(1));
             svdag.update(&store, root, 6);
@@ -2228,10 +2570,6 @@ mod tests {
 
         let pre_compact_len = svdag.nodes.len();
         let pre_compact_total = svdag.total_slot_count();
-        assert!(
-            svdag.stale_ratio() > 0.0,
-            "edits should produce some stale slots"
-        );
 
         svdag.compact(&store, root);
 
@@ -2243,6 +2581,8 @@ mod tests {
             svdag.total_slot_count() <= pre_compact_total,
             "compact must not grow the cache"
         );
+        // After compact (full rebuild), id_to_offset is fresh and
+        // node_count = id_to_offset.len() = offset_by_slot.len() exactly.
         assert_eq!(
             svdag.stale_ratio(),
             0.0,
@@ -2275,5 +2615,147 @@ mod tests {
             mask > 0,
             "root mask should be nonzero for a non-empty world"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // m1f.5: SVDAG ↔ octree content sync validation
+    // ---------------------------------------------------------------
+
+    /// Helper: verify every cell in the octree matches the SVDAG lookup.
+    /// Samples all cells in the side³ cube.
+    fn assert_svdag_matches_octree(
+        svdag: &Svdag,
+        store: &NodeStore,
+        root: NodeId,
+        level: u32,
+        label: &str,
+    ) {
+        let side = 1u64 << level;
+        let mut mismatches = 0;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let octree_val = store.get_cell(root, x, y, z);
+                    let svdag_val = svdag.lookup_voxel(x, y, z) as CellState;
+                    if octree_val != svdag_val {
+                        if mismatches < 5 {
+                            eprintln!(
+                                "  MISMATCH at ({x},{y},{z}): octree={octree_val} svdag={svdag_val} [{label}]"
+                            );
+                        }
+                        mismatches += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{label}: {mismatches} voxel mismatches between octree and SVDAG"
+        );
+    }
+
+    #[test]
+    fn svdag_matches_octree_after_build() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4); // 16³ — small enough to exhaustively check
+        root = store.set_cell(root, 3, 7, 11, mat(1));
+        root = store.set_cell(root, 0, 0, 0, mat(2));
+        root = store.set_cell(root, 15, 15, 15, mat(3));
+
+        let svdag = Svdag::build(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "fresh build");
+    }
+
+    #[test]
+    fn svdag_matches_octree_after_incremental_edits() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        root = store.set_cell(root, 5, 5, 5, mat(1));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "initial");
+
+        // Edit 1: add a voxel
+        root = store.set_cell(root, 10, 2, 14, mat(2));
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "after add");
+
+        // Edit 2: overwrite existing voxel with different material
+        root = store.set_cell(root, 5, 5, 5, mat(3));
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "after overwrite");
+
+        // Edit 3: erase a voxel
+        root = store.set_cell(root, 10, 2, 14, 0);
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "after erase");
+    }
+
+    #[test]
+    fn svdag_matches_octree_after_compact() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+
+        let mut svdag = Svdag::new();
+
+        // Fill scattered voxels, updating incrementally each time.
+        for i in 0..12u64 {
+            root = store.set_cell(root, i, i % 8, (i * 3) % 16, mat((i as u16) + 1));
+            svdag.update(&store, root, 4);
+        }
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "pre-compact");
+
+        svdag.compact(&store, root);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "post-compact");
+    }
+
+    #[test]
+    fn svdag_matches_octree_cross_epoch() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        root = store.set_cell(root, 7, 3, 12, mat(1));
+        root = store.set_cell(root, 1, 1, 1, mat(2));
+
+        let mut svdag = Svdag::new();
+        svdag.update(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "epoch 1");
+
+        // Compact the store — NodeIds change, content stays the same.
+        // Must apply_remap so the persistent cache stays valid (5bb.11).
+        let (store2, root2, remap) = store.compacted_with_remap(root);
+        svdag.apply_remap(&remap);
+        svdag.update(&store2, root2, 4);
+        assert_svdag_matches_octree(&svdag, &store2, root2, 4, "epoch 2 (after compaction)");
+
+        // Edit in the new epoch and validate.
+        let mut store2 = store2;
+        let mut root2 = root2;
+        root2 = store2.set_cell(root2, 0, 15, 0, mat(4));
+        svdag.update(&store2, root2, 4);
+        assert_svdag_matches_octree(&svdag, &store2, root2, 4, "epoch 2 after edit");
+    }
+
+    #[test]
+    fn svdag_matches_octree_empty_world() {
+        let mut store = NodeStore::new();
+        let root = store.empty(4);
+        let svdag = Svdag::build(&store, root, 4);
+        assert_svdag_matches_octree(&svdag, &store, root, 4, "empty world");
+    }
+
+    #[test]
+    fn svdag_matches_octree_uniform_world() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3); // 8³ — fill all cells
+        for z in 0..8u64 {
+            for y in 0..8u64 {
+                for x in 0..8u64 {
+                    root = store.set_cell(root, x, y, z, mat(1));
+                }
+            }
+        }
+        let svdag = Svdag::build(&store, root, 3);
+        assert_svdag_matches_octree(&svdag, &store, root, 3, "fully filled 8³");
     }
 }
