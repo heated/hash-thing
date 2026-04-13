@@ -394,10 +394,7 @@ impl World {
 
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
         // Node-local alignment (9ww): the partition is determined by grid-local
-        // coordinates, not world-space origin. Every block starting at offset
-        // is valid — no world-space alignment check needed. This makes the
-        // cache key origin-independent, enabling spatial memoization for all
-        // worlds including those with block rules.
+        // coordinates, not world-space origin.
         let offset = (generation % 2) as usize;
         let mut bz = offset;
         while bz + 1 < side - 1 {
@@ -1189,5 +1186,70 @@ mod tests {
     #[should_panic]
     fn source_index_out_of_range_panics() {
         source_index(3, 0);
+    }
+
+    /// Regression test for u4w: water column should not have checkerboard gaps.
+    /// Before the fix, a single Margolus offset per step left every-other-row
+    /// empty because cells only moved within their 2×2×2 block boundary.
+    #[test]
+    fn water_column_mass_conservation() {
+        use crate::terrain::materials::WATER_MATERIAL_ID;
+        let mut world = World::new(5); // 32³
+        // Place a column of water at (16, y, 16) for y in 8..24.
+        for y in 8..24 {
+            world.set(wc(16), wc(y), wc(16), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        }
+        let initial_water = count_material(&world, 32, WATER_MATERIAL_ID);
+        assert_eq!(initial_water, 16);
+
+        for step in 0..8 {
+            world.step_recursive();
+            let water_count = count_material(&world, 32, WATER_MATERIAL_ID);
+            // Collect all water positions for diagnostics
+            let mut water_xs = std::collections::HashSet::new();
+            for z in 0..32i64 {
+                for y in 0..32i64 {
+                    for x in 0..32i64 {
+                        let cell = Cell::from_raw(world.get(
+                            WorldCoord(x), WorldCoord(y), WorldCoord(z),
+                        ));
+                        if cell.material() == WATER_MATERIAL_ID {
+                            water_xs.insert(x);
+                        }
+                    }
+                }
+            }
+            eprintln!("step {step}: water_count={water_count}, x_values={water_xs:?}");
+            // Mass must be conserved
+            assert_eq!(
+                water_count, initial_water,
+                "mass not conserved at step {step}: expected {initial_water}, got {water_count}"
+            );
+            // Water must stay at x=16 (no lateral drift)
+            assert!(
+                water_xs.contains(&16) && water_xs.len() == 1,
+                "water drifted laterally at step {step}: x values = {water_xs:?}"
+            );
+        }
+    }
+
+    /// Count cells of a given material in the world.
+    fn count_material(world: &World, side: i64, material_id: u16) -> usize {
+        let mut count = 0;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let cell = Cell::from_raw(world.get(
+                        WorldCoord(x),
+                        WorldCoord(y),
+                        WorldCoord(z),
+                    ));
+                    if cell.material() == material_id {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
 }

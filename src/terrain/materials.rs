@@ -130,8 +130,6 @@ impl MaterialRegistry {
             water_material: WATER_MATERIAL_ID,
             solidify_product: Cell::pack(STONE_MATERIAL_ID, 0),
         });
-        let fluid_block_rule =
-            registry.register_block_rule(FluidBlockRule::new(material_density, WATER_MATERIAL_ID));
         let gravity_block_rule =
             registry.register_block_rule(GravityBlockRule::new(material_density));
         let lava_fluid_block_rule =
@@ -236,7 +234,7 @@ impl MaterialRegistry {
                     conductivity: 0.6,
                 },
                 rule_id: water_rule,
-                block_rule_id: Some(fluid_block_rule),
+                block_rule_id: Some(gravity_block_rule),
             },
         );
         registry.insert(
