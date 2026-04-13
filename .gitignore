@@ -3,6 +3,7 @@
 .claude/
 .ship-notes/*
 !.ship-notes/design-ledger.md
+!.ship-notes/multiplayer-model-options.md
 
 # Beads / Dolt files (added by bd init)
 .dolt/
