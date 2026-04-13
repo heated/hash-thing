@@ -152,6 +152,17 @@ pub struct DemoWaypoint {
     pub radius: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProgressionWaterfallLayout {
+    shell: Box3,
+    shaft: Box3,
+    curtain: Box3,
+    source_x: [i64; 2],
+    source_y: [i64; 2],
+    source_z: i64,
+    focus: [i64; 3],
+}
+
 /// The simulation world. Owns the octree store and manages stepping.
 ///
 /// For now, stepping works by flattening to a grid, applying rules, and
@@ -1154,6 +1165,7 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        self.clone_sources.clear();
         let terrain_params = TerrainParams::for_level(self.level);
         let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level)
             .expect("TerrainParams::for_level must yield a valid heightmap field");
@@ -1186,6 +1198,7 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        self.clone_sources.clear();
         let field = GyroidField::for_world(self.level, 42);
         let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
         self.root = root;
@@ -1412,6 +1425,70 @@ impl World {
         ]
     }
 
+    fn progression_waterfall_layout(
+        corridor: Box3,
+        tease_b: Box3,
+        ground_y: i64,
+    ) -> ProgressionWaterfallLayout {
+        let source_z = tease_b.min[2] - 2;
+        let curtain_z = source_z + 1;
+        let curtain_front_z = tease_b.min[2];
+        let shaft_bottom = ground_y - 2;
+        let shaft_top = corridor.max[1] + 4;
+        let source_x = [tease_b.min[0], tease_b.max[0]];
+
+        ProgressionWaterfallLayout {
+            shell: Box3::new(
+                [source_x[0] - 1, shaft_bottom - 1, source_z],
+                [source_x[1] + 1, shaft_top + 1, curtain_z],
+            ),
+            shaft: Box3::new(
+                [source_x[0], shaft_bottom, curtain_z],
+                [source_x[1], shaft_top, curtain_front_z],
+            ),
+            curtain: Box3::new(
+                [source_x[0], shaft_bottom, curtain_z],
+                [source_x[1], shaft_top - 1, curtain_front_z],
+            ),
+            source_x,
+            source_y: [shaft_bottom, shaft_top],
+            source_z,
+            focus: [tease_b.center()[0], corridor.center()[1], curtain_front_z],
+        }
+    }
+
+    fn place_clone_source(&mut self, pos: [i64; 3], source_material: u16) {
+        let state = Cell::pack(CLONE_MATERIAL_ID, source_material).raw();
+        self.set(
+            WorldCoord(pos[0]),
+            WorldCoord(pos[1]),
+            WorldCoord(pos[2]),
+            state,
+        );
+        self.clone_sources.push(pos);
+    }
+
+    fn seed_progression_waterfall(
+        &mut self,
+        corridor: Box3,
+        tease_b: Box3,
+        ground_y: i64,
+    ) -> ProgressionWaterfallLayout {
+        let layout = Self::progression_waterfall_layout(corridor, tease_b, ground_y);
+        let water_material = Cell::from_raw(WATER).material();
+
+        self.fill_box(layout.shell, STONE);
+        self.fill_box(layout.shaft, AIR);
+        self.fill_box(layout.curtain, WATER);
+        for y in layout.source_y[0]..=layout.source_y[1] {
+            for x in layout.source_x[0]..=layout.source_x[1] {
+                self.place_clone_source([x, y, layout.source_z], water_material);
+            }
+        }
+
+        layout
+    }
+
     pub fn seed_lattice_progression_demo(&mut self) -> DemoLayout {
         self.seed_lattice_megastructure();
         let field = LatticeField::for_world(self.level, 42);
@@ -1461,13 +1538,7 @@ impl World {
             balcony,
             panorama,
         );
-        self.fill_floor(
-            Box3::new(
-                [panorama.min[0], balcony.min[1], balcony.min[2]],
-                [panorama.max[0], balcony.max[1], balcony.max[2]],
-            ),
-            STONE,
-        );
+        self.stage_panorama_gangplank(balcony, panorama);
         self.carve_rising_promenade(
             atrium.center()[0],
             balcony.center()[0],
@@ -1489,6 +1560,7 @@ impl World {
             panorama,
             reveal_center,
         ));
+        self.seed_progression_waterfall(corridor, tease_b, ground_y);
         self.seed_reveal_fireworks(balcony.center());
         self.seed_progression_break_trigger(tease_a);
 
@@ -1629,6 +1701,30 @@ impl World {
             ),
             WATER,
         );
+    }
+
+    fn stage_panorama_gangplank(&mut self, balcony: Box3, panorama: Box3) {
+        let spine_z = balcony.center()[2];
+        let drop_floor = (balcony.min[1] - 10).max(0);
+        let gangplank = Box3::new(
+            [balcony.min[0], balcony.min[1], spine_z - 1],
+            [panorama.max[0], balcony.max[1], spine_z + 1],
+        );
+        let wide_span = Box3::new(
+            [panorama.min[0], balcony.min[1], balcony.min[2]],
+            [panorama.max[0], balcony.max[1], balcony.max[2]],
+        );
+
+        // Clear the broad terrace floor first so the reveal reads as a narrow
+        // bridge over open air instead of a safe plaza.
+        self.fill_floor(wide_span, AIR);
+        self.fill_floor(gangplank, STONE);
+
+        let drop = Box3::new(
+            [balcony.max[0] - 1, drop_floor, balcony.min[2] - 2],
+            [panorama.max[0], balcony.min[1] - 2, balcony.max[2] + 2],
+        );
+        self.fill_box(drop, AIR);
     }
 
     fn seed_progression_break_trigger(&mut self, tease_a: Box3) {
@@ -1936,6 +2032,7 @@ mod tests {
 
     use super::*;
     use crate::player;
+    use crate::render::Svdag;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
         MaterialRegistry, FAN, FIRE, FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
@@ -2037,6 +2134,86 @@ mod tests {
         }
 
         panic!("no walkable route between {from:?} and {to:?}");
+    }
+
+    fn sync_svdag_with_world(world: &mut World, svdag: &mut Svdag) {
+        if let Some(remap) = world.last_compaction_remap.take() {
+            svdag.apply_remap(&remap);
+        }
+        svdag.update(&world.store, world.root, world.level);
+        if svdag.stale_ratio() > 0.5 {
+            svdag.compact(&world.store, world.root);
+        }
+    }
+
+    fn lookup_svdag_voxel(svdag: &Svdag, x: u64, y: u64, z: u64) -> u16 {
+        const LEAF_BIT: u32 = 0x8000_0000;
+
+        let side = 1u64 << svdag.root_level;
+        if x >= side || y >= side || z >= side {
+            return 0;
+        }
+        let mut offset = svdag.nodes[0] as usize;
+        let mut lx = x;
+        let mut ly = y;
+        let mut lz = z;
+        for level in (1..=svdag.root_level).rev() {
+            let half = 1u64 << (level - 1);
+            let ox = usize::from(lx >= half);
+            let oy = usize::from(ly >= half);
+            let oz = usize::from(lz >= half);
+            let octant = ox | (oy << 1) | (oz << 2);
+
+            let mask = svdag.nodes[offset];
+            let child_word = svdag.nodes[offset + 1 + octant];
+            if mask & (1 << octant) == 0 {
+                return 0;
+            }
+            if child_word & LEAF_BIT != 0 {
+                return (child_word & !LEAF_BIT) as u16;
+            }
+
+            offset = child_word as usize;
+            if ox == 1 {
+                lx -= half;
+            }
+            if oy == 1 {
+                ly -= half;
+            }
+            if oz == 1 {
+                lz -= half;
+            }
+        }
+        0
+    }
+
+    fn assert_svdag_matches_world(world: &World, svdag: &Svdag, label: &str) {
+        let side = world.side();
+        let mut mismatches = 0;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let octree = world.get(
+                        WorldCoord(x as i64),
+                        WorldCoord(y as i64),
+                        WorldCoord(z as i64),
+                    );
+                    let dag = lookup_svdag_voxel(svdag, x as u64, y as u64, z as u64);
+                    if octree != dag {
+                        if mismatches < 5 {
+                            eprintln!(
+                                "  MISMATCH at ({x},{y},{z}): octree={octree} svdag={dag} [{label}]"
+                            );
+                        }
+                        mismatches += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{label}: {mismatches} voxel mismatches between world octree and Svdag"
+        );
     }
 
     fn wc(coord: u64) -> WorldCoord {
@@ -2411,6 +2588,24 @@ mod tests {
     }
 
     #[test]
+    fn water_and_sand_scene_keeps_svdag_in_sync_across_steps() {
+        let mut world = World::new(6); // 64^3 is still practical for exhaustive Svdag checks.
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "initial water scene");
+
+        for step in 1..=12 {
+            world.step();
+            sync_svdag_with_world(&mut world, &mut svdag);
+            assert_svdag_matches_world(&world, &svdag, &format!("after water-heavy step {step}"));
+        }
+    }
+
+    #[test]
     fn lattice_progression_demo_spawn_and_waypoints_are_open() {
         let mut w = World::new(6); // side 64
         let layout = w.seed_lattice_progression_demo();
@@ -2448,6 +2643,46 @@ mod tests {
     }
 
     #[test]
+    fn lattice_progression_demo_reveal_reads_as_gangplank_over_void() {
+        let mut w = World::new(6);
+        let layout = w.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(w.level, 42);
+        let ProgressionBoxes {
+            balcony, panorama, ..
+        } = World::progression_boxes(&field);
+        let tip_x = panorama.max[0] - 1;
+        let side_z = (balcony.max[2] + 2).min(panorama.max[2]);
+
+        assert_eq!(
+            w.get(
+                WorldCoord(tip_x),
+                WorldCoord(layout.panorama_center[1] - 1),
+                WorldCoord(layout.panorama_center[2]),
+            ),
+            STONE,
+            "gangplank should carry the player at the reveal tip"
+        );
+        assert_eq!(
+            w.get(
+                WorldCoord(tip_x),
+                WorldCoord(layout.panorama_center[1] - 1),
+                WorldCoord(side_z),
+            ),
+            AIR,
+            "off the gangplank there should be no terrace floor"
+        );
+        assert_eq!(
+            w.get(
+                WorldCoord(tip_x),
+                WorldCoord(layout.panorama_center[1] - 4),
+                WorldCoord(layout.panorama_center[2]),
+            ),
+            AIR,
+            "the reveal tip should hang over a real drop"
+        );
+    }
+
+    #[test]
     fn lattice_progression_demo_places_spectacle_along_the_walk_route() {
         let mut w = World::new(6);
         let layout = w.seed_lattice_progression_demo();
@@ -2474,6 +2709,76 @@ mod tests {
             snapshot.contains(&FIREWORK),
             "reveal should stage firework launchers near {:?}",
             layout.reveal_center
+        );
+    }
+
+    #[test]
+    fn lattice_progression_demo_stages_clone_fed_waterfall_beside_corridor_gap() {
+        let mut w = World::new(6);
+        let _layout = w.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(w.level, 42);
+        let ground_y = field.lo[1] + field.floor_thick;
+        let ProgressionBoxes {
+            corridor, tease_b, ..
+        } = World::progression_boxes(&field);
+        let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
+        let water_material = Cell::from_raw(WATER).material();
+
+        assert!(
+            w.active_material_stats_near(waterfall.focus, 4).water_cells > 0,
+            "corridor side gap should frame a visible waterfall near {:?}",
+            waterfall.focus
+        );
+        for y in waterfall.source_y[0]..=waterfall.source_y[1] {
+            for x in waterfall.source_x[0]..=waterfall.source_x[1] {
+                let state = Cell::from_raw(w.get(
+                    WorldCoord(x),
+                    WorldCoord(y),
+                    WorldCoord(waterfall.source_z),
+                ));
+                assert_eq!(
+                    state.material(),
+                    CLONE_MATERIAL_ID,
+                    "waterfall source wall should be clone blocks"
+                );
+                assert_eq!(
+                    state.metadata(),
+                    water_material,
+                    "waterfall clone blocks should encode water as their source material"
+                );
+            }
+        }
+        assert_eq!(
+            w.get(
+                WorldCoord(tease_b.center()[0]),
+                WorldCoord(corridor.center()[1]),
+                WorldCoord(tease_b.max[2]),
+            ),
+            AIR,
+            "waterfall should stay outside the corridor cavity"
+        );
+    }
+
+    #[test]
+    fn lattice_progression_demo_reseed_resets_waterfall_clone_tracking() {
+        let mut w = World::new(6);
+        let field = LatticeField::for_world(w.level, 42);
+        let ground_y = field.lo[1] + field.floor_thick;
+        let ProgressionBoxes {
+            corridor, tease_b, ..
+        } = World::progression_boxes(&field);
+        let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
+        let expected_sources = ((waterfall.source_x[1] - waterfall.source_x[0] + 1)
+            * (waterfall.source_y[1] - waterfall.source_y[0] + 1)) as usize;
+
+        w.seed_lattice_progression_demo();
+        assert_eq!(w.clone_sources.len(), expected_sources);
+
+        w.seed_lattice_progression_demo();
+        assert_eq!(
+            w.clone_sources.len(),
+            expected_sources,
+            "scene reseed should replace waterfall clone tracking instead of accumulating duplicates"
         );
     }
 
@@ -3962,6 +4267,56 @@ mod tests {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+
+    #[test]
+    fn progression_waterfall_stays_visually_contiguous() {
+        let mut world = World::new(6);
+        world.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(world.level, 42);
+        let ground_y = field.lo[1] + field.floor_thick;
+        let ProgressionBoxes {
+            corridor, tease_b, ..
+        } = World::progression_boxes(&field);
+        let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
+
+        for _ in 0..6 {
+            world.spawn_clones();
+            world.step();
+        }
+
+        let mut occupied = Vec::new();
+        for y in waterfall.shaft.min[1]..=waterfall.shaft.max[1] {
+            let mut xs = Vec::new();
+            for x in waterfall.curtain.min[0]..=waterfall.curtain.max[0] {
+                let has_water = (waterfall.curtain.min[2]..=waterfall.curtain.max[2]).any(|z| {
+                    Cell::from_raw(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z))).material()
+                        == WATER_MATERIAL_ID
+                });
+                if has_water {
+                    xs.push(x);
+                }
+            }
+            if !xs.is_empty() {
+                occupied.push((y, xs));
+            }
+        }
+
+        assert!(
+            occupied.len() >= 4,
+            "waterfall should remain visible across multiple projected rows"
+        );
+        for (y, xs) in occupied {
+            for pair in xs.windows(2) {
+                assert_eq!(
+                    pair[1] - pair[0],
+                    1,
+                    "waterfall developed a projected gap at y={y}, x={}..{}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
     }
 
