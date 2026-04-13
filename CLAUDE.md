@@ -186,15 +186,7 @@ Measure warm frames only (skip cold startup generations). Cold frame cost is one
 
 ## Perf tracking
 
-When closing any bead that changes performance characteristics, add a `bd comments add` with before/after numbers. Include: world size, build profile (debug/release), hardware context (e.g. "Mac integrated GPU"), and which metric moved. This is how we track regressions and wins project-wide — the bead comment trail is the perf history.
-
-Key metrics to capture when relevant:
-- `render_gpu` — GPU frame time (from timestamp query)
-- `render_cpu` — CPU-side render submission
-- `upload_cpu` — SVDAG rebuild + GPU transfer
-- `step` — hashlife generation time (warm)
-- terrain gen time at standard sizes (512³, 1024³)
-- memory (octree nodes, SVDAG size)
+On perf-relevant bead close, `bd comments add` with before/after numbers (world size, release, metric name). Metrics: `render_gpu`, `upload_cpu`, `step`, terrain gen, memory.
 
 ## Quick Reference
 
