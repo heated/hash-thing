@@ -165,13 +165,13 @@ fn lattice_demo_waypoint(side: usize, beat: LatticeDemoBeat) -> DemoWaypoint {
                 player: PlayerPose {
                     pos: [center + offset, side * 0.58, center + offset],
                     yaw: std::f64::consts::FRAC_PI_4,
-                    pitch: -0.22,
+                    pitch: 0.24,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.5, 0.46, 0.5],
+                    target: [0.62, 0.72, 0.62],
                     yaw: std::f32::consts::FRAC_PI_4,
-                    pitch: 0.18,
-                    dist: 1.05,
+                    pitch: 0.32,
+                    dist: 0.82,
                 },
             }
         }
@@ -1692,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn lattice_panorama_waypoint_faces_inward_and_downward() {
+    fn lattice_panorama_waypoint_faces_inward_and_upward() {
         let waypoint = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
         let (_eye, dir) = player::eye_ray(
             &waypoint.player.pos,
@@ -1700,7 +1700,7 @@ mod tests {
             waypoint.player.pitch,
         );
         assert!(dir[0] < 0.0);
-        assert!(dir[1] < 0.0);
+        assert!(dir[1] > 0.0);
         assert!(dir[2] < 0.0);
     }
 
@@ -1737,7 +1737,9 @@ mod tests {
     fn first_person_legend_hides_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
         assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(!lines.iter().any(|line| line.contains("DEV intro/interior/reveal")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
         assert!(lines.iter().any(|line| line.contains("Walk lattice")));
     }
@@ -1746,7 +1748,9 @@ mod tests {
     fn orbit_legend_marks_lattice_jumps_as_debug() {
         let lines = App::legend_lines(CameraMode::Orbit);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(lines.iter().any(|line| line.contains("DEV intro/interior/reveal")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
         assert!(lines.iter().any(|line| line.contains("Walk lattice")));
     }
