@@ -82,7 +82,7 @@ pub struct World {
     pub simulation_seed: u64,
     pub materials: MaterialRegistry,
     /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
-    /// `ensure_region` generates terrain (heightmap + caves)
+    /// `ensure_region` generates terrain (heightmap)
     /// for newly-created sibling octants instead of leaving them empty.
     terrain_params: Option<TerrainParams>,
     /// Spatial memoization cache for the recursive Hashlife stepper.
