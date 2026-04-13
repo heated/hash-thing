@@ -916,8 +916,8 @@ mod tests {
         let mut brute = World::new(4);
         let mut recur = World::new(4);
         let params = TerrainParams::default();
-        brute.seed_terrain(&params);
-        recur.seed_terrain(&params);
+        brute.seed_terrain(&params).unwrap();
+        recur.seed_terrain(&params).unwrap();
         assert_eq!(brute.flatten(), recur.flatten(), "initial state must match");
         for _ in 0..2 {
             brute.step();
@@ -1081,8 +1081,8 @@ mod tests {
         let params = TerrainParams::default();
         let mut brute = World::new(level);
         let mut recur = World::new(level);
-        brute.seed_terrain(&params);
-        recur.seed_terrain(&params);
+        brute.seed_terrain(&params).unwrap();
+        recur.seed_terrain(&params).unwrap();
 
         // Brute-force timing.
         let t0 = Instant::now();

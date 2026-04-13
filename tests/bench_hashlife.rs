@@ -20,7 +20,7 @@ fn bench_step(label: &str, level: u32, generations: usize) {
     let t0 = Instant::now();
     let mut world = World::new(level);
     let params = TerrainParams::for_level(level);
-    let stats = world.seed_terrain(&params);
+    let stats = world.seed_terrain(&params).expect("level-derived terrain params must validate");
     let seed_ms = t0.elapsed().as_millis();
     eprintln!(
         "  seed: {seed_ms}ms (precompute: {}µs, gen: {}µs), pop: {}, \
@@ -123,7 +123,9 @@ fn bench_edit_propagation(label: &str, level: u32, edits: usize) {
 
     let mut world = World::new(level);
     let params = TerrainParams::for_level(level);
-    world.seed_terrain(&params);
+    world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
 
     // Warm step — populate cache
     let t = Instant::now();
@@ -195,7 +197,9 @@ fn bench_edit_cache_impact_64() {
     // Tiny world to see exact cache invalidation numbers
     let mut world = World::new(6);
     let params = TerrainParams::for_level(6);
-    world.seed_terrain(&params);
+    world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
 
     world.step_recursive();
     let warm = world.hashlife_stats;
