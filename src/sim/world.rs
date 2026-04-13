@@ -1140,7 +1140,8 @@ impl World {
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
         let terrain_params = TerrainParams::for_level(self.level);
-        let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level);
+        let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level)
+            .expect("TerrainParams::for_level must yield a valid heightmap field");
         let lattice = LatticeField::for_world(self.level, 42);
         let edge_blend = (lattice.cell_size / 2).max(2);
         let field = TerrainBlendField::new(
@@ -1571,7 +1572,8 @@ impl World {
         self.hashlife_all_inert_cache.clear();
         let heightmap = params.to_heightmap();
         let precompute_start = std::time::Instant::now();
-        let field = PrecomputedHeightmapField::new(heightmap, self.level);
+        let field = PrecomputedHeightmapField::new(heightmap, self.level)
+            .expect("validated TerrainParams must yield a valid heightmap field");
         let precompute_us = precompute_start.elapsed().as_micros() as u64;
         let gen_start = std::time::Instant::now();
         let (root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
@@ -2035,7 +2037,8 @@ mod tests {
         world.seed_lattice_megastructure();
 
         let params = TerrainParams::for_level(6);
-        let terrain = PrecomputedHeightmapField::new(params.to_heightmap(), 6);
+        let terrain = PrecomputedHeightmapField::new(params.to_heightmap(), 6)
+            .expect("TerrainParams::for_level must yield a valid heightmap field");
         let point = [0i64, 20, 20];
         let point_world = [0u64, 20, 20];
 
