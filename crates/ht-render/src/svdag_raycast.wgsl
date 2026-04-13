@@ -136,17 +136,6 @@ fn heatmap_color(ratio: f32) -> vec3<f32> {
     return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
 }
 
-// Linear → sRGB conversion. Compute shaders write to storage textures
-// which bypass hardware sRGB conversion that fragment shaders get for free
-// when the render target is Rgba8UnormSrgb. We must do the conversion
-// manually to match the previous visual output.
-fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    let cutoff = c <= vec3<f32>(0.0031308);
-    let lo = c * 12.92;
-    let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
-    return select(hi, lo, cutoff);
-}
-
 // Iterative DAG descent.
 //
 // Strategy: for each ray, start at root. At each level, compute which octant
@@ -538,10 +527,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         final_color = vec4<f32>(bg, 1.0);
     }
 
-    // Linear → sRGB: storage texture writes bypass hardware sRGB conversion.
-    // The blit shader samples this texture and writes to the sRGB swapchain,
-    // but the swapchain's sRGB encoding expects pre-converted sRGB values
-    // when sampled as a regular texture_2d<f32>. Apply conversion here.
-    let srgb = linear_to_srgb(final_color.xyz);
-    textureStore(output, vec2<i32>(gid.xy), vec4<f32>(srgb, final_color.a));
+    // Store linear color — the blit shader writes to an sRGB swapchain surface,
+    // so hardware sRGB encoding happens at the final render pass output.
+    // No manual conversion needed here; rgba16float stores linear values losslessly.
+    textureStore(output, vec2<i32>(gid.xy), final_color);
 }

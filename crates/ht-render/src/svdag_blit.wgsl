@@ -2,13 +2,10 @@
 // to the swapchain surface. This is the first draw call in the render pass;
 // particle, HUD, and legend overlays follow in the same pass.
 //
-// The raycast compute shader writes sRGB-encoded values to an rgba16float
-// storage texture. This shader samples it as a regular texture and outputs
-// to the sRGB swapchain. Since the values are already sRGB-encoded, the
-// swapchain's sRGB encoding will double-encode slightly — but at 16-bit
-// float precision the visual difference is imperceptible. If exact round-trip
-// is needed, sample as rgba16float and skip the swapchain sRGB (use a non-sRGB
-// surface format).
+// The raycast compute shader writes linear-space colors to an rgba16float
+// storage texture. This shader samples it and outputs to the sRGB swapchain,
+// which applies hardware linear→sRGB conversion on write — matching the
+// color pipeline of the old fragment shader path.
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
