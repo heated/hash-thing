@@ -82,6 +82,32 @@ pub struct DemoLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DemoSpectacleProfile {
+    Cascade,
+    Hearth,
+    Clash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DemoSpectacleAnchor {
+    pub label: &'static str,
+    pub center: [i64; 3],
+    pub profile: DemoSpectacleProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveMaterialStats {
+    pub fire_cells: u32,
+    pub water_cells: u32,
+}
+
+impl ActiveMaterialStats {
+    pub fn active_cells(self) -> u32 {
+        self.fire_cells + self.water_cells
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Box3 {
     min: [i64; 3],
     max: [i64; 3],
@@ -843,10 +869,118 @@ impl World {
         }
     }
 
+    /// Stamp deterministic active-material set pieces around named anchors.
+    ///
+    /// This is deliberately scene-local plumbing: callers provide the
+    /// anchor positions, while the helper provides reproducible spectacle
+    /// primitives that survive scene resets without hard-coding a route.
+    pub fn stage_demo_spectacles(&mut self, anchors: &[DemoSpectacleAnchor]) {
+        for &anchor in anchors {
+            self.stage_demo_spectacle(anchor);
+        }
+    }
+
+    /// Count active materials in a local box around `center`. Tests and
+    /// future scene validators use this to assert spectacle presence
+    /// after a reset without depending on exact voxel-for-voxel layouts.
+    pub fn active_material_stats_near(&self, center: [i64; 3], radius: u64) -> ActiveMaterialStats {
+        let radius = i64::try_from(radius).expect("demo spectacle radius must fit in i64");
+        let mut stats = ActiveMaterialStats::default();
+        for z in (center[2] - radius)..=(center[2] + radius) {
+            for y in (center[1] - radius)..=(center[1] + radius) {
+                for x in (center[0] - radius)..=(center[0] + radius) {
+                    match self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) {
+                        FIRE => stats.fire_cells += 1,
+                        WATER => stats.water_cells += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        stats
+    }
+
+    fn stage_demo_spectacle(&mut self, anchor: DemoSpectacleAnchor) {
+        match anchor.profile {
+            DemoSpectacleProfile::Cascade => self.stage_cascade(anchor.center),
+            DemoSpectacleProfile::Hearth => self.stage_hearth(anchor.center),
+            DemoSpectacleProfile::Clash => self.stage_clash(anchor.center),
+        }
+    }
+
+    fn stage_cascade(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box_clamped([cx - 3, cy - 2, cz - 3], [cx + 4, cy + 5, cz + 4], AIR);
+        self.fill_box_clamped([cx - 2, cy - 2, cz - 3], [cx + 3, cy, cz + 3], DIRT);
+        self.fill_box_clamped([cx - 2, cy - 1, cz + 2], [cx + 3, cy + 4, cz + 3], STONE);
+        self.fill_box_clamped([cx - 1, cy + 2, cz], [cx + 2, cy + 4, cz + 1], WATER);
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 1], [cx - 2, cy + 1, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 2, cy - 1, cz - 1], [cx + 3, cy + 1, cz + 1], FIRE);
+    }
+
+    fn stage_hearth(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 3], [cx + 4, cy + 4, cz + 4], AIR);
+        self.fill_box_clamped([cx - 3, cy - 1, cz - 3], [cx + 4, cy, cz + 4], STONE);
+        self.fill_box_clamped([cx - 2, cy, cz + 2], [cx + 3, cy + 3, cz + 3], GRASS);
+        self.fill_box_clamped([cx - 1, cy, cz - 1], [cx + 1, cy + 2, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 1, cy, cz - 1], [cx + 2, cy + 2, cz + 1], WATER);
+    }
+
+    fn stage_clash(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box_clamped([cx - 4, cy - 2, cz - 3], [cx + 5, cy + 4, cz + 4], AIR);
+        self.fill_box_clamped([cx - 4, cy - 2, cz - 3], [cx + 5, cy, cz + 4], DIRT);
+        self.fill_box_clamped([cx - 4, cy - 1, cz + 2], [cx - 1, cy + 2, cz + 3], GRASS);
+        self.fill_box_clamped([cx - 3, cy, cz - 1], [cx - 1, cy + 2, cz + 1], FIRE);
+        self.fill_box_clamped([cx + 1, cy + 1, cz - 1], [cx + 4, cy + 3, cz + 1], WATER);
+        self.fill_box_clamped([cx + 1, cy - 1, cz + 2], [cx + 4, cy + 3, cz + 3], STONE);
+    }
+
+    fn fill_box_clamped(&mut self, min: [i64; 3], max: [i64; 3], state: CellState) {
+        let region = self.region();
+        for z in min[2]..max[2] {
+            for y in min[1]..max[1] {
+                for x in min[0]..max[0] {
+                    if region.contains(x, y, z) {
+                        self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                    }
+                }
+            }
+        }
+    }
+
+    fn burning_room_demo_spectacle_anchors(&self) -> [DemoSpectacleAnchor; 3] {
+        let side = self.side() as i64;
+        let margin = side / 8;
+        let lo = margin + 6;
+        let hi = side - margin - 7;
+        let mid = side / 2;
+        [
+            DemoSpectacleAnchor {
+                label: "intro",
+                center: [lo, margin + 2, lo + 4],
+                profile: DemoSpectacleProfile::Hearth,
+            },
+            DemoSpectacleAnchor {
+                label: "interior",
+                center: [mid, margin + 3, mid],
+                profile: DemoSpectacleProfile::Clash,
+            },
+            DemoSpectacleAnchor {
+                label: "panorama",
+                center: [hi, margin + 3, hi],
+                profile: DemoSpectacleProfile::Cascade,
+            },
+        ]
+    }
+
     /// Seed a demo scene: stone room with grass walls (fuel), fire, and water.
     ///
     /// Demonstrates reaction phase (fire spreads to grass, water quenches fire)
     /// plus movement phase (water falls and spreads via FluidBlockRule).
+    /// The room now carries three named spectacle anchors so resets keep
+    /// active-material read points available in the same local pockets.
     pub fn seed_burning_room(&mut self) {
         let side = self.side() as u64;
         let margin = side / 8;
@@ -870,35 +1004,7 @@ impl World {
                 }
             }
         }
-
-        // Fire source: small cluster in one corner
-        let fire_x = lo + 2;
-        let fire_z = lo + 2;
-        for dy in 1..4u64 {
-            for dx in 0..2u64 {
-                for dz in 0..2u64 {
-                    let y = lo + dy;
-                    let x = fire_x + dx;
-                    let z = fire_z + dz;
-                    if x < hi && y < hi && z < hi {
-                        self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), FIRE);
-                    }
-                }
-            }
-        }
-
-        // Water pool: opposite corner, a few layers deep
-        let water_hi_x = hi - 2;
-        let water_hi_z = hi - 2;
-        let water_lo_x = water_hi_x.saturating_sub(6);
-        let water_lo_z = water_hi_z.saturating_sub(6);
-        for y in (lo + 1)..(lo + 4).min(hi) {
-            for z in water_lo_z..water_hi_z {
-                for x in water_lo_x..water_hi_x {
-                    self.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), WATER);
-                }
-            }
-        }
+        self.stage_demo_spectacles(&self.burning_room_demo_spectacle_anchors());
     }
 
     /// Seed a deterministic four-stop demo gallery with local fire/water
@@ -1539,6 +1645,39 @@ mod tests {
         WorldCoord(coord as i64)
     }
 
+    fn demo_spectacle_anchors() -> [DemoSpectacleAnchor; 3] {
+        [
+            DemoSpectacleAnchor {
+                label: "intro",
+                center: [16, 10, 16],
+                profile: DemoSpectacleProfile::Hearth,
+            },
+            DemoSpectacleAnchor {
+                label: "interior",
+                center: [32, 12, 32],
+                profile: DemoSpectacleProfile::Clash,
+            },
+            DemoSpectacleAnchor {
+                label: "panorama",
+                center: [48, 14, 48],
+                profile: DemoSpectacleProfile::Cascade,
+            },
+        ]
+    }
+
+    fn local_snapshot(world: &World, center: [i64; 3], radius: u64) -> Vec<CellState> {
+        let radius = i64::try_from(radius).expect("demo spectacle radius must fit in i64");
+        let mut cells = Vec::new();
+        for z in (center[2] - radius)..=(center[2] + radius) {
+            for y in (center[1] - radius)..=(center[1] + radius) {
+                for x in (center[0] - radius)..=(center[0] + radius) {
+                    cells.push(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)));
+                }
+            }
+        }
+        cells
+    }
+
     // -----------------------------------------------------------------
     // 1. Empty world stays empty under amoeba.
     // -----------------------------------------------------------------
@@ -1765,6 +1904,63 @@ mod tests {
                 world.count_active_material_cells_near(waypoint.center, waypoint.radius) > 0,
                 "waypoint {} should have local fire/water spectacle",
                 waypoint.label
+            );
+        }
+    }
+
+    #[test]
+    fn demo_spectacles_seed_active_materials_near_every_anchor() {
+        let mut world = World::new(6);
+        let anchors = demo_spectacle_anchors();
+        world.stage_demo_spectacles(&anchors);
+
+        for anchor in anchors {
+            let stats = world.active_material_stats_near(anchor.center, 4);
+            assert!(
+                stats.fire_cells > 0,
+                "{} must include fire near {:?}",
+                anchor.label,
+                anchor.center
+            );
+            assert!(
+                stats.water_cells > 0,
+                "{} must include water near {:?}",
+                anchor.label,
+                anchor.center
+            );
+        }
+    }
+
+    #[test]
+    fn burning_room_reset_reseeds_identical_spectacle_pockets() {
+        let mut first = World::new(6);
+        first.seed_burning_room();
+        let anchors = first.burning_room_demo_spectacle_anchors();
+
+        let expected: Vec<_> = anchors
+            .iter()
+            .map(|anchor| {
+                (
+                    anchor.label,
+                    first.active_material_stats_near(anchor.center, 5),
+                    local_snapshot(&first, anchor.center, 5),
+                )
+            })
+            .collect();
+
+        let mut second = World::new(6);
+        second.seed_burning_room();
+        for (anchor, (label, stats, snapshot)) in anchors.iter().zip(expected.iter()) {
+            let actual_stats = second.active_material_stats_near(anchor.center, 5);
+            assert_eq!(actual_stats, *stats, "{label} stats drifted across reset");
+            assert!(
+                actual_stats.active_cells() > 0,
+                "{label} must retain active materials after reset"
+            );
+            assert_eq!(
+                local_snapshot(&second, anchor.center, 5),
+                *snapshot,
+                "{label} local snapshot drifted across reset"
             );
         }
     }

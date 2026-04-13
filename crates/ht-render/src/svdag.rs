@@ -534,6 +534,64 @@ pub mod cpu_trace {
         (t_near, t_far)
     }
 
+    fn aabb_slab_times(
+        origin: [f32; 3],
+        inv_dir: [f32; 3],
+        box_min: [f32; 3],
+        box_max: [f32; 3],
+    ) -> ([f32; 3], [f32; 3]) {
+        let t1 = [
+            (box_min[0] - origin[0]) * inv_dir[0],
+            (box_min[1] - origin[1]) * inv_dir[1],
+            (box_min[2] - origin[2]) * inv_dir[2],
+        ];
+        let t2 = [
+            (box_max[0] - origin[0]) * inv_dir[0],
+            (box_max[1] - origin[1]) * inv_dir[1],
+            (box_max[2] - origin[2]) * inv_dir[2],
+        ];
+        (
+            [t1[0].min(t2[0]), t1[1].min(t2[1]), t1[2].min(t2[2])],
+            [t1[0].max(t2[0]), t1[1].max(t2[1]), t1[2].max(t2[2])],
+        )
+    }
+
+    fn face_normal_from_slab_times(rd: [f32; 3], tmin_v: [f32; 3], tmax_v: [f32; 3]) -> [f32; 3] {
+        // Shared analytical face normal for both leaf hits and the shader's
+        // representative-material LOD path. Outside-origin rays pick the entry
+        // face (`argmax(tmin_v)`); inside-origin rays pick the nearest exit
+        // face (`argmin(tmax_v)`) so the normal points where the ray will
+        // emerge instead of back into the node.
+        let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
+        if inside {
+            if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
+                [rd[0].signum(), 0.0, 0.0]
+            } else if tmax_v[1] <= tmax_v[2] {
+                [0.0, rd[1].signum(), 0.0]
+            } else {
+                [0.0, 0.0, rd[2].signum()]
+            }
+        } else if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
+            [-rd[0].signum(), 0.0, 0.0]
+        } else if tmin_v[1] >= tmin_v[2] {
+            [0.0, -rd[1].signum(), 0.0]
+        } else {
+            [0.0, 0.0, -rd[2].signum()]
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn aabb_face_normal(
+        origin: [f32; 3],
+        inv_dir: [f32; 3],
+        rd: [f32; 3],
+        box_min: [f32; 3],
+        box_max: [f32; 3],
+    ) -> [f32; 3] {
+        let (tmin_v, tmax_v) = aabb_slab_times(origin, inv_dir, box_min, box_max);
+        face_normal_from_slab_times(rd, tmin_v, tmax_v)
+    }
+
     /// Raycast with a root-level-derived step budget. Thin wrapper around
     /// `raycast_with_budget` that computes the budget from `root_level` via
     /// `step_budget`. Production callers use this entry point.
@@ -739,38 +797,9 @@ pub mod cpu_trace {
                             node_min[2] + ((oct >> 2) & 1) as f32 * half,
                         ];
                         let leaf_max = [leaf_min[0] + half, leaf_min[1] + half, leaf_min[2] + half];
-                        let lt1 = [
-                            (leaf_min[0] - ro_local[0]) * inv_rd[0],
-                            (leaf_min[1] - ro_local[1]) * inv_rd[1],
-                            (leaf_min[2] - ro_local[2]) * inv_rd[2],
-                        ];
-                        let lt2 = [
-                            (leaf_max[0] - ro_local[0]) * inv_rd[0],
-                            (leaf_max[1] - ro_local[1]) * inv_rd[1],
-                            (leaf_max[2] - ro_local[2]) * inv_rd[2],
-                        ];
-                        let tmin_v = [lt1[0].min(lt2[0]), lt1[1].min(lt2[1]), lt1[2].min(lt2[2])];
-                        let tmax_v = [lt1[0].max(lt2[0]), lt1[1].max(lt2[1]), lt1[2].max(lt2[2])];
-                        // hash-thing-2nd: inside-leaf fallback. Cascades use
-                        // `<=`/`>=` to break ties identically to the GPU
-                        // shader — do NOT flip to `<`/`>`. CPU/GPU parity
-                        // depends on matching tiebreak order.
-                        let inside = tmin_v[0] < 0.0 && tmin_v[1] < 0.0 && tmin_v[2] < 0.0;
-                        let normal = if inside {
-                            if tmax_v[0] <= tmax_v[1] && tmax_v[0] <= tmax_v[2] {
-                                [rd[0].signum(), 0.0, 0.0]
-                            } else if tmax_v[1] <= tmax_v[2] {
-                                [0.0, rd[1].signum(), 0.0]
-                            } else {
-                                [0.0, 0.0, rd[2].signum()]
-                            }
-                        } else if tmin_v[0] >= tmin_v[1] && tmin_v[0] >= tmin_v[2] {
-                            [-rd[0].signum(), 0.0, 0.0]
-                        } else if tmin_v[1] >= tmin_v[2] {
-                            [0.0, -rd[1].signum(), 0.0]
-                        } else {
-                            [0.0, 0.0, -rd[2].signum()]
-                        };
+                        let (tmin_v, tmax_v) =
+                            aabb_slab_times(ro_local, inv_rd, leaf_min, leaf_max);
+                        let normal = face_normal_from_slab_times(rd, tmin_v, tmax_v);
                         return TraceResult {
                             hit_cell: Some(mat),
                             steps: step,
@@ -906,7 +935,7 @@ pub mod cpu_trace {
                     break;
                 }
                 let next_oct = octant_of(pos, rd_m, node_min, half);
-                if skip_mask & (1 << ((next_oct ^ mirror_mask) as u32)) != 0 {
+                if skip_mask & (1 << (next_oct ^ mirror_mask)) != 0 {
                     break; // next octant is occupied
                 }
                 if record {
@@ -2215,6 +2244,72 @@ mod tests {
             [0.0, 0.0, 1.0],
             "diagonal rd {rd:?} from voxel center must exit through +z \
              (largest |rd_axis|) → normal [0,0,+1], got {normal:?}",
+        );
+    }
+
+    /// hash-thing-p9dd: the representative-material LOD path shades an
+    /// interior node AABB rather than a leaf AABB, but the normal-picking
+    /// rule is the same. Outside-node rays must still choose the entry face.
+    #[test]
+    fn lod_node_normal_outside_origin_matches_entry_face() {
+        let node_min = [0.25, 0.25, 0.25];
+        let node_max = [0.75, 0.75, 0.75];
+        let center = [0.5, 0.5, 0.5];
+        let cases: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("-x face", [-3.0, center[1], center[2]], [-1.0, 0.0, 0.0]),
+            ("+x face", [3.0, center[1], center[2]], [1.0, 0.0, 0.0]),
+            ("-y face", [center[0], -3.0, center[2]], [0.0, -1.0, 0.0]),
+            ("+y face", [center[0], 3.0, center[2]], [0.0, 1.0, 0.0]),
+            ("-z face", [center[0], center[1], -3.0], [0.0, 0.0, -1.0]),
+            ("+z face", [center[0], center[1], 3.0], [0.0, 0.0, 1.0]),
+        ];
+
+        for (name, ro, expected_normal) in cases {
+            let rd = normalize([center[0] - ro[0], center[1] - ro[1], center[2] - ro[2]]);
+            let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+            let normal = cpu_trace::aabb_face_normal(*ro, inv_rd, rd, node_min, node_max);
+            assert_eq!(
+                normal, *expected_normal,
+                "{name}: representative-material LOD hit must shade with \
+                 entry-face normal {expected_normal:?}, got {normal:?}",
+            );
+        }
+    }
+
+    /// hash-thing-p9dd: when the camera sits inside a coarse LOD node, the
+    /// representative-material path must pick the nearest exit face, not the
+    /// inward back face that produced floating rectangle artifacts.
+    #[test]
+    fn lod_node_normal_inside_origin_picks_exit_face() {
+        let node_min = [0.25, 0.25, 0.25];
+        let node_max = [0.75, 0.75, 0.75];
+        let center = [0.5, 0.5, 0.5];
+        let cases: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("+x exit", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            ("-x exit", [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            ("+y exit", [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            ("-y exit", [0.0, -1.0, 0.0], [0.0, -1.0, 0.0]),
+            ("+z exit", [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]),
+            ("-z exit", [0.0, 0.0, -1.0], [0.0, 0.0, -1.0]),
+        ];
+
+        for (name, rd, expected_normal) in cases {
+            let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+            let normal = cpu_trace::aabb_face_normal(center, inv_rd, *rd, node_min, node_max);
+            assert_eq!(
+                normal, *expected_normal,
+                "{name}: inside-node LOD shading must use exit-face normal \
+                 {expected_normal:?}, got {normal:?}",
+            );
+        }
+
+        let rd = normalize([1.0, 2.0, 3.0]);
+        let inv_rd = [1.0 / rd[0], 1.0 / rd[1], 1.0 / rd[2]];
+        let normal = cpu_trace::aabb_face_normal(center, inv_rd, rd, node_min, node_max);
+        assert_eq!(
+            normal,
+            [0.0, 0.0, 1.0],
+            "diagonal inside-node LOD ray must exit through +z, got {normal:?}",
         );
     }
 

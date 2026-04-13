@@ -432,8 +432,18 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     let nt1 = (nmin - ro_local) * inv_rd;
                     let nt2 = (nmax - ro_local) * inv_rd;
                     let ntmin_v = min(nt1, nt2);
-                    var normal = vec3<f32>(0.0, 1.0, 0.0);
-                    if ntmin_v.x >= ntmin_v.y && ntmin_v.x >= ntmin_v.z {
+                    let ntmax_v = max(nt1, nt2);
+                    var normal = vec3<f32>(0.0);
+                    let inside_node = ntmin_v.x < 0.0 && ntmin_v.y < 0.0 && ntmin_v.z < 0.0;
+                    if inside_node {
+                        if ntmax_v.x <= ntmax_v.y && ntmax_v.x <= ntmax_v.z {
+                            normal = vec3<f32>(sign(rd.x), 0.0, 0.0);
+                        } else if ntmax_v.y <= ntmax_v.z {
+                            normal = vec3<f32>(0.0, sign(rd.y), 0.0);
+                        } else {
+                            normal = vec3<f32>(0.0, 0.0, sign(rd.z));
+                        }
+                    } else if ntmin_v.x >= ntmin_v.y && ntmin_v.x >= ntmin_v.z {
                         normal = vec3<f32>(-sign(rd.x), 0.0, 0.0);
                     } else if ntmin_v.y >= ntmin_v.z {
                         normal = vec3<f32>(0.0, -sign(rd.y), 0.0);

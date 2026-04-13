@@ -92,7 +92,7 @@ impl TerrainParams {
 }
 
 #[cfg(test)]
-mod validate_tests {
+mod validation_tests {
     use super::*;
 
     #[test]
@@ -122,11 +122,6 @@ mod validate_tests {
             assert!(TerrainParams::for_level(level).validate().is_ok());
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn validate_rejects_non_finite_wavelength() {
