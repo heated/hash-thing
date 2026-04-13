@@ -220,6 +220,8 @@ struct App {
     last_mouse: Option<(f64, f64)>,
     /// Currently held keyboard keys (for per-frame movement polling).
     keys_held: HashSet<KeyCode>,
+    /// Last frame's Space state so jump only triggers on a fresh press.
+    jump_was_held: bool,
     /// Camera mode: orbit (debug) or first-person (gameplay).
     camera_mode: CameraMode,
     /// The player entity, if spawned.
@@ -307,6 +309,7 @@ impl App {
             mouse_pressed: false,
             last_mouse: None,
             keys_held: HashSet::new(),
+            jump_was_held: false,
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
@@ -517,8 +520,7 @@ impl App {
                 "",
                 "  WASD        Move",
                 "  Mouse       Look",
-                "  Space       Fly up",
-                "  Shift       Fly down",
+                "  Space       Jump",
                 "  Ctrl        Sprint",
                 "  LClick      Break block",
                 "  RClick      Place block",
@@ -1098,6 +1100,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::Focused(false) => {
                 self.keys_held.clear();
+                self.jump_was_held = false;
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1116,7 +1119,7 @@ impl ApplicationHandler for App {
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
                             // In orbit mode, Space toggles pause.
-                            // In FPS mode, Space is fly-up (handled per-frame).
+                            // In FPS mode, Space is jump (handled per-frame).
                             if self.camera_mode == CameraMode::Orbit {
                                 self.paused = !self.paused;
                                 log::info!("Paused: {}", self.paused);
@@ -1618,7 +1621,9 @@ impl ApplicationHandler for App {
                         } else {
                             0.0
                         };
-                        let up = if self.keys_held.contains(&KeyCode::Space) {
+                        let space_held = self.keys_held.contains(&KeyCode::Space);
+                        let jump_requested = space_held && !self.jump_was_held;
+                        let up = if space_held {
                             1.0
                         } else if self.keys_held.contains(&KeyCode::ShiftLeft)
                             || self.keys_held.contains(&KeyCode::ShiftRight)
@@ -1641,6 +1646,7 @@ impl ApplicationHandler for App {
                             (delta[0] * delta[0] + delta[2] * delta[2]).sqrt() / dt.max(1e-6);
 
                         let stepping = self.is_stepping();
+                        let mut camera_grounded = false;
                         if let Some(p) = self.entities.get_mut(pid) {
                             if stepping {
                                 // Free-fly: no collision while world is on
@@ -1649,17 +1655,28 @@ impl ApplicationHandler for App {
                                 p.pos[1] += delta[1];
                                 p.pos[2] += delta[2];
                             } else {
-                                p.pos = player::apply_movement(&self.world, &p.pos, &delta);
+                                let step = player::step_grounded_movement(
+                                    &self.world,
+                                    &p.pos,
+                                    p.vel[1],
+                                    player::GroundedMoveInput {
+                                        yaw,
+                                        move_input: [fwd, right],
+                                        speed,
+                                        dt,
+                                        jump_requested,
+                                    },
+                                );
+                                p.pos = step.pos;
+                                p.vel[1] = step.vertical_velocity;
                             }
                         }
-                        let mut camera_grounded = false;
                         if !stepping {
                             if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
                                 camera_grounded = player::is_grounded(&self.world, &p.pos);
                             }
                         }
                         let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
-
                         // hash-thing-m1f.4 / 37r: grow the world when the
                         // player approaches any boundary (positive or negative).
                         // Skipped during background step — world is placeholder.
@@ -1763,6 +1780,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                self.jump_was_held = self.keys_held.contains(&KeyCode::Space);
 
                 self.upload_visible_particles();
 
@@ -1824,8 +1842,7 @@ fn main() {
     log::info!("  --- First-person mode ---");
     log::info!("  WASD: move (relative to look direction)");
     log::info!("  Mouse: look around");
-    log::info!("  Space: fly up   Shift: fly down");
-    log::info!("  Ctrl: sprint");
+    log::info!("  Space: jump   Ctrl: sprint");
     log::info!("  Left click: break block   Right click: place block");
     log::info!("  --- Shared ---");
     log::info!("  F5: pause/resume");
@@ -1971,6 +1988,9 @@ mod tests {
     #[test]
     fn first_person_legend_hides_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
+        assert!(lines.iter().any(|line| line.contains("Space       Jump")));
+        assert!(!lines.iter().any(|line| line.contains("Fly up")));
+        assert!(!lines.iter().any(|line| line.contains("Fly down")));
         assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
         assert!(!lines
             .iter()
