@@ -3,7 +3,7 @@
 //! intermediates in the hash itself).
 //!
 //! v1 quality is intentionally simple. Swap to simplex/gradient noise behind
-//! the `RegionField::sample` boundary if visual review demands it. The
+//! the `WorldGen::sample` boundary if visual review demands it. The
 //! consumer (`HeightmapField`) only sees `fractal_2d(x, z, seed, octaves) ->
 //! f32` in `[0, 1]`.
 
@@ -60,10 +60,10 @@ fn value_2d(x: f32, z: f32, seed: u64) -> f32 {
 /// round-to-nearest, and under adversarial input sequences could in principle
 /// round a few ulp higher. The explicit `.clamp(0.0, 1.0)` at the return
 /// makes the `[0, 1]` bound tight — which in turn makes the y-band proof in
-/// `HeightmapField::classify_box` bulletproof rather than "sound with
+/// `HeightmapField::classify` bulletproof rather than "sound with
 /// margin". The clamp cost is one min/max per call; at 64³ only a few
 /// thousand surface-band calls hit this path (sky and deep stone short-
-/// circuit via `classify_box` without sampling).
+/// circuit via `classify` without sampling).
 ///
 /// `octaves` must be `>= 1`.
 pub fn fractal_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
@@ -78,7 +78,7 @@ pub fn fractal_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
         amp *= 0.5;
         freq *= 2.0;
     }
-    // Tight clamp — makes `classify_box`'s y-band proof bulletproof. See
+    // Tight clamp — makes `classify`'s y-band proof bulletproof. See
     // the doc comment above for the rounding story.
     (sum / total).clamp(0.0, 1.0)
 }

@@ -197,11 +197,11 @@ pub struct FlammableRule {
 
 impl CaRule for FlammableRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
-        debug_assert!(!center.is_empty(), "FlammableRule should not dispatch for AIR");
-        if neighbors
-            .iter()
-            .any(|n| n.material() == self.fire_material)
-        {
+        debug_assert!(
+            !center.is_empty(),
+            "FlammableRule should not dispatch for AIR"
+        );
+        if neighbors.iter().any(|n| n.material() == self.fire_material) {
             self.fire_product
         } else {
             center
@@ -249,11 +249,11 @@ pub struct DissolvableRule {
 
 impl CaRule for DissolvableRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
-        debug_assert!(!center.is_empty(), "DissolvableRule should not dispatch for AIR");
-        if neighbors
-            .iter()
-            .any(|n| n.material() == self.acid_material)
-        {
+        debug_assert!(
+            !center.is_empty(),
+            "DissolvableRule should not dispatch for AIR"
+        );
+        if neighbors.iter().any(|n| n.material() == self.acid_material) {
             Cell::EMPTY
         } else {
             center
@@ -303,7 +303,10 @@ pub struct FireworkRule {
 
 impl CaRule for FireworkRule {
     fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
-        debug_assert!(!center.is_empty(), "FireworkRule should not dispatch for AIR");
+        debug_assert!(
+            !center.is_empty(),
+            "FireworkRule should not dispatch for AIR"
+        );
         let age = center.metadata();
         if age >= self.fuse_length {
             self.explode_product
