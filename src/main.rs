@@ -7,6 +7,8 @@ use hash_thing::terrain;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, WindowEvent},
@@ -885,6 +887,9 @@ impl ApplicationHandler for App {
                     .create_window(attrs)
                     .expect("failed to create main window"),
             );
+            // Agent/CLI launches on macOS can leave the app alive but unfocused.
+            window.set_visible(true);
+            window.focus_window();
             self.window = Some(window.clone());
 
             let mut renderer =
@@ -1664,7 +1669,14 @@ fn main() {
         volume_size.trailing_zeros()
     );
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let mut event_loop_builder = EventLoop::builder();
+    #[cfg(target_os = "macos")]
+    {
+        // Make launch behavior explicit instead of depending on bundle/agent defaults.
+        event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
+        event_loop_builder.with_activate_ignoring_other_apps(true);
+    }
+    let event_loop = event_loop_builder.build().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
     event_loop
