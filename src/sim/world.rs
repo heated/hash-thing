@@ -8,7 +8,7 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, WATER,
+    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -70,6 +70,38 @@ pub struct WorldCoord(pub i64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct LocalCoord(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DemoLayout {
+    pub player_pos: [f64; 3],
+    pub player_yaw: f64,
+    pub player_pitch: f64,
+    pub corridor_mid: [i64; 3],
+    pub atrium_center: [i64; 3],
+    pub reveal_center: [i64; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Box3 {
+    min: [i64; 3],
+    max: [i64; 3],
+}
+
+impl Box3 {
+    #[inline]
+    const fn new(min: [i64; 3], max: [i64; 3]) -> Self {
+        Self { min, max }
+    }
+
+    #[inline]
+    fn center(self) -> [i64; 3] {
+        [
+            (self.min[0] + self.max[0]) / 2,
+            (self.min[1] + self.max[1]) / 2,
+            (self.min[2] + self.max[2]) / 2,
+        ]
+    }
+}
 
 /// The simulation world. Owns the octree store and manages stepping.
 ///
@@ -909,6 +941,198 @@ impl World {
         stats
     }
 
+    fn fill_box(&mut self, volume: Box3, state: CellState) {
+        for z in volume.min[2]..=volume.max[2] {
+            for y in volume.min[1]..=volume.max[1] {
+                for x in volume.min[0]..=volume.max[0] {
+                    self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                }
+            }
+        }
+    }
+
+    fn progression_boxes(
+        field: &LatticeField,
+    ) -> (Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3) {
+        let lo = field.lo;
+        let hi = field.hi;
+        let ground_y = lo[1] + field.floor_thick;
+        let room_height = (field.cell_size / 2).max(4);
+        let tunnel_half_w = (field.wall_thick + 1).max(2);
+
+        let start_shell = Box3::new(
+            [lo[0] + 1, ground_y, lo[2] + 1],
+            [
+                lo[0] + field.cell_size + 2,
+                ground_y + room_height + 2,
+                lo[2] + field.cell_size + 2,
+            ],
+        );
+        let start_room = Box3::new(
+            [
+                start_shell.min[0] + 1,
+                start_shell.min[1] + 1,
+                start_shell.min[2] + 1,
+            ],
+            [
+                start_shell.max[0] - 1,
+                start_shell.max[1] - 1,
+                start_shell.max[2] - 1,
+            ],
+        );
+
+        let corridor_z = (start_room.min[2] + start_room.max[2]) / 2;
+        let corridor_end_x = (lo[0] + field.cell_size * 3).min(hi[0] - field.cell_size * 2);
+        let corridor_shell = Box3::new(
+            [
+                start_shell.max[0] - 1,
+                ground_y,
+                corridor_z - tunnel_half_w - 1,
+            ],
+            [
+                corridor_end_x,
+                ground_y + room_height + 1,
+                corridor_z + tunnel_half_w + 1,
+            ],
+        );
+        let corridor = Box3::new(
+            [
+                corridor_shell.min[0] + 1,
+                corridor_shell.min[1] + 1,
+                corridor_shell.min[2] + 1,
+            ],
+            [
+                corridor_shell.max[0],
+                corridor_shell.max[1] - 1,
+                corridor_shell.max[2] - 1,
+            ],
+        );
+
+        let tease_a = Box3::new(
+            [
+                corridor.min[0] + field.cell_size / 2,
+                corridor.min[1],
+                corridor.max[2] + 1,
+            ],
+            [
+                corridor.min[0] + field.cell_size,
+                corridor.max[1] + 1,
+                (corridor.max[2] + field.cell_size).min(hi[2] - 2),
+            ],
+        );
+        let tease_b = Box3::new(
+            [
+                corridor.max[0] - field.cell_size,
+                corridor.min[1],
+                (corridor.min[2] - field.cell_size).max(lo[2] + 1),
+            ],
+            [
+                corridor.max[0] - field.cell_size / 2,
+                corridor.max[1] + 1,
+                corridor.min[2] - 1,
+            ],
+        );
+
+        let atrium = Box3::new(
+            [
+                corridor.max[0] - field.cell_size / 2,
+                ground_y + 1,
+                lo[2] + field.cell_size,
+            ],
+            [
+                (corridor.max[0] + field.cell_size * 2).min(hi[0] - 3),
+                (ground_y + field.cell_size + 2).min(hi[1] - 3),
+                (lo[2] + field.cell_size * 4).min(hi[2] - 3),
+            ],
+        );
+
+        let balcony = Box3::new(
+            [
+                atrium.max[0] - field.cell_size,
+                ground_y + room_height / 2,
+                atrium.center()[2] - tunnel_half_w - 1,
+            ],
+            [
+                hi[0] - 2,
+                ground_y + room_height / 2 + 3,
+                atrium.center()[2] + tunnel_half_w + 1,
+            ],
+        );
+        let panorama = Box3::new(
+            [
+                atrium.max[0] - field.cell_size / 2,
+                ground_y,
+                lo[2] + field.cell_size / 2,
+            ],
+            [
+                hi[0] - 1,
+                hi[1] - 2,
+                (lo[2] + field.cell_size * 5).min(hi[2] - 2),
+            ],
+        );
+
+        (
+            start_shell,
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            atrium,
+            balcony,
+            panorama,
+        )
+    }
+
+    pub fn seed_lattice_progression_demo(&mut self) -> DemoLayout {
+        self.seed_lattice_megastructure();
+        let field = LatticeField::for_world(self.level, 42);
+        let ground_y = field.lo[1] + field.floor_thick;
+        let (
+            start_shell,
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            atrium,
+            balcony,
+            panorama,
+        ) = Self::progression_boxes(&field);
+
+        self.fill_box(start_shell, STONE);
+        self.fill_box(start_room, AIR);
+        self.fill_box(
+            Box3::new(
+                [start_room.min[0], start_shell.min[1], start_room.min[2]],
+                [start_room.max[0], start_shell.min[1], start_room.max[2]],
+            ),
+            DIRT,
+        );
+
+        self.fill_box(corridor_shell, STONE);
+        self.fill_box(corridor, AIR);
+        self.fill_box(tease_a, AIR);
+        self.fill_box(tease_b, AIR);
+        self.fill_box(atrium, AIR);
+        self.fill_box(balcony, AIR);
+        self.fill_box(panorama, AIR);
+
+        let player_pos = [
+            start_room.center()[0] as f64 + 0.5,
+            (ground_y + 1) as f64,
+            start_room.center()[2] as f64 + 0.5,
+        ];
+        DemoLayout {
+            player_pos,
+            player_yaw: -std::f64::consts::FRAC_PI_2,
+            player_pitch: 0.0,
+            corridor_mid: corridor.center(),
+            atrium_center: atrium.center(),
+            reveal_center: balcony.center(),
+        }
+    }
+
     pub fn population(&self) -> u64 {
         self.store.population(self.root)
     }
@@ -1063,6 +1287,7 @@ mod tests {
     //! Reference tests for the brute-force dispatch step.
 
     use super::*;
+    use crate::player;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, WATER};
 
@@ -1340,6 +1565,56 @@ mod tests {
         assert!(
             grid.contains(&0),
             "gyroid must leave air voids to walk through"
+        );
+    }
+
+    #[test]
+    fn lattice_progression_demo_spawn_and_waypoints_are_open() {
+        let mut w = World::new(6); // side 64
+        let layout = w.seed_lattice_progression_demo();
+
+        assert!(
+            !player::player_collides(&w, &layout.player_pos),
+            "demo spawn must be walkable: {:?}",
+            layout.player_pos
+        );
+
+        for checkpoint in [
+            layout.corridor_mid,
+            layout.atrium_center,
+            layout.reveal_center,
+        ] {
+            assert_eq!(
+                w.get(
+                    WorldCoord(checkpoint[0]),
+                    WorldCoord(checkpoint[1]),
+                    WorldCoord(checkpoint[2]),
+                ),
+                AIR,
+                "checkpoint must be air: {checkpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lattice_progression_demo_preserves_lattice_materials() {
+        let mut w = World::new(6); // side 64
+        let _layout = w.seed_lattice_progression_demo();
+        let grid = w.flatten();
+        let has = |mat: CellState| grid.contains(&mat);
+
+        assert!(
+            has(STONE),
+            "progression demo must still have stone structure"
+        );
+        assert!(has(GRASS), "progression demo must still have lattice walls");
+        assert!(
+            has(WATER),
+            "progression demo must still preserve water channels"
+        );
+        assert!(
+            has(FIRE),
+            "progression demo must still preserve fire accents"
         );
     }
 

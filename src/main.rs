@@ -223,7 +223,8 @@ impl App {
                 "",
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     0  Recenter",
+                "  M  Gyroid     N  Lattice",
+                "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
                 "  Esc Quit",
@@ -240,7 +241,8 @@ impl App {
                 "",
                 "  T  Terrain    B  Burning room",
                 "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     0  Recenter",
+                "  M  Gyroid     N  Lattice",
+                "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Toggle help",
                 "  Esc Quit",
@@ -491,6 +493,20 @@ impl App {
         log::info!("{label}: pop={}", self.world.population());
     }
 
+    fn reset_player_pose(&mut self, pos: [f64; 3], yaw: f64, pitch: f64) {
+        let Some(pid) = self.player_id else {
+            return;
+        };
+        let Some(entity) = self.entities.get_mut(pid) else {
+            return;
+        };
+        entity.pos = pos;
+        if let sim::EntityKind::Player(ref mut ps) = entity.kind {
+            ps.yaw = yaw;
+            ps.pitch = pitch;
+        }
+    }
+
     fn load_gyroid_demo(&mut self) {
         if self.is_stepping() {
             return;
@@ -520,6 +536,38 @@ impl App {
             elapsed.as_secs_f64() * 1000.0,
             stats.total_collapses(),
             stats.classify_calls,
+        );
+    }
+
+    fn load_lattice_demo(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        let layout = self.world.seed_lattice_progression_demo();
+        self.reset_player_pose(layout.player_pos, layout.player_yaw, layout.player_pitch);
+        let elapsed = start.elapsed();
+        self.gol_smoke_scene = false;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = false; // Let materials interact immediately.
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!(
+            "Lattice progression demo: pop={} gen={:.1}ms reveal={:?}",
+            self.world.population(),
+            elapsed.as_secs_f64() * 1000.0,
+            layout.reveal_center,
         );
     }
 
@@ -731,6 +779,9 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("m") => {
                             self.load_gyroid_demo();
+                        }
+                        winit::keyboard::Key::Character("n") => {
+                            self.load_lattice_demo();
                         }
                         winit::keyboard::Key::Character(
                             n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),

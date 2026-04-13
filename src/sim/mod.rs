@@ -8,4 +8,4 @@ pub mod world;
 pub use entity::{Entity, EntityId, EntityKind, EntityStore, ParticleState, PlayerState};
 pub use mutation::{MutationQueue, WorldMutation};
 pub use rule::GameOfLife3D;
-pub use world::{HashlifeStats, LocalCoord, RealizedRegion, World, WorldCoord};
+pub use world::{DemoLayout, HashlifeStats, LocalCoord, RealizedRegion, World, WorldCoord};
