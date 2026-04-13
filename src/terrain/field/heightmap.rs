@@ -11,7 +11,7 @@
 //! 2D height grid + min/max mipmap. `classify` uses exact local surface
 //! bounds instead of global amplitude bounds — still proof-based, much tighter.
 
-use super::WorldGen;
+use super::{TerrainSurface, WorldGen};
 use crate::octree::CellState;
 use crate::terrain::materials::{material_from_depth, AIR, SAND, STONE, WATER};
 use crate::terrain::noise::{biome_2d, fractal_2d};
@@ -57,6 +57,12 @@ impl HeightmapField {
         // n ∈ [0, 1] (debug_assert in fractal_2d). Map to [-1, 1].
         let centered = n * 2.0 - 1.0;
         self.base_y + centered * self.amplitude
+    }
+}
+
+impl TerrainSurface for HeightmapField {
+    fn surface_y_at(&self, x: i64, z: i64) -> f32 {
+        self.surface_y(x as f32, z as f32)
     }
 }
 
@@ -263,6 +269,12 @@ impl PrecomputedHeightmapField {
         } else {
             self.inner.surface_y(x as f32, z as f32)
         }
+    }
+}
+
+impl TerrainSurface for PrecomputedHeightmapField {
+    fn surface_y_at(&self, x: i64, z: i64) -> f32 {
+        self.precomputed_surface_y(x, z)
     }
 }
 

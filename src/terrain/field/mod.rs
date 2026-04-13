@@ -79,10 +79,12 @@ pub mod density;
 pub mod half_space;
 pub mod heightmap;
 pub mod lattice;
+pub mod terrain_blend;
 
 pub use density::DensityField;
 pub use heightmap::HeightmapField;
 pub use lattice::LatticeField;
+pub use terrain_blend::{TerrainBlendField, TerrainSurface};
 
 #[cfg(test)]
 mod tests {

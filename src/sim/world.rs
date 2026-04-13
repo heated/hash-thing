@@ -5,6 +5,7 @@ use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
 use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
+use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
     BlockRuleId, MaterialRegistry, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, WATER,
 };
@@ -851,26 +852,40 @@ impl World {
         }
     }
 
-    /// Seed a lattice megastructure with active materials.
+    /// Seed a lattice megastructure embedded in natural terrain.
     ///
     /// A 3D grid of corridors carved from stone, with grass-covered pillars,
     /// water channels, lava pools, fire sources, and sand dunes. The
-    /// periodic lattice compresses well in the octree (hashlife sharing)
-    /// while the active materials (fire consuming grass, water flowing,
-    /// lava solidifying) create dynamic visual interest.
+    /// periodic lattice compresses well in the octree (hashlife sharing).
+    /// A heightmap terrain fills the outside world, and the outer shell of
+    /// the lattice tapers into that terrain so the seam reads less like a
+    /// hard cuboid cutout.
     ///
-    /// Uses `LatticeField` + `gen_region` for octree-native generation
-    /// with proof-based collapse (no O(n^3) per-voxel loop).
+    /// Uses `LatticeField` + `TerrainBlendField` + `gen_region` for
+    /// octree-native generation with proof-based collapse.
     pub fn seed_lattice_megastructure(&mut self) {
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
-        let field = LatticeField::for_world(self.level, 42);
+        let terrain_params = TerrainParams::for_level(self.level);
+        let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level);
+        let lattice = LatticeField::for_world(self.level, 42);
+        let edge_blend = (lattice.cell_size / 2).max(2);
+        let field = TerrainBlendField::new(
+            lattice.clone(),
+            terrain,
+            lattice.lo,
+            lattice.hi,
+            edge_blend,
+            (lattice.cell_size / 3).max(4) as f32,
+            3.0,
+        );
         let (root, _stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
         self.root = root;
         self.generation = 0;
+        self.terrain_params = Some(terrain_params);
         self.block_rule_present = None;
     }
 
@@ -1273,6 +1288,22 @@ mod tests {
         assert!(has(GRASS), "lattice must have grass pillars");
         assert!(has(WATER), "lattice must have water channels");
         assert!(has(FIRE), "lattice must have fire sources");
+    }
+
+    #[test]
+    fn seed_lattice_megastructure_matches_terrain_outside_structure_zone() {
+        let mut world = World::new(6);
+        world.seed_lattice_megastructure();
+
+        let params = TerrainParams::for_level(6);
+        let terrain = PrecomputedHeightmapField::new(params.to_heightmap(), 6);
+        let point = [0i64, 20, 20];
+        let point_world = [0u64, 20, 20];
+
+        assert_eq!(
+            world.get(wc(point_world[0]), wc(point_world[1]), wc(point_world[2])),
+            crate::terrain::WorldGen::sample(&terrain, point)
+        );
     }
 
     // -----------------------------------------------------------------
