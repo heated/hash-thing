@@ -10,11 +10,12 @@ on:
 permissions:
   contents: read
 
-# Cancel in-flight runs on PRs only — never on main pushes, so a fast
-# follow-up commit doesn't kill the integration build of the previous one.
+# Cancel superseded runs on both PRs and main pushes. On this repo the crew
+# lands to main rapidly, so keeping older main builds alive mostly burns
+# runner time and generates redundant failure/cancellation email noise.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
