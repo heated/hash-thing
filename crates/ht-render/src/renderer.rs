@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -1674,7 +1674,7 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameOutcome, ticks_to_duration};
+    use super::{ticks_to_duration, FrameOutcome};
     use std::time::Duration;
 
     #[test]
