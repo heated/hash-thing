@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -552,8 +552,11 @@ impl Renderer {
 
         let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("blit_sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            // The raycast target is often rendered at half-res and then
+            // upscaled to the swapchain. Nearest keeps the voxel look crisp
+            // instead of bilinear-smearing edges across the upscale.
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -1671,7 +1674,7 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ticks_to_duration, FrameOutcome};
+    use super::{FrameOutcome, ticks_to_duration};
     use std::time::Duration;
 
     #[test]
