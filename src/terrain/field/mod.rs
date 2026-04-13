@@ -75,9 +75,11 @@ impl WorldGen for ComposedWorldGen {
 }
 
 pub mod const_field;
+pub mod density;
 pub mod half_space;
 pub mod heightmap;
 
+pub use density::DensityField;
 pub use heightmap::HeightmapField;
 
 #[cfg(test)]
