@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -336,6 +336,7 @@ pub struct Renderer {
     /// lacks TIMESTAMP_QUERY entirely). Consume-on-read avoids
     /// double-recording the same duration across frames.
     last_gpu_frame_time: Option<Duration>,
+    start_time: Instant,
 }
 
 impl Renderer {
@@ -912,6 +913,7 @@ impl Renderer {
             render_scale: 0.5,
             gpu_timing,
             last_gpu_frame_time: None,
+            start_time: Instant::now(),
         }
     }
 
@@ -1371,8 +1373,9 @@ impl Renderer {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let fov_tan = (std::f32::consts::FRAC_PI_4 / 2.0).tan();
 
+        let elapsed_secs = self.start_time.elapsed().as_secs_f32();
         let uniforms = Uniforms {
-            camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], 0.0],
+            camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], elapsed_secs],
             camera_dir: [cam_dir[0], cam_dir[1], cam_dir[2], 0.0],
             camera_up: [up[0], up[1], up[2], 0.0],
             camera_right: [right[0], right[1], right[2], 0.0],

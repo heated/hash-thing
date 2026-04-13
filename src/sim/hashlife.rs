@@ -379,15 +379,31 @@ impl World {
         // would wrap outside the padded region. Callers only extract the center
         // that remains valid after the requested number of steps.
         let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+        // Precompute per-material noop flag to avoid vtable dispatch per cell.
+        // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
+        // entirely (next is zero-initialized). For GoL, air participates in birth
+        // rules and must NOT be skipped.
+        let noop_by_material = self.materials.noop_flags();
+        let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
         for z in 1..side - 1 {
             for y in 1..side - 1 {
                 for x in 1..side - 1 {
-                    let cell = Cell::from_raw(grid[x + y * side + z * side * side]);
-                    let neighbors = get_neighbors_from_grid(grid, side, x, y, z);
+                    let idx = x + y * side + z * side * side;
+                    let raw = grid[idx];
+                    if raw == 0 && air_is_noop {
+                        continue;
+                    }
+                    let cell = Cell::from_raw(raw);
+                    let mat = cell.material() as usize;
+                    if mat < noop_by_material.len() && noop_by_material[mat] {
+                        next[idx] = raw;
+                        continue;
+                    }
                     let rule = self.materials.rule_for_cell(cell).unwrap_or_else(|| {
                         panic!("missing CaRule for material {}", cell.material())
                     });
-                    next[x + y * side + z * side * side] = rule.step_cell(cell, &neighbors).raw();
+                    let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
+                    next[idx] = rule.step_cell(cell, &neighbors).raw();
                 }
             }
         }
@@ -626,7 +642,12 @@ fn source_index(p: usize, s: usize) -> (usize, usize) {
     }
 }
 
-fn get_neighbors_from_grid(
+/// Get 26 Moore neighbors from a flat grid without bounds checking.
+/// Caller must ensure `x, y, z` are all in `1..side-1` (interior cells).
+/// Uses direct arithmetic instead of `rem_euclid` — safe because interior
+/// cells always have valid neighbors at offsets -1, 0, +1.
+#[inline]
+fn get_neighbors_from_grid_unchecked(
     grid: &[CellState],
     side: usize,
     x: usize,
@@ -635,16 +656,15 @@ fn get_neighbors_from_grid(
 ) -> [Cell; 26] {
     let mut neighbors = [Cell::EMPTY; 26];
     let mut idx = 0;
-    let s = side as i64;
-    for dz in [-1i64, 0, 1] {
-        for dy in [-1i64, 0, 1] {
-            for dx in [-1i64, 0, 1] {
+    for dz in [-1i32, 0, 1] {
+        for dy in [-1i32, 0, 1] {
+            for dx in [-1i32, 0, 1] {
                 if dx == 0 && dy == 0 && dz == 0 {
                     continue;
                 }
-                let nx = (x as i64 + dx).rem_euclid(s) as usize;
-                let ny = (y as i64 + dy).rem_euclid(s) as usize;
-                let nz = (z as i64 + dz).rem_euclid(s) as usize;
+                let nx = (x as i32 + dx) as usize;
+                let ny = (y as i32 + dy) as usize;
+                let nz = (z as i32 + dz) as usize;
                 neighbors[idx] = Cell::from_raw(grid[nx + ny * side + nz * side * side]);
                 idx += 1;
             }

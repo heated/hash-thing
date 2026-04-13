@@ -1,8 +1,8 @@
 //! Headless GPU raycast benchmarks at multiple world scales (m1f.2).
 //!
-//! Renders the SVDAG raycast shader to an off-screen texture and measures
-//! GPU execution time via TIMESTAMP_QUERY (falls back to wall-clock if
-//! unavailable). No window required.
+//! Renders the SVDAG raycast compute shader to an off-screen storage texture,
+//! blits to a render target, and measures GPU execution time via TIMESTAMP_QUERY
+//! (falls back to wall-clock if unavailable). No window required.
 //!
 //! Run with: `cargo test --release --test bench_gpu_raycast -- --ignored --nocapture`
 //!
@@ -18,8 +18,9 @@ use wgpu::util::DeviceExt;
 const RENDER_WIDTH: u32 = 1920;
 const RENDER_HEIGHT: u32 = 1080;
 const RENDER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const RAYCAST_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// Minimal camera uniforms matching the SVDAG raycast shader layout.
+/// Camera + scene uniforms matching the SVDAG compute raycast shader layout.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -27,20 +28,28 @@ struct Uniforms {
     camera_dir: [f32; 4],
     camera_up: [f32; 4],
     camera_right: [f32; 4],
-    /// x: volume_size, y: aspect_ratio, z: fov_tan, w: time
+    /// x: volume_size, y: aspect_ratio, z: fov_tan, w: screen_height
     params: [f32; 4],
+    /// x: debug_mode, y: lod_bias, z: output_width, w: output_height
+    debug: [f32; 4],
 }
 
 struct HeadlessRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    bind_group: Option<wgpu::BindGroup>,
+    // Compute raycast pipeline
+    compute_pipeline: wgpu::ComputePipeline,
+    compute_bind_group_layout: wgpu::BindGroupLayout,
+    compute_bind_group: Option<wgpu::BindGroup>,
     uniform_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     dag_buffer: Option<wgpu::Buffer>,
+    raycast_texture_view: wgpu::TextureView,
+    // Blit pipeline
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group: wgpu::BindGroup,
     render_target: wgpu::TextureView,
+    // GPU timing
     timestamp_supported: bool,
     query_set: Option<wgpu::QuerySet>,
     resolve_buffer: Option<wgpu::Buffer>,
@@ -88,7 +97,7 @@ impl HeadlessRenderer {
             0.0
         };
 
-        // Render target texture
+        // --- Render target (final blit output) ---
         let target_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("bench_target"),
             size: wgpu::Extent3d {
@@ -105,18 +114,36 @@ impl HeadlessRenderer {
         });
         let render_target = target_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Uniforms
+        // --- Raycast storage texture (compute output) ---
+        let raycast_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("raycast_output"),
+            size: wgpu::Extent3d {
+                width: RENDER_WIDTH,
+                height: RENDER_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: RAYCAST_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let raycast_texture_view = raycast_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // --- Uniforms ---
         let uniforms = Uniforms {
             camera_pos: [0.0; 4],
-            camera_dir: [0.0; 4],
+            camera_dir: [0.0, 0.0, -1.0, 0.0],
             camera_up: [0.0, 1.0, 0.0, 0.0],
             camera_right: [1.0, 0.0, 0.0, 0.0],
             params: [
                 64.0,
                 RENDER_WIDTH as f32 / RENDER_HEIGHT as f32,
-                1.0,
+                (std::f32::consts::FRAC_PI_4).tan(),
                 RENDER_HEIGHT as f32,
             ],
+            debug: [0.0, 0.0, RENDER_WIDTH as f32, RENDER_HEIGHT as f32],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -124,7 +151,7 @@ impl HeadlessRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Palette buffer (minimal)
+        // --- Palette buffer ---
         let palette: Vec<[f32; 4]> = (0..256)
             .map(|i| {
                 let t = i as f32 / 255.0;
@@ -137,68 +164,147 @@ impl HeadlessRenderer {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        // Bind group layout
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("svdag_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        // --- Compute pipeline (SVDAG raycast) ---
+        let compute_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("svdag_compute_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: RAYCAST_FORMAT,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
-        // Shader + pipeline
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("svdag raycast"),
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("svdag raycast compute"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("../crates/ht-render/src/svdag_raycast.wgsl").into(),
             ),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bench_pl"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+        let compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("svdag_compute_pl"),
+                bind_group_layouts: &[Some(&compute_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("svdag_compute"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // --- Blit pipeline (samples raycast texture → render target) ---
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let blit_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("blit_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit_bg"),
+            layout: &blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&raycast_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit_sampler),
+                },
+            ],
+        });
+
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../crates/ht-render/src/svdag_blit.wgsl").into(),
+            ),
+        });
+
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit_pl"),
+            bind_group_layouts: &[Some(&blit_bind_group_layout)],
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("bench_rp"),
-            layout: Some(&pipeline_layout),
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit_rp"),
+            layout: Some(&blit_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &blit_shader,
                 entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &blit_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: RENDER_FORMAT,
@@ -217,7 +323,7 @@ impl HeadlessRenderer {
             cache: None,
         });
 
-        // Timestamp query resources
+        // --- Timestamp query resources ---
         let (query_set, resolve_buffer, readback_buffer) = if timestamp_supported {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("bench_timestamps"),
@@ -244,12 +350,15 @@ impl HeadlessRenderer {
         Some(Self {
             device,
             queue,
-            pipeline,
-            bind_group_layout,
-            bind_group: None,
+            compute_pipeline,
+            compute_bind_group_layout,
+            compute_bind_group: None,
             uniform_buffer,
             palette_buffer,
             dag_buffer: None,
+            raycast_texture_view,
+            blit_pipeline,
+            blit_bind_group,
             render_target,
             timestamp_supported,
             query_set,
@@ -260,7 +369,6 @@ impl HeadlessRenderer {
     }
 
     fn upload_svdag(&mut self, svdag: &Svdag, volume_size: u32) {
-        // Update uniforms with correct volume size
         let uniforms = Uniforms {
             camera_pos: [0.0; 4],
             camera_dir: [0.0, 0.0, -1.0, 0.0],
@@ -269,14 +377,14 @@ impl HeadlessRenderer {
             params: [
                 volume_size as f32,
                 RENDER_WIDTH as f32 / RENDER_HEIGHT as f32,
-                (std::f32::consts::FRAC_PI_4).tan(), // 45° FOV
-                0.0,
+                (std::f32::consts::FRAC_PI_4).tan(),
+                RENDER_HEIGHT as f32,
             ],
+            debug: [0.0, 0.0, RENDER_WIDTH as f32, RENDER_HEIGHT as f32],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        // Upload DAG nodes
         let data = bytemuck::cast_slice(&svdag.nodes);
         let dag_buffer = self
             .device
@@ -286,33 +394,40 @@ impl HeadlessRenderer {
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
-        // Rebuild bind group
-        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("svdag_bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dag_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.palette_buffer.as_entire_binding(),
-                },
-            ],
-        }));
+        self.compute_bind_group =
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("svdag_compute_bg"),
+                layout: &self.compute_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dag_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.palette_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.raycast_texture_view),
+                    },
+                ],
+            }));
 
         self.dag_buffer = Some(dag_buffer);
     }
 
-    /// Render one frame. Returns GPU duration if timestamps available,
-    /// else wall-clock duration.
+    /// Render one frame (compute raycast + blit). Returns GPU duration if
+    /// timestamps available, else wall-clock duration.
     fn render_frame(&self) -> Duration {
-        let bg = self.bind_group.as_ref().expect("must upload_svdag first");
+        let bg = self
+            .compute_bind_group
+            .as_ref()
+            .expect("must upload_svdag first");
 
         let mut encoder = self
             .device
@@ -325,9 +440,23 @@ impl HeadlessRenderer {
             encoder.write_timestamp(qs, 0);
         }
 
+        // Compute pass: SVDAG raycast → storage texture
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bench_pass"),
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("svdag raycast compute"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            compute_pass.set_bind_group(0, bg, &[]);
+            let wg_x = RENDER_WIDTH.div_ceil(8);
+            let wg_y = RENDER_HEIGHT.div_ceil(8);
+            compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // Render pass: blit storage texture → render target
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.render_target,
                     resolve_target: None,
@@ -342,9 +471,9 @@ impl HeadlessRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, Some(bg), &[]);
-            pass.draw(0..6, 0..1);
+            render_pass.set_pipeline(&self.blit_pipeline);
+            render_pass.set_bind_group(0, &self.blit_bind_group, &[]);
+            render_pass.draw(0..3, 0..1); // fullscreen triangle
         }
 
         // End timestamp + resolve
@@ -381,7 +510,6 @@ impl HeadlessRenderer {
                 readback.unmap();
             }
         } else {
-            // No timestamps — wait for GPU to finish, measure wall-clock.
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         }
 
@@ -436,7 +564,6 @@ fn bench_raycast(label: &str, level: u32, frames: usize) {
     for i in 0..frames {
         let dt = renderer.render_frame();
         times.push(dt);
-        // Abort if a single frame takes too long
         if dt > Duration::from_secs(5) {
             eprintln!(
                 "  ABORT: frame {} took {:.1}s (>5s limit)",
@@ -445,7 +572,6 @@ fn bench_raycast(label: &str, level: u32, frames: usize) {
             );
             break;
         }
-        // Cap total benchmark time
         if total_start.elapsed() > Duration::from_secs(30) {
             eprintln!("  TIMEOUT: {} frames in 30s", i + 1);
             break;
@@ -457,7 +583,6 @@ fn bench_raycast(label: &str, level: u32, frames: usize) {
         return;
     }
 
-    // Statistics
     let n = times.len();
     let total_ms: f64 = times.iter().map(|t| t.as_secs_f64() * 1000.0).sum();
     let mean_ms = total_ms / n as f64;
@@ -507,7 +632,7 @@ fn bench_raycast_4096() {
     bench_raycast("4096³", 12, 10);
 }
 
-/// Combined benchmark: SVDAG build + step + rebuild + raycast.
+/// Combined benchmark: SVDAG build + CA step + rebuild + raycast.
 /// Simulates real gameplay: step the CA, rebuild SVDAG, render.
 #[test]
 #[ignore]

@@ -597,6 +597,21 @@ impl MaterialRegistry {
             && self.rule_for_cell(cell).is_some_and(|rule| rule.is_noop())
     }
 
+    /// Precomputed per-material-ID noop flag for hot-loop CaRule skipping.
+    /// `result[material_id] == true` iff the material's CaRule is noop (identity).
+    /// Avoids vtable dispatch per cell in the base-case inner loop.
+    pub fn noop_flags(&self) -> Vec<bool> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|e| self.rules[e.rule_id.0].is_noop())
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     pub fn color_palette_rgba(&self) -> Vec<[f32; 4]> {
         let mut palette =
             vec![[0.0, 0.0, 0.0, 0.0]; self.entries.len().max(INITIAL_MATERIAL_SLOTS)];
