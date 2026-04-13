@@ -318,7 +318,9 @@ impl World {
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
     fn step_base_case(&mut self, node: NodeId, _parity: u32) -> NodeId {
-        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        // Stack-allocated grid avoids heap allocation per base case (~16K calls).
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
         let next = self.step_grid_once(&grid, self.generation);
         self.center_level3_grid_to_node(&next)
     }
@@ -361,7 +363,8 @@ impl World {
     }
 
     fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
-        let grid = self.store.flatten(node, LEVEL3_SIDE);
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
         let next = self.step_grid_once(&grid, generation);
         let next = self.step_grid_once(&next, generation + 1);
         self.center_level3_grid_to_node(&next)

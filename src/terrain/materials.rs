@@ -596,7 +596,9 @@ impl MaterialRegistry {
     /// subtrees composed of these materials.
     pub fn cell_is_inert_fixed_point(&self, cell: Cell) -> bool {
         self.block_rule_id_for_cell(cell).is_none()
-            && self.rule_for_cell(cell).is_some_and(|rule| rule.is_noop())
+            && self
+                .rule_for_cell(cell)
+                .is_some_and(|rule| rule.is_self_inert())
     }
 
     /// Precomputed per-material-ID noop flag for hot-loop CaRule skipping.

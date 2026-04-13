@@ -505,8 +505,11 @@ impl World {
         // Snapshot and validate: collect (pos, source_material) for live clones.
         let mut live_sources: Vec<([i64; 3], u16)> = Vec::new();
         for &pos in &self.clone_sources {
-            let cell =
-                Cell::from_raw(self.get(WorldCoord(pos[0]), WorldCoord(pos[1]), WorldCoord(pos[2])));
+            let cell = Cell::from_raw(self.get(
+                WorldCoord(pos[0]),
+                WorldCoord(pos[1]),
+                WorldCoord(pos[2]),
+            ));
             if cell.material() == CLONE_MATERIAL_ID {
                 live_sources.push((pos, cell.metadata()));
             }
