@@ -27,6 +27,95 @@ pub const LOOK_SENSITIVITY: f64 = 0.003;
 /// Maximum raycast range for block place/break (in cells).
 pub const INTERACT_RANGE: f64 = 40.0;
 
+/// Camera-space offsets layered on top of the first-person eye position.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FirstPersonCameraOffset {
+    pub vertical: f64,
+    pub lateral: f64,
+    pub forward: f64,
+}
+
+/// Small deterministic state machine that adds weight to first-person camera
+/// motion without entangling renderer-side camera math.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FirstPersonCameraFeel {
+    phase: f64,
+    vertical: f64,
+    lateral: f64,
+    impulse: f64,
+    moving: bool,
+    grounded: bool,
+    initialized: bool,
+}
+
+impl FirstPersonCameraFeel {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn tick(
+        &mut self,
+        planar_speed: f64,
+        sprinting: bool,
+        grounded: bool,
+        dt: f64,
+    ) -> FirstPersonCameraOffset {
+        if dt <= 0.0 {
+            return FirstPersonCameraOffset {
+                vertical: self.vertical + self.impulse,
+                lateral: self.lateral,
+                forward: -self.impulse * 0.5,
+            };
+        }
+
+        let active = grounded && planar_speed > 0.1;
+        if !self.initialized {
+            self.moving = active;
+            self.grounded = grounded;
+            self.initialized = true;
+        }
+        if active {
+            let cadence_hz = 1.2 + planar_speed * 0.12;
+            self.phase = (self.phase + dt * cadence_hz * std::f64::consts::TAU)
+                .rem_euclid(std::f64::consts::TAU);
+        }
+
+        let speed_ratio = (planar_speed / (PLAYER_SPEED * PLAYER_SPRINT)).clamp(0.0, 1.0);
+        let bob_gain = if sprinting { 1.3 } else { 1.0 };
+        let target_vertical = if active {
+            -self.phase.sin().abs() * (0.012 + 0.014 * speed_ratio) * bob_gain
+        } else {
+            0.0
+        };
+        let target_lateral = if active {
+            self.phase.cos() * (0.005 + 0.007 * speed_ratio) * bob_gain
+        } else {
+            0.0
+        };
+
+        let smoothing = 1.0 - (-dt * 12.0).exp();
+        self.vertical += (target_vertical - self.vertical) * smoothing;
+        self.lateral += (target_lateral - self.lateral) * smoothing;
+
+        if self.initialized && active != self.moving {
+            self.impulse = if active { 0.010 } else { -0.012 };
+        }
+        if self.initialized && grounded && !self.grounded {
+            self.impulse = self.impulse.min(-0.016);
+        }
+        self.impulse *= (-dt * 10.0).exp();
+
+        self.moving = active;
+        self.grounded = grounded;
+
+        FirstPersonCameraOffset {
+            vertical: self.vertical + self.impulse,
+            lateral: self.lateral,
+            forward: -self.impulse * 0.5,
+        }
+    }
+}
+
 /// Check if the player's AABB at `pos` overlaps any solid cell.
 pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
     let hw = PLAYER_HALF_W;
@@ -47,6 +136,13 @@ pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
         }
     }
     false
+}
+
+/// Probe slightly below the player capsule to decide whether the camera-feel
+/// layer should behave like grounded locomotion or airborne drift.
+pub fn is_grounded(world: &World, pos: &[f64; 3]) -> bool {
+    let probe = [pos[0], pos[1] - 0.05, pos[2]];
+    player_collides(world, &probe)
 }
 
 /// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
@@ -258,6 +354,54 @@ mod tests {
                 .sqrt();
         // Diagonal should be same speed as forward (normalized)
         assert!((len_fwd - len_diag).abs() < 1e-9);
+    }
+
+    #[test]
+    fn camera_feel_idle_stays_neutral() {
+        let mut feel = FirstPersonCameraFeel::default();
+        for _ in 0..30 {
+            let offset = feel.tick(0.0, false, true, 1.0 / 60.0);
+            assert!(offset.vertical.abs() < 1e-6);
+            assert!(offset.lateral.abs() < 1e-6);
+            assert!(offset.forward.abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn camera_feel_sprint_bobs_more_than_walk() {
+        let mut walk = FirstPersonCameraFeel::default();
+        let mut sprint = FirstPersonCameraFeel::default();
+        let mut walk_peak = 0.0f64;
+        let mut sprint_peak = 0.0f64;
+
+        for _ in 0..90 {
+            let walk_offset = walk.tick(PLAYER_SPEED, false, true, 1.0 / 60.0);
+            let sprint_offset = sprint.tick(PLAYER_SPEED * PLAYER_SPRINT, true, true, 1.0 / 60.0);
+            walk_peak = walk_peak.max(walk_offset.vertical.abs() + walk_offset.lateral.abs());
+            sprint_peak =
+                sprint_peak.max(sprint_offset.vertical.abs() + sprint_offset.lateral.abs());
+        }
+
+        assert!(
+            sprint_peak > walk_peak,
+            "sprint bob should read stronger than walk bob"
+        );
+    }
+
+    #[test]
+    fn camera_feel_landing_adds_downward_impulse() {
+        let mut feel = FirstPersonCameraFeel::default();
+        let airborne = feel.tick(PLAYER_SPEED, false, false, 1.0 / 60.0);
+        let landing = feel.tick(PLAYER_SPEED, false, true, 1.0 / 60.0);
+
+        assert!(
+            landing.vertical < airborne.vertical,
+            "landing should add a downward camera response"
+        );
+        assert!(
+            landing.forward > 0.0,
+            "landing should add a small forward settle cue"
+        );
     }
 
     #[test]

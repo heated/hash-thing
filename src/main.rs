@@ -267,6 +267,8 @@ struct App {
     current_demo_beat: Option<LatticeDemoBeat>,
     /// Timed intro -> interior -> reveal cut for the short-form demo.
     short_demo_cut: Option<LatticeShortDemoCut>,
+    /// Deterministic first-person camera motion layer (bob, settle, sprint cue).
+    camera_feel: player::FirstPersonCameraFeel,
 }
 
 impl App {
@@ -323,6 +325,7 @@ impl App {
             legend_dirty: true,
             current_demo_beat: None,
             short_demo_cut: None,
+            camera_feel: player::FirstPersonCameraFeel::default(),
         };
 
         let player_pos = app.reset_scene_entities();
@@ -489,6 +492,7 @@ impl App {
 
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
         self.camera_mode = CameraMode::Orbit;
+        self.camera_feel.reset();
         self.legend_dirty = true;
         if let Some(renderer) = &mut self.renderer {
             renderer.camera_target = pose.target;
@@ -1041,6 +1045,9 @@ impl ApplicationHandler for App {
                                 CameraMode::Orbit => CameraMode::FirstPerson,
                                 CameraMode::FirstPerson => CameraMode::Orbit,
                             };
+                            if self.camera_mode == CameraMode::Orbit {
+                                self.camera_feel.reset();
+                            }
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
@@ -1522,15 +1529,17 @@ impl ApplicationHandler for App {
                             0.0
                         };
 
-                        let speed = if self.keys_held.contains(&KeyCode::ControlLeft)
-                            || self.keys_held.contains(&KeyCode::ControlRight)
-                        {
+                        let sprinting = self.keys_held.contains(&KeyCode::ControlLeft)
+                            || self.keys_held.contains(&KeyCode::ControlRight);
+                        let speed = if sprinting {
                             PLAYER_SPEED * PLAYER_SPRINT
                         } else {
                             PLAYER_SPEED
                         };
 
                         let delta = player::compute_move_delta(yaw, [fwd, right, up], speed, dt);
+                        let camera_planar_speed =
+                            (delta[0] * delta[0] + delta[2] * delta[2]).sqrt() / dt.max(1e-6);
 
                         let stepping = self.is_stepping();
                         if let Some(p) = self.entities.get_mut(pid) {
@@ -1544,6 +1553,13 @@ impl ApplicationHandler for App {
                                 p.pos = player::apply_movement(&self.world, &p.pos, &delta);
                             }
                         }
+                        let mut camera_grounded = false;
+                        if !stepping {
+                            if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
+                                camera_grounded = player::is_grounded(&self.world, &p.pos);
+                            }
+                        }
+                        let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
 
                         // hash-thing-m1f.4 / 37r: grow the world when the
                         // player approaches any boundary (positive or negative).
@@ -1603,13 +1619,32 @@ impl ApplicationHandler for App {
                         let wo = self.render_origin;
                         if let Some(player) = self.entities.get_mut(pid) {
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.camera_target = [
-                                    (player.pos[0] - wo[0] as f64) as f32 * inv_size as f32,
-                                    (player.pos[1] - wo[1] as f64 + PLAYER_HEIGHT * 0.85) as f32
-                                        * inv_size as f32,
-                                    (player.pos[2] - wo[2] as f64) as f32 * inv_size as f32,
-                                ];
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
+                                    let (camera_planar_speed, camera_sprinting, camera_grounded) =
+                                        camera_motion;
+                                    let motion = self.camera_feel.tick(
+                                        camera_planar_speed,
+                                        camera_sprinting,
+                                        camera_grounded,
+                                        dt,
+                                    );
+                                    let (sin_yaw, cos_yaw) = ps.yaw.sin_cos();
+                                    let right = [cos_yaw, 0.0, -sin_yaw];
+                                    let forward = [-sin_yaw, 0.0, -cos_yaw];
+                                    let eye = [
+                                        player.pos[0]
+                                            + right[0] * motion.lateral
+                                            + forward[0] * motion.forward,
+                                        player.pos[1] + PLAYER_HEIGHT * 0.85 + motion.vertical,
+                                        player.pos[2]
+                                            + right[2] * motion.lateral
+                                            + forward[2] * motion.forward,
+                                    ];
+                                    renderer.camera_target = [
+                                        (eye[0] - wo[0] as f64) as f32 * inv_size as f32,
+                                        (eye[1] - wo[1] as f64) as f32 * inv_size as f32,
+                                        (eye[2] - wo[2] as f64) as f32 * inv_size as f32,
+                                    ];
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
                                     renderer.hotbar_selected_slot =
