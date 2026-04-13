@@ -77,7 +77,6 @@ struct App {
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
     paused: bool,
-    step_timer: std::time::Instant,
     /// Wall-clock checkpoint for the next perf summary line. Reset each
     /// time the line fires so cadence stays ~LOG_INTERVAL_SECS regardless
     /// of sim/step rate.
@@ -173,7 +172,6 @@ impl App {
             gol_smoke_scene: false,
             svdag: render::Svdag::new(),
             paused: false,
-            step_timer: std::time::Instant::now(),
             log_timer: std::time::Instant::now(),
             mouse_pressed: false,
             last_mouse: None,
@@ -935,13 +933,16 @@ impl ApplicationHandler for App {
                                 self.paused = true;
                             }
                         }
-                        self.step_timer = std::time::Instant::now();
                     }
                 }
 
                 // --- Kick off background step if due (x5w) ---
+                // Step as fast as the background thread can go — no artificial
+                // throttle. The step runs off-thread (x5w) so it doesn't
+                // block rendering. Previous 200ms interval was a conservative
+                // default that limited CA to ~5 steps/sec even though the
+                // stepper can do ~16/sec at 512³ (hash-thing-cbu).
                 if !self.paused
-                    && self.step_timer.elapsed().as_millis() > 200
                     && !self.is_stepping()
                 {
                     self.step_start = std::time::Instant::now();
