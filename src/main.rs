@@ -200,22 +200,80 @@ impl App {
             legend_dirty: true,
         };
 
-        // Spawn the player entity at the world center, looking forward.
-        let center = volume_size as f64 / 2.0;
-        let player_id = app.entities.add(
-            [center, center + 2.0, center],
-            [0.0; 3],
-            sim::EntityKind::Player(sim::PlayerState {
-                yaw: std::f64::consts::FRAC_PI_4,
-                pitch: 0.0,
-                held_material: 1, // stone
-            }),
+        let player_pos = app.reset_scene_entities();
+        app.spawn_demo_entities();
+        log::info!(
+            "Player spawned at ({}, {}, {})",
+            player_pos[0],
+            player_pos[1],
+            player_pos[2]
         );
-        app.player_id = Some(player_id);
-        log::info!("Player spawned at ({center}, {}, {center})", center + 2.0);
         log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
 
         app
+    }
+
+    fn world_center(&self) -> [f64; 3] {
+        let side = self.world.side() as f64;
+        [
+            self.world.origin[0] as f64 + side * 0.5,
+            self.world.origin[1] as f64 + side * 0.5,
+            self.world.origin[2] as f64 + side * 0.5,
+        ]
+    }
+
+    fn reset_scene_entities(&mut self) -> [f64; 3] {
+        let player_state = self
+            .player_id
+            .and_then(|id| self.entities.iter().find(|entity| entity.id == id))
+            .and_then(|entity| match &entity.kind {
+                sim::EntityKind::Player(state) => Some(state.clone()),
+                _ => None,
+            })
+            .unwrap_or(sim::PlayerState {
+                yaw: std::f64::consts::FRAC_PI_4,
+                pitch: 0.0,
+                held_material: 1,
+            });
+        let center = self.world_center();
+        let pos = [center[0], center[1] + 2.0, center[2]];
+        self.entities = sim::EntityStore::new();
+        self.player_id = Some(self.entities.add(
+            pos,
+            [0.0; 3],
+            sim::EntityKind::Player(player_state),
+        ));
+        pos
+    }
+
+    fn spawn_demo_entities(&mut self) {
+        let center = self.world_center();
+        let mid_y = center[1] + 1.0;
+        self.entities.add(
+            [center[0] - 10.0, mid_y, center[2] - 4.0],
+            [0.0; 3],
+            sim::EntityKind::Emitter(sim::EmitterState::geyser()),
+        );
+        self.entities.add(
+            [center[0] + 10.0, mid_y + 2.0, center[2] + 6.0],
+            [0.0; 3],
+            sim::EntityKind::Emitter(sim::EmitterState::volcano()),
+        );
+        self.entities.add(
+            [center[0] + 2.0, mid_y, center[2] - 12.0],
+            [0.0; 3],
+            sim::EntityKind::Emitter(sim::EmitterState::whirlpool()),
+        );
+        for offset in [-8.0, 0.0, 8.0] {
+            self.entities.add(
+                [center[0] + offset, mid_y, center[2] + 12.0],
+                [0.0; 3],
+                sim::EntityKind::Critter(sim::CritterState::new(
+                    hash_thing::terrain::materials::VINE_MATERIAL_ID,
+                )),
+            );
+        }
+        log::info!("Spawned environmental demo entities: geyser, volcano, whirlpool, critters");
     }
 
     /// True while the sim step is running on a background thread.
@@ -518,6 +576,7 @@ impl App {
         }
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.seed_burning_room();
+        self.reset_scene_entities();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = true;
@@ -557,6 +616,8 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let stats = self.world.seed_gyroid_megastructure();
+        self.reset_scene_entities();
+        self.spawn_demo_entities();
         let elapsed = start.elapsed();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
@@ -589,6 +650,8 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let layout = self.world.seed_lattice_progression_demo();
+        self.reset_scene_entities();
+        self.spawn_demo_entities();
         self.reset_player_pose(layout.player_pos, layout.player_yaw, layout.player_pitch);
         let elapsed = start.elapsed();
         self.gol_smoke_scene = false;
@@ -628,6 +691,8 @@ impl App {
         let nodes_before = self.world.store.stats();
         let start = std::time::Instant::now();
         let stats = self.world.seed_terrain(&params);
+        self.reset_scene_entities();
+        self.spawn_demo_entities();
         let elapsed = start.elapsed();
         self.noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
         self.gol_smoke_scene = false;
@@ -1073,10 +1138,12 @@ impl ApplicationHandler for App {
                                             .iter()
                                             .filter_map(|e| {
                                                 let mat = match &e.kind {
-                                                    sim::EntityKind::Particle(p) => {
-                                                        p.material as u32
+                                                    sim::EntityKind::Player(_)
+                                                    | sim::EntityKind::Emitter(_) => return None,
+                                                    sim::EntityKind::Particle(_)
+                                                    | sim::EntityKind::Critter(_) => {
+                                                        e.render_material().unwrap() as u32
                                                     }
-                                                    sim::EntityKind::Player(_) => return None,
                                                 };
                                                 Some([
                                                     (e.pos[0] - wo[0] as f64) as f32 * inv_size,
