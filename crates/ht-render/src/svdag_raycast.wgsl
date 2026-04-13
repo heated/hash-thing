@@ -450,9 +450,19 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     } else {
                         normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
                     }
-                    let lod_center = node_min + vec3<f32>(half);
+                    // Like leaf hits, representative-material LOD hits must
+                    // shade from the actual surface intersection point, not
+                    // the node center, or coarse nodes turn into axis-aligned
+                    // rectangular patches in interiors.
+                    let lod_hit_t = select(
+                        max(max(ntmin_v.x, ntmin_v.y), ntmin_v.z),
+                        min(min(ntmax_v.x, ntmax_v.y), ntmax_v.z),
+                        inside_node,
+                    );
+                    let lod_hit_pos =
+                        ro_local + rd * max(lod_hit_t, 0.0) - normal * (INV_RES * 0.25);
                     let lod_time = u.camera_pos.w;
-                    let lod_props = material_shade(lod_mat, lod_center, normal, lod_time);
+                    let lod_props = material_shade(lod_mat, lod_hit_pos, normal, lod_time);
                     let lit = shade_surface(lod_props, normal, rd);
                     return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
