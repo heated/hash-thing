@@ -104,10 +104,10 @@ struct App {
 impl App {
     fn new() -> Self {
         let mut world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-        world.seed_burning_room();
+        world.seed_demo_spectacle();
         let material_palette_len = world.materials.color_palette_rgba().len();
 
-        log::info!("Initial CA demo: burning room pop={}", world.population());
+        log::info!("Initial CA demo: spectacle gallery pop={}", world.population());
         log::debug!("Material registry palette slots={material_palette_len}");
 
         // Start paused so the user opts into stepping explicitly. The
@@ -173,9 +173,9 @@ impl App {
         log::info!("Rule: {label}");
     }
 
-    fn load_burning_room_demo(&mut self, label: &str) {
+    fn load_demo_spectacle(&mut self, label: &str) {
         self.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
-        self.world.seed_burning_room();
+        self.world.seed_demo_spectacle();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = true;
@@ -338,7 +338,7 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("r") => {
                             // Reset the default CA/materials demo.
-                            self.load_burning_room_demo("Reset burning room demo");
+                            self.load_demo_spectacle("Reset spectacle gallery");
                         }
                         winit::keyboard::Key::Character("t") => {
                             // Plain terrain remains available as an explicit
@@ -381,8 +381,9 @@ impl ApplicationHandler for App {
                             self.select_rule(sim::GameOfLife3D::new(4, 7, 6, 8), "Pyroclastic");
                         }
                         winit::keyboard::Key::Character("b") => {
-                            // Burning room demo: fire + water + grass walls.
-                            self.load_burning_room_demo("Reset burning room demo");
+                            // Default demo gallery: deterministic local fire/water set pieces
+                            // staged around the beat waypoints.
+                            self.load_demo_spectacle("Reset spectacle gallery");
                         }
                         winit::keyboard::Key::Character("v") => {
                             if let Some(renderer) = &mut self.renderer {
@@ -564,9 +565,10 @@ fn main() {
     log::info!("  Scroll: zoom");
     log::info!("  Space: pause/resume");
     log::info!("  S: single step");
-    log::info!("  R: reset terrain (heightmap)");
+    log::info!("  R/B: reset spectacle gallery");
     log::info!("  C: reset terrain with caves (CA post-pass)");
     log::info!("  D: reset terrain with caves + dungeons");
+    log::info!("  T: reset terrain (heightmap)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  V: toggle Flat3D / SVDAG rendering");
@@ -597,5 +599,23 @@ mod tests {
         app.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
 
         assert_eq!(app.world.store.get_cached_step(input), None);
+    }
+
+    #[test]
+    fn demo_reset_restores_active_materials_near_each_waypoint() {
+        let mut app = App::new();
+        app.world = sim::World::new(VOLUME_SIZE.trailing_zeros());
+
+        app.load_demo_spectacle("test reset");
+
+        for waypoint in app.world.demo_waypoints() {
+            assert!(
+                app.world
+                    .count_active_material_cells_near(waypoint.center, waypoint.radius)
+                    > 0,
+                "reset should restore spectacle at waypoint {}",
+                waypoint.label
+            );
+        }
     }
 }
