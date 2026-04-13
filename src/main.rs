@@ -72,14 +72,81 @@ struct PlayerPose {
     pitch: f64,
 }
 
-fn lattice_panorama_player_pose(side: usize) -> PlayerPose {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrbitCameraPose {
+    target: [f32; 3],
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatticeDemoBeat {
+    Intro,
+    Interior,
+    Panorama,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DemoWaypoint {
+    label: &'static str,
+    player: PlayerPose,
+    camera: OrbitCameraPose,
+}
+
+fn lattice_demo_waypoint(side: usize, beat: LatticeDemoBeat) -> DemoWaypoint {
     let side = side as f64;
     let center = side * 0.5;
-    let offset = side * 0.22;
-    PlayerPose {
-        pos: [center + offset, side * 0.58, center + offset],
-        yaw: std::f64::consts::FRAC_PI_4,
-        pitch: -0.22,
+    match beat {
+        LatticeDemoBeat::Intro => {
+            let offset = side * 0.28;
+            DemoWaypoint {
+                label: "intro",
+                player: PlayerPose {
+                    pos: [center - offset, side * 0.34, center - offset],
+                    yaw: -3.0 * std::f64::consts::FRAC_PI_4,
+                    pitch: -0.08,
+                },
+                camera: OrbitCameraPose {
+                    target: [0.36, 0.34, 0.36],
+                    yaw: -3.0 * std::f32::consts::FRAC_PI_4,
+                    pitch: 0.08,
+                    dist: 0.34,
+                },
+            }
+        }
+        LatticeDemoBeat::Interior => DemoWaypoint {
+            label: "interior",
+            player: PlayerPose {
+                pos: [center + side * 0.04, side * 0.46, center + side * 0.10],
+                yaw: std::f64::consts::FRAC_PI_2,
+                pitch: -0.12,
+            },
+            camera: OrbitCameraPose {
+                target: [0.54, 0.46, 0.50],
+                yaw: std::f32::consts::FRAC_PI_2,
+                pitch: 0.10,
+                dist: 0.22,
+            },
+        },
+        LatticeDemoBeat::Panorama => {
+            let offset = side * 0.22;
+            DemoWaypoint {
+                label: "panorama",
+                player: PlayerPose {
+                    pos: [center + offset, side * 0.58, center + offset],
+                    yaw: std::f64::consts::FRAC_PI_4,
+                    pitch: -0.22,
+                },
+                camera: OrbitCameraPose {
+                    target: [0.5, 0.46, 0.5],
+                    yaw: std::f32::consts::FRAC_PI_4,
+                    pitch: 0.18,
+                    dist: 1.05,
+                },
+            }
+        }
     }
 }
 
@@ -357,15 +424,23 @@ impl App {
         }
     }
 
-    fn set_lattice_panorama_camera(&mut self) {
+    fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
         self.camera_mode = CameraMode::Orbit;
         self.legend_dirty = true;
         if let Some(renderer) = &mut self.renderer {
-            renderer.camera_target = [0.5, 0.46, 0.5];
-            renderer.camera_yaw = std::f32::consts::FRAC_PI_4;
-            renderer.camera_pitch = 0.18;
-            renderer.camera_dist = 1.05;
+            renderer.camera_target = pose.target;
+            renderer.camera_yaw = pose.yaw;
+            renderer.camera_pitch = pose.pitch;
+            renderer.camera_dist = pose.dist;
         }
+    }
+
+    fn load_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
+        self.load_lattice_demo();
+        let waypoint = lattice_demo_waypoint(self.world.side(), beat);
+        self.apply_player_pose(waypoint.player);
+        self.apply_orbit_camera_pose(waypoint.camera);
+        log::info!("Lattice demo preset: {}", waypoint.label);
     }
 
     /// Break the block the player is looking at.
@@ -678,10 +753,7 @@ impl App {
     }
 
     fn load_lattice_panorama_demo(&mut self) {
-        self.load_lattice_demo();
-        self.apply_player_pose(lattice_panorama_player_pose(self.world.side()));
-        self.set_lattice_panorama_camera();
-        log::info!("Panoramic lattice demo: orbit reveal preset loaded");
+        self.load_lattice_demo_beat(LatticeDemoBeat::Panorama);
     }
 
     fn load_terrain_scene(&mut self, label: &str, params: terrain::TerrainParams) {
@@ -1489,20 +1561,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lattice_panorama_pose_stays_inside_world() {
-        let pose = lattice_panorama_player_pose(2048);
-        for axis in [0, 1, 2] {
-            assert!(pose.pos[axis] > 0.0);
-            assert!(pose.pos[axis] < 2048.0);
+    fn lattice_demo_waypoints_stay_inside_world() {
+        for beat in [
+            LatticeDemoBeat::Intro,
+            LatticeDemoBeat::Interior,
+            LatticeDemoBeat::Panorama,
+        ] {
+            let waypoint = lattice_demo_waypoint(2048, beat);
+            for axis in [0, 1, 2] {
+                assert!(waypoint.player.pos[axis] > 0.0);
+                assert!(waypoint.player.pos[axis] < 2048.0);
+            }
         }
     }
 
     #[test]
-    fn lattice_panorama_pose_faces_inward_and_downward() {
-        let pose = lattice_panorama_player_pose(512);
-        let (_eye, dir) = player::eye_ray(&pose.pos, pose.yaw, pose.pitch);
+    fn lattice_panorama_waypoint_faces_inward_and_downward() {
+        let waypoint = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let (_eye, dir) = player::eye_ray(
+            &waypoint.player.pos,
+            waypoint.player.yaw,
+            waypoint.player.pitch,
+        );
         assert!(dir[0] < 0.0);
         assert!(dir[1] < 0.0);
         assert!(dir[2] < 0.0);
+    }
+
+    #[test]
+    fn lattice_demo_waypoints_are_distinct() {
+        let intro = lattice_demo_waypoint(512, LatticeDemoBeat::Intro);
+        let interior = lattice_demo_waypoint(512, LatticeDemoBeat::Interior);
+        let panorama = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        assert_ne!(intro.label, interior.label);
+        assert_ne!(interior.label, panorama.label);
+        assert_ne!(intro.player.pos, panorama.player.pos);
     }
 }
