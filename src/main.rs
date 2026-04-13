@@ -274,6 +274,10 @@ impl App {
             return;
         };
         if let Some((hit, _prev)) = player::raycast_cells(&self.world, eye, dir) {
+            // Remove from clone_sources if this was a clone block.
+            self.world
+                .clone_sources
+                .retain(|pos| pos != &[hit[0], hit[1], hit[2]]);
             self.world.set(
                 sim::WorldCoord(hit[0]),
                 sim::WorldCoord(hit[1]),
@@ -408,6 +412,56 @@ impl App {
                     log::info!("Held: {name} ({material_id})");
                 }
             }
+        }
+    }
+
+    /// Place a clone block that continuously spawns the currently held material.
+    /// The source material ID is encoded in the clone cell's metadata.
+    fn place_clone_block(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let held_material = self
+            .player_id
+            .and_then(|id| self.entities.iter().find(|e| e.id == id))
+            .and_then(|e| {
+                if let sim::EntityKind::Player(ref ps) = e.kind {
+                    Some(ps.held_material)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1);
+
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        if let Some((hit, prev)) = player::raycast_cells(&self.world, eye, dir) {
+            if prev == hit {
+                return;
+            }
+            // Encode the source material in clone block metadata.
+            let state =
+                hash_thing::octree::Cell::pack(hash_thing::terrain::materials::CLONE_MATERIAL_ID, held_material)
+                    .raw();
+            let pos = [prev[0], prev[1], prev[2]];
+            self.world.set(
+                sim::WorldCoord(pos[0]),
+                sim::WorldCoord(pos[1]),
+                sim::WorldCoord(pos[2]),
+                state,
+            );
+            self.world.clone_sources.push(pos);
+            log::info!(
+                "Placed clone block (spawns material {held_material}) at {:?}",
+                pos
+            );
+            Self::upload_volume(
+                &mut self.renderer,
+                &mut self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+            );
         }
     }
 
@@ -787,7 +841,13 @@ impl ApplicationHandler for App {
                     && state == ElementState::Pressed
                     && self.camera_mode == CameraMode::FirstPerson
                 {
-                    self.place_block();
+                    if self.keys_held.contains(&KeyCode::ControlLeft)
+                        || self.keys_held.contains(&KeyCode::ControlRight)
+                    {
+                        self.place_clone_block();
+                    } else {
+                        self.place_block();
+                    }
                 }
             }
 
@@ -947,6 +1007,7 @@ impl ApplicationHandler for App {
                     self.step_handle = Some(std::thread::spawn(move || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             world.apply_mutations();
+                            world.spawn_clones();
                             world.step_recursive();
                             world
                         }))

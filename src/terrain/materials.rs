@@ -36,6 +36,7 @@ pub const METAL_MATERIAL_ID: MaterialId = 14;
 pub const VINE_MATERIAL_ID: MaterialId = 15;
 pub const FAN_MATERIAL_ID: MaterialId = 16;
 pub const FIREWORK_MATERIAL_ID: MaterialId = 17;
+pub const CLONE_MATERIAL_ID: MaterialId = 18;
 
 pub const AIR: CellState = Cell::EMPTY.raw();
 pub const STONE: CellState = Cell::pack(STONE_MATERIAL_ID, 0).raw();
@@ -55,6 +56,7 @@ pub const METAL: CellState = Cell::pack(METAL_MATERIAL_ID, 0).raw();
 pub const VINE: CellState = Cell::pack(VINE_MATERIAL_ID, 0).raw();
 pub const FAN: CellState = Cell::pack(FAN_MATERIAL_ID, 0).raw();
 pub const FIREWORK: CellState = Cell::pack(FIREWORK_MATERIAL_ID, 0).raw();
+pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
 
 /// Density lookup for block rules (gravity, fluid). Maps material ID → density.
 ///
@@ -82,6 +84,7 @@ pub fn material_density(cell: Cell) -> f32 {
         VINE_MATERIAL_ID => 1.1,
         FAN_MATERIAL_ID => 1.0,
         FIREWORK_MATERIAL_ID => -0.3,
+        CLONE_MATERIAL_ID => 10.0, // immovable
         _ => 0.0,
     }
 }
@@ -525,6 +528,23 @@ impl MaterialRegistry {
                 block_rule_id: Some(gravity_block_rule),
             },
         );
+        registry.insert(
+            CLONE_MATERIAL_ID,
+            MaterialEntry {
+                visual: MaterialVisualProperties {
+                    label: "clone",
+                    base_color: [0.95, 0.85, 0.2, 1.0],
+                    texture_ref: None,
+                },
+                physical: MaterialPhysicalProperties {
+                    density: 10.0,
+                    flammability: 0.0,
+                    conductivity: 0.0,
+                },
+                rule_id: static_rule,
+                block_rule_id: None,
+            },
+        );
 
         registry
     }
@@ -793,7 +813,7 @@ mod tests {
     fn materials_are_distinct() {
         let mats = [
             AIR, STONE, DIRT, GRASS, FIRE, WATER, SAND, LAVA, ICE, ACID, OIL, GUNPOWDER, STEAM,
-            GAS, METAL, VINE, FAN, FIREWORK,
+            GAS, METAL, VINE, FAN, FIREWORK, CLONE,
         ];
         for (i, &a) in mats.iter().enumerate() {
             for (j, &b) in mats.iter().enumerate() {
@@ -1038,6 +1058,7 @@ mod tests {
             VINE_MATERIAL_ID,
             FAN_MATERIAL_ID,
             FIREWORK_MATERIAL_ID,
+            CLONE_MATERIAL_ID,
         ];
         for &id in &ids {
             let cell = if id == AIR_MATERIAL_ID {

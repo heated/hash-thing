@@ -5,7 +5,7 @@ use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
 use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, LAVA, SAND, STONE, WATER,
+    BlockRuleId, MaterialRegistry, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, LAVA, SAND, STONE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -109,6 +109,11 @@ pub struct World {
     /// Pending world mutations. Entities push here; `apply_mutations`
     /// drains and applies in arrival order at tick boundary.
     pub queue: MutationQueue,
+    /// Positions of clone blocks in world coordinates. Each tick,
+    /// clone blocks spawn their encoded material into adjacent air cells.
+    /// Validated lazily — stale entries (destroyed by acid/etc.) are pruned
+    /// on `spawn_clones`.
+    pub clone_sources: Vec<[i64; 3]>,
     /// World-space origin of local coordinate (0,0,0). When the world
     /// grows in the negative direction, origin shifts to keep the old
     /// root's cells at the same world-space positions.
@@ -165,6 +170,7 @@ impl World {
             hashlife_all_inert_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
+            clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
         }
@@ -192,6 +198,7 @@ impl World {
             hashlife_all_inert_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
+            clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
         }
@@ -473,6 +480,65 @@ impl World {
                     }
                 }
             }
+        }
+    }
+
+    /// Spawn materials from clone blocks into adjacent air cells.
+    ///
+    /// For each tracked clone source, verify it still exists (prune stale entries),
+    /// then write the encoded source material into the 6 cardinal neighbors that
+    /// are currently air. Mutations are applied immediately.
+    pub fn spawn_clones(&mut self) {
+        if self.clone_sources.is_empty() {
+            return;
+        }
+
+        const DIRS: [[i64; 3]; 6] = [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ];
+
+        // Snapshot and validate: collect (pos, source_material) for live clones.
+        let mut live_sources: Vec<([i64; 3], u16)> = Vec::new();
+        for &pos in &self.clone_sources {
+            let cell =
+                Cell::from_raw(self.get(WorldCoord(pos[0]), WorldCoord(pos[1]), WorldCoord(pos[2])));
+            if cell.material() == CLONE_MATERIAL_ID {
+                live_sources.push((pos, cell.metadata()));
+            }
+        }
+
+        // Prune stale entries.
+        self.clone_sources = live_sources.iter().map(|&(pos, _)| pos).collect();
+
+        for (pos, source_material_id) in live_sources {
+            if source_material_id == 0 {
+                continue; // metadata 0 = no source configured
+            }
+            let spawn_state = Cell::pack(source_material_id, 0).raw();
+            for dir in &DIRS {
+                let nx = pos[0] + dir[0];
+                let ny = pos[1] + dir[1];
+                let nz = pos[2] + dir[2];
+                let neighbor = self.get(WorldCoord(nx), WorldCoord(ny), WorldCoord(nz));
+                if neighbor == 0 {
+                    self.queue.push(WorldMutation::SetCell {
+                        x: WorldCoord(nx),
+                        y: WorldCoord(ny),
+                        z: WorldCoord(nz),
+                        state: spawn_state,
+                    });
+                }
+            }
+        }
+
+        // Apply the spawned cells.
+        if !self.queue.is_empty() {
+            self.apply_mutations();
         }
     }
 
