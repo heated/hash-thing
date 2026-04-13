@@ -25,6 +25,7 @@ const DEFAULT_VOLUME_SIZE: u32 = 2048;
 /// `world.generation` so the log keeps ticking even when the sim is paused
 /// or stepping slowly — see hash-thing-q63.
 const LOG_INTERVAL_SECS: f64 = 2.0;
+const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
 /// One-line gen summary. Centralised so the `App::new` startup path and the
 /// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
@@ -219,6 +220,8 @@ struct App {
     last_mouse: Option<(f64, f64)>,
     /// Currently held keyboard keys (for per-frame movement polling).
     keys_held: HashSet<KeyCode>,
+    /// Last frame's Space state so jump only triggers on a fresh press.
+    jump_was_held: bool,
     /// Camera mode: orbit (debug) or first-person (gameplay).
     camera_mode: CameraMode,
     /// The player entity, if spawned.
@@ -259,6 +262,8 @@ struct App {
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
     render_inv_size: f32,
+    /// Log the slow-debug-build advisory at most once per run.
+    warned_dev_profile_perf: bool,
     /// Legend (keybindings help) overlay toggle (m1f.7.2).
     legend_visible: bool,
     /// True when the legend texture needs re-upload (mode change or toggle).
@@ -267,8 +272,20 @@ struct App {
     current_demo_beat: Option<LatticeDemoBeat>,
     /// Timed intro -> interior -> reveal cut for the short-form demo.
     short_demo_cut: Option<LatticeShortDemoCut>,
+    /// Deterministic first-person camera motion layer (bob, settle, sprint cue).
+    camera_feel: player::FirstPersonCameraFeel,
     /// Defer expensive initial scene generation until after the window exists.
     startup_scene_pending: bool,
+}
+
+fn should_warn_about_slow_dev_step(
+    debug_build: bool,
+    volume_size: u32,
+    step_elapsed: std::time::Duration,
+) -> bool {
+    debug_build
+        && volume_size >= 256
+        && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
 impl App {
@@ -292,6 +309,7 @@ impl App {
             mouse_pressed: false,
             last_mouse: None,
             keys_held: HashSet::new(),
+            jump_was_held: false,
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
@@ -306,10 +324,12 @@ impl App {
             step_start: std::time::Instant::now(),
             render_origin,
             render_inv_size,
+            warned_dev_profile_perf: false,
             legend_visible: true,
             legend_dirty: true,
             current_demo_beat: None,
             short_demo_cut: None,
+            camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
         };
 
@@ -424,6 +444,69 @@ impl App {
         log::info!("Spawned environmental demo entities: geyser, volcano, whirlpool, critters");
     }
 
+    fn renderer_camera_world_pos(&self, renderer: &render::Renderer) -> [f64; 3] {
+        let target = [
+            self.render_origin[0] as f64
+                + renderer.camera_target[0] as f64 / self.render_inv_size as f64,
+            self.render_origin[1] as f64
+                + renderer.camera_target[1] as f64 / self.render_inv_size as f64,
+            self.render_origin[2] as f64
+                + renderer.camera_target[2] as f64 / self.render_inv_size as f64,
+        ];
+        let (sin_yaw, cos_yaw) = renderer.camera_yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = renderer.camera_pitch.sin_cos();
+        let cam_dir = [-cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw];
+        [
+            target[0]
+                - cam_dir[0] as f64 * renderer.camera_dist as f64 / self.render_inv_size as f64,
+            target[1]
+                - cam_dir[1] as f64 * renderer.camera_dist as f64 / self.render_inv_size as f64,
+            target[2]
+                - cam_dir[2] as f64 * renderer.camera_dist as f64 / self.render_inv_size as f64,
+        ]
+    }
+
+    fn upload_visible_particles(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let Some(camera_pos) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| self.renderer_camera_world_pos(renderer))
+        else {
+            return;
+        };
+
+        let inv_size = self.render_inv_size;
+        let wo = self.render_origin;
+        let particle_data: Vec<[f32; 4]> = self
+            .entities
+            .iter()
+            .filter_map(|e| {
+                let mat = match &e.kind {
+                    sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
+                    sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
+                        e.render_material().unwrap() as u32
+                    }
+                };
+                if !player::has_line_of_sight(&self.world, camera_pos, e.pos) {
+                    return None;
+                }
+                Some([
+                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
+                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
+                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
+                    f32::from_bits(mat),
+                ])
+            })
+            .collect();
+
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_particles(&particle_data);
+        }
+    }
+
     /// True while the sim step is running on a background thread.
     fn is_stepping(&self) -> bool {
         self.step_handle.is_some()
@@ -437,8 +520,7 @@ impl App {
                 "",
                 "  WASD        Move",
                 "  Mouse       Look",
-                "  Space       Fly up",
-                "  Shift       Fly down",
+                "  Space       Jump",
                 "  Ctrl        Sprint",
                 "  LClick      Break block",
                 "  RClick      Place block",
@@ -512,6 +594,7 @@ impl App {
 
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
         self.camera_mode = CameraMode::Orbit;
+        self.camera_feel.reset();
         self.legend_dirty = true;
         if let Some(renderer) = &mut self.renderer {
             renderer.camera_target = pose.target;
@@ -1017,6 +1100,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::Focused(false) => {
                 self.keys_held.clear();
+                self.jump_was_held = false;
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1035,7 +1119,7 @@ impl ApplicationHandler for App {
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
                             // In orbit mode, Space toggles pause.
-                            // In FPS mode, Space is fly-up (handled per-frame).
+                            // In FPS mode, Space is jump (handled per-frame).
                             if self.camera_mode == CameraMode::Orbit {
                                 self.paused = !self.paused;
                                 log::info!("Paused: {}", self.paused);
@@ -1067,6 +1151,9 @@ impl ApplicationHandler for App {
                                 CameraMode::Orbit => CameraMode::FirstPerson,
                                 CameraMode::FirstPerson => CameraMode::Orbit,
                             };
+                            if self.camera_mode == CameraMode::Orbit {
+                                self.camera_feel.reset();
+                            }
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
@@ -1387,7 +1474,23 @@ impl ApplicationHandler for App {
                 if let Some(ref handle) = self.step_handle {
                     if handle.is_finished() {
                         let handle = self.step_handle.take().unwrap();
-                        self.perf.record("step", self.step_start.elapsed());
+                        let step_elapsed = self.step_start.elapsed();
+                        self.perf.record("step", step_elapsed);
+                        if !self.warned_dev_profile_perf
+                            && should_warn_about_slow_dev_step(
+                                cfg!(debug_assertions),
+                                self.volume_size,
+                                step_elapsed,
+                            )
+                        {
+                            log::warn!(
+                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile bench -- {}` for interactive playtesting.",
+                                step_elapsed.as_secs_f64() * 1000.0,
+                                self.volume_size,
+                                self.volume_size,
+                            );
+                            self.warned_dev_profile_perf = true;
+                        }
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
@@ -1406,31 +1509,6 @@ impl ApplicationHandler for App {
                                         &mut self.svdag,
                                         &mut self.last_svdag_stats,
                                     );
-                                    if let Some(renderer) = &mut self.renderer {
-                                        let inv_size = self.render_inv_size;
-                                        let wo = self.render_origin;
-                                        let particle_data: Vec<[f32; 4]> = self
-                                            .entities
-                                            .iter()
-                                            .filter_map(|e| {
-                                                let mat = match &e.kind {
-                                                    sim::EntityKind::Player(_)
-                                                    | sim::EntityKind::Emitter(_) => return None,
-                                                    sim::EntityKind::Particle(_)
-                                                    | sim::EntityKind::Critter(_) => {
-                                                        e.render_material().unwrap() as u32
-                                                    }
-                                                };
-                                                Some([
-                                                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
-                                                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
-                                                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
-                                                    f32::from_bits(mat),
-                                                ])
-                                            })
-                                            .collect();
-                                        renderer.upload_particles(&particle_data);
-                                    }
                                 }
                             }
                             Err(msg) => {
@@ -1543,7 +1621,9 @@ impl ApplicationHandler for App {
                         } else {
                             0.0
                         };
-                        let up = if self.keys_held.contains(&KeyCode::Space) {
+                        let space_held = self.keys_held.contains(&KeyCode::Space);
+                        let jump_requested = space_held && !self.jump_was_held;
+                        let up = if space_held {
                             1.0
                         } else if self.keys_held.contains(&KeyCode::ShiftLeft)
                             || self.keys_held.contains(&KeyCode::ShiftRight)
@@ -1553,17 +1633,20 @@ impl ApplicationHandler for App {
                             0.0
                         };
 
-                        let speed = if self.keys_held.contains(&KeyCode::ControlLeft)
-                            || self.keys_held.contains(&KeyCode::ControlRight)
-                        {
+                        let sprinting = self.keys_held.contains(&KeyCode::ControlLeft)
+                            || self.keys_held.contains(&KeyCode::ControlRight);
+                        let speed = if sprinting {
                             PLAYER_SPEED * PLAYER_SPRINT
                         } else {
                             PLAYER_SPEED
                         };
 
                         let delta = player::compute_move_delta(yaw, [fwd, right, up], speed, dt);
+                        let camera_planar_speed =
+                            (delta[0] * delta[0] + delta[2] * delta[2]).sqrt() / dt.max(1e-6);
 
                         let stepping = self.is_stepping();
+                        let mut camera_grounded = false;
                         if let Some(p) = self.entities.get_mut(pid) {
                             if stepping {
                                 // Free-fly: no collision while world is on
@@ -1572,10 +1655,28 @@ impl ApplicationHandler for App {
                                 p.pos[1] += delta[1];
                                 p.pos[2] += delta[2];
                             } else {
-                                p.pos = player::apply_movement(&self.world, &p.pos, &delta);
+                                let step = player::step_grounded_movement(
+                                    &self.world,
+                                    &p.pos,
+                                    p.vel[1],
+                                    player::GroundedMoveInput {
+                                        yaw,
+                                        move_input: [fwd, right],
+                                        speed,
+                                        dt,
+                                        jump_requested,
+                                    },
+                                );
+                                p.pos = step.pos;
+                                p.vel[1] = step.vertical_velocity;
                             }
                         }
-
+                        if !stepping {
+                            if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
+                                camera_grounded = player::is_grounded(&self.world, &p.pos);
+                            }
+                        }
+                        let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
                         // hash-thing-m1f.4 / 37r: grow the world when the
                         // player approaches any boundary (positive or negative).
                         // Skipped during background step — world is placeholder.
@@ -1634,13 +1735,32 @@ impl ApplicationHandler for App {
                         let wo = self.render_origin;
                         if let Some(player) = self.entities.get_mut(pid) {
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.camera_target = [
-                                    (player.pos[0] - wo[0] as f64) as f32 * inv_size as f32,
-                                    (player.pos[1] - wo[1] as f64 + PLAYER_HEIGHT * 0.85) as f32
-                                        * inv_size as f32,
-                                    (player.pos[2] - wo[2] as f64) as f32 * inv_size as f32,
-                                ];
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
+                                    let (camera_planar_speed, camera_sprinting, camera_grounded) =
+                                        camera_motion;
+                                    let motion = self.camera_feel.tick(
+                                        camera_planar_speed,
+                                        camera_sprinting,
+                                        camera_grounded,
+                                        dt,
+                                    );
+                                    let (sin_yaw, cos_yaw) = ps.yaw.sin_cos();
+                                    let right = [cos_yaw, 0.0, -sin_yaw];
+                                    let forward = [-sin_yaw, 0.0, -cos_yaw];
+                                    let eye = [
+                                        player.pos[0]
+                                            + right[0] * motion.lateral
+                                            + forward[0] * motion.forward,
+                                        player.pos[1] + PLAYER_HEIGHT * 0.85 + motion.vertical,
+                                        player.pos[2]
+                                            + right[2] * motion.lateral
+                                            + forward[2] * motion.forward,
+                                    ];
+                                    renderer.camera_target = [
+                                        (eye[0] - wo[0] as f64) as f32 * inv_size as f32,
+                                        (eye[1] - wo[1] as f64) as f32 * inv_size as f32,
+                                        (eye[2] - wo[2] as f64) as f32 * inv_size as f32,
+                                    ];
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
                                     renderer.hotbar_selected_slot =
@@ -1660,6 +1780,9 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                self.jump_was_held = self.keys_held.contains(&KeyCode::Space);
+
+                self.upload_visible_particles();
 
                 // Time render. Disjoint-field borrows: the Timer holds
                 // self.perf, renderer borrows self.renderer — orthogonal.
@@ -1719,8 +1842,7 @@ fn main() {
     log::info!("  --- First-person mode ---");
     log::info!("  WASD: move (relative to look direction)");
     log::info!("  Mouse: look around");
-    log::info!("  Space: fly up   Shift: fly down");
-    log::info!("  Ctrl: sprint");
+    log::info!("  Space: jump   Ctrl: sprint");
     log::info!("  Left click: break block   Right click: place block");
     log::info!("  --- Shared ---");
     log::info!("  F5: pause/resume");
@@ -1775,6 +1897,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
@@ -1865,6 +1988,9 @@ mod tests {
     #[test]
     fn first_person_legend_hides_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
+        assert!(lines.iter().any(|line| line.contains("Space       Jump")));
+        assert!(!lines.iter().any(|line| line.contains("Fly up")));
+        assert!(!lines.iter().any(|line| line.contains("Fly down")));
         assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
         assert!(!lines
             .iter()
@@ -1901,5 +2027,29 @@ mod tests {
                 waypoint.label
             );
         }
+    }
+
+    #[test]
+    fn slow_dev_step_warning_requires_debug_large_world_and_slow_step() {
+        assert!(should_warn_about_slow_dev_step(
+            true,
+            256,
+            Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            false,
+            256,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            true,
+            128,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_warn_about_slow_dev_step(
+            true,
+            256,
+            Duration::from_millis(DEV_PROFILE_STEP_WARN_MS - 1)
+        ));
     }
 }
