@@ -1,6 +1,8 @@
-// SVDAG raycasting shader.
+// SVDAG raycasting compute shader (hash-thing-5bb.6.1).
 //
-// Iterative descent through a sparse voxel DAG, rendered via a fullscreen pass.
+// Iterative descent through a sparse voxel DAG, dispatched as a compute shader
+// writing to a storage texture. Converted from fragment shader to enable future
+// workgroup-cooperative optimizations (tile early-exit, shared DAG cache).
 //
 // Buffer layout (dag_nodes: array<u32>):
 //   [0]:     root_offset — absolute index of the current root node's slot
@@ -28,34 +30,14 @@ struct Uniforms {
     camera_right: vec4<f32>,
     // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: screen_height
     params: vec4<f32>,
-    // x: debug_mode (0=normal, 1=step-count heatmap), y/z/w: reserved
+    // x: debug_mode (0=normal, 1=step-count heatmap), y: lod_bias, z: output_width, w: output_height
     debug: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> dag_nodes: array<u32>;
 @group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
-    let positions = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
-    );
-    var out: VertexOutput;
-    out.position = vec4<f32>(positions[id], 0.0, 1.0);
-    out.uv = positions[id];
-    return out;
-}
+@group(0) @binding(3) var output: texture_storage_2d<rgba16float, write>;
 
 // Material color palette. Input is the packed 16-bit cell word:
 //   bits 15..6 material_id (10 bits)
@@ -152,6 +134,17 @@ fn heatmap_color(ratio: f32) -> vec3<f32> {
         return mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), t * 2.0);
     }
     return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+}
+
+// Linear → sRGB conversion. Compute shaders write to storage textures
+// which bypass hardware sRGB conversion that fragment shaders get for free
+// when the render target is Rgba8UnormSrgb. We must do the conversion
+// manually to match the previous visual output.
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let cutoff = c <= vec3<f32>(0.0031308);
+    let lo = c * 12.92;
+    let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(hi, lo, cutoff);
 }
 
 // Iterative DAG descent.
@@ -491,20 +484,38 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     return RayResult(vec4<f32>(1.0, 0.0, 1.0, 1.0), step, max_steps);
 }
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let width = u32(u.debug.z);
+    let height = u32(u.debug.w);
+
+    // OOB guard: edge workgroups may dispatch threads beyond the output
+    // texture dimensions when width/height aren't multiples of 8.
+    if gid.x >= width || gid.y >= height {
+        return;
+    }
+
+    // Compute UV in [-1, 1] range matching the old vertex shader output.
+    let uv = vec2<f32>(
+        (f32(gid.x) + 0.5) / f32(width) * 2.0 - 1.0,
+        // Flip Y: gid.y=0 is top of screen, but UV.y=1 should be top
+        1.0 - (f32(gid.y) + 0.5) / f32(height) * 2.0,
+    );
+
     let aspect = u.params.y;
     let fov_tan = u.params.z;
 
     let rd = normalize(
         u.camera_dir.xyz +
-        u.camera_right.xyz * in.uv.x * aspect * fov_tan +
-        u.camera_up.xyz * in.uv.y * fov_tan
+        u.camera_right.xyz * uv.x * aspect * fov_tan +
+        u.camera_up.xyz * uv.y * fov_tan
     );
     let ro = u.camera_pos.xyz;
 
     let result = raycast(ro, rd);
     let debug_mode = u32(u.debug.x);
+
+    var final_color: vec4<f32>;
 
     // Debug mode 1: step-count heatmap. Shows traversal cost per pixel.
     if debug_mode == 1u {
@@ -512,19 +523,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let hm = heatmap_color(ratio);
         // Dim background rays (no hit) to distinguish sky from geometry.
         if result.color.a == 0.0 {
-            return vec4<f32>(hm * 0.3, 1.0);
+            final_color = vec4<f32>(hm * 0.3, 1.0);
+        } else {
+            final_color = vec4<f32>(hm, 1.0);
         }
-        return vec4<f32>(hm, 1.0);
+    } else if result.color.a > 0.0 {
+        final_color = result.color;
+    } else {
+        // Sky gradient: lighter blue at top, desaturated at horizon.
+        let sky_t = uv.y * 0.5 + 0.5;
+        let sky_top = vec3<f32>(0.35, 0.55, 0.90);
+        let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
+        let bg = mix(sky_bot, sky_top, sky_t);
+        final_color = vec4<f32>(bg, 1.0);
     }
 
-    if result.color.a > 0.0 {
-        return result.color;
-    }
-
-    // Sky gradient: lighter blue at top, desaturated at horizon.
-    let t = in.uv.y * 0.5 + 0.5;
-    let sky_top = vec3<f32>(0.35, 0.55, 0.90);
-    let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
-    let bg = mix(sky_bot, sky_top, t);
-    return vec4<f32>(bg, 1.0);
+    // Linear → sRGB: storage texture writes bypass hardware sRGB conversion.
+    // The blit shader samples this texture and writes to the sRGB swapchain,
+    // but the swapchain's sRGB encoding expects pre-converted sRGB values
+    // when sampled as a regular texture_2d<f32>. Apply conversion here.
+    let srgb = linear_to_srgb(final_color.xyz);
+    textureStore(output, vec2<i32>(gid.xy), vec4<f32>(srgb, final_color.a));
 }
