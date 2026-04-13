@@ -262,6 +262,13 @@ impl NodeStore {
         grid
     }
 
+    /// Flatten into a caller-provided buffer. The buffer must be exactly
+    /// `side³` elements and should be zero-initialized.
+    pub fn flatten_buf(&self, root: NodeId, grid: &mut [CellState], side: usize) {
+        debug_assert_eq!(grid.len(), side * side * side);
+        self.flatten_into(root, grid, side, 0, 0, 0);
+    }
+
     fn flatten_into(
         &self,
         id: NodeId,

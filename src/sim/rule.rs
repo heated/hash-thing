@@ -12,9 +12,21 @@ pub trait CaRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
 
     /// True if this rule always returns the center cell unchanged (identity).
-    /// Used by hashlife to skip stepping entire inert subtrees.
+    /// Used in the base-case inner loop to skip neighbor collection.
     fn is_noop(&self) -> bool {
         false
+    }
+
+    /// True if this rule is identity when all neighbors are the same material
+    /// (self-inert). Used by hashlife subtree-level short-circuit: a subtree
+    /// of uniform material with `is_self_inert() == true` can skip stepping
+    /// because internal cells never have cross-material neighbors. Boundary
+    /// interactions are handled by the 27-intermediate overlap in the parent.
+    ///
+    /// Default: delegates to `is_noop()`. Override for conditionally-noop rules
+    /// like DissolvableRule (identity unless acid is adjacent).
+    fn is_self_inert(&self) -> bool {
+        self.is_noop()
     }
 
     /// Clone into a boxed trait object. Enables Clone for MaterialRegistry
@@ -258,6 +270,10 @@ impl CaRule for DissolvableRule {
         } else {
             center
         }
+    }
+
+    fn is_self_inert(&self) -> bool {
+        true
     }
 
     fn clone_box(&self) -> Box<dyn CaRule + Send> {
