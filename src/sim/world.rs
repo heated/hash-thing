@@ -8,7 +8,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FIRE, GRASS, SAND, STONE, WATER,
+    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE, FIREWORK, GRASS, SAND,
+    STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -127,6 +128,19 @@ impl Box3 {
             (self.min[2] + self.max[2]) / 2,
         ]
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProgressionBoxes {
+    start_shell: Box3,
+    start_room: Box3,
+    corridor_shell: Box3,
+    corridor: Box3,
+    tease_a: Box3,
+    tease_b: Box3,
+    atrium: Box3,
+    balcony: Box3,
+    panorama: Box3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1174,9 +1188,21 @@ impl World {
         }
     }
 
-    fn progression_boxes(
-        field: &LatticeField,
-    ) -> (Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3) {
+    #[cfg(test)]
+    fn box_contains_material(&self, volume: Box3, state: CellState) -> bool {
+        for z in volume.min[2]..=volume.max[2] {
+            for y in volume.min[1]..=volume.max[1] {
+                for x in volume.min[0]..=volume.max[0] {
+                    if self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) == state {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn progression_boxes(field: &LatticeField) -> ProgressionBoxes {
         let lo = field.lo;
         let hi = field.hi;
         let ground_y = lo[1] + field.floor_thick;
@@ -1294,7 +1320,7 @@ impl World {
             ],
         );
 
-        (
+        ProgressionBoxes {
             start_shell,
             start_room,
             corridor_shell,
@@ -1304,14 +1330,14 @@ impl World {
             atrium,
             balcony,
             panorama,
-        )
+        }
     }
 
     pub fn seed_lattice_progression_demo(&mut self) -> DemoLayout {
         self.seed_lattice_megastructure();
         let field = LatticeField::for_world(self.level, 42);
         let ground_y = field.lo[1] + field.floor_thick;
-        let (
+        let ProgressionBoxes {
             start_shell,
             start_room,
             corridor_shell,
@@ -1321,7 +1347,7 @@ impl World {
             atrium,
             balcony,
             panorama,
-        ) = Self::progression_boxes(&field);
+        } = Self::progression_boxes(&field);
 
         self.fill_box(start_shell, STONE);
         self.fill_box(start_room, AIR);
@@ -1340,6 +1366,15 @@ impl World {
         self.fill_box(atrium, AIR);
         self.fill_box(balcony, AIR);
         self.fill_box(panorama, AIR);
+        self.stage_lattice_progression_materials(
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            balcony,
+            panorama,
+        );
 
         let player_pos = [
             start_room.center()[0] as f64 + 0.5,
@@ -1354,6 +1389,132 @@ impl World {
             atrium_center: atrium.center(),
             reveal_center: balcony.center(),
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the route beats are named scene volumes, not anonymous coordinates"
+    )]
+    fn stage_lattice_progression_materials(
+        &mut self,
+        start_room: Box3,
+        corridor_shell: Box3,
+        corridor: Box3,
+        tease_a: Box3,
+        tease_b: Box3,
+        balcony: Box3,
+        panorama: Box3,
+    ) {
+        // Room: vine-draped entry wall and ceiling lip so the start reads
+        // organic rather than bare debug architecture.
+        self.fill_box(
+            Box3::new(
+                [
+                    start_room.min[0] + 1,
+                    start_room.min[1],
+                    start_room.max[2] - 1,
+                ],
+                [
+                    start_room.min[0] + 3,
+                    start_room.max[1] - 1,
+                    start_room.max[2] - 1,
+                ],
+            ),
+            VINE,
+        );
+        self.fill_box(
+            Box3::new(
+                [
+                    start_room.min[0] + 2,
+                    start_room.max[1] - 1,
+                    start_room.max[2] - 2,
+                ],
+                [
+                    start_room.min[0] + 5,
+                    start_room.max[1] - 1,
+                    start_room.max[2] - 1,
+                ],
+            ),
+            VINE,
+        );
+
+        // Corridor: carve a side opening and hang a thin waterfall through it.
+        let corridor_mid = corridor.center();
+        let gap_z = corridor_shell.max[2];
+        self.fill_box(
+            Box3::new(
+                [corridor_mid[0] - 1, corridor.min[1], gap_z],
+                [corridor_mid[0] + 1, corridor.max[1], gap_z],
+            ),
+            AIR,
+        );
+        self.fill_box(
+            Box3::new(
+                [corridor_mid[0], corridor.min[1] + 2, corridor.max[2] - 1],
+                [corridor_mid[0], corridor.max[1], corridor.max[2]],
+            ),
+            WATER,
+        );
+
+        // Tease: sand spill on one branch, fan props on the other so the
+        // player reads "something strange is happening ahead" before the reveal.
+        let tease_a_center = tease_a.center();
+        self.fill_box(
+            Box3::new(
+                [tease_a.min[0] + 1, tease_a.min[1], tease_a_center[2] - 1],
+                [
+                    tease_a.min[0] + 4,
+                    tease_a.min[1] + 1,
+                    tease_a_center[2] + 1,
+                ],
+            ),
+            SAND,
+        );
+        let tease_b_center = tease_b.center();
+        self.fill_box(
+            Box3::new(
+                [
+                    tease_b.max[0] - 1,
+                    tease_b.min[1] + 1,
+                    tease_b_center[2] - 1,
+                ],
+                [
+                    tease_b.max[0] - 1,
+                    tease_b.min[1] + 2,
+                    tease_b_center[2] + 1,
+                ],
+            ),
+            FAN,
+        );
+
+        // Reveal: water curtains framing the balcony plus fireworks staged
+        // just above the platform so they immediately rise and burst.
+        self.fill_box(
+            Box3::new(
+                [panorama.min[0] + 1, balcony.min[1], balcony.min[2]],
+                [panorama.min[0] + 1, balcony.max[1] + 3, balcony.min[2] + 1],
+            ),
+            WATER,
+        );
+        self.fill_box(
+            Box3::new(
+                [panorama.min[0] + 1, balcony.min[1], balcony.max[2] - 1],
+                [panorama.min[0] + 1, balcony.max[1] + 3, balcony.max[2]],
+            ),
+            WATER,
+        );
+        let reveal_center = balcony.center();
+        self.fill_box(
+            Box3::new(
+                [reveal_center[0] - 1, balcony.max[1], reveal_center[2] - 1],
+                [
+                    reveal_center[0] + 1,
+                    balcony.max[1] + 1,
+                    reveal_center[2] + 1,
+                ],
+            ),
+            FIREWORK,
+        );
     }
 
     pub fn population(&self) -> u64 {
@@ -1623,7 +1784,9 @@ mod tests {
     use super::*;
     use crate::player;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
-    use crate::terrain::materials::{MaterialRegistry, FIRE, GRASS, LAVA, SAND, STONE, WATER};
+    use crate::terrain::materials::{
+        MaterialRegistry, FAN, FIRE, FIREWORK, GRASS, LAVA, SAND, STONE, VINE, WATER,
+    };
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -2067,6 +2230,60 @@ mod tests {
         assert!(
             has(FIRE),
             "progression demo must still preserve fire accents"
+        );
+    }
+
+    #[test]
+    fn lattice_progression_demo_stages_route_specific_materials() {
+        let mut w = World::new(6);
+        let _layout = w.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(w.level, 42);
+        let ProgressionBoxes {
+            start_shell: _start_shell,
+            start_room,
+            corridor_shell,
+            corridor,
+            tease_a,
+            tease_b,
+            atrium: _atrium,
+            balcony,
+            panorama,
+        } = World::progression_boxes(&field);
+
+        assert!(
+            w.box_contains_material(start_room, VINE),
+            "start room should stage vine detail"
+        );
+        assert!(
+            w.box_contains_material(corridor_shell, WATER),
+            "corridor should stage a waterfall/gap read"
+        );
+        assert!(
+            w.box_contains_material(tease_a, SAND),
+            "tease branch should contain sand staging"
+        );
+        assert!(
+            w.box_contains_material(tease_b, FAN),
+            "tease branch should contain fan props"
+        );
+        assert!(
+            w.box_contains_material(balcony, FIREWORK)
+                || w.box_contains_material(panorama, FIREWORK),
+            "reveal should stage fireworks"
+        );
+        assert!(
+            w.box_contains_material(panorama, WATER),
+            "reveal should keep water framing"
+        );
+
+        // Sanity: the corridor still remains traversable through its center.
+        assert_eq!(
+            w.get(
+                WorldCoord(corridor.center()[0]),
+                WorldCoord(corridor.center()[1]),
+                WorldCoord(corridor.center()[2]),
+            ),
+            AIR
         );
     }
 
