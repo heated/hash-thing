@@ -1461,13 +1461,7 @@ impl World {
             balcony,
             panorama,
         );
-        self.fill_floor(
-            Box3::new(
-                [panorama.min[0], balcony.min[1], balcony.min[2]],
-                [panorama.max[0], balcony.max[1], balcony.max[2]],
-            ),
-            STONE,
-        );
+        self.stage_panorama_gangplank(balcony, panorama);
         self.carve_rising_promenade(
             atrium.center()[0],
             balcony.center()[0],
@@ -1629,6 +1623,30 @@ impl World {
             ),
             WATER,
         );
+    }
+
+    fn stage_panorama_gangplank(&mut self, balcony: Box3, panorama: Box3) {
+        let spine_z = balcony.center()[2];
+        let drop_floor = (balcony.min[1] - 10).max(0);
+        let gangplank = Box3::new(
+            [balcony.min[0], balcony.min[1], spine_z - 1],
+            [panorama.max[0], balcony.max[1], spine_z + 1],
+        );
+        let wide_span = Box3::new(
+            [panorama.min[0], balcony.min[1], balcony.min[2]],
+            [panorama.max[0], balcony.max[1], balcony.max[2]],
+        );
+
+        // Clear the broad terrace floor first so the reveal reads as a narrow
+        // bridge over open air instead of a safe plaza.
+        self.fill_floor(wide_span, AIR);
+        self.fill_floor(gangplank, STONE);
+
+        let drop = Box3::new(
+            [balcony.max[0] - 1, drop_floor, balcony.min[2] - 2],
+            [panorama.max[0], balcony.min[1] - 2, balcony.max[2] + 2],
+        );
+        self.fill_box(drop, AIR);
     }
 
     fn seed_progression_break_trigger(&mut self, tease_a: Box3) {
@@ -2445,6 +2463,46 @@ mod tests {
         for segment in route.windows(2) {
             assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
         }
+    }
+
+    #[test]
+    fn lattice_progression_demo_reveal_reads_as_gangplank_over_void() {
+        let mut w = World::new(6);
+        let layout = w.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(w.level, 42);
+        let ProgressionBoxes {
+            balcony, panorama, ..
+        } = World::progression_boxes(&field);
+        let tip_x = panorama.max[0] - 1;
+        let side_z = (balcony.max[2] + 2).min(panorama.max[2]);
+
+        assert_eq!(
+            w.get(
+                WorldCoord(tip_x),
+                WorldCoord(layout.panorama_center[1] - 1),
+                WorldCoord(layout.panorama_center[2]),
+            ),
+            STONE,
+            "gangplank should carry the player at the reveal tip"
+        );
+        assert_eq!(
+            w.get(
+                WorldCoord(tip_x),
+                WorldCoord(layout.panorama_center[1] - 1),
+                WorldCoord(side_z),
+            ),
+            AIR,
+            "off the gangplank there should be no terrace floor"
+        );
+        assert_eq!(
+            w.get(
+                WorldCoord(tip_x),
+                WorldCoord(layout.panorama_center[1] - 4),
+                WorldCoord(layout.panorama_center[2]),
+            ),
+            AIR,
+            "the reveal tip should hang over a real drop"
+        );
     }
 
     #[test]
