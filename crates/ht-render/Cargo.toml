@@ -1,0 +1,16 @@
+[package]
+name = "ht-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ht-octree = { path = "../ht-octree" }
+wgpu = "29"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+rustc-hash = "2"
+
+[lints.rust]
+unused = { level = "deny", priority = -1 }
+dead_code = "warn"

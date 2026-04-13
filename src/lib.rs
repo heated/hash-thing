@@ -1,12 +1,23 @@
-pub mod octree;
+// Workspace crate re-exports — external API unchanged.
+pub use ht_octree as octree;
+pub use ht_octree::rng;
+pub use ht_render as render;
+
 pub mod perf;
-pub mod render;
-pub mod rng;
+pub mod player;
 pub mod sim;
 pub mod terrain;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use {
+    std::{cell::RefCell, rc::Rc, sync::Arc},
+    winit::{application::ApplicationHandler, event::WindowEvent},
+};
+
+#[cfg(target_arch = "wasm32")]
+const WASM_VOLUME_SIZE: u32 = 64;
 
 /// WASM entry point. Sets up logging, inserts a canvas into the DOM, and
 /// starts the winit event loop. The actual renderer init requires async
@@ -24,7 +35,10 @@ pub fn wasm_main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let mut app = WasmApp { window: None };
+    let mut app = WasmApp {
+        window: None,
+        gpu: Rc::new(RefCell::new(WasmGpuState::default())),
+    };
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -32,11 +46,19 @@ pub fn wasm_main() {
 
 #[cfg(target_arch = "wasm32")]
 struct WasmApp {
-    window: Option<std::sync::Arc<winit::window::Window>>,
+    window: Option<Arc<winit::window::Window>>,
+    gpu: Rc<RefCell<WasmGpuState>>,
 }
 
 #[cfg(target_arch = "wasm32")]
-impl winit::application::ApplicationHandler for WasmApp {
+#[derive(Default)]
+struct WasmGpuState {
+    init_started: bool,
+    renderer: Option<render::Renderer>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ApplicationHandler for WasmApp {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -48,7 +70,7 @@ impl winit::application::ApplicationHandler for WasmApp {
             .with_title("hash-thing | WebGPU")
             .with_inner_size(winit::dpi::LogicalSize::new(960, 540));
 
-        let window = std::sync::Arc::new(
+        let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create WASM window"),
@@ -75,10 +97,19 @@ impl winit::application::ApplicationHandler for WasmApp {
 
         self.window = Some(window);
 
-        // TODO(hash-thing-xb7.6): wire async renderer init via
-        // wasm_bindgen_futures::spawn_local. pollster::block_on panics
-        // on WASM — need to restructure the init path.
-        log::info!("WASM window created — renderer init requires async wiring (xb7.6)");
+        if self.gpu.borrow().init_started {
+            return;
+        }
+
+        self.gpu.borrow_mut().init_started = true;
+        let gpu = Rc::clone(&self.gpu);
+        let window = Arc::clone(self.window.as_ref().expect("window just created"));
+        wasm_bindgen_futures::spawn_local(async move {
+            let renderer = render::Renderer::new(window.clone(), WASM_VOLUME_SIZE).await;
+            gpu.borrow_mut().renderer = Some(renderer);
+            log::info!("WASM renderer initialized");
+            window.request_redraw();
+        });
     }
 
     fn window_event(
@@ -89,8 +120,21 @@ impl winit::application::ApplicationHandler for WasmApp {
     ) {
         match event {
             winit::event::WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = self.gpu.borrow_mut().renderer.as_mut() {
+                    renderer.resize(size.width, size.height);
+                }
+            }
             winit::event::WindowEvent::RedrawRequested => {
-                if let Some(window) = &self.window {
+                let outcome = {
+                    let mut gpu = self.gpu.borrow_mut();
+                    gpu.renderer.as_mut().map(render::Renderer::render)
+                };
+                if matches!(outcome, Some(render::FrameOutcome::Occluded)) {
+                    return;
+                }
+                if outcome.is_some() {
+                    let window = self.window.as_ref().expect("window exists during redraw");
                     window.request_redraw();
                 }
             }

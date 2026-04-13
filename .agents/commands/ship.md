@@ -66,8 +66,8 @@ Resolve in this order, first match wins:
 
 **`BASE_BRANCH`** — what to diff/push against
 1. `$SHIP_BASE_BRANCH` env var
-2. `git rev-parse --abbrev-ref origin/HEAD 2>/dev/null` (e.g. `origin/main` or `origin/master`)
-3. `origin/master` (legacy arch default)
+2. `git rev-parse --abbrev-ref origin/HEAD 2>/dev/null` (e.g. `origin/main`)
+3. `origin/main`
 
 **`REPO_KIND`** — determines whether arch-specific helpers run
 - `arch` if `$(git rev-parse --show-toplevel)` is inside `~/arch/` AND `~/arch/.runtime/start-dev.sh` exists
@@ -290,17 +290,17 @@ Run `/trident-code-review` — 9 agents (3 models × 3 lenses) + 3 synthesis. Fu
 
 **Context gathering:**
 ```bash
-git fetch origin master
-git log --oneline origin/master..HEAD
-git diff origin/master...HEAD --stat
-git diff origin/master...HEAD
+git fetch origin "${BASE_BRANCH#origin/}"
+git log --oneline "$BASE_BRANCH"..HEAD
+git diff "$BASE_BRANCH"...HEAD --stat
+git diff "$BASE_BRANCH"...HEAD
 ```
 
 **Build prompt files:**
 ```bash
 mkdir -p notes/.tmp/ship-{BRANCH_ID}
-cat ~/.claude/commands/code_review.md > notes/.tmp/ship-{BRANCH_ID}/review-standard.md
-cat ~/.claude/commands/code_review_critical.md > notes/.tmp/ship-{BRANCH_ID}/review-critical.md
+cat .agents/commands/code_review.md > notes/.tmp/ship-{BRANCH_ID}/review-standard.md
+cat .agents/commands/code_review_critical.md > notes/.tmp/ship-{BRANCH_ID}/review-critical.md
 echo -e "\n\n---\n\n# CONTEXT\n\nBranch: ...\nCommits: ...\nDiff: ..." >> notes/.tmp/ship-{BRANCH_ID}/review-standard.md
 echo -e "\n\n---\n\n# CONTEXT\n\nBranch: ...\nCommits: ...\nDiff: ..." >> notes/.tmp/ship-{BRANCH_ID}/review-critical.md
 cp notes/.tmp/ship-{BRANCH_ID}/review-standard.md notes/.tmp/ship-{BRANCH_ID}/review-standard-gemini.md  # Gemini needs workspace-local file
@@ -400,7 +400,7 @@ Do **NOT** create an MR. The human creates MRs.
 
 **Only runs when `REPO_KIND=arch`.** Generic repos: skip to Phase 11 (or run `cargo test` / language-native test runner manually if the plan called for it). The rest of this phase assumes arch-labs infrastructure.
 
-1. **Determine minimum service set** from `git diff --stat origin/master...HEAD`:
+1. **Determine minimum service set** from `git diff --stat "$BASE_BRANCH"...HEAD`:
 
    **UI mode** — pick the minimal set:
    | Changed paths | Flag |

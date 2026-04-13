@@ -3,7 +3,7 @@
 //! intermediates in the hash itself).
 //!
 //! v1 quality is intentionally simple. Swap to simplex/gradient noise behind
-//! the `RegionField::sample` boundary if visual review demands it. The
+//! the `WorldGen::sample` boundary if visual review demands it. The
 //! consumer (`HeightmapField`) only sees `fractal_2d(x, z, seed, octaves) ->
 //! f32` in `[0, 1]`.
 //!
@@ -31,6 +31,17 @@ fn hash_unit(ix: i64, iz: i64, seed: u64) -> f32 {
         ^ seed.wrapping_mul(0x165667B19E3779F9);
     let m = mix64(h);
     // Top 24 bits → unit float, mantissa-friendly.
+    (m >> 40) as f32 / ((1u32 << 24) as f32)
+}
+
+/// Hash an `(ix, iy, iz, seed)` 3D lattice point to a value in `[0, 1)`.
+#[inline]
+fn hash_unit_3d(ix: i64, iy: i64, iz: i64, seed: u64) -> f32 {
+    let h = (ix as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (iy as u64).wrapping_mul(0xC2B2AE3D27D4EB4F)
+        ^ (iz as u64).wrapping_mul(0x165667B19E3779F9)
+        ^ seed.wrapping_mul(0x517CC1B727220A95);
+    let m = mix64(h);
     (m >> 40) as f32 / ((1u32 << 24) as f32)
 }
 
@@ -66,6 +77,56 @@ fn value_2d(x: f32, z: f32, seed: u64) -> f32 {
     a * (1.0 - tz) + b * tz
 }
 
+/// 3D value noise. Trilinear interpolation between eight lattice corners
+/// with smoothstep on each axis. Output is in `[0, 1]`.
+fn value_3d(x: f32, y: f32, z: f32, seed: u64) -> f32 {
+    let xf = x.floor();
+    let yf = y.floor();
+    let zf = z.floor();
+    let ix = xf as i64;
+    let iy = yf as i64;
+    let iz = zf as i64;
+    let tx = smoothstep(x - xf);
+    let ty = smoothstep(y - yf);
+    let tz = smoothstep(z - zf);
+
+    // Eight corners of the unit cube.
+    let v000 = hash_unit_3d(ix, iy, iz, seed);
+    let v100 = hash_unit_3d(ix + 1, iy, iz, seed);
+    let v010 = hash_unit_3d(ix, iy + 1, iz, seed);
+    let v110 = hash_unit_3d(ix + 1, iy + 1, iz, seed);
+    let v001 = hash_unit_3d(ix, iy, iz + 1, seed);
+    let v101 = hash_unit_3d(ix + 1, iy, iz + 1, seed);
+    let v011 = hash_unit_3d(ix, iy + 1, iz + 1, seed);
+    let v111 = hash_unit_3d(ix + 1, iy + 1, iz + 1, seed);
+
+    // Trilinear interpolation: x → y → z.
+    let a00 = v000 * (1.0 - tx) + v100 * tx;
+    let a10 = v010 * (1.0 - tx) + v110 * tx;
+    let a01 = v001 * (1.0 - tx) + v101 * tx;
+    let a11 = v011 * (1.0 - tx) + v111 * tx;
+    let b0 = a00 * (1.0 - ty) + a10 * ty;
+    let b1 = a01 * (1.0 - ty) + a11 * ty;
+    b0 * (1.0 - tz) + b1 * tz
+}
+
+/// Octave-summed 3D value noise. Result is in `[0, 1]` by construction.
+/// Same amplitude-tracking approach as `fractal_2d`.
+pub fn fractal_3d(x: f32, y: f32, z: f32, seed: u64, octaves: u32) -> f32 {
+    debug_assert!(octaves >= 1, "fractal_3d needs at least one octave");
+    let mut sum = 0.0f32;
+    let mut total = 0.0f32;
+    let mut amp = 1.0f32;
+    let mut freq = 1.0f32;
+    for i in 0..octaves {
+        sum += amp * value_3d(x * freq, y * freq, z * freq, seed.wrapping_add(i as u64));
+        total += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    (sum / total).clamp(0.0, 1.0)
+}
+
 /// Octave-summed value noise. Result is in `[0, 1]` by construction (each
 /// octave is in `[0, 1]`, the weighted sum is divided by the total weight).
 ///
@@ -74,10 +135,10 @@ fn value_2d(x: f32, z: f32, seed: u64) -> f32 {
 /// round-to-nearest, and under adversarial input sequences could in principle
 /// round a few ulp higher. The explicit `.clamp(0.0, 1.0)` at the return
 /// makes the `[0, 1]` bound tight — which in turn makes the y-band proof in
-/// `HeightmapField::classify_box` bulletproof rather than "sound with
+/// `HeightmapField::classify` bulletproof rather than "sound with
 /// margin". The clamp cost is one min/max per call; at 64³ only a few
 /// thousand surface-band calls hit this path (sky and deep stone short-
-/// circuit via `classify_box` without sampling).
+/// circuit via `classify` without sampling).
 ///
 /// `octaves` must be `>= 1`.
 pub fn fractal_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
@@ -92,7 +153,7 @@ pub fn fractal_2d(x: f32, z: f32, seed: u64, octaves: u32) -> f32 {
         amp *= 0.5;
         freq *= 2.0;
     }
-    // Tight clamp — makes `classify_box`'s y-band proof bulletproof. See
+    // Tight clamp — makes `classify`'s y-band proof bulletproof. See
     // the doc comment above for the rounding story.
     (sum / total).clamp(0.0, 1.0)
 }
@@ -156,6 +217,12 @@ pub fn voronoi_2d(x: f32, z: f32, seed: u64) -> Voronoi2dSample {
         second_sq,
         edge_gap: second_sq.sqrt() - nearest_sq.sqrt(),
     }
+}
+
+/// Low-frequency biome noise. Single-octave value noise with a distinct seed
+/// offset so it's independent of the heightmap. Output in `[0, 1]`.
+pub fn biome_2d(x: f32, z: f32, seed: u64) -> f32 {
+    value_2d(x, z, seed.wrapping_add(0xA1B2C3D4E5F60718))
 }
 
 #[cfg(test)]
@@ -234,5 +301,33 @@ mod tests {
                 sample.second_sq
             );
         }
+    }
+
+    #[test]
+    fn fractal_3d_in_unit_interval() {
+        let mut s = 0xCAFEBABEu64;
+        for _ in 0..10_000 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = ((s >> 16) as i32 as f32) * 0.001;
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let y = ((s >> 16) as i32 as f32) * 0.001;
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let z = ((s >> 16) as i32 as f32) * 0.001;
+            let v = fractal_3d(x, y, z, s, 4);
+            assert!((0.0..=1.0).contains(&v), "v={v} x={x} y={y} z={z} seed={s}");
+        }
+    }
+
+    #[test]
+    fn fractal_3d_is_deterministic() {
+        let a = fractal_3d(1.5, 2.5, 3.5, 42, 4);
+        let b = fractal_3d(1.5, 2.5, 3.5, 42, 4);
+        assert_eq!(a.to_bits(), b.to_bits());
     }
 }

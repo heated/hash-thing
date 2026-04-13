@@ -1,13 +1,14 @@
 # World Generation Evolution
 
-`hash-thing-fha` is a future-facing exploration bead, but mainline does not
-currently expose the `WorldGen` trait named in that bead. The real seams on
-`origin/main` are smaller and more useful:
+`hash-thing-fha` is a future-facing exploration bead. The seam that matters on
+`origin/main` is not "some future generator system"; it is the concrete
+`WorldGen` contract that already feeds the recursive octree builder.
 
-- `RegionField::sample` and `RegionField::classify_box` decide whether a
-  region is uniform enough to short-circuit the recursive octree builder.
-- Flat-grid post-passes like `terrain::caves` and `terrain::dungeons` modify
-  bounded subvolumes after the initial field has been generated.
+- `WorldGen::sample` decides the exact material at a coordinate.
+- `WorldGen::classify` decides whether a whole region is uniform enough to
+  short-circuit recursion.
+- Bounded structure passes still make sense, but only if they can be expressed
+  as deterministic owned-region generation rather than mutable global state.
 - Determinism is the non-negotiable invariant: a generator must remain a pure
   function of coordinates, params, and seed.
 
@@ -24,15 +25,15 @@ Best fit for:
 
 Why this lane fits:
 
-- `classify_box` can still prove large uniform regions, so the recursive
-  builder keeps its asymptotic win.
+- `classify` can still prove large uniform regions, so the recursive builder
+  keeps its asymptotic win.
 - Sampling composes with the existing `gen_region` path.
 - These approaches scale naturally to infinite-space evaluation.
 
 What must stay true:
 
-- The field must supply conservative bounds for `classify_box`, or it becomes
-  a leaf-by-leaf generator and loses the whole octree advantage.
+- The field must supply conservative bounds for `classify`, or it becomes a
+  leaf-by-leaf generator and loses the whole octree advantage.
 - Any learned model must be version-locked and platform-stable; "same seed,
   different GPU" is unacceptable.
 
@@ -91,7 +92,7 @@ What must stay true:
 
 Small, landable experiments that would add real signal:
 
-1. Add a 3D Voronoi density field and measure whether `classify_box` can still
+1. Add a 3D Voronoi density field and measure whether `classify` can still
    prove large empty / solid bands.
 2. Prototype a tiny grammar side table keyed by region pair and benchmark the
    hash-table lookup cost during region generation.

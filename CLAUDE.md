@@ -8,7 +8,18 @@ Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` un
 
 ```
 gate-sensitivity: medium
+soft-max-command-seconds: 60
 ```
+
+Prefer commands that finish in under ~60s. Benchmarks, large builds, long test suites: run the smallest representative scale first. Only go bigger if explicitly asked or the small run was inconclusive. Background long runs rather than blocking.
+
+## GPU / visual validation
+
+Mac integrated GPU works — wgpu/Metal renders fine. Agents can launch the app, take screenshots, read perf logs. Only gate on human for interactive feel (WASD, mouse look). Don't self-block on "needs GPU."
+
+## Build profiles
+
+Default to dev. `--profile bench` for perf work. `--release` only for distributable artifacts.
 
 ## Agent surface — where project skills and commands live
 
@@ -21,7 +32,7 @@ This project is designed to work with **any of three CLI agents**: Claude Code (
 
 **Why this matters for cost**: edward's Claude Code $200/month plan is maxing out. Shifting review workload from all-Claude trident (9 Claude agents) to real-trident (3 Claude + 3 Codex + 3 Gemini) saves ~2/3 of Claude token spend. That only works if Codex and Gemini sessions can read the same project instructions and workflows — which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
 
-**When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). The `/ship` skill itself may still hardcode the user-global path — if so, file a bead or fix it inline. Until then, splicing the project-local file into the prompt is sufficient.
+**When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
 
 ## The crew
 
@@ -141,6 +152,8 @@ Commit at every natural boundary — plan file written, first test green, helper
 
 ## Landing to main — don't let feature branches accumulate
 
+**Never `cd` into the main repo checkout to commit.** Work in your worktree; land via `git push origin HEAD:main`.
+
 **Feature branches are not a staging area.** Per edward 2026-04-11: "are you just not merging to main? you should be." Any work that's tested and ready belongs on `origin/main`, not parked on a long-lived `worktree-*` or crew branch.
 
 **The default lifecycle for any seat:**
@@ -167,6 +180,14 @@ Commit at every natural boundary — plan file written, first test green, helper
 
 The prior divergence backlog (18 commits on `worktree-vast-leaping-allen`, 9 on `worktree-sleepy-wiggling-fountain`, both ahead of main) was a bug, not a feature. 52b-A is the cleanup for that specific instance.
 
+## Benchmarking convention
+
+Measure warm frames only (skip cold startup generations). Cold frame cost is one-time; interactive feel depends on steady-state.
+
+## Perf tracking
+
+On perf-relevant bead close, `bd comments add` with before/after latencies (world size, release). Latency is the priority metric — memory secondary. Key latencies: `render_gpu`, `upload_cpu`, `step`, terrain gen.
+
 ## Quick Reference
 
 ```bash
@@ -176,6 +197,20 @@ bd update <id> --status in_progress  # Claim work
 bd close <id>         # Complete work
 bd sync               # Sync with git
 ```
+
+## CI ownership — you break it, you fix it
+
+After every `git push origin HEAD:main`, check CI:
+
+```bash
+gh run list --branch main --limit 1 --json conclusion -q '.[0].conclusion'
+```
+
+- **If `failure`:** you own the fix. Read `gh run view <id> --log-failed`, diagnose, fix, push. Don't leave a red main for the next seat.
+- **If `in_progress`:** wait ~2min and re-check, or move on and let the next push-to-main seat catch it.
+- **If another seat's push broke CI** and they're offline: first-to-notice owns the fix. File a bead if the fix is non-trivial.
+
+CI failures on main are P1 — they block every other seat's validation step.
 
 ## Landing the Plane (Session Completion)
 
@@ -205,4 +240,3 @@ bd sync               # Sync with git
 - NEVER stop before landing — that leaves work stranded locally or on a feature branch.
 - NEVER say "ready to push when you are" — you land main yourself.
 - If landing main fails, resolve and retry until it succeeds. If you hit a genuine merge conflict you can't resolve, file a bead with the conflict surface and park at a design gate — don't just leave the branch dangling.
-

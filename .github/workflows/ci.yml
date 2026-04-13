@@ -23,6 +23,8 @@ env:
   # workflow-level RUSTFLAGS (which would poison the dep graph and the cache
   # fingerprint).
   CARGO_INCREMENTAL: "0"
+  # Override sccache wrapper from .cargo/config.toml — CI doesn't have it.
+  RUSTC_WRAPPER: ""
 
 jobs:
   actionlint:
