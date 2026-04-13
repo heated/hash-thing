@@ -77,9 +77,11 @@ pub struct DemoLayout {
     pub player_pos: [f64; 3],
     pub player_yaw: f64,
     pub player_pitch: f64,
+    pub walk_route: [[i64; 3]; 6],
     pub corridor_mid: [i64; 3],
     pub atrium_center: [i64; 3],
     pub reveal_center: [i64; 3],
+    pub panorama_center: [i64; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1189,6 +1191,40 @@ impl World {
         }
     }
 
+    fn fill_floor(&mut self, volume: Box3, state: CellState) {
+        self.fill_box(
+            Box3::new(
+                [volume.min[0], volume.min[1] - 1, volume.min[2]],
+                [volume.max[0], volume.min[1] - 1, volume.max[2]],
+            ),
+            state,
+        );
+    }
+
+    fn carve_rising_promenade(
+        &mut self,
+        x0: i64,
+        x1: i64,
+        z0: i64,
+        z1: i64,
+        floor_y0: i64,
+        floor_y1: i64,
+    ) {
+        let span = (x1 - x0).abs().max(1);
+        let step = if x1 >= x0 { 1 } else { -1 };
+        let mut x = x0;
+        loop {
+            let traveled = (x - x0).abs();
+            let floor_y = floor_y0 + (floor_y1 - floor_y0) * traveled / span;
+            self.fill_box(Box3::new([x, floor_y, z0], [x, floor_y + 3, z1]), AIR);
+            self.fill_box(Box3::new([x, floor_y - 1, z0], [x, floor_y - 1, z1]), STONE);
+            if x == x1 {
+                break;
+            }
+            x += step;
+        }
+    }
+
     fn progression_boxes(
         field: &LatticeField,
     ) -> (Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3, Box3) {
@@ -1322,6 +1358,35 @@ impl World {
         )
     }
 
+    fn lattice_progression_spectacle_anchors(
+        start_room: Box3,
+        atrium: Box3,
+        panorama: Box3,
+        reveal: [i64; 3],
+    ) -> [DemoSpectacleAnchor; 3] {
+        [
+            DemoSpectacleAnchor {
+                label: "intro",
+                center: [
+                    start_room.min[0] + 2,
+                    start_room.min[1],
+                    start_room.max[2] - 2,
+                ],
+                profile: DemoSpectacleProfile::Hearth,
+            },
+            DemoSpectacleAnchor {
+                label: "interior",
+                center: [atrium.center()[0], atrium.min[1], atrium.center()[2] + 3],
+                profile: DemoSpectacleProfile::Clash,
+            },
+            DemoSpectacleAnchor {
+                label: "panorama",
+                center: [panorama.center()[0], reveal[1], reveal[2] + 3],
+                profile: DemoSpectacleProfile::Cascade,
+            },
+        ]
+    }
+
     pub fn seed_lattice_progression_demo(&mut self) -> DemoLayout {
         self.seed_lattice_megastructure();
         let field = LatticeField::for_world(self.level, 42);
@@ -1347,14 +1412,49 @@ impl World {
             ),
             DIRT,
         );
-
         self.fill_box(corridor_shell, STONE);
         self.fill_box(corridor, AIR);
+        self.fill_floor(corridor, DIRT);
+        let entry_passage = Box3::new(
+            [start_room.max[0] - 1, start_room.min[1], corridor.min[2]],
+            [corridor.min[0], corridor.max[1], corridor.max[2]],
+        );
+        self.fill_box(entry_passage, AIR);
+        self.fill_floor(entry_passage, DIRT);
         self.fill_box(tease_a, AIR);
         self.fill_box(tease_b, AIR);
         self.fill_box(atrium, AIR);
+        self.fill_floor(atrium, STONE);
         self.fill_box(balcony, AIR);
         self.fill_box(panorama, AIR);
+        self.fill_floor(
+            Box3::new(
+                [panorama.min[0], balcony.min[1], balcony.min[2]],
+                [panorama.max[0], balcony.max[1], balcony.max[2]],
+            ),
+            STONE,
+        );
+        self.carve_rising_promenade(
+            atrium.center()[0],
+            balcony.center()[0],
+            balcony.min[2],
+            balcony.max[2],
+            atrium.min[1],
+            balcony.min[1],
+        );
+
+        let corridor_mid = [corridor.center()[0], corridor.min[1], corridor.center()[2]];
+        let corridor_turn = [corridor.max[0] - 2, corridor.min[1], corridor.center()[2]];
+        let atrium_entry = [corridor_turn[0], atrium.min[1], atrium.min[2] + 1];
+        let atrium_center = [atrium.center()[0], atrium.min[1], atrium.center()[2]];
+        let reveal_center = [balcony.center()[0], balcony.min[1], balcony.center()[2]];
+        let panorama_center = [panorama.center()[0], balcony.min[1], balcony.center()[2]];
+        self.stage_demo_spectacles(&Self::lattice_progression_spectacle_anchors(
+            start_room,
+            atrium,
+            panorama,
+            reveal_center,
+        ));
         self.seed_reveal_fireworks(balcony.center());
         self.seed_progression_break_trigger(tease_a);
 
@@ -1367,9 +1467,18 @@ impl World {
             player_pos,
             player_yaw: -std::f64::consts::FRAC_PI_2,
             player_pitch: 0.0,
-            corridor_mid: corridor.center(),
-            atrium_center: atrium.center(),
-            reveal_center: balcony.center(),
+            walk_route: [
+                corridor_mid,
+                corridor_turn,
+                atrium_entry,
+                atrium_center,
+                reveal_center,
+                panorama_center,
+            ],
+            corridor_mid,
+            atrium_center,
+            reveal_center,
+            panorama_center,
         }
     }
 
@@ -1682,6 +1791,7 @@ mod tests {
     use crate::terrain::materials::{
         MaterialRegistry, FIRE, FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
     };
+    use std::collections::{HashSet, VecDeque};
 
     /// Helper: build an empty 8^3 world (level=3).
     fn empty_world() -> World {
@@ -1692,6 +1802,92 @@ mod tests {
         let mut world = empty_world();
         world.materials = MaterialRegistry::gol_smoke_with_rule(rule);
         world
+    }
+
+    fn feet(point: [i64; 3]) -> [f64; 3] {
+        [
+            point[0] as f64 + 0.5,
+            point[1] as f64,
+            point[2] as f64 + 0.5,
+        ]
+    }
+
+    fn player_has_support(world: &World, pos: &[f64; 3]) -> bool {
+        let hw = player::PLAYER_HALF_W;
+        let x_min = (pos[0] - hw).floor() as i64;
+        let x_max = (pos[0] + hw).floor() as i64;
+        let z_min = (pos[2] - hw).floor() as i64;
+        let z_max = (pos[2] + hw).floor() as i64;
+        let support_y = pos[1].floor() as i64 - 1;
+        for x in x_min..=x_max {
+            for z in z_min..=z_max {
+                if world.get(WorldCoord(x), WorldCoord(support_y), WorldCoord(z)) != AIR {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn walk_cell(pos: [f64; 3]) -> [i64; 3] {
+        [
+            pos[0].floor() as i64,
+            pos[1].floor() as i64,
+            pos[2].floor() as i64,
+        ]
+    }
+
+    fn is_walkable_player_cell(world: &World, cell: [i64; 3]) -> bool {
+        let pos = feet(cell);
+        !player::player_collides(world, &pos) && player_has_support(world, &pos)
+    }
+
+    fn assert_walk_segment_is_traversable(world: &World, from: [i64; 3], to: [i64; 3]) {
+        assert!(
+            is_walkable_player_cell(world, from),
+            "segment start must be walkable: {from:?}"
+        );
+        assert!(
+            is_walkable_player_cell(world, to),
+            "segment end must be walkable: {to:?}"
+        );
+
+        let x_min = from[0].min(to[0]) - 6;
+        let x_max = from[0].max(to[0]) + 6;
+        let y_min = from[1].min(to[1]) - 2;
+        let y_max = from[1].max(to[1]) + 2;
+        let z_min = from[2].min(to[2]) - 6;
+        let z_max = from[2].max(to[2]) + 6;
+
+        let mut frontier = VecDeque::from([from]);
+        let mut visited = HashSet::from([from]);
+
+        while let Some(cell) = frontier.pop_front() {
+            if cell == to {
+                return;
+            }
+
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                for dy in -1..=1 {
+                    let next = [cell[0] + dx, cell[1] + dy, cell[2] + dz];
+                    if next[0] < x_min
+                        || next[0] > x_max
+                        || next[1] < y_min
+                        || next[1] > y_max
+                        || next[2] < z_min
+                        || next[2] > z_max
+                        || visited.contains(&next)
+                        || !is_walkable_player_cell(world, next)
+                    {
+                        continue;
+                    }
+                    visited.insert(next);
+                    frontier.push_back(next);
+                }
+            }
+        }
+
+        panic!("no walkable route between {from:?} and {to:?}");
     }
 
     fn wc(coord: u64) -> WorldCoord {
@@ -2076,11 +2272,7 @@ mod tests {
             layout.player_pos
         );
 
-        for checkpoint in [
-            layout.corridor_mid,
-            layout.atrium_center,
-            layout.reveal_center,
-        ] {
+        for checkpoint in layout.walk_route {
             assert_eq!(
                 w.get(
                     WorldCoord(checkpoint[0]),
@@ -2089,6 +2281,37 @@ mod tests {
                 ),
                 AIR,
                 "checkpoint must be air: {checkpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lattice_progression_demo_route_is_player_traversable_end_to_end() {
+        let mut w = World::new(6);
+        let layout = w.seed_lattice_progression_demo();
+        let route = std::iter::once(walk_cell(layout.player_pos))
+            .chain(layout.walk_route)
+            .collect::<Vec<_>>();
+
+        for segment in route.windows(2) {
+            assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+        }
+    }
+
+    #[test]
+    fn lattice_progression_demo_places_spectacle_along_the_walk_route() {
+        let mut w = World::new(6);
+        let layout = w.seed_lattice_progression_demo();
+
+        for checkpoint in [
+            layout.corridor_mid,
+            layout.atrium_center,
+            layout.reveal_center,
+            layout.panorama_center,
+        ] {
+            assert!(
+                w.active_material_stats_near(checkpoint, 6).active_cells() > 0,
+                "checkpoint should read local spectacle while walking: {checkpoint:?}"
             );
         }
     }
