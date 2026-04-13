@@ -56,8 +56,8 @@ impl Default for TerrainParams {
 
 impl TerrainParams {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.wavelength <= 0.0 {
-            return Err("wavelength must be > 0");
+        if !self.wavelength.is_finite() || self.wavelength <= 0.0 {
+            return Err("wavelength must be finite and > 0");
         }
         if self.octaves == 0 {
             return Err("octaves must be >= 1");
@@ -79,5 +79,60 @@ impl TerrainParams {
             wavelength: self.wavelength,
             octaves: self.octaves,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_non_finite_wavelength() {
+        for wavelength in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let params = TerrainParams {
+                wavelength,
+                ..Default::default()
+            };
+            assert_eq!(
+                params.validate(),
+                Err("wavelength must be finite and > 0"),
+                "unexpected validation result for wavelength={wavelength:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_wavelength() {
+        for wavelength in [0.0, -1.0] {
+            let params = TerrainParams {
+                wavelength,
+                ..Default::default()
+            };
+            assert_eq!(
+                params.validate(),
+                Err("wavelength must be finite and > 0"),
+                "unexpected validation result for wavelength={wavelength:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn to_heightmap_copies_shape_fields() {
+        let params = TerrainParams {
+            seed: 42,
+            base_y: 12.5,
+            amplitude: 3.25,
+            wavelength: 19.0,
+            octaves: 6,
+            caves: Some(CaveParams::default()),
+            dungeons: Some(DungeonParams::default()),
+        };
+
+        let field = params.to_heightmap();
+        assert_eq!(field.seed, 42);
+        assert_eq!(field.base_y, 12.5);
+        assert_eq!(field.amplitude, 3.25);
+        assert_eq!(field.wavelength, 19.0);
+        assert_eq!(field.octaves, 6);
     }
 }
