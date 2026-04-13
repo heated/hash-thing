@@ -296,6 +296,14 @@ pub struct Renderer {
     pub hud_material_color: [f32; 4],
     pub hud_visible: bool,
 
+    // Hotbar overlay (hash-thing-e7k.6)
+    hotbar_pipeline: wgpu::RenderPipeline,
+    hotbar_bind_group: wgpu::BindGroup,
+    hotbar_uniform_buffer: wgpu::Buffer,
+    /// Which material slot is selected (0-based: 0 = material 1/stone).
+    pub hotbar_selected_slot: u32,
+    pub hotbar_visible: bool,
+
     // Legend overlay (hash-thing-m1f.7.2)
     legend_pipeline: wgpu::RenderPipeline,
     legend_bind_group_layout: wgpu::BindGroupLayout,
@@ -770,6 +778,97 @@ impl Renderer {
             cache: None,
         });
 
+        // Hotbar overlay (hash-thing-e7k.6)
+        let hotbar_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hotbar shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("hotbar.wgsl").into()),
+        });
+
+        let hotbar_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hotbar_uniforms"),
+            size: 16, // 1 × vec4<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let hotbar_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hotbar_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let hotbar_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hotbar_bg"),
+            layout: &hotbar_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: hotbar_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: palette_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let hotbar_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("hotbar_pl"),
+                bind_group_layouts: &[Some(&hotbar_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let hotbar_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hotbar_rp"),
+            layout: Some(&hotbar_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hotbar_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hotbar_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Legend overlay (hash-thing-m1f.7.2)
         let legend_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("legend shader"),
@@ -894,6 +993,11 @@ impl Renderer {
             hud_uniform_buffer,
             hud_material_color: [1.0, 1.0, 1.0, 1.0],
             hud_visible: false,
+            hotbar_pipeline,
+            hotbar_bind_group,
+            hotbar_uniform_buffer,
+            hotbar_selected_slot: 0,
+            hotbar_visible: false,
             legend_pipeline,
             legend_bind_group_layout,
             legend_bind_group: None,
@@ -1140,6 +1244,22 @@ impl Renderer {
                     ],
                 }));
         }
+
+        // Rebuild hotbar bind group (it references palette via binding 1).
+        self.hotbar_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hotbar_bg"),
+            layout: &self.hotbar_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.hotbar_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.palette_buffer.as_entire_binding(),
+                },
+            ],
+        });
 
         // Rebuild SVDAG compute bind group if it exists (it also references palette).
         if let Some(svdag_buf) = &self.svdag_buffer {
@@ -1487,6 +1607,21 @@ impl Renderer {
                 render_pass.set_pipeline(&self.hud_pipeline);
                 render_pass.set_bind_group(0, &self.hud_bind_group, &[]);
                 render_pass.draw(0..30, 0..1);
+            }
+
+            // Hotbar overlay (e7k.6).
+            if self.hotbar_visible {
+                let aspect = self.config.width as f32 / self.config.height as f32;
+                let hotbar_data: [f32; 4] =
+                    [aspect, self.hotbar_selected_slot as f32, 0.0, 0.0];
+                self.queue.write_buffer(
+                    &self.hotbar_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&hotbar_data),
+                );
+                render_pass.set_pipeline(&self.hotbar_pipeline);
+                render_pass.set_bind_group(0, &self.hotbar_bind_group, &[]);
+                render_pass.draw(0..108, 0..1); // 18 slots × 6 verts
             }
 
             // Legend overlay — keybindings text (m1f.7.2).
