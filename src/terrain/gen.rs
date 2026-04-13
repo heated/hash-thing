@@ -45,12 +45,8 @@ pub struct GenStats {
     pub precompute_us: u64,
     /// Wall-clock time for the heightmap gen_region pass (set by seed_terrain).
     pub gen_region_us: u64,
-    /// Wall-clock time for the cave CA post-pass, 0 if caves disabled.
-    pub cave_us: u64,
-    /// Node count in the store after gen_region (before caves).
+    /// Node count in the store after gen_region.
     pub nodes_after_gen: usize,
-    /// Node count after cave carving (or same as nodes_after_gen if no caves).
-    pub nodes_after_caves: usize,
 }
 
 impl GenStats {

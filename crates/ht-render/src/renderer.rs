@@ -46,6 +46,8 @@ struct Uniforms {
     camera_right: [f32; 4],
     /// x: volume_size, y: aspect_ratio, z: fov_tan, w: screen_height
     params: [f32; 4],
+    /// x: debug_mode (0=normal, 1=step-count heatmap), y/z/w: reserved
+    debug: [f32; 4],
 }
 
 /// Outcome of a single `Renderer::render` call. Replaces an earlier `bool`
@@ -144,9 +146,24 @@ impl GpuTiming {
     /// `request_readback` fires after submit. This lets the caller
     /// back out if it ends up not submitting (e.g. surface occluded
     /// between the check and the draw).
+    #[allow(dead_code)] // kept for future render-pass timing
     fn pass_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         if self.state.load(Ordering::Acquire) == GT_IDLE {
             Some(wgpu::RenderPassTimestampWrites {
+                query_set: &self.query_set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Compute-pass variant of `pass_writes()`. Used for timing the
+    /// SVDAG raycast compute dispatch (hash-thing-5bb.6.1).
+    fn compute_pass_writes(&self) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        if self.state.load(Ordering::Acquire) == GT_IDLE {
+            Some(wgpu::ComputePassTimestampWrites {
                 query_set: &self.query_set,
                 beginning_of_pass_write_index: Some(0),
                 end_of_pass_write_index: Some(1),
@@ -244,16 +261,25 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
 
-    // SVDAG path
-    svdag_pipeline: wgpu::RenderPipeline,
-    svdag_bind_group_layout: wgpu::BindGroupLayout,
-    svdag_bind_group: Option<wgpu::BindGroup>,
+    // SVDAG compute raycast path (hash-thing-5bb.6.1)
+    svdag_compute_pipeline: wgpu::ComputePipeline,
+    svdag_compute_bind_group_layout: wgpu::BindGroupLayout,
+    svdag_compute_bind_group: Option<wgpu::BindGroup>,
     svdag_buffer: Option<wgpu::Buffer>,
     svdag_buffer_cap: u64, // current allocation in bytes
     /// Tracks how many u32s of `Svdag::nodes` have been uploaded to the GPU.
     /// Only the tail past this watermark (plus the root-offset header at slot 0)
     /// needs re-uploading each frame. Reset to 0 on buffer reallocation.
     svdag_uploaded_len: usize,
+    /// Storage texture for compute raycast output (hash-thing-5bb.6.1).
+    raycast_texture: wgpu::Texture,
+    raycast_texture_view: wgpu::TextureView,
+
+    // Blit pass: samples raycast_texture, writes to swapchain (5bb.6.1)
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
+    blit_bind_group: wgpu::BindGroup,
+    blit_sampler: wgpu::Sampler,
 
     // Particle billboard pass (hash-thing-5bb.9)
     particle_pipeline: wgpu::RenderPipeline,
@@ -292,6 +318,13 @@ pub struct Renderer {
     pub camera_pitch: f32,
     pub camera_dist: f32,
     pub camera_target: [f32; 3],
+
+    /// Debug render mode. 0 = normal, 1 = step-count heatmap.
+    pub debug_mode: u32,
+    /// LOD bias multiplier. 1.0 = default, higher = more aggressive LOD.
+    pub lod_bias: f32,
+    /// Render resolution scale. 0.5 = half-res (4x fewer pixels), 1.0 = full.
+    pub render_scale: f32,
 
     // GPU-timestamp instrumentation. `None` on adapters without
     // `Features::TIMESTAMP_QUERY` — all timing falls back to the CPU
@@ -370,11 +403,14 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        // Default render_scale = 0.5: render at half physical resolution
+        // for 4x fewer pixels. Trade sharpness for framerate.
+        let render_scale: f32 = 0.5;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: ((size.width as f32 * render_scale) as u32).max(1),
+            height: ((size.height as f32 * render_scale) as u32).max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -388,6 +424,7 @@ impl Renderer {
             camera_up: [0.0, 1.0, 0.0, 0.0],
             camera_right: [1.0, 0.0, 0.0, 0.0],
             params: [volume_size as f32, 1.0, 1.0, 0.0],
+            debug: [0.0; 4],
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -421,15 +458,21 @@ impl Renderer {
             count: None,
         };
 
-        // === SVDAG pipeline ===
+        // === SVDAG compute raycast pipeline (hash-thing-5bb.6.1) ===
 
-        let svdag_bind_group_layout =
+        // Storage texture for compute output. Dimensions match the scaled
+        // surface config (already half-res from render_scale).
+        let raycast_tex_format = wgpu::TextureFormat::Rgba16Float;
+        let (raycast_texture, raycast_texture_view) =
+            Self::create_raycast_texture_static(&device, config.width, config.height, raycast_tex_format);
+
+        let svdag_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("svdag_bgl"),
+                label: Some("svdag_compute_bgl"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -439,7 +482,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
@@ -447,33 +490,121 @@ impl Renderer {
                         },
                         count: None,
                     },
-                    palette_bgl_entry,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: raycast_tex_format,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
         let svdag_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("svdag raycast shader"),
+            label: Some("svdag raycast compute shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("svdag_raycast.wgsl").into()),
         });
 
-        let svdag_pipeline_layout =
+        let svdag_compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("svdag_pl"),
-                bind_group_layouts: &[Some(&svdag_bind_group_layout)],
+                label: Some("svdag_compute_pl"),
+                bind_group_layouts: &[Some(&svdag_compute_bind_group_layout)],
                 immediate_size: 0,
             });
 
-        let svdag_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("svdag_rp"),
-            layout: Some(&svdag_pipeline_layout),
-            vertex: wgpu::VertexState {
+        let svdag_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("svdag_compute"),
+                layout: Some(&svdag_compute_pipeline_layout),
                 module: &svdag_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // === Blit pipeline: samples compute output → swapchain (5bb.6.1) ===
+
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let blit_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("blit_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit_bg"),
+            layout: &blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&raycast_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit_sampler),
+                },
+            ],
+        });
+
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("svdag_blit.wgsl").into()),
+        });
+
+        let blit_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("blit_pl"),
+                bind_group_layouts: &[Some(&blit_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit_rp"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
                 entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &svdag_shader,
+                module: &blit_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -736,12 +867,18 @@ impl Renderer {
             device,
             queue,
             config,
-            svdag_pipeline,
-            svdag_bind_group_layout,
-            svdag_bind_group: None,
+            svdag_compute_pipeline,
+            svdag_compute_bind_group_layout,
+            svdag_compute_bind_group: None,
             svdag_buffer: None,
             svdag_buffer_cap: 0,
             svdag_uploaded_len: 0,
+            raycast_texture,
+            raycast_texture_view,
+            blit_pipeline,
+            blit_bind_group_layout,
+            blit_bind_group,
+            blit_sampler,
             particle_pipeline,
             particle_bind_group_layout,
             particle_bind_group: None,
@@ -770,8 +907,94 @@ impl Renderer {
             camera_pitch: 0.4,
             camera_dist: 2.0,
             camera_target: [0.5, 0.5, 0.5],
+            debug_mode: 0,
+            lod_bias: 1.0,
+            render_scale: 0.5,
             gpu_timing,
             last_gpu_frame_time: None,
+        }
+    }
+
+    /// Create the storage texture used as compute raycast output (5bb.6.1).
+    /// Separate static method so it can be called from both `new()` and `resize()`.
+    fn create_raycast_texture_static(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("raycast_output"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        (texture, view)
+    }
+
+    /// Recreate the raycast storage texture and dependent bind groups after resize.
+    fn recreate_raycast_texture(&mut self) {
+        let (tex, view) = Self::create_raycast_texture_static(
+            &self.device,
+            self.config.width,
+            self.config.height,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        self.raycast_texture = tex;
+        self.raycast_texture_view = view;
+
+        // Rebuild blit bind group (references the texture view).
+        self.blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit_bg"),
+            layout: &self.blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.raycast_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                },
+            ],
+        });
+
+        // Rebuild compute bind group if SVDAG buffer exists (references texture view).
+        if let Some(svdag_buf) = &self.svdag_buffer {
+            self.svdag_compute_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("svdag_compute_bg"),
+                    layout: &self.svdag_compute_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: svdag_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.palette_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.raycast_texture_view,
+                            ),
+                        },
+                    ],
+                }));
         }
     }
 
@@ -825,8 +1048,8 @@ impl Renderer {
                 mapped_at_creation: false,
             });
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("svdag_bg"),
-                layout: &self.svdag_bind_group_layout,
+                label: Some("svdag_compute_bg"),
+                layout: &self.svdag_compute_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -840,12 +1063,18 @@ impl Renderer {
                         binding: 2,
                         resource: self.palette_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.raycast_texture_view,
+                        ),
+                    },
                 ],
             });
             self.svdag_buffer = Some(buffer);
             self.svdag_buffer_cap = cap;
             self.svdag_uploaded_len = 0;
-            self.svdag_bind_group = Some(bg);
+            self.svdag_compute_bind_group = Some(bg);
             require_full = true;
         }
 
@@ -909,12 +1138,12 @@ impl Renderer {
                 }));
         }
 
-        // Rebuild SVDAG bind group if it exists (it also references palette).
+        // Rebuild SVDAG compute bind group if it exists (it also references palette).
         if let Some(svdag_buf) = &self.svdag_buffer {
-            self.svdag_bind_group =
+            self.svdag_compute_bind_group =
                 Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("svdag_bg"),
-                    layout: &self.svdag_bind_group_layout,
+                    label: Some("svdag_compute_bg"),
+                    layout: &self.svdag_compute_bind_group_layout,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -927,6 +1156,12 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: self.palette_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.raycast_texture_view,
+                            ),
                         },
                     ],
                 }));
@@ -1055,9 +1290,12 @@ impl Renderer {
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
+            let s = self.render_scale;
+            self.config.width = ((width as f32 * s) as u32).max(1);
+            self.config.height = ((height as f32 * s) as u32).max(1);
             self.surface.configure(&self.device, &self.config);
+            // Recreate storage texture to match new dimensions (5bb.6.1).
+            self.recreate_raycast_texture();
         }
     }
 
@@ -1144,6 +1382,12 @@ impl Renderer {
                 fov_tan,
                 self.config.height as f32,
             ],
+            debug: [
+                self.debug_mode as f32,
+                self.lod_bias,
+                self.config.width as f32,
+                self.config.height as f32,
+            ],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -1154,25 +1398,40 @@ impl Renderer {
                 label: Some("render encoder"),
             });
 
-        // hash-thing-6x3: if the previous frame's readback is done,
-        // instrument this frame. Otherwise skip — one readback in flight
-        // is enough for the mean/p95 the perf line reports.
+        // hash-thing-5bb.6.1: compute dispatch for SVDAG raycast, then
+        // blit + overlays in a single render pass.
         //
-        // The `Option<RenderPassTimestampWrites>` holds a `&QuerySet`
-        // borrowed from `self.gpu_timing`, so it must live across the
-        // render-pass scope but can be dropped before the post-pass
-        // `encode_resolve` call.
-        let timestamp_writes = self.gpu_timing.as_ref().and_then(|gt| gt.pass_writes());
-        let captured_this_frame = timestamp_writes.is_some();
+        // GPU timing wraps the compute dispatch (the expensive part).
+        let compute_timestamp_writes = self
+            .gpu_timing
+            .as_ref()
+            .and_then(|gt| gt.compute_pass_writes());
+        let captured_this_frame = compute_timestamp_writes.is_some();
 
+        // --- Compute pass: SVDAG raycast → storage texture ---
+        if let Some(bg) = &self.svdag_compute_bind_group {
+            let mut compute_pass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("svdag raycast compute"),
+                    timestamp_writes: compute_timestamp_writes,
+                });
+            compute_pass.set_pipeline(&self.svdag_compute_pipeline);
+            compute_pass.set_bind_group(0, bg, &[]);
+            let wg_x = self.config.width.div_ceil(8);
+            let wg_y = self.config.height.div_ceil(8);
+            compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // --- Render pass: blit + particles + HUD + legend (single pass) ---
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render pass"),
+                label: Some("blit + overlay pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
+                        // Clear to sky color as fallback if compute hasn't run yet.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.53,
                             g: 0.72,
@@ -1183,24 +1442,23 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes,
+                timestamp_writes: None, // timing is on the compute pass
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
 
-            if let Some(bg) = &self.svdag_bind_group {
-                render_pass.set_pipeline(&self.svdag_pipeline);
-                render_pass.set_bind_group(0, bg, &[]);
-                render_pass.draw(0..6, 0..1);
+            // Blit compute output to swapchain (fullscreen triangle).
+            if self.svdag_compute_bind_group.is_some() {
+                render_pass.set_pipeline(&self.blit_pipeline);
+                render_pass.set_bind_group(0, &self.blit_bind_group, &[]);
+                render_pass.draw(0..3, 0..1); // fullscreen triangle = 3 verts
             }
-            // If SVDAG hasn't been uploaded yet, the clear color is shown.
 
             // Particle overlay — drawn after voxels with alpha blending.
             if self.particle_count > 0 {
                 if let Some(bg) = &self.particle_bind_group {
                     render_pass.set_pipeline(&self.particle_pipeline);
                     render_pass.set_bind_group(0, bg, &[]);
-                    // 6 vertices per quad, one instance per particle.
                     render_pass.draw(0..6, 0..self.particle_count);
                 }
             }
@@ -1225,21 +1483,18 @@ impl Renderer {
                 );
                 render_pass.set_pipeline(&self.hud_pipeline);
                 render_pass.set_bind_group(0, &self.hud_bind_group, &[]);
-                // 5 quads × 6 vertices = 30 vertices.
                 render_pass.draw(0..30, 0..1);
             }
 
             // Legend overlay — keybindings text (m1f.7.2).
             if self.legend_visible {
                 if let Some(bg) = &self.legend_bind_group {
-                    // Position the legend in the bottom-left corner.
                     let aspect = self.config.width as f32 / self.config.height as f32;
                     let tex_aspect = if self.legend_tex_h > 0 {
                         self.legend_tex_w as f32 / self.legend_tex_h as f32
                     } else {
                         1.0
                     };
-                    // Legend height = 40% of screen height, width from aspect.
                     let quad_h = 0.8;
                     let quad_w = quad_h * tex_aspect / aspect;
                     let margin = 0.02;

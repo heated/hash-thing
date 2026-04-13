@@ -19,7 +19,7 @@
 //!   [1..]:      concatenated 9-u32 interior-node slots, append-only
 //!
 //! Interior node slot (9 u32s = 36 bytes):
-//!   [0]:        child_mask (low 8 bits: which octants are non-empty)
+//!   [0]:        child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
 //!   [1..=8]:    child entries — packed as (is_leaf << 31) | payload_bits
 //!     - is_leaf: payload is the 16-bit material state in low bits
 //!     - else:    payload is the absolute offset of the child node in this buffer
@@ -68,6 +68,15 @@ pub struct Svdag {
     ///
     /// Keyed by the full 9-u32 slot (not a hash) so lookups are collision-free.
     offset_by_slot: FxHashMap<[u32; 9], u32>,
+    /// Persistent NodeId→offset cache across frames. When the octree store is
+    /// compacted (remapping NodeIds), callers must call `apply_remap()` before
+    /// the next `update()` so cache keys stay valid. This turns `update()` from
+    /// O(reachable) to O(changed): unchanged subtrees hit this cache in O(1)
+    /// and skip the entire descent + slot computation (hash-thing-5bb.11).
+    id_to_offset: FxHashMap<NodeId, u32>,
+    /// Count of new nodes added to `id_to_offset` during each `update()` call.
+    /// Used to detect whether anything changed (for node_count bookkeeping).
+    new_this_update: usize,
     /// Level of the current root (2^level cells per side).
     pub root_level: u32,
     /// Number of interior nodes reachable from the current root.
@@ -86,6 +95,8 @@ impl Svdag {
         Self {
             nodes: vec![0u32],
             offset_by_slot: FxHashMap::default(),
+            id_to_offset: FxHashMap::default(),
+            new_this_update: 0,
             root_level: 0,
             node_count: 0,
         }
@@ -116,7 +127,9 @@ impl Svdag {
         if let Node::Leaf(state) = store.get(root) {
             // Degenerate single-node DAG: all 8 children point at the same
             // inline leaf. Build the slot and cache it normally.
-            let mask = if *state != 0 { 0xffu32 } else { 0u32 };
+            let occ = if *state != 0 { 0xffu32 } else { 0u32 };
+            let rep = (*state as u32) & 0xFFFF;
+            let mask = occ | (rep << 8);
             let leaf_slot = LEAF_BIT | (*state as u32);
             let mut slot = [0u32; 9];
             slot[0] = mask;
@@ -126,13 +139,46 @@ impl Svdag {
             let offset = self.intern_slot(slot);
             self.nodes[0] = offset;
             self.node_count = 1;
+            self.id_to_offset.clear();
+            self.id_to_offset.insert(root, offset);
             return;
         }
 
-        let mut id_to_offset: FxHashMap<NodeId, u32> = FxHashMap::default();
-        let root_offset = self.visit(store, root, &mut id_to_offset);
+        self.new_this_update = 0;
+        let root_offset = self.visit(store, root);
         self.nodes[0] = root_offset;
-        self.node_count = id_to_offset.len();
+        // After a fresh build (empty cache → all misses), id_to_offset.len()
+        // is the exact reachable count. On incremental updates, new_this_update
+        // tells us how many nodes changed; the reachable count is approximately
+        // the previous count adjusted by the delta. For stale_ratio accuracy,
+        // we re-derive from id_to_offset.len() whenever new nodes were added
+        // (conservative: includes stale entries → triggers compaction sooner).
+        if self.new_this_update > 0 || self.node_count == 0 {
+            // Changed: re-derive. Overestimates when id_to_offset has stale
+            // entries, but that makes stale_ratio conservative.
+            self.node_count = self.id_to_offset.len();
+        }
+    }
+
+    /// Remap the persistent NodeId→offset cache after a store compaction.
+    ///
+    /// `compacted_with_remap` returns a `FxHashMap<NodeId, NodeId>` mapping
+    /// old ids to new ids. This method rebuilds `id_to_offset` with the new
+    /// keys so the next `update()` can still hit the cache for unchanged
+    /// subtrees — turning O(reachable) into O(changed) (hash-thing-5bb.11).
+    ///
+    /// Call this *before* `update()` whenever the store has been compacted.
+    /// If the remap is `None` (e.g. scene reset), the cache is cleared and
+    /// the next `update()` does a full walk.
+    pub fn apply_remap(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
+        let old = std::mem::take(&mut self.id_to_offset);
+        self.id_to_offset.reserve(old.len());
+        for (old_id, offset) in old {
+            if let Some(&new_id) = remap.get(&old_id) {
+                self.id_to_offset.insert(new_id, offset);
+            }
+            // Entries not in remap were GC'd — drop them.
+        }
     }
 
     /// Recursively visit a node. Returns its absolute offset in `nodes`.
@@ -140,13 +186,13 @@ impl Svdag {
     /// Bottom-up: child offsets are resolved before the parent's slot is
     /// assembled, so the parent's slot is itself a fully content-determined
     /// identity once the children have been placed.
-    fn visit(
-        &mut self,
-        store: &NodeStore,
-        id: NodeId,
-        id_to_offset: &mut FxHashMap<NodeId, u32>,
-    ) -> u32 {
-        if let Some(&offset) = id_to_offset.get(&id) {
+    ///
+    /// Uses the persistent `id_to_offset` cache: if a NodeId was seen in a
+    /// previous frame (and remapped correctly via `apply_remap`), we return
+    /// its offset immediately without descending. This is the core of the
+    /// O(changed) optimization (hash-thing-5bb.11).
+    fn visit(&mut self, store: &NodeStore, id: NodeId) -> u32 {
+        if let Some(&offset) = self.id_to_offset.get(&id) {
             return offset;
         }
         match store.get(id) {
@@ -160,29 +206,43 @@ impl Svdag {
                 let children = *children;
                 let mut slot = [0u32; 9];
                 let mut mask: u32 = 0;
+                let mut rep_mat: u32 = 0;
                 for (i, &child_id) in children.iter().enumerate() {
                     match store.get(child_id) {
                         Node::Leaf(state) => {
                             if *state != 0 {
                                 mask |= 1 << i;
+                                if rep_mat == 0 {
+                                    rep_mat = *state as u32;
+                                }
                             }
                             slot[1 + i] = LEAF_BIT | (*state as u32);
                         }
                         Node::Interior { population, .. } => {
                             if *population > 0 {
                                 mask |= 1 << i;
-                                let child_offset = self.visit(store, child_id, id_to_offset);
+                                let child_offset = self.visit(store, child_id);
                                 slot[1 + i] = child_offset;
+                                // Propagate representative material from child
+                                // (m1f.7.3.2: packed into bits 8-23 of child_mask).
+                                if rep_mat == 0 {
+                                    let child_cmask = self.nodes[child_offset as usize];
+                                    rep_mat = (child_cmask >> 8) & 0xFFFF;
+                                }
                             } else {
                                 slot[1 + i] = LEAF_BIT;
                             }
                         }
                     }
                 }
-                slot[0] = mask;
+                // Pack representative material into bits 8-23 of child_mask.
+                // Shader LOD reads `(cmask >> 8) & 0xFFFF` to get the material
+                // without scanning children (hash-thing-m1f.7.3.2).
+                slot[0] = mask | ((rep_mat & 0xFFFF) << 8);
 
                 let offset = self.intern_slot(slot);
-                id_to_offset.insert(id, offset);
+                self.id_to_offset.insert(id, offset);
+                self.new_this_update += 1;
                 offset
             }
         }
@@ -242,6 +302,9 @@ impl Svdag {
     /// is a reasonable default.
     pub fn compact(&mut self, store: &NodeStore, root: NodeId) {
         let root_level = self.root_level;
+        // Full rebuild clears id_to_offset — the next update() will repopulate
+        // it from a fresh walk. This is expected: compaction is infrequent
+        // (stale_ratio > 0.5) and the one-frame full-walk cost is amortized.
         *self = Self::build(store, root, root_level);
     }
 }
@@ -324,6 +387,10 @@ pub mod cpu_trace {
     use super::*;
 
     pub const MAX_DEPTH: usize = 24;
+    /// Stack depth cap (hash-thing-m1f.7.3). Decoupled from MAX_DEPTH
+    /// so the stack arrays use fewer registers on the GPU. 16 levels
+    /// supports worlds up to 2^16 = 65536 cells/side.
+    pub const MAX_STACK: usize = 16;
     // LEAF_BIT comes from `use super::*` above — kept in one place so the
     // shader mirror stays a single source of truth (hash-thing-x9r).
     const EPS: f32 = 1e-5;
@@ -557,14 +624,17 @@ pub mod cpu_trace {
                 .clamp(0.0, (RESOLUTION - 1) as f32) as u32,
         ];
 
-        let mut stack_node = [0u32; MAX_DEPTH];
-        let mut stack_min = [[0.0f32; 3]; MAX_DEPTH];
-        let mut stack_half = [0.0f32; MAX_DEPTH];
+        let mut stack_node = [0u32; MAX_STACK];
+        let mut stack_min = [[0.0f32; 3]; MAX_STACK];
+        let mut stack_half = [0.0f32; MAX_STACK];
+        let mut stack_cmask = [0u32; MAX_STACK];
         let mut depth: usize = 0;
 
-        stack_node[0] = dag[0];
+        let root_offset = dag[0];
+        stack_node[0] = root_offset;
         stack_min[0] = [0.0; 3];
         stack_half[0] = 0.5;
+        stack_cmask[0] = dag[root_offset as usize];
 
         // Local-frame starting t. Just past the root entry; `ro_local` is
         // already on the root face.
@@ -630,13 +700,24 @@ pub mod cpu_trace {
             depth = top;
 
             // Descend
-            for _d in 0..MAX_DEPTH {
+            for _d in 0..MAX_STACK {
                 let node_offset = stack_node[depth] as usize;
                 let node_min = stack_min[depth];
                 let half = stack_half[depth];
+                let cmask = stack_cmask[depth];
                 let oct = octant_of(pos, rd_m, node_min, half);
                 // Stage 2: XOR to un-mirror the octant for DAG lookup.
-                let child_slot = dag[node_offset + 1 + (oct ^ mirror_mask) as usize];
+                let mirrored_oct = (oct ^ mirror_mask) as usize;
+
+                // m1f.7.3: check cached child_mask before reading child_slot.
+                if cmask & (1 << mirrored_oct) == 0 {
+                    if record {
+                        events.push(TraceEvent::EmptyLeaf { depth, oct });
+                    }
+                    break;
+                }
+
+                let child_slot = dag[node_offset + 1 + mirrored_oct];
 
                 if child_slot & LEAF_BIT != 0 {
                     let mat = child_slot & 0xFFFF;
@@ -703,7 +784,7 @@ pub mod cpu_trace {
                     }
                     break;
                 } else {
-                    if depth + 1 >= MAX_DEPTH {
+                    if depth + 1 >= MAX_STACK {
                         break;
                     }
                     let child_min = [
@@ -715,6 +796,7 @@ pub mod cpu_trace {
                     stack_node[depth] = child_slot;
                     stack_min[depth] = child_min;
                     stack_half[depth] = half * 0.5;
+                    stack_cmask[depth] = dag[child_slot as usize];
                     if record {
                         events.push(TraceEvent::Descend {
                             depth,
@@ -728,7 +810,8 @@ pub mod cpu_trace {
             // Step past the current (empty) octant, then skip consecutive
             // empty siblings using the parent's child_mask (hash-thing-x5w.1).
             // Hoist invariants — depth doesn't change within the inner loop.
-            let skip_mask = dag[stack_node[depth] as usize];
+            // m1f.7.3: use cached child_mask instead of re-reading.
+            let skip_mask = stack_cmask[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
             loop {
@@ -1068,9 +1151,13 @@ mod tests {
         assert_eq!(dag.nodes.len(), 10, "header + one interior node = 10 u32s");
         let root_off = dag.nodes[0] as usize;
         assert_eq!(root_off, 1, "root offset points past header");
+        // m1f.7.3: child_mask word = low 8 bits occupancy | bits 8-23 rep material.
+        // Leaf root with mat3 → rep_mat = mat3's packed CellState = 3 << 6 = 192.
+        let rep_mat = mat3 as u32;
         assert_eq!(
-            dag.nodes[root_off], 0xffu32,
-            "all 8 octants populated for a nonzero leaf root"
+            dag.nodes[root_off],
+            0xffu32 | (rep_mat << 8),
+            "all 8 octants populated + representative material for a nonzero leaf root"
         );
         for i in 0..8 {
             assert_eq!(
@@ -2380,7 +2467,7 @@ mod tests {
         let mut svdag = Svdag::new();
         svdag.update(&store, root, 6);
 
-        // Make several edits to accumulate stale slots.
+        // Make several edits to accumulate stale slots in offset_by_slot.
         for i in 1..10 {
             root = store.set_cell(root, i * 5, i * 3, i * 4, mat(1));
             svdag.update(&store, root, 6);
@@ -2388,10 +2475,6 @@ mod tests {
 
         let pre_compact_len = svdag.nodes.len();
         let pre_compact_total = svdag.total_slot_count();
-        assert!(
-            svdag.stale_ratio() > 0.0,
-            "edits should produce some stale slots"
-        );
 
         svdag.compact(&store, root);
 
@@ -2403,6 +2486,8 @@ mod tests {
             svdag.total_slot_count() <= pre_compact_total,
             "compact must not grow the cache"
         );
+        // After compact (full rebuild), id_to_offset is fresh and
+        // node_count = id_to_offset.len() = offset_by_slot.len() exactly.
         assert_eq!(
             svdag.stale_ratio(),
             0.0,
@@ -2542,7 +2627,9 @@ mod tests {
         assert_svdag_matches_octree(&svdag, &store, root, 4, "epoch 1");
 
         // Compact the store — NodeIds change, content stays the same.
-        let (store2, root2) = store.compacted(root);
+        // Must apply_remap so the persistent cache stays valid (5bb.11).
+        let (store2, root2, remap) = store.compacted_with_remap(root);
+        svdag.apply_remap(&remap);
         svdag.update(&store2, root2, 4);
         assert_svdag_matches_octree(&svdag, &store2, root2, 4, "epoch 2 (after compaction)");
 

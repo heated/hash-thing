@@ -1,13 +1,15 @@
-// SVDAG raycasting shader.
+// SVDAG raycasting compute shader (hash-thing-5bb.6.1).
 //
-// Iterative descent through a sparse voxel DAG, rendered via a fullscreen pass.
+// Iterative descent through a sparse voxel DAG, dispatched as a compute shader
+// writing to a storage texture. Converted from fragment shader to enable future
+// workgroup-cooperative optimizations (tile early-exit, shared DAG cache).
 //
 // Buffer layout (dag_nodes: array<u32>):
 //   [0]:     root_offset — absolute index of the current root node's slot
 //   [1..]:   append-only stream of 9-u32 interior-node slots
 //
 // Interior node slot (9 u32s):
-//   [0]: child_mask (low 8 bits = octant occupancy)
+//   [0]: child_mask (low 8 bits = octant occupancy, bits 8-23 = representative material)
 //   [1..=8]: child entries, where each entry is:
 //     - bit 31 set → leaf, low 16 bits = material state
 //     - bit 31 clear → interior, value = absolute offset of child node in buffer
@@ -28,32 +30,14 @@ struct Uniforms {
     camera_right: vec4<f32>,
     // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: screen_height
     params: vec4<f32>,
+    // x: debug_mode (0=normal, 1=step-count heatmap), y: lod_bias, z: output_width, w: output_height
+    debug: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> dag_nodes: array<u32>;
 @group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
-    let positions = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
-    );
-    var out: VertexOutput;
-    out.position = vec4<f32>(positions[id], 0.0, 1.0);
-    out.uv = positions[id];
-    return out;
-}
+@group(0) @binding(3) var output: texture_storage_2d<rgba16float, write>;
 
 // Material color palette. Input is the packed 16-bit cell word:
 //   bits 15..6 material_id (10 bits)
@@ -120,6 +104,13 @@ const LEAF_BIT: u32 = 0x80000000u;
 // for any practical hashlife scale. Pinned by cpu_trace::integer_dda_exact.
 const RESOLUTION: u32 = 1u << MAX_DEPTH;
 const INV_RES: f32 = 1.0 / f32(RESOLUTION);
+// hash-thing-m1f.7.3: stack depth is decoupled from DDA resolution.
+// MAX_DEPTH (24) drives RESOLUTION for DDA precision; MAX_STACK (16) caps
+// the actual descent depth and stack array size. Reducing from 24 to 16
+// saves ~160 bytes of per-thread register space (3 arrays × 8 fewer slots),
+// improving GPU occupancy and latency hiding. Supports worlds up to
+// 2^16 = 65536 cells/side — well beyond any practical Hashlife scale.
+const MAX_STACK: u32 = 16u;
 
 // hash-thing-2w5: step budget scales with root_level so deep scenes don't
 // silently black out on long sparse traversals. Must stay in lockstep with
@@ -129,6 +120,21 @@ const INV_RES: f32 = 1.0 / f32(RESOLUTION);
 //                            diagonal worst case)
 const MIN_STEP_BUDGET: u32 = 1024u;
 const STEP_BUDGET_FUDGE: u32 = 8u;
+
+struct RayResult {
+    color: vec4<f32>,
+    steps: u32,
+    max_steps: u32,
+};
+
+// Step-count heatmap: green (0%) → yellow (50%) → red (100%).
+fn heatmap_color(ratio: f32) -> vec3<f32> {
+    let t = clamp(ratio, 0.0, 1.0);
+    if t < 0.5 {
+        return mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), t * 2.0);
+    }
+    return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+}
 
 // Iterative DAG descent.
 //
@@ -141,7 +147,7 @@ const STEP_BUDGET_FUDGE: u32 = 8u;
 // but correct enough to prove the pipeline works and reserve the complexity
 // budget. Optimizations (ray-octant mirroring, ancestor memoization, bitmask
 // coalescing) can be layered on later.
-fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     // Laine-Karras Stage 2: mirror ray so rd is componentwise non-negative.
     // Octant child indices are XORed with mirror_mask during DAG lookup.
     let neg = rd < vec3<f32>(0.0);
@@ -169,7 +175,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // Intersect mirrored ray with root cube [0,1]^3
     let root_hit = intersect_aabb(ro_m, inv_rd, vec3<f32>(0.0), vec3<f32>(1.0));
     if root_hit.x > root_hit.y || root_hit.y < 0.0 {
-        return vec4<f32>(0.0);
+        return RayResult(vec4<f32>(0.0), 0u, 1u);
     }
 
     // hash-thing-27m v2: clamp ro to the root-cube entry (Laine-Karras).
@@ -192,16 +198,21 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         u32(clamp(floor(ro_local.z * f32(RESOLUTION)), 0.0, f32(RESOLUTION - 1u))),
     );
 
-    // Stack of (node_offset, node_min, half_size)
-    var stack_node: array<u32, MAX_DEPTH>;
-    var stack_min: array<vec3<f32>, MAX_DEPTH>;
-    var stack_half: array<f32, MAX_DEPTH>;
+    // Stack of (node_offset, node_min, half_size, child_mask).
+    // child_mask is cached on push to avoid re-reading the buffer during
+    // the skip loop and descent empty-checks (hash-thing-m1f.7.3).
+    var stack_node: array<u32, MAX_STACK>;
+    var stack_min: array<vec3<f32>, MAX_STACK>;
+    var stack_half: array<f32, MAX_STACK>;
+    var stack_cmask: array<u32, MAX_STACK>;
     var depth: u32 = 0u;
 
     // Slot 0 of the buffer holds the current root offset; real slots start at 1.
-    stack_node[0] = dag_nodes[0];
+    let root_offset = dag_nodes[0];
+    stack_node[0] = root_offset;
     stack_min[0] = vec3<f32>(0.0);
     stack_half[0] = 0.5;
+    stack_cmask[0] = dag_nodes[root_offset];
 
     // Local-frame starting t — just past the root entry. `ro_local`
     // already sits on the root face, so we nudge forward by EPS.
@@ -214,7 +225,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // explicit background return, NOT a `break` — the post-loop
         // fall-through is now the hash-thing-2w5 magenta exhaustion sentinel,
         // so any `break` here would render every clean root-exit as magenta.
-        if t > t_exit { return vec4<f32>(0.0); }
+        if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
         // Integer DDA (hash-thing-pck): pos from integer cell center.
         var pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
 
@@ -231,7 +242,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             }
             if top == 0u {
                 // Exited root
-                return vec4<f32>(0.0);
+                return RayResult(vec4<f32>(0.0), step, max_steps);
             }
             top = top - 1u;
         }
@@ -239,35 +250,21 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
 
         // Descend until leaf or empty
         var descended = false;
-        for (var d = 0u; d < MAX_DEPTH; d = d + 1u) {
+        for (var d = 0u; d < MAX_STACK; d = d + 1u) {
             let node_offset = stack_node[depth];
             let node_min = stack_min[depth];
             let half = stack_half[depth];
+            let cmask = stack_cmask[depth];
 
-            // LOD cutoff (x5w): if this voxel is sub-pixel, scan children
-            // for the first non-empty leaf and treat the whole octant as
-            // a solid hit at that color. Dramatically cuts step count for
-            // distant or complex geometry.
+            // LOD cutoff (x5w): if this voxel is sub-pixel, use the
+            // representative material packed in bits 8-23 of child_mask
+            // (m1f.7.3.2). No child scan needed — 0 buffer reads.
+            // LOD bias (m1f.7.3.3): multiply threshold by debug.y (default 1.0)
+            // to allow runtime LOD tuning. Higher = more aggressive = faster.
+            let lod_bias = max(u.debug.y, 1.0);
             let t_dist = max(t + entry, 1e-4);
-            if pixel_world > 0.0 && half < pixel_world * t_dist {
-                // Find any non-empty child in this node.
-                var lod_mat: u32 = 0u;
-                for (var c = 0u; c < 8u; c = c + 1u) {
-                    let cs = dag_nodes[node_offset + 1u + c];
-                    if (cs & LEAF_BIT) != 0u {
-                        let m = cs & 0xFFFFu;
-                        if m > 0u { lod_mat = m; break; }
-                    } else if cs != 0u {
-                        // Interior child — pick its first leaf recursively
-                        // would be expensive; just use the first child of
-                        // the interior node as an approximation.
-                        let inner_first = dag_nodes[cs + 1u];
-                        if (inner_first & LEAF_BIT) != 0u {
-                            let m = inner_first & 0xFFFFu;
-                            if m > 0u { lod_mat = m; break; }
-                        }
-                    }
-                }
+            if pixel_world > 0.0 && half < pixel_world * t_dist * lod_bias {
+                let lod_mat = (cmask >> 8u) & 0xFFFFu;
                 if lod_mat > 0u {
                     // Shade as a flat-color hit at node center.
                     let base = material_color(lod_mat);
@@ -288,7 +285,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     }
                     let diffuse = max(dot(normal, light_dir), 0.0);
                     let lit = base * (0.3 + diffuse * 0.7);
-                    return vec4<f32>(lit, 1.0);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // All children empty — step past this node
                 break;
@@ -296,7 +293,15 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
 
             let oct = octant_of(pos, rd_m, node_min, half);
             // Stage 2: XOR to un-mirror the octant for DAG lookup.
-            let child_slot = dag_nodes[node_offset + 1u + (oct ^ mirror_mask)];
+            let mirrored_oct = oct ^ mirror_mask;
+
+            // m1f.7.3: check cached child_mask before reading child_slot.
+            // If the octant is empty, skip the buffer read entirely.
+            if (cmask & (1u << mirrored_oct)) == 0u {
+                break; // empty child — go to DDA
+            }
+
+            let child_slot = dag_nodes[node_offset + 1u + mirrored_oct];
 
             if (child_slot & LEAF_BIT) != 0u {
                 let mat = child_slot & 0xFFFFu;
@@ -363,13 +368,13 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                     let diffuse = max(dot(normal, light_dir), 0.0);
                     let ambient = 0.3;
                     let lit = base * (ambient + diffuse * 0.7);
-                    return vec4<f32>(lit, 1.0);
+                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // Empty leaf — break to step ray
                 break;
             } else {
                 // Interior node — descend
-                if depth + 1u >= MAX_DEPTH { break; }
+                if depth + 1u >= MAX_STACK { break; }
                 let child_min = vec3<f32>(
                     node_min.x + f32(oct & 1u) * half,
                     node_min.y + f32((oct >> 1u) & 1u) * half,
@@ -379,6 +384,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
                 stack_node[depth] = child_slot;
                 stack_min[depth] = child_min;
                 stack_half[depth] = half * 0.5;
+                stack_cmask[depth] = dag_nodes[child_slot];
                 descended = true;
             }
         }
@@ -389,7 +395,8 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         // iteration (pop + descend + DDA). With it, the ray jumps across all
         // empty children of a node in one pass — major win for sparse scenes.
         // Hoist invariants — depth doesn't change within the inner loop.
-        let skip_mask = dag_nodes[stack_node[depth]];
+        // m1f.7.3: use cached child_mask instead of re-reading from buffer.
+        let skip_mask = stack_cmask[depth];
         let node_min_s = stack_min[depth];
         let half_s = stack_half[depth];
         loop {
@@ -417,7 +424,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             let octant_base = u32(cmin_exit * f32(RESOLUTION));
             let boundary_cell = octant_base + step_cells;
             if boundary_cell >= RESOLUTION {
-                return vec4<f32>(0.0); // exited volume
+                return RayResult(vec4<f32>(0.0), step, max_steps); // exited volume
             }
             if exit_axis == 0u { int_pos.x = boundary_cell; }
             else if exit_axis == 1u { int_pos.y = boundary_cell; }
@@ -441,7 +448,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
             // still inside the same parent. If so, skip it without going
             // through the outer loop's pop+descend overhead.
             if step >= max_steps { break; }
-            if t > t_exit { return vec4<f32>(0.0); }
+            if t > t_exit { return RayResult(vec4<f32>(0.0), step, max_steps); }
             pos = (vec3<f32>(int_pos) + 0.5) * INV_RES;
             let h2_s = half_s * 2.0;
             if !(all(pos >= node_min_s) && all(pos < node_min_s + h2_s)) {
@@ -463,30 +470,65 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     // is impossible to miss on screen. The CPU replica sets
     // `TraceResult.exhausted = true` for the same condition so tests can
     // assert on it directly.
-    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    return RayResult(vec4<f32>(1.0, 0.0, 1.0, 1.0), step, max_steps);
 }
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let width = u32(u.debug.z);
+    let height = u32(u.debug.w);
+
+    // OOB guard: edge workgroups may dispatch threads beyond the output
+    // texture dimensions when width/height aren't multiples of 8.
+    if gid.x >= width || gid.y >= height {
+        return;
+    }
+
+    // Compute UV in [-1, 1] range matching the old vertex shader output.
+    let uv = vec2<f32>(
+        (f32(gid.x) + 0.5) / f32(width) * 2.0 - 1.0,
+        // Flip Y: gid.y=0 is top of screen, but UV.y=1 should be top
+        1.0 - (f32(gid.y) + 0.5) / f32(height) * 2.0,
+    );
+
     let aspect = u.params.y;
     let fov_tan = u.params.z;
 
     let rd = normalize(
         u.camera_dir.xyz +
-        u.camera_right.xyz * in.uv.x * aspect * fov_tan +
-        u.camera_up.xyz * in.uv.y * fov_tan
+        u.camera_right.xyz * uv.x * aspect * fov_tan +
+        u.camera_up.xyz * uv.y * fov_tan
     );
     let ro = u.camera_pos.xyz;
 
-    let hit = raycast(ro, rd);
-    if hit.a > 0.0 {
-        return hit;
+    let result = raycast(ro, rd);
+    let debug_mode = u32(u.debug.x);
+
+    var final_color: vec4<f32>;
+
+    // Debug mode 1: step-count heatmap. Shows traversal cost per pixel.
+    if debug_mode == 1u {
+        let ratio = f32(result.steps) / f32(result.max_steps);
+        let hm = heatmap_color(ratio);
+        // Dim background rays (no hit) to distinguish sky from geometry.
+        if result.color.a == 0.0 {
+            final_color = vec4<f32>(hm * 0.3, 1.0);
+        } else {
+            final_color = vec4<f32>(hm, 1.0);
+        }
+    } else if result.color.a > 0.0 {
+        final_color = result.color;
+    } else {
+        // Sky gradient: lighter blue at top, desaturated at horizon.
+        let sky_t = uv.y * 0.5 + 0.5;
+        let sky_top = vec3<f32>(0.35, 0.55, 0.90);
+        let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
+        let bg = mix(sky_bot, sky_top, sky_t);
+        final_color = vec4<f32>(bg, 1.0);
     }
 
-    // Sky gradient: lighter blue at top, desaturated at horizon.
-    let t = in.uv.y * 0.5 + 0.5;
-    let sky_top = vec3<f32>(0.35, 0.55, 0.90);
-    let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
-    let bg = mix(sky_bot, sky_top, t);
-    return vec4<f32>(bg, 1.0);
+    // Store linear color — the blit shader writes to an sRGB swapchain surface,
+    // so hardware sRGB encoding happens at the final render pass output.
+    // No manual conversion needed here; rgba16float stores linear values losslessly.
+    textureStore(output, vec2<i32>(gid.xy), final_color);
 }

@@ -136,5 +136,13 @@ mod wgsl_drift_guard {
              STEP_BUDGET_FUDGE drifted from the CPU oracle in \
              svdag.rs::cpu_trace. Update whichever side is wrong."
         );
+
+        let expected_stack = format!("const MAX_STACK: u32 = {}u;", cpu_trace::MAX_STACK);
+        assert!(
+            SVDAG_RAYCAST_WGSL.contains(&expected_stack),
+            "svdag_raycast.wgsl must contain `{expected_stack}` — \
+             MAX_STACK drifted from the CPU oracle in \
+             svdag.rs::cpu_trace. Update whichever side is wrong."
+        );
     }
 }
