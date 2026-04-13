@@ -92,7 +92,7 @@ impl TerrainParams {
 }
 
 #[cfg(test)]
-mod tests {
+mod validation_tests {
     use super::*;
 
     #[test]
@@ -161,7 +161,7 @@ mod tests {
             amplitude: 3.25,
             wavelength: 19.0,
             octaves: 6,
-            sea_level: Some(8.0),
+            sea_level: Some(9.0),
         };
 
         let field = params.to_heightmap();
@@ -170,6 +170,6 @@ mod tests {
         assert_eq!(field.amplitude, 3.25);
         assert_eq!(field.wavelength, 19.0);
         assert_eq!(field.octaves, 6);
-        assert_eq!(field.sea_level, Some(8.0));
+        assert_eq!(field.sea_level, Some(9.0));
     }
 }
