@@ -598,6 +598,11 @@ impl World {
         // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
         self.step_blocks(&mut next, side);
 
+        // Phase 3: gravity gap-fill — prevents Margolus rarefaction.
+        // Fills air gaps within gravity-bearing bodies by cascading cells
+        // down, but only at positions with gravity cells on both sides.
+        gravity_gap_fill(&mut next, side, &self.materials);
+
         self.commit_step(&next, side);
     }
 
@@ -931,6 +936,40 @@ impl World {
         self.terrain_params = Some(*params);
         self.block_rule_present = None;
         stats
+    }
+}
+
+/// Gravity gap-fill: cascading bottom-to-top sweep that fills air gaps
+/// WITHIN gravity-bearing bodies, preventing Margolus rarefaction.
+///
+/// Only swaps cell[y] (air) with cell[y+1] (gravity-bearing) when cell[y-1]
+/// is also gravity-bearing — i.e., only fills internal gaps, never extends
+/// the falling front. This prevents isolated cells from cascading to the
+/// bottom while still compacting bodies after block-rule gravity creates gaps.
+///
+/// Mass-conserving: only swaps, never creates or destroys cells.
+pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &MaterialRegistry) {
+    for z in 0..side {
+        for x in 0..side {
+            for y in 1..side.saturating_sub(1) {
+                let idx_below = x + (y - 1) * side + z * side * side;
+                let idx_cur = x + y * side + z * side * side;
+                let idx_above = x + (y + 1) * side + z * side * side;
+                let below = Cell::from_raw(grid[idx_below]);
+                let cur = Cell::from_raw(grid[idx_cur]);
+                let above = Cell::from_raw(grid[idx_above]);
+                // Only fill gap if: current is air, above is gravity-bearing,
+                // AND below is gravity-bearing (this is an internal gap).
+                if cur.is_empty()
+                    && !above.is_empty()
+                    && materials.block_rule_id_for_cell(above).is_some()
+                    && !below.is_empty()
+                    && materials.block_rule_id_for_cell(below).is_some()
+                {
+                    grid.swap(idx_cur, idx_above);
+                }
+            }
+        }
     }
 }
 
@@ -2454,5 +2493,79 @@ mod tests {
         assert!(world.is_realized(WorldCoord(-3), WorldCoord(-3), WorldCoord(-3)));
         assert!(world.is_realized(wc(0), wc(0), wc(0)));
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
+    }
+
+    /// Reproduction test for hash-thing-u4w: checkerboard density bug.
+    /// A solid block of water should not develop every-other-column air gaps.
+    #[test]
+    fn water_block_no_checkerboard_gaps() {
+        let mut world = World::new(5); // 32³
+        // Place a 6×6×6 water block in the center, well away from boundaries.
+        for z in 10..16 {
+            for y in 16..22 {
+                for x in 10..16 {
+                    world.set(wc(x), wc(y), wc(z), WATER);
+                }
+            }
+        }
+        let pop_before = world.population();
+
+        // Step 6 times — enough for the falling front to develop.
+        for step in 0..6 {
+            world.step();
+            let pop_after = world.population();
+            assert_eq!(
+                pop_before, pop_after,
+                "population changed at step {} ({} → {})",
+                step, pop_before, pop_after
+            );
+        }
+
+        // Check: for each y-level that contains water, count water cells.
+        // If there's a checkerboard, some y-levels will have ~50% of expected.
+        let side = world.side() as u64;
+        let grid = world.flatten();
+        let mut water_by_y = vec![0u64; side as usize];
+        for y in 0..side {
+            for z in 0..side {
+                for x in 0..side {
+                    let idx = x as usize + y as usize * side as usize + z as usize * side as usize * side as usize;
+                    if Cell::from_raw(grid[idx]).material() == WATER_MATERIAL_ID {
+                        water_by_y[y as usize] += 1;
+                    }
+                }
+            }
+        }
+
+        // Print water distribution for diagnosis
+        eprintln!("Water cells per y-level:");
+        for (y, &count) in water_by_y.iter().enumerate() {
+            if count > 0 {
+                eprintln!("  y={y}: {count} water cells");
+            }
+        }
+
+        // Water should occupy CONTIGUOUS y-levels (no alternating gaps).
+        // Count how many y-levels have water and check for gaps.
+        let water_levels: Vec<usize> = water_by_y
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(y, _)| y)
+            .collect();
+        assert!(
+            !water_levels.is_empty(),
+            "water should still exist after stepping"
+        );
+        // Check for gaps: consecutive water levels should differ by 1.
+        for pair in water_levels.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                1,
+                "gap between y={} and y={} — checkerboard rarefaction bug",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }
