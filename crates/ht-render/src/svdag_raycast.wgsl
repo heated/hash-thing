@@ -59,6 +59,165 @@ fn material_color(packed: u32) -> vec3<f32> {
     return vec3<f32>(0.6, 0.7, 0.8); // fallback for out-of-range mat_id
 }
 
+// ---------------------------------------------------------------------------
+// Procedural surface detail (hash-thing-e7k.2)
+//
+// Per-material shading variation using world-space position as noise seed.
+// No textures or CPU-side changes — pure shader-side procedural detail.
+// ---------------------------------------------------------------------------
+
+// Hash-based pseudo-random: fast, deterministic, no texture fetch.
+fn hash3(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Value noise: smooth random field from world-space position.
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f); // smoothstep
+
+    let n000 = hash3(i);
+    let n100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
+    let n010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0));
+    let n110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
+    let n001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0));
+    let n101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
+    let n011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
+
+    let nx00 = mix(n000, n100, u.x);
+    let nx10 = mix(n010, n110, u.x);
+    let nx01 = mix(n001, n101, u.x);
+    let nx11 = mix(n011, n111, u.x);
+    let nxy0 = mix(nx00, nx10, u.y);
+    let nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+
+// Per-material surface properties returned by material_shade.
+struct SurfaceProps {
+    color: vec3<f32>,      // modulated base color with procedural detail
+    roughness: f32,        // 0 = mirror, 1 = fully diffuse
+    emissive: vec3<f32>,   // additive glow (fire, lava)
+};
+
+// Shade a material with procedural detail based on world-space position.
+// `world_pos` is in [0,1]^3 voxel space scaled to root_side cells.
+// `time` is elapsed seconds from u.camera_pos.w.
+fn material_shade(packed: u32, world_pos: vec3<f32>, normal: vec3<f32>, time: f32) -> SurfaceProps {
+    let mat_id = packed >> 6u;
+    var base = material_color(packed);
+    var props: SurfaceProps;
+    props.roughness = 0.85;
+    props.emissive = vec3<f32>(0.0);
+
+    // Scale world_pos to voxel-cell coordinates for noise sampling.
+    let root_side = u.params.x;
+    let vox = world_pos * root_side;
+
+    // Material-specific procedural detail. IDs match MaterialRegistry:
+    // 0=air, 1=stone, 2=dirt, 3=grass, 4=fire, 5=water, 6=sand, 7=lava
+    switch mat_id {
+        case 1u: {
+            // Stone: layered noise for mineral veins + subtle color variation.
+            let coarse = value_noise(vox * 0.3);
+            let fine = value_noise(vox * 1.7);
+            let vein = smoothstep(0.42, 0.48, value_noise(vox * vec3<f32>(0.5, 0.2, 0.5)));
+            base = base * (0.85 + 0.3 * coarse) * (0.92 + 0.16 * fine);
+            // Dark veins
+            base = mix(base, base * 0.55, vein * 0.6);
+            props.roughness = 0.95;
+        }
+        case 2u: {
+            // Dirt: chunky low-frequency variation, warm-cool shift.
+            let n = value_noise(vox * 0.5);
+            let detail = value_noise(vox * 2.0);
+            base = base * (0.8 + 0.4 * n);
+            // Warm/cool variation: shift hue slightly
+            base.r += 0.04 * detail;
+            base.b -= 0.03 * detail;
+            props.roughness = 1.0;
+        }
+        case 3u: {
+            // Grass: fine detail, yellow-green variation.
+            let n = value_noise(vox * 1.5);
+            let fine = value_noise(vox * 4.0);
+            base = base * (0.85 + 0.3 * n);
+            // Shift toward yellow or deeper green per-voxel
+            base.r += 0.06 * fine;
+            base.g += 0.04 * (fine - 0.5);
+            // Top-face brightness boost (grass is brighter on top)
+            let top_factor = max(normal.y, 0.0);
+            base *= (0.9 + 0.15 * top_factor);
+            props.roughness = 0.9;
+        }
+        case 4u: {
+            // Fire: animated emissive flicker.
+            let flicker = value_noise(vox * 2.0 + vec3<f32>(0.0, time * 4.0, 0.0));
+            let pulse = 0.6 + 0.4 * flicker;
+            base *= pulse;
+            // Orange-to-yellow core
+            let core = value_noise(vox * 3.0 + vec3<f32>(time * 2.0, time * 5.0, 0.0));
+            props.emissive = base * (1.5 + core * 1.5);
+            props.roughness = 0.5;
+        }
+        case 5u: {
+            // Water: subtle depth-based tint, slight shimmer.
+            let shimmer = value_noise(vox * 2.0 + vec3<f32>(time * 0.3, 0.0, time * 0.2));
+            base *= (0.9 + 0.15 * shimmer);
+            // Slight specular sheen
+            props.roughness = 0.3;
+        }
+        case 6u: {
+            // Sand: fine speckle, warm granular texture.
+            let grain = value_noise(vox * 5.0);
+            let coarse = value_noise(vox * 0.8);
+            base *= (0.88 + 0.24 * grain);
+            base.r += 0.03 * coarse;
+            props.roughness = 0.92;
+        }
+        case 7u: {
+            // Lava: pulsing emissive glow, molten surface.
+            let flow = value_noise(vox * 0.8 + vec3<f32>(time * 0.1, time * -0.15, time * 0.05));
+            let hot = value_noise(vox * 2.0 + vec3<f32>(time * 0.3, time * 0.5, 0.0));
+            base *= (0.7 + 0.5 * flow);
+            // Hot spots glow brighter orange-yellow
+            let glow_color = mix(vec3<f32>(1.0, 0.3, 0.0), vec3<f32>(1.0, 0.8, 0.2), hot);
+            props.emissive = glow_color * (0.8 + 0.6 * flow);
+            props.roughness = 0.6;
+        }
+        default: {
+            // Unknown materials: subtle noise to avoid dead-flat appearance.
+            let n = value_noise(vox * 1.0);
+            base *= (0.9 + 0.2 * n);
+        }
+    }
+
+    props.color = base;
+    return props;
+}
+
+// Enhanced lighting with per-material roughness and specular.
+fn shade_surface(props: SurfaceProps, normal: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
+    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+    let diffuse = max(dot(normal, light_dir), 0.0);
+
+    // Blinn-Phong specular, modulated by roughness.
+    let half_vec = normalize(light_dir - rd);
+    let spec_power = mix(64.0, 2.0, props.roughness);
+    let spec = pow(max(dot(normal, half_vec), 0.0), spec_power);
+    let spec_strength = (1.0 - props.roughness) * 0.4;
+
+    // Ambient with subtle directional fill from below
+    let ambient = 0.25 + 0.05 * max(-normal.y, 0.0);
+
+    let lit = props.color * (ambient + diffuse * 0.7) + vec3<f32>(spec * spec_strength);
+    return lit + props.emissive;
+}
+
 fn intersect_aabb(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec2<f32> {
     let t1 = (box_min - origin) * inv_dir;
     let t2 = (box_max - origin) * inv_dir;
@@ -266,9 +425,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
             if pixel_world > 0.0 && half < pixel_world * t_dist * lod_bias {
                 let lod_mat = (cmask >> 8u) & 0xFFFFu;
                 if lod_mat > 0u {
-                    // Shade as a flat-color hit at node center.
-                    let base = material_color(lod_mat);
-                    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+                    // Shade with procedural detail at LOD node center.
                     // Approximate normal: use the entry face of this node.
                     let nmin = node_min;
                     let nmax = node_min + vec3<f32>(half * 2.0);
@@ -283,8 +440,10 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     } else {
                         normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
                     }
-                    let diffuse = max(dot(normal, light_dir), 0.0);
-                    let lit = base * (0.3 + diffuse * 0.7);
+                    let lod_center = node_min + vec3<f32>(half);
+                    let lod_time = u.camera_pos.w;
+                    let lod_props = material_shade(lod_mat, lod_center, normal, lod_time);
+                    let lit = shade_surface(lod_props, normal, rd);
                     return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // All children empty — step past this node
@@ -362,12 +521,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     } else {
                         normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
                     }
-                    // Lambertian + ambient + fog.
-                    let base = material_color(mat);
-                    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-                    let diffuse = max(dot(normal, light_dir), 0.0);
-                    let ambient = 0.3;
-                    let lit = base * (ambient + diffuse * 0.7);
+                    // Procedural surface detail + enhanced lighting (e7k.2).
+                    let hit_pos = leaf_min + vec3<f32>(half * 0.5);
+                    let hit_time = u.camera_pos.w;
+                    let surf = material_shade(mat, hit_pos, normal, hit_time);
+                    let lit = shade_surface(surf, normal, rd);
                     return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
                 }
                 // Empty leaf — break to step ray

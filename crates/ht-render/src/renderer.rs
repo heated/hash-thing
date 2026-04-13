@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -336,6 +336,7 @@ pub struct Renderer {
     /// lacks TIMESTAMP_QUERY entirely). Consume-on-read avoids
     /// double-recording the same duration across frames.
     last_gpu_frame_time: Option<Duration>,
+    start_time: Instant,
 }
 
 impl Renderer {
@@ -463,8 +464,12 @@ impl Renderer {
         // Storage texture for compute output. Dimensions match the scaled
         // surface config (already half-res from render_scale).
         let raycast_tex_format = wgpu::TextureFormat::Rgba16Float;
-        let (raycast_texture, raycast_texture_view) =
-            Self::create_raycast_texture_static(&device, config.width, config.height, raycast_tex_format);
+        let (raycast_texture, raycast_texture_view) = Self::create_raycast_texture_static(
+            &device,
+            config.width,
+            config.height,
+            raycast_tex_format,
+        );
 
         let svdag_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -587,12 +592,11 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("svdag_blit.wgsl").into()),
         });
 
-        let blit_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("blit_pl"),
-                bind_group_layouts: &[Some(&blit_bind_group_layout)],
-                immediate_size: 0,
-            });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit_pl"),
+            bind_group_layouts: &[Some(&blit_bind_group_layout)],
+            immediate_size: 0,
+        });
 
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("blit_rp"),
@@ -912,6 +916,7 @@ impl Renderer {
             render_scale: 0.5,
             gpu_timing,
             last_gpu_frame_time: None,
+            start_time: Instant::now(),
         }
     }
 
@@ -1065,9 +1070,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.raycast_texture_view,
-                        ),
+                        resource: wgpu::BindingResource::TextureView(&self.raycast_texture_view),
                     },
                 ],
             });
@@ -1371,8 +1374,9 @@ impl Renderer {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let fov_tan = (std::f32::consts::FRAC_PI_4 / 2.0).tan();
 
+        let elapsed_secs = self.start_time.elapsed().as_secs_f32();
         let uniforms = Uniforms {
-            camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], 0.0],
+            camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], elapsed_secs],
             camera_dir: [cam_dir[0], cam_dir[1], cam_dir[2], 0.0],
             camera_up: [up[0], up[1], up[2], 0.0],
             camera_right: [right[0], right[1], right[2], 0.0],
@@ -1410,11 +1414,10 @@ impl Renderer {
 
         // --- Compute pass: SVDAG raycast → storage texture ---
         if let Some(bg) = &self.svdag_compute_bind_group {
-            let mut compute_pass =
-                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("svdag raycast compute"),
-                    timestamp_writes: compute_timestamp_writes,
-                });
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("svdag raycast compute"),
+                timestamp_writes: compute_timestamp_writes,
+            });
             compute_pass.set_pipeline(&self.svdag_compute_pipeline);
             compute_pass.set_bind_group(0, bg, &[]);
             let wg_x = self.config.width.div_ceil(8);
