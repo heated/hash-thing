@@ -2035,7 +2035,9 @@ mod tests {
     use crate::render::Svdag;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
-        MaterialRegistry, FAN, FIRE, FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
+        MaterialRegistry, FAN, FAN_ARMED_FIREWORK_MATERIAL_IDS, FAN_ARMED_STEAM_MATERIAL_IDS, FIRE,
+        FIREWORK, FIREWORK_MATERIAL_ID, GRASS, LAVA, OIL, SAND, STEAM_MATERIAL_ID, STONE, VINE,
+        WATER,
     };
     use std::collections::{HashSet, VecDeque};
 
@@ -2769,7 +2771,8 @@ mod tests {
         } = World::progression_boxes(&field);
         let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
         let expected_sources = ((waterfall.source_x[1] - waterfall.source_x[0] + 1)
-            * (waterfall.source_y[1] - waterfall.source_y[0] + 1)) as usize;
+            * (waterfall.source_y[1] - waterfall.source_y[0] + 1))
+            as usize;
 
         w.seed_lattice_progression_demo();
         assert_eq!(w.clone_sources.len(), expected_sources);
@@ -3025,6 +3028,61 @@ mod tests {
         world.step_recursive();
         assert_eq!(world.get(wc(2), wc(1), wc(2)), AIR);
         assert_eq!(world.get(wc(3), wc(1), wc(2)), SAND);
+    }
+
+    #[test]
+    fn fan_pushes_steam_without_resetting_age_in_recursive_runtime_path() {
+        let mut world = empty_world();
+        let identity = world
+            .materials
+            .register_block_rule(crate::sim::margolus::IdentityBlockRule);
+        world
+            .materials
+            .assign_block_rule(STEAM_MATERIAL_ID, identity);
+        for material_id in FAN_ARMED_STEAM_MATERIAL_IDS {
+            world.materials.assign_block_rule(material_id, identity);
+        }
+        world.set(wc(1), wc(1), wc(2), FAN);
+        world.set(wc(2), wc(1), wc(2), Cell::pack(STEAM_MATERIAL_ID, 14).raw());
+
+        world.step_recursive();
+        world.step_recursive();
+
+        assert_eq!(world.get(wc(2), wc(1), wc(2)), AIR);
+        assert_eq!(
+            world.get(wc(3), wc(1), wc(2)),
+            Cell::pack(STEAM_MATERIAL_ID, 15).raw()
+        );
+    }
+
+    #[test]
+    fn fan_pushes_firework_without_resetting_fuse_in_recursive_runtime_path() {
+        let mut world = empty_world();
+        let identity = world
+            .materials
+            .register_block_rule(crate::sim::margolus::IdentityBlockRule);
+        world
+            .materials
+            .assign_block_rule(FIREWORK_MATERIAL_ID, identity);
+        for material_id in FAN_ARMED_FIREWORK_MATERIAL_IDS {
+            world.materials.assign_block_rule(material_id, identity);
+        }
+        world.set(wc(1), wc(1), wc(2), FAN);
+        world.set(
+            wc(2),
+            wc(1),
+            wc(2),
+            Cell::pack(FIREWORK_MATERIAL_ID, 10).raw(),
+        );
+
+        world.step_recursive();
+        world.step_recursive();
+
+        assert_eq!(world.get(wc(2), wc(1), wc(2)), AIR);
+        assert_eq!(
+            world.get(wc(3), wc(1), wc(2)),
+            Cell::pack(FIREWORK_MATERIAL_ID, 11).raw()
+        );
     }
 
     #[test]
@@ -4291,7 +4349,8 @@ mod tests {
             let mut xs = Vec::new();
             for x in waterfall.curtain.min[0]..=waterfall.curtain.max[0] {
                 let has_water = (waterfall.curtain.min[2]..=waterfall.curtain.max[2]).any(|z| {
-                    Cell::from_raw(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z))).material()
+                    Cell::from_raw(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)))
+                        .material()
                         == WATER_MATERIAL_ID
                 });
                 if has_water {
