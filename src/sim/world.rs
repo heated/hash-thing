@@ -7,7 +7,7 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::materials::{
     BlockRuleId, MaterialRegistry, DIRT, FIRE, GRASS, LAVA, SAND, STONE, WATER,
 };
-use crate::terrain::{carve_caves, gen_region, GenStats, TerrainParams};
+use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
 
 /// The axis-aligned cube of world-space that the octree currently covers.
@@ -347,21 +347,15 @@ impl World {
     }
 
     /// Generate a sibling octant for lazy expansion. If `terrain_params` is
-    /// set, produces terrain (heightmap + caves) at the given
-    /// world-space origin. Otherwise returns a canonical empty node.
+    /// set, produces terrain (heightmap) at the given world-space origin.
+    /// Otherwise returns a canonical empty node.
     fn gen_sibling(&mut self, level: u32, origin: [i64; 3]) -> NodeId {
         let params = match &self.terrain_params {
             Some(p) => *p,
             None => return self.store.empty(level),
         };
         let field = params.to_heightmap();
-        let (mut node, _stats) = gen_region(&mut self.store, &field, origin, level);
-        let side = 1usize << level;
-        if let Some(cave_params) = &params.caves {
-            let mut grid = self.store.flatten(node, side);
-            crate::terrain::caves::carve_caves_grid(&mut grid, side, origin, cave_params);
-            node = self.store.from_flat(&grid, side);
-        }
+        let (node, _stats) = gen_region(&mut self.store, &field, origin, level);
         node
     }
 
@@ -972,20 +966,10 @@ impl World {
         let field = PrecomputedHeightmapField::new(heightmap, self.level);
         let precompute_us = precompute_start.elapsed().as_micros() as u64;
         let gen_start = std::time::Instant::now();
-        let (mut root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
+        let (root, mut stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
         stats.precompute_us = precompute_us;
         stats.gen_region_us = gen_start.elapsed().as_micros() as u64;
         stats.nodes_after_gen = self.store.stats();
-        // Opt-in cave-CA post-pass. Runs as a separate stage after the
-        // heightmap recursion so the baseline perf path (and every
-        // pre-caves test) sees identical work when `params.caves` is
-        // `None`.
-        if let Some(cave_params) = params.caves {
-            let cave_start = std::time::Instant::now();
-            root = carve_caves(&mut self.store, root, self.level, &cave_params);
-            stats.cave_us = cave_start.elapsed().as_micros() as u64;
-        }
-        stats.nodes_after_caves = self.store.stats();
         self.root = root;
         self.generation = 0;
         self.terrain_params = Some(*params);
@@ -2029,31 +2013,6 @@ mod tests {
                 "cell at ({x}, 3, 3) changed after expansion"
             );
         }
-    }
-
-    #[test]
-    fn expand_terrain_with_caves() {
-        use crate::terrain::CaveParams;
-        let params = TerrainParams {
-            caves: Some(CaveParams::default()),
-            ..Default::default()
-        };
-
-        let mut w_caves = World::new(3);
-        w_caves.seed_terrain(&params);
-        w_caves.ensure_contains(wc(10), wc(0), wc(0));
-
-        let mut w_plain = World::new(3);
-        w_plain.seed_terrain(&TerrainParams::default());
-        w_plain.ensure_contains(wc(10), wc(0), wc(0));
-
-        // Caves should carve out some material — fewer populated cells.
-        assert!(
-            w_caves.population() < w_plain.population(),
-            "caves should reduce population: caves={}, plain={}",
-            w_caves.population(),
-            w_plain.population()
-        );
     }
 
     #[test]

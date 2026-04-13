@@ -48,12 +48,11 @@ fn log_gen_stats(
         0.0
     };
     let gen_region_ms = stats.gen_region_us as f64 / 1_000.0;
-    let cave_ms = stats.cave_us as f64 / 1_000.0;
     log::info!(
         "{label}: {side}^3 pop={pop} nodes={nodes} (+{delta}) \
          gen_calls={calls} samples={samples} classifies={classifies} collapses={collapses} \
-         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms cave={cave_ms:.2}ms) \
-         nodes_after_gen={nag} nodes_after_caves={nac} | \
+         gen_time={gen_ms:.2}ms (region={gen_region_ms:.2}ms) \
+         nodes_after_gen={nag} | \
          noise~{ns:.0}ns/sample → ~{sample_pct:.0}% of gen",
         pop = population,
         delta = nodes_delta,
@@ -62,7 +61,6 @@ fn log_gen_stats(
         classifies = stats.classify_calls,
         collapses = stats.total_collapses(),
         nag = stats.nodes_after_gen,
-        nac = stats.nodes_after_caves,
         ns = noise_ns_per_sample,
     );
 }
@@ -135,28 +133,18 @@ struct App {
 impl App {
     fn new(volume_size: u32) -> Self {
         let mut world = sim::World::new(volume_size.trailing_zeros());
-        // Skip caves at 1024³+ — cave carving is O(n³) and takes minutes.
         let level = volume_size.trailing_zeros();
-        let caves = if level <= 9 {
-            Some(terrain::CaveParams::default())
-        } else {
-            None
-        };
-        let terrain_params = terrain::TerrainParams {
-            caves,
-            ..terrain::TerrainParams::for_level(level)
-        };
+        let terrain_params = terrain::TerrainParams::for_level(level);
         let stats = world.seed_terrain(&terrain_params);
         world.seed_water_and_sand();
         let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
         let material_palette_len = world.materials.color_palette_rgba().len();
 
         log::info!(
-            "Initial scene: terrain+caves pop={} nodes={} gen={}µs cave={}µs",
+            "Initial scene: terrain pop={} nodes={} gen={}µs",
             world.population(),
             world.store.stats(),
             stats.gen_region_us,
-            stats.cave_us,
         );
         log::debug!("Material registry palette slots={material_palette_len}");
 
@@ -638,7 +626,6 @@ impl ApplicationHandler for App {
                                 self.world.population()
                             );
                         }
-                        // C (caves terrain) removed — cave carving too slow at scale.
                         winit::keyboard::Key::Character("r") => {
                             // Reset the default CA/materials demo.
                             self.load_burning_room_demo("Reset burning room demo");
@@ -942,9 +929,7 @@ impl ApplicationHandler for App {
                 // block rendering. Previous 200ms interval was a conservative
                 // default that limited CA to ~5 steps/sec even though the
                 // stepper can do ~16/sec at 512³ (hash-thing-cbu).
-                if !self.paused
-                    && !self.is_stepping()
-                {
+                if !self.paused && !self.is_stepping() {
                     self.step_start = std::time::Instant::now();
                     // Move world to background thread; replace with tiny
                     // placeholder so self.world remains valid (but inert).
@@ -1215,7 +1200,6 @@ fn main() {
     log::info!("  F5: pause/resume");
     log::info!("  S: single step");
     log::info!("  R: reset terrain (heightmap)");
-    log::info!("  C: reset terrain with caves (CA post-pass)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
