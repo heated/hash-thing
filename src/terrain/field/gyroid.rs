@@ -107,8 +107,8 @@ pub struct GyroidField {
 }
 
 impl GyroidField {
-    pub fn new(params: GyroidParams) -> Self {
-        params.validate().expect("invalid gyroid params");
+    pub fn new(params: GyroidParams) -> Result<Self, &'static str> {
+        params.validate()?;
         let inner = ImplicitField {
             seed: params.seed,
             lo: params.lo,
@@ -121,11 +121,12 @@ impl GyroidField {
             solid: params.solid,
             warp: params.warp,
         };
-        Self { params, inner }
+        Ok(Self { params, inner })
     }
 
     pub fn for_world(level: u32, seed: u64) -> Self {
         Self::new(GyroidParams::for_world(level, seed))
+            .expect("for_world must synthesize valid gyroid params")
     }
 }
 
@@ -261,17 +262,24 @@ mod tests {
         let thicker = GyroidField::new(GyroidParams {
             band_thickness: base.band_thickness * 1.5,
             ..base
-        });
+        })
+        .expect("thicker gyroid params should remain valid");
         let smoother = GyroidField::new(GyroidParams {
             warp: NoiseWarp {
                 amplitude: base.warp.amplitude * 0.5,
                 ..base.warp
             },
             ..base
-        });
+        })
+        .expect("smoother gyroid params should remain valid");
 
         let mut store = NodeStore::new();
-        let (root_base, _) = gen_region(&mut store, &GyroidField::new(base), [0, 0, 0], 6);
+        let (root_base, _) = gen_region(
+            &mut store,
+            &GyroidField::new(base).expect("base gyroid params should remain valid"),
+            [0, 0, 0],
+            6,
+        );
         let (root_thicker, _) = gen_region(&mut NodeStore::new(), &thicker, [0, 0, 0], 6);
         let (root_smoother, _) = gen_region(&mut NodeStore::new(), &smoother, [0, 0, 0], 6);
 
@@ -292,6 +300,19 @@ mod tests {
         assert!(
             ns.is_finite() && ns > 0.0,
             "sample probe must produce a finite time"
+        );
+    }
+
+    #[test]
+    fn new_rejects_invalid_params() {
+        let mut params = GyroidParams::for_world(6, 42);
+        params.band_thickness = 0.0;
+        assert!(
+            matches!(
+                GyroidField::new(params),
+                Err("band_thickness must be finite and > 0")
+            ),
+            "invalid gyroid params should be rejected without panicking"
         );
     }
 }
