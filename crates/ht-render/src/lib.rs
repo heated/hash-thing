@@ -14,6 +14,7 @@ mod wgsl_drift_guard {
     use ht_octree::Cell;
 
     const SVDAG_RAYCAST_WGSL: &str = include_str!("svdag_raycast.wgsl");
+    const PARTICLE_WGSL: &str = include_str!("particle.wgsl");
 
     #[test]
     fn wgsl_metadata_shift_matches_rust() {
@@ -126,6 +127,40 @@ mod wgsl_drift_guard {
                  material LOD hits should shade the actual surface hit position \
                  (nudged inward), not the node center, or coarse interiors turn \
                  into rectangular ghost patches."
+            );
+        }
+    }
+
+    #[test]
+    fn wgsl_hit_alpha_tracks_scene_distance() {
+        let expected_lines = [
+            "vec4<f32>(lit, max(entry + max(lod_hit_t, 0.0), 1e-4))",
+            "vec4<f32>(lit, max(entry + max(hit_t, 0.0), 1e-4))",
+            "final_color = vec4<f32>(bg, 0.0);",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` — the raycast \
+                 output alpha now carries scene hit distance for overlay \
+                 occlusion; background pixels must keep alpha 0."
+            );
+        }
+    }
+
+    #[test]
+    fn wgsl_particles_sample_scene_depth_for_occlusion() {
+        let expected_lines = [
+            "@group(0) @binding(3) var t_scene: texture_2d<f32>;",
+            "let scene = textureSample(t_scene, s_scene, in.screen_uv);",
+            "if scene.a > 0.0 && scene.a + depth_epsilon < in.ray_t {",
+        ];
+        for expected in expected_lines {
+            assert!(
+                PARTICLE_WGSL.contains(expected),
+                "particle.wgsl must contain `{expected}` — billboard overlays \
+                 should sample the raycast texture's scene depth and discard \
+                 particles hidden behind voxel geometry."
             );
         }
     }
