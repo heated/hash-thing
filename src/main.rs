@@ -1056,6 +1056,7 @@ impl ApplicationHandler for App {
                 // Reset HUD each frame — FPS block below sets it true.
                 if let Some(renderer) = &mut self.renderer {
                     renderer.hud_visible = false;
+                    renderer.hotbar_visible = false;
 
                     // Legend overlay (m1f.7.2): upload text when dirty.
                     if self.legend_dirty {
@@ -1193,6 +1194,7 @@ impl ApplicationHandler for App {
                                 if let sim::EntityKind::Player(ref ps) = player.kind {
                                     renderer.camera_yaw = ps.yaw as f32;
                                     renderer.camera_pitch = ps.pitch as f32;
+                                    renderer.hotbar_selected_slot = ps.held_material.saturating_sub(1) as u32;
                                     if !stepping {
                                         let palette = self.world.materials.color_palette_rgba();
                                         let mat = ps.held_material as usize;
@@ -1203,6 +1205,7 @@ impl ApplicationHandler for App {
                                 }
                                 renderer.camera_dist = 0.0;
                                 renderer.hud_visible = true;
+                                renderer.hotbar_visible = true;
                             }
                         }
                     }
