@@ -20,7 +20,9 @@ fn bench_step(label: &str, level: u32, generations: usize) {
     let t0 = Instant::now();
     let mut world = World::new(level);
     let params = TerrainParams::for_level(level);
-    let stats = world.seed_terrain(&params).expect("level-derived terrain params must validate");
+    let stats = world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
     let seed_ms = t0.elapsed().as_millis();
     eprintln!(
         "  seed: {seed_ms}ms (precompute: {}µs, gen: {}µs), pop: {}, \

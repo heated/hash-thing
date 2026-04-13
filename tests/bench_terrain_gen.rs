@@ -14,7 +14,9 @@ fn bench_terrain(label: &str, level: u32) {
     let start = Instant::now();
     let mut world = World::new(level);
     let params = TerrainParams::for_level(level);
-    let stats = world.seed_terrain(&params).expect("level-derived terrain params must validate");
+    let stats = world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
     let total = start.elapsed();
 
     eprintln!(

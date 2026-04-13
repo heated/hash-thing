@@ -233,14 +233,16 @@ pub fn is_grounded(world: &World, pos: &[f64; 3]) -> bool {
         || snap_down_to_support(world, pos, GROUND_SNAP_HEIGHT).is_some()
 }
 
-/// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
-/// `hit_cell` is the first solid cell along the ray, `prev_cell` is the
-/// empty cell just before it (for block placement).
-pub fn raycast_cells(
+fn raycast_cells_with_range(
     world: &World,
     origin: [f64; 3],
     dir: [f64; 3],
+    max_dist: f64,
 ) -> Option<([i64; 3], [i64; 3])> {
+    if max_dist <= 0.0 {
+        return None;
+    }
+
     let mut pos = [
         origin[0].floor() as i64,
         origin[1].floor() as i64,
@@ -268,7 +270,7 @@ pub fn raycast_cells(
         }
     }
 
-    let max_steps = (INTERACT_RANGE * 2.0) as usize;
+    let max_steps = (max_dist.ceil() as usize).saturating_mul(2).max(1);
     let mut prev = pos;
     for _ in 0..max_steps {
         let cell = world.get(WorldCoord(pos[0]), WorldCoord(pos[1]), WorldCoord(pos[2]));
@@ -287,8 +289,70 @@ pub fn raycast_cells(
             pos[2] += step[2];
             t_max[2] += t_delta[2];
         }
+
+        let travel_t = t_max[0].min(t_max[1]).min(t_max[2]);
+        if travel_t > max_dist {
+            break;
+        }
     }
     None
+}
+
+fn ray_aabb_entry_t(origin: [f64; 3], dir: [f64; 3], cell: [i64; 3]) -> Option<f64> {
+    let mut t_min = f64::NEG_INFINITY;
+    let mut t_max = f64::INFINITY;
+    for axis in 0..3 {
+        let min = cell[axis] as f64;
+        let max = min + 1.0;
+        if dir[axis].abs() < 1e-12 {
+            if origin[axis] < min || origin[axis] > max {
+                return None;
+            }
+            continue;
+        }
+        let inv_dir = 1.0 / dir[axis];
+        let mut axis_t0 = (min - origin[axis]) * inv_dir;
+        let mut axis_t1 = (max - origin[axis]) * inv_dir;
+        if axis_t0 > axis_t1 {
+            std::mem::swap(&mut axis_t0, &mut axis_t1);
+        }
+        t_min = t_min.max(axis_t0);
+        t_max = t_max.min(axis_t1);
+        if t_max < t_min {
+            return None;
+        }
+    }
+    Some(t_min.max(0.0))
+}
+
+/// Return whether `target` is directly visible from `origin` through empty
+/// cells. Used to keep particle billboards from drawing through voxel walls.
+pub fn has_line_of_sight(world: &World, origin: [f64; 3], target: [f64; 3]) -> bool {
+    let delta = [
+        target[0] - origin[0],
+        target[1] - origin[1],
+        target[2] - origin[2],
+    ];
+    let dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+    if dist <= 1e-9 {
+        return true;
+    }
+    let dir = [delta[0] / dist, delta[1] / dist, delta[2] / dist];
+    match raycast_cells_with_range(world, origin, dir, dist) {
+        None => true,
+        Some((hit, _)) => ray_aabb_entry_t(origin, dir, hit).is_some_and(|entry_t| entry_t >= dist),
+    }
+}
+
+/// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
+/// `hit_cell` is the first solid cell along the ray, `prev_cell` is the
+/// empty cell just before it (for block placement).
+pub fn raycast_cells(
+    world: &World,
+    origin: [f64; 3],
+    dir: [f64; 3],
+) -> Option<([i64; 3], [i64; 3])> {
+    raycast_cells_with_range(world, origin, dir, INTERACT_RANGE)
 }
 
 /// Compute the player's eye position and look direction from position + angles.
@@ -599,6 +663,18 @@ mod tests {
             landing.forward > 0.0,
             "landing should add a small forward settle cue"
         );
+    }
+
+    #[test]
+    fn line_of_sight_reaches_visible_target() {
+        let world = World::new(3);
+        assert!(has_line_of_sight(&world, [1.5, 1.5, 1.5], [5.5, 1.5, 1.5]));
+    }
+
+    #[test]
+    fn line_of_sight_blocks_target_behind_wall() {
+        let world = world_with_wall(3, 1, 1);
+        assert!(!has_line_of_sight(&world, [1.5, 1.5, 1.5], [5.5, 1.5, 1.5]));
     }
 
     #[test]
