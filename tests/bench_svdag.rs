@@ -29,7 +29,9 @@ fn bench_svdag_build(label: &str, level: u32) {
     eprintln!("--- {label}: SVDAG build (level={level}, side={side}³) ---");
 
     let mut world = World::new(level);
-    let _ = world.seed_terrain(&TerrainParams::for_level(level));
+    let _ = world
+        .seed_terrain(&TerrainParams::for_level(level))
+        .expect("level-derived terrain params must validate");
     eprintln!("  world seeded, population: {}", world.population());
 
     // Cold build (no cached slots).

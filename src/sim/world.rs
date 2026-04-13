@@ -1839,8 +1839,8 @@ impl World {
     /// node counts honest, and makes the epoch boundary explicit.
     ///
     /// **The caller MUST keep the simulation paused around this call.**
-    pub fn seed_terrain(&mut self, params: &TerrainParams) -> GenStats {
-        params.validate().expect("invalid TerrainParams");
+    pub fn seed_terrain(&mut self, params: &TerrainParams) -> Result<GenStats, &'static str> {
+        params.validate()?;
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
@@ -1860,7 +1860,7 @@ impl World {
         self.generation = 0;
         self.terrain_params = Some(*params);
         self.block_rule_present = None;
-        stats
+        Ok(stats)
     }
 }
 
@@ -2726,10 +2726,10 @@ mod tests {
         let mut world = World::new(6);
         let params = TerrainParams::default();
 
-        let _ = world.seed_terrain(&params);
+        let _ = world.seed_terrain(&params).unwrap();
         let nodes_after_first = world.store.stats();
 
-        let _ = world.seed_terrain(&params);
+        let _ = world.seed_terrain(&params).unwrap();
         let nodes_after_second = world.store.stats();
 
         assert_eq!(
@@ -2738,6 +2738,25 @@ mod tests {
              from {nodes_after_first} to {nodes_after_second} across a \
              deterministic re-seed",
         );
+    }
+
+    #[test]
+    fn seed_terrain_rejects_invalid_params_without_mutating_world() {
+        let mut world = World::new(6);
+        let nodes_before = world.store.stats();
+        let root_before = world.root;
+        let invalid = TerrainParams {
+            wavelength: 0.0,
+            ..TerrainParams::default()
+        };
+
+        assert!(matches!(
+            world.seed_terrain(&invalid),
+            Err("wavelength must be finite and > 0")
+        ));
+        assert_eq!(world.store.stats(), nodes_before);
+        assert_eq!(world.root, root_before);
+        assert!(world.terrain_params.is_none());
     }
 
     #[test]
@@ -3368,7 +3387,7 @@ mod tests {
     fn expand_with_terrain_populates_new_octants() {
         let mut world = World::new(3); // side=8
         let params = TerrainParams::default();
-        world.seed_terrain(&params);
+        world.seed_terrain(&params).unwrap();
         let pop_initial = world.population();
         assert!(pop_initial > 0, "terrain should produce non-empty world");
 
@@ -3387,11 +3406,11 @@ mod tests {
         let params = TerrainParams::default();
 
         let mut w1 = World::new(3);
-        w1.seed_terrain(&params);
+        w1.seed_terrain(&params).unwrap();
         w1.ensure_contains(wc(10), wc(0), wc(0));
 
         let mut w2 = World::new(3);
-        w2.seed_terrain(&params);
+        w2.seed_terrain(&params).unwrap();
         w2.ensure_contains(wc(10), wc(0), wc(0));
 
         // Same params + same expansion → same world.
@@ -3405,7 +3424,7 @@ mod tests {
     fn expand_terrain_preserves_original_cells() {
         let mut world = World::new(3);
         let params = TerrainParams::default();
-        world.seed_terrain(&params);
+        world.seed_terrain(&params).unwrap();
 
         // Record some cells from the original region.
         let cells_before: Vec<_> = (0..8u64).map(|x| world.get(wc(x), wc(3), wc(3))).collect();
@@ -3431,12 +3450,12 @@ mod tests {
 
         // Path A: generate at level 3, then expand to level 4.
         let mut grown = World::new(3);
-        grown.seed_terrain(&params);
+        grown.seed_terrain(&params).unwrap();
         grown.ensure_contains(wc(10), wc(0), wc(0)); // grows to level 4
 
         // Path B: generate at level 4 directly.
         let mut direct = World::new(4);
-        direct.seed_terrain(&params);
+        direct.seed_terrain(&params).unwrap();
 
         // Spot-check cells across the expansion boundary (x=8 is the seam).
         for x in 0..16u64 {
