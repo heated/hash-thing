@@ -195,7 +195,7 @@ impl App {
         );
         app.player_id = Some(player_id);
         log::info!("Player spawned at ({center}, {}, {center})", center + 2.0);
-        log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-7=material, F5=pause, Tab=orbit");
+        log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
 
         app
     }
@@ -389,6 +389,16 @@ impl App {
             5 => "Water",
             6 => "Sand",
             7 => "Lava",
+            8 => "Ice",
+            9 => "Acid",
+            10 => "Oil",
+            11 => "Gunpowder",
+            12 => "Steam",
+            13 => "Gas",
+            14 => "Metal",
+            15 => "Vine",
+            16 => "Fan",
+            17 => "Firework",
             _ => return,
         };
         if let Some(pid) = self.player_id {
@@ -665,7 +675,7 @@ impl ApplicationHandler for App {
                             self.load_lattice_demo();
                         }
                         winit::keyboard::Key::Character(
-                            n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7"),
+                            n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
                         ) => {
                             let digit: u16 = n.parse().unwrap();
                             if self.camera_mode == CameraMode::FirstPerson {
@@ -822,13 +832,13 @@ impl ApplicationHandler for App {
                             (renderer.camera_dist - scroll * 0.1).clamp(0.5, 10.0);
                     }
                 } else if scroll.abs() > 0.01 {
-                    // FPS mode: scroll cycles held material (1-7).
+                    // FPS mode: scroll cycles held material (1-17).
                     let next = self.player_id.and_then(|pid| {
                         let entity = self.entities.get_mut(pid)?;
                         if let sim::EntityKind::Player(ref ps) = entity.kind {
                             let dir = if scroll > 0.0 { 1i16 } else { -1 };
                             let cur = ps.held_material as i16;
-                            Some(((cur - 1 + dir).rem_euclid(7) + 1) as u16)
+                            Some(((cur - 1 + dir).rem_euclid(17) + 1) as u16)
                         } else {
                             None
                         }

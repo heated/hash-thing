@@ -72,9 +72,9 @@ impl CaRule for NoopRule {
 }
 
 /// Fire persists while fuel is adjacent, and is quenched by water.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FireRule {
-    pub fuel_material: u16,
+    pub fuel_materials: Vec<u16>,
     pub quencher_material: u16,
 }
 
@@ -88,7 +88,7 @@ impl CaRule for FireRule {
             Cell::EMPTY
         } else if neighbors
             .iter()
-            .any(|neighbor| neighbor.material() == self.fuel_material)
+            .any(|neighbor| self.fuel_materials.contains(&neighbor.material()))
         {
             center
         } else {
@@ -97,10 +97,7 @@ impl CaRule for FireRule {
     }
 
     fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(FireRule {
-            fuel_material: self.fuel_material,
-            quencher_material: self.quencher_material,
-        })
+        Box::new(self.clone())
     }
 }
 
@@ -162,6 +159,163 @@ impl CaRule for LavaRule {
         Box::new(LavaRule {
             water_material: self.water_material,
             solidify_product: self.solidify_product,
+        })
+    }
+}
+
+/// Ice melts into water when fire or lava is adjacent.
+#[derive(Debug, Clone)]
+pub struct IceRule {
+    pub heat_materials: Vec<u16>,
+    pub melt_product: Cell,
+}
+
+impl CaRule for IceRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "IceRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|n| self.heat_materials.contains(&n.material()))
+        {
+            self.melt_product
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
+    }
+}
+
+/// Flammable material catches fire from adjacent fire.
+#[derive(Debug)]
+pub struct FlammableRule {
+    pub fire_material: u16,
+    pub fire_product: Cell,
+}
+
+impl CaRule for FlammableRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "FlammableRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|n| n.material() == self.fire_material)
+        {
+            self.fire_product
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(FlammableRule {
+            fire_material: self.fire_material,
+            fire_product: self.fire_product,
+        })
+    }
+}
+
+/// Acid is consumed when touching a dissolvable material.
+/// Both acid and the target dissolve (target handled by DissolvableRule).
+#[derive(Debug, Clone)]
+pub struct AcidRule {
+    pub dissolvable_materials: Vec<u16>,
+}
+
+impl CaRule for AcidRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "AcidRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|n| self.dissolvable_materials.contains(&n.material()))
+        {
+            Cell::EMPTY
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(self.clone())
+    }
+}
+
+/// Material dissolves when adjacent to acid.
+#[derive(Debug)]
+pub struct DissolvableRule {
+    pub acid_material: u16,
+}
+
+impl CaRule for DissolvableRule {
+    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "DissolvableRule should not dispatch for AIR");
+        if neighbors
+            .iter()
+            .any(|n| n.material() == self.acid_material)
+        {
+            Cell::EMPTY
+        } else {
+            center
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(DissolvableRule {
+            acid_material: self.acid_material,
+        })
+    }
+}
+
+/// Steam ages via metadata and condenses to water after a threshold.
+#[derive(Debug)]
+pub struct SteamRule {
+    pub condense_product: Cell,
+    pub max_age: u16,
+}
+
+impl CaRule for SteamRule {
+    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "SteamRule should not dispatch for AIR");
+        let age = center.metadata();
+        if age >= self.max_age {
+            self.condense_product
+        } else {
+            Cell::pack(center.material(), age + 1)
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(SteamRule {
+            condense_product: self.condense_product,
+            max_age: self.max_age,
+        })
+    }
+}
+
+/// Firework rises (via negative density in block rule) and explodes into fire
+/// after reaching a metadata age threshold.
+#[derive(Debug)]
+pub struct FireworkRule {
+    pub explode_product: Cell,
+    pub fuse_length: u16,
+}
+
+impl CaRule for FireworkRule {
+    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+        debug_assert!(!center.is_empty(), "FireworkRule should not dispatch for AIR");
+        let age = center.metadata();
+        if age >= self.fuse_length {
+            self.explode_product
+        } else {
+            Cell::pack(center.material(), age + 1)
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CaRule + Send> {
+        Box::new(FireworkRule {
+            explode_product: self.explode_product,
+            fuse_length: self.fuse_length,
         })
     }
 }
@@ -373,7 +527,7 @@ mod tests {
     #[test]
     fn fire_rule_burns_out_without_fuel() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         assert_eq!(
@@ -386,7 +540,7 @@ mod tests {
     #[test]
     fn fire_rule_survives_when_fuel_is_adjacent() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         let mut neighbors = [Cell::EMPTY; 26];
@@ -397,7 +551,7 @@ mod tests {
     #[test]
     fn fire_rule_quencher_beats_fuel_and_extinguishes() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         let mut neighbors = [Cell::EMPTY; 26];
@@ -410,7 +564,7 @@ mod tests {
     #[test]
     fn fire_rule_preserves_center_payload_when_fueled() {
         let rule = FireRule {
-            fuel_material: 3,
+            fuel_materials: vec![3],
             quencher_material: 5,
         };
         let mut neighbors = [Cell::EMPTY; 26];
