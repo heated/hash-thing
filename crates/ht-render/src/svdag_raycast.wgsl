@@ -521,8 +521,18 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     } else {
                         normal = vec3<f32>(0.0, 0.0, -sign(rd.z));
                     }
-                    // Procedural surface detail + enhanced lighting (e7k.2).
-                    let hit_pos = leaf_min + vec3<f32>(half * 0.5);
+                    // Procedural surface detail should follow the actual
+                    // surface hit point, not the leaf center, or large
+                    // collapsed leaves show up as floating rectangular
+                    // shading patches. Bias a fraction of a cell inward so
+                    // the sample stays inside the hit voxel on the chosen face.
+                    let hit_t = select(
+                        max(max(tmin_v.x, tmin_v.y), tmin_v.z),
+                        min(min(tmax_v.x, tmax_v.y), tmax_v.z),
+                        inside,
+                    );
+                    let hit_pos =
+                        ro_local + rd * max(hit_t, 0.0) - normal * (INV_RES * 0.25);
                     let hit_time = u.camera_pos.w;
                     let surf = material_shade(mat, hit_pos, normal, hit_time);
                     let lit = shade_surface(surf, normal, rd);

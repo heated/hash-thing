@@ -74,6 +74,23 @@ mod wgsl_drift_guard {
     }
 
     #[test]
+    fn wgsl_leaf_shading_uses_surface_hit_position() {
+        let expected_lines = [
+            "let hit_t = select(",
+            "ro_local + rd * max(hit_t, 0.0) - normal * (INV_RES * 0.25);",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` — leaf shading \
+                 should sample the actual surface hit position (nudged inward), \
+                 not the leaf center, or collapsed leaves turn into rectangular \
+                 lighting artifacts."
+            );
+        }
+    }
+
+    #[test]
     fn wgsl_svdag_octant_of_tiebreak_matches_rust() {
         let expected_lines = [
             "if pos.x > mid.x || (pos.x == mid.x && rd.x >= 0.0) { idx |= 1u; }",
