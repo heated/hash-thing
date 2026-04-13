@@ -158,7 +158,7 @@ struct ProgressionWaterfallLayout {
     shaft: Box3,
     curtain: Box3,
     source_x: [i64; 2],
-    source_y: i64,
+    source_y: [i64; 2],
     source_z: i64,
     focus: [i64; 3],
 }
@@ -1432,6 +1432,7 @@ impl World {
     ) -> ProgressionWaterfallLayout {
         let source_z = tease_b.min[2] - 2;
         let curtain_z = source_z + 1;
+        let curtain_front_z = tease_b.min[2];
         let shaft_bottom = ground_y - 2;
         let shaft_top = corridor.max[1] + 4;
         let source_x = [tease_b.min[0], tease_b.max[0]];
@@ -1443,16 +1444,16 @@ impl World {
             ),
             shaft: Box3::new(
                 [source_x[0], shaft_bottom, curtain_z],
-                [source_x[1], shaft_top, curtain_z],
+                [source_x[1], shaft_top, curtain_front_z],
             ),
             curtain: Box3::new(
                 [source_x[0], shaft_bottom, curtain_z],
-                [source_x[1], shaft_top - 1, curtain_z],
+                [source_x[1], shaft_top - 1, curtain_front_z],
             ),
             source_x,
-            source_y: shaft_top,
+            source_y: [shaft_bottom, shaft_top],
             source_z,
-            focus: [tease_b.center()[0], corridor.center()[1], curtain_z],
+            focus: [tease_b.center()[0], corridor.center()[1], curtain_front_z],
         }
     }
 
@@ -1479,8 +1480,10 @@ impl World {
         self.fill_box(layout.shell, STONE);
         self.fill_box(layout.shaft, AIR);
         self.fill_box(layout.curtain, WATER);
-        for x in layout.source_x[0]..=layout.source_x[1] {
-            self.place_clone_source([x, layout.source_y, layout.source_z], water_material);
+        for y in layout.source_y[0]..=layout.source_y[1] {
+            for x in layout.source_x[0]..=layout.source_x[1] {
+                self.place_clone_source([x, y, layout.source_z], water_material);
+            }
         }
 
         layout
@@ -2029,6 +2032,7 @@ mod tests {
 
     use super::*;
     use crate::player;
+    use crate::render::Svdag;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
         MaterialRegistry, FAN, FIRE, FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
@@ -2130,6 +2134,86 @@ mod tests {
         }
 
         panic!("no walkable route between {from:?} and {to:?}");
+    }
+
+    fn sync_svdag_with_world(world: &mut World, svdag: &mut Svdag) {
+        if let Some(remap) = world.last_compaction_remap.take() {
+            svdag.apply_remap(&remap);
+        }
+        svdag.update(&world.store, world.root, world.level);
+        if svdag.stale_ratio() > 0.5 {
+            svdag.compact(&world.store, world.root);
+        }
+    }
+
+    fn lookup_svdag_voxel(svdag: &Svdag, x: u64, y: u64, z: u64) -> u16 {
+        const LEAF_BIT: u32 = 0x8000_0000;
+
+        let side = 1u64 << svdag.root_level;
+        if x >= side || y >= side || z >= side {
+            return 0;
+        }
+        let mut offset = svdag.nodes[0] as usize;
+        let mut lx = x;
+        let mut ly = y;
+        let mut lz = z;
+        for level in (1..=svdag.root_level).rev() {
+            let half = 1u64 << (level - 1);
+            let ox = usize::from(lx >= half);
+            let oy = usize::from(ly >= half);
+            let oz = usize::from(lz >= half);
+            let octant = ox | (oy << 1) | (oz << 2);
+
+            let mask = svdag.nodes[offset];
+            let child_word = svdag.nodes[offset + 1 + octant];
+            if mask & (1 << octant) == 0 {
+                return 0;
+            }
+            if child_word & LEAF_BIT != 0 {
+                return (child_word & !LEAF_BIT) as u16;
+            }
+
+            offset = child_word as usize;
+            if ox == 1 {
+                lx -= half;
+            }
+            if oy == 1 {
+                ly -= half;
+            }
+            if oz == 1 {
+                lz -= half;
+            }
+        }
+        0
+    }
+
+    fn assert_svdag_matches_world(world: &World, svdag: &Svdag, label: &str) {
+        let side = world.side();
+        let mut mismatches = 0;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let octree = world.get(
+                        WorldCoord(x as i64),
+                        WorldCoord(y as i64),
+                        WorldCoord(z as i64),
+                    );
+                    let dag = lookup_svdag_voxel(svdag, x as u64, y as u64, z as u64);
+                    if octree != dag {
+                        if mismatches < 5 {
+                            eprintln!(
+                                "  MISMATCH at ({x},{y},{z}): octree={octree} svdag={dag} [{label}]"
+                            );
+                        }
+                        mismatches += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{label}: {mismatches} voxel mismatches between world octree and Svdag"
+        );
     }
 
     fn wc(coord: u64) -> WorldCoord {
@@ -2504,6 +2588,24 @@ mod tests {
     }
 
     #[test]
+    fn water_and_sand_scene_keeps_svdag_in_sync_across_steps() {
+        let mut world = World::new(6); // 64^3 is still practical for exhaustive Svdag checks.
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "initial water scene");
+
+        for step in 1..=12 {
+            world.step();
+            sync_svdag_with_world(&mut world, &mut svdag);
+            assert_svdag_matches_world(&world, &svdag, &format!("after water-heavy step {step}"));
+        }
+    }
+
+    #[test]
     fn lattice_progression_demo_spawn_and_waypoints_are_open() {
         let mut w = World::new(6); // side 64
         let layout = w.seed_lattice_progression_demo();
@@ -2627,22 +2729,24 @@ mod tests {
             "corridor side gap should frame a visible waterfall near {:?}",
             waterfall.focus
         );
-        for x in waterfall.source_x[0]..=waterfall.source_x[1] {
-            let state = Cell::from_raw(w.get(
-                WorldCoord(x),
-                WorldCoord(waterfall.source_y),
-                WorldCoord(waterfall.source_z),
-            ));
-            assert_eq!(
-                state.material(),
-                CLONE_MATERIAL_ID,
-                "waterfall source row should be clone blocks"
-            );
-            assert_eq!(
-                state.metadata(),
-                water_material,
-                "waterfall clone blocks should encode water as their source material"
-            );
+        for y in waterfall.source_y[0]..=waterfall.source_y[1] {
+            for x in waterfall.source_x[0]..=waterfall.source_x[1] {
+                let state = Cell::from_raw(w.get(
+                    WorldCoord(x),
+                    WorldCoord(y),
+                    WorldCoord(waterfall.source_z),
+                ));
+                assert_eq!(
+                    state.material(),
+                    CLONE_MATERIAL_ID,
+                    "waterfall source wall should be clone blocks"
+                );
+                assert_eq!(
+                    state.metadata(),
+                    water_material,
+                    "waterfall clone blocks should encode water as their source material"
+                );
+            }
         }
         assert_eq!(
             w.get(
@@ -2664,7 +2768,8 @@ mod tests {
             corridor, tease_b, ..
         } = World::progression_boxes(&field);
         let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
-        let expected_sources = (waterfall.source_x[1] - waterfall.source_x[0] + 1) as usize;
+        let expected_sources = ((waterfall.source_x[1] - waterfall.source_x[0] + 1)
+            * (waterfall.source_y[1] - waterfall.source_y[0] + 1)) as usize;
 
         w.seed_lattice_progression_demo();
         assert_eq!(w.clone_sources.len(), expected_sources);
@@ -2899,6 +3004,27 @@ mod tests {
         assert_eq!(world.store.stats(), nodes_before);
         assert_eq!(world.root, root_before);
         assert!(world.terrain_params.is_none());
+    }
+
+    #[test]
+    fn fan_pushes_sand_across_floor_in_recursive_runtime_path() {
+        let mut world = empty_world();
+        for x in 0..5 {
+            world.set(wc(x), wc(0), wc(2), STONE);
+        }
+        world.set(wc(1), wc(1), wc(2), FAN);
+        world.set(wc(2), wc(1), wc(2), SAND);
+
+        world.step_recursive();
+        assert_eq!(
+            Cell::from_raw(world.get(wc(2), wc(1), wc(2))).material(),
+            Cell::from_raw(SAND).material()
+        );
+        assert_eq!(world.get(wc(3), wc(1), wc(2)), AIR);
+
+        world.step_recursive();
+        assert_eq!(world.get(wc(2), wc(1), wc(2)), AIR);
+        assert_eq!(world.get(wc(3), wc(1), wc(2)), SAND);
     }
 
     #[test]
@@ -4141,6 +4267,56 @@ mod tests {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+
+    #[test]
+    fn progression_waterfall_stays_visually_contiguous() {
+        let mut world = World::new(6);
+        world.seed_lattice_progression_demo();
+        let field = LatticeField::for_world(world.level, 42);
+        let ground_y = field.lo[1] + field.floor_thick;
+        let ProgressionBoxes {
+            corridor, tease_b, ..
+        } = World::progression_boxes(&field);
+        let waterfall = World::progression_waterfall_layout(corridor, tease_b, ground_y);
+
+        for _ in 0..6 {
+            world.spawn_clones();
+            world.step();
+        }
+
+        let mut occupied = Vec::new();
+        for y in waterfall.shaft.min[1]..=waterfall.shaft.max[1] {
+            let mut xs = Vec::new();
+            for x in waterfall.curtain.min[0]..=waterfall.curtain.max[0] {
+                let has_water = (waterfall.curtain.min[2]..=waterfall.curtain.max[2]).any(|z| {
+                    Cell::from_raw(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(z))).material()
+                        == WATER_MATERIAL_ID
+                });
+                if has_water {
+                    xs.push(x);
+                }
+            }
+            if !xs.is_empty() {
+                occupied.push((y, xs));
+            }
+        }
+
+        assert!(
+            occupied.len() >= 4,
+            "waterfall should remain visible across multiple projected rows"
+        );
+        for (y, xs) in occupied {
+            for pair in xs.windows(2) {
+                assert_eq!(
+                    pair[1] - pair[0],
+                    1,
+                    "waterfall developed a projected gap at y={y}, x={}..{}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
     }
 

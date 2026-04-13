@@ -269,27 +269,14 @@ struct App {
     short_demo_cut: Option<LatticeShortDemoCut>,
     /// Deterministic first-person camera motion layer (bob, settle, sprint cue).
     camera_feel: player::FirstPersonCameraFeel,
+    /// Defer expensive initial scene generation until after the window exists.
+    startup_scene_pending: bool,
 }
 
 impl App {
     fn new(volume_size: u32) -> Self {
-        let mut world = sim::World::new(volume_size.trailing_zeros());
         let level = volume_size.trailing_zeros();
-        let terrain_params = terrain::TerrainParams::for_level(level);
-        let stats = world
-            .seed_terrain(&terrain_params)
-            .expect("level-derived terrain params must validate");
-        world.seed_water_and_sand();
-        let noise_ns = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
-        let material_palette_len = world.materials.color_palette_rgba().len();
-
-        log::info!(
-            "Initial scene: terrain pop={} nodes={} gen={}µs",
-            world.population(),
-            world.store.stats(),
-            stats.gen_region_us,
-        );
-        log::debug!("Material registry palette slots={material_palette_len}");
+        let world = sim::World::new(level);
 
         // Start running so materials interact immediately (powder-game feel).
         // F5 or Space (orbit mode) toggles pause.
@@ -313,7 +300,7 @@ impl App {
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
-            noise_ns_per_sample: noise_ns,
+            noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
             entities: sim::EntityStore::new(),
             volume_size,
@@ -326,6 +313,7 @@ impl App {
             current_demo_beat: None,
             short_demo_cut: None,
             camera_feel: player::FirstPersonCameraFeel::default(),
+            startup_scene_pending: true,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -339,6 +327,41 @@ impl App {
         log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
 
         app
+    }
+
+    fn load_initial_scene(&mut self) {
+        let terrain_params = terrain::TerrainParams::for_level(self.volume_size.trailing_zeros());
+        let stats = self
+            .world
+            .seed_terrain(&terrain_params)
+            .expect("level-derived terrain params must validate");
+        self.world.seed_water_and_sand();
+        self.noise_ns_per_sample = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
+        self.reset_scene_entities();
+        self.spawn_demo_entities();
+        self.paused = false;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!(
+            "Initial scene: terrain pop={} nodes={} gen={}µs",
+            self.world.population(),
+            self.world.store.stats(),
+            stats.gen_region_us,
+        );
+        log::debug!(
+            "Material registry palette slots={}",
+            self.world.materials.color_palette_rgba().len()
+        );
     }
 
     fn world_center(&self) -> [f64; 3] {
@@ -617,6 +640,9 @@ impl App {
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
@@ -1342,6 +1368,11 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                if self.startup_scene_pending {
+                    self.startup_scene_pending = false;
+                    self.load_initial_scene();
+                }
+
                 // Frame delta time for frame-rate-independent movement (xa7).
                 let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
                 self.last_frame = std::time::Instant::now();
@@ -1857,6 +1888,13 @@ mod tests {
             LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(8.1)),
             None
         );
+    }
+
+    #[test]
+    fn app_new_defers_initial_scene_generation_until_window_loop() {
+        let app = App::new(256);
+        assert!(app.startup_scene_pending);
+        assert_eq!(app.world.population(), 0);
     }
 
     #[test]

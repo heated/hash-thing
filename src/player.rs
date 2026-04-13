@@ -22,6 +22,10 @@ pub const PLAYER_SPRINT: f64 = 2.5;
 pub const PLAYER_HALF_W: f64 = 0.3;
 /// Player height (cells).
 pub const PLAYER_HEIGHT: f64 = 1.6;
+/// Maximum vertical lift the collision solver will try to clear a low ledge.
+const STEP_UP_HEIGHT: f64 = 1.0;
+/// Maximum drop to snap down to a nearby floor when moving horizontally.
+const GROUND_SNAP_HEIGHT: f64 = 0.35;
 /// Mouse look sensitivity (radians per pixel).
 pub const LOOK_SENSITIVITY: f64 = 0.003;
 /// Maximum raycast range for block place/break (in cells).
@@ -138,11 +142,64 @@ pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
     false
 }
 
-/// Probe slightly below the player capsule to decide whether the camera-feel
-/// layer should behave like grounded locomotion or airborne drift.
+fn player_supported_at_y(world: &World, pos: &[f64; 3], support_y: i64) -> bool {
+    let hw = PLAYER_HALF_W;
+    let x_min = (pos[0] - hw).floor() as i64;
+    let x_max = (pos[0] + hw).floor() as i64;
+    let z_min = (pos[2] - hw).floor() as i64;
+    let z_max = (pos[2] + hw).floor() as i64;
+    for cx in x_min..=x_max {
+        for cz in z_min..=z_max {
+            if world.get(WorldCoord(cx), WorldCoord(support_y), WorldCoord(cz)) != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn snap_down_to_support(world: &World, pos: &[f64; 3], max_drop: f64) -> Option<[f64; 3]> {
+    let top_support = pos[1].floor() as i64 - 1;
+    let bottom_support = (pos[1] - max_drop).floor() as i64 - 1;
+    for support_y in (bottom_support..=top_support).rev() {
+        let candidate_y = support_y as f64 + 1.0;
+        if pos[1] - candidate_y < -1e-9 || pos[1] - candidate_y > max_drop + 1e-9 {
+            continue;
+        }
+        let mut candidate = *pos;
+        candidate[1] = candidate_y;
+        if !player_collides(world, &candidate)
+            && player_supported_at_y(world, &candidate, support_y)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn try_step_move(world: &World, pos: &[f64; 3], axis: usize, delta: f64) -> Option<[f64; 3]> {
+    if axis == 1 || delta.abs() < 1e-9 {
+        return None;
+    }
+    snap_down_to_support(world, pos, GROUND_SNAP_HEIGHT)?;
+    let mut raised = *pos;
+    raised[1] += STEP_UP_HEIGHT;
+    if player_collides(world, &raised) {
+        return None;
+    }
+    raised[axis] += delta;
+    if player_collides(world, &raised) {
+        return None;
+    }
+    snap_down_to_support(world, &raised, STEP_UP_HEIGHT)
+}
+
+/// Report whether the player is standing on support or close enough to snap
+/// onto it; camera feel should read those states as grounded locomotion.
 pub fn is_grounded(world: &World, pos: &[f64; 3]) -> bool {
-    let probe = [pos[0], pos[1] - 0.05, pos[2]];
-    player_collides(world, &probe)
+    let support_y = pos[1].floor() as i64 - 1;
+    player_supported_at_y(world, pos, support_y)
+        || snap_down_to_support(world, pos, GROUND_SNAP_HEIGHT).is_some()
 }
 
 /// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
@@ -252,6 +309,14 @@ pub fn apply_movement(world: &World, pos: &[f64; 3], delta: &[f64; 3]) -> [f64; 
         new_pos[axis] += delta[axis];
         if player_collides(world, &new_pos) {
             new_pos[axis] = old;
+            if let Some(stepped) = try_step_move(world, &new_pos, axis, delta[axis]) {
+                new_pos = stepped;
+            }
+        }
+    }
+    if delta[1] <= 0.0 {
+        if let Some(snapped) = snap_down_to_support(world, &new_pos, GROUND_SNAP_HEIGHT) {
+            new_pos = snapped;
         }
     }
     new_pos
@@ -266,6 +331,17 @@ mod tests {
         let mut world = World::new(3); // 8³
         let material = Cell::pack(1, 0).raw();
         world.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), material);
+        world
+    }
+
+    fn world_with_floor(y: i64, x0: i64, x1: i64, z0: i64, z1: i64) -> World {
+        let mut world = World::new(3);
+        let material = Cell::pack(1, 0).raw();
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                world.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), material);
+            }
+        }
         world
     }
 
@@ -425,5 +501,39 @@ mod tests {
         let new_pos = apply_movement(&world, &pos, &delta);
         assert!((new_pos[0] - 5.0).abs() < 1e-9);
         assert!((new_pos[2] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_movement_steps_up_one_block_ledge() {
+        let mut world = world_with_floor(0, 0, 7, 0, 7);
+        let material = Cell::pack(1, 0).raw();
+        world.set(WorldCoord(4), WorldCoord(1), WorldCoord(3), material);
+        let pos = [3.5, 1.0, 3.5];
+        let delta = [0.8, 0.0, 0.0];
+        let new_pos = apply_movement(&world, &pos, &delta);
+        assert!(
+            (new_pos[0] - 4.3).abs() < 1e-9,
+            "horizontal move should clear the ledge"
+        );
+        assert!(
+            (new_pos[1] - 2.0).abs() < 1e-9,
+            "step-up should land the player on top of the ledge"
+        );
+    }
+
+    #[test]
+    fn apply_movement_snaps_down_small_floor_gap() {
+        let world = world_with_floor(0, 0, 7, 0, 7);
+        let pos = [3.5, 1.2, 3.5];
+        let delta = [0.4, 0.0, 0.0];
+        let new_pos = apply_movement(&world, &pos, &delta);
+        assert!(
+            (new_pos[0] - 3.9).abs() < 1e-9,
+            "horizontal movement should still apply"
+        );
+        assert!(
+            (new_pos[1] - 1.0).abs() < 1e-9,
+            "small drops should snap back onto the floor"
+        );
     }
 }
