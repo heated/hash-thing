@@ -93,6 +93,15 @@ const SAND_BIOME_THRESHOLD: f32 = 0.3;
 /// Wavelength for biome noise (cells). Large value → big biome regions.
 const BIOME_WAVELENGTH: f32 = 64.0;
 
+/// Vertical band around sea level that always gets sandy shallow material.
+/// This gives coastlines a readable beach even outside sandy biomes.
+const SHORELINE_BAND: f32 = 2.0;
+
+#[inline]
+fn shoreline_is_sandy(surface: f32, sea_level: Option<f32>) -> bool {
+    sea_level.is_some_and(|sl| (surface - sl).abs() <= SHORELINE_BAND)
+}
+
 impl WorldGen for HeightmapField {
     fn sample(&self, p: [i64; 3]) -> CellState {
         let surface = self.surface_y(p[0] as f32, p[2] as f32);
@@ -108,8 +117,12 @@ impl WorldGen for HeightmapField {
             return AIR;
         }
         // In sandy biomes, replace grass and dirt with sand so the terrain
-        // has natural sand regions that fall and settle under gravity.
+        // has natural sand regions that fall and settle under gravity. Also
+        // force a narrow sand band near sea level so shorelines read clearly.
         if base != STONE && depth < 4.0 {
+            if shoreline_is_sandy(surface, self.sea_level) {
+                return SAND;
+            }
             let biome = biome_2d(
                 p[0] as f32 / BIOME_WAVELENGTH,
                 p[2] as f32 / BIOME_WAVELENGTH,
@@ -315,6 +328,9 @@ impl WorldGen for PrecomputedHeightmapField {
             return AIR;
         }
         if base != STONE && depth < 4.0 {
+            if shoreline_is_sandy(surface, self.inner.sea_level) {
+                return SAND;
+            }
             let ux = p[0] as usize;
             let uz = p[2] as usize;
             let sandy = if ux < self.side && uz < self.side {
@@ -550,6 +566,36 @@ mod tests {
     }
 
     #[test]
+    fn shoreline_band_forces_sand_even_outside_sandy_biomes() {
+        let mut f = test_field();
+        f.sea_level = Some(28.0);
+
+        let shoreline = (0..128).find_map(|x| {
+            (0..128).find_map(|z| {
+                let surface = f.surface_y(x as f32, z as f32);
+                let biome = biome_2d(
+                    x as f32 / BIOME_WAVELENGTH,
+                    z as f32 / BIOME_WAVELENGTH,
+                    f.seed,
+                );
+                let y = surface.floor() as i64;
+                let cell = f.sample([x, y, z]);
+                ((surface - f.sea_level.unwrap()).abs() <= SHORELINE_BAND
+                    && biome >= SAND_BIOME_THRESHOLD
+                    && cell != AIR)
+                    .then_some((x, y, z))
+            })
+        });
+
+        let (x, y, z) = shoreline.expect("expected a non-biome shoreline sample in scan window");
+        assert_eq!(
+            f.sample([x, y, z]),
+            SAND,
+            "shoreline cells should read as sand even outside sandy biomes"
+        );
+    }
+
+    #[test]
     fn classify_water_above_surface_below_sea() {
         let mut f = test_field();
         f.sea_level = Some(28.0);
@@ -612,6 +658,28 @@ mod tests {
             stats2.total_collapses(),
             stats1.total_collapses(),
         );
+    }
+
+    #[test]
+    fn precomputed_preserves_shoreline_sand_rule() {
+        let mut field = test_field();
+        field.sea_level = Some(28.0);
+        let precomputed = PrecomputedHeightmapField::new(field, 6)
+            .expect("test heightmap field should precompute successfully");
+
+        let shoreline = (0..64).find_map(|x| {
+            (0..64).find_map(|z| {
+                let surface = precomputed.precomputed_surface_y(x, z);
+                let y = surface.floor() as i64;
+                ((surface - field.sea_level.unwrap()).abs() <= SHORELINE_BAND
+                    && precomputed.sample([x, y, z]) == SAND)
+                    .then_some((x, y, z))
+            })
+        });
+
+        let (x, y, z) = shoreline.expect("expected a shoreline sand sample in precomputed terrain");
+        assert_eq!(field.sample([x, y, z]), SAND);
+        assert_eq!(precomputed.sample([x, y, z]), SAND);
     }
 
     #[test]
