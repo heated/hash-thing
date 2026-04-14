@@ -396,3 +396,75 @@ Minimum viable reproduction for another repo:
 - `~/.claude/CLAUDE.md` still references `~/cmux-repo`, but that source checkout is not present here
 - browser automation is evidenced by logs, but its active config surface is not captured in one obvious file here
 - this file is a snapshot, not a self-updating system; if Edward wants it to stay current, it should either become part of the `.agents/` refresh discipline or get its own upkeep bead
+
+## 10. Gas City Install Path Snapshot
+
+This snapshot was added during `hash-thing-kqy6.1.1` on 2026-04-14 to answer the practical question: what is the smallest path to a real local Gas City smoke run from this machine state?
+
+### Local machine state
+
+- macOS 15.7.2 on `x86_64`
+- `tmux`, `git`, `jq`, and `dolt` already installed
+- `gc` missing initially
+- `flock` missing initially
+- `go version` was `go1.18`
+- Command Line Tools were present at `/Library/Developer/CommandLineTools` but too old for the current Homebrew Gas City install path
+
+### What failed
+
+Homebrew path:
+- `brew tap gastownhall/gascity` worked
+- `brew install gastownhall/gascity/gascity` did not complete
+- blocker: Homebrew stopped with "Your Command Line Tools are too outdated" before `gc` was installed
+
+Source-build path:
+- current Gas City README says source builds require Go `1.25+`
+- this machine currently has Go `1.18`
+- conclusion: source build is blocked until Go is upgraded substantially
+
+Default beads path:
+- `gc init --provider codex --skip-provider-readiness /tmp/gascity-city` created the city
+- then it stopped with `missing required dependencies: flock`
+- conclusion: default `bd` beads path still expects `flock` on macOS
+
+### What worked
+
+Smallest successful smoke path from the current machine state:
+
+1. Download the prebuilt release binary directly from GitHub:
+   - `gascity_0.14.1_darwin_amd64.tar.gz`
+2. Extract it and use the bundled `gc` binary directly
+3. Initialize a city:
+   - `./gc init --provider codex --skip-provider-readiness /tmp/gascity-city`
+4. Switch the beads backend to file mode:
+   - set `GC_BEADS=file` at start time, or add `[beads] provider = "file"` to `city.toml`
+5. Start the city:
+   - `GC_BEADS=file ./gc start`
+
+Observed result:
+- city registered and started under the supervisor
+- `gc status` showed a running standalone controller
+- `gc doctor` passed the core checks, including:
+  - controller running
+  - beads store accessible
+  - dolt skipped because file backend was active
+  - builtin `bd`/`dolt` pack family not required
+
+### Practical conclusion
+
+The smallest real local smoke run on this machine does **not** require:
+- Homebrew `gc`
+- upgraded Go
+- `dolt`
+- `bd`
+- `flock`
+
+It **does** require:
+- the prebuilt `gc` release binary
+- existing always-on binaries (`tmux`, `git`, `jq`, `pgrep`, `lsof`)
+- file-backed beads mode
+
+That makes file-backed mode the practical unblocker for local evaluation on this machine. If we later want the default `bd`/Dolt path, we still need to fix the machine-level prerequisites:
+- update Command Line Tools so Homebrew installs work again
+- install `flock`
+- likely upgrade Go if source builds matter
