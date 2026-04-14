@@ -14,7 +14,7 @@ use winit::{
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::EventLoop,
     keyboard::KeyCode,
-    window::{Window, WindowAttributes},
+    window::{CursorGrabMode, Window, WindowAttributes},
 };
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
@@ -276,6 +276,10 @@ struct App {
     camera_feel: player::FirstPersonCameraFeel,
     /// Defer expensive initial scene generation until after the window exists.
     startup_scene_pending: bool,
+    /// Last known OS window focus state. Cursor capture only makes sense while focused.
+    window_focused: bool,
+    /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
+    cursor_captured: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -286,6 +290,10 @@ fn should_warn_about_slow_dev_step(
     debug_build
         && volume_size >= 256
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
+}
+
+fn should_capture_cursor(camera_mode: CameraMode, window_focused: bool) -> bool {
+    window_focused && camera_mode == CameraMode::FirstPerson
 }
 
 impl App {
@@ -331,6 +339,8 @@ impl App {
             short_demo_cut: None,
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
+            window_focused: true,
+            cursor_captured: false,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -344,6 +354,45 @@ impl App {
         log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
 
         app
+    }
+
+    fn apply_cursor_capture(&mut self, capture: bool) {
+        let Some(window) = self.window.as_ref() else {
+            self.cursor_captured = false;
+            return;
+        };
+
+        if capture {
+            let grab = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            match grab {
+                Ok(()) => {
+                    window.set_cursor_visible(false);
+                    self.cursor_captured = true;
+                    self.last_mouse = None;
+                }
+                Err(err) => {
+                    log::warn!("Failed to grab FPS cursor: {err}");
+                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                    self.cursor_captured = false;
+                }
+            }
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.cursor_captured = false;
+            self.last_mouse = None;
+        }
+    }
+
+    fn sync_cursor_capture(&mut self) {
+        let should_capture = should_capture_cursor(self.camera_mode, self.window_focused);
+        if should_capture == self.cursor_captured {
+            return;
+        }
+        self.apply_cursor_capture(should_capture);
     }
 
     fn load_initial_scene(&mut self) {
@@ -1067,6 +1116,7 @@ impl ApplicationHandler for App {
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
+            self.sync_cursor_capture();
         }
     }
 
@@ -1099,8 +1149,15 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Focused(false) => {
+                self.window_focused = false;
                 self.keys_held.clear();
                 self.jump_was_held = false;
+                self.sync_cursor_capture();
+            }
+
+            WindowEvent::Focused(true) => {
+                self.window_focused = true;
+                self.sync_cursor_capture();
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1154,6 +1211,7 @@ impl ApplicationHandler for App {
                             if self.camera_mode == CameraMode::Orbit {
                                 self.camera_feel.reset();
                             }
+                            self.sync_cursor_capture();
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
@@ -2051,5 +2109,13 @@ mod tests {
             256,
             Duration::from_millis(DEV_PROFILE_STEP_WARN_MS - 1)
         ));
+    }
+
+    #[test]
+    fn cursor_capture_requires_first_person_and_focus() {
+        assert!(should_capture_cursor(CameraMode::FirstPerson, true));
+        assert!(!should_capture_cursor(CameraMode::FirstPerson, false));
+        assert!(!should_capture_cursor(CameraMode::Orbit, true));
+        assert!(!should_capture_cursor(CameraMode::Orbit, false));
     }
 }
