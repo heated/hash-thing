@@ -464,7 +464,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     let lod_time = u.camera_pos.w;
                     let lod_props = material_shade(lod_mat, lod_hit_pos, normal, lod_time);
                     let lit = shade_surface(lod_props, normal, rd);
-                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
+                    return RayResult(
+                        vec4<f32>(lit, max(entry + max(lod_hit_t, 0.0), 1e-4)),
+                        step,
+                        max_steps,
+                    );
                 }
                 // All children empty — step past this node
                 break;
@@ -556,7 +560,11 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     let hit_time = u.camera_pos.w;
                     let surf = material_shade(mat, hit_pos, normal, hit_time);
                     let lit = shade_surface(surf, normal, rd);
-                    return RayResult(vec4<f32>(lit, 1.0), step, max_steps);
+                    return RayResult(
+                        vec4<f32>(lit, max(entry + max(hit_t, 0.0), 1e-4)),
+                        step,
+                        max_steps,
+                    );
                 }
                 // Empty leaf — break to step ray
                 break;
@@ -700,9 +708,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let hm = heatmap_color(ratio);
         // Dim background rays (no hit) to distinguish sky from geometry.
         if result.color.a == 0.0 {
-            final_color = vec4<f32>(hm * 0.3, 1.0);
+            final_color = vec4<f32>(hm * 0.3, 0.0);
         } else {
-            final_color = vec4<f32>(hm, 1.0);
+            final_color = vec4<f32>(hm, result.color.a);
         }
     } else if result.color.a > 0.0 {
         final_color = result.color;
@@ -712,7 +720,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sky_top = vec3<f32>(0.35, 0.55, 0.90);
         let sky_bot = vec3<f32>(0.65, 0.78, 0.92);
         let bg = mix(sky_bot, sky_top, sky_t);
-        final_color = vec4<f32>(bg, 1.0);
+        final_color = vec4<f32>(bg, 0.0);
     }
 
     // Store linear color — the blit shader writes to an sRGB swapchain surface,

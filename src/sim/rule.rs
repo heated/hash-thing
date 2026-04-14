@@ -78,6 +78,15 @@ impl FanDirection {
     const ALL: [Self; 4] = [Self::PosX, Self::NegX, Self::PosZ, Self::NegZ];
     const ARMED_METADATA_BASE: u16 = 60;
 
+    fn index(self) -> usize {
+        match self {
+            Self::PosX => 0,
+            Self::NegX => 1,
+            Self::PosZ => 2,
+            Self::NegZ => 3,
+        }
+    }
+
     fn delta(self) -> (i32, i32, i32) {
         match self {
             Self::PosX => (1, 0, 0),
@@ -116,6 +125,37 @@ impl FanDirection {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FanCarriedMaterial {
+    pub base_material: u16,
+    pub armed_materials: [u16; 4],
+}
+
+impl FanCarriedMaterial {
+    pub const fn new(base_material: u16, armed_materials: [u16; 4]) -> Self {
+        Self {
+            base_material,
+            armed_materials,
+        }
+    }
+
+    fn armed_material(self, dir: FanDirection) -> u16 {
+        self.armed_materials[dir.index()]
+    }
+
+    fn direction_for(self, material: u16) -> Option<FanDirection> {
+        FanDirection::ALL
+            .into_iter()
+            .find(|&dir| self.armed_material(dir) == material)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FanTransport {
+    MetadataBand,
+    MaterialChannel(FanCarriedMaterial),
 }
 
 fn neighbor_at(neighbors: &[Cell; 26], dx: i32, dy: i32, dz: i32) -> Cell {
@@ -166,6 +206,7 @@ fn arming_direction(neighbors: &[Cell; 26], fan_material: u16) -> Option<FanDire
 #[derive(Debug, Clone)]
 pub struct AirRule {
     pub fan_material: u16,
+    pub carried_materials: Vec<FanCarriedMaterial>,
     pub vine_growth: Option<AirVineGrowthRule>,
 }
 
@@ -180,6 +221,11 @@ impl CaRule for AirRule {
             }
             if FanDirection::from_armed_metadata(source.metadata()) == Some(dir) {
                 return Cell::pack(source.material(), 0);
+            }
+            if let Some(base_material) = self.carried_materials.iter().find_map(|carried| {
+                (carried.armed_material(dir) == source.material()).then_some(carried.base_material)
+            }) {
+                return Cell::pack(base_material, source.metadata());
             }
         }
         self.vine_growth
@@ -216,10 +262,15 @@ impl CaRule for FanRule {
     }
 }
 
-/// Wrap an existing rule with one-tick fan transport using the high metadata band.
+/// Wrap an existing rule with one-tick fan transport.
+///
+/// Most materials use the high metadata band for the transient "armed" state.
+/// Age-bearing particles can instead route that state through dedicated
+/// carry-material IDs so their payload metadata stays intact.
 pub struct FanDrivenRule {
     base: Box<dyn CaRule + Send>,
     fan_material: u16,
+    transport: FanTransport,
 }
 
 impl fmt::Debug for FanDrivenRule {
@@ -238,30 +289,75 @@ impl FanDrivenRule {
         Self {
             base: Box::new(base),
             fan_material,
+            transport: FanTransport::MetadataBand,
+        }
+    }
+
+    pub fn new_with_material_transport<R>(
+        base: R,
+        fan_material: u16,
+        carried_material: FanCarriedMaterial,
+    ) -> Self
+    where
+        R: CaRule + Send + 'static,
+    {
+        Self {
+            base: Box::new(base),
+            fan_material,
+            transport: FanTransport::MaterialChannel(carried_material),
+        }
+    }
+
+    fn decode_center(&self, center: Cell) -> Cell {
+        match self.transport {
+            FanTransport::MetadataBand => clear_push_metadata(center),
+            FanTransport::MaterialChannel(carried_material) => carried_material
+                .direction_for(center.material())
+                .map(|_| Cell::pack(carried_material.base_material, center.metadata()))
+                .unwrap_or(center),
+        }
+    }
+
+    fn armed_direction(&self, center: Cell) -> Option<FanDirection> {
+        match self.transport {
+            FanTransport::MetadataBand => FanDirection::from_armed_metadata(center.metadata()),
+            FanTransport::MaterialChannel(carried_material) => {
+                carried_material.direction_for(center.material())
+            }
+        }
+    }
+
+    fn arm_cell(&self, next: Cell, dir: FanDirection) -> Cell {
+        match self.transport {
+            FanTransport::MetadataBand => Cell::pack(next.material(), dir.armed_metadata()),
+            FanTransport::MaterialChannel(carried_material) => {
+                Cell::pack(carried_material.armed_material(dir), next.metadata())
+            }
         }
     }
 }
 
 impl CaRule for FanDrivenRule {
     fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
-        let base_next = self.base.step_cell(clear_push_metadata(center), neighbors);
-        if base_next.is_empty() || base_next.material() != center.material() {
+        let center_base = self.decode_center(center);
+        let base_next = self.base.step_cell(center_base, neighbors);
+        if base_next.is_empty() || base_next.material() != center_base.material() {
             return base_next;
         }
 
-        if let Some(dir) = FanDirection::from_armed_metadata(center.metadata()) {
+        if let Some(dir) = self.armed_direction(center) {
             let (dx, dy, dz) = dir.delta();
             if neighbor_at(neighbors, dx, dy, dz).is_empty() {
                 return Cell::EMPTY;
             }
-            return Cell::pack(base_next.material(), 0);
+            return base_next;
         }
 
         if let Some(dir) = arming_direction(neighbors, self.fan_material) {
-            return Cell::pack(base_next.material(), dir.armed_metadata());
+            return self.arm_cell(base_next, dir);
         }
 
-        Cell::pack(base_next.material(), 0)
+        base_next
     }
 
     fn is_self_inert(&self) -> bool {
@@ -272,6 +368,7 @@ impl CaRule for FanDrivenRule {
         Box::new(Self {
             base: self.base.clone_box(),
             fan_material: self.fan_material,
+            transport: self.transport,
         })
     }
 }
@@ -972,6 +1069,7 @@ mod tests {
     fn air_rule_accepts_armed_incoming_material() {
         let rule = AirRule {
             fan_material: 16,
+            carried_materials: Vec::new(),
             vine_growth: None,
         };
         let mut neighbors = [Cell::EMPTY; 26];
@@ -984,6 +1082,19 @@ mod tests {
         );
 
         assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::pack(6, 0));
+    }
+
+    #[test]
+    fn air_rule_accepts_material_channel_incoming_material() {
+        let rule = AirRule {
+            fan_material: 16,
+            carried_materials: vec![FanCarriedMaterial::new(6, [30, 31, 32, 33])],
+            vine_growth: None,
+        };
+        let mut neighbors = [Cell::EMPTY; 26];
+        set_neighbor(&mut neighbors, -1, 0, 0, Cell::pack(30, 11));
+
+        assert_eq!(rule.step_cell(Cell::EMPTY, &neighbors), Cell::pack(6, 11));
     }
 
     #[test]
@@ -1016,15 +1127,37 @@ mod tests {
     fn fan_driven_rule_respects_fan_facing_metadata() {
         let rule = FanDrivenRule::new(NoopRule, 16);
         let mut neighbors = [Cell::EMPTY; 26];
-        set_neighbor(
-            &mut neighbors,
-            1,
-            0,
-            0,
-            Cell::pack(16, 1),
+        set_neighbor(&mut neighbors, 1, 0, 0, Cell::pack(16, 1));
+
+        assert_eq!(
+            rule.step_cell(Cell::pack(6, 0), &neighbors),
+            Cell::pack(6, 0)
+        );
+    }
+
+    #[test]
+    fn fan_driven_rule_material_channel_preserves_payload_metadata() {
+        let rule = FanDrivenRule::new_with_material_transport(
+            SteamRule {
+                condense_product: Cell::pack(5, 0),
+                max_age: 20,
+            },
+            16,
+            FanCarriedMaterial::new(6, [30, 31, 32, 33]),
+        );
+        let mut arm_neighbors = [Cell::EMPTY; 26];
+        set_neighbor(&mut arm_neighbors, -1, 0, 0, Cell::pack(16, 0));
+        assert_eq!(
+            rule.step_cell(Cell::pack(6, 12), &arm_neighbors),
+            Cell::pack(30, 13)
         );
 
-        assert_eq!(rule.step_cell(Cell::pack(6, 0), &neighbors), Cell::pack(6, 0));
+        let mut blocked_neighbors = [Cell::EMPTY; 26];
+        set_neighbor(&mut blocked_neighbors, 1, 0, 0, Cell::pack(9, 0));
+        assert_eq!(
+            rule.step_cell(Cell::pack(30, 13), &blocked_neighbors),
+            Cell::pack(6, 14)
+        );
     }
 
     #[test]

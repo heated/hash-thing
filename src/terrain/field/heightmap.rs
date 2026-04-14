@@ -129,7 +129,6 @@ fn smooth_surface_biome_transition(
     }
     base
 }
-
 impl WorldGen for HeightmapField {
     fn sample(&self, p: [i64; 3]) -> CellState {
         let surface = self.surface_y(p[0] as f32, p[2] as f32);
@@ -144,6 +143,9 @@ impl WorldGen for HeightmapField {
             }
             return AIR;
         }
+        // In sandy biomes, replace grass and dirt with sand so the terrain
+        // has natural sand regions that fall and settle under gravity. Also
+        // force a narrow sand band near sea level so shorelines read clearly.
         if base != STONE && depth < 4.0 {
             if shoreline_is_sandy(surface, self.sea_level) {
                 return SAND;
