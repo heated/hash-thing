@@ -1,5 +1,11 @@
 # Agent Instructions
 
+## ⚠ FEATURE FREEZE — effective 2026-04-13
+
+**All new feature work is paused.** No new features, no perf work, no refactors land on main until the codebase integrity audit (hash-thing-882n) clears. Bug fixes to existing broken behavior may continue. Check `bd show hash-thing-882n` for status. This freeze applies to all crew members and all worktrees.
+
+---
+
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
 **Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper at `.bin/bd` retries on embedded Dolt lock contention (hash-thing-eg3) with exponential backoff. Without it, concurrent worktree agents hit `another process holds the exclusive lock` errors that require manual sleep-and-retry. The wrapper handles up to 5 retries transparently.
