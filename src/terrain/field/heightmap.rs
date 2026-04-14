@@ -93,6 +93,34 @@ const SAND_BIOME_THRESHOLD: f32 = 0.3;
 /// Wavelength for biome noise (cells). Large value → big biome regions.
 const BIOME_WAVELENGTH: f32 = 64.0;
 
+#[inline]
+fn biome_is_sandy(seed: u64, x: i64, z: i64) -> bool {
+    biome_2d(
+        x as f32 / BIOME_WAVELENGTH,
+        z as f32 / BIOME_WAVELENGTH,
+        seed,
+    ) < SAND_BIOME_THRESHOLD
+}
+
+fn smooth_surface_biome_transition(
+    base: CellState,
+    depth: f32,
+    is_sandy: bool,
+    has_sandy_neighbor: bool,
+) -> CellState {
+    if base == STONE || depth >= 4.0 {
+        return base;
+    }
+    if is_sandy {
+        return SAND;
+    }
+    // Avoid a neon one-voxel grass cap directly against sandy columns.
+    if base != SAND && depth < 1.0 && has_sandy_neighbor {
+        return crate::terrain::materials::DIRT;
+    }
+    base
+}
+
 impl WorldGen for HeightmapField {
     fn sample(&self, p: [i64; 3]) -> CellState {
         let surface = self.surface_y(p[0] as f32, p[2] as f32);
@@ -107,17 +135,13 @@ impl WorldGen for HeightmapField {
             }
             return AIR;
         }
-        // In sandy biomes, replace grass and dirt with sand so the terrain
-        // has natural sand regions that fall and settle under gravity.
+        let is_sandy = biome_is_sandy(self.seed, p[0], p[2]);
+        let has_sandy_neighbor = !is_sandy
+            && [[-1i64, 0i64], [1, 0], [0, -1], [0, 1]]
+                .into_iter()
+                .any(|[dx, dz]| biome_is_sandy(self.seed, p[0] + dx, p[2] + dz));
         if base != STONE && depth < 4.0 {
-            let biome = biome_2d(
-                p[0] as f32 / BIOME_WAVELENGTH,
-                p[2] as f32 / BIOME_WAVELENGTH,
-                self.seed,
-            );
-            if biome < SAND_BIOME_THRESHOLD {
-                return SAND;
-            }
+            return smooth_surface_biome_transition(base, depth, is_sandy, has_sandy_neighbor);
         }
         base
     }
@@ -317,18 +341,26 @@ impl WorldGen for PrecomputedHeightmapField {
         if base != STONE && depth < 4.0 {
             let ux = p[0] as usize;
             let uz = p[2] as usize;
-            let sandy = if ux < self.side && uz < self.side {
+            let is_sandy = if ux < self.side && uz < self.side {
                 self.is_sandy[uz * self.side + ux]
             } else {
-                biome_2d(
-                    p[0] as f32 / BIOME_WAVELENGTH,
-                    p[2] as f32 / BIOME_WAVELENGTH,
-                    self.inner.seed,
-                ) < SAND_BIOME_THRESHOLD
+                biome_is_sandy(self.inner.seed, p[0], p[2])
             };
-            if sandy {
-                return SAND;
-            }
+            let has_sandy_neighbor = !is_sandy
+                && [[-1i64, 0i64], [1, 0], [0, -1], [0, 1]]
+                    .into_iter()
+                    .any(|[dx, dz]| {
+                        let nx = p[0] + dx;
+                        let nz = p[2] + dz;
+                        let ux = nx as usize;
+                        let uz = nz as usize;
+                        if ux < self.side && uz < self.side {
+                            self.is_sandy[uz * self.side + ux]
+                        } else {
+                            biome_is_sandy(self.inner.seed, nx, nz)
+                        }
+                    });
+            return smooth_surface_biome_transition(base, depth, is_sandy, has_sandy_neighbor);
         }
         base
     }
@@ -363,6 +395,7 @@ impl WorldGen for PrecomputedHeightmapField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::materials::DIRT;
 
     /// Deterministic field with known bounds for testing classify.
     /// base_y=32, amplitude=8 → surface ∈ [24, 40].
@@ -533,6 +566,48 @@ mod tests {
             sand_count < surface_count,
             "expected mixed biomes, not all sand ({sand_count}/{surface_count})"
         );
+    }
+
+    fn find_grass_sand_boundary(field: &HeightmapField) -> Option<(i64, i64)> {
+        for x in 1..127i64 {
+            for z in 1..127i64 {
+                if biome_is_sandy(field.seed, x, z) {
+                    continue;
+                }
+                if [[-1i64, 0i64], [1, 0], [0, -1], [0, 1]]
+                    .into_iter()
+                    .any(|[dx, dz]| biome_is_sandy(field.seed, x + dx, z + dz))
+                {
+                    return Some((x, z));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn grassy_surface_next_to_sand_biome_feathers_to_dirt() {
+        let f = test_field();
+        let (x, z) = find_grass_sand_boundary(&f).expect("expected a grass/sand biome boundary");
+        let surface = f.surface_y(x as f32, z as f32);
+        let y = surface.floor() as i64;
+
+        assert_eq!(
+            f.sample([x, y, z]),
+            DIRT,
+            "surface grass cap at a sand boundary should feather to dirt"
+        );
+    }
+
+    #[test]
+    fn precomputed_heightmap_matches_boundary_feathering() {
+        let f = test_field();
+        let pre = PrecomputedHeightmapField::new(f, 7).expect("test field must validate");
+        let (x, z) = find_grass_sand_boundary(&f).expect("expected a grass/sand biome boundary");
+        let surface = f.surface_y(x as f32, z as f32);
+        let y = surface.floor() as i64;
+
+        assert_eq!(pre.sample([x, y, z]), DIRT);
     }
 
     #[test]
