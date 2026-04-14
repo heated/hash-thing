@@ -222,6 +222,8 @@ struct App {
     keys_held: HashSet<KeyCode>,
     /// Last frame's Space state so jump only triggers on a fresh press.
     jump_was_held: bool,
+    /// Pause redraw-driven rendering when the window loses focus.
+    focused: bool,
     /// Camera mode: orbit (debug) or first-person (gameplay).
     camera_mode: CameraMode,
     /// The player entity, if spawned.
@@ -310,6 +312,7 @@ impl App {
             last_mouse: None,
             keys_held: HashSet::new(),
             jump_was_held: false,
+            focused: true,
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
@@ -1102,9 +1105,18 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::Focused(false) => {
-                self.keys_held.clear();
-                self.jump_was_held = false;
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if focused {
+                    self.last_mouse = None;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                } else {
+                    self.keys_held.clear();
+                    self.jump_was_held = false;
+                    self.last_mouse = None;
+                }
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1448,7 +1460,7 @@ impl ApplicationHandler for App {
                 // stepping the sim + uploading the SVDAG during a 100%-CPU
                 // spin on an invisible surface is exactly what 8jp was about.
                 // `WindowEvent::Occluded(false)` re-arms the loop.
-                if self.occluded {
+                if self.occluded || !self.focused {
                     return;
                 }
 
