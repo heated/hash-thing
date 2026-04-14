@@ -88,6 +88,18 @@ If you find overlap with an in-flight branch, pick a different task or coordinat
 
 **Edward is never at the yoke.** The crew never waits for him at any gate, ever. Don't ask him to approve plans, don't wait for him to respond, don't idle.
 
+### Bead shipping flow
+
+For bd-backed work, follow `ship-auto` semantics, not the human-gated `/ship` flow. The canonical reference today is `~/.claude/commands/_archived/ship-auto.md` plus the global `~/.claude/CLAUDE.md` "Gate Tiers" rubric.
+
+Operationally, that means:
+- read `.bin/bd show <id>` **and every comment** before planning or coding
+- if a comment points at prior art like `hash-thing-xyz`, read that bead too before acting
+- write a plan, run plan review, and continue without waiting for human approval
+- only park for human input when the question satisfies the global "Gate Tiers" criteria for a real design gate
+
+The checked-in `.agents/commands/ship.md` is still the human-gated free-form workflow. Do **not** use its Phase 2b plan gate for routine bead work on this repo.
+
 ### Work cadence — short chunks, frequent re-consult
 
 Crew works in **5–30 minute chunks**. Reach a natural stopping point often (phase boundary, test green, helper extracted, commit boundary) and **reconsult `bd ready` before picking the next thing**. Do not grind on one task for hours without checking if something more urgent arrived. If you're heads-down on a 4-hour refactor without ever re-checking the queue, you're doing it wrong — break the refactor into smaller commits and re-poll between them.
@@ -104,10 +116,10 @@ At every gate (including design gates):
 
 1. `bd update <id> --status blocked`
 2. `bd comments add <id> "<one-line reason — what edward needs to decide>"`
-3. Pull the next task off `bd ready` and start a fresh `/ship <id>`
+3. Pull the next task off `bd ready` and start a fresh ship-auto pass on `<id>`
 4. Keep cycling — see the dry-queue section below
 
-Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/ship` end-to-end.
+Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through ship-auto end-to-end.
 
 **Design gates are narrower than they look.** If a scout finds two independent implementations of the same bead, do NOT park at a human gate just because there's a choice to make. Review both and pick one yourself. Only genuine user-facing design calls (what the system *is*, not how it's built) warrant the gate. Internal-API / implementation-detail decisions are autonomous. See `hash-thing-52b` for the precedent.
 
@@ -159,7 +171,7 @@ Commit at every natural boundary — plan file written, first test green, helper
 **The default lifecycle for any seat:**
 
 1. Claim the bead (`bd update <id> --claim`) on your worktree branch.
-2. Implement / review / fix on the worktree branch — normal `/ship` flow, this part doesn't change.
+2. Implement / review / fix on the worktree branch — normal ship-auto flow for beads, this part doesn't change.
 3. **Before declaring the bead closed, land it on main.** Either fast-forward `origin/main` or create a merge commit to it. If the tree hasn't moved, fast-forward. If it has, pull main first, resolve locally, push main forward. No PR dance, no waiting for edward.
 4. `bd close <id>` fires *after* main has the work, not after the worktree branch does.
 
@@ -176,7 +188,7 @@ Commit at every natural boundary — plan file written, first test green, helper
 - Design-gate parking — the bead is `blocked`, not ready; the branch goes quiet until unparked.
 - A seat found a genuine user-facing design question and is waiting on edward — rare, always a bead comment first.
 
-**What this does NOT mean:** We're not adopting GitLab/GitHub PR review as a gate. The `/ship` review tiers (dual/triple/trident) still run; the crew still cross-reviews. The difference is that "push passes" → "land on main" is one step, not two.
+**What this does NOT mean:** We're not adopting GitLab/GitHub PR review as a gate. The ship review tiers (dual/triple/trident) still run; the crew still cross-reviews. The difference is that "push passes" → "land on main" is one step, not two.
 
 The prior divergence backlog (18 commits on `worktree-vast-leaping-allen`, 9 on `worktree-sleepy-wiggling-fountain`, both ahead of main) was a bug, not a feature. 52b-A is the cleanup for that specific instance.
 
