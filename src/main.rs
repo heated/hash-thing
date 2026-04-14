@@ -1083,6 +1083,10 @@ impl ApplicationHandler for App {
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
+            // Some macOS / agent launches do not schedule an initial redraw
+            // on their own. Arm the first frame explicitly so startup scene
+            // generation and the steady redraw loop can begin.
+            window.request_redraw();
         }
     }
 
