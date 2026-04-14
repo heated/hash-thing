@@ -309,6 +309,10 @@ struct App {
     startup_scene_pending: bool,
     /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
     cursor_captured: bool,
+    /// Retry FPS grab from redraws after a transient startup failure.
+    cursor_retry_pending: bool,
+    /// Log at most one warning per failed grab streak.
+    cursor_grab_warned: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -323,6 +327,14 @@ fn should_warn_about_slow_dev_step(
 
 fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
     focused && camera_mode == CameraMode::FirstPerson
+}
+
+fn should_retry_cursor_capture_on_redraw(
+    focused: bool,
+    occluded: bool,
+    cursor_retry_pending: bool,
+) -> bool {
+    focused && !occluded && cursor_retry_pending
 }
 
 impl App {
@@ -370,6 +382,8 @@ impl App {
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
             cursor_captured: false,
+            cursor_retry_pending: false,
+            cursor_grab_warned: false,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -399,26 +413,38 @@ impl App {
                 Ok(()) => {
                     window.set_cursor_visible(false);
                     self.cursor_captured = true;
+                    self.cursor_retry_pending = false;
+                    self.cursor_grab_warned = false;
                     self.last_mouse = None;
                 }
                 Err(err) => {
-                    log::warn!("Failed to grab FPS cursor: {err}");
+                    if !self.cursor_grab_warned {
+                        log::warn!("Failed to grab FPS cursor: {err}");
+                    }
                     let _ = window.set_cursor_grab(CursorGrabMode::None);
                     window.set_cursor_visible(true);
                     self.cursor_captured = false;
+                    self.cursor_retry_pending = true;
+                    self.cursor_grab_warned = true;
                 }
             }
         } else {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             window.set_cursor_visible(true);
             self.cursor_captured = false;
+            self.cursor_retry_pending = false;
+            self.cursor_grab_warned = false;
             self.last_mouse = None;
         }
     }
 
     fn sync_cursor_capture(&mut self) {
         let should_capture = should_capture_cursor(self.camera_mode, self.focused);
-        if should_capture == self.cursor_captured {
+        if should_capture {
+            if self.cursor_captured {
+                return;
+            }
+        } else if !self.cursor_captured && !self.cursor_retry_pending {
             return;
         }
         self.apply_cursor_capture(should_capture);
@@ -1531,6 +1557,13 @@ impl ApplicationHandler for App {
                     self.startup_scene_pending = false;
                     self.load_initial_scene();
                 }
+                if should_retry_cursor_capture_on_redraw(
+                    self.focused,
+                    self.occluded,
+                    self.cursor_retry_pending,
+                ) {
+                    self.sync_cursor_capture();
+                }
 
                 // Frame delta time for frame-rate-independent movement (xa7).
                 let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
@@ -2183,5 +2216,13 @@ mod tests {
         assert!(!should_capture_cursor(CameraMode::FirstPerson, false));
         assert!(!should_capture_cursor(CameraMode::Orbit, true));
         assert!(!should_capture_cursor(CameraMode::Orbit, false));
+    }
+
+    #[test]
+    fn redraw_retry_only_runs_for_pending_fps_capture() {
+        assert!(should_retry_cursor_capture_on_redraw(true, false, true));
+        assert!(!should_retry_cursor_capture_on_redraw(true, true, true));
+        assert!(!should_retry_cursor_capture_on_redraw(false, false, true));
+        assert!(!should_retry_cursor_capture_on_redraw(true, false, false));
     }
 }
