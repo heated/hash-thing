@@ -222,6 +222,8 @@ struct App {
     keys_held: HashSet<KeyCode>,
     /// Last frame's Space state so jump only triggers on a fresh press.
     jump_was_held: bool,
+    /// Pause redraw-driven rendering when the window loses focus.
+    focused: bool,
     /// Camera mode: orbit (debug) or first-person (gameplay).
     camera_mode: CameraMode,
     /// The player entity, if spawned.
@@ -276,8 +278,6 @@ struct App {
     camera_feel: player::FirstPersonCameraFeel,
     /// Defer expensive initial scene generation until after the window exists.
     startup_scene_pending: bool,
-    /// Last known OS window focus state. Cursor capture only makes sense while focused.
-    window_focused: bool,
     /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
     cursor_captured: bool,
 }
@@ -292,8 +292,8 @@ fn should_warn_about_slow_dev_step(
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
-fn should_capture_cursor(camera_mode: CameraMode, window_focused: bool) -> bool {
-    window_focused && camera_mode == CameraMode::FirstPerson
+fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
+    focused && camera_mode == CameraMode::FirstPerson
 }
 
 impl App {
@@ -318,6 +318,7 @@ impl App {
             last_mouse: None,
             keys_held: HashSet::new(),
             jump_was_held: false,
+            focused: true,
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
@@ -339,7 +340,6 @@ impl App {
             short_demo_cut: None,
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
-            window_focused: true,
             cursor_captured: false,
         };
 
@@ -388,7 +388,7 @@ impl App {
     }
 
     fn sync_cursor_capture(&mut self) {
-        let should_capture = should_capture_cursor(self.camera_mode, self.window_focused);
+        let should_capture = should_capture_cursor(self.camera_mode, self.focused);
         if should_capture == self.cursor_captured {
             return;
         }
@@ -1148,16 +1148,20 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::Focused(false) => {
-                self.window_focused = false;
-                self.keys_held.clear();
-                self.jump_was_held = false;
-                self.sync_cursor_capture();
-            }
-
-            WindowEvent::Focused(true) => {
-                self.window_focused = true;
-                self.sync_cursor_capture();
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if focused {
+                    self.last_mouse = None;
+                    self.sync_cursor_capture();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                } else {
+                    self.keys_held.clear();
+                    self.jump_was_held = false;
+                    self.last_mouse = None;
+                    self.sync_cursor_capture();
+                }
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1502,7 +1506,7 @@ impl ApplicationHandler for App {
                 // stepping the sim + uploading the SVDAG during a 100%-CPU
                 // spin on an invisible surface is exactly what 8jp was about.
                 // `WindowEvent::Occluded(false)` re-arms the loop.
-                if self.occluded {
+                if self.occluded || !self.focused {
                     return;
                 }
 
