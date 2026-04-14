@@ -68,6 +68,35 @@ fn log_gen_stats(
     );
 }
 
+fn collect_visible_particle_data(
+    world: &sim::World,
+    entities: &sim::EntityStore,
+    camera_pos: [f64; 3],
+    render_origin: [i64; 3],
+    render_inv_size: f32,
+) -> Vec<[f32; 4]> {
+    entities
+        .iter()
+        .filter_map(|entity| {
+            let mat = match &entity.kind {
+                sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
+                sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
+                    entity.render_material().unwrap() as u32
+                }
+            };
+            if !player::has_line_of_sight(world, camera_pos, entity.pos) {
+                return None;
+            }
+            Some([
+                (entity.pos[0] - render_origin[0] as f64) as f32 * render_inv_size,
+                (entity.pos[1] - render_origin[1] as f64) as f32 * render_inv_size,
+                (entity.pos[2] - render_origin[2] as f64) as f32 * render_inv_size,
+                f32::from_bits(mat),
+            ])
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlayerPose {
     pos: [f64; 3],
@@ -527,29 +556,13 @@ impl App {
             return;
         };
 
-        let inv_size = self.render_inv_size;
-        let wo = self.render_origin;
-        let particle_data: Vec<[f32; 4]> = self
-            .entities
-            .iter()
-            .filter_map(|e| {
-                let mat = match &e.kind {
-                    sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
-                    sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
-                        e.render_material().unwrap() as u32
-                    }
-                };
-                if !player::has_line_of_sight(&self.world, camera_pos, e.pos) {
-                    return None;
-                }
-                Some([
-                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
-                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
-                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
-                    f32::from_bits(mat),
-                ])
-            })
-            .collect();
+        let particle_data = collect_visible_particle_data(
+            &self.world,
+            &self.entities,
+            camera_pos,
+            self.render_origin,
+            self.render_inv_size,
+        );
 
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_particles(&particle_data);
@@ -1117,6 +1130,10 @@ impl ApplicationHandler for App {
                 &mut self.last_svdag_stats,
             );
             self.sync_cursor_capture();
+            // Some macOS / agent launches do not schedule an initial redraw
+            // on their own. Arm the first frame explicitly so startup scene
+            // generation and the steady redraw loop can begin.
+            window.request_redraw();
         }
     }
 
@@ -1959,6 +1976,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
     use std::time::Duration;
 
     #[test]
@@ -2045,6 +2063,50 @@ mod tests {
         let app = App::new(256);
         assert!(app.startup_scene_pending);
         assert_eq!(app.world.population(), 0);
+    }
+
+    #[test]
+    fn collect_visible_particle_data_culls_entities_behind_walls() {
+        let mut world = sim::World::new(3);
+        let wall = hash_thing::octree::Cell::pack(1, 0).raw();
+        world.set(
+            sim::WorldCoord(3),
+            sim::WorldCoord(1),
+            sim::WorldCoord(1),
+            wall,
+        );
+
+        let mut entities = sim::EntityStore::new();
+        entities.add(
+            [2.5, 1.5, 1.5],
+            [0.0; 3],
+            sim::EntityKind::Critter(sim::CritterState::new(VINE_MATERIAL_ID)),
+        );
+        entities.add(
+            [5.5, 1.5, 1.5],
+            [0.0; 3],
+            sim::EntityKind::Particle(sim::ParticleState {
+                material: FIRE_MATERIAL_ID,
+                ttl: 5,
+                on_despawn: None,
+            }),
+        );
+
+        let visible = collect_visible_particle_data(
+            &world,
+            &entities,
+            [1.5, 1.5, 1.5],
+            [0, 0, 0],
+            1.0 / world.side() as f32,
+        );
+
+        assert_eq!(
+            visible.len(),
+            1,
+            "only the unoccluded critter should upload"
+        );
+        assert_eq!(visible[0][3].to_bits(), VINE_MATERIAL_ID as u32);
+        assert!((visible[0][0] - 2.5 / world.side() as f32).abs() < 1e-6);
     }
 
     #[test]
