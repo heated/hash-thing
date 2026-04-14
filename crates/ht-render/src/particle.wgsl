@@ -22,11 +22,15 @@ struct Particle {
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> particles: array<Particle>;
 @group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
+@group(0) @binding(3) var t_scene: texture_2d<f32>;
+@group(0) @binding(4) var s_scene: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) screen_uv: vec2<f32>,
+    @location(3) ray_t: f32,
 };
 
 @vertex
@@ -49,6 +53,7 @@ fn vs_main(
     let p = particles[iid];
     let world_pos = p.pos_mat.xyz;
     let material = bitcast<u32>(p.pos_mat.w);
+    let center_ray_t = length(world_pos - u.camera_pos.xyz);
 
     // Billboard size in world units. Particles are small — 1/64 of the
     // volume (one voxel-ish). Scale slightly larger so they're visible.
@@ -77,10 +82,6 @@ fn vs_main(
     let clip_y = vy / (vz * fov_tan);
 
     var out: VertexOutput;
-    // Clamp depth slightly above 0 to avoid artifacts from particles behind camera.
-    let depth = max(vz, 0.001);
-    // Map to NDC depth [0,1] — simple reciprocal, no near/far planes needed
-    // since we're overlaying on a raycast (no depth buffer).
     out.position = vec4<f32>(clip_x, clip_y, 0.5, 1.0);
     // Hide particles behind the camera.
     if vz < 0.0 {
@@ -88,11 +89,19 @@ fn vs_main(
     }
     out.uv = uv;
     out.color = palette[material];
+    out.screen_uv = vec2<f32>(clip_x * 0.5 + 0.5, 0.5 - clip_y * 0.5);
+    out.ray_t = center_ray_t;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let scene = textureSample(t_scene, s_scene, in.screen_uv);
+    let depth_epsilon = 2.0 / u.params.x;
+    if scene.a > 0.0 && scene.a + depth_epsilon < in.ray_t {
+        discard;
+    }
+
     // Soft circular dot — fade from center to edge.
     let dist = length(in.uv);
     if dist > 1.0 {

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -646,7 +646,7 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -665,6 +665,22 @@ impl Renderer {
                         count: None,
                     },
                     palette_bgl_entry,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -1108,6 +1124,49 @@ impl Renderer {
                     ],
                 }));
         }
+
+        if self.particle_count > 0 {
+            self.rebuild_particle_bind_group();
+        }
+    }
+
+    fn rebuild_particle_bind_group(&mut self) {
+        let Some(buf) = &self.particle_buffer else {
+            self.particle_bind_group = None;
+            return;
+        };
+        if self.particle_count == 0 {
+            self.particle_bind_group = None;
+            return;
+        }
+
+        self.particle_bind_group =
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("particle_bg"),
+                layout: &self.particle_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.palette_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.raycast_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                    },
+                ],
+            }));
     }
 
     /// Consume and return the most recently resolved GPU render-pass
@@ -1226,26 +1285,8 @@ impl Renderer {
             });
 
         // Rebuild particle bind group if it exists (it references palette).
-        if let Some(particle_buf) = &self.particle_buffer {
-            self.particle_bind_group =
-                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("particle_bg"),
-                    layout: &self.particle_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.uniform_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: particle_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: self.palette_buffer.as_entire_binding(),
-                        },
-                    ],
-                }));
+        if self.particle_buffer.is_some() {
+            self.rebuild_particle_bind_group();
         }
 
         // Rebuild hotbar bind group (it references palette via binding 1).
@@ -1321,25 +1362,7 @@ impl Renderer {
 
         if let Some(buf) = &self.particle_buffer {
             self.queue.write_buffer(buf, 0, bytes);
-            self.particle_bind_group =
-                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("particle_bg"),
-                    layout: &self.particle_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.uniform_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: self.palette_buffer.as_entire_binding(),
-                        },
-                    ],
-                }));
+            self.rebuild_particle_bind_group();
         }
     }
 
@@ -1674,7 +1697,7 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameOutcome, ticks_to_duration};
+    use super::{ticks_to_duration, FrameOutcome};
     use std::time::Duration;
 
     #[test]

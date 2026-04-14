@@ -10,9 +10,9 @@ use crate::octree::{Cell, CellState};
 use crate::sim::margolus::FluidBlockRule;
 use crate::sim::margolus::GravityBlockRule;
 use crate::sim::rule::{
-    AcidRule, AirRule, AirVineGrowthRule, BlockRule, CaRule, DissolvableRule, FanDrivenRule,
-    FanRule, FireRule, FireworkRule, FlammableRule, GameOfLife3D, IceRule, LavaRule, NoopRule,
-    SteamRule, VineRule, WaterRule,
+    AcidRule, AirRule, AirVineGrowthRule, BlockRule, CaRule, DissolvableRule, FanCarriedMaterial,
+    FanDrivenRule, FanRule, FireRule, FireworkRule, FlammableRule, GameOfLife3D, IceRule, LavaRule,
+    NoopRule, SteamRule, VineRule, WaterRule,
 };
 
 pub type MaterialId = u16;
@@ -38,6 +38,26 @@ pub const VINE_MATERIAL_ID: MaterialId = 15;
 pub const FAN_MATERIAL_ID: MaterialId = 16;
 pub const FIREWORK_MATERIAL_ID: MaterialId = 17;
 pub const CLONE_MATERIAL_ID: MaterialId = 18;
+const FAN_STEAM_POS_X_MATERIAL_ID: MaterialId = 19;
+const FAN_STEAM_NEG_X_MATERIAL_ID: MaterialId = 20;
+const FAN_STEAM_POS_Z_MATERIAL_ID: MaterialId = 21;
+const FAN_STEAM_NEG_Z_MATERIAL_ID: MaterialId = 22;
+const FAN_FIREWORK_POS_X_MATERIAL_ID: MaterialId = 23;
+const FAN_FIREWORK_NEG_X_MATERIAL_ID: MaterialId = 24;
+const FAN_FIREWORK_POS_Z_MATERIAL_ID: MaterialId = 25;
+const FAN_FIREWORK_NEG_Z_MATERIAL_ID: MaterialId = 26;
+pub(crate) const FAN_ARMED_STEAM_MATERIAL_IDS: [MaterialId; 4] = [
+    FAN_STEAM_POS_X_MATERIAL_ID,
+    FAN_STEAM_NEG_X_MATERIAL_ID,
+    FAN_STEAM_POS_Z_MATERIAL_ID,
+    FAN_STEAM_NEG_Z_MATERIAL_ID,
+];
+pub(crate) const FAN_ARMED_FIREWORK_MATERIAL_IDS: [MaterialId; 4] = [
+    FAN_FIREWORK_POS_X_MATERIAL_ID,
+    FAN_FIREWORK_NEG_X_MATERIAL_ID,
+    FAN_FIREWORK_POS_Z_MATERIAL_ID,
+    FAN_FIREWORK_NEG_Z_MATERIAL_ID,
+];
 
 pub const AIR: CellState = Cell::EMPTY.raw();
 pub const STONE: CellState = Cell::pack(STONE_MATERIAL_ID, 0).raw();
@@ -80,11 +100,13 @@ pub fn material_density(cell: Cell) -> f32 {
         OIL_MATERIAL_ID => 0.8,
         GUNPOWDER_MATERIAL_ID => 1.4,
         STEAM_MATERIAL_ID => -0.1,
+        id if FAN_ARMED_STEAM_MATERIAL_IDS.contains(&id) => -0.1,
         GAS_MATERIAL_ID => -0.2,
         METAL_MATERIAL_ID => 7.0,
         VINE_MATERIAL_ID => 1.1,
         FAN_MATERIAL_ID => 1.0,
         FIREWORK_MATERIAL_ID => -0.3,
+        id if FAN_ARMED_FIREWORK_MATERIAL_IDS.contains(&id) => -0.3,
         CLONE_MATERIAL_ID => 10.0, // immovable
         _ => 0.0,
     }
@@ -156,6 +178,10 @@ impl MaterialRegistry {
         let mut registry = Self::new();
         let air_rule = registry.register_rule(AirRule {
             fan_material: FAN_MATERIAL_ID,
+            carried_materials: vec![
+                FanCarriedMaterial::new(STEAM_MATERIAL_ID, FAN_ARMED_STEAM_MATERIAL_IDS),
+                FanCarriedMaterial::new(FIREWORK_MATERIAL_ID, FAN_ARMED_FIREWORK_MATERIAL_IDS),
+            ],
             vine_growth: Some(AirVineGrowthRule {
                 vine_material: VINE_MATERIAL_ID,
                 support_materials: vec![
@@ -221,14 +247,22 @@ impl MaterialRegistry {
             },
             FAN_MATERIAL_ID,
         ));
-        let steam_rule = registry.register_rule(SteamRule {
-            condense_product: Cell::pack(WATER_MATERIAL_ID, 0),
-            max_age: 20,
-        });
-        let firework_rule = registry.register_rule(FireworkRule {
-            explode_product: Cell::pack(FIRE_MATERIAL_ID, 0),
-            fuse_length: 12,
-        });
+        let steam_rule = registry.register_rule(FanDrivenRule::new_with_material_transport(
+            SteamRule {
+                condense_product: Cell::pack(WATER_MATERIAL_ID, 0),
+                max_age: 20,
+            },
+            FAN_MATERIAL_ID,
+            FanCarriedMaterial::new(STEAM_MATERIAL_ID, FAN_ARMED_STEAM_MATERIAL_IDS),
+        ));
+        let firework_rule = registry.register_rule(FanDrivenRule::new_with_material_transport(
+            FireworkRule {
+                explode_product: Cell::pack(FIRE_MATERIAL_ID, 0),
+                fuse_length: 12,
+            },
+            FAN_MATERIAL_ID,
+            FanCarriedMaterial::new(FIREWORK_MATERIAL_ID, FAN_ARMED_FIREWORK_MATERIAL_IDS),
+        ));
         let fan_fire_rule = registry.register_rule(FanDrivenRule::new(
             FireRule {
                 fuel_materials: vec![
@@ -564,6 +598,54 @@ impl MaterialRegistry {
                 block_rule_id: Some(gravity_block_rule),
             },
         );
+        for (material_id, label) in [
+            (FAN_STEAM_POS_X_MATERIAL_ID, "_fan_steam_pos_x"),
+            (FAN_STEAM_NEG_X_MATERIAL_ID, "_fan_steam_neg_x"),
+            (FAN_STEAM_POS_Z_MATERIAL_ID, "_fan_steam_pos_z"),
+            (FAN_STEAM_NEG_Z_MATERIAL_ID, "_fan_steam_neg_z"),
+        ] {
+            registry.insert(
+                material_id,
+                MaterialEntry {
+                    visual: MaterialVisualProperties {
+                        label,
+                        base_color: [0.85, 0.85, 0.9, 0.6],
+                        texture_ref: None,
+                    },
+                    physical: MaterialPhysicalProperties {
+                        density: -0.1,
+                        flammability: 0.0,
+                        conductivity: 0.3,
+                    },
+                    rule_id: steam_rule,
+                    block_rule_id: Some(gravity_block_rule),
+                },
+            );
+        }
+        for (material_id, label) in [
+            (FAN_FIREWORK_POS_X_MATERIAL_ID, "_fan_firework_pos_x"),
+            (FAN_FIREWORK_NEG_X_MATERIAL_ID, "_fan_firework_neg_x"),
+            (FAN_FIREWORK_POS_Z_MATERIAL_ID, "_fan_firework_pos_z"),
+            (FAN_FIREWORK_NEG_Z_MATERIAL_ID, "_fan_firework_neg_z"),
+        ] {
+            registry.insert(
+                material_id,
+                MaterialEntry {
+                    visual: MaterialVisualProperties {
+                        label,
+                        base_color: [0.9, 0.2, 0.5, 1.0],
+                        texture_ref: None,
+                    },
+                    physical: MaterialPhysicalProperties {
+                        density: -0.3,
+                        flammability: 0.8,
+                        conductivity: 0.0,
+                    },
+                    rule_id: firework_rule,
+                    block_rule_id: Some(gravity_block_rule),
+                },
+            );
+        }
         registry.insert(
             CLONE_MATERIAL_ID,
             MaterialEntry {
@@ -1113,11 +1195,19 @@ mod tests {
             OIL_MATERIAL_ID,
             GUNPOWDER_MATERIAL_ID,
             STEAM_MATERIAL_ID,
+            FAN_STEAM_POS_X_MATERIAL_ID,
+            FAN_STEAM_NEG_X_MATERIAL_ID,
+            FAN_STEAM_POS_Z_MATERIAL_ID,
+            FAN_STEAM_NEG_Z_MATERIAL_ID,
             GAS_MATERIAL_ID,
             METAL_MATERIAL_ID,
             VINE_MATERIAL_ID,
             FAN_MATERIAL_ID,
             FIREWORK_MATERIAL_ID,
+            FAN_FIREWORK_POS_X_MATERIAL_ID,
+            FAN_FIREWORK_NEG_X_MATERIAL_ID,
+            FAN_FIREWORK_POS_Z_MATERIAL_ID,
+            FAN_FIREWORK_NEG_Z_MATERIAL_ID,
             CLONE_MATERIAL_ID,
         ];
         for &id in &ids {
