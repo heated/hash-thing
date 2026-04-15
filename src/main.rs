@@ -319,6 +319,10 @@ fn should_warn_about_slow_dev_step(
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
+fn default_legend_visibility(mode: CameraMode) -> bool {
+    matches!(mode, CameraMode::Orbit)
+}
+
 impl App {
     fn new(volume_size: u32) -> Self {
         let level = volume_size.trailing_zeros();
@@ -357,7 +361,7 @@ impl App {
             render_origin,
             render_inv_size,
             warned_dev_profile_perf: false,
-            legend_visible: true,
+            legend_visible: default_legend_visibility(CameraMode::FirstPerson),
             legend_dirty: true,
             current_demo_beat: None,
             short_demo_cut: None,
@@ -532,45 +536,46 @@ impl App {
     fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
         match mode {
             CameraMode::FirstPerson => vec![
-                "  FIRST-PERSON MODE",
+                "  FIELD LINK",
                 "",
-                "  WASD        Move",
-                "  Mouse       Look",
-                "  Space       Jump",
-                "  Ctrl        Sprint",
-                "  LClick      Break block",
-                "  RClick      Place block",
-                "  1-7         Material",
-                "  Tab         Orbit mode",
+                "  WASD        Drift",
+                "  Mouse       Aim",
+                "  Space       Leap",
+                "  Ctrl        Surge",
+                "  LClick      Carve",
+                "  RClick      Cast",
+                "  Scroll/1-9  Matter",
+                "  Ctrl+RClick Clone source",
+                "  Tab         Survey cam",
                 "",
                 "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Walk lattice",
+                "  R  Reset      G  GoL bloom",
+                "  M  Gyroid     N  Lattice walk",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Toggle help",
-                "  Esc Quit",
+                "  F5 Pause      F1  Signal legend",
+                "  Esc Exit",
             ],
             CameraMode::Orbit => vec![
-                "  ORBIT MODE",
+                "  SURVEY CAM",
                 "",
-                "  LClick+Drag Orbit camera",
-                "  Scroll      Zoom",
+                "  LClick+Drag Orbit",
+                "  Scroll      Push / pull",
                 "  Space       Pause",
                 "  S           Single step",
-                "  1-4         CA rule",
-                "  Tab         FPS mode",
+                "  1-4         Rule set",
+                "  Tab         Field link",
                 "",
                 "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Walk lattice",
+                "  R  Reset      G  GoL bloom",
+                "  M  Gyroid     N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
                 "  V  DEV tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Toggle help",
-                "  Esc Quit",
+                "  F5 Pause      F1  Signal legend",
+                "  Esc Exit",
             ],
         }
     }
@@ -611,6 +616,7 @@ impl App {
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
         self.camera_mode = CameraMode::Orbit;
         self.camera_feel.reset();
+        self.legend_visible = default_legend_visibility(self.camera_mode);
         self.legend_dirty = true;
         if let Some(renderer) = &mut self.renderer {
             renderer.camera_target = pose.target;
@@ -1183,6 +1189,7 @@ impl ApplicationHandler for App {
                             if self.camera_mode == CameraMode::Orbit {
                                 self.camera_feel.reset();
                             }
+                            self.legend_visible = default_legend_visibility(self.camera_mode);
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
@@ -1804,7 +1811,7 @@ impl ApplicationHandler for App {
                                 }
                                 renderer.camera_dist = 0.0;
                                 renderer.hud_visible = true;
-                                renderer.hotbar_visible = true;
+                                renderer.hotbar_visible = false;
                             }
                         }
                     }
@@ -2062,7 +2069,8 @@ mod tests {
     #[test]
     fn first_person_legend_hides_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
-        assert!(lines.iter().any(|line| line.contains("Space       Jump")));
+        assert!(lines.iter().any(|line| line.contains("Space       Leap")));
+        assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
         assert!(!lines.iter().any(|line| line.contains("Fly down")));
         assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
@@ -2070,7 +2078,7 @@ mod tests {
             .iter()
             .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
-        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
+        assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
 
     #[test]
@@ -2081,7 +2089,13 @@ mod tests {
             .iter()
             .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
-        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
+        assert!(lines.iter().any(|line| line.contains("Lattice walk")));
+    }
+
+    #[test]
+    fn legend_defaults_follow_camera_mode() {
+        assert!(!default_legend_visibility(CameraMode::FirstPerson));
+        assert!(default_legend_visibility(CameraMode::Orbit));
     }
 
     #[test]
