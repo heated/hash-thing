@@ -138,7 +138,7 @@ _(filled at finish)_
    - Assumptions you're making so the human can correct early
    - Tradeoffs and edge cases the human may not have considered
 3. **Ask preferences:**
-   - **Plan review tier:** trident / triple / dual / single / none — runs automatically in Phase 3 **after** the human approves the plan in Phase 2b. **Default comes from the bead priority table in global `~/.claude/CLAUDE.md` "Reviews"** — not free-form agent pick. If `$BD_ID` is set, read `bd show $BD_ID` for the priority and map via that table. If unsure, go *up* a tier; the cost of an extra review is negligible vs a shipped bug in invariant-bearing code. Only downgrade with explicit rationale noted in the metadata file. Never skip plan review on P0/P1 without the human's explicit say-so.
+   - **Plan review tier:** trident / triple / dual / single / none — runs automatically in Phase 3 **after** the human approves the plan in Phase 2b. **Default comes from the bead priority table in the project `CLAUDE.md` / `AGENTS.md` "Reviews" section** — not free-form agent pick. If `$BD_ID` is set, read `bd show $BD_ID` for the priority and map via that table. If unsure, go *up* a tier; the cost of an extra review is negligible vs a shipped bug in invariant-bearing code. Only downgrade with explicit rationale noted in the metadata file. Never skip plan review on P0/P1 without the human's explicit say-so.
    - **Preview:** spin up dev servers on completion? (Agent decides which service based on what changed.)
 4. **Record preferences** in the metadata file
 

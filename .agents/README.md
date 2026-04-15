@@ -13,6 +13,11 @@ This directory is the **shared surface** that Claude Code, Codex Exec, and Gemin
 │   ├── trident-plan-review.md
 │   ├── ship.md
 │   └── diagram.md
+├── prompts/           # tracked prompt frameworks used by project-local commands
+│   ├── CodeReview-Evolutionary.md
+│   ├── PlanReview-Standard.md
+│   ├── PlanReview-Adversarial.md
+│   └── PlanReview-Evolutionary.md
 └── skills/
     └── review-tiers/
         └── SKILL.md   # tier selection algorithm for /ship phase 6
@@ -24,7 +29,7 @@ These are **copies**, not symlinks into `~/.claude/`. Absolute symlinks break on
 
 - `AGENTS.md` at the repo root is a symlink to `CLAUDE.md`. Codex and Gemini auto-load `AGENTS.md`; Claude Code auto-loads `CLAUDE.md`. Content is identical because it's the same file.
 - `.agents/` is tracked in git (not in `.gitignore`). Every worktree and every fresh clone has it.
-- The `/ship` skill's phase-6 review prompt may still hardcode `~/.claude/commands/code_review.md` for Claude Code sessions. That's fine — the project-local copy is there for Codex/Gemini sessions and for cross-tool trident reviews, not as a replacement for Claude Code's user-global discovery path.
+- Project-local trident review commands must resolve every review framework they execute from `.agents/`, not `~/.claude/`, so fresh clones and non-Claude seats can run without private global config.
 
 ## Refreshing from `~/.claude/`
 
@@ -38,6 +43,10 @@ cp ~/.claude/commands/trident-code-review.md  .agents/commands/trident-code-revi
 cp ~/.claude/commands/trident-plan-review.md  .agents/commands/trident-plan-review.md
 cp ~/.claude/commands/ship.md                 .agents/commands/ship.md
 cp ~/.claude/commands/diagram.md              .agents/commands/diagram.md
+cp ~/.claude/agents/CodeReview-Evolutionary.md .agents/prompts/CodeReview-Evolutionary.md
+cp ~/.claude/agents/PlanReview-Standard.md     .agents/prompts/PlanReview-Standard.md
+cp ~/.claude/agents/PlanReview-Adversarial.md  .agents/prompts/PlanReview-Adversarial.md
+cp ~/.claude/agents/PlanReview-Evolutionary.md .agents/prompts/PlanReview-Evolutionary.md
 
 # review-tiers lives in _archived in ~/.claude but is still the authoritative copy:
 cp -r ~/.claude/skills/_archived/review-tiers/* .agents/skills/review-tiers/

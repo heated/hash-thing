@@ -123,7 +123,7 @@ For each of the 6 Codex/Gemini agents, write a prompt file. **Codex prompt files
 ```bash
 # Codex prompt — note /tmp output path
 cat > "$WS_STAGING/prompt-standard-codex.md" <<'EOF'
-Read ~/.claude/agents/PlanReview-Standard.md for your review approach and thinking framework. Then read {INPUT_FILE} — that is the document you are reviewing.
+Read .agents/prompts/PlanReview-Standard.md for your review approach and thinking framework. Then read {INPUT_FILE} — that is the document you are reviewing.
 
 **THIS IS A READ-ONLY REVIEW.** Your ONLY output is the review file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
 
@@ -147,9 +147,9 @@ EOF
 
 Copy the prompt framework files into the workspace-local staging (both Codex and Gemini sandbox reads to the workspace):
 ```bash
-cp ~/.claude/agents/PlanReview-Standard.md "$WS_STAGING/"
-cp ~/.claude/agents/PlanReview-Adversarial.md "$WS_STAGING/"
-cp ~/.claude/agents/PlanReview-Evolutionary.md "$WS_STAGING/"
+cp .agents/prompts/PlanReview-Standard.md "$WS_STAGING/"
+cp .agents/prompts/PlanReview-Adversarial.md "$WS_STAGING/"
+cp .agents/prompts/PlanReview-Evolutionary.md "$WS_STAGING/"
 ```
 
 If the input file is outside the workspace, also copy it:
@@ -179,9 +179,9 @@ For Gemini prompt files, use workspace-local paths for both the framework file a
 **Claude agents** (3x) — use the **Agent tool** (parallel subagents):
 
 Launch three Agent tool calls in a single message with the launch template, substituting:
-- Standard: `PROMPT_PATH=~/.claude/agents/PlanReview-Standard.md`, `lens=standard`, `MODEL=Claude`
-- Adversarial: `PROMPT_PATH=~/.claude/agents/PlanReview-Adversarial.md`, `lens=adversarial`, `MODEL=Claude`
-- Evolutionary: `PROMPT_PATH=~/.claude/agents/PlanReview-Evolutionary.md`, `lens=evolutionary`, `MODEL=Claude`
+- Standard: `PROMPT_PATH=.agents/prompts/PlanReview-Standard.md`, `lens=standard`, `MODEL=Claude`
+- Adversarial: `PROMPT_PATH=.agents/prompts/PlanReview-Adversarial.md`, `lens=adversarial`, `MODEL=Claude`
+- Evolutionary: `PROMPT_PATH=.agents/prompts/PlanReview-Evolutionary.md`, `lens=evolutionary`, `MODEL=Claude`
 
 ---
 
