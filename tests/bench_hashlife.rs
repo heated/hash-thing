@@ -5,6 +5,10 @@
 //! These are `#[ignore]` tests, not criterion benchmarks, to avoid adding
 //! dependencies. The `--release` flag is critical — debug builds are 10-50x
 //! slower and not representative of real performance.
+//!
+//! Confidence note: this file is observational only. It prints timings and
+//! cache stats for manual comparison; it does not enforce a machine-checked
+//! performance budget in CI.
 
 use hash_thing::sim::World;
 use hash_thing::terrain::materials::STONE;
