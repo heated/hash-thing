@@ -194,7 +194,7 @@ echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUM
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 
 # Evolutionary prompt
-cat ~/.claude/agents/CodeReview-Evolutionary.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
+cat .agents/prompts/CodeReview-Evolutionary.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
 ```
@@ -221,7 +221,7 @@ For Gemini, also copy the prompt framework files into the workspace (Gemini sand
 ```bash
 cp .agents/commands/code_review.md notes/.tmp/trident-{REVIEW_ID}/
 cp .agents/commands/code_review_critical.md notes/.tmp/trident-{REVIEW_ID}/
-cp ~/.claude/agents/CodeReview-Evolutionary.md notes/.tmp/trident-{REVIEW_ID}/
+cp .agents/prompts/CodeReview-Evolutionary.md notes/.tmp/trident-{REVIEW_ID}/
 ```
 
 For Gemini prompt files, use workspace-local paths for both the framework file and the context document.
