@@ -14,7 +14,7 @@ use winit::{
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::EventLoop,
     keyboard::KeyCode,
-    window::{Window, WindowAttributes},
+    window::{CursorGrabMode, Window, WindowAttributes},
 };
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
@@ -66,6 +66,35 @@ fn log_gen_stats(
         nag = stats.nodes_after_gen,
         ns = noise_ns_per_sample,
     );
+}
+
+fn collect_visible_particle_data(
+    world: &sim::World,
+    entities: &sim::EntityStore,
+    camera_pos: [f64; 3],
+    render_origin: [i64; 3],
+    render_inv_size: f32,
+) -> Vec<[f32; 4]> {
+    entities
+        .iter()
+        .filter_map(|entity| {
+            let mat = match &entity.kind {
+                sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
+                sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
+                    entity.render_material().unwrap() as u32
+                }
+            };
+            if !player::has_line_of_sight(world, camera_pos, entity.pos) {
+                return None;
+            }
+            Some([
+                (entity.pos[0] - render_origin[0] as f64) as f32 * render_inv_size,
+                (entity.pos[1] - render_origin[1] as f64) as f32 * render_inv_size,
+                (entity.pos[2] - render_origin[2] as f64) as f32 * render_inv_size,
+                f32::from_bits(mat),
+            ])
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -278,6 +307,8 @@ struct App {
     camera_feel: player::FirstPersonCameraFeel,
     /// Defer expensive initial scene generation until after the window exists.
     startup_scene_pending: bool,
+    /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
+    cursor_captured: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -288,6 +319,14 @@ fn should_warn_about_slow_dev_step(
     debug_build
         && volume_size >= 256
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
+}
+
+fn default_legend_visibility(mode: CameraMode) -> bool {
+    matches!(mode, CameraMode::Orbit)
+}
+
+fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
+    focused && camera_mode == CameraMode::FirstPerson
 }
 
 impl App {
@@ -328,12 +367,13 @@ impl App {
             render_origin,
             render_inv_size,
             warned_dev_profile_perf: false,
-            legend_visible: true,
+            legend_visible: default_legend_visibility(CameraMode::FirstPerson),
             legend_dirty: true,
             current_demo_beat: None,
             short_demo_cut: None,
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
+            cursor_captured: false,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -347,6 +387,45 @@ impl App {
         log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
 
         app
+    }
+
+    fn apply_cursor_capture(&mut self, capture: bool) {
+        let Some(window) = self.window.as_ref() else {
+            self.cursor_captured = false;
+            return;
+        };
+
+        if capture {
+            let grab = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            match grab {
+                Ok(()) => {
+                    window.set_cursor_visible(false);
+                    self.cursor_captured = true;
+                    self.last_mouse = None;
+                }
+                Err(err) => {
+                    log::warn!("Failed to grab FPS cursor: {err}");
+                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                    self.cursor_captured = false;
+                }
+            }
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.cursor_captured = false;
+            self.last_mouse = None;
+        }
+    }
+
+    fn sync_cursor_capture(&mut self) {
+        let should_capture = should_capture_cursor(self.camera_mode, self.focused);
+        if should_capture == self.cursor_captured {
+            return;
+        }
+        self.apply_cursor_capture(should_capture);
     }
 
     fn load_initial_scene(&mut self) {
@@ -391,6 +470,18 @@ impl App {
             self.world.origin[1] as f64 + side * 0.5,
             self.world.origin[2] as f64 + side * 0.5,
         ]
+    }
+
+    fn recenter_player(&mut self) -> bool {
+        let Some(pid) = self.player_id else {
+            return false;
+        };
+        let center = self.world_center();
+        let Some(player) = self.entities.get_mut(pid) else {
+            return false;
+        };
+        player.pos = [center[0], center[1] + 2.0, center[2]];
+        true
     }
 
     fn reset_scene_entities(&mut self) -> [f64; 3] {
@@ -481,29 +572,13 @@ impl App {
             return;
         };
 
-        let inv_size = self.render_inv_size;
-        let wo = self.render_origin;
-        let particle_data: Vec<[f32; 4]> = self
-            .entities
-            .iter()
-            .filter_map(|e| {
-                let mat = match &e.kind {
-                    sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
-                    sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
-                        e.render_material().unwrap() as u32
-                    }
-                };
-                if !player::has_line_of_sight(&self.world, camera_pos, e.pos) {
-                    return None;
-                }
-                Some([
-                    (e.pos[0] - wo[0] as f64) as f32 * inv_size,
-                    (e.pos[1] - wo[1] as f64) as f32 * inv_size,
-                    (e.pos[2] - wo[2] as f64) as f32 * inv_size,
-                    f32::from_bits(mat),
-                ])
-            })
-            .collect();
+        let particle_data = collect_visible_particle_data(
+            &self.world,
+            &self.entities,
+            camera_pos,
+            self.render_origin,
+            self.render_inv_size,
+        );
 
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_particles(&particle_data);
@@ -519,45 +594,46 @@ impl App {
     fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
         match mode {
             CameraMode::FirstPerson => vec![
-                "  FIRST-PERSON MODE",
+                "  FIELD LINK",
                 "",
-                "  WASD        Move",
-                "  Mouse       Look",
-                "  Space       Jump",
-                "  Ctrl        Sprint",
-                "  LClick      Break block",
-                "  RClick      Place block",
-                "  1-7         Material",
-                "  Tab         Orbit mode",
+                "  WASD        Drift",
+                "  Mouse       Aim",
+                "  Space       Leap",
+                "  Ctrl        Surge",
+                "  LClick      Carve",
+                "  RClick      Cast",
+                "  Scroll/1-9  Matter",
+                "  Ctrl+RClick Clone source",
+                "  Tab         Survey cam",
                 "",
                 "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Walk lattice",
+                "  R  Reset      G  GoL bloom",
+                "  M  Gyroid     N  Lattice walk",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Toggle help",
-                "  Esc Quit",
+                "  F5 Pause      F1  Signal legend",
+                "  Esc Exit",
             ],
             CameraMode::Orbit => vec![
-                "  ORBIT MODE",
+                "  SURVEY CAM",
                 "",
-                "  LClick+Drag Orbit camera",
-                "  Scroll      Zoom",
+                "  LClick+Drag Orbit",
+                "  Scroll      Push / pull",
                 "  Space       Pause",
                 "  S           Single step",
-                "  1-4         CA rule",
-                "  Tab         FPS mode",
+                "  1-4         Rule set",
+                "  Tab         Field link",
                 "",
                 "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Walk lattice",
+                "  R  Reset      G  GoL bloom",
+                "  M  Gyroid     N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
                 "  V  DEV tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Toggle help",
-                "  Esc Quit",
+                "  F5 Pause      F1  Signal legend",
+                "  Esc Exit",
             ],
         }
     }
@@ -598,6 +674,7 @@ impl App {
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
         self.camera_mode = CameraMode::Orbit;
         self.camera_feel.reset();
+        self.legend_visible = default_legend_visibility(self.camera_mode);
         self.legend_dirty = true;
         if let Some(renderer) = &mut self.renderer {
             renderer.camera_target = pose.target;
@@ -1070,6 +1147,7 @@ impl ApplicationHandler for App {
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
             );
+            self.sync_cursor_capture();
             // Some macOS / agent launches do not schedule an initial redraw
             // on their own. Arm the first frame explicitly so startup scene
             // generation and the steady redraw loop can begin.
@@ -1109,6 +1187,7 @@ impl ApplicationHandler for App {
                 self.focused = focused;
                 if focused {
                     self.last_mouse = None;
+                    self.sync_cursor_capture();
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1116,6 +1195,7 @@ impl ApplicationHandler for App {
                     self.keys_held.clear();
                     self.jump_was_held = false;
                     self.last_mouse = None;
+                    self.sync_cursor_capture();
                 }
             }
 
@@ -1150,12 +1230,8 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("0") => {
                             // Recenter player at world center.
-                            if let Some(pid) = self.player_id {
-                                let center = self.world.side() as f64 / 2.0;
-                                if let Some(p) = self.entities.get_mut(pid) {
-                                    p.pos = [center, center + 2.0, center];
-                                    log::info!("Player recentered");
-                                }
+                            if self.recenter_player() {
+                                log::info!("Player recentered");
                             }
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F1) => {
@@ -1170,6 +1246,8 @@ impl ApplicationHandler for App {
                             if self.camera_mode == CameraMode::Orbit {
                                 self.camera_feel.reset();
                             }
+                            self.legend_visible = default_legend_visibility(self.camera_mode);
+                            self.sync_cursor_capture();
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
@@ -1791,7 +1869,7 @@ impl ApplicationHandler for App {
                                 }
                                 renderer.camera_dist = 0.0;
                                 renderer.hud_visible = true;
-                                renderer.hotbar_visible = true;
+                                renderer.hotbar_visible = false;
                             }
                         }
                     }
@@ -1913,6 +1991,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
     use std::time::Duration;
 
     #[test]
@@ -2002,9 +2081,54 @@ mod tests {
     }
 
     #[test]
+    fn collect_visible_particle_data_culls_entities_behind_walls() {
+        let mut world = sim::World::new(3);
+        let wall = hash_thing::octree::Cell::pack(1, 0).raw();
+        world.set(
+            sim::WorldCoord(3),
+            sim::WorldCoord(1),
+            sim::WorldCoord(1),
+            wall,
+        );
+
+        let mut entities = sim::EntityStore::new();
+        entities.add(
+            [2.5, 1.5, 1.5],
+            [0.0; 3],
+            sim::EntityKind::Critter(sim::CritterState::new(VINE_MATERIAL_ID)),
+        );
+        entities.add(
+            [5.5, 1.5, 1.5],
+            [0.0; 3],
+            sim::EntityKind::Particle(sim::ParticleState {
+                material: FIRE_MATERIAL_ID,
+                ttl: 5,
+                on_despawn: None,
+            }),
+        );
+
+        let visible = collect_visible_particle_data(
+            &world,
+            &entities,
+            [1.5, 1.5, 1.5],
+            [0, 0, 0],
+            1.0 / world.side() as f32,
+        );
+
+        assert_eq!(
+            visible.len(),
+            1,
+            "only the unoccluded critter should upload"
+        );
+        assert_eq!(visible[0][3].to_bits(), VINE_MATERIAL_ID as u32);
+        assert!((visible[0][0] - 2.5 / world.side() as f32).abs() < 1e-6);
+    }
+
+    #[test]
     fn first_person_legend_hides_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
-        assert!(lines.iter().any(|line| line.contains("Space       Jump")));
+        assert!(lines.iter().any(|line| line.contains("Space       Leap")));
+        assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
         assert!(!lines.iter().any(|line| line.contains("Fly down")));
         assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
@@ -2012,7 +2136,7 @@ mod tests {
             .iter()
             .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
-        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
+        assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
 
     #[test]
@@ -2023,7 +2147,13 @@ mod tests {
             .iter()
             .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
-        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
+        assert!(lines.iter().any(|line| line.contains("Lattice walk")));
+    }
+
+    #[test]
+    fn legend_defaults_follow_camera_mode() {
+        assert!(!default_legend_visibility(CameraMode::FirstPerson));
+        assert!(default_legend_visibility(CameraMode::Orbit));
     }
 
     #[test]
@@ -2043,6 +2173,30 @@ mod tests {
                 waypoint.label
             );
         }
+    }
+
+    #[test]
+    fn recenter_player_respects_shifted_world_origin() {
+        let mut app = App::new(8);
+        app.world.ensure_region(
+            [sim::WorldCoord(-4), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [sim::WorldCoord(7), sim::WorldCoord(7), sim::WorldCoord(7)],
+        );
+        assert!(
+            app.world.origin[0] < 0,
+            "test setup should force a negative origin shift"
+        );
+
+        assert!(app.recenter_player());
+
+        let pid = app.player_id.expect("player should exist");
+        let player = app
+            .entities
+            .iter()
+            .find(|entity| entity.id == pid)
+            .expect("player entity should still exist");
+        let center = app.world_center();
+        assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
     }
 
     #[test]
@@ -2067,5 +2221,13 @@ mod tests {
             256,
             Duration::from_millis(DEV_PROFILE_STEP_WARN_MS - 1)
         ));
+    }
+
+    #[test]
+    fn cursor_capture_requires_first_person_and_focus() {
+        assert!(should_capture_cursor(CameraMode::FirstPerson, true));
+        assert!(!should_capture_cursor(CameraMode::FirstPerson, false));
+        assert!(!should_capture_cursor(CameraMode::Orbit, true));
+        assert!(!should_capture_cursor(CameraMode::Orbit, false));
     }
 }

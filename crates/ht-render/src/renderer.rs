@@ -1704,9 +1704,9 @@ impl Renderer {
                     } else {
                         1.0
                     };
-                    let quad_h = 0.8;
+                    let quad_h = 0.62;
                     let quad_w = quad_h * tex_aspect / aspect;
-                    let margin = 0.02;
+                    let margin = 0.035;
                     let quad_left = -1.0 + margin;
                     let quad_bottom = -1.0 + margin;
                     let legend_params: [f32; 4] = [quad_left, quad_bottom, quad_w, quad_h];
