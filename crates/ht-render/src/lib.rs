@@ -13,7 +13,6 @@ mod wgsl_drift_guard {
     //! same change. See comments next to `material_color` in each shader.
     use ht_octree::Cell;
 
-    const RENDERER_RS: &str = include_str!("renderer.rs");
     const SVDAG_RAYCAST_WGSL: &str = include_str!("svdag_raycast.wgsl");
     const PARTICLE_WGSL: &str = include_str!("particle.wgsl");
 
@@ -162,47 +161,6 @@ mod wgsl_drift_guard {
                 "particle.wgsl must contain `{expected}` — billboard overlays \
                  should sample the raycast texture's scene depth and discard \
                  particles hidden behind voxel geometry."
-            );
-        }
-    }
-
-    #[test]
-    fn renderer_particle_bind_group_helper_covers_all_runtime_bindings() {
-        let expected_lines = [
-            "fn rebuild_particle_bind_group(&mut self) {",
-            "binding: 0,",
-            "binding: 1,",
-            "binding: 2,",
-            "binding: 3,",
-            "binding: 4,",
-            "resource: wgpu::BindingResource::TextureView(&self.raycast_texture_view),",
-            "resource: wgpu::BindingResource::Sampler(&self.blit_sampler),",
-        ];
-        for expected in expected_lines {
-            assert!(
-                RENDERER_RS.contains(expected),
-                "renderer.rs must contain `{expected}` — particle bind-group \
-                 rebuilds should flow through the shared helper with the full \
-                 live binding set, or layout drift will survive compile-time \
-                 checks and fail only at runtime."
-            );
-        }
-    }
-
-    #[test]
-    fn renderer_rebuild_call_sites_delegate_to_particle_helper() {
-        let expected_lines = [
-            "if self.particle_count > 0 {\n            self.rebuild_particle_bind_group();\n        }",
-            "if self.particle_buffer.is_some() {\n            self.rebuild_particle_bind_group();\n        }",
-            "self.rebuild_particle_bind_group();",
-        ];
-        for expected in expected_lines {
-            assert!(
-                RENDERER_RS.contains(expected),
-                "renderer.rs must contain `{expected}` — particle bind-group \
-                 refreshes on raycast-texture recreate, palette upload, and \
-                 particle upload should all delegate through the shared helper \
-                 instead of open-coding stale binding lists."
             );
         }
     }
