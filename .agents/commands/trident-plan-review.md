@@ -1,6 +1,6 @@
 # Trident Plan Review: Nine-Agent Plan Review
 
-Run parallel plan reviews using Claude, Codex, and Gemini — each provider runs three lenses: Standard (analytical), Adversarial (critical), and Evolutionary (exploratory). Output lives alongside the input file in a review pack folder.
+Run parallel plan reviews with a Codex-heavy nine-review mix: Claude runs the three canonical lenses, Codex runs the three canonical lenses plus two focused extra passes, and Gemini runs a single standard pass. Output lives alongside the input file in a review pack folder.
 
 **Usage:**
 - `/user:trident-plan-review <file>` — Review a plan/document through all nine agents
@@ -33,10 +33,10 @@ Main Agent (Opus 4.6)
 ├── Create review pack folder alongside input file
 ├── Identify related context files for agents
 ├── Write prompt files for Codex/Gemini (file-reference approach)
-├── Launch 9 agents
-│   ├── 3x Claude — via Agent tool (subagents)
-│   ├── 3x Codex — via Bash (headless CLI)
-│   └── 3x Gemini — via Bash (headless CLI)
+├── Launch 9 review agents
+│   ├── 3x Claude — standard, adversarial, evolutionary
+│   ├── 5x Codex — standard, standard-execution, adversarial, adversarial-dependencies, evolutionary
+│   └── 1x Gemini — standard only
 ├── Wait and collect all 9
 ├── Quality gate — verify output files exist and have substance
 ├── Launch 3 synthesis Agents (one per lens)
@@ -135,6 +135,38 @@ Use these values: PLAN_ID={REVIEW_ID}, MODEL=Codex.
 
 Now follow the instructions in the prompt file.
 EOF
+
+cat > "$WS_STAGING/prompt-standard-codex-execution.md" <<'EOF'
+Read .agents/prompts/PlanReview-Standard.md for your review approach and thinking framework. Then read {INPUT_FILE} — that is the document you are reviewing.
+
+**THIS IS A READ-ONLY REVIEW.** Your ONLY output is the review file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
+
+**OUTPUT:** Write your review to `/tmp/trident-{REVIEW_ID}/standard-codex-execution.md`
+
+Use these values: PLAN_ID={REVIEW_ID}, MODEL=Codex.
+{CONTEXT_NOTE}
+{ADDITIONAL_NOTES}
+
+Extra focus for this pass: bias toward sequencing realism, validation order, rollback points, likely implementation stalls, and where the plan may be too optimistic about execution flow.
+
+Now follow the instructions in the prompt file.
+EOF
+
+cat > "$WS_STAGING/prompt-adversarial-codex-dependencies.md" <<'EOF'
+Read .agents/prompts/PlanReview-Adversarial.md for your review approach and thinking framework. Then read {INPUT_FILE} — that is the document you are reviewing.
+
+**THIS IS A READ-ONLY REVIEW.** Your ONLY output is the review file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
+
+**OUTPUT:** Write your review to `/tmp/trident-{REVIEW_ID}/adversarial-codex-dependencies.md`
+
+Use these values: PLAN_ID={REVIEW_ID}, MODEL=Codex.
+{CONTEXT_NOTE}
+{ADDITIONAL_NOTES}
+
+Extra focus for this pass: bias toward dependency realism, gating assumptions, external-service risk, operator complexity, and hidden coordination costs.
+
+Now follow the instructions in the prompt file.
+EOF
 ```
 
 Gemini prompt files go in the workspace-local staging dir and use PACK_DIR for output (Gemini sandbox is more permissive):
@@ -185,7 +217,7 @@ Launch three Agent tool calls in a single message with the launch template, subs
 
 ---
 
-**Codex agents** (3x) — use Bash with `run_in_background: true`:
+**Codex agents** (5x) — use Bash with `run_in_background: true`:
 
 **Important:** Use `env -u CLAUDECODE` to strip the environment variable that blocks nested sessions.
 
@@ -194,23 +226,23 @@ Each agent reads its prompt from the **workspace-local** staging dir (not the ab
 ```bash
 env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
 
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex-execution.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard-execution.log
+
 env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial.log
+
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex-dependencies.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial-dependencies.log
 
 env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
 ```
 
 ---
 
-**Gemini agents** (3x) — use Bash with `run_in_background: true`:
+**Gemini agents** (1x) — use Bash with `run_in_background: true`:
 
 Each agent reads its prompt from the file written in Phase 3:
 
 ```bash
 gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
-
-gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-gemini.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-adversarial.log
-
-gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-gemini.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-evolutionary.log
 ```
 
 ---
@@ -218,7 +250,10 @@ gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/promp
 **Tell the user:**
 > "Plan: {input_file} | Review Pack: {PACK_DIR}
 >
-> Launched 9 agents (3 Standard, 3 Adversarial, 3 Evolutionary) across Claude, Codex, and Gemini.
+> Launched 9 review agents:
+> - Claude (Standard, Adversarial, Evolutionary)
+> - Codex (Standard, Standard-Execution, Adversarial, Adversarial-Dependencies, Evolutionary)
+> - Gemini (Standard)
 >
 > You can continue working. I'll synthesize when complete."
 
@@ -229,7 +264,7 @@ gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/promp
 
 **Collect Codex output from /tmp:** Codex writes to `/tmp/trident-{REVIEW_ID}/` because PACK_DIR may be outside its sandbox. Copy any output files to PACK_DIR:
 ```bash
-for f in /tmp/trident-{REVIEW_ID}/*-codex.md; do
+for f in /tmp/trident-{REVIEW_ID}/*codex*.md; do
     [ -f "$f" ] && cp "$f" "{PACK_DIR}/"
 done
 ```
@@ -245,22 +280,23 @@ wc -c {PACK_DIR}/*.md
 
 Report any gaps to the user before proceeding to synthesis.
 
-Expected files: `standard-claude.md`, `standard-codex.md`, `standard-gemini.md`, `adversarial-claude.md`, `adversarial-codex.md`, `adversarial-gemini.md`, `evolutionary-claude.md`, `evolutionary-codex.md`, `evolutionary-gemini.md`.
+Expected files: `standard-claude.md`, `standard-codex.md`, `standard-codex-execution.md`, `standard-gemini.md`, `adversarial-claude.md`, `adversarial-codex.md`, `adversarial-codex-dependencies.md`, `evolutionary-claude.md`, `evolutionary-codex.md`.
 
 ### Phase 6: Three Synthesis Agents
 
-Launch **three Agent tool calls** in a single message. Each synthesizes one lens across all three models.
+Launch **three Agent tool calls** in a single message. Each synthesizes one lens across its weighted input set.
 
 **Synthesis-Standard Agent:**
 > Read the following three reviews and synthesize them into a single cohesive document:
 > - `{PACK_DIR}/standard-claude.md`
 > - `{PACK_DIR}/standard-codex.md`
+> - `{PACK_DIR}/standard-codex-execution.md`
 > - `{PACK_DIR}/standard-gemini.md`
 >
-> These are Standard/Analytical reviews of the same plan from three different AI models. Your job:
+> These are Standard/Analytical reviews of the same plan from a weighted Claude/Codex/Gemini mix. Your job:
 > 1. Where do models agree? (highest confidence findings)
 > 2. Where do they diverge? (the disagreement itself is signal)
-> 3. What unique insights did only one model surface?
+> 3. What unique insights did only one pass surface?
 > 4. Consolidated questions for the plan author (deduplicated, numbered)
 > 5. Overall readiness verdict synthesized across all three
 >
@@ -271,11 +307,11 @@ Launch **three Agent tool calls** in a single message. Each synthesizes one lens
 > Read the following three reviews and synthesize them into a single cohesive document:
 > - `{PACK_DIR}/adversarial-claude.md`
 > - `{PACK_DIR}/adversarial-codex.md`
-> - `{PACK_DIR}/adversarial-gemini.md`
+> - `{PACK_DIR}/adversarial-codex-dependencies.md`
 >
-> These are Adversarial/Critical reviews of the same plan from three different AI models. Your job:
-> 1. Consensus risks — what do multiple models flag? (highest priority)
-> 2. Unique concerns — risks only one model raised (worth investigating)
+> These are Adversarial/Critical reviews of the same plan from a weighted Claude/Codex mix. Your job:
+> 1. Consensus risks — what do multiple passes flag? (highest priority)
+> 2. Unique concerns — risks only one pass raised (worth investigating)
 > 3. Assumption audit — merge and deduplicate all surfaced assumptions
 > 4. The uncomfortable truths — what hard messages recur across models?
 > 5. Consolidated hard questions for the plan author (deduplicated, numbered)
@@ -287,11 +323,10 @@ Launch **three Agent tool calls** in a single message. Each synthesizes one lens
 > Read the following three reviews and synthesize them into a single cohesive document:
 > - `{PACK_DIR}/evolutionary-claude.md`
 > - `{PACK_DIR}/evolutionary-codex.md`
-> - `{PACK_DIR}/evolutionary-gemini.md`
 >
-> These are Evolutionary/Exploratory reviews of the same plan from three different AI models. Your job:
-> 1. Consensus direction — evolution paths multiple models identified
-> 2. Best concrete suggestions — the most actionable ideas across all three
+> These are Evolutionary/Exploratory reviews of the same plan from the Claude/Codex pair. Your job:
+> 1. Consensus direction — evolution paths multiple passes identified
+> 2. Best concrete suggestions — the most actionable ideas across the Claude/Codex pair
 > 3. Wildest mutations — the most creative/ambitious ideas (even if risky)
 > 4. Flywheel opportunities — self-reinforcing loops any model identified
 > 5. Strategic questions for the plan author (deduplicated, numbered)
@@ -327,7 +362,7 @@ Tell the user:
 > - `synthesis-adversarial.md` — critical findings
 > - `synthesis-evolutionary.md` — evolutionary opportunities
 >
-> Full review pack (12 files) at: `{PACK_DIR}/`"
+> Full review pack (12 files: 9 reviews + 3 syntheses) at: `{PACK_DIR}/`"
 
 ---
 

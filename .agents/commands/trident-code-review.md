@@ -1,6 +1,6 @@
 # Trident Code Review: Nine-Agent Code Review
 
-Run parallel code reviews using Claude, Codex, and Gemini — each provider runs three lenses: Standard, Critical (adversarial), and Evolutionary (exploratory). Output lives in a review pack folder under `~/at/arch/notes/`.
+Run parallel code reviews with a Codex-heavy nine-review mix: Claude runs the three canonical lenses, Codex runs the three canonical lenses plus two focused extra passes, and Gemini runs a single standard pass. Output lives in a review pack folder under `~/at/arch/notes/`.
 
 **Usage:**
 - `/trident-code-review` — Review current branch with all nine agents
@@ -33,10 +33,10 @@ Main Agent (Opus 4.6)
 ├── Generate context document
 ├── Identify related context files for agents
 ├── Write prompt files for Codex/Gemini (file-reference approach)
-├── Launch 9 agents
-│   ├── 3x Claude — via Agent tool (subagents)
-│   ├── 3x Codex — via Bash (headless CLI)
-│   └── 3x Gemini — via Bash (headless CLI)
+├── Launch 9 review agents
+│   ├── 3x Claude — standard, critical, evolutionary
+│   ├── 5x Codex — standard, standard-invariants, critical, critical-runtime, evolutionary
+│   └── 1x Gemini — standard only
 ├── Wait and collect all 9
 ├── Quality gate — verify output files exist and have substance
 ├── Launch 3 synthesis Agents (one per lens)
@@ -56,11 +56,11 @@ After all 9 complete, launch 3 synthesis agents (one per lens), then open the sy
 | Claude | Agent | Critical | Agent tool with critical prompt |
 | Claude | Agent | Evolutionary | Agent tool with evolutionary prompt |
 | Codex | Bash | Standard | `env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read {prompt_file}..." 2>&1 \| tee {log}` |
+| Codex | Bash | Standard-Invariants | same pattern, but with an invariants/state/test-gap focus note |
 | Codex | Bash | Critical | same pattern |
+| Codex | Bash | Critical-Runtime | same pattern, but with an operational/runtime/perf-cliff focus note |
 | Codex | Bash | Evolutionary | same pattern |
 | Gemini | Bash | Standard | `gemini -m gemini-3-pro-preview --yolo "Read {prompt_file}..." 2>&1 \| tee {log}` |
-| Gemini | Bash | Critical | same pattern |
-| Gemini | Bash | Evolutionary | same pattern |
 
 **IMPORTANT:** All prompt files MUST be written inside the workspace (e.g., `notes/.tmp/`) — NOT `/tmp/`. Gemini CLI sandboxes file reads to workspace directories only.
 
@@ -199,10 +199,10 @@ echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUM
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
 ```
 
-Then, write per-agent prompt files for Codex and Gemini (6 total):
+Then, write per-agent prompt files for Codex and Gemini (6 total: 5 Codex, 1 Gemini):
 
 ```bash
-# Example for standard-codex — repeat pattern for all 6 (standard/critical/evolutionary x codex/gemini)
+# Example for standard-codex — repeat the pattern for the other 5 agents.
 cat > notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md <<'PROMPT_EOF'
 Read notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md and follow the instructions.
 
@@ -215,9 +215,41 @@ Use these values: STORY_ID={REVIEW_ID}, MODEL=Codex.
 
 Now follow the instructions in the review prompt file.
 PROMPT_EOF
+
+# Example for a focused extra Codex pass: same standard review, but with a narrower brief
+cat > notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex-invariants.md <<'PROMPT_EOF'
+Read notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md and follow the instructions.
+
+**THIS IS A READ-ONLY REVIEW.** Your ONLY output is the review file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
+
+**OUTPUT:** Write your review to `/tmp/trident-{REVIEW_ID}/standard-codex-invariants.md`
+
+Use these values: STORY_ID={REVIEW_ID}, MODEL=Codex.
+{CONTEXT_NOTE}
+
+Extra focus for this pass: spend disproportionate attention on invariants, state transitions, ownership boundaries, cache invalidation, and missing regression coverage. Prefer correctness and test-gap findings over style commentary.
+
+Now follow the instructions in the review prompt file.
+PROMPT_EOF
+
+# Example for the second extra Codex pass: same critical review, but biased toward runtime failures
+cat > notes/.tmp/trident-{REVIEW_ID}/prompt-critical-codex-runtime.md <<'PROMPT_EOF'
+Read notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md and follow the instructions.
+
+**THIS IS A READ-ONLY REVIEW.** Your ONLY output is the review file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
+
+**OUTPUT:** Write your review to `/tmp/trident-{REVIEW_ID}/critical-codex-runtime.md`
+
+Use these values: STORY_ID={REVIEW_ID}, MODEL=Codex.
+{CONTEXT_NOTE}
+
+Extra focus for this pass: bias toward runtime failure modes, concurrency hazards, perf cliffs, observability gaps, CI blind spots, and production-only behavior.
+
+Now follow the instructions in the review prompt file.
+PROMPT_EOF
 ```
 
-For Gemini, also copy the prompt framework files into the workspace (Gemini sandboxes reads to the workspace):
+For Gemini, copy the prompt framework files into the workspace (Gemini now runs only the standard pass):
 ```bash
 cp .agents/commands/code_review.md notes/.tmp/trident-{REVIEW_ID}/
 cp .agents/commands/code_review_critical.md notes/.tmp/trident-{REVIEW_ID}/
@@ -234,7 +266,7 @@ PACK_DIR=~/at/arch/notes/trident-review-{REVIEW_ID}-pack-{TIMESTAMP}
 mkdir -p "$PACK_DIR"
 ```
 
-Launch all nine with `run_in_background: true` for Bash agents. Claude agents use the Agent tool (3 calls in a single message).
+Launch all nine review agents with `run_in_background: true` for Bash agents. Claude agents use the Agent tool (3 calls in a single message).
 
 **Launch message template** (for Claude subagents — Codex/Gemini use their prompt files from Phase 4):
 
@@ -261,7 +293,7 @@ Launch three Agent tool calls in a single message with the launch template, subs
 
 ---
 
-**Codex agents** (3x) — use Bash with `run_in_background: true`:
+**Codex agents** (5x) — use Bash with `run_in_background: true`:
 
 **Important:** Use `env -u CLAUDECODE` to strip the environment variable that blocks nested sessions.
 
@@ -275,23 +307,23 @@ mkdir -p /tmp/trident-{REVIEW_ID}
 ```bash
 env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
 
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex-invariants.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard-invariants.log
+
 env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-critical-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-critical.log
+
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-critical-codex-runtime.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-critical-runtime.log
 
 env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
 ```
 
 ---
 
-**Gemini agents** (3x) — use Bash with `run_in_background: true`:
+**Gemini agents** (1x) — use Bash with `run_in_background: true`:
 
 Each agent reads its prompt from the file written in Phase 4:
 
 ```bash
 gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
-
-gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-critical-gemini.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-critical.log
-
-gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-gemini.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-evolutionary.log
 ```
 
 ---
@@ -301,8 +333,8 @@ gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/promp
 >
 > Launched 9 review agents:
 > - Claude (Standard, Critical, Evolutionary)
-> - Codex (Standard, Critical, Evolutionary)
-> - Gemini (Standard, Critical, Evolutionary)
+> - Codex (Standard, Standard-Invariants, Critical, Critical-Runtime, Evolutionary)
+> - Gemini (Standard)
 >
 > Review pack: `{PACK_DIR}/`
 >
@@ -320,16 +352,16 @@ ls -la {PACK_DIR}/*.md 2>/dev/null
 
 **Collect Codex output from /tmp:** Codex writes to `/tmp/trident-{REVIEW_ID}/` because PACK_DIR is outside its sandbox. Copy any output files to PACK_DIR:
 ```bash
-for f in /tmp/trident-{REVIEW_ID}/*-codex.md; do
+for f in /tmp/trident-{REVIEW_ID}/*codex*.md; do
     [ -f "$f" ] && cp "$f" "{PACK_DIR}/"
 done
 ```
 
-**Stdout fallback:** Codex/Gemini may write findings to stdout instead of the output file. For each missing pack file, check the corresponding log in `/tmp/` — if it has review content (>500 bytes of non-boilerplate), copy it as the output file:
+**Stdout fallback:** Codex/Gemini may write findings to stdout instead of the output file. For each missing pack file, check the corresponding log in `/tmp/` — if it has review content (>500 bytes of non-boilerplate), copy it as the output file. Use the actual agent suffix (`codex-standard-invariants`, `codex-critical-runtime`, etc.), not a generic `{model}-{lens}` guess:
 ```bash
-# For each missing {lens}-{model}.md in PACK_DIR:
-if [ ! -f "{PACK_DIR}/{lens}-{model}.md" ] && [ -s "/tmp/trident-{REVIEW_ID}/{model}-{lens}.log" ]; then
-    cp "/tmp/trident-{REVIEW_ID}/{model}-{lens}.log" "{PACK_DIR}/{lens}-{model}.md"
+# Example for the extra invariants pass:
+if [ ! -f "{PACK_DIR}/standard-codex-invariants.md" ] && [ -s "/tmp/trident-{REVIEW_ID}/codex-standard-invariants.log" ]; then
+    cp "/tmp/trident-{REVIEW_ID}/codex-standard-invariants.log" "{PACK_DIR}/standard-codex-invariants.md"
 fi
 ```
 
@@ -344,16 +376,17 @@ wc -c {PACK_DIR}/*.md
 
 Report any gaps to the user before proceeding to synthesis.
 
-Expected files: `standard-claude.md`, `standard-codex.md`, `standard-gemini.md`, `critical-claude.md`, `critical-codex.md`, `critical-gemini.md`, `evolutionary-claude.md`, `evolutionary-codex.md`, `evolutionary-gemini.md`.
+Expected files: `standard-claude.md`, `standard-codex.md`, `standard-codex-invariants.md`, `standard-gemini.md`, `critical-claude.md`, `critical-codex.md`, `critical-codex-runtime.md`, `evolutionary-claude.md`, `evolutionary-codex.md`.
 
 ### Phase 7: Three Synthesis Agents
 
-Launch **three Agent tool calls** in a single message. Each synthesizes one lens across all three models.
+Launch **three Agent tool calls** in a single message. Each synthesizes one lens across its weighted input set.
 
 **Synthesis-Standard Agent:**
 > Read all Standard code reviews for {REVIEW_ID}:
 > - `{PACK_DIR}/standard-claude.md`
 > - `{PACK_DIR}/standard-codex.md`
+> - `{PACK_DIR}/standard-codex-invariants.md`
 > - `{PACK_DIR}/standard-gemini.md`
 >
 > **THIS IS A READ-ONLY REVIEW.** Your ONLY output is the synthesis file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
@@ -361,7 +394,7 @@ Launch **three Agent tool calls** in a single message. Each synthesizes one lens
 > Synthesize into a single document. Focus on:
 > 1. Consensus issues — what do 2+ models agree on? (highest confidence)
 > 2. Divergent views — where do models disagree? (signal worth examining)
-> 3. Unique findings — issues only one model raised
+> 3. Unique findings — issues only one pass raised
 > 4. Consolidated blockers, important items, and suggestions (deduplicated)
 >
 > Write to: `{PACK_DIR}/synthesis-standard.md`
@@ -371,13 +404,13 @@ Launch **three Agent tool calls** in a single message. Each synthesizes one lens
 > Read all Critical code reviews for {REVIEW_ID}:
 > - `{PACK_DIR}/critical-claude.md`
 > - `{PACK_DIR}/critical-codex.md`
-> - `{PACK_DIR}/critical-gemini.md`
+> - `{PACK_DIR}/critical-codex-runtime.md`
 >
 > **THIS IS A READ-ONLY REVIEW.** Your ONLY output is the synthesis file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
 >
 > Synthesize into a single document. Focus on:
 > 1. Consensus risks — failure modes multiple models identified (highest priority)
-> 2. Unique concerns — risks only one model raised (worth investigating)
+> 2. Unique concerns — risks only one pass raised (worth investigating)
 > 3. The ugly truths — hard messages that recur across models
 > 4. Consolidated blockers and production risk assessment
 >
@@ -388,13 +421,12 @@ Launch **three Agent tool calls** in a single message. Each synthesizes one lens
 > Read all Evolutionary code reviews for {REVIEW_ID}:
 > - `{PACK_DIR}/evolutionary-claude.md`
 > - `{PACK_DIR}/evolutionary-codex.md`
-> - `{PACK_DIR}/evolutionary-gemini.md`
 >
 > **THIS IS A READ-ONLY REVIEW.** Your ONLY output is the synthesis file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
 >
 > Synthesize into a single document. Focus on:
-> 1. Consensus direction — evolution paths multiple models identified
-> 2. Best concrete suggestions — most actionable ideas across all three
+> 1. Consensus direction — evolution paths multiple passes identified
+> 2. Best concrete suggestions — most actionable ideas across the Claude/Codex pair
 > 3. Wildest mutations — creative/ambitious ideas worth exploring
 > 4. Leverage points and flywheel opportunities
 >
@@ -428,7 +460,7 @@ Tell the user:
 > - `synthesis-critical.md` — adversarial findings and production readiness
 > - `synthesis-evolutionary.md` — creative opportunities and evolution paths
 >
-> Full review pack (12 files) at: `{PACK_DIR}/`"
+> Full review pack (12 files: 9 reviews + 3 syntheses) at: `{PACK_DIR}/`"
 
 ---
 
