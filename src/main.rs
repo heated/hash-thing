@@ -114,9 +114,9 @@ struct OrbitCameraPose {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingPlayerAction {
-    BreakBlock,
-    PlaceBlock,
-    PlaceCloneBlock,
+    Break,
+    Place,
+    PlaceClone,
 }
 
 #[allow(dead_code)]
@@ -633,9 +633,9 @@ impl App {
             return;
         };
         match action {
-            PendingPlayerAction::BreakBlock => self.break_block(),
-            PendingPlayerAction::PlaceBlock => self.place_block(),
-            PendingPlayerAction::PlaceCloneBlock => self.place_clone_block(),
+            PendingPlayerAction::Break => self.break_block(),
+            PendingPlayerAction::Place => self.place_block(),
+            PendingPlayerAction::PlaceClone => self.place_clone_block(),
         }
     }
 
@@ -1508,7 +1508,7 @@ impl ApplicationHandler for App {
                     } else if state == ElementState::Pressed {
                         // FPS mode: left click = break block.
                         if self.is_stepping() {
-                            self.pending_player_action = Some(PendingPlayerAction::BreakBlock);
+                            self.pending_player_action = Some(PendingPlayerAction::Break);
                         } else {
                             self.break_block();
                         }
@@ -1522,14 +1522,13 @@ impl ApplicationHandler for App {
                         || self.keys_held.contains(&KeyCode::ControlRight)
                     {
                         if self.is_stepping() {
-                            self.pending_player_action =
-                                Some(PendingPlayerAction::PlaceCloneBlock);
+                            self.pending_player_action = Some(PendingPlayerAction::PlaceClone);
                         } else {
                             self.place_clone_block();
                         }
                     } else {
                         if self.is_stepping() {
-                            self.pending_player_action = Some(PendingPlayerAction::PlaceBlock);
+                            self.pending_player_action = Some(PendingPlayerAction::Place);
                         } else {
                             self.place_block();
                         }
