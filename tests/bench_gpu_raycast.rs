@@ -34,6 +34,46 @@ struct Uniforms {
     debug: [f32; 4],
 }
 
+#[derive(Clone, Copy)]
+struct BenchCamera {
+    pos: [f32; 3],
+    dir: [f32; 3],
+    up: [f32; 3],
+    right: [f32; 3],
+}
+
+impl BenchCamera {
+    fn empty_corner() -> Self {
+        Self {
+            pos: [0.0, 0.0, 0.0],
+            dir: [0.0, 0.0, -1.0],
+            up: [0.0, 1.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+        }
+    }
+
+    fn app_spawn(volume_size: u32) -> Self {
+        let side = volume_size as f32;
+        let yaw = std::f32::consts::FRAC_PI_4;
+        let pitch = 0.0f32;
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = pitch.sin_cos();
+        let dir = [-cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw];
+        let right = [cos_yaw, 0.0, -sin_yaw];
+        let up = [
+            right[1] * dir[2] - right[2] * dir[1],
+            right[2] * dir[0] - right[0] * dir[2],
+            right[0] * dir[1] - right[1] * dir[0],
+        ];
+        Self {
+            pos: [0.5, 0.5 + 2.0 / side, 0.5],
+            dir,
+            up,
+            right,
+        }
+    }
+}
+
 struct HeadlessRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -132,11 +172,12 @@ impl HeadlessRenderer {
         let raycast_texture_view = raycast_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         // --- Uniforms ---
+        let camera = BenchCamera::empty_corner();
         let uniforms = Uniforms {
-            camera_pos: [0.0; 4],
-            camera_dir: [0.0, 0.0, -1.0, 0.0],
-            camera_up: [0.0, 1.0, 0.0, 0.0],
-            camera_right: [1.0, 0.0, 0.0, 0.0],
+            camera_pos: [camera.pos[0], camera.pos[1], camera.pos[2], 0.0],
+            camera_dir: [camera.dir[0], camera.dir[1], camera.dir[2], 0.0],
+            camera_up: [camera.up[0], camera.up[1], camera.up[2], 0.0],
+            camera_right: [camera.right[0], camera.right[1], camera.right[2], 0.0],
             params: [
                 64.0,
                 RENDER_WIDTH as f32 / RENDER_HEIGHT as f32,
@@ -368,12 +409,12 @@ impl HeadlessRenderer {
         })
     }
 
-    fn upload_svdag(&mut self, svdag: &Svdag, volume_size: u32) {
+    fn upload_svdag(&mut self, svdag: &Svdag, volume_size: u32, camera: BenchCamera) {
         let uniforms = Uniforms {
-            camera_pos: [0.0; 4],
-            camera_dir: [0.0, 0.0, -1.0, 0.0],
-            camera_up: [0.0, 1.0, 0.0, 0.0],
-            camera_right: [1.0, 0.0, 0.0, 0.0],
+            camera_pos: [camera.pos[0], camera.pos[1], camera.pos[2], 0.0],
+            camera_dir: [camera.dir[0], camera.dir[1], camera.dir[2], 0.0],
+            camera_up: [camera.up[0], camera.up[1], camera.up[2], 0.0],
+            camera_right: [camera.right[0], camera.right[1], camera.right[2], 0.0],
             params: [
                 volume_size as f32,
                 RENDER_WIDTH as f32 / RENDER_HEIGHT as f32,
@@ -516,7 +557,7 @@ impl HeadlessRenderer {
     }
 }
 
-fn bench_raycast(label: &str, level: u32, frames: usize) {
+fn bench_raycast(label: &str, level: u32, frames: usize, camera: BenchCamera) {
     let side = 1u64 << level;
     eprintln!("--- {label}: GPU raycast benchmark (level={level}, side={side}³) ---");
 
@@ -553,7 +594,7 @@ fn bench_raycast(label: &str, level: u32, frames: usize) {
         }
     );
 
-    renderer.upload_svdag(&svdag, side as u32);
+    renderer.upload_svdag(&svdag, side as u32, camera);
 
     // Warmup frame (shader compilation, etc.)
     let warmup = renderer.render_frame();
@@ -600,37 +641,43 @@ fn bench_raycast(label: &str, level: u32, frames: usize) {
 #[test]
 #[ignore]
 fn bench_raycast_64() {
-    bench_raycast("64³", 6, 100);
+    bench_raycast("64³", 6, 100, BenchCamera::empty_corner());
 }
 
 #[test]
 #[ignore]
 fn bench_raycast_256() {
-    bench_raycast("256³", 8, 100);
+    bench_raycast("256³", 8, 100, BenchCamera::empty_corner());
+}
+
+#[test]
+#[ignore]
+fn bench_raycast_256_app_spawn() {
+    bench_raycast("256³ app-spawn", 8, 100, BenchCamera::app_spawn(256));
 }
 
 #[test]
 #[ignore]
 fn bench_raycast_512() {
-    bench_raycast("512³", 9, 50);
+    bench_raycast("512³", 9, 50, BenchCamera::empty_corner());
 }
 
 #[test]
 #[ignore]
 fn bench_raycast_1024() {
-    bench_raycast("1024³", 10, 30);
+    bench_raycast("1024³", 10, 30, BenchCamera::empty_corner());
 }
 
 #[test]
 #[ignore]
 fn bench_raycast_2048() {
-    bench_raycast("2048³", 11, 20);
+    bench_raycast("2048³", 11, 20, BenchCamera::empty_corner());
 }
 
 #[test]
 #[ignore]
 fn bench_raycast_4096() {
-    bench_raycast("4096³", 12, 10);
+    bench_raycast("4096³", 12, 10, BenchCamera::empty_corner());
 }
 
 /// Combined benchmark: SVDAG build + CA step + rebuild + raycast.
@@ -657,7 +704,7 @@ fn bench_raycast_with_active_ca() {
 
     let mut svdag = Svdag::new();
     svdag.update(&world.store, world.root, world.level);
-    renderer.upload_svdag(&svdag, side as u32);
+    renderer.upload_svdag(&svdag, side as u32, BenchCamera::empty_corner());
 
     // Warmup
     let _ = renderer.render_frame();
@@ -681,7 +728,7 @@ fn bench_raycast_with_active_ca() {
         svdag.update(&world.store, world.root, world.level);
         let build_ms = build_t.elapsed().as_millis();
 
-        renderer.upload_svdag(&svdag, side as u32);
+        renderer.upload_svdag(&svdag, side as u32, BenchCamera::empty_corner());
         let render_dt = renderer.render_frame();
         let render_ms = render_dt.as_secs_f64() * 1000.0;
 
