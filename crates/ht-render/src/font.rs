@@ -294,13 +294,13 @@ mod tests {
     #[test]
     fn letter_a_has_lit_pixels() {
         let (pixels, w, _h) = render_text_rgba(&["A"], 1);
-        // Check that at least some pixels are white (not all background).
-        let white_count = (0..(pixels.len() / 4))
-            .filter(|&i| pixels[i * 4] == 255)
+        // Check that at least some pixels are opaque glyph pixels (not all background).
+        let lit_count = (0..(pixels.len() / 4))
+            .filter(|&i| pixels[i * 4 + 3] == 255)
             .count();
         assert!(
-            white_count > 0,
-            "Expected some white pixels for 'A', tex_w={}",
+            lit_count > 0,
+            "Expected some lit glyph pixels for 'A', tex_w={}",
             w
         );
     }
