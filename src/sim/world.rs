@@ -617,23 +617,60 @@ impl World {
         count
     }
 
+    fn contains_world_coord(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> bool {
+        let side = self.side() as i64;
+        x.0 >= self.origin[0]
+            && x.0 < self.origin[0] + side
+            && y.0 >= self.origin[1]
+            && y.0 < self.origin[1] + side
+            && z.0 >= self.origin[2]
+            && z.0 < self.origin[2] + side
+    }
+
     /// Drain the mutation queue and apply every pending mutation to the
     /// octree in arrival order. This is the only path for entity-produced
     /// edits to reach the world (closed-world invariant, hash-thing-1v0.9).
+    /// Entity-produced writes outside the realized region are dropped
+    /// instead of panicking; read paths already treat OOB as empty.
     pub fn apply_mutations(&mut self) {
         for m in self.queue.take() {
             match m {
                 WorldMutation::SetCell { x, y, z, state } => {
-                    self.set(x, y, z, state);
+                    if self.contains_world_coord(x, y, z) {
+                        self.set(x, y, z, state);
+                    }
                 }
                 WorldMutation::FillRegion { min, max, state } => {
                     debug_assert!(
                         min[0].0 <= max[0].0 && min[1].0 <= max[1].0 && min[2].0 <= max[2].0,
                         "FillRegion: min must be <= max on every axis"
                     );
-                    for z in min[2].0..=max[2].0 {
-                        for y in min[1].0..=max[1].0 {
-                            for x in min[0].0..=max[0].0 {
+                    let side = self.side() as i64;
+                    let world_min = self.origin;
+                    let world_max = [
+                        self.origin[0] + side - 1,
+                        self.origin[1] + side - 1,
+                        self.origin[2] + side - 1,
+                    ];
+                    let clamped_min = [
+                        min[0].0.max(world_min[0]),
+                        min[1].0.max(world_min[1]),
+                        min[2].0.max(world_min[2]),
+                    ];
+                    let clamped_max = [
+                        max[0].0.min(world_max[0]),
+                        max[1].0.min(world_max[1]),
+                        max[2].0.min(world_max[2]),
+                    ];
+                    if clamped_min[0] > clamped_max[0]
+                        || clamped_min[1] > clamped_max[1]
+                        || clamped_min[2] > clamped_max[2]
+                    {
+                        continue;
+                    }
+                    for z in clamped_min[2]..=clamped_max[2] {
+                        for y in clamped_min[1]..=clamped_max[1] {
+                            for x in clamped_min[0]..=clamped_max[0] {
                                 self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
                             }
                         }
@@ -3936,6 +3973,50 @@ mod tests {
     }
 
     #[test]
+    fn apply_mutations_drops_out_of_bounds_setcell() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::SetCell {
+            x: WorldCoord(8),
+            y: wc(2),
+            z: wc(2),
+            state: STONE,
+        });
+
+        world.apply_mutations();
+
+        assert_eq!(world.get(wc(7), wc(2), wc(2)), 0);
+        assert!(world.queue.is_empty());
+    }
+
+    #[test]
+    fn apply_mutations_drops_out_of_bounds_setcell_with_shifted_origin() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.ensure_contains(WorldCoord(-1), wc(0), wc(0));
+
+        let in_bounds = WorldCoord(world.origin[0]);
+        let out_of_bounds = WorldCoord(world.origin[0] - 1);
+        world.queue.push(WorldMutation::SetCell {
+            x: in_bounds,
+            y: wc(0),
+            z: wc(0),
+            state: STONE,
+        });
+        world.queue.push(WorldMutation::SetCell {
+            x: out_of_bounds,
+            y: wc(0),
+            z: wc(0),
+            state: DIRT,
+        });
+
+        world.apply_mutations();
+
+        assert_eq!(world.get(in_bounds, wc(0), wc(0)), STONE);
+        assert_eq!(world.get(out_of_bounds, wc(0), wc(0)), 0);
+    }
+
+    #[test]
     fn fill_region_covers_inclusive_box() {
         use crate::sim::WorldMutation;
         let mut world = World::new(3);
@@ -3957,6 +4038,33 @@ mod tests {
             }
         }
         assert_eq!(count, 27);
+    }
+
+    #[test]
+    fn fill_region_clamps_to_realized_bounds() {
+        use crate::sim::WorldMutation;
+        let mut world = World::new(3);
+        world.queue.push(WorldMutation::FillRegion {
+            min: [wc(6), wc(6), wc(6)],
+            max: [wc(8), wc(8), wc(8)],
+            state: STONE,
+        });
+
+        world.apply_mutations();
+
+        let mut count = 0;
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    if world.get(wc(x), wc(y), wc(z)) == STONE {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 8);
+        assert_eq!(world.get(wc(6), wc(6), wc(6)), STONE);
+        assert_eq!(world.get(wc(7), wc(7), wc(7)), STONE);
     }
 
     #[test]
@@ -4377,6 +4485,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn spawn_clones_drops_out_of_bounds_neighbor_writes() {
+        let mut world = World::new(2);
+        world.place_clone_source([3, 1, 1], WATER_MATERIAL_ID);
+
+        world.spawn_clones();
+
+        assert_eq!(
+            Cell::from_raw(world.get(wc(2), wc(1), wc(1))).material(),
+            WATER_MATERIAL_ID
+        );
+        assert_eq!(
+            Cell::from_raw(world.get(wc(3), wc(2), wc(1))).material(),
+            WATER_MATERIAL_ID
+        );
+        assert_eq!(
+            Cell::from_raw(world.get(wc(3), wc(0), wc(1))).material(),
+            WATER_MATERIAL_ID
+        );
+        assert_eq!(
+            Cell::from_raw(world.get(wc(3), wc(1), wc(2))).material(),
+            WATER_MATERIAL_ID
+        );
+        assert_eq!(
+            Cell::from_raw(world.get(wc(3), wc(1), wc(0))).material(),
+            WATER_MATERIAL_ID
+        );
+        assert_eq!(world.get(WorldCoord(4), wc(1), wc(1)), 0);
     }
 
     #[test]
