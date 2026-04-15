@@ -405,7 +405,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Performance — release-mode budget; debug is much looser.
+    // Performance — narrow enforced gate, not the repo's general perf story.
     // -----------------------------------------------------------------
 
     #[test]
@@ -417,7 +417,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Always print so the number lands in CI logs even when the budget
-        // gate is disabled.
+        // gate is disabled. This test is the narrow machine-enforced perf
+        // gate the repo currently has: release-only, 64^3 terrain gen only.
         eprintln!(
             "gen_region 64^3: {:?}, calls={}, leaves={}, interiors={}, collapses={}",
             elapsed,

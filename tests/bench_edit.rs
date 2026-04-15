@@ -7,6 +7,9 @@
 //!
 //! ## Baseline (2026-04-12, M-series Mac, release build)
 //!
+//! Confidence note: this file is observational only. It is useful for manual
+//! perf diagnosis, but it does not define enforced pass/fail budgets.
+//!
 //! | Scale | set_cell | flatten  | edit→flatten | Notes                    |
 //! |-------|----------|----------|--------------|--------------------------|
 //! | 64³   | <1µs     | 560µs    | 560µs        | 0.5MB flat buffer        |
