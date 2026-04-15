@@ -660,6 +660,66 @@ fn bench_raycast_256_app_spawn() {
     bench_raycast("256³ app-spawn", 8, 100, BenchCamera::app_spawn(256));
 }
 
+/// Headless game/app smoke path for agents and CI-like environments.
+///
+/// Runs the real startup ingredients we can support without a visible surface:
+/// seed terrain, add dynamic CA materials, render one offscreen frame, step the
+/// world once, rebuild the SVDAG, and render again.
+///
+/// Preferred command:
+/// `cargo test --profile bench --test bench_gpu_raycast headless_game_smoke_256 -- --ignored --nocapture`
+///
+/// The default test profile also works, but it takes close to a minute at
+/// 256³ because the simulated step runs unoptimized.
+#[test]
+#[ignore]
+fn headless_game_smoke_256() {
+    let level = 8;
+    let side = 1u64 << level;
+
+    let mut world = World::new(level);
+    let _ = world
+        .seed_terrain(&TerrainParams::for_level(level))
+        .expect("level-derived terrain params must validate");
+    world.seed_water_and_sand();
+
+    let mut renderer = match HeadlessRenderer::new() {
+        Some(r) => r,
+        None => {
+            eprintln!("SKIP: no GPU adapter available for headless smoke");
+            return;
+        }
+    };
+
+    let mut svdag = Svdag::new();
+    svdag.update(&world.store, world.root, world.level);
+    assert!(svdag.node_count > 0, "seeded world should build a non-empty SVDAG");
+
+    renderer.upload_svdag(&svdag, side as u32, BenchCamera::app_spawn(side as u32));
+    let first = renderer.render_frame();
+    assert!(
+        first < Duration::from_secs(5),
+        "initial headless frame should complete quickly, got {:.2}s",
+        first.as_secs_f64()
+    );
+
+    world.step();
+    assert!(world.generation >= 1, "smoke step should advance the world");
+
+    svdag.update(&world.store, world.root, world.level);
+    assert!(
+        svdag.node_count > 0,
+        "post-step world should still build a non-empty SVDAG"
+    );
+    renderer.upload_svdag(&svdag, side as u32, BenchCamera::app_spawn(side as u32));
+    let second = renderer.render_frame();
+    assert!(
+        second < Duration::from_secs(5),
+        "post-step headless frame should complete quickly, got {:.2}s",
+        second.as_secs_f64()
+    );
+}
+
 #[test]
 #[ignore]
 fn bench_raycast_512() {
