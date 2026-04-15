@@ -8,6 +8,9 @@
 //!
 //! ## Baseline (2026-04-12, M-series Mac, release build)
 //!
+//! Confidence note: this file is observational only. The baseline table and
+//! printed timings are for manual tracking, not machine-enforced perf gating.
+//!
 //! | Scale | Cold build | Warm rebuild | Nodes  | Size   |
 //! |-------|------------|--------------|--------|--------|
 //! | 64³   | 91µs       | 49µs         | 640    | 0.0 MB |

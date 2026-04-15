@@ -2,6 +2,10 @@
 //!
 //! Measures heightmap precomputation + octree gen_region time.
 //! Run with: `cargo test --release --test bench_terrain_gen -- --ignored --nocapture`
+//!
+//! Confidence note: this harness is observational only. The printed timings
+//! support manual regression checks; the enforced perf gate lives separately
+//! in `src/terrain/gen.rs::generation_perf_budget` and is much narrower.
 
 use hash_thing::sim::World;
 use hash_thing::terrain::TerrainParams;

@@ -112,6 +112,13 @@ struct OrbitCameraPose {
     dist: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingPlayerAction {
+    Break,
+    Place,
+    PlaceClone,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LatticeDemoBeat {
@@ -309,6 +316,9 @@ struct App {
     startup_scene_pending: bool,
     /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
     cursor_captured: bool,
+    /// Replay FPS interactions on the next live-world frame instead of
+    /// dropping them while a background step is in flight.
+    pending_player_action: Option<PendingPlayerAction>,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -374,6 +384,7 @@ impl App {
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
             cursor_captured: false,
+            pending_player_action: None,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -588,6 +599,44 @@ impl App {
     /// True while the sim step is running on a background thread.
     fn is_stepping(&self) -> bool {
         self.step_handle.is_some()
+    }
+
+    fn maybe_start_background_step(&mut self) {
+        if self.paused || self.is_stepping() {
+            return;
+        }
+        self.step_start = std::time::Instant::now();
+        // Move world to the background thread only after the frame has
+        // consumed the live snapshot for movement, interaction, and render.
+        let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
+        self.step_handle = Some(std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                world.apply_mutations();
+                world.spawn_clones();
+                world.step_recursive();
+                world
+            }))
+            .map_err(|e| {
+                if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                }
+            })
+        }));
+    }
+
+    fn run_pending_player_action(&mut self) {
+        let Some(action) = self.pending_player_action.take() else {
+            return;
+        };
+        match action {
+            PendingPlayerAction::Break => self.break_block(),
+            PendingPlayerAction::Place => self.place_block(),
+            PendingPlayerAction::PlaceClone => self.place_clone_block(),
+        }
     }
 
     /// Legend text lines for the current camera mode.
@@ -1458,7 +1507,11 @@ impl ApplicationHandler for App {
                         }
                     } else if state == ElementState::Pressed {
                         // FPS mode: left click = break block.
-                        self.break_block();
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::Break);
+                        } else {
+                            self.break_block();
+                        }
                     }
                 }
                 if button == MouseButton::Right
@@ -1468,9 +1521,17 @@ impl ApplicationHandler for App {
                     if self.keys_held.contains(&KeyCode::ControlLeft)
                         || self.keys_held.contains(&KeyCode::ControlRight)
                     {
-                        self.place_clone_block();
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::PlaceClone);
+                        } else {
+                            self.place_clone_block();
+                        }
                     } else {
-                        self.place_block();
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::Place);
+                        } else {
+                            self.place_block();
+                        }
                     }
                 }
             }
@@ -1616,34 +1677,8 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // --- Kick off background step if due (x5w) ---
-                // Step as fast as the background thread can go — no artificial
-                // throttle. The step runs off-thread (x5w) so it doesn't
-                // block rendering. Previous 200ms interval was a conservative
-                // default that limited CA to ~5 steps/sec even though the
-                // stepper can do ~16/sec at 512³ (hash-thing-cbu).
-                if !self.paused && !self.is_stepping() {
-                    self.step_start = std::time::Instant::now();
-                    // Move world to background thread; replace with tiny
-                    // placeholder so self.world remains valid (but inert).
-                    let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
-                    self.step_handle = Some(std::thread::spawn(move || {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            world.apply_mutations();
-                            world.spawn_clones();
-                            world.step_recursive();
-                            world
-                        }))
-                        .map_err(|e| {
-                            if let Some(s) = e.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = e.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown panic".to_string()
-                            }
-                        })
-                    }));
+                if !self.is_stepping() {
+                    self.run_pending_player_action();
                 }
 
                 // Wall-clock perf summary (hash-thing-q63). Sits outside the
@@ -1912,6 +1947,10 @@ impl ApplicationHandler for App {
                     self.occluded = true;
                     return;
                 }
+
+                // Kick off the next background step only after this frame has
+                // finished consuming the live world snapshot.
+                self.maybe_start_background_step();
 
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -2197,6 +2236,86 @@ mod tests {
             .expect("player entity should still exist");
         let center = app.world_center();
         assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
+    }
+
+    #[test]
+    fn background_step_starts_after_live_world_player_update() {
+        let mut app = App::new(8);
+        app.paused = false;
+        app.keys_held.insert(KeyCode::KeyW);
+        let stone = hash_thing::octree::Cell::pack(1, 0).raw();
+        for x in 3..=5 {
+            for z in 3..=5 {
+                app.world.set(
+                    sim::WorldCoord(x),
+                    sim::WorldCoord(0),
+                    sim::WorldCoord(z),
+                    stone,
+                );
+            }
+        }
+        app.world.set(
+            sim::WorldCoord(4),
+            sim::WorldCoord(1),
+            sim::WorldCoord(3),
+            stone,
+        );
+        app.world.set(
+            sim::WorldCoord(4),
+            sim::WorldCoord(2),
+            sim::WorldCoord(3),
+            stone,
+        );
+        app.reset_player_pose([4.5, 1.0, 4.5], 0.0, 0.0);
+
+        let pid = app.player_id.expect("player should exist");
+        let speed = PLAYER_SPEED;
+        let step = player::step_grounded_movement(
+            &app.world,
+            &[4.5, 1.0, 4.5],
+            0.0,
+            player::GroundedMoveInput {
+                yaw: 0.0,
+                move_input: [1.0, 0.0],
+                speed,
+                dt: 0.1,
+                jump_requested: false,
+            },
+        );
+        let expected_z = step.pos[2];
+
+        let yaw = app
+            .entities
+            .get_mut(pid)
+            .and_then(|e| match &e.kind {
+                sim::EntityKind::Player(ps) => Some(ps.yaw),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let delta = player::compute_move_delta(yaw, [1.0, 0.0, 0.0], speed, 0.1);
+        assert!(
+            4.5 + delta[2] < expected_z,
+            "free-fly would move farther through the wall than grounded movement"
+        );
+
+        if let Some(player) = app.entities.get_mut(pid) {
+            player.pos = step.pos;
+        }
+        app.maybe_start_background_step();
+
+        let player = app
+            .entities
+            .iter()
+            .find(|entity| entity.id == pid)
+            .expect("player entity should still exist");
+        assert_eq!(player.pos[2], expected_z);
+        assert!(app.is_stepping(), "step should start after player update");
+
+        let handle = app.step_handle.take().expect("step handle should exist");
+        app.world = handle
+            .join()
+            .expect("step thread should not panic")
+            .expect("step thread should return a world");
     }
 
     #[test]

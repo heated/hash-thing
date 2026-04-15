@@ -8,6 +8,10 @@
 //!
 //! Constraint: each scale caps at ~30 seconds total. If a single frame
 //! exceeds 5 seconds, the benchmark aborts at that scale.
+//!
+//! Confidence note: this harness is observational only. GPU-adapter absence,
+//! timeout, or timing regressions are logged for human review; they are not
+//! enforced as pass/fail confidence gates.
 
 use hash_thing::render::Svdag;
 use hash_thing::sim::World;

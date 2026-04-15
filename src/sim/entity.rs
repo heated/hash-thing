@@ -584,6 +584,31 @@ mod tests {
     }
 
     #[test]
+    fn particle_despawn_outside_realized_region_is_dropped_on_apply() {
+        let mut store = EntityStore::new();
+        store.add(
+            [7.6, 3.0, 3.0],
+            [0.8, 0.0, 0.0],
+            EntityKind::Particle(ParticleState {
+                material: 1,
+                ttl: 0,
+                on_despawn: Some(WATER),
+            }),
+        );
+
+        let mut world = World::new(3);
+        let mut queue = MutationQueue::new();
+        store.update(&world, &mut queue);
+        assert_eq!(queue.len(), 1);
+
+        world.queue = queue;
+        world.apply_mutations();
+
+        assert_eq!(world.get(WorldCoord(7), WorldCoord(3), WorldCoord(3)), 0);
+        assert_eq!(world.get(WorldCoord(0), WorldCoord(3), WorldCoord(3)), 0);
+    }
+
+    #[test]
     fn default_is_empty() {
         let store = EntityStore::default();
         assert!(store.is_empty());

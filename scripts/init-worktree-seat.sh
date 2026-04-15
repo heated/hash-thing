@@ -15,7 +15,8 @@
 #   3. Picks the next free seat from the 5-seat auto-pool
 #      (flint · cairn · onyx · ember · spark), scanning sibling worktrees'
 #      `.beads/actor` files to find gaps.
-#   4. Writes the chosen seat to `.beads/actor`.
+#   4. Writes the chosen seat to `.beads/actor` and points `.beads/redirect`
+#      at the shared main-repo tracker state.
 #
 # Design decisions (hash-thing-9uh, edward answered 2026-04-11):
 #   - Mayor is NOT in the auto-pool. To seat a mayor, set `.beads/actor` manually
@@ -29,6 +30,10 @@
 # Exit 1 ONLY when the user almost certainly wants to know (pool exhausted).
 
 set -euo pipefail
+
+repo_root_from_common_git() {
+    git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git$||'
+}
 
 # --- Fast path: if seat file already exists, do nothing. ---------------------
 # This is the hot path — fires on every SessionStart — and needs to stay cheap.
@@ -106,8 +111,13 @@ done
 # Walk the pool in order; first seat not in USED is ours.
 for seat in "${POOL[@]}"; do
     if ! grep -qw "$seat" <<< "$USED"; then
+        REPO_ROOT=$(repo_root_from_common_git)
         mkdir -p .beads
+        chmod 700 .beads 2>/dev/null || true
         echo "$seat" > .beads/actor
+        if [[ -n "$REPO_ROOT" && -d "$REPO_ROOT/.beads" ]]; then
+            echo "$REPO_ROOT/.beads" > .beads/redirect
+        fi
         echo "init-worktree-seat: assigned seat '$seat' (worktree=$(basename "$PWD"))"
         exit 0
     fi
