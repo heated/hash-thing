@@ -112,6 +112,13 @@ struct OrbitCameraPose {
     dist: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingPlayerAction {
+    BreakBlock,
+    PlaceBlock,
+    PlaceCloneBlock,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LatticeDemoBeat {
@@ -309,6 +316,9 @@ struct App {
     startup_scene_pending: bool,
     /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
     cursor_captured: bool,
+    /// Replay FPS interactions on the next live-world frame instead of
+    /// dropping them while a background step is in flight.
+    pending_player_action: Option<PendingPlayerAction>,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -319,6 +329,10 @@ fn should_warn_about_slow_dev_step(
     debug_build
         && volume_size >= 256
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
+}
+
+fn default_legend_visibility(mode: CameraMode) -> bool {
+    matches!(mode, CameraMode::Orbit)
 }
 
 fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
@@ -363,13 +377,14 @@ impl App {
             render_origin,
             render_inv_size,
             warned_dev_profile_perf: false,
-            legend_visible: true,
+            legend_visible: default_legend_visibility(CameraMode::FirstPerson),
             legend_dirty: true,
             current_demo_beat: None,
             short_demo_cut: None,
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
             cursor_captured: false,
+            pending_player_action: None,
         };
 
         let player_pos = app.reset_scene_entities();
@@ -466,6 +481,18 @@ impl App {
             self.world.origin[1] as f64 + side * 0.5,
             self.world.origin[2] as f64 + side * 0.5,
         ]
+    }
+
+    fn recenter_player(&mut self) -> bool {
+        let Some(pid) = self.player_id else {
+            return false;
+        };
+        let center = self.world_center();
+        let Some(player) = self.entities.get_mut(pid) else {
+            return false;
+        };
+        player.pos = [center[0], center[1] + 2.0, center[2]];
+        true
     }
 
     fn reset_scene_entities(&mut self) -> [f64; 3] {
@@ -574,49 +601,88 @@ impl App {
         self.step_handle.is_some()
     }
 
+    fn maybe_start_background_step(&mut self) {
+        if self.paused || self.is_stepping() {
+            return;
+        }
+        self.step_start = std::time::Instant::now();
+        // Move world to the background thread only after the frame has
+        // consumed the live snapshot for movement, interaction, and render.
+        let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
+        self.step_handle = Some(std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                world.apply_mutations();
+                world.spawn_clones();
+                world.step_recursive();
+                world
+            }))
+            .map_err(|e| {
+                if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                }
+            })
+        }));
+    }
+
+    fn run_pending_player_action(&mut self) {
+        let Some(action) = self.pending_player_action.take() else {
+            return;
+        };
+        match action {
+            PendingPlayerAction::BreakBlock => self.break_block(),
+            PendingPlayerAction::PlaceBlock => self.place_block(),
+            PendingPlayerAction::PlaceCloneBlock => self.place_clone_block(),
+        }
+    }
+
     /// Legend text lines for the current camera mode.
     fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
         match mode {
             CameraMode::FirstPerson => vec![
-                "  FIRST-PERSON MODE",
+                "  FIELD LINK",
                 "",
-                "  WASD        Move",
-                "  Mouse       Look",
-                "  Space       Jump",
-                "  Ctrl        Sprint",
-                "  LClick      Break block",
-                "  RClick      Place block",
-                "  1-7         Material",
-                "  Tab         Orbit mode",
+                "  WASD        Drift",
+                "  Mouse       Aim",
+                "  Space       Leap",
+                "  Ctrl        Surge",
+                "  LClick      Carve",
+                "  RClick      Cast",
+                "  Scroll/1-9  Matter",
+                "  Ctrl+RClick Clone source",
+                "  Tab         Survey cam",
                 "",
                 "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Walk lattice",
+                "  R  Reset      G  GoL bloom",
+                "  M  Gyroid     N  Lattice walk",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Toggle help",
-                "  Esc Quit",
+                "  F5 Pause      F1  Signal legend",
+                "  Esc Exit",
             ],
             CameraMode::Orbit => vec![
-                "  ORBIT MODE",
+                "  SURVEY CAM",
                 "",
-                "  LClick+Drag Orbit camera",
-                "  Scroll      Zoom",
+                "  LClick+Drag Orbit",
+                "  Scroll      Push / pull",
                 "  Space       Pause",
                 "  S           Single step",
-                "  1-4         CA rule",
-                "  Tab         FPS mode",
+                "  1-4         Rule set",
+                "  Tab         Field link",
                 "",
                 "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL sphere",
-                "  M  Gyroid     N  Walk lattice",
+                "  R  Reset      G  GoL bloom",
+                "  M  Gyroid     N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
                 "  V  DEV tweet reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Toggle help",
-                "  Esc Quit",
+                "  F5 Pause      F1  Signal legend",
+                "  Esc Exit",
             ],
         }
     }
@@ -657,6 +723,7 @@ impl App {
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
         self.camera_mode = CameraMode::Orbit;
         self.camera_feel.reset();
+        self.legend_visible = default_legend_visibility(self.camera_mode);
         self.legend_dirty = true;
         if let Some(renderer) = &mut self.renderer {
             renderer.camera_target = pose.target;
@@ -1212,12 +1279,8 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("0") => {
                             // Recenter player at world center.
-                            if let Some(pid) = self.player_id {
-                                let center = self.world.side() as f64 / 2.0;
-                                if let Some(p) = self.entities.get_mut(pid) {
-                                    p.pos = [center, center + 2.0, center];
-                                    log::info!("Player recentered");
-                                }
+                            if self.recenter_player() {
+                                log::info!("Player recentered");
                             }
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F1) => {
@@ -1232,6 +1295,7 @@ impl ApplicationHandler for App {
                             if self.camera_mode == CameraMode::Orbit {
                                 self.camera_feel.reset();
                             }
+                            self.legend_visible = default_legend_visibility(self.camera_mode);
                             self.sync_cursor_capture();
                             self.legend_dirty = true;
                             log::info!("Camera mode: {:?}", self.camera_mode);
@@ -1443,7 +1507,11 @@ impl ApplicationHandler for App {
                         }
                     } else if state == ElementState::Pressed {
                         // FPS mode: left click = break block.
-                        self.break_block();
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::BreakBlock);
+                        } else {
+                            self.break_block();
+                        }
                     }
                 }
                 if button == MouseButton::Right
@@ -1453,9 +1521,18 @@ impl ApplicationHandler for App {
                     if self.keys_held.contains(&KeyCode::ControlLeft)
                         || self.keys_held.contains(&KeyCode::ControlRight)
                     {
-                        self.place_clone_block();
+                        if self.is_stepping() {
+                            self.pending_player_action =
+                                Some(PendingPlayerAction::PlaceCloneBlock);
+                        } else {
+                            self.place_clone_block();
+                        }
                     } else {
-                        self.place_block();
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::PlaceBlock);
+                        } else {
+                            self.place_block();
+                        }
                     }
                 }
             }
@@ -1601,34 +1678,8 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // --- Kick off background step if due (x5w) ---
-                // Step as fast as the background thread can go — no artificial
-                // throttle. The step runs off-thread (x5w) so it doesn't
-                // block rendering. Previous 200ms interval was a conservative
-                // default that limited CA to ~5 steps/sec even though the
-                // stepper can do ~16/sec at 512³ (hash-thing-cbu).
-                if !self.paused && !self.is_stepping() {
-                    self.step_start = std::time::Instant::now();
-                    // Move world to background thread; replace with tiny
-                    // placeholder so self.world remains valid (but inert).
-                    let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
-                    self.step_handle = Some(std::thread::spawn(move || {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            world.apply_mutations();
-                            world.spawn_clones();
-                            world.step_recursive();
-                            world
-                        }))
-                        .map_err(|e| {
-                            if let Some(s) = e.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = e.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown panic".to_string()
-                            }
-                        })
-                    }));
+                if !self.is_stepping() {
+                    self.run_pending_player_action();
                 }
 
                 // Wall-clock perf summary (hash-thing-q63). Sits outside the
@@ -1854,7 +1905,7 @@ impl ApplicationHandler for App {
                                 }
                                 renderer.camera_dist = 0.0;
                                 renderer.hud_visible = true;
-                                renderer.hotbar_visible = true;
+                                renderer.hotbar_visible = false;
                             }
                         }
                     }
@@ -1897,6 +1948,10 @@ impl ApplicationHandler for App {
                     self.occluded = true;
                     return;
                 }
+
+                // Kick off the next background step only after this frame has
+                // finished consuming the live world snapshot.
+                self.maybe_start_background_step();
 
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -2112,7 +2167,8 @@ mod tests {
     #[test]
     fn first_person_legend_hides_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
-        assert!(lines.iter().any(|line| line.contains("Space       Jump")));
+        assert!(lines.iter().any(|line| line.contains("Space       Leap")));
+        assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
         assert!(!lines.iter().any(|line| line.contains("Fly down")));
         assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
@@ -2120,7 +2176,7 @@ mod tests {
             .iter()
             .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
-        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
+        assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
 
     #[test]
@@ -2131,7 +2187,13 @@ mod tests {
             .iter()
             .any(|line| line.contains("DEV intro/interior/reveal")));
         assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
-        assert!(lines.iter().any(|line| line.contains("Walk lattice")));
+        assert!(lines.iter().any(|line| line.contains("Lattice walk")));
+    }
+
+    #[test]
+    fn legend_defaults_follow_camera_mode() {
+        assert!(!default_legend_visibility(CameraMode::FirstPerson));
+        assert!(default_legend_visibility(CameraMode::Orbit));
     }
 
     #[test]
@@ -2151,6 +2213,110 @@ mod tests {
                 waypoint.label
             );
         }
+    }
+
+    #[test]
+    fn recenter_player_respects_shifted_world_origin() {
+        let mut app = App::new(8);
+        app.world.ensure_region(
+            [sim::WorldCoord(-4), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [sim::WorldCoord(7), sim::WorldCoord(7), sim::WorldCoord(7)],
+        );
+        assert!(
+            app.world.origin[0] < 0,
+            "test setup should force a negative origin shift"
+        );
+
+        assert!(app.recenter_player());
+
+        let pid = app.player_id.expect("player should exist");
+        let player = app
+            .entities
+            .iter()
+            .find(|entity| entity.id == pid)
+            .expect("player entity should still exist");
+        let center = app.world_center();
+        assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
+    }
+
+    #[test]
+    fn background_step_starts_after_live_world_player_update() {
+        let mut app = App::new(8);
+        app.paused = false;
+        app.keys_held.insert(KeyCode::KeyW);
+        let stone = hash_thing::octree::Cell::pack(1, 0).raw();
+        for x in 3..=5 {
+            for z in 3..=5 {
+                app.world.set(
+                    sim::WorldCoord(x),
+                    sim::WorldCoord(0),
+                    sim::WorldCoord(z),
+                    stone,
+                );
+            }
+        }
+        app.world.set(
+            sim::WorldCoord(4),
+            sim::WorldCoord(1),
+            sim::WorldCoord(3),
+            stone,
+        );
+        app.world.set(
+            sim::WorldCoord(4),
+            sim::WorldCoord(2),
+            sim::WorldCoord(3),
+            stone,
+        );
+        app.reset_player_pose([4.5, 1.0, 4.5], 0.0, 0.0);
+
+        let pid = app.player_id.expect("player should exist");
+        let speed = PLAYER_SPEED;
+        let step = player::step_grounded_movement(
+            &app.world,
+            &[4.5, 1.0, 4.5],
+            0.0,
+            player::GroundedMoveInput {
+                yaw: 0.0,
+                move_input: [1.0, 0.0],
+                speed,
+                dt: 0.1,
+                jump_requested: false,
+            },
+        );
+        let expected_z = step.pos[2];
+
+        let yaw = app
+            .entities
+            .get_mut(pid)
+            .and_then(|e| match &e.kind {
+                sim::EntityKind::Player(ps) => Some(ps.yaw),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let delta = player::compute_move_delta(yaw, [1.0, 0.0, 0.0], speed, 0.1);
+        assert!(
+            4.5 + delta[2] < expected_z,
+            "free-fly would move farther through the wall than grounded movement"
+        );
+
+        if let Some(player) = app.entities.get_mut(pid) {
+            player.pos = step.pos;
+        }
+        app.maybe_start_background_step();
+
+        let player = app
+            .entities
+            .iter()
+            .find(|entity| entity.id == pid)
+            .expect("player entity should still exist");
+        assert_eq!(player.pos[2], expected_z);
+        assert!(app.is_stepping(), "step should start after player update");
+
+        let handle = app.step_handle.take().expect("step handle should exist");
+        app.world = handle
+            .join()
+            .expect("step thread should not panic")
+            .expect("step thread should return a world");
     }
 
     #[test]

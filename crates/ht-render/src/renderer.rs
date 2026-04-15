@@ -37,6 +37,43 @@ fn ticks_to_duration(start_ticks: u64, end_ticks: u64, period_ns: f32) -> Durati
     Duration::from_nanos(ns as u64)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RendererLifecycleSnapshot {
+    has_svdag_buffer: bool,
+    has_particle_buffer: bool,
+    particle_count: u32,
+}
+
+impl RendererLifecycleSnapshot {
+    fn from_renderer(renderer: &Renderer) -> Self {
+        Self {
+            has_svdag_buffer: renderer.svdag_buffer.is_some(),
+            has_particle_buffer: renderer.particle_buffer.is_some(),
+            particle_count: renderer.particle_count,
+        }
+    }
+
+    fn rebuild_compute_bind_group_on_texture_recreate(self) -> bool {
+        self.has_svdag_buffer
+    }
+
+    fn rebuild_compute_bind_group_on_palette_upload(self) -> bool {
+        self.has_svdag_buffer
+    }
+
+    fn rebuild_particle_bind_group_on_texture_recreate(self) -> bool {
+        self.particle_count > 0
+    }
+
+    fn rebuild_particle_bind_group_on_palette_upload(self) -> bool {
+        self.has_particle_buffer
+    }
+
+    fn particle_bind_group_should_exist(self) -> bool {
+        self.has_particle_buffer && self.particle_count > 0
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -1071,6 +1108,7 @@ impl Renderer {
 
     /// Recreate the raycast storage texture and dependent bind groups after resize.
     fn recreate_raycast_texture(&mut self) {
+        let lifecycle = RendererLifecycleSnapshot::from_renderer(self);
         let (tex, view) = Self::create_raycast_texture_static(
             &self.device,
             self.config.width,
@@ -1097,7 +1135,10 @@ impl Renderer {
         });
 
         // Rebuild compute bind group if SVDAG buffer exists (references texture view).
-        if let Some(svdag_buf) = &self.svdag_buffer {
+        if lifecycle.rebuild_compute_bind_group_on_texture_recreate() {
+            let Some(svdag_buf) = &self.svdag_buffer else {
+                return;
+            };
             self.svdag_compute_bind_group =
                 Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("svdag_compute_bg"),
@@ -1125,17 +1166,18 @@ impl Renderer {
                 }));
         }
 
-        if self.particle_count > 0 {
+        if lifecycle.rebuild_particle_bind_group_on_texture_recreate() {
             self.rebuild_particle_bind_group();
         }
     }
 
     fn rebuild_particle_bind_group(&mut self) {
+        let lifecycle = RendererLifecycleSnapshot::from_renderer(self);
         let Some(buf) = &self.particle_buffer else {
             self.particle_bind_group = None;
             return;
         };
-        if self.particle_count == 0 {
+        if !lifecycle.particle_bind_group_should_exist() {
             self.particle_bind_group = None;
             return;
         }
@@ -1276,6 +1318,7 @@ impl Renderer {
     /// materials). Recreates the palette buffer and both bind groups since
     /// wgpu bind groups are immutable (hash-thing-5bb.7 / hash-thing-ll6).
     pub fn upload_palette(&mut self, palette: &[[f32; 4]]) {
+        let lifecycle = RendererLifecycleSnapshot::from_renderer(self);
         self.palette_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1285,7 +1328,7 @@ impl Renderer {
             });
 
         // Rebuild particle bind group if it exists (it references palette).
-        if self.particle_buffer.is_some() {
+        if lifecycle.rebuild_particle_bind_group_on_palette_upload() {
             self.rebuild_particle_bind_group();
         }
 
@@ -1306,7 +1349,10 @@ impl Renderer {
         });
 
         // Rebuild SVDAG compute bind group if it exists (it also references palette).
-        if let Some(svdag_buf) = &self.svdag_buffer {
+        if lifecycle.rebuild_compute_bind_group_on_palette_upload() {
+            let Some(svdag_buf) = &self.svdag_buffer else {
+                return;
+            };
             self.svdag_compute_bind_group =
                 Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("svdag_compute_bg"),
@@ -1658,9 +1704,9 @@ impl Renderer {
                     } else {
                         1.0
                     };
-                    let quad_h = 0.8;
+                    let quad_h = 0.62;
                     let quad_w = quad_h * tex_aspect / aspect;
-                    let margin = 0.02;
+                    let margin = 0.035;
                     let quad_left = -1.0 + margin;
                     let quad_bottom = -1.0 + margin;
                     let legend_params: [f32; 4] = [quad_left, quad_bottom, quad_w, quad_h];
@@ -1697,7 +1743,7 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ticks_to_duration, FrameOutcome};
+    use super::{ticks_to_duration, FrameOutcome, RendererLifecycleSnapshot};
     use std::time::Duration;
 
     #[test]
@@ -1751,6 +1797,89 @@ mod tests {
             for (j, b) in all.iter().enumerate() {
                 assert_eq!(a == b, i == j, "{a:?} vs {b:?}");
             }
+        }
+    }
+
+    #[test]
+    fn lifecycle_snapshot_only_rebuilds_compute_bind_group_when_svdag_buffer_exists() {
+        let without_svdag = RendererLifecycleSnapshot {
+            has_svdag_buffer: false,
+            has_particle_buffer: false,
+            particle_count: 0,
+        };
+        let with_svdag = RendererLifecycleSnapshot {
+            has_svdag_buffer: true,
+            ..without_svdag
+        };
+
+        assert!(!without_svdag.rebuild_compute_bind_group_on_texture_recreate());
+        assert!(!without_svdag.rebuild_compute_bind_group_on_palette_upload());
+        assert!(with_svdag.rebuild_compute_bind_group_on_texture_recreate());
+        assert!(with_svdag.rebuild_compute_bind_group_on_palette_upload());
+    }
+
+    #[test]
+    fn lifecycle_snapshot_distinguishes_resize_vs_palette_particle_rebuilds() {
+        let buffered_but_empty = RendererLifecycleSnapshot {
+            has_svdag_buffer: false,
+            has_particle_buffer: true,
+            particle_count: 0,
+        };
+        let active_particles = RendererLifecycleSnapshot {
+            particle_count: 3,
+            ..buffered_but_empty
+        };
+
+        assert!(buffered_but_empty.rebuild_particle_bind_group_on_palette_upload());
+        assert!(!buffered_but_empty.rebuild_particle_bind_group_on_texture_recreate());
+
+        assert!(active_particles.rebuild_particle_bind_group_on_palette_upload());
+        assert!(active_particles.rebuild_particle_bind_group_on_texture_recreate());
+    }
+
+    #[test]
+    fn lifecycle_snapshot_particle_bind_group_requires_buffer_and_live_particles() {
+        let cases = [
+            (
+                RendererLifecycleSnapshot {
+                    has_svdag_buffer: false,
+                    has_particle_buffer: false,
+                    particle_count: 0,
+                },
+                false,
+            ),
+            (
+                RendererLifecycleSnapshot {
+                    has_svdag_buffer: false,
+                    has_particle_buffer: true,
+                    particle_count: 0,
+                },
+                false,
+            ),
+            (
+                RendererLifecycleSnapshot {
+                    has_svdag_buffer: false,
+                    has_particle_buffer: false,
+                    particle_count: 4,
+                },
+                false,
+            ),
+            (
+                RendererLifecycleSnapshot {
+                    has_svdag_buffer: false,
+                    has_particle_buffer: true,
+                    particle_count: 4,
+                },
+                true,
+            ),
+        ];
+
+        for (snapshot, expected) in cases {
+            assert_eq!(
+                snapshot.particle_bind_group_should_exist(),
+                expected,
+                "{snapshot:?}"
+            );
         }
     }
 }

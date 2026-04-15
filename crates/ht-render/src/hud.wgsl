@@ -1,6 +1,6 @@
 // HUD overlay shader (hash-thing-5bb.10).
 //
-// Draws a crosshair and material color indicator in screen space.
+// Draws an open reticle and material signal bar in screen space.
 // No bind groups needed — all parameters come via push constants or
 // are baked into the vertex positions.
 
@@ -18,22 +18,25 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
 };
 
-// Crosshair: 4 thin rectangles forming a + shape, plus a material indicator square.
-// Total: 5 quads = 30 vertices.
+// Reticle: two open side rails, two short vertical cues, and one
+// material signal bar below center. Total: 5 quads = 30 vertices.
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     var out: VertexOutput;
 
-    // Crosshair parameters (in NDC, where screen is [-1,1]²).
-    let arm_len = 0.015;  // half-length of each arm
-    let arm_w = 0.002;    // half-width of each arm
-    let gap = 0.004;      // gap in center
+    // Reticle geometry (in NDC, where screen is [-1,1]²).
+    let side_len = 0.018;
+    let side_w = 0.0018;
+    let side_gap = 0.010;
+    let cue_len = 0.009;
+    let cue_w = 0.0014;
+    let cue_offset = 0.016;
 
-    // Material indicator square.
-    let sq_size = 0.02;
-    let sq_x = -0.06;     // offset left of center
-    let sq_y = -0.04;     // offset below center
+    // Material signal bar.
+    let sig_w = 0.018;
+    let sig_h = 0.004;
+    let sig_y = -0.050;
 
     let aspect = u.params.x;
 
@@ -48,23 +51,27 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let cv = corner_v[local_v];
 
     var pos = vec2<f32>(0.0, 0.0);
-    var color = vec4<f32>(1.0, 1.0, 1.0, 0.8); // white crosshair
+    var color = vec4<f32>(0.97, 0.91, 0.82, 0.86);
 
     if quad_id == 0u {
-        // Right arm
-        pos = vec2<f32>((gap + arm_len * (cu * 0.5 + 0.5)) / aspect, arm_w * cv);
+        // Left rail
+        let x = -(side_gap + side_len * (cu * 0.5 + 0.5));
+        pos = vec2<f32>(x / aspect, side_w * cv);
     } else if quad_id == 1u {
-        // Left arm
-        pos = vec2<f32>(-(gap + arm_len * (cu * 0.5 + 0.5)) / aspect, arm_w * cv);
+        // Right rail
+        let x = side_gap + side_len * (cu * 0.5 + 0.5);
+        pos = vec2<f32>(x / aspect, side_w * cv);
     } else if quad_id == 2u {
-        // Top arm
-        pos = vec2<f32>(arm_w * cu / aspect, gap + arm_len * (cv * 0.5 + 0.5));
+        // Upper cue
+        let y = cue_offset + cue_len * (cv * 0.5 + 0.5);
+        pos = vec2<f32>(cue_w * cu / aspect, y);
     } else if quad_id == 3u {
-        // Bottom arm
-        pos = vec2<f32>(arm_w * cu / aspect, -(gap + arm_len * (cv * 0.5 + 0.5)));
+        // Lower cue
+        let y = -(cue_offset + cue_len * (cv * 0.5 + 0.5));
+        pos = vec2<f32>(cue_w * cu / aspect, y);
     } else if quad_id == 4u {
-        // Material indicator square — bottom-left of crosshair
-        pos = vec2<f32>((sq_x + sq_size * cu) / aspect, sq_y + sq_size * cv);
+        // Material signal bar below center.
+        pos = vec2<f32>(sig_w * cu / aspect, sig_y + sig_h * cv);
         color = u.material_color;
     }
 

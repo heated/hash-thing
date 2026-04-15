@@ -208,8 +208,9 @@ const CHAR_H: usize = GLYPH_H + 2; // 2px spacing
 
 /// Render lines of text into an RGBA pixel buffer.
 ///
-/// Returns `(pixels, width, height)`. Background is semi-transparent black;
-/// text is white. `scale` multiplies each pixel (1 = native 6×9 per char).
+/// Returns `(pixels, width, height)`. Background is transparent so the
+/// shader can supply the panel treatment; glyphs are warm off-white.
+/// `scale` multiplies each pixel (1 = native 6×9 per char).
 pub fn render_text_rgba(lines: &[&str], scale: u32) -> (Vec<u8>, u32, u32) {
     let max_cols = lines.iter().map(|l| l.len()).max().unwrap_or(0);
     let pad = 2; // padding in native pixels
@@ -220,12 +221,12 @@ pub fn render_text_rgba(lines: &[&str], scale: u32) -> (Vec<u8>, u32, u32) {
     let out_h = (tex_h as u32) * scale;
     let mut pixels = vec![0u8; (out_w * out_h * 4) as usize];
 
-    // Fill background: semi-transparent dark.
+    // Transparent background: the legend shader paints the panel.
     for i in 0..(out_w * out_h) as usize {
         pixels[i * 4] = 0;
         pixels[i * 4 + 1] = 0;
         pixels[i * 4 + 2] = 0;
-        pixels[i * 4 + 3] = 160;
+        pixels[i * 4 + 3] = 0;
     }
 
     for (row, line) in lines.iter().enumerate() {
@@ -243,9 +244,9 @@ pub fn render_text_rgba(lines: &[&str], scale: u32) -> (Vec<u8>, u32, u32) {
                                 let py = nat_y as u32 * scale + sy;
                                 if px < out_w && py < out_h {
                                     let idx = ((py * out_w + px) * 4) as usize;
-                                    pixels[idx] = 255;
-                                    pixels[idx + 1] = 255;
-                                    pixels[idx + 2] = 255;
+                                    pixels[idx] = 245;
+                                    pixels[idx + 1] = 233;
+                                    pixels[idx + 2] = 214;
                                     pixels[idx + 3] = 255;
                                 }
                             }
@@ -293,13 +294,13 @@ mod tests {
     #[test]
     fn letter_a_has_lit_pixels() {
         let (pixels, w, _h) = render_text_rgba(&["A"], 1);
-        // Check that at least some pixels are white (not all background).
-        let white_count = (0..(pixels.len() / 4))
-            .filter(|&i| pixels[i * 4] == 255)
+        // Check that at least some pixels are opaque glyph pixels (not all background).
+        let lit_count = (0..(pixels.len() / 4))
+            .filter(|&i| pixels[i * 4 + 3] == 255)
             .count();
         assert!(
-            white_count > 0,
-            "Expected some white pixels for 'A', tex_w={}",
+            lit_count > 0,
+            "Expected some lit glyph pixels for 'A', tex_w={}",
             w
         );
     }

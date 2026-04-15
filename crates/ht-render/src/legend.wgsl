@@ -38,7 +38,26 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     return out;
 }
 
+fn over_straight(top: vec4<f32>, bottom: vec4<f32>) -> vec4<f32> {
+    let out_a = top.a + bottom.a * (1.0 - top.a);
+    if out_a <= 0.0001 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let out_rgb = (top.rgb * top.a + bottom.rgb * bottom.a * (1.0 - top.a)) / out_a;
+    return vec4<f32>(out_rgb, out_a);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(legend_tex, legend_samp, in.uv);
+    let tex = textureSample(legend_tex, legend_samp, in.uv);
+    let uv = in.uv;
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    let panel_fade = smoothstep(0.0, 0.06, edge);
+    let accent = smoothstep(0.0, 0.025, uv.y) * (1.0 - smoothstep(0.025, 0.07, uv.y));
+    let panel = vec4<f32>(0.05, 0.07, 0.09, 0.68 * panel_fade);
+    let accent_band = vec4<f32>(0.78, 0.57, 0.30, 0.45 * accent * panel_fade);
+    let text = vec4<f32>(tex.rgb, tex.a);
+    let base = over_straight(accent_band, panel);
+    return over_straight(text, base);
 }
