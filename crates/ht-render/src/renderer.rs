@@ -106,6 +106,13 @@ pub enum FrameOutcome {
     Timeout,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RendererCpuPhaseTimes {
+    pub surface_acquire: Duration,
+    pub submit: Duration,
+    pub present: Duration,
+}
+
 /// GPU-side render pass timing via `wgpu::Features::TIMESTAMP_QUERY`.
 ///
 /// Owns a 2-entry `QuerySet` (pass start + pass end), a resolve buffer
@@ -381,6 +388,9 @@ pub struct Renderer {
     /// lacks TIMESTAMP_QUERY entirely). Consume-on-read avoids
     /// double-recording the same duration across frames.
     last_gpu_frame_time: Option<Duration>,
+    /// Most recent CPU-side frame phase timings, consumed by
+    /// `take_last_cpu_phase_times()` so callers can record them once.
+    last_cpu_phase_times: Option<RendererCpuPhaseTimes>,
     start_time: Instant,
 }
 
@@ -1076,6 +1086,7 @@ impl Renderer {
             render_scale: 0.5,
             gpu_timing,
             last_gpu_frame_time: None,
+            last_cpu_phase_times: None,
             start_time: Instant::now(),
         }
     }
@@ -1222,6 +1233,10 @@ impl Renderer {
     /// `render_cpu` from `main.rs`.
     pub fn take_last_gpu_frame_time(&mut self) -> Option<Duration> {
         self.last_gpu_frame_time.take()
+    }
+
+    pub fn take_last_cpu_phase_times(&mut self) -> Option<RendererCpuPhaseTimes> {
+        self.last_cpu_phase_times.take()
     }
 
     /// Upload (or re-upload) a serialized SVDAG to the GPU.
@@ -1513,6 +1528,7 @@ impl Renderer {
         // No catch-all: `CurrentSurfaceTexture` is not `#[non_exhaustive]`, so
         // any future wgpu variant becomes a compile error pointing here,
         // instead of getting silently swallowed (hash-thing-8jp I1a).
+        let acquire_start = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(tex) | CurrentSurfaceTexture::Suboptimal(tex) => tex,
             CurrentSurfaceTexture::Occluded => return FrameOutcome::Occluded,
@@ -1540,6 +1556,7 @@ impl Renderer {
                 return FrameOutcome::Timeout;
             }
         };
+        let surface_acquire = acquire_start.elapsed();
 
         let view = surface_texture
             .texture
@@ -1728,8 +1745,17 @@ impl Renderer {
             }
         }
 
+        let submit_start = Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
+        let submit = submit_start.elapsed();
+        let present_start = Instant::now();
         surface_texture.present();
+        let present = present_start.elapsed();
+        self.last_cpu_phase_times = Some(RendererCpuPhaseTimes {
+            surface_acquire,
+            submit,
+            present,
+        });
 
         if captured_this_frame {
             if let Some(gt) = &self.gpu_timing {

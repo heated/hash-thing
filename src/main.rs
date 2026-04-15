@@ -1933,6 +1933,12 @@ impl ApplicationHandler for App {
                 // always return `None` here — `render_cpu` stays the
                 // only render metric on those machines.
                 if let Some(renderer) = self.renderer.as_mut() {
+                    if let Some(cpu_times) = renderer.take_last_cpu_phase_times() {
+                        self.perf
+                            .record("surface_acquire_cpu", cpu_times.surface_acquire);
+                        self.perf.record("submit_cpu", cpu_times.submit);
+                        self.perf.record("present_cpu", cpu_times.present);
+                    }
                     if let Some(d) = renderer.take_last_gpu_frame_time() {
                         self.perf.record("render_gpu", d);
                     }
