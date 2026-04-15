@@ -259,6 +259,92 @@ Working rules:
 - actor identity lives in each worktree's `.beads/actor`
 - tracker state is shared through the repo-root `.beads/`
 
+## Workflow Fit Snapshot: Gastown vs Gas City vs Current/Minimal
+
+This snapshot was added during `hash-thing-kqy6.1.3` on 2026-04-14 to compare likely adoption shapes for this repo's crew workflow.
+
+### Bottom line
+
+The best near-term shape for hash-thing is a hybrid biased toward the current/minimal loop, not a wholesale port to Gas Town.
+
+Gas Town is the most mature and opinionated option, but its native loop is Mayor-led and role-heavy. Gas City is concrete enough to evaluate as real software, but it is still more of an orchestration SDK than a finished workflow answer. For this repo, Gas City is the only serious next-substrate candidate, and only as a narrow hybrid if hands-on trials remain positive.
+
+### Core loops
+
+Current/minimal loop:
+1. Poll `.bin/bd ready`
+2. Claim bead
+3. Work in a seat worktree
+4. Validate
+5. Run review tier
+6. Land on `main`
+7. Close bead
+8. Poll again
+
+Gas Town native loop:
+1. Start in Mayor
+2. Create convoy around beads
+3. Sling work to crew or polecats
+4. Witness/Deacon/Dogs supervise health and recovery
+5. Refinery handles merge discipline
+6. Mayor reports status and routes escalations
+
+Gas City native loop:
+1. Define a city in `city.toml`
+2. Add rigs and providers
+3. Start the controller/supervisor loop
+4. Create beads or sessions
+5. Attach to sessions and let desired state reconcile to running state
+6. Use formulas, waits, mail, and orders where needed
+
+### Fit for this repo
+
+Current/minimal:
+- best Codex-first fit today
+- lowest ceremony
+- already aligned with cmux and peer-seat ownership
+
+Gas Town:
+- strongest built-in operating model
+- biggest workflow change
+- weakest fit for "any seat owns the full loop" and "mayor is mostly observer"
+
+Gas City:
+- better long-term fit than Gas Town because it is runtime-agnostic and config-first
+- concrete enough to evaluate now: active repo, releases, docs, runtimes, beads integration
+- still requires us to define our own house style for peer seats, review policy, direct-to-main landing, and cmux supervision
+
+### Adoption shapes
+
+Wholesale Gas Town port:
+- highest automation
+- highest process overhead
+- poor fit unless the explicit goal becomes a Mayor-centered town
+
+Native Gas City adoption:
+- medium/high migration cost
+- plausible if we want a reusable orchestration substrate
+- still requires design work before it feels like hash-thing
+
+Hybrid:
+- keep `bd`, worktrees, direct seat ownership, current review tiers, and direct-to-main landing
+- borrow only the pieces that replace bespoke glue cleanly
+- best fit now
+
+Likely hybrid imports, if trials justify them:
+- runtime/provider abstraction
+- controller/supervisor for session lifecycle
+- declarative config or pack surface
+- better health/recovery loops
+
+### Recommendation shape
+
+1. Keep the current/minimal crew loop as the baseline.
+2. Do not wholesale-port this repo to Gas Town.
+3. Treat Gas City as the only serious next-substrate candidate.
+4. If Gas City trials stay positive, prototype a narrow hybrid that preserves peer-seat pull semantics and direct seat ownership.
+5. If Gas City feels heavy even in narrow use, tighten the current setup instead of adopting either system wholesale.
+
 Important project convention: Edward is not expected to operate `bd` directly. If a bead action is attributed to a human name, the project docs treat that as a likely missing `BEADS_ACTOR`, not evidence of a human action.
 
 ## 6. Browser Automation / MCP
@@ -310,3 +396,75 @@ Minimum viable reproduction for another repo:
 - `~/.claude/CLAUDE.md` still references `~/cmux-repo`, but that source checkout is not present here
 - browser automation is evidenced by logs, but its active config surface is not captured in one obvious file here
 - this file is a snapshot, not a self-updating system; if Edward wants it to stay current, it should either become part of the `.agents/` refresh discipline or get its own upkeep bead
+
+## 10. Gas City Install Path Snapshot
+
+This snapshot was added during `hash-thing-kqy6.1.1` on 2026-04-14 to answer the practical question: what is the smallest path to a real local Gas City smoke run from this machine state?
+
+### Local machine state
+
+- macOS 15.7.2 on `x86_64`
+- `tmux`, `git`, `jq`, and `dolt` already installed
+- `gc` missing initially
+- `flock` missing initially
+- `go version` was `go1.18`
+- Command Line Tools were present at `/Library/Developer/CommandLineTools` but too old for the current Homebrew Gas City install path
+
+### What failed
+
+Homebrew path:
+- `brew tap gastownhall/gascity` worked
+- `brew install gastownhall/gascity/gascity` did not complete
+- blocker: Homebrew stopped with "Your Command Line Tools are too outdated" before `gc` was installed
+
+Source-build path:
+- current Gas City README says source builds require Go `1.25+`
+- this machine currently has Go `1.18`
+- conclusion: source build is blocked until Go is upgraded substantially
+
+Default beads path:
+- `gc init --provider codex --skip-provider-readiness /tmp/gascity-city` created the city
+- then it stopped with `missing required dependencies: flock`
+- conclusion: default `bd` beads path still expects `flock` on macOS
+
+### What worked
+
+Smallest successful smoke path from the current machine state:
+
+1. Download the prebuilt release binary directly from GitHub:
+   - `gascity_0.14.1_darwin_amd64.tar.gz`
+2. Extract it and use the bundled `gc` binary directly
+3. Initialize a city:
+   - `./gc init --provider codex --skip-provider-readiness /tmp/gascity-city`
+4. Switch the beads backend to file mode:
+   - set `GC_BEADS=file` at start time, or add `[beads] provider = "file"` to `city.toml`
+5. Start the city:
+   - `GC_BEADS=file ./gc start`
+
+Observed result:
+- city registered and started under the supervisor
+- `gc status` showed a running standalone controller
+- `gc doctor` passed the core checks, including:
+  - controller running
+  - beads store accessible
+  - dolt skipped because file backend was active
+  - builtin `bd`/`dolt` pack family not required
+
+### Practical conclusion
+
+The smallest real local smoke run on this machine does **not** require:
+- Homebrew `gc`
+- upgraded Go
+- `dolt`
+- `bd`
+- `flock`
+
+It **does** require:
+- the prebuilt `gc` release binary
+- existing always-on binaries (`tmux`, `git`, `jq`, `pgrep`, `lsof`)
+- file-backed beads mode
+
+That makes file-backed mode the practical unblocker for local evaluation on this machine. If we later want the default `bd`/Dolt path, we still need to fix the machine-level prerequisites:
+- update Command Line Tools so Homebrew installs work again
+- install `flock`
+- likely upgrade Go if source builds matter
