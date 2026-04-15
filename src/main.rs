@@ -472,6 +472,18 @@ impl App {
         ]
     }
 
+    fn recenter_player(&mut self) -> bool {
+        let Some(pid) = self.player_id else {
+            return false;
+        };
+        let center = self.world_center();
+        let Some(player) = self.entities.get_mut(pid) else {
+            return false;
+        };
+        player.pos = [center[0], center[1] + 2.0, center[2]];
+        true
+    }
+
     fn reset_scene_entities(&mut self) -> [f64; 3] {
         let player_state = self
             .player_id
@@ -1218,12 +1230,8 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("0") => {
                             // Recenter player at world center.
-                            if let Some(pid) = self.player_id {
-                                let center = self.world.side() as f64 / 2.0;
-                                if let Some(p) = self.entities.get_mut(pid) {
-                                    p.pos = [center, center + 2.0, center];
-                                    log::info!("Player recentered");
-                                }
+                            if self.recenter_player() {
+                                log::info!("Player recentered");
                             }
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F1) => {
@@ -2165,6 +2173,30 @@ mod tests {
                 waypoint.label
             );
         }
+    }
+
+    #[test]
+    fn recenter_player_respects_shifted_world_origin() {
+        let mut app = App::new(8);
+        app.world.ensure_region(
+            [sim::WorldCoord(-4), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [sim::WorldCoord(7), sim::WorldCoord(7), sim::WorldCoord(7)],
+        );
+        assert!(
+            app.world.origin[0] < 0,
+            "test setup should force a negative origin shift"
+        );
+
+        assert!(app.recenter_player());
+
+        let pid = app.player_id.expect("player should exist");
+        let player = app
+            .entities
+            .iter()
+            .find(|entity| entity.id == pid)
+            .expect("player entity should still exist");
+        let center = app.world_center();
+        assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
     }
 
     #[test]
