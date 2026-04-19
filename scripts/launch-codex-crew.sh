@@ -88,7 +88,7 @@ PROMPT="You are crew seat '$SEAT' on the hash-thing project (a 3D voxel engine i
 CRITICAL SETUP — run these first:
   export BEADS_ACTOR=$SEAT
 
-IMPORTANT: Use '.bin/bd' wrapper, NOT bare 'bd' — it retries Dolt lock contention.
+IMPORTANT: Use '.bin/bd' wrapper, NOT bare 'bd' — it forces the repo-root shared .beads server, preserves BEADS_ACTOR, and guards bd close.
 
 Read AGENTS.md for full project instructions, then:
   .bin/bd ready -n 10

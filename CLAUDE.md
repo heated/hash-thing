@@ -27,7 +27,7 @@ The prior blanket feature freeze (2026-04-13 → 2026-04-19) is dropped; this di
 
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
-**Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper at `.bin/bd` retries on embedded Dolt lock contention (hash-thing-eg3) with exponential backoff. Without it, concurrent worktree agents hit `another process holds the exclusive lock` errors that require manual sleep-and-retry. The wrapper handles up to 5 retries transparently.
+**Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper forces `bd` to use the repo-root shared `.beads` database/server from any worktree, preserves `BEADS_ACTOR` while hopping to main, and adds preflight checks on `bd close` so issues are only closed after the relevant commit is on `origin/main`.
 
 Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` under "Gate Tiers." Default sensitivity applies here; amend the line below if the bar should move project-wide.
 
