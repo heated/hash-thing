@@ -212,7 +212,10 @@ const CHAR_H: usize = GLYPH_H + 2; // 2px spacing
 /// shader can supply the panel treatment; glyphs are warm off-white.
 /// `scale` multiplies each pixel (1 = native 6×9 per char).
 pub fn render_text_rgba(lines: &[&str], scale: u32) -> (Vec<u8>, u32, u32) {
-    let max_cols = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+    // char-count, not byte-length: a 2- or 4-byte char would over-allocate
+    // tex_w under `line.len()`, and the `chars().enumerate()` render loop
+    // below advances by char — so the two must agree (hash-thing-9q5o).
+    let max_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let pad = 2; // padding in native pixels
     let tex_w = max_cols * CHAR_W + pad * 2;
     let tex_h = lines.len() * CHAR_H + pad * 2;
@@ -302,6 +305,19 @@ mod tests {
             lit_count > 0,
             "Expected some lit glyph pixels for 'A', tex_w={}",
             w
+        );
+    }
+
+    /// Non-ASCII input must size the texture by char count, not byte length
+    /// (hash-thing-9q5o). "é" is 2 UTF-8 bytes; "Aé" should produce the same
+    /// `tex_w` as a 2-char ASCII string.
+    #[test]
+    fn non_ascii_sizes_by_char_count_not_byte_len() {
+        let (_pa, w_two_ascii, _ha) = render_text_rgba(&["AB"], 1);
+        let (_pm, w_mixed, _hm) = render_text_rgba(&["Aé"], 1);
+        assert_eq!(
+            w_mixed, w_two_ascii,
+            "2-char line should have the same width regardless of UTF-8 byte length"
         );
     }
 }

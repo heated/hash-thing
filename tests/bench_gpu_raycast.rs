@@ -693,7 +693,10 @@ fn headless_game_smoke_256() {
 
     let mut svdag = Svdag::new();
     svdag.update(&world.store, world.root, world.level);
-    assert!(svdag.node_count > 0, "seeded world should build a non-empty SVDAG");
+    assert!(
+        svdag.node_count > 0,
+        "seeded world should build a non-empty SVDAG"
+    );
 
     renderer.upload_svdag(&svdag, side as u32, BenchCamera::app_spawn(side as u32));
     let first = renderer.render_frame();
