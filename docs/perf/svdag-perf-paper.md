@@ -268,7 +268,7 @@ Samples taken from a 14-second windowed run, dropping the first log line (warmup
 - **CPU contention.** `step_recursive` is a hot single-threaded user of one P-core. Freezing sim returns that core's cycles to OS / wgpu / display-server work that surface acquire transitively waits on.
 - **Unified-memory cache contention.** Sim writes evict renderer-relevant lines from shared L2; freezing sim leaves renderer's working set warm.
 
-The two hypotheses predict the same `surface_acquire_cpu` reduction. Disambiguating needs proxy 2 (same-core vs different-core sim scheduling), which is open as `hash-thing-xhi6` follow-up.
+The two hypotheses predict the same `surface_acquire_cpu` reduction. Disambiguating needs proxy 2 (same-core vs different-core sim scheduling), executed as `hash-thing-xhi6` (see proxy-2 results immediately below).
 
 **What proxy 1 does establish.**
 1. Renderer-only steady-state at 256 ³ on this hardware lives at **~18 ms surface_acquire_cpu**, not the ~26 ms we see with sim live. The remaining ~18 ms is a windowed-presentation floor (consistent with `dlse.2.2` findings — that path is acquire-dominated independently of sim).
@@ -277,7 +277,30 @@ The two hypotheses predict the same `surface_acquire_cpu` reduction. Disambiguat
 
 **Implication for §3 frame budget.** The §3.1 budget assumed sim and render were independent on a separate-thread M-series. They aren't quite — sim costs the renderer ~8 ms / frame at 256 ³. At 4096³ the sim cost is ~64× larger (linear in node count for active-region work) but rendering is also more memory-bound, so the contention term may grow faster than linear. Re-derive at 4096³ when `hash-thing-ivms` lands.
 
-**Verdict status:** **contention present, magnitude ~30 % of windowed frame at 256³, driver (CPU vs cache) unresolved.** Follow-up bead filed for proxy 2.
+**Verdict status:** **contention present, magnitude ~30 % of windowed frame at 256³, driver (CPU vs cache) unresolved by proxy 1.** See proxy 2 immediately below.
+
+**Proxy 2 — sim-thread QoS sweep (hash-thing-xhi6).** `HASH_THING_SIM_QOS=<class>` calls `pthread_set_qos_class_self_np` from inside the spawned background-step thread. macOS schedulers steer `BACKGROUND` / `UTILITY` toward the E-cluster and `INTERACTIVE` / `INITIATED` toward the P-cluster. The renderer / main thread runs at the inherited QoS (`USER_INITIATED` for winit + AppKit), so `interactive` keeps sim and render in the same pool, and `background` moves sim to a different pool. Same scene / build / sample protocol as proxy 1. n=5 each (post-warmup), runs cooled between conditions where possible.
+
+| QoS                 | step (mean) | surface_acquire_cpu (mean) | Δ vs interactive | sim cluster |
+|---------------------|-------------|----------------------------|------------------|-------------|
+| interactive         | 371 ms      | 25.5 ms                    | (baseline)       | P           |
+| utility             | 803 ms      | 31.1 ms                    | +5.6 ms          | mixed → E   |
+| background          | 1327 ms     | 40.0 ms                    | +14.5 ms         | E           |
+| (sim-frozen, proxy 1)| —          | 18.5 ms                    | −7.0 ms          | n/a         |
+
+`render_gpu` stayed at ~0.12 ms across all conditions (QoS-independent, same as proxy 1).
+
+**What proxy 2 was supposed to deliver.** The bead's premise: if same-pool sim runs the renderer faster than different-pool sim, CPU-cycle contention is dominant; if equal, unified-memory bandwidth is dominant.
+
+**What proxy 2 actually shows.** Different-pool sim runs the renderer *slower*, in proportion to how badly the sim itself is throttled by E-cluster scheduling. So:
+- Same-pool (interactive, ~25.5 ms) is statistically indistinguishable from the inherited baseline (~26.5 ms in proxy 1) — the inherited QoS is already same-pool. There is no QoS knob that *reduces* the contention, only knobs that make it worse.
+- Cross-pool sim adds a *new* cost (cross-cluster coherence traffic on the system-level cache, sim-throughput-dependent placeholder-swap pacing, or both) that swamps any saving from removing CPU-pool sharing.
+
+**Conclusion.** Proxy 2's premise is refuted: the CPU-cycle / unified-memory dichotomy doesn't cleanly map to a P-vs-E pool toggle on M2. Two possibilities remain: (a) CPU-cycle contention is not dominant and a new cross-cluster cost dwarfs whatever savings proxy 2 was trying to surface; (b) CPU-cycle contention is dominant, but the new cross-cluster cost on M2 outweighs the saving by ~5–14 ms. Either way, the clean disambiguation isn't available from QoS scheduling on this hardware.
+
+**M2 MBA thermal caveat.** The fanless M2 throttles after ~2 sustained 14 s benches (step time grows 5–10× on the second-or-later run). The numbers above used the ordering `interactive → utility → background` with cool-downs; sustained thermal load is itself a confound for any longer-running sweep on this chassis. Raw evidence at `.ship-notes/xhi6-cache-locality-proxy2-2026-04-21.md`.
+
+**Verdict (proxy 1 + proxy 2):** sim ↔ renderer contention at the SVDAG boundary is real (~8 ms / 30 % at 256³ windowed), `render_gpu` is uninvolved, and the contention is CPU-side / unified-memory-side. Neither proxy disambiguates which of the two CPU-side mechanisms dominates. A useful next proxy would hold sim CPU work constant while toggling its memory-access footprint (e.g. read-only step pass vs mutate-only step pass), or read per-thread `task_thread_times_info` directly to attribute time without leaning on QoS-class scheduling.
 
 ### 4.4 Per-step upload volume to `Svdag::nodes`
 
@@ -381,3 +404,5 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-20 | spark | §4 populated (bead stue.3). Answered Q1 (store is shared; render-side cache is a bounded address-translation layer), Q2 (~1,847 hashlife misses/step at 256³ → ~544 SVDAG slot appends/step; ~72% short-circuit rate), Q4 (~19.6 KB mean / ~79 KB max upload per step at 256³, confirming edward's diff-compressibility hypothesis). Q3 (cache locality) deferred with two empirical-proxy experiments for follow-up. Measurements land via new `tests/bench_svdag.rs::bench_svdag_step_deltas_*`. |
 | 2026-04-20 | spark | §3.8 cold-frame confound check (bead `hash-thing-6hta`). `Perf` ring buffer is FIFO-64 with no cold-frame skip; at ~30 FPS cold frames evict within ~2.1 s, so the first log line is partially contaminated but steady-state lines (which all prior dlse.2.2 observations sampled) are clean. Does not invalidate the 25 ms surface_acquire finding. |
 | 2026-04-21 | onyx | §2.2 verdict + new §4.6 "Update model comparison" (bead `hash-thing-jl4d`). Clarifies that our SVDAG is **dynamic** — rebuild-per-tick on CPU with O(new-slot) diff upload — rather than static Kämpe or GPU-resident HashDAG. Pins the distinction so later discussion does not re-establish it. Evidence: ~544 slot appends/step at 256³ warm with arbitrary-depth CA churn (§4.4) flows through the same code path as structural changes. |
+| 2026-04-21 | spark | §4.3 cache-locality proxy 1 (bead `hash-thing-stue.7`). Sim-frozen vs sim-running 256³ windowed: ~30 % of windowed frame cost on M2 MBA is sim ↔ render contention at the SVDAG boundary. Driver (CPU vs cache) unresolved by proxy 1. New `HASH_THING_FREEZE_SIM=1` diagnostic env var. |
+| 2026-04-21 | spark | §4.3 cache-locality proxy 2 (bead `hash-thing-xhi6`). Sim-thread QoS sweep on M2: same-pool (interactive) ≈ inherited baseline; cross-pool (utility/background) is *worse*, not better. Refutes proxy 2's premise — the CPU-cycle / unified-memory dichotomy doesn't map cleanly onto a P-vs-E pool toggle on M2. New `HASH_THING_SIM_QOS={interactive,initiated,default,utility,background}` env var. |

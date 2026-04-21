@@ -28,6 +28,65 @@ const DEFAULT_VOLUME_SIZE: u32 = 2048;
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
+/// Thin wrapper over macOS `pthread_set_qos_class_self_np` used as the
+/// xhi6 diagnostic knob (proxy 2 for SVDAG↔sim cache-locality work).
+/// `parse` maps the `HASH_THING_SIM_QOS` env string to a `qos_class_t`
+/// constant; `apply` installs it on the *current* thread. No-ops on
+/// non-macOS targets so the cross-compile stays green.
+mod thread_qos {
+    #[cfg(target_os = "macos")]
+    mod imp {
+        pub const USER_INTERACTIVE: u32 = 0x21;
+        pub const USER_INITIATED: u32 = 0x19;
+        pub const DEFAULT: u32 = 0x15;
+        pub const UTILITY: u32 = 0x11;
+        pub const BACKGROUND: u32 = 0x09;
+
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+
+        pub fn apply(qos: u32) {
+            // SAFETY: Apple-documented libc entrypoint. Both inputs are
+            // ABI-compatible primitives; no memory is exchanged.
+            let rc = unsafe { pthread_set_qos_class_self_np(qos, 0) };
+            if rc == 0 {
+                log::info!("sim thread QoS set to 0x{qos:02x}");
+            } else {
+                log::warn!("pthread_set_qos_class_self_np failed: rc={rc} qos=0x{qos:02x}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    mod imp {
+        pub const USER_INTERACTIVE: u32 = 1;
+        pub const USER_INITIATED: u32 = 2;
+        pub const DEFAULT: u32 = 3;
+        pub const UTILITY: u32 = 4;
+        pub const BACKGROUND: u32 = 5;
+
+        pub fn apply(_qos: u32) {
+            log::warn!("HASH_THING_SIM_QOS set but target is not macOS; ignoring");
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<u32> {
+        match s {
+            "interactive" => Some(imp::USER_INTERACTIVE),
+            "initiated" => Some(imp::USER_INITIATED),
+            "default" => Some(imp::DEFAULT),
+            "utility" => Some(imp::UTILITY),
+            "background" => Some(imp::BACKGROUND),
+            _ => None,
+        }
+    }
+
+    pub fn apply(qos: u32) {
+        imp::apply(qos);
+    }
+}
+
 /// One-line gen summary. Centralised so the `App::new` startup path and the
 /// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
 /// classify_calls / nodes_delta / noise_fraction fields; the rest is carried
@@ -339,6 +398,15 @@ struct App {
     /// SVDAG every frame. Used to measure renderer-only frame cost without
     /// sim/render unified-memory contention. Set via `HASH_THING_FREEZE_SIM=1`.
     freeze_sim: bool,
+    /// macOS QoS class to apply to the background sim thread (hash-thing-xhi6
+    /// proxy 2). `Some` → the thread calls `pthread_set_qos_class_self_np`
+    /// at entry. `USER_INTERACTIVE` keeps sim in the P-core pool alongside
+    /// the main render thread; `BACKGROUND` steers it toward E-cores.
+    /// Comparing the two isolates CPU-cycle contention (same pool = slower)
+    /// from unified-memory cache contention (no change either way). `None`
+    /// leaves the thread at its inherited QoS. Set via
+    /// `HASH_THING_SIM_QOS={interactive|initiated|default|utility|background}`.
+    sim_qos: Option<u32>,
     /// Self-driving windowed-vs-fullscreen acquire measurement
     /// (`dlse.2.2`). `Some` when `HASH_THING_ACQUIRE_HARNESS=1`.
     /// When active, the harness forces a windowed start, burns a
@@ -455,10 +523,17 @@ impl App {
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
             freeze_sim: std::env::var("HASH_THING_FREEZE_SIM").ok().as_deref() == Some("1"),
+            sim_qos: std::env::var("HASH_THING_SIM_QOS")
+                .ok()
+                .as_deref()
+                .and_then(thread_qos::parse),
             acquire_harness: acquire_harness::Harness::from_env(),
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
+        }
+        if let Some(qos) = app.sim_qos {
+            log::info!("HASH_THING_SIM_QOS active: sim thread will request QoS 0x{qos:02x} (xhi6 diagnostic)");
         }
         // The harness owns the windowed→fullscreen transition explicitly;
         // honouring `HASH_THING_FULLSCREEN=1` on top of it would skip the
@@ -754,7 +829,11 @@ impl App {
         // Move world to the background thread only after the frame has
         // consumed the live snapshot for movement, interaction, and render.
         let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
+        let sim_qos = self.sim_qos;
         self.step_handle = Some(std::thread::spawn(move || {
+            if let Some(qos) = sim_qos {
+                thread_qos::apply(qos);
+            }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 world.apply_mutations();
                 world.spawn_clones();
