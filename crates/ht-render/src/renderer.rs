@@ -1687,7 +1687,9 @@ impl Renderer {
         let surface_acquire = acquire_start.elapsed();
 
         let view = match &surface_texture {
-            Some(st) => st.texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            Some(st) => st
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default()),
             None => self
                 .off_surface_target
                 .as_ref()
