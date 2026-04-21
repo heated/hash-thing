@@ -1,8 +1,8 @@
 # SVDAG Performance Paper (Living Document)
 
-**Owner:** mayor seat. Singular. Other seats may comment via bead `hash-thing-stue` or open follow-up beads; direct edits to this document by non-mayor seats should be rare and noted in the revision log.
+**Ownership:** the **crew** owns this document. Any seat may write into it under a sub-bead of `hash-thing-stue`. **Mayor's role** is to surface decisions, re-derive the spec from the paper, redirect investigations that the paper rules in/out, and keep the document coherent — not to write all of it. Mayor does not gate edits.
 
-**Status:** Skeleton. First real revision pending (see bead `hash-thing-stue` children).
+**Status:** Skeleton. First real revisions pending (see bead `hash-thing-stue` children — claimable by any seat).
 
 **Companion:** `docs/perf/svdag-perf-spec.md` — short re-derived intuition. The spec is regenerated from this paper, not edited in isolation. If the spec disagrees with the paper, the paper wins.
 
