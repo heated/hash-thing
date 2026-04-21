@@ -149,10 +149,17 @@ struct GpuTiming {
     /// PENDING → IDLE on failure. The render thread transitions IDLE →
     /// PENDING (in `request_readback`) and READY → IDLE (in `poll`).
     state: Arc<AtomicU8>,
+    /// When true, the caller sandwiches the compute pass with
+    /// `write_timestamp_begin`/`write_timestamp_end` on the encoder and
+    /// `compute_pass_writes()` returns `None`. Requires the adapter to
+    /// support `TIMESTAMP_QUERY_INSIDE_ENCODERS`. See hash-thing-dlse.2.3
+    /// for why: in-pass timestamps on Metal include barrier/sync waits,
+    /// which inflates "compute time" with cross-frame dependencies.
+    use_in_encoder: bool,
 }
 
 impl GpuTiming {
-    fn new(device: &wgpu::Device, period_ns: f32) -> Self {
+    fn new(device: &wgpu::Device, period_ns: f32, use_in_encoder: bool) -> Self {
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("gpu_timing_qs"),
             ty: wgpu::QueryType::Timestamp,
@@ -179,7 +186,24 @@ impl GpuTiming {
             readback_buffer,
             period_ns,
             state: Arc::new(AtomicU8::new(GT_IDLE)),
+            use_in_encoder,
         }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.state.load(Ordering::Acquire) == GT_IDLE
+    }
+
+    fn uses_in_encoder(&self) -> bool {
+        self.use_in_encoder
+    }
+
+    fn write_timestamp_begin(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.write_timestamp(&self.query_set, 0);
+    }
+
+    fn write_timestamp_end(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.write_timestamp(&self.query_set, 1);
     }
 
     /// If idle, return a `RenderPassTimestampWrites` that captures
@@ -205,7 +229,15 @@ impl GpuTiming {
 
     /// Compute-pass variant of `pass_writes()`. Used for timing the
     /// SVDAG raycast compute dispatch (hash-thing-5bb.6.1).
+    ///
+    /// Returns `None` when the adapter supports
+    /// `TIMESTAMP_QUERY_INSIDE_ENCODERS` — in that mode the caller is
+    /// responsible for bracketing the compute pass via
+    /// `write_timestamp_begin`/`write_timestamp_end` on the encoder.
     fn compute_pass_writes(&self) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        if self.use_in_encoder {
+            return None;
+        }
         if self.state.load(Ordering::Acquire) == GT_IDLE {
             Some(wgpu::ComputePassTimestampWrites {
                 query_set: &self.query_set,
@@ -433,12 +465,27 @@ impl Renderer {
         let mut required_features = wgpu::Features::empty();
         let adapter_features = adapter.features();
         let timestamp_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        // hash-thing-dlse.2.3: TIMESTAMP_QUERY_INSIDE_ENCODERS lets us use
+        // `encoder.write_timestamp` outside a render/compute pass. Metal
+        // appears to attribute in-pass barrier/sync waits to the pass's
+        // begin/end timestamps, which makes `ComputePassTimestampWrites`
+        // include cross-frame sync waits in what looks like "compute time".
+        // The headless bench already uses in-encoder writes (bench_gpu_raycast.rs)
+        // and reports ~0.2ms for the same dispatch that the windowed app
+        // measures at ~30ms — this flag switches the app to the same
+        // pattern so we're comparing like with like.
+        let in_encoder_timestamps_supported =
+            timestamp_supported
+                && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         if timestamp_supported {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         } else {
             log::info!(
                 "GPU adapter lacks TIMESTAMP_QUERY — perf will report CPU submit overhead only"
             );
+        }
+        if in_encoder_timestamps_supported {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         }
 
         let (device, queue) = adapter
@@ -1028,12 +1075,17 @@ impl Renderer {
             let period_ns = queue.get_timestamp_period();
             let info = adapter.get_info();
             log::info!(
-                "GPU timestamp_period={period_ns}ns (adapter={:?} backend={:?} driver={:?})",
+                "GPU timestamp_period={period_ns}ns (adapter={:?} backend={:?} driver={:?}) in_encoder={}",
                 info.name,
                 info.backend,
                 info.driver_info,
+                in_encoder_timestamps_supported,
             );
-            Some(GpuTiming::new(&device, period_ns))
+            Some(GpuTiming::new(
+                &device,
+                period_ns,
+                in_encoder_timestamps_supported,
+            ))
         } else {
             None
         };
@@ -1621,24 +1673,45 @@ impl Renderer {
         // hash-thing-5bb.6.1: compute dispatch for SVDAG raycast, then
         // blit + overlays in a single render pass.
         //
-        // GPU timing wraps the compute dispatch (the expensive part).
+        // GPU timing wraps the compute dispatch (the expensive part). When
+        // the adapter supports TIMESTAMP_QUERY_INSIDE_ENCODERS, we write
+        // timestamps on the encoder instead of via ComputePassTimestampWrites
+        // so the measurement excludes cross-pass barrier/sync waits
+        // (hash-thing-dlse.2.3).
         let compute_timestamp_writes = self
             .gpu_timing
             .as_ref()
             .and_then(|gt| gt.compute_pass_writes());
-        let captured_this_frame = compute_timestamp_writes.is_some();
+        let in_encoder_capturing = self.svdag_compute_bind_group.is_some()
+            && self
+                .gpu_timing
+                .as_ref()
+                .is_some_and(|gt| gt.uses_in_encoder() && gt.is_idle());
+        let captured_this_frame = compute_timestamp_writes.is_some() || in_encoder_capturing;
 
         // --- Compute pass: SVDAG raycast → storage texture ---
         if let Some(bg) = &self.svdag_compute_bind_group {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("svdag raycast compute"),
-                timestamp_writes: compute_timestamp_writes,
-            });
-            compute_pass.set_pipeline(&self.svdag_compute_pipeline);
-            compute_pass.set_bind_group(0, bg, &[]);
-            let wg_x = self.config.width.div_ceil(8);
-            let wg_y = self.config.height.div_ceil(8);
-            compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
+            if in_encoder_capturing {
+                if let Some(gt) = &self.gpu_timing {
+                    gt.write_timestamp_begin(&mut encoder);
+                }
+            }
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("svdag raycast compute"),
+                    timestamp_writes: compute_timestamp_writes,
+                });
+                compute_pass.set_pipeline(&self.svdag_compute_pipeline);
+                compute_pass.set_bind_group(0, bg, &[]);
+                let wg_x = self.config.width.div_ceil(8);
+                let wg_y = self.config.height.div_ceil(8);
+                compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
+            }
+            if in_encoder_capturing {
+                if let Some(gt) = &self.gpu_timing {
+                    gt.write_timestamp_end(&mut encoder);
+                }
+            }
         }
 
         // --- Render pass: blit + particles + HUD + legend (single pass) ---
