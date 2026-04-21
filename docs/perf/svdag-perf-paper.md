@@ -1,6 +1,6 @@
 # SVDAG Performance Paper (Living Document)
 
-**Ownership:** mayor owns project-level movement (decomposition, surfacing, keeping it advancing); crew owns execution (claims sub-beads of `hash-thing-stue`, writes into the paper). Roles defined in `.agents/skills/mayor/SKILL.md`.
+**Ownership:** mayor owns project-level movement (decomposition, surfacing, keeping it advancing); crew owns execution (claims sub-beads of `hash-thing-stue`, writes into the paper). Roles defined in the `mayor` Claude skill.
 
 **Status:** Skeleton. First real revisions pending (see bead `hash-thing-stue` children — claimable by any seat).
 
