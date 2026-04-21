@@ -6,13 +6,15 @@
 
 Escalate by parking the bead (`status=blocked` + structured ESCALATION comment), never by `AskUserQuestion`. The human sweeps `bd list --status blocked` on their own cadence.
 
-**Narrow exception lane — may proceed without full /ship-auto** (per moss's 882n.7.1 proposal):
+**Narrow exception lane — may proceed without full /ship-auto** (per moss's 882n.7.1 proposal, narrowed 2026-04-20 by edward after a w1yq landed unreviewed under the old bug-fix clause):
 - Audit / triage / review / harness work.
-- Narrow bug fixes that restore documented broken behavior: ≤2 files **or** ≤300 LOC, **no** invariant-path changes (store / hashlife / world / svdag / wgsl / rule-system).
 - Diagnostics, repro harnesses, assertions, test additions, logging, small reverts.
 - Review/audit setup work that doesn't change ship policy.
 
+Bug fixes — even narrow, even "restores documented broken behavior" — go through /ship-auto. The crew has demonstrated that "narrow bug fix" is easy to rationalize into shipping an untested architectural change (event-routing rewrite) with zero external review. An extra review is cheap.
+
 **Must go through /ship-auto** (no exception lane):
+- Any code fix that changes program behavior, including bug fixes.
 - New features or capability expansion, even if small.
 - Broad refactors / cross-module cleanups whose main value is code quality.
 - Algorithm, caching, serialization, buffer-layout, renderer/sim contract changes.
