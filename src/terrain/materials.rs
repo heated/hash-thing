@@ -19,6 +19,36 @@ pub type MaterialId = u16;
 
 pub const INITIAL_MATERIAL_SLOTS: usize = 256;
 
+/// Greatest common divisor for u32. Used to collapse shared BlockRule divisors
+/// when multiple materials point at the same rule with different divisors.
+fn gcd_u32(a: u32, b: u32) -> u32 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Least common multiple for u64. Used to compute the memo schedule period.
+fn lcm_u64(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    a / gcd_u64(a, b) * b
+}
+
+fn gcd_u64(a: u64, b: u64) -> u64 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
 pub const AIR_MATERIAL_ID: MaterialId = 0;
 pub const STONE_MATERIAL_ID: MaterialId = 1;
 pub const DIRT_MATERIAL_ID: MaterialId = 2;
@@ -138,6 +168,12 @@ pub struct MaterialEntry {
     pub physical: MaterialPhysicalProperties,
     pub rule_id: RuleId,
     pub block_rule_id: Option<BlockRuleId>,
+    /// How often this material's rules fire, in whole sim ticks.
+    /// Rule (CaRule and BlockRule) applies iff `generation % tick_divisor == 0`.
+    /// `1` = every tick (default, current behavior). Must be >= 1.
+    /// See `sim/hashlife.rs::step_grid_once` for how this gates dispatch and
+    /// `MaterialRegistry::memo_period` for how it flows into the memo key.
+    pub tick_divisor: u16,
 }
 
 pub struct MaterialRegistry {
@@ -304,6 +340,7 @@ impl MaterialRegistry {
                 },
                 rule_id: air_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -321,6 +358,7 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -338,6 +376,7 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -355,6 +394,7 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -372,6 +412,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_fire_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -389,6 +430,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_water_rule,
                 block_rule_id: Some(water_fluid_block_rule),
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -406,6 +448,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_static_rule,
                 block_rule_id: Some(gravity_block_rule),
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -423,6 +466,7 @@ impl MaterialRegistry {
                 },
                 rule_id: lava_rule,
                 block_rule_id: Some(lava_fluid_block_rule),
+                tick_divisor: 1,
             },
         );
 
@@ -443,6 +487,7 @@ impl MaterialRegistry {
                 },
                 rule_id: ice_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -460,6 +505,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_acid_rule,
                 block_rule_id: Some(acid_fluid_block_rule),
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -477,6 +523,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_flammable_rule,
                 block_rule_id: Some(oil_fluid_block_rule),
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -494,6 +541,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_flammable_rule,
                 block_rule_id: Some(gravity_block_rule),
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -511,6 +559,7 @@ impl MaterialRegistry {
                 },
                 rule_id: steam_rule,
                 block_rule_id: Some(gravity_block_rule),
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -528,6 +577,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_flammable_rule,
                 block_rule_id: Some(gravity_block_rule),
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -545,6 +595,7 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -562,6 +613,7 @@ impl MaterialRegistry {
                 },
                 rule_id: vine_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -579,6 +631,7 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
         registry.insert(
@@ -596,6 +649,7 @@ impl MaterialRegistry {
                 },
                 rule_id: firework_rule,
                 block_rule_id: Some(gravity_block_rule),
+                tick_divisor: 1,
             },
         );
         for (material_id, label) in [
@@ -619,6 +673,7 @@ impl MaterialRegistry {
                     },
                     rule_id: steam_rule,
                     block_rule_id: Some(gravity_block_rule),
+                    tick_divisor: 1,
                 },
             );
         }
@@ -643,6 +698,7 @@ impl MaterialRegistry {
                     },
                     rule_id: firework_rule,
                     block_rule_id: Some(gravity_block_rule),
+                    tick_divisor: 1,
                 },
             );
         }
@@ -661,6 +717,7 @@ impl MaterialRegistry {
                 },
                 rule_id: static_rule,
                 block_rule_id: None,
+                tick_divisor: 1,
             },
         );
 
@@ -732,6 +789,59 @@ impl MaterialRegistry {
             .collect()
     }
 
+    /// Per-material tick_divisor, indexed by material id. Unregistered slots
+    /// return 1 (no skip). Used by the step dispatcher to gate per-tick firing.
+    pub fn tick_divisor_flags(&self) -> Vec<u16> {
+        self.entries
+            .iter()
+            .map(|entry| entry.as_ref().map(|e| e.tick_divisor.max(1)).unwrap_or(1))
+            .collect()
+    }
+
+    /// Per-block-rule tick_divisor, indexed by BlockRuleId. Because multiple
+    /// materials can share one BlockRule, the divisor for a shared rule is the
+    /// GCD of its users' divisors — any tick where ANY user fires must apply
+    /// the rule. If no material references a rule id (dead rule), returns 1.
+    pub fn block_rule_tick_divisors(&self) -> Vec<u16> {
+        let mut per_rule = vec![0u32; self.block_rules.len()];
+        for entry in self.entries.iter().filter_map(|e| e.as_ref()) {
+            if let Some(BlockRuleId(id)) = entry.block_rule_id {
+                let d = entry.tick_divisor.max(1) as u32;
+                per_rule[id] = if per_rule[id] == 0 {
+                    d
+                } else {
+                    gcd_u32(per_rule[id], d)
+                };
+            }
+        }
+        per_rule
+            .into_iter()
+            .map(|d| {
+                if d == 0 {
+                    1
+                } else {
+                    d.min(u16::MAX as u32) as u16
+                }
+            })
+            .collect()
+    }
+
+    /// The schedule period of the memo key: the smallest `T` such that for any
+    /// `generation g`, the behavior of a step at generation `g` is determined
+    /// by `g mod T`. Equal to `LCM(2 * tick_divisor_i)` over registered
+    /// materials — the factor-of-2 captures Margolus partition alternation.
+    ///
+    /// With all divisors = 1, returns 2 (identical to today's `parity` key).
+    /// If no materials are registered (empty world), returns 2.
+    pub fn memo_period(&self) -> u64 {
+        let mut period: u64 = 2;
+        for entry in self.entries.iter().filter_map(|e| e.as_ref()) {
+            let d = entry.tick_divisor.max(1) as u64;
+            period = lcm_u64(period, 2 * d);
+        }
+        period
+    }
+
     pub fn color_palette_rgba(&self) -> Vec<[f32; 4]> {
         let mut palette =
             vec![[0.0, 0.0, 0.0, 0.0]; self.entries.len().max(INITIAL_MATERIAL_SLOTS)];
@@ -768,6 +878,18 @@ impl MaterialRegistry {
                 panic!("material {material_id} must exist before assigning a block rule")
             })
             .block_rule_id = Some(block_rule_id);
+    }
+
+    /// Set the tick divisor for an existing material. Divisor is clamped to
+    /// `>= 1` in accessor paths, but callers should pass `>= 1` for clarity.
+    /// Crate-private because the shipping path bakes divisors into registrar
+    /// constructors; this exists for tests and for the future tuning bead.
+    #[allow(dead_code)]
+    pub(crate) fn set_tick_divisor(&mut self, material_id: MaterialId, divisor: u16) {
+        self.entries[material_id as usize]
+            .as_mut()
+            .unwrap_or_else(|| panic!("material {material_id} must exist to set tick_divisor"))
+            .tick_divisor = divisor;
     }
 
     /// Look up a block rule by ID. Used by `World::step_blocks()`.
@@ -921,6 +1043,7 @@ mod tests {
             },
             rule_id,
             block_rule_id: None,
+            tick_divisor: 1,
         }
     }
 
@@ -1255,5 +1378,118 @@ mod tests {
                 .is_none(),
             "grass should not have a block rule"
         );
+    }
+
+    #[test]
+    fn memo_period_all_default_divisors_is_two() {
+        let registry = MaterialRegistry::terrain_defaults();
+        assert_eq!(
+            registry.memo_period(),
+            2,
+            "with all tick_divisor=1, memo_period must be LCM(2,2,...) = 2 — identical to today's parity key"
+        );
+    }
+
+    #[test]
+    fn memo_period_empty_registry_is_two() {
+        let registry = MaterialRegistry::new();
+        assert_eq!(registry.memo_period(), 2);
+    }
+
+    #[test]
+    fn memo_period_expands_for_larger_divisors() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        registry.insert(0, entry_with(rule_id, [0.0; 4]));
+        // d=1 → 2, d=4 → 8 → LCM(2, 8) = 8
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 4,
+                ..entry_with(rule_id, [1.0, 0.0, 0.0, 1.0])
+            },
+        );
+        assert_eq!(registry.memo_period(), 8);
+
+        // Add d=3 → 6 → LCM(8, 6) = 24
+        registry.insert(
+            2,
+            MaterialEntry {
+                tick_divisor: 3,
+                ..entry_with(rule_id, [0.0, 1.0, 0.0, 1.0])
+            },
+        );
+        assert_eq!(registry.memo_period(), 24);
+    }
+
+    #[test]
+    fn tick_divisor_flags_returns_per_material_values() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        registry.insert(0, entry_with(rule_id, [0.0; 4]));
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 4,
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+        let flags = registry.tick_divisor_flags();
+        assert_eq!(flags[0], 1);
+        assert_eq!(flags[1], 4);
+    }
+
+    #[test]
+    fn tick_divisor_flags_treats_zero_as_one() {
+        // Defensive: zero divisor should clamp to 1 (a 0-divisor would divide
+        // by zero in the dispatcher). The struct field is u16; we verify the
+        // `.max(1)` guard in the accessor.
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 0,
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        assert_eq!(registry.tick_divisor_flags()[0], 1);
+    }
+
+    #[test]
+    fn block_rule_tick_divisors_uses_gcd_for_shared_rules() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        // Two materials sharing one BlockRule with different divisors.
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 6,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+        let divisors = registry.block_rule_tick_divisors();
+        // GCD(4, 6) = 2 — rule fires whenever either user fires.
+        assert_eq!(divisors[block_rule_id.0], 2);
+    }
+
+    #[test]
+    fn block_rule_tick_divisors_dead_rule_is_one() {
+        let mut registry = MaterialRegistry::new();
+        let _rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        // No material references this block rule — treat as divisor=1.
+        let divisors = registry.block_rule_tick_divisors();
+        assert_eq!(divisors[block_rule_id.0], 1);
     }
 }

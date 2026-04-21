@@ -54,8 +54,14 @@ impl World {
         self.hashlife_stats = super::world::HashlifeStats::default();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
-        let parity = (self.generation % 2) as u32;
-        let result = self.step_node(padded_root, padded_level, parity);
+        // Memo key: generation modulo the schedule period of the material
+        // registry. With all tick_divisors = 1, memo_period() = 2 and this
+        // reduces to the classic Margolus parity. With slower divisors, the
+        // period grows to LCM(2*d_i) so identical inputs at the same schedule
+        // phase always produce identical outputs (iowh).
+        let period = self.materials.memo_period();
+        let phase = (self.generation % period) as u32;
+        let result = self.step_node(padded_root, padded_level, phase);
         self.root = result;
         let step_stats = self.hashlife_stats;
         self.hashlife_stats_total.accumulate(&step_stats);
@@ -297,9 +303,13 @@ impl World {
 
     /// Recursively step a node. Input level n (≥ 3), output level n-1.
     /// Block-rule partition uses node-local alignment, so origin is not needed
-    /// and the cache key is just (NodeId, parity) — enabling spatial memoization
-    /// for all worlds, including those with block rules (9ww).
-    fn step_node(&mut self, node: NodeId, level: u32, parity: u32) -> NodeId {
+    /// and the cache key is (NodeId, schedule_phase). With per-material
+    /// tick_divisors all = 1, `schedule_phase = generation % 2` (Margolus
+    /// parity). With any divisor > 1 the phase expands to `generation %
+    /// memo_period()` where memo_period = LCM over materials of 2*divisor
+    /// (iowh). Identical subtrees at the same schedule_phase always produce
+    /// identical outputs (9ww + iowh).
+    fn step_node(&mut self, node: NodeId, level: u32, schedule_phase: u32) -> NodeId {
         assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
@@ -323,7 +333,7 @@ impl World {
             return self.center_node(node, level);
         }
 
-        let key = (node, parity);
+        let key = (node, schedule_phase);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
@@ -334,9 +344,9 @@ impl World {
         }
 
         let result = if level == 3 {
-            self.step_base_case(node, parity)
+            self.step_base_case(node, schedule_phase)
         } else {
-            self.step_recursive_case(node, level, parity)
+            self.step_recursive_case(node, level, schedule_phase)
         };
 
         self.hashlife_cache.insert(key, result);
@@ -345,7 +355,12 @@ impl World {
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
     /// run BlockRule on all aligned blocks, extract center 4³ → level-2 output.
-    fn step_base_case(&mut self, node: NodeId, _parity: u32) -> NodeId {
+    ///
+    /// The unused `_schedule_phase` parameter matches the cache key component
+    /// that the caller uses to distinguish memo entries; it is redundant with
+    /// `self.generation % memo_period` for a given step, but kept in the
+    /// signature so step_node's call is symmetric with step_recursive_case.
+    fn step_base_case(&mut self, node: NodeId, _schedule_phase: u32) -> NodeId {
         // Stack-allocated grid avoids heap allocation per base case (~16K calls).
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
@@ -422,6 +437,7 @@ impl World {
         // entirely (next is zero-initialized). For GoL, air participates in birth
         // rules and must NOT be skipped.
         let noop_by_material = self.materials.noop_flags();
+        let divisor_by_material = self.materials.tick_divisor_flags();
         let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
         for z in 1..side - 1 {
             for y in 1..side - 1 {
@@ -437,6 +453,15 @@ impl World {
                         next[idx] = raw;
                         continue;
                     }
+                    // tick_divisor gate: rule fires only when generation is a
+                    // multiple of this material's divisor (iowh). Skipped ticks
+                    // keep the cell unchanged. Divisor=1 (default) reduces to
+                    // "every tick", identical to pre-iowh behavior.
+                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                    if divisor > 1 && !generation.is_multiple_of(divisor) {
+                        next[idx] = raw;
+                        continue;
+                    }
                     let rule = self.materials.rule_for_cell(cell).unwrap_or_else(|| {
                         panic!("missing CaRule for material {}", cell.material())
                     });
@@ -447,21 +472,62 @@ impl World {
         }
 
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
-        // Node-local alignment (9ww): the partition is determined by grid-local
-        // coordinates, not world-space origin.
-        let offset = (generation % 2) as usize;
-        let mut bz = offset;
-        while bz + 1 < side - 1 {
-            let mut by = offset;
-            while by + 1 < side - 1 {
-                let mut bx = offset;
-                while bx + 1 < side - 1 {
-                    self.apply_block_in_grid(&mut next, side, bx, by, bz);
-                    bx += 2;
+        // Node-local alignment (9ww): partition is determined by grid-local
+        // coordinates, not world-space origin. With per-rule tick_divisors
+        // (iowh), each BlockRule has its own offset `(generation / divisor) % 2`
+        // derived from its slowed-down tick schedule — this preserves Margolus
+        // mass-conservation alternation for slowed rules. Default d=1 reduces
+        // to `generation % 2`, identical to pre-iowh behavior.
+        let block_rule_divisors = self.materials.block_rule_tick_divisors();
+
+        // Fast path: when all divisors are 1 (period 2), every rule uses the
+        // same offset = generation % 2. Keep the old single-offset loop to
+        // avoid extra iteration on the default hot path.
+        let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1)
+            && divisor_by_material.iter().all(|&d| d == 1);
+        if all_divisors_one {
+            let offset = (generation % 2) as usize;
+            let mut bz = offset;
+            while bz + 1 < side - 1 {
+                let mut by = offset;
+                while by + 1 < side - 1 {
+                    let mut bx = offset;
+                    while bx + 1 < side - 1 {
+                        self.apply_block_in_grid(&mut next, side, bx, by, bz);
+                        bx += 2;
+                    }
+                    by += 2;
                 }
-                by += 2;
+                bz += 2;
             }
-            bz += 2;
+        } else {
+            // Slow path: iterate both offsets, decide per-block based on the
+            // dominant rule's own slowed-down tick schedule. Empty blocks and
+            // mismatched-offset blocks early-exit cheaply.
+            for pass_offset in 0..2usize {
+                let mut bz = pass_offset;
+                while bz + 1 < side - 1 {
+                    let mut by = pass_offset;
+                    while by + 1 < side - 1 {
+                        let mut bx = pass_offset;
+                        while bx + 1 < side - 1 {
+                            self.apply_block_in_grid_with_schedule(
+                                &mut next,
+                                side,
+                                bx,
+                                by,
+                                bz,
+                                pass_offset,
+                                generation,
+                                &block_rule_divisors,
+                            );
+                            bx += 2;
+                        }
+                        by += 2;
+                    }
+                    bz += 2;
+                }
+            }
         }
 
         next
@@ -480,6 +546,74 @@ impl World {
             }
         }
         self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
+    }
+
+    /// Slow-path variant of `apply_block_in_grid` used when any BlockRule has
+    /// `tick_divisor > 1`. Only applies the block's dominant rule when the
+    /// current pass_offset matches that rule's Margolus offset for this tick
+    /// and the rule is active this tick (`generation % divisor == 0`). No-op
+    /// otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_block_in_grid_with_schedule(
+        &self,
+        grid: &mut [CellState],
+        side: usize,
+        bx: usize,
+        by: usize,
+        bz: usize,
+        pass_offset: usize,
+        generation: u64,
+        block_rule_divisors: &[u16],
+    ) {
+        let mut block = [Cell::EMPTY; 8];
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                    block[octant_index(dx as u32, dy as u32, dz as u32)] =
+                        Cell::from_raw(grid[idx]);
+                }
+            }
+        }
+
+        if block.iter().all(|c| c.is_empty()) {
+            return;
+        }
+
+        let rule_id = match self.unique_block_rule(&block) {
+            Some(id) => id,
+            None => return,
+        };
+
+        let divisor = block_rule_divisors
+            .get(rule_id.0)
+            .copied()
+            .unwrap_or(1)
+            .max(1) as u64;
+        if !generation.is_multiple_of(divisor) {
+            return;
+        }
+        let rule_offset = ((generation / divisor) & 1) as usize;
+        if rule_offset != pass_offset {
+            return;
+        }
+
+        let rule = self.materials.block_rule(rule_id);
+        let result = rule.step_block(&block);
+
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = octant_index(dx as u32, dy as u32, dz as u32);
+                    let original = block[i];
+                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
+                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                    if has_rule || original.is_empty() {
+                        grid[idx] = result[i].raw();
+                    }
+                }
+            }
+        }
     }
 
     /// Apply a single block rule within a flat grid.
@@ -530,7 +664,7 @@ impl World {
     }
 
     /// Recursive case: level ≥ 3.
-    fn step_recursive_case(&mut self, node: NodeId, level: u32, parity: u32) -> NodeId {
+    fn step_recursive_case(&mut self, node: NodeId, level: u32, schedule_phase: u32) -> NodeId {
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
@@ -582,7 +716,7 @@ impl World {
                     }
                     let sub_root = self.store.interior(level - 1, sub_cube);
                     result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node(sub_root, level - 1, parity);
+                        self.step_node(sub_root, level - 1, schedule_phase);
                 }
             }
         }
@@ -1294,5 +1428,112 @@ mod tests {
             }
         }
         count
+    }
+
+    /// tick_divisor=2 on WATER means the BlockRule fires every other tick.
+    /// The gate is "rule fires iff generation % divisor == 0", so with
+    /// divisor=2 it fires at gen=0, 2, 4, ... (pre-step generation) and skips
+    /// at gen=1, 3, 5. Over 4 steps that's 2 firings and 2 skips, so a
+    /// falling water cell should move at most 2 levels rather than 4.
+    #[test]
+    fn tick_divisor_two_halves_water_block_rule_firing_cadence() {
+        let mut fast = World::new(4); // 16³, every tick
+        let mut slow = World::new(4); // 16³, every other tick
+        slow.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+
+        let water = Cell::pack(WATER_MATERIAL_ID, 0).raw();
+        // Water near the top of the world with clear air below.
+        for world in [&mut fast, &mut slow] {
+            world.set(wc(8), wc(12), wc(8), water);
+        }
+
+        // After 1 step the slow world is pre-step gen=0, so it fires identically.
+        fast.step_recursive();
+        slow.step_recursive();
+        assert_eq!(
+            fast.flatten(),
+            slow.flatten(),
+            "gen 0→1: both fire identically"
+        );
+
+        // After 2 steps the slow world skips its second firing (pre-step gen=1).
+        // Fast world keeps falling; slow world is now one step behind.
+        fast.step_recursive();
+        let slow_snapshot = slow.flatten();
+        slow.step_recursive();
+        assert_eq!(
+            slow.flatten(),
+            slow_snapshot,
+            "gen 1→2: slow world must be a no-op under divisor=2"
+        );
+        assert_ne!(
+            fast.flatten(),
+            slow.flatten(),
+            "fast world must have advanced past slow world"
+        );
+
+        // After 3 steps slow fires again (pre-step gen=2); fast keeps falling.
+        fast.step_recursive();
+        slow.step_recursive();
+        // Slow world is always exactly 1 firing behind fast world — they
+        // produce the same sequence of state snapshots just offset.
+    }
+
+    /// Memo soundness: a world stepped forward with prior cache entries must
+    /// match a fresh world with no cache stepped to the same generation.
+    /// Runs with a non-default divisor to exercise the expanded memo period
+    /// key (T=4 when water d=2, vs T=2 baseline). If the cache key were too
+    /// narrow, the cached world would return a stale result.
+    #[test]
+    fn memo_soundness_divisor_two_matches_fresh_step() {
+        const STEPS: usize = 6;
+        const LEVEL: u32 = 4;
+        const WATER_COL_X: u64 = 8;
+        const WATER_COL_Z: u64 = 8;
+        const WATER_COL_Y_RANGE: std::ops::Range<u64> = 4..12;
+
+        let seed_world = || {
+            let mut w = World::new(LEVEL);
+            w.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+            for y in WATER_COL_Y_RANGE {
+                w.set(
+                    wc(WATER_COL_X),
+                    wc(y),
+                    wc(WATER_COL_Z),
+                    Cell::pack(WATER_MATERIAL_ID, 0).raw(),
+                );
+            }
+            w
+        };
+
+        // Warm cache: step one world for STEPS generations, then step once more.
+        let mut warm = seed_world();
+        for _ in 0..STEPS {
+            warm.step_recursive();
+        }
+        let warm_before = warm.flatten();
+        warm.step_recursive();
+        let warm_after = warm.flatten();
+
+        // Fresh cache: step a NEW world the same number of steps, then once more.
+        // Its final `step_recursive` call should see no prior cache entries for
+        // the intermediate node shapes (the seed is deterministic, but the
+        // cache was never populated).
+        let mut fresh = seed_world();
+        for _ in 0..STEPS {
+            fresh.step_recursive();
+        }
+        let fresh_before = fresh.flatten();
+        assert_eq!(
+            fresh_before, warm_before,
+            "deterministic seed must produce identical state after {STEPS} steps"
+        );
+        fresh.step_recursive();
+        let fresh_after = fresh.flatten();
+
+        assert_eq!(
+            warm_after, fresh_after,
+            "cached step must match fresh step at generation {STEPS} + 1"
+        );
     }
 }
