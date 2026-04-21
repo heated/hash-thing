@@ -519,6 +519,16 @@ impl Renderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        log::info!(
+            "surface_caps: present_modes={:?} alpha_modes={:?} formats={:?}",
+            surface_caps.present_modes, surface_caps.alpha_modes, surface_caps.formats,
+        );
+        log::info!(
+            "surface_config: present_mode={:?} alpha_mode={:?} format={:?} max_frame_latency={} render_scale={} size={}x{} (physical={}x{})",
+            config.present_mode, config.alpha_mode, config.format,
+            config.desired_maximum_frame_latency, render_scale,
+            config.width, config.height, size.width, size.height,
+        );
         surface.configure(&device, &config);
 
         let uniforms = Uniforms {
