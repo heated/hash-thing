@@ -196,13 +196,82 @@ Step 2 (fullscreen borderless) tests hypothesis (a). Step 3 (off-surface render 
 
 Hashlife memo (`step_cache`) and the SVDAG share a deep structural assumption: **subtrees are deduplicated and addressed by content.** This section owns the architectural surface where they meet.
 
-Open questions to resolve in the paper:
+First pass (2026-04-20, bead `hash-thing-stue.3`, spark). Measurements from `tests/bench_svdag.rs::bench_svdag_step_deltas_*`, release profile, seeded world = level-appropriate terrain + `seed_water_and_sand`, warmup=5 steps, measured=40 steps.
 
-- **Shared store or siloed?** Currently siloed (TODO: confirm by reading `crates/ht-octree/src/store.rs` — does the SVDAG build walk the same node IDs the sim uses, or does it re-hash from raw cells?). If siloed, what is the cost — duplicated memory, duplicated hashing work, or just convenience? If shared, what would be lost?
-- **Memo churn vs SVDAG compaction.** Each generation, active-material rules dirty some subtree set. The SVDAG must either rebuild those subtrees or accept node turnover. Steady-state rate? At the limit, if the entire reachable set churns per generation, the SVDAG offers nothing over a flat 3D texture. Need a measurement and a model.
-- **Cache locality across the boundary.** The sim writes cells; the renderer reads cells (via the SVDAG). On a unified-memory architecture (M1), they share L3/system bandwidth. If sim writes are evicting render-side hot lines (or vice versa), we pay an invisible cost that doesn't show up in either subsystem in isolation. spark's hypothesis 2 in dlse.2 (cross-frame `raycast_texture` serialization) is one face of this — there may be others.
+### 4.1 Shared store or siloed?
 
-If there is a fundamental architectural limit at this boundary, we surface it here. If there isn't, we say so explicitly so future investigations stop suspecting one.
+**Shared.** There is a single canonical `NodeStore` (`crates/ht-octree/src/store.rs:16`) per `World`. Both the hashlife memo and the SVDAG build read from it and address content by the same `NodeId` type.
+
+- `World` owns the store: `pub store: NodeStore` (implied by `src/sim/world.rs:187-200` — the hashlife caches are fields on `World`, keyed by `(NodeId, parity)` / `(NodeId, generation)` / `NodeId`).
+- Hashlife memo keys **are** store NodeIds (`src/sim/hashlife.rs:228-265`).
+- `Svdag::update(&NodeStore, root: NodeId, ...)` descends that same store (`crates/ht-render/src/svdag.rs:124`); its persistent `id_to_offset: FxHashMap<NodeId, u32>` caches render-side offsets keyed by store NodeIds.
+- When `NodeStore::compacted_with_remap_keeping` fires (`src/sim/world.rs:1938`, from `hashlife::maybe_compact`), the same remap table is fed into the SVDAG (`src/main.rs:876` via `Svdag::apply_remap`) and into the hashlife caches (`hashlife::remap_caches`). Both sides stay valid across compaction.
+
+**What is siloed is the content-indirection layer, not the store.** The SVDAG maintains two additional caches — `offset_by_slot: FxHashMap<[u32; 9], u32>` (slot-bytes → GPU offset; cross-epoch content dedup) and `id_to_offset` above. These live entirely inside `Svdag`; the sim doesn't see them. They exist because the GPU buffer is an append-only serialization with different stability semantics than `NodeId` (NodeIds churn on compaction; slot bytes are epoch-stable). This is the right shape — pretending the render buffer and the sim store share a single address space would break the incremental upload path.
+
+**Cost of the current split:** the SVDAG carries two hashmaps over the reachable-node set (`offset_by_slot` and `id_to_offset`, ~48 B + ~12 B per entry on a typical LP64 allocator). At 256³ steady-state, `offset_by_slot.len()` converges to the total-slot count including stale slots from earlier epochs — bounded by `stale_ratio()` which triggers `Svdag::compact` at 50% (`src/main.rs:882`). So the render-side bookkeeping stays O(reachable) within a factor of 2.
+
+**Verdict:** shared store, siloed render-side cache. Nothing duplicates the actual octree content; the extra maps are address-translation tables between stable-content and stable-position. No action.
+
+### 4.2 Memo churn vs SVDAG compaction
+
+**Measured at 256³ (terrain + water/sand, 40 warm steps):**
+
+- **Hashlife cache misses (new subtree computations): ~1,847 per step** (73,884 summed).
+- **SVDAG new-slot appends: ~544 per step** (mean 4,892 u32s/step ÷ 9 u32s per interior slot).
+- **Cache hits: ~2,222 per step** (88,899 summed), **hit rate: 54.6%**.
+- **Empty-subtree skips: ~1,670/step** (66,798 summed) — no CA work needed for empty subtrees.
+- **Fixed-point skips: ~930/step** (37,219 summed) — inert uniform subtrees that step to themselves.
+- **Short-circuit rate (hits + empty + fp) / (hits + misses + empty + fp): ~72%.** Only ~28% of subtree descents actually run the CA kernel.
+- **SVDAG compactions fired in 40 steps: 0.** The 50% stale-ratio threshold was never hit.
+
+**Measured at 64³ (same seed pattern):**
+
+- Cache misses ~412/step; SVDAG appends ~115 slots/step; hit rate 45.2%; short-circuit rate ~65%.
+- Scales roughly with volume (64× larger volume ≈ 4.5× misses, not 64× — the extra short-circuits absorb most of the growth).
+
+**Implications:**
+
+1. **Memo hit rate alone under-reports memo effectiveness by a lot.** At 256³ the raw hit/miss ratio is 55%, but counting the empty- and fixed-point-skip paths as "did not do CA work," the effective short-circuit rate is ~72%. A plain hit-rate graph would give a false-pessimism signal in steady state.
+2. **SVDAG absorbs memo churn well.** Of ~1,847 new subtrees per step, only ~544 translate to SVDAG slot appends (~30%). The gap is because `offset_by_slot` deduplicates by slot bytes across epochs — many "new" NodeIds carry slot bytes already present from prior epochs. So SVDAG slot count grows slower than hashlife memo size in steady state.
+3. **We are not near the degenerate limit.** At 256³, a full-reachable-set churn per step would be ~7,340 slot appends/step (from the cold build). We see ~544/step — two orders of magnitude below. Edward's hypothesis ("only parts of the world mutate, and the DAG is super compressible — diff-based uploads should be tiny") is confirmed for this scenario.
+
+### 4.3 Cache locality across the boundary
+
+**Deferred — not yet measurable with available tools.** A proper answer requires shared-L2/L3 traffic counters separated by producer (sim writes vs renderer reads), which Metal does not expose to unprivileged processes on macOS. `powermetrics --samplers gpu_power` gives aggregate GPU memory bandwidth but not eviction-attributed-to-side-A.
+
+Two empirical signals we could use as proxies:
+
+1. **Back-to-back per-frame latency with sim disabled** (freeze `world.generation` and skip `step_recursive`) vs sim enabled. If renderer-only frames are measurably faster on M-series under windowed vs fullscreen, unified-memory contention is likely. `hash-thing-dlse.2.2` is already investigating surface-acquire dominance in the windowed path; freezing sim is a small add.
+2. **Thread-parked vs running sim during a renderer micro-bench.** Instead of freezing, pin sim to another core and compare renderer frame time vs sim on the same core as the render submit. If same-core-sim is slower, cache contention is the likely driver; if equal, memory bandwidth is fungible.
+
+Both are measurable on M1/M2 without privileged counters. Filing as follow-up: `hash-thing-stue.7` (cache locality empirical proxies). Not blocking the §5 gap report.
+
+### 4.4 Per-step upload volume to `Svdag::nodes`
+
+**Measured at 256³ (terrain + water/sand, 40 warm steps), release profile:**
+
+- **Upload bytes/step: mean 19.6 KB, max 79 KB.**
+- **New u32s appended to `Svdag::nodes` per step: mean 4,892 (~544 new 9-u32 slots), max 19,782 (~2,198 slots).**
+- **Full buffer at cold: 66,061 u32s = 258 KB (7,340 reachable nodes).** A full re-upload is 13× the mean incremental upload.
+- **Compactions fired in 40 steps: 0.** No full re-uploads happened in the measurement window.
+
+**At 256³, per-frame SVDAG upload traffic is O(10 KB), not O(256 KB).** At 60 FPS this is ~1.2 MB/s upload, well under 0.01% of the M1 68 GB/s memory bandwidth ceiling. Edward's hypothesis is confirmed.
+
+**Upload path is architecturally O(new-content).** Inspection of `Renderer::upload_svdag` (`crates/ht-render/src/renderer.rs:1325`) shows:
+- Slot 0 (4-byte root header) is always rewritten.
+- The tail `dag.nodes[prev_len..new_len]` is appended.
+- A full re-upload only fires when the GPU buffer grows (doubling) or when `Svdag::compact` runs (stale_ratio > 0.5, rare).
+
+**Measured at 64³ for reference:** mean 4 KB/step, max 10 KB/step. Scales sub-linearly with volume (64× volume ≈ 5× upload bytes).
+
+**Implication for §5 (gap report):** SVDAG upload traffic is not a frame-budget concern at 256³, and on the current trend not at 512³ either. Any perf regression that makes upload look expensive is probably a different bug (e.g. unnecessary full re-uploads, buffer thrash, slot dedup broken).
+
+### 4.5 Verdict on the boundary
+
+**No fundamental architectural limit at the SVDAG ↔ memo boundary at 256³.** The two subsystems share a NodeStore; the render-side address-translation maps add bounded overhead; memo short-circuits absorb >70% of subtree descents; SVDAG uploads are O(new-content) at ~10 KB/frame scale. Cache locality across the boundary is the one question we cannot answer with current tools; the proxies in §4.3 will close that question.
+
+The *next* scale where the boundary might matter is the streaming regime (`hash-thing-cswp`): with 4096³+ worlds and view-distance streaming, the reachable-set churn per view-shift is much larger than per-generation churn, and the `offset_by_slot` cache growth becomes a real memory consideration. File a new `stue` child when the streaming work gets close.
 
 ---
 
@@ -216,9 +285,10 @@ Format (placeholder):
 |---|---|---|---|---|
 | Raycast traversal (headless, 256³, 1920×1080) | **0.19 ms mean / 0.45 ms p95** on M2 16 GB (`bench_gpu_raycast::bench_raycast_256_app_spawn`, spark 2026-04-15); M1-implied ≈ 0.3 ms | ~2.0 ms envelope on M1 MBA (§3.4) | ~7× model over-predicts | Measurement faster than model. Likely cause: effective traversal depth < 4 (§3.6). Follow-up bead: instrument per-ray depth histogram. |
 | Raycast traversal (windowed, 256³ / 50% render scale) | **0.16 ms mean** on M2 16 GB, post-dlse.2.3 (commit 8648dc0, TIMESTAMP_QUERY_INSIDE_ENCODERS); M1-implied ≈ 0.24 ms | ~1.2 ms envelope on M1 MBA at 960×600 (§3.4 × 0.6 for smaller ray count) | ~5× model over-predicts | Matches headless bench within factor of 2. Windowed ≠ slow; prior "30 ms" was measurement artifact. |
-| SVDAG build (cold) | TODO | TODO | TODO | TODO |
-| SVDAG compaction | TODO | TODO | TODO | TODO |
-| Step (memo hit path) | TODO | TODO | TODO | TODO |
+| SVDAG build (cold, 256³ terrain+water+sand) | **~1.08 ms** on M2 16 GB, release (`bench_svdag_step_deltas_256`, spark 2026-04-20); M1-implied ≈ 1.6 ms | Not yet in §3 (cold-build model) | N/A until modelled | One-shot cost; steady-state uses incremental path. |
+| SVDAG incremental upload (256³, warm, per step) | **mean 19.6 KB, max 79 KB** on M2 16 GB (`bench_svdag_step_deltas_256`, spark 2026-04-20 — §4.4) | Not yet modelled (§3 is raycast-only) | N/A until modelled | O(new-content). ~1.2 MB/s at 60 FPS — negligible vs 68 GB/s ceiling. |
+| SVDAG compaction | Not observed in 40-step warm window at 256³ (§4.4) | N/A | N/A | Fires only when `stale_ratio > 0.5`; not a steady-state cost. |
+| Step (memo short-circuit rate, 256³ warm) | **~72% short-circuit** (hits + empty + fp) on M2 16 GB (`bench_svdag_step_deltas_256`, §4.2) | Not yet in §3 (memo model) | N/A until modelled | Raw hit rate ~55%; skips absorb another ~17%. |
 | Step (memo miss / cold gen) | TODO | TODO | TODO | TODO |
 | Surface acquire (windowed, 256³ / 50%) | **~25 ms/frame** on M2 16 GB (spark 2026-04-19, three consecutive log lines) | Not yet in §3 (surface/presentation model is §3.8 TODO) | N/A until modelled | **This is the real 30 FPS bug.** Owned by `hash-thing-dlse.2.2`. |
 
@@ -252,3 +322,4 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-20 | onyx | §2 first pass (bead stue.1). Six-paper survey: ESVO 2010, SVDAG 2013, SSVDAG 2016, HashDAG 2020, HashDAG-attributes 2023, sparse 64-trees 2024. Each with reported number, implied M1-MBA number, verdict. Several exact numbers flagged TODO-verify (PDFs did not decode via WebFetch); headline figures and verdicts stand. |
 | 2026-04-20 | onyx | §3 theoretical frame-cost model (bead stue.2). Bottom-up derivation from M1 8-core GPU specs (2.6 TFLOPS, 68 GB/s) and the actual 36-byte interior-node encoding in `crates/ht-render/src/svdag.rs`. Predicts ~2 ms SVDAG traversal envelope at 256³ / 576k rays on M1 MBA. §5 gap report populated with raycast rows — measurement (post-dlse.2.3) is ~5-7× faster than model, consistent with shorter-than-assumed effective traversal depth. Surface-acquire row added to route dlse's 30 FPS bug to dlse.2.2; §3.8 surface/presentation model flagged as TODO. |
 | 2026-04-21 | onyx | §3.8 present-path inventory (bead dlse.2.2 step 1, commit `4f60ddc`). macOS M2 Metal exposes only `[Fifo, Immediate]` — no Mailbox. Rules out "triple-buffer-style unlocked present was on the table." The moss/AutoNoVsync null result combined with no-Mailbox narrows the 25 ms `surface_acquire_cpu` bug to compositor fence or driver-internal serialization; step 2 and step 3 of dlse.2.2 will distinguish these. |
+| 2026-04-20 | spark | §4 populated (bead stue.3). Answered Q1 (store is shared; render-side cache is a bounded address-translation layer), Q2 (~1,847 hashlife misses/step at 256³ → ~544 SVDAG slot appends/step; ~72% short-circuit rate), Q4 (~19.6 KB mean / ~79 KB max upload per step at 256³, confirming edward's diff-compressibility hypothesis). Q3 (cache locality) deferred with two empirical-proxy experiments for follow-up. Measurements land via new `tests/bench_svdag.rs::bench_svdag_step_deltas_*`. |
