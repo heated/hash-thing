@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, MouseButton, WindowEvent},
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
     event_loop::EventLoop,
     keyboard::KeyCode,
     window::{CursorGrabMode, Window, WindowAttributes},
@@ -1537,9 +1537,14 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                // When the cursor is grabbed (FPS look), macOS delivers
+                // relative motion via `DeviceEvent::MouseMotion`. `CursorMoved`
+                // either stops firing or reports a stationary position, so we
+                // must not feed its deltas into look input — see `device_event`
+                // below. (hash-thing-w1yq)
                 let should_look = match self.camera_mode {
                     CameraMode::Orbit => self.mouse_pressed,
-                    CameraMode::FirstPerson => true, // always look in FPS
+                    CameraMode::FirstPerson => !self.cursor_captured,
                 };
                 if should_look {
                     if let Some((lx, ly)) = self.last_mouse {
@@ -1964,6 +1969,33 @@ impl ApplicationHandler for App {
             }
 
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // macOS delivers relative mouse motion here when the cursor is
+        // grabbed/locked; `WindowEvent::CursorMoved` stops firing or
+        // reports a stationary position in that state. Without this,
+        // FPS look is dead whenever the cursor is actually captured.
+        // hash-thing-w1yq.
+        let DeviceEvent::MouseMotion { delta: (dx, dy) } = event else {
+            return;
+        };
+        if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
+            return;
+        }
+        let Some(pid) = self.player_id else { return };
+        let Some(player) = self.entities.get_mut(pid) else {
+            return;
+        };
+        if let sim::EntityKind::Player(ref mut ps) = player.kind {
+            ps.yaw += dx * LOOK_SENSITIVITY;
+            ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
         }
     }
 }

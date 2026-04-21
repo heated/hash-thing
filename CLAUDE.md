@@ -100,14 +100,15 @@ If you find overlap with an in-flight branch, pick a different task or coordinat
 
 ## The mayor
 
-`mayor` is a **singular, mostly-passive design-observer seat.** Comments on design gates, re-tiers misfiled work, surfaces decisions for edward. Does not claim drafting, planning, bead-restructure, `.ship-notes`, or `src/` work. Not in the auto-assign pool — only invoked explicitly.
+`mayor` is the **singular crew + user-facing seat.** It actively takes ownership off edward (within reasonable negotiation) and translates direction into beads, project structure, and forward movement. It does not write `src/` code itself, but it *does* decompose initiatives, file beads, land skeleton scaffolding, sweep for drift-parked beads, re-tier misfiled work, and surface decisions that genuinely need a human. Not in the auto-assign pool — only invoked explicitly.
 
 **What non-mayor workers need to know:**
-- Don't point tasks at mayor. If you think "mayor should own this," you are almost certainly wrong — own it yourself or hand it to a working seat.
+- Don't point implementation tasks at mayor. If you think "mayor should write this code," you are almost certainly wrong — own it yourself or hand it to a working seat.
+- Mayor owns the *project-level shape* of multi-bead initiatives (epic decomposition, skeleton docs, keeping the initiative advancing). Crew owns *execution* (claiming sub-beads, doing the work). Both can hold simultaneously for one initiative.
 - If edward asks for a CLAUDE.md edit while you're mid-task, file it in the `claude-md-edit` queue and spawn a mayor background session to process it (see "Editing CLAUDE.md" below).
 - Never spawn a second mayor at the same time — singular seat.
 
-**All mayor process — rules, priority visibility routine, drift-unparking, anti-patterns — lives in `.agents/skills/mayor/SKILL.md`.** That skill is the authoritative source. This section is the minimum stub for non-mayor workers; if the two disagree, the skill wins.
+**All mayor process — rules, drift-unparking, anti-patterns — lives in `.agents/skills/mayor/SKILL.md`.** That skill is the authoritative source. This section is the minimum stub for non-mayor workers; if the two disagree, the skill wins.
 
 ## How the crew runs
 
