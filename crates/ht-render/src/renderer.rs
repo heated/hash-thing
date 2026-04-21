@@ -2204,8 +2204,45 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ticks_to_duration, FrameOutcome, RendererLifecycleSnapshot};
+    use super::{ticks_to_duration, FrameOutcome, GpuTiming, RendererLifecycleSnapshot};
     use std::time::Duration;
+
+    /// Try to build a headless wgpu device with TIMESTAMP_QUERY. Returns
+    /// `None` on CI / machines without a supported adapter so the tests
+    /// gracefully skip instead of failing.
+    fn try_make_timestamp_device() -> Option<(wgpu::Device, wgpu::Queue, f32, bool)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            backend_options: Default::default(),
+            display: Default::default(),
+            flags: Default::default(),
+            memory_budget_thresholds: Default::default(),
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        let af = adapter.features();
+        if !af.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        let in_encoder = af.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let mut required = wgpu::Features::TIMESTAMP_QUERY;
+        if in_encoder {
+            required |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("gpu_timing_tests"),
+            required_features: required,
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .ok()?;
+        let period = queue.get_timestamp_period();
+        Some((device, queue, period, in_encoder))
+    }
 
     #[test]
     fn ticks_to_duration_period_one_is_identity() {
@@ -2342,5 +2379,125 @@ mod tests {
                 "{snapshot:?}"
             );
         }
+    }
+
+    // hash-thing-lwa2 — device-backed coverage for the two-instance
+    // GpuTiming path introduced by dlse.2.4. Tests graceful-skip on
+    // adapters without TIMESTAMP_QUERY so CI hosts without a supported
+    // GPU still pass.
+
+    #[test]
+    fn gpu_timing_fresh_instance_is_idle() {
+        let Some((device, _queue, period, in_encoder)) = try_make_timestamp_device() else {
+            return;
+        };
+        let gt = GpuTiming::new(&device, period, in_encoder, "test_fresh");
+        assert!(gt.is_idle(), "fresh GpuTiming must report idle");
+        assert!(
+            gt.take_resolved().is_none(),
+            "fresh GpuTiming must not report any resolved readback"
+        );
+        assert_eq!(gt.uses_in_encoder(), in_encoder);
+    }
+
+    #[test]
+    fn gpu_timing_pass_writes_respects_in_encoder_mode() {
+        let Some((device, _queue, period, _in_encoder)) = try_make_timestamp_device() else {
+            return;
+        };
+
+        let via_pass = GpuTiming::new(&device, period, false, "test_pass_mode");
+        assert!(
+            via_pass.pass_writes().is_some(),
+            "idle pass-mode instance must yield a RenderPassTimestampWrites"
+        );
+        assert!(
+            via_pass.compute_pass_writes().is_some(),
+            "idle pass-mode instance must yield a ComputePassTimestampWrites"
+        );
+
+        // In-encoder mode requires adapter support; skip the assertion
+        // otherwise rather than force an unsatisfiable request.
+        if device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+        {
+            let via_encoder = GpuTiming::new(&device, period, true, "test_encoder_mode");
+            assert!(
+                via_encoder.pass_writes().is_none(),
+                "in-encoder instance must suppress pass_writes"
+            );
+            assert!(
+                via_encoder.compute_pass_writes().is_none(),
+                "in-encoder instance must suppress compute_pass_writes"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_timing_two_instances_have_independent_state_end_to_end() {
+        // dlse.2.4 — the compute-pass and render-pass brackets each own
+        // their own GpuTiming. Driving `compute` through a real
+        // PENDING → READY → IDLE cycle must not drag `render` out of
+        // IDLE. Codex + Claude reviewers flagged the prior IDLE-only
+        // variant of this test as vacuous: `take_resolved()` short-
+        // circuits on !READY so it could not catch a shared-state
+        // regression. This test forces the actual transition by
+        // encoding two `write_timestamp` calls on the encoder, which
+        // only requires TIMESTAMP_QUERY_INSIDE_ENCODERS — no pipeline
+        // or bind-group setup.
+        let Some((device, queue, period, in_encoder)) = try_make_timestamp_device() else {
+            return;
+        };
+        if !in_encoder {
+            // Adapter lacks TIMESTAMP_QUERY_INSIDE_ENCODERS; driving the
+            // cycle without a real compute/render pass is not possible.
+            // The per-pass branch is already pinned by
+            // `pass_writes_respects_in_encoder_mode`.
+            return;
+        }
+
+        let compute = GpuTiming::new(&device, period, true, "test_compute");
+        let render = GpuTiming::new(&device, period, true, "test_render");
+        assert!(compute.is_idle());
+        assert!(render.is_idle());
+
+        // Encode + submit a minimal workload on `compute` only.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_two_instances_encoder"),
+        });
+        compute.write_timestamp_begin(&mut encoder);
+        compute.write_timestamp_end(&mut encoder);
+        compute.encode_resolve(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        compute.request_readback();
+
+        // Pump the `map_async` callback synchronously. The
+        // `wait_indefinitely` variant blocks until every pending
+        // submission + mapping completes, which is the pattern
+        // `tests/bench_gpu_hash_table.rs` uses for the same shape
+        // of readback test.
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        // `compute` must have transitioned to READY; `render` must be
+        // untouched. This is the regression test the reviewers asked
+        // for — if `state` were accidentally shared across instances,
+        // `render.is_idle()` would flip false here.
+        assert!(!compute.is_idle(), "compute should be READY post-poll");
+        assert!(
+            render.is_idle(),
+            "render must NOT be dragged out of IDLE by compute's readback"
+        );
+
+        // Drain compute; confirm it returns a duration (the two
+        // timestamps are close but non-negative per the saturating
+        // subtract in `ticks_to_duration`). Render must still be IDLE.
+        let dur = compute
+            .take_resolved()
+            .expect("compute readback must be ready after Wait poll");
+        let _ = dur; // value is backend-dependent; shape is what we pin.
+        assert!(compute.is_idle(), "compute must return to IDLE after take");
+        assert!(render.is_idle(), "render still untouched");
+        assert!(render.take_resolved().is_none());
     }
 }

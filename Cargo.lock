@@ -730,6 +730,7 @@ dependencies = [
  "bytemuck",
  "ht-octree",
  "log",
+ "pollster",
  "rustc-hash 2.1.2",
  "wgpu",
  "winit",
