@@ -44,7 +44,6 @@ use hash_thing::terrain::TerrainParams;
 
 const WIDTH: usize = 960;
 const HEIGHT: usize = 540;
-const LEVEL: u32 = 8;
 
 #[derive(Clone, Copy)]
 struct Camera {
@@ -206,14 +205,16 @@ fn run_pose(dag: &[u32], root_level: u32, cam: &Camera) -> PoseStats {
     }
 }
 
-#[test]
-#[ignore]
-fn depth_histogram_256() {
-    eprintln!("--- traversal-step histogram @ 256³, {WIDTH}×{HEIGHT} rays/pose ---");
+fn run_depth_histogram(level: u32, enforce_floors: bool) {
+    let side_voxels = 1u64 << level;
+    eprintln!(
+        "--- traversal-step histogram @ {}³, {WIDTH}×{HEIGHT} rays/pose ---",
+        side_voxels,
+    );
 
-    let mut world = World::new(LEVEL);
+    let mut world = World::new(level);
     let _ = world
-        .seed_terrain(&TerrainParams::for_level(LEVEL))
+        .seed_terrain(&TerrainParams::for_level(level))
         .expect("level-derived terrain params must validate");
     eprintln!("world population: {}", world.population());
 
@@ -224,7 +225,7 @@ fn depth_histogram_256() {
         (svdag.nodes.len() * 4) as f64 / (1024.0 * 1024.0),
     );
 
-    let side = (1u32 << LEVEL) as f32;
+    let side = side_voxels as f32;
     let spawn_y = 0.5 + 2.0 / side;
     let poses = [
         camera_from_yaw_pitch(
@@ -281,10 +282,14 @@ fn depth_histogram_256() {
         // invalidating the sample. Thresholds are ~50% of the 2026-04-20
         // measured means (15.0 / 6.8 / 13.2) -- low enough to survive terrain
         // tweaks, high enough to notice an order-of-magnitude regression.
-        let expected_min = expected_min_mean(cam.label);
-        let (mean, _, _, _) = summarize(&combined);
-        if mean < expected_min {
-            mean_drift.push((cam.label, mean, expected_min));
+        // Floors are calibrated at 256³ only; skipped at other scales until
+        // the same empirical calibration exists there.
+        if enforce_floors {
+            let expected_min = expected_min_mean(cam.label);
+            let (mean, _, _, _) = summarize(&combined);
+            if mean < expected_min {
+                mean_drift.push((cam.label, mean, expected_min));
+            }
         }
     }
 
@@ -311,6 +316,28 @@ fn depth_histogram_256() {
          yaw/pitch/FOV or the screen math in run_pose. Per-pose (label, measured, floor): \
          {mean_drift:?}"
     );
+}
+
+#[test]
+#[ignore]
+fn depth_histogram_256() {
+    run_depth_histogram(8, true);
+}
+
+/// Traversal-step histogram at 4096³ (hash-thing-cz0r, follow-up to ivms).
+/// Validates the §3.10.1 projection that mean traversal depth scales to
+/// roughly 20 steps at default-spawn (3× the 256³ baseline). Floors are
+/// NOT enforced here — no baseline measurements exist yet at level 12;
+/// first run establishes them, future runs gain guards.
+///
+/// Expected cost: SVDAG build is the dominant term (projected ~2s cold at
+/// 4096³ under L^1.58) plus 960×540×3 ≈ 1.56M CPU raycasts at deeper
+/// traversal. Designed to stay under the 60s ceiling; if it overflows the
+/// budget on slower hardware, drop to two poses or a reduced ray grid.
+#[test]
+#[ignore]
+fn depth_histogram_4096() {
+    run_depth_histogram(12, false);
 }
 
 fn expected_min_mean(label: &str) -> f64 {
