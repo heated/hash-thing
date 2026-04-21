@@ -1334,6 +1334,13 @@ impl ApplicationHandler for App {
             let mut renderer =
                 pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
+            // `surface.get_current_texture()` + `present()`; pairs with the
+            // acquire harness to measure whether the ~25 ms surface_acquire
+            // stall is swapchain-pacing (collapses) or elsewhere (persists).
+            if std::env::var("HASH_THING_OFF_SURFACE").ok().as_deref() == Some("1") {
+                renderer.enable_off_surface();
+            }
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
