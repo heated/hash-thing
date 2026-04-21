@@ -248,7 +248,7 @@ fn depth_histogram_256() {
     ];
 
     let t0 = std::time::Instant::now();
-    let mut total_exhausted = 0u32;
+    let mut exhausted_by_pose: Vec<(&str, u32)> = Vec::new();
     for cam in &poses {
         eprintln!();
         eprintln!("pose: {}", cam.label);
@@ -272,7 +272,7 @@ fn depth_histogram_256() {
             .copied()
             .collect();
         print_histogram("all ", &combined);
-        total_exhausted += stats.exhausted;
+        exhausted_by_pose.push((cam.label, stats.exhausted));
     }
 
     let elapsed_s = t0.elapsed().as_secs_f64();
@@ -285,9 +285,10 @@ fn depth_histogram_256() {
         (WIDTH * HEIGHT * poses.len()) as f64 / elapsed_s,
     );
 
-    assert_eq!(
-        total_exhausted, 0,
+    let bad: Vec<&(&str, u32)> = exhausted_by_pose.iter().filter(|(_, n)| *n > 0).collect();
+    assert!(
+        bad.is_empty(),
         "exhausted rays would poison the histogram — step_budget is too low \
-         or the scene hit a pathological case. Investigate."
+         or the scene hit a pathological case. Per-pose counts: {bad:?}"
     );
 }
