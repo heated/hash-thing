@@ -239,6 +239,47 @@ Concrete numbers: `submit_cpu = 25.21/27.48 ms` (p95), steady-state across 4 con
 
 **Cold-frame confound check (bead `hash-thing-6hta`, spark 2026-04-20).** The `Perf` ring buffer is a FIFO of 64 samples per metric with no cold-frame skip (`src/perf.rs:61-87`, `src/main.rs:2036` records every frame's `surface_acquire` unconditionally). At ~30 FPS that evicts cold frames within ~2.1 s of wall-clock, so the *first* `log::info` line at `LOG_INTERVAL_SECS = 2.0` s is partially cold-contaminated, but lines 2+ are steady-state. moss's 2026-04-15 repro and spark's 2026-04-19 "three consecutive log lines" observation both sampled steady-state lines, not the opening line. The existing **`C` keybind** (`perf.clear()`, `src/main.rs`) is the correct drain-and-measure mechanism when isolating warm samples is needed. Conclusion: the confound exists in principle but does not explain the dlse.2.2 ~25 ms sustained measurement.
 
+### 3.9 Render-pass attribution (dlse.2.4) — REVISES the §3.8 conclusion
+
+Step 4 of the dlse.2.2 investigation adds a second `TIMESTAMP_QUERY_INSIDE_ENCODERS` bracket around the blit + particle + HUD + hotbar + legend render pass, in parallel with the existing compute-pass bracket. This is the direct follow-up proposed at the end of §3.8 — attribute the ~25 ms frame budget to a concrete pass. The result REVISES the §3.8 conclusion.
+
+**Instrumentation (onyx 2026-04-21).** Two independent `GpuTiming` instances with distinct query sets / resolve buffers / readback buffers, each honouring the existing `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` kill switch. Single `device.poll(Poll)` per frame drives both. New metric `render_pass_gpu` in `Perf` alongside the historical (compute-only) `render_gpu`. `acquire_harness.rs` extended with a parallel column so dlse.2.2 step-2-style windowed/fullscreen captures don't silently drop the new data.
+
+**Measurement — M2 MBA 16 GB, 256³ dev, default 50 % render scale, windowed, steady-state (lines 3–5 of a 15 s run):**
+
+| metric                   | mean     | p95      | samples |
+|--------------------------|----------|----------|---------|
+| `render_gpu` (compute)   | 0.08 ms  | 0.15 ms  | ~60     |
+| `render_pass_gpu` (blit+overlays) | 0.08 ms | 0.16 ms | ~60 |
+| **total GPU work**       | **~0.16 ms** | ~0.31 ms | — |
+| `submit_cpu`             | 0.34 ms  | 0.45 ms  | ~60     |
+| `present_cpu`            | 0.02 ms  | 0.03 ms  | ~60     |
+| `surface_acquire_cpu`    | 24.81 ms | 30.80 ms | ~60     |
+| `render_cpu` total       | 25.54 ms | 32.75 ms | ~60     |
+
+**REVISION — the §3.8 "real GPU frame time" conclusion was wrong.** Direct GPU instrumentation shows the two passes together consume ~0.16 ms of GPU work per frame, not ~25 ms. The `render_pass_gpu` metric specifically tops out below 0.2 ms even at p95. The ~25 ms ceiling is NOT GPU-bound.
+
+The 25 ms lives where the step-2/3/3b elimination said it couldn't: in `surface.get_current_texture()`. The new brackets rule in what earlier steps only proved by absence — the GPU is idle for roughly 24 of every 25 ms, CPU-blocked at the swapchain handoff. The previous "by elimination" inference collapsed because it assumed an enumeration of three hypotheses (compositor / swapchain-pacing / timestamp-fence) was exhaustive. It wasn't. A fourth cause — **driver/OS-level vsync pacing** that holds the drawable even when the GPU is free — fits every datum: windowed, fullscreen, with or without timestamp traffic, on-surface or off-surface (in off-surface mode the block migrates to `submit_cpu` at ~25 ms even though the new `render_pass_gpu` bracket still reads ≤0.3 ms, proving the stall in that mode is not GPU work either).
+
+**Off-surface comparison — submit_cpu stall is NOT render-pass work either:**
+
+| metric                   | windowed   | `HASH_THING_OFF_SURFACE=1` |
+|--------------------------|------------|----------------------------|
+| `render_pass_gpu` mean   | 0.08 ms    | 0.15 ms                    |
+| `render_pass_gpu` p95    | 0.16 ms    | 0.34 ms                    |
+| `submit_cpu` mean        | 0.34 ms    | 25–28 ms                   |
+| `surface_acquire_cpu`    | 24.81 ms   | 0.00 ms                    |
+
+The off-surface `render_gpu` (compute) bracket reports inflated numbers (~9–26 ms mean). `ticks_to_duration` is a pure end-minus-start subtraction on GPU-reported tick counts (`crates/ht-render/src/renderer.rs:344`), so the inflation is a real GPU-time delta *between* the two writes — not a Rust-side callback ordering artifact. The most plausible mechanism is that Metal attributes inter-command-buffer waits to the GPU command next in flight: off-surface, the compute-pass begin-timestamp can sit through a queue-depth stall that the render-pass begin-timestamp, executing later in the same command buffer, has already cleared. The render-pass bracket stays under 0.35 ms in both modes and correlates better with the known-tiny render-pass workload, so we treat it as the more reliable reading here; the compute-bracket variance is an open item, not a pinned conclusion (follow-up bead).
+
+**What this means for dlse P0.** The 30 FPS ceiling on M2 at 256³ is not a compute, not a blit, not an overlay, not a shader problem. Optimizing anything in the render encoder buys nothing. The actual knob is swapchain-side pacing — something like `maximumDrawableCount`, `displaySyncEnabled`, or `presentsWithTransaction` on the underlying `CAMetalLayer` — which wgpu 29.0.1 does not expose through its `SurfaceConfiguration`. Candidates going forward (any of which is a standalone investigation, not in scope for dlse.2.4):
+
+1. **Raise `desired_maximum_frame_latency` from 2 to 3.** Gives the swapchain one more drawable in flight, which on Metal historically unblocks the kind of acquire stall seen here. Cheap to try (one-line change). Prior attempt under dlse.2.2 went the opposite direction (*latency=1*, see `.ship-notes/` history); latency=3 has not been probed.
+2. **Direct `CAMetalLayer` access.** wgpu exposes `unsafe { surface.as_hal::<wgpu::hal::metal::Api, _, _>(|hal| hal.raw_device().clone()) }` on Metal; via `metal-rs` we can set `maximumDrawableCount=3` and `displaySyncEnabled=NO`. Heavier — requires a Metal-only code path and a feature flag.
+3. **Accept 30 FPS on integrated M-series and document it.** The GPU is already idle; rendering the same scene at 60 FPS would require the driver to hand us drawables faster, which is out of our reach at the wgpu layer. Ship notes: "M2 integrated runs at 30 FPS in windowed mode; the bottleneck is CAMetalLayer pacing, not our renderer."
+
+dlse.2.2 should be **reopened** for option 1 (fast) and a new bead filed for option 2 (Metal-specific). The §3.8 closure note was premature; this is a swapchain-layer bug, not a renderer-compute bug.
+
 ---
 
 ## 4. SVDAG ↔ memo-step interaction

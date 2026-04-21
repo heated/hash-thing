@@ -2269,6 +2269,13 @@ impl ApplicationHandler for App {
                     if let Some(d) = renderer.take_last_gpu_frame_time() {
                         self.perf.record("render_gpu", d);
                     }
+                    // dlse.2.4: second bracket around the blit + overlay
+                    // render pass. `render_gpu` has always been
+                    // compute-only despite the name; the render-pass
+                    // GPU cost lands in this separate metric.
+                    if let Some(d) = renderer.take_last_render_pass_gpu_frame_time() {
+                        self.perf.record("render_pass_gpu", d);
+                    }
                 }
 
                 // Belt-and-suspenders: if the surface reports Occluded

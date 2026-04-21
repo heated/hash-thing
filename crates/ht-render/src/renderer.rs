@@ -159,9 +159,17 @@ struct GpuTiming {
 }
 
 impl GpuTiming {
-    fn new(device: &wgpu::Device, period_ns: f32, use_in_encoder: bool) -> Self {
+    /// `label_prefix` gets concatenated with `_qs`, `_resolve`, `_readback`
+    /// for the three wgpu objects; distinguishes multiple instances in
+    /// RenderDoc / Metal capture tooling.
+    fn new(
+        device: &wgpu::Device,
+        period_ns: f32,
+        use_in_encoder: bool,
+        label_prefix: &str,
+    ) -> Self {
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("gpu_timing_qs"),
+            label: Some(&format!("{label_prefix}_qs")),
             ty: wgpu::QueryType::Timestamp,
             count: 2,
         });
@@ -169,13 +177,13 @@ impl GpuTiming {
         // u64 timestamps). `QUERY_RESOLVE_BUFFER_ALIGNMENT` is 256; the
         // allocator rounds up anyway so a 16-byte request is fine.
         let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpu_timing_resolve"),
+            label: Some(&format!("{label_prefix}_resolve")),
             size: TIMESTAMP_BYTES,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpu_timing_readback"),
+            label: Some(&format!("{label_prefix}_readback")),
             size: TIMESTAMP_BYTES,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -208,14 +216,20 @@ impl GpuTiming {
 
     /// If idle, return a `RenderPassTimestampWrites` that captures
     /// pass start + pass end. Returns `None` if a prior readback is
-    /// still in flight.
+    /// still in flight, OR when the adapter supports
+    /// `TIMESTAMP_QUERY_INSIDE_ENCODERS` — in that mode the caller is
+    /// responsible for bracketing the render pass via
+    /// `write_timestamp_begin`/`write_timestamp_end` on the encoder
+    /// (mirrors `compute_pass_writes()`; avoids double-bracketing).
     ///
     /// Does NOT transition state — state stays IDLE until
     /// `request_readback` fires after submit. This lets the caller
     /// back out if it ends up not submitting (e.g. surface occluded
     /// between the check and the draw).
-    #[allow(dead_code)] // kept for future render-pass timing
     fn pass_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        if self.use_in_encoder {
+            return None;
+        }
         if self.state.load(Ordering::Acquire) == GT_IDLE {
             Some(wgpu::RenderPassTimestampWrites {
                 query_set: &self.query_set,
@@ -289,18 +303,18 @@ impl GpuTiming {
             });
     }
 
-    /// Pump `map_async` callbacks via `device.poll`, then consume a
-    /// pending readback if one just became ready. Returns the
-    /// resolved `Duration` for the most recently completed frame, or
-    /// `None` if no readback is ready.
+    /// Consume a pending readback if one just became ready. Returns
+    /// the resolved `Duration` for the most recently completed frame,
+    /// or `None` if no readback is ready.
+    ///
+    /// Does NOT call `device.poll` — callers must invoke
+    /// `device.poll(Poll)` exactly once per frame (before polling any
+    /// `GpuTiming` instances) to pump `map_async` callbacks. The split
+    /// keeps the cost at one poll even when multiple timing brackets
+    /// exist in the same frame (dlse.2.4).
     ///
     /// Transitions READY → IDLE on success.
-    fn poll(&self, device: &wgpu::Device) -> Option<Duration> {
-        // Pump callbacks. `PollType::Poll` is non-blocking: it processes
-        // whatever's ready and returns immediately. Cheap when there's
-        // nothing in flight.
-        let _ = device.poll(wgpu::PollType::Poll);
-
+    fn take_resolved(&self) -> Option<Duration> {
         if self.state.load(Ordering::Acquire) != GT_READY {
             return None;
         }
@@ -426,13 +440,27 @@ pub struct Renderer {
     // GPU-timestamp instrumentation. `None` on adapters without
     // `Features::TIMESTAMP_QUERY` — all timing falls back to the CPU
     // ring in that case (see `hash-thing-6x3`).
+    //
+    // Two instances (dlse.2.4): one brackets the SVDAG compute pass,
+    // the other brackets the blit + overlay render pass. The metric
+    // `render_gpu` historically measures only the compute pass; the
+    // new `render_pass_gpu` metric comes from `gpu_timing_render_pass`.
+    // Kept as two independent state machines to preserve the
+    // one-readback-in-flight invariant per pass.
     gpu_timing: Option<GpuTiming>,
-    /// Most recently resolved GPU render-pass duration. Set by `render()`
-    /// when a readback completes, consumed by `take_last_gpu_frame_time()`.
-    /// `None` means no new sample since the last take (or the adapter
-    /// lacks TIMESTAMP_QUERY entirely). Consume-on-read avoids
-    /// double-recording the same duration across frames.
+    gpu_timing_render_pass: Option<GpuTiming>,
+    /// Most recently resolved GPU compute-pass duration (dlse.2.3 has
+    /// always bracketed the compute dispatch only, despite the name).
+    /// Set by `render()` when a readback completes, consumed by
+    /// `take_last_gpu_frame_time()`. `None` means no new sample since
+    /// the last take (or the adapter lacks TIMESTAMP_QUERY entirely).
+    /// Consume-on-read avoids double-recording across frames.
     last_gpu_frame_time: Option<Duration>,
+    /// Most recently resolved GPU render-pass duration (blit + HUD +
+    /// particles + hotbar + legend), bracketed in parallel with
+    /// `last_gpu_frame_time`. Set by `render()`, consumed by
+    /// `take_last_render_pass_gpu_frame_time()`. dlse.2.4.
+    last_render_pass_gpu_frame_time: Option<Duration>,
     /// Most recent CPU-side frame phase timings, consumed by
     /// `take_last_cpu_phase_times()` so callers can record them once.
     last_cpu_phase_times: Option<RendererCpuPhaseTimes>,
@@ -1137,18 +1165,28 @@ impl Renderer {
             adapter_info.driver_info,
             adapter_info.device_type,
         );
-        let gpu_timing = if timestamp_supported {
+        let (gpu_timing, gpu_timing_render_pass) = if timestamp_supported {
             let period_ns = queue.get_timestamp_period();
             log::info!(
                 "GPU timestamp_period={period_ns}ns in_encoder={in_encoder_timestamps_supported}"
             );
-            Some(GpuTiming::new(
-                &device,
-                period_ns,
-                in_encoder_timestamps_supported,
-            ))
+            // dlse.2.4: parallel brackets around compute pass and render pass.
+            (
+                Some(GpuTiming::new(
+                    &device,
+                    period_ns,
+                    in_encoder_timestamps_supported,
+                    "gpu_timing_compute",
+                )),
+                Some(GpuTiming::new(
+                    &device,
+                    period_ns,
+                    in_encoder_timestamps_supported,
+                    "gpu_timing_render_pass",
+                )),
+            )
         } else {
-            None
+            (None, None)
         };
 
         Self {
@@ -1212,7 +1250,9 @@ impl Renderer {
             lod_bias: 1.0,
             render_scale: 0.5,
             gpu_timing,
+            gpu_timing_render_pass,
             last_gpu_frame_time: None,
+            last_render_pass_gpu_frame_time: None,
             last_cpu_phase_times: None,
             off_surface_target: None,
             start_time: Instant::now(),
@@ -1384,17 +1424,38 @@ impl Renderer {
             }));
     }
 
-    /// Consume and return the most recently resolved GPU render-pass
-    /// duration, or `None` if no new sample has been captured since the
-    /// last call. Call once per frame after `render()` returns; the
-    /// value is intended to be fed into `Perf` as the `render_gpu`
-    /// metric (see `hash-thing-6x3`).
+    /// Consume and return the most recently resolved GPU
+    /// **compute-pass** duration (SVDAG raycast dispatch), or `None` if
+    /// no new sample has been captured since the last call. Call once
+    /// per frame after `render()` returns; the value is intended to be
+    /// fed into `Perf` as the `render_gpu` metric (see
+    /// `hash-thing-6x3`).
+    ///
+    /// Name is a historical accident — `render_gpu` has always been
+    /// compute-only because the blit+overlay render pass was assumed
+    /// ~free until dlse.2.2 proved otherwise. The render-pass bracket
+    /// lives in `take_last_render_pass_gpu_frame_time()` (dlse.2.4);
+    /// `render_gpu` is kept as-is to avoid forking metric history
+    /// across the perf paper.
     ///
     /// Adapters without `Features::TIMESTAMP_QUERY` always return
     /// `None` — in that case the only render metric is the CPU-submit
     /// `render_cpu` from `main.rs`.
     pub fn take_last_gpu_frame_time(&mut self) -> Option<Duration> {
         self.last_gpu_frame_time.take()
+    }
+
+    /// Consume and return the most recently resolved GPU
+    /// **render-pass** duration (blit + particles + HUD + hotbar +
+    /// legend), or `None` if no new sample has been captured since the
+    /// last call. Companion to `take_last_gpu_frame_time()` — together
+    /// they bracket the two GPU-expensive chunks of the frame encoder
+    /// (dlse.2.4).
+    ///
+    /// Returns `None` on adapters without `Features::TIMESTAMP_QUERY`
+    /// and when `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` is set.
+    pub fn take_last_render_pass_gpu_frame_time(&mut self) -> Option<Duration> {
+        self.last_render_pass_gpu_frame_time.take()
     }
 
     pub fn take_last_cpu_phase_times(&mut self) -> Option<RendererCpuPhaseTimes> {
@@ -1737,15 +1798,22 @@ impl Renderer {
         use wgpu::CurrentSurfaceTexture;
 
         // hash-thing-6x3: pump `map_async` callbacks and consume any
-        // GPU-timestamp readback that landed since the last frame.
-        // `GpuTiming::poll` calls `device.poll(Poll)` internally, so this
-        // is the single place we drive wgpu's main-thread callback pump.
-        // Must happen before we potentially skip the frame on surface
-        // failures — otherwise a long run of Occluded frames would
-        // accumulate un-polled callbacks.
+        // GPU-timestamp readbacks that landed since the last frame.
+        // dlse.2.4 adds a second bracket; `device.poll(Poll)` runs
+        // exactly once here so cost stays flat regardless of how many
+        // `GpuTiming` instances exist. Must happen before we
+        // potentially skip the frame on surface failures — otherwise a
+        // long run of Occluded frames would accumulate un-polled
+        // callbacks.
+        let _ = self.device.poll(wgpu::PollType::Poll);
         if let Some(gt) = &self.gpu_timing {
-            if let Some(d) = gt.poll(&self.device) {
+            if let Some(d) = gt.take_resolved() {
                 self.last_gpu_frame_time = Some(d);
+            }
+        }
+        if let Some(gt) = &self.gpu_timing_render_pass {
+            if let Some(d) = gt.take_resolved() {
+                self.last_render_pass_gpu_frame_time = Some(d);
             }
         }
 
@@ -1853,31 +1921,56 @@ impl Renderer {
         // timestamps on the encoder instead of via ComputePassTimestampWrites
         // so the measurement excludes cross-pass barrier/sync waits
         // (hash-thing-dlse.2.3).
-        let compute_timestamp_writes = self
-            .gpu_timing
-            .as_ref()
-            .and_then(|gt| gt.compute_pass_writes());
         // hash-thing-dlse.2.2.1 diagnostic: `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1`
         // skips both the in-encoder timestamp writes and the resolve/map
         // path so we can isolate whether off-surface's ~26 ms submit_cpu
         // stall is caused by the timestamp fence (hypothesis A) or by
-        // Metal submit backpressure (hypothesis B).
+        // Metal submit backpressure (hypothesis B). dlse.2.4 extends
+        // the gate to cover the new render-pass bracket.
         let resolve_disabled = std::env::var("HASH_THING_DISABLE_TIMESTAMP_RESOLVE")
             .ok()
             .as_deref()
             == Some("1");
-        let in_encoder_capturing = !resolve_disabled
+
+        // --- Compute-pass timing setup ---
+        let compute_timestamp_writes = if resolve_disabled {
+            None
+        } else {
+            self.gpu_timing
+                .as_ref()
+                .and_then(|gt| gt.compute_pass_writes())
+        };
+        let compute_in_encoder_capturing = !resolve_disabled
             && self.svdag_compute_bind_group.is_some()
             && self
                 .gpu_timing
                 .as_ref()
                 .is_some_and(|gt| gt.uses_in_encoder() && gt.is_idle());
-        let captured_this_frame =
-            !resolve_disabled && (compute_timestamp_writes.is_some() || in_encoder_capturing);
+        let captured_compute_this_frame =
+            !resolve_disabled && (compute_timestamp_writes.is_some() || compute_in_encoder_capturing);
+
+        // --- Render-pass timing setup (dlse.2.4). Independent state
+        // machine — may capture on a frame the compute pass doesn't, or
+        // vice versa, whenever one of the two readbacks is still in
+        // flight. ---
+        let render_pass_timestamp_writes = if resolve_disabled {
+            None
+        } else {
+            self.gpu_timing_render_pass
+                .as_ref()
+                .and_then(|gt| gt.pass_writes())
+        };
+        let render_pass_in_encoder_capturing = !resolve_disabled
+            && self
+                .gpu_timing_render_pass
+                .as_ref()
+                .is_some_and(|gt| gt.uses_in_encoder() && gt.is_idle());
+        let captured_render_pass_this_frame = !resolve_disabled
+            && (render_pass_timestamp_writes.is_some() || render_pass_in_encoder_capturing);
 
         // --- Compute pass: SVDAG raycast → storage texture ---
         if let Some(bg) = &self.svdag_compute_bind_group {
-            if in_encoder_capturing {
+            if compute_in_encoder_capturing {
                 if let Some(gt) = &self.gpu_timing {
                     gt.write_timestamp_begin(&mut encoder);
                 }
@@ -1893,7 +1986,7 @@ impl Renderer {
                 let wg_y = self.config.height.div_ceil(8);
                 compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
-            if in_encoder_capturing {
+            if compute_in_encoder_capturing {
                 if let Some(gt) = &self.gpu_timing {
                     gt.write_timestamp_end(&mut encoder);
                 }
@@ -1901,6 +1994,17 @@ impl Renderer {
         }
 
         // --- Render pass: blit + particles + HUD + legend (single pass) ---
+        // dlse.2.4: bracket the whole pass with timestamps parallel to
+        // the compute pass above. When the adapter supports
+        // TIMESTAMP_QUERY_INSIDE_ENCODERS we bracket with
+        // encoder.write_timestamp on either side of begin_render_pass;
+        // otherwise we thread RenderPassTimestampWrites into the
+        // descriptor (which `pass_writes()` returns on that branch).
+        if render_pass_in_encoder_capturing {
+            if let Some(gt) = &self.gpu_timing_render_pass {
+                gt.write_timestamp_begin(&mut encoder);
+            }
+        }
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit + overlay pass"),
@@ -1920,7 +2024,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None, // timing is on the compute pass
+                timestamp_writes: render_pass_timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2042,9 +2146,19 @@ impl Renderer {
                 }
             }
         }
+        if render_pass_in_encoder_capturing {
+            if let Some(gt) = &self.gpu_timing_render_pass {
+                gt.write_timestamp_end(&mut encoder);
+            }
+        }
 
-        if captured_this_frame {
+        if captured_compute_this_frame {
             if let Some(gt) = &self.gpu_timing {
+                gt.encode_resolve(&mut encoder);
+            }
+        }
+        if captured_render_pass_this_frame {
+            if let Some(gt) = &self.gpu_timing_render_pass {
                 gt.encode_resolve(&mut encoder);
             }
         }
@@ -2063,8 +2177,13 @@ impl Renderer {
             present,
         });
 
-        if captured_this_frame {
+        if captured_compute_this_frame {
             if let Some(gt) = &self.gpu_timing {
+                gt.request_readback();
+            }
+        }
+        if captured_render_pass_this_frame {
+            if let Some(gt) = &self.gpu_timing_render_pass {
                 gt.request_readback();
             }
         }
