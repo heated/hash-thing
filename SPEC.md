@@ -196,6 +196,7 @@ These are the operational specifications. If one of these ever disagrees with th
 - **Fold metadata into material as tagged pointer space.** (Verbatim: "Maybe we fold meta into the material, some sort of tagged pointer space?")
 - **Experiment with physics.** (Verbatim: "physics: lets experiment")
 - **Emergent behavior is acceptable alongside hand-authored.** (Verbatim: "and im down to have a lot of this (and less, emergent. whatever works)")
+- **Design toward cache-resident working sets where possible.** (Edward 2026-04-20: "I legitimately might be pretty interested in making... designing the game toward stuff that is like higher performance that like fits in L2 or something. So let's just keep that in mind and add that to our high level design stuff.") The M1 MBA reference hardware has ~4 MB shared L2 and ~68 GB/s DRAM bandwidth. A working set that fits in L2 runs bandwidth-free in the hot loop; one that exceeds L2 pays 3–5× on raycast traversal and correspondingly more on sim. This favors: scenes with structural repetition (high SVDAG dedup rate, small reachable-DAG), localized active regions instead of globally-churning worlds, visual designs that benefit from "many drops, few unique subtree shapes" rather than "every cell unique." Game design tradeoffs that keep the reachable-DAG small are preferred over those that blow it up — explicitly, not just as a perf side-effect. See `docs/perf/svdag-perf-paper.md` §3.5 for the cache-residency math.
 
 ### Design gates (what needs edward vs what's clear from spec)
 

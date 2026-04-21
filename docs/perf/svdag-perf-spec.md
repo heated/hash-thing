@@ -33,6 +33,7 @@ If you are tuning to a different machine (M2, M3, discrete GPU), you are tuning 
 
 (To be derived from paper §3 and §4.)
 
+- **Favor L2-resident working sets.** Reachable DAG below ~4 MB (≈ 100k interior nodes at 36 B each) runs bandwidth-free in raycast hot loops. Above that, DRAM at ~68 GB/s dominates and raycast slows 3–5×. This is a **design input**, not just an optimization target — game decisions (rain density, per-material churn, procedural variety) should consider the DAG-size consequence, not just the visual/gameplay shape. See SPEC.md "Soft requirements" (2026-04-20 entry) and paper §3.5.
 - TODO — e.g., "Doubling world linear scale costs roughly Nx in raycast time because traversal depth grows by 1 bit and average reachable set grows by ~2x; so 512³ should cost ~2x of 256³, not ~8x."
 - TODO — e.g., "Active-material churn above N cells/generation defeats SVDAG compaction; at that point a flat 3D texture is the right structure."
 - TODO — e.g., "Cross-frame texture dependencies on integrated GPU cost more than they look like they should; prefer ping-pong over single-target."
