@@ -4929,6 +4929,37 @@ mod tests {
         assert!(summary.contains("memo_mac="));
     }
 
+    /// HUD overlay (hash-thing-nhwo) splits `memo_summary` on whitespace
+    /// so each field lands on its own line. Guards against future schema
+    /// changes that would introduce an intra-field space (e.g.
+    /// `memo_tbl=1 234`) which would silently break the HUD layout.
+    #[test]
+    fn memo_summary_splits_cleanly_for_hud_overlay() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+        world.step_recursive();
+
+        let summary = world.memo_summary();
+        let lines: Vec<&str> = summary.split_whitespace().collect();
+
+        assert!(
+            lines.len() >= 3,
+            "memo_summary should split into at least 3 fields, got {lines:?}",
+        );
+        for line in &lines {
+            assert!(
+                line.starts_with("memo_"),
+                "every field must start with memo_ to keep the HUD layout sane, got {line:?}",
+            );
+            assert!(
+                line.len() <= 25,
+                "field too wide for compact HUD panel ({} chars): {line:?}",
+                line.len(),
+            );
+        }
+    }
+
     #[test]
     fn hashlife_stats_per_step_reset_preserved() {
         let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
