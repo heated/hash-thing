@@ -115,10 +115,30 @@ fn bench_hashlife_1024() {
     bench_step("1024³", 10, 5);
 }
 
+/// Seed-only 4096³: measures reachable DAG size + seed timing without any
+/// warm step. Completes in ~4s on M1 MBA and is safe under the default 60s
+/// test-runner ceiling. Use this for fast node-count measurements (e.g.
+/// §5 gap report in `docs/perf/svdag-perf-paper.md`).
 #[test]
 #[ignore]
-fn bench_hashlife_4096() {
-    bench_step("4096³", 12, 2);
+fn bench_hashlife_4096_seed() {
+    bench_step("4096³ seed only", 12, 0);
+}
+
+/// One-step 4096³: seed + exactly one warm step. Exceeds the 60s test-runner
+/// ceiling on M1-class hardware — run out-of-band with an explicit longer
+/// timeout:
+/// ```text
+/// cargo test --release --test bench_hashlife bench_hashlife_4096_step \
+///     -- --ignored --nocapture
+/// ```
+/// Required to measure warm-step cost at 4096³ (`render_gpu` / macro-cache
+/// hit rate). Kept separate from `_seed` so the cheap node-count probe stays
+/// agent-runnable under the soft-max-command-seconds budget.
+#[test]
+#[ignore]
+fn bench_hashlife_4096_step() {
+    bench_step("4096³ step", 12, 1);
 }
 
 /// Measure edit propagation: seed → warm step → place block → re-step.
