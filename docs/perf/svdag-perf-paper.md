@@ -752,11 +752,14 @@ These criteria are deliberately *fragile*. Moving goalposts after the spike runs
 
 **Scope.** Hash-table *primitive* viability under uniform-random load, measured
 on M1 MBA (reference hardware per §1). Linear-probe open-addressing, 32-bit
-packed keys (`0` reserved as empty sentinel, so `(NodeId, parity)` is folded
-via `fxhash(node) ^ parity`), atomic CAS on slot_keys serializes insert
-contention. Memo-purity overwrite semantics (a later step producing the same
-`(NodeId, parity) → NodeId` mapping is a no-op). One dispatch per phase
-(insert / lookup-hit / lookup-miss). Source:
+packed keys (`0` reserved as empty sentinel). The microbench exercises
+already-packed `u32` keys drawn from a SplitMix64 stream; the production
+memo shape `(NodeId, parity) → NodeId` would fold into the same key width
+via `fxhash(node) ^ parity` but that fold is not exercised here — the
+bench measures the table primitive, not the key-derivation path. Atomic
+CAS on slot_keys serializes insert contention. Memo-purity overwrite
+semantics (a later step producing the same mapping is a no-op). One
+dispatch per phase (insert / lookup-hit / lookup-miss). Source:
 `tests/bench_gpu_hash_table.rs`.
 
 **Methodology.** In-encoder `TIMESTAMP_QUERY_INSIDE_ENCODERS` timestamps
@@ -785,7 +788,7 @@ GPU hash-table sweep (seed 0xA5A5A5A5, timestamp_supported=true)
 |---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|----------|----------|-----------|
 |   10000 |  4096 | 0.75 |   16384 | 1.77 (2.03) |      0.069 |      0.099 |      0.083 |         59.5 |         41.3 |          49.2 |        7 |        7 |         8 |
 |   10000 | 10000 | 0.50 |   32768 | 1.73 (1.88) |      0.074 |      0.092 |      0.106 |        134.5 |        109.2 |          94.0 |       12 |       12 |        12 |
-|   10000 | 10000 | 0.90 |   16384 | 1.70 (1.90) |      0.057 |      0.108 |      0.190 |        176.6 |         92.8 |          52.7 |       30 |       30 |        30 |
+|   10000 | 10000 | 0.90 |   16384 | 1.70 (1.90) |      0.057 |      0.108 |      0.190 |        176.6 |         92.8 |          52.7 |       30 |       30 |        38 |
 |  100000 |  4096 | 0.75 |  262144 | 1.69 (1.82) |      0.058 |      0.071 |      0.084 |         70.6 |         58.0 |          48.5 |        2 |        2 |         2 |
 |  100000 | 16384 | 0.50 |  262144 | 2.01 (3.29) |      0.052 |      0.143 |      0.128 |        317.1 |        114.9 |         127.6 |        3 |        3 |         4 |
 |  100000 | 16384 | 0.75 |  262144 | 1.95 (3.11) |      0.067 |      0.407 |      0.114 |        245.8 |         40.2 |         144.3 |        3 |        3 |         4 |
@@ -801,15 +804,23 @@ board because the 1.5 ms submit+poll wall-clock floor dominates a tiny
 compute workload; they're in the full sweep output for transparency but
 are not the primitive measurement.)
 
-**Probe depth.** `maxP_{ins,hit,miss}` are the per-phase max buckets
-(reset and read back between phases so they attribute cleanly). For
-`N ≥ 100K` the table is "empty enough per bucket" that linear probing
-sees `maxP ≤ 5` across all phases even at LF 0.9. The outlier is
-`N=10K, M=10000, LF ∈ {0.75, 0.9}` where `maxP=30`: 10K threads racing
-into a 16K-slot table produce deep clusters by the time the last inserts
-arrive, and subsequent lookups inherit those clusters (hence insert and
-hit phases show the same 30). The 32-slot histogram overflow counter was
-never triggered — no run came close to the `table_size` wrap-around abort.
+*Footnote on the `M` column:* the sweep axis is
+`m_threads ∈ {256, 1024, 4096, 16384}`, but the dispatch size printed
+is `threads_to_dispatch = m_threads.min(n)`. At `N=10000`, the
+`m_threads=16384` row prints as `M=10000` — same sweep configuration,
+clipped to the input size.
+
+**Probe depth.** `maxP_{ins,hit,miss}` report the exact max probe count
+observed per phase, captured by an `atomicMax(&max_probes_exact[0], probes)`
+scalar inside the WGSL shader (cleared and read back between phases).
+Under `N ≥ 100K` the table is "empty enough per bucket" that linear
+probing sees `maxP ≤ 5` across all phases even at LF 0.9. The outlier
+is `N=10K, M=10000, LF ∈ {0.75, 0.9}` where insert/hit saturate near 30
+and the miss path reaches 38 at LF 0.9: 10K threads racing into a
+16K-slot table produce deep clusters, lookup-hit inherits them, and
+lookup-miss walks slightly further since miss probes follow the same
+clusters and only terminate on an empty slot. None of these approached
+the `table_size` wrap-around abort in `cs_insert` / `cs_lookup`.
 
 **Verdict: GO (linear probing, no cuckoo required).**
 
@@ -840,9 +851,12 @@ GPU memo overall*) if any of:
 
 - `gpu_hit_Mk/s` drops below 50 at LF 0.9 for N ≥ 100K.
 - `maxP` exceeds `log2(table_size)` at any load factor up to 0.9 for N ≥ 100K.
-- A concurrent-same-key insert takes more than ~10× the uncontended insert
-  path (measured by the `concurrent_same_key_cas_serializes` correctness
-  test at bench time).
+- Concurrent same-key inserts fail to serialize to exactly one winner.
+  The `concurrent_same_key_cas_serializes` correctness test asserts this
+  invariant (plus that the winning slot's value equals the shared value)
+  but does not time the contended vs uncontended dispatch; a timed
+  slowdown measurement belongs to abwm.3 where real contention lives on
+  the sim dispatch.
 
 None of those conditions are met in the current sweep. Linear probing
 stands up; proceed to abwm.3 integration.
@@ -888,3 +902,4 @@ stands up; proceed to abwm.3 integration.
 | 2026-04-21 | onyx | §3.10.2, §3.10.5, §5, §6 (bead `hash-thing-cz0r`). Collapses the §6 entry 8 projection band to measurement. `bench_depth_histogram` extended to level 12 via an extracted `run_depth_histogram(level, enforce_floors)` helper; the 256³ path keeps its v2d1 mean-steps floors, 4096³ runs without floor assertions until baseline calibration lands. Measured at 4096³: default-spawn=**25.90**, looking-down=**16.76**, horizontal-mid=**24.20** DDA steps/ray mean. Landed dead-center of the ivms §3.10.2 projection (22–28 band), so §3.10.5 envelope shifts <1 ms and the scenario spread remains the operative uncertainty. Secondary finding: the depth-vs-linear scaling exponent is flatter than projected (0.20–0.33 measured vs ~0.8 assumed) — the SVDAG shares coarse-ancestor descent chains across the wider frustum at 4096³ rather than paying raw tree-height. Also corrected a false "128-step shader cap" claim in the §5 gap report: real cap is `max(1024, root_side×8) = 32,768` at 4096³ (cited `svdag_raycast.wgsl:330-332`); measured max=235, budget fine. |
 | 2026-04-21 | onyx | §3.10.5.1, §3.10.6, §5, §6 (bead `hash-thing-e092`). Seeded-terrain raycast variant landed as `bench_raycast_4096_app_spawn`: **0.30 ms mean / 0.22 ms p50 / 1.06 ms p95 / ~3379 fps** on M2 16 GB, SVDAG 548k nodes / 18.8 MB. M1-implied at 1.5× factor: ~0.45 ms mean. **Refutes all three §3.10.4 cache-mix scenarios** (4 / 17 / 27 ms) as calibrated upper bounds — measurement ~10× below even the optimistic branch. The 256³ §3.6 pattern (warp-coherent L1 reuse) replicates at 4096³; the "whole-DAG spills L2" framing was not the operative bottleneck. The 17 ms confident upper bound still holds (measurement < bound by ~38×) but the interior scenario labels are not predictive. §6 entry 10 resolved. New open: re-derive the envelope using warp-width + ancestor-chain heuristics at 4096³ and check whether *that* model predicts within 2–3×. 4096³ primary-ray-only rendering is comfortable on M2 and likely comfortable on M1 MBA — budget headroom (~16 ms on M1 at the 60-FPS target) is available for sim + secondary rays + present. |
 | 2026-04-21 | onyx | §4.7.2, §5, §6 Q11 (bead `hash-thing-slc1`). Three-point memo-miss scaling measurement: 64³=411.75, 256³=1847.1, 512³=2295.8 misses/step (last confirmed twice to 0.01 %). Pair-wise slopes drop from **1.08** (64³→256³) to **0.31** (256³→512³); least-squares fit across all three: `L^0.863`. **The §4.7's "exponent blows up at 1024³+" worry is refuted in the 64³–512³ range** — scaling is *favorably* sub-linear, not super-linear. Revised 4096³ miss-count band: 4k–40k (vs prior 20k–80k two-point projection); upload-bandwidth band at 60 FPS tightens to 2–26 MB/s. Out-of-band 2048³/4096³ measurement remains unresolved — one 2048³ warm step ran >15 min of CPU in the current `#[ignore]` harness before being stopped, well past the 60s soft-ceiling. §6 Q11 marked partially resolved; follow-up bead filed for a long-timeout measurement workflow. |
+| 2026-04-21 | spark | §8.6 retro follow-ups (bead `hash-thing-ta8j`). Replaced the saturating 32-bucket probe-depth histogram with an exact `atomicMax` scalar in the WGSL shader — the N=10K/M=10K/LF=0.9 row's `maxP_miss` resolves from saturated-30 to exact 38 (insert/hit are confirmed exactly 30, not saturated). Added a cross-dispatch-fence comment in `cs_insert` warning a future abwm.3 integrator that queue-submit ordering is load-bearing and WGSL has no release-store. Softened flip condition #3 to match what the correctness test actually asserts (serialization of concurrent same-key inserts + value assertion on the winning slot) rather than an unmeasured 10× slowdown claim. Tightened §8.6 Scope prose to describe the packed-u32 keys the harness actually runs, not the production `(NodeId, parity)` fold (which lives in abwm.3). M-column footnote added. No verdict change: GO for linear probing still holds. |

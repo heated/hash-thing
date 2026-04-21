@@ -21,9 +21,6 @@ const RNG_SEED: u64 = 0xA5A5_A5A5;
 /// Workgroup size. 64 is the conventional WebGPU-portable choice.
 const WORKGROUP_SIZE: u32 = 64;
 
-/// Histogram bucket count (probes 0..30, plus 31 = overflow).
-const HIST_BUCKETS: u32 = 32;
-
 const SHADER_SRC: &str = r#"
 struct Params {
     capacity: u32,
@@ -37,8 +34,8 @@ struct Params {
 @group(0) @binding(2) var<storage, read> input_values: array<u32>;
 @group(0) @binding(3) var<storage, read_write> slot_keys: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> slot_values: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> probe_hist: array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> lookup_results: array<u32>;
+@group(0) @binding(5) var<storage, read_write> lookup_results: array<u32>;
+@group(0) @binding(6) var<storage, read_write> max_probes_exact: array<atomic<u32>>;
 
 // fxhash-shaped: mul by odd 32-bit constant derived from the low half of
 // Knuth's golden-ratio 64-bit constant (0x9E3779B97F4A7C15), xor-shift,
@@ -50,9 +47,8 @@ fn fxhash(k: u32) -> u32 {
     return h;
 }
 
-fn bump_hist(probes: u32) {
-    let b = min(probes, 30u);
-    atomicAdd(&probe_hist[b], 1u);
+fn record_max_probes(probes: u32) {
+    atomicMax(&max_probes_exact[0], probes);
 }
 
 @compute @workgroup_size(64)
@@ -63,6 +59,16 @@ fn cs_reset(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&slot_values[i], 0u);
 }
 
+// Cross-dispatch visibility note for cs_insert and cs_lookup:
+// Key-then-value stores in cs_insert (slot_keys, then slot_values) are
+// separate atomics with NO release-store ordering within a single dispatch.
+// The abwm.2 bench only interleaves insert and lookup across separate
+// `queue.submit` calls, so the GPU's submit barrier flushes slot_values
+// before the next dispatch's atomicLoad observes the matching slot_keys.
+// WGSL exposes no acquire/release semantics, so any caller that fuses
+// insert and lookup into one dispatch (e.g. abwm.3 sim-step integration)
+// must add its own synchronization — this ordering is NOT portable inside
+// a single dispatch.
 @compute @workgroup_size(64)
 fn cs_insert(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tid = gid.x;
@@ -74,20 +80,20 @@ fn cs_insert(@builtin(global_invocation_id) gid: vec3<u32>) {
     var probes: u32 = 0u;
     loop {
         if (probes >= params.capacity) {
-            atomicAdd(&probe_hist[31u], 1u);
+            record_max_probes(probes);
             return;
         }
         let ex = atomicCompareExchangeWeak(&slot_keys[slot], 0u, key);
         if (ex.exchanged) {
             atomicStore(&slot_values[slot], value);
-            bump_hist(probes);
+            record_max_probes(probes);
             return;
         }
         if (ex.old_value == key) {
             // Overwrite duplicate (memo purity — same key must map to same
             // value). Per-plan semantics.
             atomicStore(&slot_values[slot], value);
-            bump_hist(probes);
+            record_max_probes(probes);
             return;
         }
         if (ex.old_value == 0u) {
@@ -113,18 +119,18 @@ fn cs_lookup(@builtin(global_invocation_id) gid: vec3<u32>) {
     loop {
         if (probes >= params.capacity) {
             lookup_results[tid] = 0xFFFFFFFFu;
-            atomicAdd(&probe_hist[31u], 1u);
+            record_max_probes(probes);
             return;
         }
         let sk = atomicLoad(&slot_keys[slot]);
         if (sk == 0u) {
             lookup_results[tid] = 0xFFFFFFFFu;
-            bump_hist(probes);
+            record_max_probes(probes);
             return;
         }
         if (sk == key) {
             lookup_results[tid] = atomicLoad(&slot_values[slot]);
-            bump_hist(probes);
+            record_max_probes(probes);
             return;
         }
         probes = probes + 1u;
@@ -309,8 +315,8 @@ struct Table {
     params_buf: wgpu::Buffer,
     slot_keys: wgpu::Buffer,
     slot_values: wgpu::Buffer,
-    probe_hist: wgpu::Buffer,
-    probe_hist_read: wgpu::Buffer,
+    max_probes_exact: wgpu::Buffer,
+    max_probes_read: wgpu::Buffer,
 }
 
 impl Table {
@@ -333,17 +339,17 @@ impl Table {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let probe_hist = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("probe_hist"),
-            size: bytes_u32 * HIST_BUCKETS as u64,
+        let max_probes_exact = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("max_probes_exact"),
+            size: bytes_u32,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let probe_hist_read = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("probe_hist_read"),
-            size: bytes_u32 * HIST_BUCKETS as u64,
+        let max_probes_read = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("max_probes_read"),
+            size: bytes_u32,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -358,8 +364,8 @@ impl Table {
             params_buf,
             slot_keys,
             slot_values,
-            probe_hist,
-            probe_hist_read,
+            max_probes_exact,
+            max_probes_read,
         }
     }
 
@@ -374,23 +380,22 @@ impl Table {
             .write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&[p]));
     }
 
-    fn clear_probe_hist(&self, ctx: &GpuCtx) {
-        let zeros = vec![0u32; HIST_BUCKETS as usize];
+    fn clear_max_probes(&self, ctx: &GpuCtx) {
         ctx.queue
-            .write_buffer(&self.probe_hist, 0, bytemuck::cast_slice(&zeros));
+            .write_buffer(&self.max_probes_exact, 0, bytemuck::cast_slice(&[0u32]));
     }
 
-    fn read_probe_hist(&self, ctx: &GpuCtx) -> [u32; HIST_BUCKETS as usize] {
+    fn read_max_probes(&self, ctx: &GpuCtx) -> u32 {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(
-            &self.probe_hist,
+            &self.max_probes_exact,
             0,
-            &self.probe_hist_read,
+            &self.max_probes_read,
             0,
-            std::mem::size_of::<u32>() as u64 * HIST_BUCKETS as u64,
+            std::mem::size_of::<u32>() as u64,
         );
         ctx.queue.submit(Some(enc.finish()));
-        let slice = self.probe_hist_read.slice(..);
+        let slice = self.max_probes_read.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -398,11 +403,10 @@ impl Table {
         ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
         let _ = rx.recv().unwrap();
         let data = slice.get_mapped_range();
-        let mut out = [0u32; HIST_BUCKETS as usize];
-        out.copy_from_slice(bytemuck::cast_slice(&data[..]));
+        let v: u32 = bytemuck::cast_slice::<u8, u32>(&data[..])[0];
         drop(data);
-        self.probe_hist_read.unmap();
-        out
+        self.max_probes_read.unmap();
+        v
     }
 
     fn reset(&self, ctx: &GpuCtx) {
@@ -417,7 +421,7 @@ impl Table {
             pass.dispatch_workgroups(groups, 1, 1);
         }
         ctx.queue.submit(Some(enc.finish()));
-        self.clear_probe_hist(ctx);
+        self.clear_max_probes(ctx);
     }
 
     fn bind_group(
@@ -453,11 +457,11 @@ impl Table {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: self.probe_hist.as_entire_binding(),
+                    resource: lookup_results.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: lookup_results.as_entire_binding(),
+                    resource: self.max_probes_exact.as_entire_binding(),
                 },
             ],
         })
@@ -667,8 +671,8 @@ fn lookup_disjoint_keys_all_miss() {
     // Disjoint keys for lookup (seed offset avoids any collision).
     let miss_keys = gen_unique_keys(n, RNG_SEED ^ 0xDEAD_BEEF);
     let miss_keys_buf = make_input_buffer(&ctx, "miss_keys", &miss_keys);
-    let missinsert_results_buf = make_output_buffer(&ctx, "miss_results", n);
-    let bg2 = table.bind_group(&ctx, &miss_keys_buf, &values_buf, &missinsert_results_buf);
+    let miss_results_buf = make_output_buffer(&ctx, "miss_results", n);
+    let bg2 = table.bind_group(&ctx, &miss_keys_buf, &values_buf, &miss_results_buf);
     let _ = run_phase(&ctx, &ctx.pipeline_lookup, &bg2, n);
 
     // Any collision between the two key sets would produce a spurious hit;
@@ -677,7 +681,7 @@ fn lookup_disjoint_keys_all_miss() {
     let inserted: std::collections::HashSet<u32> = keys.iter().copied().collect();
     let expected_collisions: usize = miss_keys.iter().filter(|k| inserted.contains(k)).count();
 
-    let results = read_buffer_u32(&ctx, &missinsert_results_buf, n);
+    let results = read_buffer_u32(&ctx, &miss_results_buf, n);
     let got_hits = results.iter().filter(|r| **r != 0xFFFF_FFFF).count();
     assert_eq!(
         got_hits, expected_collisions,
@@ -765,6 +769,16 @@ fn concurrent_same_key_cas_serializes() {
         key_count, 1,
         "concurrent same-key insert landed {key_count} copies; CAS failed to serialize"
     );
+    // Winning slot's value must equal shared_value — duplicate-overwrite
+    // semantics in cs_insert mean the last store wins, but every thread
+    // stores the same value, so the result is deterministic.
+    let winning_slot = slots.iter().position(|k| *k == shared_key).unwrap();
+    let values = read_buffer_u32(&ctx, &table.slot_values, capacity);
+    assert_eq!(
+        values[winning_slot], shared_value,
+        "winning slot's value = {} expected {shared_value}",
+        values[winning_slot]
+    );
     // Stray values outside the winning slot are allowed (they may be in the
     // process of being written when the race resolved); what matters is that
     // there's exactly one slot_keys entry for the shared key.
@@ -817,15 +831,6 @@ fn mean(samples: &[Duration]) -> Duration {
     total / samples.len() as u32
 }
 
-fn max_probe_bucket(hist: &[u32]) -> u32 {
-    for (i, &c) in hist.iter().enumerate().rev() {
-        if c > 0 {
-            return i as u32;
-        }
-    }
-    0
-}
-
 fn run_sweep_row(
     ctx: &GpuCtx,
     n: u32,
@@ -865,28 +870,28 @@ fn run_sweep_row(
         table.write_params(ctx, threads_to_dispatch);
         let bg_ins = table.bind_group(ctx, &keys_buf, &values_buf, &results_buf);
         let (w_ins, g_ins) = run_phase(ctx, &ctx.pipeline_insert, &bg_ins, threads_to_dispatch);
-        let ins_hist = if pass >= warm_runs {
-            let h = table.read_probe_hist(ctx);
-            table.clear_probe_hist(ctx);
-            Some(h)
+        let ins_mp = if pass >= warm_runs {
+            let m = table.read_max_probes(ctx);
+            table.clear_max_probes(ctx);
+            Some(m)
         } else {
-            table.clear_probe_hist(ctx);
+            table.clear_max_probes(ctx);
             None
         };
         let (w_hit, g_hit) = run_phase(ctx, &ctx.pipeline_lookup, &bg_ins, threads_to_dispatch);
-        let hit_hist = if pass >= warm_runs {
-            let h = table.read_probe_hist(ctx);
-            table.clear_probe_hist(ctx);
-            Some(h)
+        let hit_mp = if pass >= warm_runs {
+            let m = table.read_max_probes(ctx);
+            table.clear_max_probes(ctx);
+            Some(m)
         } else {
-            table.clear_probe_hist(ctx);
+            table.clear_max_probes(ctx);
             None
         };
         let bg_miss = table.bind_group(ctx, &miss_keys_buf, &values_buf, &results_buf);
         let (w_miss, g_miss) =
             run_phase(ctx, &ctx.pipeline_lookup, &bg_miss, threads_to_dispatch);
-        let miss_hist = if pass >= warm_runs {
-            Some(table.read_probe_hist(ctx))
+        let miss_mp = if pass >= warm_runs {
+            Some(table.read_max_probes(ctx))
         } else {
             None
         };
@@ -904,14 +909,14 @@ fn run_sweep_row(
             if let Some(d) = g_miss {
                 gpu_miss.push(d);
             }
-            if let Some(h) = ins_hist {
-                max_probes_ins = max_probes_ins.max(max_probe_bucket(&h));
+            if let Some(m) = ins_mp {
+                max_probes_ins = max_probes_ins.max(m);
             }
-            if let Some(h) = hit_hist {
-                max_probes_hit = max_probes_hit.max(max_probe_bucket(&h));
+            if let Some(m) = hit_mp {
+                max_probes_hit = max_probes_hit.max(m);
             }
-            if let Some(h) = miss_hist {
-                max_probes_miss = max_probes_miss.max(max_probe_bucket(&h));
+            if let Some(m) = miss_mp {
+                max_probes_miss = max_probes_miss.max(m);
             }
         }
     }
