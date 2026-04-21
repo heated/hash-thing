@@ -23,8 +23,6 @@ Bug fixes — even narrow, even "restores documented broken behavior" — go thr
 
 If ambiguous, route through /ship-auto. An extra review is cheap; a shipped bug in invariant-bearing code is not.
 
-The prior blanket feature freeze (2026-04-13 → 2026-04-19) is dropped; this directive replaces it as the durable rigor posture.
-
 ---
 
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
