@@ -2874,37 +2874,32 @@ mod tests {
     }
 
     /// hash-thing-rk4n regression: walks the default water scene past
-    /// ground-impact at the scale edward reports corruption on (256^3),
-    /// using the brute-force `step()` path which runs `commit_step`
-    /// (store-compact every tick). Skipping some sync calls mimics
-    /// dropped render frames and used to expose `last_compaction_remap`
-    /// being single-buffered: two successive `commit_step` calls without
-    /// an intervening sync clobbered the first remap, so the SVDAG cache
-    /// decoded subsequent nodes from the wrong store generation.
-    /// Fixed in rk4n.1 by compose-on-write (see `compose_remap`); this
-    /// test stays as a regression guard.
+    /// ground-impact using the brute-force `step()` path which runs
+    /// `commit_step` (store-compact every tick). Skipping some sync calls
+    /// mimics dropped render frames and used to expose
+    /// `last_compaction_remap` being single-buffered: two successive
+    /// `commit_step` calls without an intervening sync clobbered the first
+    /// remap, so the SVDAG cache decoded subsequent nodes from the wrong
+    /// store generation. Fixed in rk4n.1 by compose-on-write
+    /// (see `compose_remap`); this test stays as a regression guard.
     ///
-    /// Water pool sits at `water_y = center + center/4` with `pool_depth =
-    /// (side/32).max(2)`. At 256^3 the pool bottom is ~32 cells above the
-    /// mid-terrain floor, so it needs ~32 steps for impact plus a comfortable
-    /// tail. 60 total steps covers the impact and ~20 steps after, the window
-    /// edward named.
-    ///
-    /// Marked `#[ignore]` because 60 steps at 256^3 plus periodic exhaustive
-    /// 16.7M-voxel verification is too slow for the default test run. Invoke
-    /// with `cargo test --release -- --ignored
-    /// water_and_sand_256_commit_step_skip_sync_corrupts_svdag`.
+    /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
+    /// always-on under the 60s soft-max (~10s observed). With the fix
+    /// reverted, the assertion fires at step 42 with ~254k mismatches.
+    /// Water pool sits at `water_y = center + center/4` with
+    /// `pool_depth = (side/32).max(2)` — at 128^3 the pool bottom is ~16
+    /// cells above the mid-terrain floor, so 60 steps covers impact plus
+    /// tail comfortably.
     #[test]
-    #[ignore]
-    fn water_and_sand_256_commit_step_skip_sync_corrupts_svdag() {
-        let mut world = World::new(8); // 256^3, matches the default visual repro.
-        let params = TerrainParams::for_level(8);
+    fn water_and_sand_128_commit_step_skip_sync_corrupts_svdag() {
+        let mut world = World::new(7);
+        let params = TerrainParams::for_level(7);
         let _ = world.seed_terrain(&params);
         world.seed_water_and_sand();
 
         let mut svdag = Svdag::new();
         sync_svdag_with_world(&mut world, &mut svdag);
-        assert_svdag_matches_world(&world, &svdag, "initial 256^3 water scene");
+        assert_svdag_matches_world(&world, &svdag, "initial 128^3 water scene");
 
         // Mirror the "occasionally drop a render frame" pattern: verify most
         // steps but skip some past step 40 so two commit_step calls can land
@@ -2918,7 +2913,7 @@ mod tests {
                 assert_svdag_matches_world(
                     &world,
                     &svdag,
-                    &format!("after 256^3 water step {step}"),
+                    &format!("after 128^3 water step {step}"),
                 );
             }
         }
@@ -2931,17 +2926,20 @@ mod tests {
     /// fails, the SVDAG cache is aliasing across a silent store swap.
     /// Fixed in rk4n.1 by publishing the remap with compose-on-write;
     /// this test stays as a regression guard.
+    ///
+    /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
+    /// always-on under the 60s soft-max (~5s observed). With the fix
+    /// reverted, the assertion fires at step 24 with ~974k mismatches.
     #[test]
-    #[ignore]
-    fn water_and_sand_256_step_recursive_with_sync_every_step() {
-        let mut world = World::new(8);
-        let params = TerrainParams::for_level(8);
+    fn water_and_sand_128_step_recursive_with_sync_every_step() {
+        let mut world = World::new(7);
+        let params = TerrainParams::for_level(7);
         let _ = world.seed_terrain(&params);
         world.seed_water_and_sand();
 
         let mut svdag = Svdag::new();
         sync_svdag_with_world(&mut world, &mut svdag);
-        assert_svdag_matches_world(&world, &svdag, "initial 256^3 water scene");
+        assert_svdag_matches_world(&world, &svdag, "initial 128^3 water scene");
 
         for step in 1u32..=60 {
             world.step_recursive();
@@ -2949,7 +2947,7 @@ mod tests {
             assert_svdag_matches_world(
                 &world,
                 &svdag,
-                &format!("after 256^3 step_recursive {step}"),
+                &format!("after 128^3 step_recursive {step}"),
             );
         }
     }
