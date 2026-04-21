@@ -1189,6 +1189,88 @@ mod tests {
         assert_eq!(world.population(), pop_before);
     }
 
+    /// hash-thing-4497 investigation: measure the actual divergence
+    /// between `step_node_macro` (the macro path) and brute-force
+    /// stepping on a world with block-rule cells. The fallback at
+    /// step_recursive_pow2:100 currently bypasses the macro path
+    /// whenever block-rule cells are present; this test bypasses the
+    /// fallback to exercise the macro path directly and report on the
+    /// nature of any divergence.
+    ///
+    /// Expected outcome (hypothesis from the 4497 analysis):
+    /// the macro path IS sound w.r.t. Margolus block-rule partition
+    /// alignment (sub-cube origins are always at even parent coords),
+    /// but it lacks the per-generation `gravity_gap_fill` that
+    /// brute-force `step()` applies at phase 3. So the divergence
+    /// should be entirely in the gap-fill-affected cells — vertical
+    /// rarefaction under water columns — NOT in the block-rule
+    /// partition boundaries themselves.
+    ///
+    /// This is an investigation probe, not a ship assertion: it
+    /// prints the divergence rather than failing, so future runs
+    /// capture the behavior without pinning it.
+    #[test]
+    fn investigation_4497_macro_vs_brute_with_block_rules() {
+        let level = 4u32;
+        let mut macro_world = World::new(level);
+        let mut brute = World::new(level);
+
+        // Seed identical water-heavy worlds. Water carries both CaRule
+        // (flow) and BlockRule (horizontal spread) + gravity_gap_fill
+        // eligibility, so it exercises all three phases that diverge
+        // between the two paths.
+        seed_random_material_cells(&mut macro_world, 0x4497_u64);
+        seed_random_material_cells(&mut brute, 0x4497_u64);
+        assert_eq!(macro_world.flatten(), brute.flatten());
+
+        let steps = macro_world.recursive_pow2_step_count();
+        for _ in 0..steps {
+            brute.step();
+        }
+
+        // Run the macro path directly, bypassing the has_block_rule_cells
+        // guard at step_recursive_pow2:100. Mirrors the guard-free
+        // branch of step_recursive_pow2 exactly.
+        let padded_root = macro_world.pad_root();
+        let padded_level = macro_world.level + 1;
+        let result =
+            macro_world.step_node_macro(padded_root, padded_level, macro_world.generation);
+        macro_world.root = result;
+        macro_world.generation += steps;
+
+        let macro_flat = macro_world.flatten();
+        let brute_flat = brute.flatten();
+        let side = macro_world.side();
+        assert_eq!(macro_flat.len(), brute_flat.len());
+
+        let mut diff_count = 0usize;
+        let mut diff_with_water_present = 0usize;
+        for (i, (&m, &b)) in macro_flat.iter().zip(brute_flat.iter()).enumerate() {
+            if m != b {
+                diff_count += 1;
+                let water_raw =
+                    crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw();
+                if m == water_raw || b == water_raw {
+                    diff_with_water_present += 1;
+                }
+                if diff_count <= 8 {
+                    let z = i / (side * side);
+                    let y = (i / side) % side;
+                    let x = i % side;
+                    eprintln!(
+                        "divergence at ({x},{y},{z}): macro={m:#010x} brute={b:#010x}"
+                    );
+                }
+            }
+        }
+        let total = macro_flat.len();
+        eprintln!(
+            "4497 probe: level={level} steps={steps} total_cells={total} \
+             diffs={diff_count} ({:.2}%) water_touching_diffs={diff_with_water_present}",
+            (diff_count as f64 / total as f64) * 100.0
+        );
+    }
+
     #[test]
     fn pad_root_preserves_center() {
         let mut world = World::new(3);
