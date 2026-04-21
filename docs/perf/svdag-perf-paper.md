@@ -422,6 +422,7 @@ Track here so they don't get lost between revisions.
 3. Does the per-cell tagged-cell encoding limit SVDAG compression vs an externalized attribute table (Dolonius)? Quantify.
 4. What is the right SVDAG node budget for an 8 GB unified-memory machine, given that the OS, browser, and app share that pool?
 5. Is there a useful intermediate: a coarser SVDAG for far-field rays plus a fine-grained one for near-field? Cost/benefit on M1.
+6. GPU spatial memo questions — see §8.5. Summarized: key-shape rotation, NodeStore compaction remap, CPU/GPU hybrid level split, warp-divergence from rule-table branches, macro-cache GPU analogue.
 
 ---
 
@@ -431,7 +432,109 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 
 ---
 
-## 8. Revision log
+## 8. GPU spatial memo feasibility
+
+First pass (2026-04-21, bead `hash-thing-abwm.1`, spark). Pre-implementation architecture sketch for moving hashlife spatial memoization onto the GPU. No code has been written; this section decides whether to write code.
+
+### 8.1 Problem restatement
+
+The hashlife memo today (`src/sim/hashlife.rs:326`) is `FxHashMap<(NodeId, parity), NodeId>`: given a store `NodeId` and the sim's current parity (`generation % 2`), look up the memoized step result. On miss, recurse into children, apply the Margolus 2³ block rule at the base case, memoize, return. §4.2 measured ~1,847 cache misses / step at 256³ steady-state with ~55 % hit rate and ~72 % combined short-circuit rate (hits + empty + fixed-point). Each miss currently drives a serial descent on the CPU.
+
+Three CPU-side bottlenecks motivate a GPU port:
+
+1. **Recursion is serial.** The CPU walks one path at a time; siblings at the same octree level can't share work.
+2. **Miss-path CA evaluation is cell-by-cell.** The base case applies the Margolus rule to 512 cells (8 × 2³ block) for every miss; this is embarrassingly parallel but CPU-SIMD-only today.
+3. **NodeStore is already GPU-resident for raycast.** The `Svdag::nodes` buffer holds the reachable set of the octree for the renderer. A GPU memo that probes the same layout avoids a full copy and opens the door to sharing the address-translation table (§4.1).
+
+GPU ambition: same functional contract, breadth-first by level, many `(NodeId, parity)` probes per dispatch. Each level is one compute dispatch that probes the memo; hits write result slots, misses enqueue child work to the next level.
+
+### 8.2 Literature pointers
+
+Organized by what we'd need to borrow. Several exact numbers are **TODO-verify** — the abstracts and secondary summaries are consistent, but primary PDFs were not decoded for this first pass. Filling those gaps is scout work for the next revision.
+
+**GPU hash tables (the primitive we'd build on).**
+
+- **Alcantara, Sharf, Abbasinejad, Sengupta, Mitra, Owens, Tao (SIGGRAPH 2009), "Real-time parallel hashing on the GPU."** Cuckoo hashing with 4 hash functions and atomic compare-and-swap inserts. Amortized O(1) insert, constant-bounded lookup. Establishes the CAS-loop insert pattern every subsequent GPU hash table reuses. Resize requires full rebuild — not a good fit for append-churn-heavy workloads. TODO-verify throughput table against the SIGGRAPH 2009 paper.
+- **NVIDIA cuCollections (2020–present).** Open-addressing and static/dynamic map containers with in-kernel insert/find. Documented for CUDA; the *pattern* (open addressing + CAS insert + optional linear probing sequence) is portable to WGSL storage-buffer + atomic compare-exchange. Useful as a reference API shape, not a dependency.
+- **Khorasani, Vora, Gupta, Bhuyan (SC 2015, "Stadium hashing").** Coalesced probe layout specifically designed around GPU memory access patterns; reduces warp-divergence on insert by grouping probe chains spatially. Useful if our memo hits probe-chain lengths that matter in profile; premature otherwise.
+
+**Dynamic GPU-resident DAGs (closest prior art).**
+
+- **HashDAG (Careil, Billeter, Eisemann, CGF 2020; §2.4 above).** A published working system that does bottom-up edits on a GPU-resident hash-consed DAG, keyed on child-pointer tuples. That *is* a spatial memo for a DAG; the GPU side is an open-addressing bucketed table with per-bucket write locks (readers lock-free). Reference implementation at <https://github.com/Phyronnaz/HashDAG> is the concrete read. The probe / CAS-insert primitive is reusable. What differs is the **key**: HashDAG keys on subtree content `[child0 … child7]` (≥ 32 bytes), ours on `(NodeId, parity)` (8 bytes). Ours is cheaper to probe; theirs is content-addressed and survives NodeId remapping without a rebuild.
+
+**GPU cellular automata (orthogonal but adjacent).**
+
+- **Lefebvre (GPU Gems series, mid-2000s), GPU CA.** Dense texture-swap ping-pong evaluation. 2D grids at very high throughput, but no sparsity and no memoization. Relevant only as "the base case of our CA evaluator fits in one dispatch" — we already do this on CPU and it would trivially port to a compute dispatch; the question is whether memoization still wins once the base case is that cheap. TODO-verify exact GPU-Gems volume and author (this may have been a Lefebvre chapter in GPU Gems 2 or 3, or an entirely different author in Programming GPUs).
+- **GPU-hashlife attempts.** No well-known published implementation. Hashlife's value comes from amortizing serial recursion across many ticks via memo hits; GPUs favor flat parallel workloads; the combination is an open research problem. Gosper's original (1984) hashlife on Life CA establishes the invariants; the GPU port question is whether enough sibling parallelism exists per level to amortize probe overhead.
+
+**Lock-free append-only allocation.**
+
+Not memoization-specific but relevant as the *simplest* dynamic-allocation primitive: a single atomic counter `next_slot` + a CAS-insert into `table[hash(key) & mask]`. For a memo that only grows between compactions (never deletes), this is the complete write path. Compact on host-side when load factor ≥ 0.5, re-upload. We already do structurally-similar compaction for the SVDAG `NodeStore` at 50 % stale ratio (§4.2, `src/main.rs:882`) — the memo can ride the same cadence.
+
+### 8.3 Architecture sketch for our problem
+
+**Key shape (from the existing code).**
+
+- Key: `(NodeId, parity)` = `(u32, u32)` = 64 bits.
+- Value: `NodeId` = 32 bits. Sentinel for empty-slot: `u32::MAX`.
+- Hash function: `splitmix64` or `xxhash` of the packed 64-bit key. Cheap (a few arithmetic ops per probe), collision properties well-understood.
+
+**NodeStore co-location.**
+
+The `Svdag::nodes` buffer (§4.1) already holds the GPU side of the reachable set. A GPU memo can either:
+- **(a) Share `Svdag::nodes` directly.** Probe resolves `NodeId → Svdag offset` via the existing `id_to_offset` translation — but `id_to_offset` is currently CPU-side. Porting it to GPU is its own sub-spike.
+- **(b) Maintain a parallel GPU buffer.** Append-only slot table keyed by `NodeId`, co-resident with `Svdag::nodes`. Simpler to build; doubles the reachable-set memory footprint (~48 B × reachable-node-count at current encoding).
+
+Recommended: **(b) for phase 2 spike**; re-evaluate sharing once the probe throughput number is known.
+
+**Layout.**
+
+1. **Open-addressing linear probe.** `table[2^n]` of `(key_lo, key_hi, value)` u32 triples (or an `atomic<u64>` key + a parallel u32 value buffer — the former packs cleaner, the latter avoids 64-bit atomics on backends that don't support them). Load factor ≤ 0.5. Insert = CAS loop on the key slot; query = linear probe until match or sentinel. Simple enough to prototype in one compute pass; complete enough to measure.
+2. **Cuckoo (Alcantara shape).** Two or three tables with different hash functions; CAS-eviction on insert. Bounded lookup (2-3 probes); higher insert cost; guaranteed insert only below ~75 % load. Defer to phase 3 if phase 2 shows probe-chain length is the bottleneck.
+3. **Bucketed with per-bucket write locks (HashDAG shape).** Overkill for append-only churn without deletes. Adopt only if mixed read/write contention from the renderer probing the same memo shows up in profile.
+
+**Dispatch shape.**
+
+For one sim step at 256³ (tree height = log₂(256) = 8):
+
+- **Level 7 (root).** Input: one `(root_id, parity)` pair. One probe. On hit, emit result; on miss, enqueue 8 children into the level-6 queue.
+- **Levels 6 → 1.** Breadth-first: read the level's work queue, probe the memo, enqueue children for misses. Each level is 1 compute dispatch + 1 compact (exclusive prefix-sum on the "child emit" flag) + maybe 1 dispatch to evaluate block-rule on base-case misses. Total: ~20–24 dispatches/step for a full descent; most levels are shallow and finish in microseconds.
+- **Level 0 (leaves).** Apply Margolus 2³ block rule to each emitted leaf pair. 512 cells per leaf = 1 workgroup per leaf. Output = new leaf NodeId (allocated into the NodeStore). Insert `(leaf_id, parity) → new_leaf_id` into the memo.
+- **Post-step.** Root result written back to host (or kept on GPU for the next tick). Memo persists across ticks.
+
+**CPU ↔ GPU boundary.**
+
+- CPU owns: rule authoring (static), hash seed, resize decisions, NodeStore compaction triggers, root result readback (optional).
+- GPU owns: all probe/insert operations during a step; block-rule evaluation; child-work queue compaction.
+- Cross-boundary traffic: one `(root_id, parity)` down per step, one `root_result` up per step (if the renderer needs it CPU-side — it doesn't for raycast, which reads NodeStore directly). Per-step uplink is essentially zero once the memo is GPU-resident.
+
+**Interaction with existing SVDAG rebuild.**
+
+Today: CPU runs the step, updates the store, incremental SVDAG uploads ~544 new slots / step (§4.2). A GPU memo that also mutates the NodeStore *has to* coordinate with the SVDAG upload — either by running on a NodeStore snapshot (copy-on-write) or by serializing sim and render dispatches on the same queue. Phase 2 should prototype the latter (single queue; step dispatches precede render dispatches within a tick) and measure whether the forced serialization costs more than the current sim-thread / render-thread cache contention (~30 % of frame per §4.3).
+
+### 8.4 Go / no-go criteria for phase 2
+
+Phase 2 (a working spike that steps a small world on GPU end-to-end) is worth doing iff *at least two* of the following are plausibly achievable under reasonable effort:
+
+1. **GPU hash probe throughput ≥ 50 M probes/sec on M1 MBA.** Bandwidth ceiling is ~68 GB/s ÷ 12 B/probe ≈ 5.7 Gprobes/s, so 50 M/s is < 1 % of the bandwidth ceiling and should be reachable even with unoptimized linear probing. If the prototype misses this, something is wrong at the primitive level and the full port is premature.
+2. **Full-step dispatch chain finishes in ≤ 10 ms on GPU at 256³.** The CPU step is currently ~10 ms warm (§4.2-implied, TODO: measure directly). Anything slower than parity on the *existing* workload is not worth shipping; the bar is "beats CPU on the thing CPU is already good at."
+3. **Per-step memo insert rate ≥ 1 M inserts/sec.** ~1,847 inserts / 10 ms = 185 k/s CPU today. A GPU variant has to beat this comfortably — 1 M/s is ~5× margin, enough to absorb resize cost and still show a win.
+
+If *none* of (1)–(3) is plausible, the spike is a no-go: the architecture can't pay for the orchestration cost. If *all three* are comfortably plausible, phase 2 is green and phase 3 (shipping it into the real sim loop) becomes the next question. If *exactly one* succeeds, phase 2 should re-scope to investigate the specific failed criterion before committing to the full port — the architecture is probably wrong somewhere.
+
+These criteria are deliberately *fragile*. Moving goalposts after the spike runs defeats the point of the spike.
+
+### 8.5 Open questions (added to §6)
+
+- Does Margolus parity rotation across levels force a different memo key than `(NodeId, parity)`? (Currently assumed no; parity is already in the key and the CPU implementation carries it through unchanged.)
+- How does GPU memo interact with NodeStore compaction? Remapping a CPU-side `FxHashMap` is a copy (§4.1, `hashlife::remap_caches`); remapping a GPU table is a compute-dispatch over `2^n` slots plus a parallel reduce. Can this reuse the existing CPU→GPU remap table?
+- Is there a hybrid sweet spot — GPU memo for levels 4+ (deep subtrees with many parallel leaves) + CPU memo for levels 0–3 (shallow, low probe count, high per-probe latency amortization)? Likely yes, but the threshold level depends on the (1)–(3) numbers.
+- How does CA-rule divergence across warp lanes interact with the base-case block-rule dispatch? Different materials hit different rule-table branches; warp-wide, the worst case is ~32-way divergence. Measure early.
+- Does `hashlife_macro_cache` (pow-of-2 macro-steps) have a GPU analogue, or does it only make sense for the serial hashlife path? If it only works on CPU, the GPU port loses the macro-step amortization — which is a meaningful fraction of the observed hit rate at certain world topologies. TODO: measure macro-cache contribution separately at 256³.
+
+---
+
+## 9. Revision log
 
 | Date | Author | Change |
 |---|---|---|
@@ -446,4 +549,5 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-21 | spark | §4.3 cache-locality proxy 2 (bead `hash-thing-xhi6`). Sim-thread QoS sweep on M2: same-pool (interactive) ≈ inherited baseline; cross-pool (utility/background) is *worse*, not better. Refutes proxy 2's premise — the CPU-cycle / unified-memory dichotomy doesn't map cleanly onto a P-vs-E pool toggle on M2. New `HASH_THING_SIM_QOS={interactive,initiated,default,utility,background}` env var. |
 | 2026-04-21 | onyx | §3.8 step 2 result (bead `hash-thing-dlse.2.2`). Fullscreen borderless measured on M2 MBA 256³ dev via `HASH_THING_ACQUIRE_HARNESS=1`: `surface_acquire_cpu` = 25.3 ms windowed vs **30.0 ms fullscreen** (+4.7 ms / +18.5 %, harness verdict: fullscreen worse than windowed). Hypothesis (a) CoreAnimation-compositor-only stall is refuted — both modes hit the same 60 Hz → 30 FPS cliff. Also landed init-time monitor/adapter logging (commit `fba5efb`): M2 refresh is 60 Hz (bounds vsync budget at 16.67 ms), scale_factor = 2, Apple M2 Metal IntegratedGpu. Surviving knobs: off-surface render target (step 3) and frame_latency=3 / Immediate sweep (step 4). |
 | 2026-04-21 | onyx | §3.8 step 3 result (bead `hash-thing-dlse.2.2`). Off-surface render target on M2 MBA 256³ dev via `HASH_THING_OFF_SURFACE=1`: `surface_acquire_cpu` collapses to 0.0 ms but **the stall migrates to `submit_cpu` (~26 ms)**. Total frame budget unchanged. Hypothesis (b) swapchain-pacing is refuted — the wait is not the swapchain. Surviving hypothesis (c): something in our own submit/encoding pipeline (likely the timestamp resolve/map path) inserts an implicit CPU-side fence. Next diagnostic: disable timestamp resolve and re-measure; if submit_cpu collapses, the resolve path is the culprit. |
+| 2026-04-21 | spark | §8 GPU spatial memo feasibility (bead `hash-thing-abwm.1`). Pre-implementation sketch: literature pointers (Alcantara 2009 cuckoo, HashDAG 2020, GPU CA, GPU-hashlife gap), architecture for `(NodeId, parity) → NodeId` on GPU (open-addressing linear probe, breadth-first dispatch per tree level, NodeStore co-location), and three fragile go/no-go criteria for phase 2. No code written; this section decides whether to write any. Revision log promoted from §8 to §9. |
 | 2026-04-21 | onyx | §3.8 step 3b conclusion (bead `hash-thing-dlse.2.2.1`, closes). New diagnostic env var `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` (skips in-encoder timestamp writes AND resolve/map). Off-surface + timestamp-disabled measurement: submit_cpu = 25.21/27.48 ms — unchanged. **Hypothesis (c) timestamp-fence refuted.** By elimination across steps 2/3/3b, the ~25 ms stall is real GPU frame time at 256³ / 50% on M2, dominated by non-compute-pass work (blit + HUD + overlays) which is not yet instrumented. `render_gpu = 0.16 ms` from dlse.2.3 is the compute pass only. Next-step surface for dlse.2.2: bracket the render pass with TIMESTAMP_QUERY_INSIDE_ENCODERS to attribute the missing ~25 ms. The 30 FPS bug is GPU-bound, not compositor-bound. |
