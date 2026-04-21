@@ -1,3 +1,4 @@
+use hash_thing::acquire_harness::{self, Action as HarnessAction};
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
@@ -332,6 +333,13 @@ struct App {
     /// so the periodic log can print it even while the next step is on
     /// the background thread (where `self.world` is a placeholder).
     last_memo_summary: String,
+    /// Self-driving windowed-vs-fullscreen acquire measurement
+    /// (`dlse.2.2`). `Some` when `HASH_THING_ACQUIRE_HARNESS=1`.
+    /// When active, the harness forces a windowed start, burns a
+    /// warmup window, records capture samples, flips fullscreen,
+    /// records again, logs a side-by-side report, and asks the event
+    /// loop to exit.
+    acquire_harness: Option<acquire_harness::Harness>,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -440,7 +448,15 @@ impl App {
             fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
+            acquire_harness: acquire_harness::Harness::from_env(),
         };
+        // The harness owns the windowed→fullscreen transition explicitly;
+        // honouring `HASH_THING_FULLSCREEN=1` on top of it would skip the
+        // windowed capture phase. Force windowed start when the harness is
+        // on.
+        if app.acquire_harness.is_some() {
+            app.fullscreen_active = false;
+        }
 
         // Seed the cached memo summary so the very first periodic log line
         // has a populated column instead of a blank trailing field
@@ -1328,6 +1344,13 @@ impl ApplicationHandler for App {
             let mut renderer =
                 pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
+            // `surface.get_current_texture()` + `present()`; pairs with the
+            // acquire harness to measure whether the ~25 ms surface_acquire
+            // stall is swapchain-pacing (collapses) or elsewhere (persists).
+            if std::env::var("HASH_THING_OFF_SURFACE").ok().as_deref() == Some("1") {
+                renderer.enable_off_surface();
+            }
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
@@ -1757,7 +1780,13 @@ impl ApplicationHandler for App {
                 // stepping the sim + uploading the SVDAG during a 100%-CPU
                 // spin on an invisible surface is exactly what 8jp was about.
                 // `WindowEvent::Occluded(false)` re-arms the loop.
-                if self.occluded || !self.focused {
+                //
+                // Exception: when the acquire-harness is running we want
+                // frames to keep coming even if the window manager decides
+                // to unfocus us — otherwise a headless crew launch can
+                // stall forever on frame 0 waiting on focus it'll never
+                // get.
+                if self.acquire_harness.is_none() && (self.occluded || !self.focused) {
                     return;
                 }
 
@@ -2126,6 +2155,41 @@ impl ApplicationHandler for App {
                 // Kick off the next background step only after this frame has
                 // finished consuming the live world snapshot.
                 self.maybe_start_background_step();
+
+                // Advance the self-driving acquire harness (dlse.2.2).
+                // Runs after this frame's samples are in `self.perf`, so
+                // snapshots reflect the just-completed capture window.
+                // Two-pass drain: `step()` holds `&mut self.acquire_harness`
+                // + `&self.perf`, so we collect actions first and release
+                // those borrows before dispatching (which can touch `&mut
+                // self.perf`, `&mut self` for the fullscreen toggle, and
+                // `&self.acquire_harness` for the final report).
+                let harness_actions: Vec<HarnessAction> =
+                    if let Some(harness) = self.acquire_harness.as_mut() {
+                        harness.step(&self.perf)
+                    } else {
+                        Vec::new()
+                    };
+                for action in harness_actions {
+                    match action {
+                        HarnessAction::ClearPerf => {
+                            self.perf.clear();
+                            log::info!("acquire-harness: perf cleared");
+                        }
+                        HarnessAction::ToggleFullscreen => {
+                            log::info!(
+                                "acquire-harness: windowed capture done, toggling to fullscreen"
+                            );
+                            self.toggle_fullscreen();
+                        }
+                        HarnessAction::Exit => {
+                            if let Some(h) = self.acquire_harness.as_ref() {
+                                log::info!("{}", h.report());
+                            }
+                            event_loop.exit();
+                        }
+                    }
+                }
 
                 if let Some(window) = &self.window {
                     window.request_redraw();

@@ -51,7 +51,7 @@ Cross-reference for implied-number math: M1 MBA 8-core GPU ≈ 2.6 TFLOPS FP32, 
 - **Core idea.** Generalize SVO to a DAG by hash-consing subtrees. Empty and repeated regions both get deduplicated. Enables representing binary voxel scenes at 128K³ that would never fit as flat grids or plain SVOs.
 - **Reported number.** 170 MRays/sec (ambient occlusion) / 240 MRays/sec (shadows) on NVIDIA GTX 680 at "competitive with or faster than state-of-the-art triangle ray tracing" for the Epic Citadel scene voxelized to 128K³, **945 MB GPU memory** vs. ~5.1 GB for the equivalent SVO. (Source: semanticscholar summary; TODO-verify against the SIGGRAPH 2013 PDF.)
 - **Implied on M1 MBA.** GTX 680 has ≈ 192 GB/s bandwidth and 3.1 TFLOPS. M1 8-core is ~3× less bandwidth and ~1.2× less compute. Expect **~50-80 MRays/s primary / shadow** on the same algorithm at the same memory layout, for a scene that actually fits. Our 256³ demo at 50% render scale is ~576k rays/frame, so this predicts ~7-12 ms/frame for just the SVDAG traversal. Our headless bench already reports 0.19 ms mean — but our world is a 256³ instead of 128K³, and the tree is much shallower (log₂ 256 = 8 vs. log₂ 128K ≈ 17), so we do ~half the per-ray memory walk. The numbers are internally consistent.
-- **Verdict.** **This is the paper we are implementing.** Our octree is hash-consed; our GPU upload is SVDAG-shaped. Every architectural decision in the SVDAG path descends from this paper. Nothing to adopt; it's already the baseline.
+- **Verdict.** **Our GPU node encoding and upload shape descend from here, but our update model does not.** Kämpe's SVDAG is build-once-render-forever: a scene is offline-DAG-ified and then traced as a static structure. Our implementation rebuilds the CPU-side SVDAG serialization *every sim tick* from the live hash-consed octree — see §4.6 for how that differs from both Kämpe (static) and HashDAG (GPU-resident dynamic). Our octree is still hash-consed; our GPU buffer layout is still Kämpe-shaped. But "this is the paper we are implementing" undersells the delta on update semantics.
 
 ### 2.3 Villanueva, Marton, Gobbetti (2016/2017), "Symmetry-aware Sparse Voxel DAGs" (SSVDAG)
 
@@ -123,12 +123,19 @@ So one traversal step costs **~36 B of GPU memory traffic** plus a handful of AL
 
 ### 3.3 Per-ray cost
 
-**Average traversal depth.** Worst case at 256³ is `log₂(256) = 8` levels. But real rays in our scene terminate early:
-- **Sky rays** (most of the upper half of the image) hit one or two empty-parent nodes at the root levels and exit before descending past depth 2-3.
-- **Terrain rays** hit solid regions after ~5-6 descents on average for the current terrain generator (which produces flat ground with occasional vertical features).
-- **Occluded rays** (blocked by foreground geometry) terminate at whatever depth the first hit sits — similar to terrain rays.
+**Average traversal steps.** Worst case at 256³ is `log₂(256) = 8` levels of descent, but the relevant quantity for bandwidth is **total DDA steps per ray** (descend + step-past + pop), not just descent depth. Measured empirically for the **default-spawn primary-ray sample** at 256³ / 960×540 (hash-thing-stue.5, `tests/bench_depth_histogram.rs`, seeded terrain via `TerrainParams::for_level(8)`):
 
-Weighted guess: **~4 dependent-load steps per ray on average**, 8 worst case. Follow-up bead should instrument this directly.
+| Ray class | Share | Mean steps | p50 | p95 | Max |
+|---|---|---|---|---|---|
+| Hit (terrain) | 53% | 20.0 | 17 | 38 | 84 |
+| Miss (sky) | 47% | 9.3 | 9 | 22 | 64 |
+| **All primary rays** | **100%** | **15.0** | **13** | **34** | **84** |
+
+Two cross-check poses from the same harness: looking straight down (100% hit, mean 6.8, p95 10) and horizontal-at-mid (y=0.5, 55% hit, mean 13.2). No rays exhausted the step budget in 3×518k samples.
+
+The prior model guessed ~4 steps/ray. The measured mean is **~4× larger**. The under-count came from conflating "descent depth" (~5-6 for terrain at 256³) with "total DDA steps" — each sibling the ray grazes past counts, and the integer-DDA step-past + pop machinery produces several steps per hit beyond the final descent chain. Sky rays terminate much faster than hits because the root cube's empty neighborhood lets them exit after a few coarse steps, but they are not a tiny fraction of the frame: ~47% at default-spawn.
+
+*Scope note:* these numbers are for the default-spawn primary-ray sample only. Secondary rays (shadows, GI) would have a different distribution; broader scene coverage would need a live-telemetry path, out of scope for stue.5.
 
 **Per-step latency.** On an integrated unified-memory GPU, a dependent u32×9 load:
 - L1 hit (same cache line as previous step, common when rays in a warp share ancestors): ~4-8 ns amortized.
@@ -137,15 +144,15 @@ Weighted guess: **~4 dependent-load steps per ray on average**, 8 worst case. Fo
 
 Assume an 80/20 L1/L2 mix for the typical ray: `0.8 × 6 ns + 0.2 × 22 ns ≈ 9 ns per step`.
 
-**Per ray:** 4 steps × 9 ns ≈ **36 ns**. But SIMD: rays in a 32-lane warp share ancestor loads, so the *warp* costs more like `max(per-lane steps) × per-step` with coherent coalescing. For primary rays with tight screen-space locality, expected throughput is near the bandwidth ceiling, not per-lane latency.
+**Per ray:** 15 steps × 9 ns ≈ **135 ns** (using the measured mean from §3.3). SIMD: rays in a 32-lane warp share ancestor loads, so the *warp* costs more like `max(per-lane steps) × per-step` with coherent coalescing. For primary rays with tight screen-space locality, expected throughput is near the bandwidth ceiling, not per-lane latency.
 
 ### 3.4 Frame cost at 256³ × 50% render scale
 
-576k rays × 4 steps/ray × 36 B/step = **~83 MB of node traffic per frame**.
+576k rays × 15 steps/ray (measured mean, §3.3) × 36 B/step = **~311 MB of node traffic per frame**.
 
-At 68 GB/s, this is `83 MB / 68 GB/s ≈ 1.2 ms` in bandwidth-limited form. The shader also writes 576k pixels × 8 B (Rgba16Float) = 4.6 MB per frame — another ~0.07 ms. Plus instruction-issue overhead and imperfect bandwidth utilization (realistic peak is ~60% of spec on Apple Silicon for ray-tracing workloads) gives a **predicted envelope of ≈ 2.0 ms / frame** on M1 MBA for pure SVDAG traversal + raycast write.
+At 68 GB/s, this is `311 MB / 68 GB/s ≈ 4.6 ms` in bandwidth-limited form. The shader also writes 576k pixels × 8 B (Rgba16Float) = 4.6 MB per frame — another ~0.07 ms. Plus instruction-issue overhead and imperfect bandwidth utilization (realistic peak is ~60% of spec on Apple Silicon for ray-tracing workloads) gives a **predicted envelope of ≈ 7.6 ms / frame** on M1 MBA for pure SVDAG traversal + raycast write. (Pre-stue.5 this section predicted ~2 ms using a 4-step guess; measurement now pushes it upward to ~7.6 ms, *widening* the gap vs the ~0.24 ms measurement — see §3.6.)
 
-**Total frame at 60 FPS target = 16.67 ms.** SVDAG traversal alone should fit in ~2 ms, leaving ~14 ms for sim step + SVDAG upload + surface acquire + blit + HUD. Tight but feasible.
+**Total frame at 60 FPS target = 16.67 ms.** If the naive 7.6 ms bandwidth envelope were reality, SVDAG traversal alone would eat nearly half the budget. In practice measurement sits near 0.24 ms on M1-implied (§3.6), so the envelope is a *loose upper bound* — the real frame cost is set by how well the per-step cost amortizes against cache reuse, not the worst-case step × bytes product.
 
 ### 3.5 Working-set check
 
@@ -155,17 +162,19 @@ This is the model's strongest prediction: **at 256³ the SVDAG frame-cost on M1 
 
 ### 3.6 Gap vs measurement
 
-The gap-report row (see §5) compares this 2 ms envelope against:
+The gap-report row (see §5) compares the §3.4 envelope (7.6 ms post-stue.5) against:
 
 - **Headless bench (`bench_gpu_raycast`) at 256³ app-spawn, 1920×1080 on M2 16 GB:** 0.19 ms mean / 0.45 ms p95. Scaled down to M1 MBA (≈ 0.67× memory bandwidth, roughly 1.5× runtime): **predicted M1 MBA headless ≈ 0.3 ms at 1920×1080, ≈ 0.1 ms at our 960×600 windowed target.**
 - **Windowed app at 256³ / 50% on M2 16 GB (post-dlse.2.3, commit 8648dc0):** render_gpu ≈ 0.16 ms mean. Scaled to M1: **predicted ≈ 0.24 ms**. Consistent with the bench.
 - **Windowed app at 256³ / 50% on M2 16 GB (pre-dlse.2.3):** ~30 ms mean. This was a measurement artifact from ComputePassTimestampWrites charging Metal barrier waits to the compute pass timestamp; the underlying wall time was never 30 ms. See dlse.2.3 for the forensic chain and spark/cairn's hypothesis triage history.
 
-The model predicts **2 ms envelope** and measurement is **0.24 ms on M1-implied**. Gap is ~8× under-prediction by the model. Candidate explanations:
+The model predicts **7.6 ms envelope** (post-stue.5, with measured mean = 15 steps/ray) and measurement is **0.24 ms on M1-implied**. Gap is **~32× over-prediction** by the model. Candidate explanations, re-weighted after stue.5 ruled out the "depth too short" hypothesis:
 
-1. **Effective traversal depth is shorter than 4** — most rays terminate at depth 1-2 because the top of the octree has huge empty/solid subtrees that exit immediately. Likely. Add instrumentation.
-2. **Per-step cost is smaller than 9 ns** — the working set fits entirely in L1 per tile, and the shader-wide prefetch overlaps the next load with current ALU. Possible.
-3. **The 60% bandwidth-utilization factor is too pessimistic for this access pattern** — SVDAG access is warp-coherent and hits the DAG hot set hard; utilization closer to 80-90%.
+1. ~~Effective traversal depth is shorter than 4.~~ **Refuted by hash-thing-stue.5:** measured mean is ~15 steps/ray, *higher* than the pre-stue.5 guess of 4. Whatever is closing the gap, it is not a shorter effective traversal. This correction makes the gap wider, not narrower — the other two explanations must together account for a ~32× factor instead of ~8×.
+2. **Per-step cost is smaller than 9 ns** — the working set fits entirely in L1 per tile, and the shader-wide prefetch overlaps the next load with current ALU. The 9 ns figure assumed an 80/20 L1/L2 mix; if reuse is nearly 100% L1 for primary rays (warp shares the same ancestor chain for most of descent), per-step cost could plausibly be 2-3 ns.
+3. **The 60% bandwidth-utilization factor is too pessimistic for this access pattern** — SVDAG access is warp-coherent and hits the DAG hot set hard; utilization closer to 80-90%. More importantly, once the working set is L1-resident, "bandwidth" is L1 bandwidth (per-SM, ~1 TB/s class), not the 68 GB/s unified-memory spec — a full order of magnitude above what the envelope assumes.
+
+Hypotheses 2 and 3 together (`2-3 ns/step × L1-bandwidth regime`) are the **leading-hypothesis** explanation for the 32× factor. stue.5 does not directly measure cache residency or utilization — it refutes explanation 1 and narrows the search, but does not pin the remaining cause. Direct confirmation would take a GPU-side counter pass (hit-rate / throughput telemetry) out of scope for this bead. Treat the paper's bandwidth envelope as a DRAM-limit ceiling, not a predicted steady-state cost.
 
 This is the **"paper wins"** direction from §0: measurement is faster than the model expected, which means the model is conservative and we have headroom to burn on correctness features (attributes, LOD) before we approach the ceiling.
 
@@ -275,6 +284,30 @@ Both are measurable on M1/M2 without privileged counters. Filing as follow-up: `
 
 The *next* scale where the boundary might matter is the streaming regime (`hash-thing-cswp`): with 4096³+ worlds and view-distance streaming, the reachable-set churn per view-shift is much larger than per-generation churn, and the `offset_by_slot` cache growth becomes a real memory consideration. File a new `stue` child when the streaming work gets close.
 
+### 4.6 Update model comparison (static / GPU-dynamic / rebuild-per-tick)
+
+Our SVDAG is **dynamic**, not static. The literature has two published points on the update-model axis, and we sit at a third.
+
+| System | Update model | Where it lives | Update cost |
+|---|---|---|---|
+| Kämpe 2013 (§2.2) | **Static.** Build once, trace forever. | CPU offline, then frozen GPU buffer. | No updates. A scene change requires a full offline rebuild. |
+| HashDAG / Careil 2020 (§2.4) | **GPU-dynamic.** Edits mutate the same DAG in place. | GPU hash table resident in VRAM. | Single GPU hash probe per edited leaf + log-height promotion. Sub-millisecond localized edits on discrete GPUs. |
+| **This codebase** | **CPU-dynamic rebuild-per-tick.** Rebuild the SVDAG serialization each sim tick from the live hash-consed octree, upload the diff. | CPU `NodeStore` + `Svdag::nodes` + `offset_by_slot`; GPU just holds the serialized bytes. | O(new slots) per step. Measured at 256³ steady state: ~544 new slots/step → ~19.6 KB appended/step (§4.4). Update depth is not a special case in the code path. |
+
+**Concrete evidence we handle arbitrary-depth updates natively.** The Margolus stepper in `sim/margolus.rs` mutates the octree at whatever depth the affected 2³ block lands at. The SVDAG rebuild in `crates/ht-render/src/svdag.rs` (via `Svdag::update`) walks whatever subset of NodeIds changed, hash-cons-dedups them against `offset_by_slot`, appends new slots to `Svdag::nodes`, and ships the tail. Nothing in that path is depth-conditional. The ~544 appends/step measurement at 256³ with water+sand churn (§4.4) is direct evidence that water-driven updates at leaf/near-leaf depth flow through the same path as higher-depth structural changes.
+
+**Trade-offs of our model.**
+
+- **Win over Kämpe (static):** the world is a live CA simulation; a static SVDAG would require a full rebuild per tick, which dominates the frame budget even at 256³ (cold rebuild is ~258 KB). We rebuild *the diff*, not the whole thing, and the diff is O(changed subtrees).
+- **Win over HashDAG (GPU-dynamic):** no GPU hash table to maintain, no VRAM pressure from the table itself, no inserts racing with reads. We upload bytes, not hash-table operations. Portability win on platforms with limited unified memory (M1 MBA 8 GB target).
+- **Loss vs HashDAG:** we pay an upload step per sim tick. At 256³ that's ~1.2 MB/s, deeply irrelevant relative to 68 GB/s unified-memory bandwidth (§4.4). At streaming-scale 4096³+ worlds this stops being free — see §5 gap report and `hash-thing-cswp`.
+- **Loss vs Kämpe:** we spend CPU cycles rebuilding the serialization every tick. The rebuild is threaded with the background sim step (`x5w`), so it's not serialized against rendering, but CPU is not infinite and this is the single largest CPU cost outside the stepper itself.
+- **Memory overhead specific to our path.** `offset_by_slot` (~48 B/entry) and `id_to_offset` (~12 B/entry) are address-translation tables between content-stable NodeIds and position-stable serialized offsets. Bounded by `Svdag::compact` at `stale_ratio > 0.5`. So render-side bookkeeping stays O(reachable) within a factor of 2 — see §4.1.
+
+**Upload bandwidth degrades when dedup rate drops.** Engineered scenes (terrain + gravity-driven CA) hit ~99% dedup in steady state (4892 new u32s/step ÷ ~66k total u32s ≈ 7.4% of full re-upload). Fully-unique-churn scenes (pathological stress) fall back to linear-in-reachable-set. The current worst case we've measured is the 79 KB/step spike in §4.4, still two orders of magnitude under the cold-rebuild cost.
+
+**Why this section exists.** Conversations around the perf paper occasionally lean on "SVDAG is static" framing from the Kämpe paper. That framing is wrong for our implementation and has architectural implications (edit latency, streaming design). This section pins the distinction so later sections (§5, §6) don't have to re-establish it.
+
 ---
 
 ## 5. Gap report
@@ -285,8 +318,8 @@ Format (placeholder):
 
 | Subsystem | Measured (ref HW) | Theoretical (§3) | Gap | Status |
 |---|---|---|---|---|
-| Raycast traversal (headless, 256³, 1920×1080) | **0.19 ms mean / 0.45 ms p95** on M2 16 GB (`bench_gpu_raycast::bench_raycast_256_app_spawn`, spark 2026-04-15); M1-implied ≈ 0.3 ms | ~2.0 ms envelope on M1 MBA (§3.4) | ~7× model over-predicts | Measurement faster than model. Likely cause: effective traversal depth < 4 (§3.6). Follow-up bead: instrument per-ray depth histogram. |
-| Raycast traversal (windowed, 256³ / 50% render scale) | **0.16 ms mean** on M2 16 GB, post-dlse.2.3 (commit 8648dc0, TIMESTAMP_QUERY_INSIDE_ENCODERS); M1-implied ≈ 0.24 ms | ~1.2 ms envelope on M1 MBA at 960×600 (§3.4 × 0.6 for smaller ray count) | ~5× model over-predicts | Matches headless bench within factor of 2. Windowed ≠ slow; prior "30 ms" was measurement artifact. |
+| Raycast traversal (headless, 256³, 1920×1080) | **0.19 ms mean / 0.45 ms p95** on M2 16 GB (`bench_gpu_raycast::bench_raycast_256_app_spawn`, spark 2026-04-15); M1-implied ≈ 0.3 ms | ~7.6 ms envelope on M1 MBA (§3.4, post-stue.5 with measured 15 steps/ray) | ~25× model over-predicts | Gap widened after hash-thing-stue.5 measured mean steps ≈ 15 (vs prior guess of 4), which pushed the envelope from ~2 ms to ~7.6 ms. The prior "depth < 4" gap explanation was refuted; leading hypothesis for the remaining factor is L1 cache residency + warp-coherent reuse (§3.6 items 2+3), not yet directly measured. |
+| Raycast traversal (windowed, 256³ / 50% render scale) | **0.16 ms mean** on M2 16 GB, post-dlse.2.3 (commit 8648dc0, TIMESTAMP_QUERY_INSIDE_ENCODERS); M1-implied ≈ 0.24 ms | ~4.6 ms envelope on M1 MBA at 960×600 (§3.4 × 0.6 for smaller ray count, post-stue.5) | ~19× model over-predicts | Matches headless bench within factor of 2. Windowed ≠ slow; prior "30 ms" was measurement artifact. |
 | SVDAG build (cold, 256³ terrain+water+sand) | **~1.08 ms** on M2 16 GB, release (`bench_svdag_step_deltas_256`, spark 2026-04-20); M1-implied ≈ 1.6 ms | Not yet in §3 (cold-build model) | N/A until modelled | One-shot cost; steady-state uses incremental path. |
 | SVDAG incremental upload (256³, warm, per step) | **mean 19.6 KB, max 79 KB** on M2 16 GB (`bench_svdag_step_deltas_256`, spark 2026-04-20 — §4.4) | Not yet modelled (§3 is raycast-only) | N/A until modelled | O(new-content). ~1.2 MB/s at 60 FPS — negligible vs 68 GB/s ceiling. |
 | SVDAG compaction | Not observed in 40-step warm window at 256³ (§4.4) | N/A | N/A | Fires only when `stale_ratio > 0.5`; not a steady-state cost. |
@@ -326,3 +359,4 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-21 | onyx | §3.8 present-path inventory (bead dlse.2.2 step 1, commit `4f60ddc`). macOS M2 Metal exposes only `[Fifo, Immediate]` — no Mailbox. Rules out "triple-buffer-style unlocked present was on the table." The moss/AutoNoVsync null result combined with no-Mailbox narrows the 25 ms `surface_acquire_cpu` bug to compositor fence or driver-internal serialization; step 2 and step 3 of dlse.2.2 will distinguish these. |
 | 2026-04-20 | spark | §4 populated (bead stue.3). Answered Q1 (store is shared; render-side cache is a bounded address-translation layer), Q2 (~1,847 hashlife misses/step at 256³ → ~544 SVDAG slot appends/step; ~72% short-circuit rate), Q4 (~19.6 KB mean / ~79 KB max upload per step at 256³, confirming edward's diff-compressibility hypothesis). Q3 (cache locality) deferred with two empirical-proxy experiments for follow-up. Measurements land via new `tests/bench_svdag.rs::bench_svdag_step_deltas_*`. |
 | 2026-04-20 | spark | §3.8 cold-frame confound check (bead `hash-thing-6hta`). `Perf` ring buffer is FIFO-64 with no cold-frame skip; at ~30 FPS cold frames evict within ~2.1 s, so the first log line is partially contaminated but steady-state lines (which all prior dlse.2.2 observations sampled) are clean. Does not invalidate the 25 ms surface_acquire finding. |
+| 2026-04-21 | onyx | §2.2 verdict + new §4.6 "Update model comparison" (bead `hash-thing-jl4d`). Clarifies that our SVDAG is **dynamic** — rebuild-per-tick on CPU with O(new-slot) diff upload — rather than static Kämpe or GPU-resident HashDAG. Pins the distinction so later discussion does not re-establish it. Evidence: ~544 slot appends/step at 256³ warm with arbitrary-depth CA churn (§4.4) flows through the same code path as structural changes. |
