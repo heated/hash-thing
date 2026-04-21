@@ -1857,12 +1857,23 @@ impl Renderer {
             .gpu_timing
             .as_ref()
             .and_then(|gt| gt.compute_pass_writes());
-        let in_encoder_capturing = self.svdag_compute_bind_group.is_some()
+        // hash-thing-dlse.2.2.1 diagnostic: `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1`
+        // skips both the in-encoder timestamp writes and the resolve/map
+        // path so we can isolate whether off-surface's ~26 ms submit_cpu
+        // stall is caused by the timestamp fence (hypothesis A) or by
+        // Metal submit backpressure (hypothesis B).
+        let resolve_disabled = std::env::var("HASH_THING_DISABLE_TIMESTAMP_RESOLVE")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let in_encoder_capturing = !resolve_disabled
+            && self.svdag_compute_bind_group.is_some()
             && self
                 .gpu_timing
                 .as_ref()
                 .is_some_and(|gt| gt.uses_in_encoder() && gt.is_idle());
-        let captured_this_frame = compute_timestamp_writes.is_some() || in_encoder_capturing;
+        let captured_this_frame =
+            !resolve_disabled && (compute_timestamp_writes.is_some() || in_encoder_capturing);
 
         // --- Compute pass: SVDAG raycast → storage texture ---
         if let Some(bg) = &self.svdag_compute_bind_group {
