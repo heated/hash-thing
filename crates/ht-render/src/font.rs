@@ -215,11 +215,7 @@ pub fn render_text_rgba(lines: &[&str], scale: u32) -> (Vec<u8>, u32, u32) {
     // char-count, not byte-length: a 2- or 4-byte char would over-allocate
     // tex_w under `line.len()`, and the `chars().enumerate()` render loop
     // below advances by char — so the two must agree (hash-thing-9q5o).
-    let max_cols = lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0);
+    let max_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let pad = 2; // padding in native pixels
     let tex_w = max_cols * CHAR_W + pad * 2;
     let tex_h = lines.len() * CHAR_H + pad * 2;

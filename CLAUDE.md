@@ -226,20 +226,6 @@ bd close <id>         # Complete work
 bd sync               # Sync with git
 ```
 
-## CI ownership — you break it, you fix it
-
-After every `git push origin HEAD:main`, check CI:
-
-```bash
-gh run list --branch main --limit 1 --json conclusion -q '.[0].conclusion'
-```
-
-- **If `failure`:** you own the fix. Read `gh run view <id> --log-failed`, diagnose, fix, push. Don't leave a red main for the next seat.
-- **If `in_progress`:** wait ~2min and re-check, or move on and let the next push-to-main seat catch it.
-- **If another seat's push broke CI** and they're offline: first-to-notice owns the fix. File a bead if the fix is non-trivial.
-
-CI failures on main are P1 — they block every other seat's validation step.
-
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, complete all steps below. Work is NOT complete until the reviewed commits are on `origin/main`.
@@ -258,7 +244,7 @@ CI failures on main are P1 — they block every other seat's validation step.
    git push origin HEAD:main        # then fast-forward main
    git status                       # MUST show "up to date with origin"
    ```
-   See the "Landing to main" section above for the rationale and multi-seat conventions.
+   See the "Landing to main" section above for the rationale and multi-seat conventions. **You do not wait on CI.** Push and proceed to the next task; CI reconciliation is mayor's responsibility (see mayor skill).
 5. **Clean up** — Clear stashes, prune remote branches.
 6. **Verify** — All changes committed AND landed on main AND `bd close <id>` done.
 7. **Hand off** — Provide context for next session in `.ship-notes/` if the work has open follow-ups.
