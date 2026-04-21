@@ -347,8 +347,9 @@ fn should_warn_about_slow_dev_step(
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
-fn default_legend_visibility(mode: CameraMode) -> bool {
-    matches!(mode, CameraMode::Orbit)
+fn default_legend_visibility(_mode: CameraMode) -> bool {
+    // Default-on until proper demo lineup lands (edward 2026-04-21).
+    true
 }
 
 fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
@@ -2480,8 +2481,8 @@ mod tests {
     }
 
     #[test]
-    fn legend_defaults_follow_camera_mode() {
-        assert!(!default_legend_visibility(CameraMode::FirstPerson));
+    fn legend_defaults_on_in_all_modes() {
+        assert!(default_legend_visibility(CameraMode::FirstPerson));
         assert!(default_legend_visibility(CameraMode::Orbit));
     }
 
