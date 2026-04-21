@@ -406,6 +406,19 @@ pub struct Renderer {
     legend_tex_h: u32,
     pub legend_visible: bool,
 
+    // Memo telemetry HUD overlay (hash-thing-nhwo) — reuses the legend
+    // pipeline / BGL / sampler, but needs its own uniform buffer because
+    // both draws happen in the same pass and `queue.write_buffer` is
+    // deferred to submit — two writes to one buffer would make both
+    // draws read the final written params.
+    memo_hud_bind_group: Option<wgpu::BindGroup>,
+    memo_hud_texture: Option<wgpu::Texture>,
+    memo_hud_texture_view: Option<wgpu::TextureView>,
+    memo_hud_uniform_buffer: wgpu::Buffer,
+    memo_hud_tex_w: u32,
+    memo_hud_tex_h: u32,
+    pub memo_hud_visible: bool,
+
     // Material palette (shared by all pipelines)
     palette_buffer: wgpu::Buffer,
 
@@ -1061,6 +1074,13 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let memo_hud_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("memo_hud_uniforms"),
+            size: 16, // vec4<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let legend_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("legend_sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -1212,6 +1232,13 @@ impl Renderer {
             legend_tex_w: 0,
             legend_tex_h: 0,
             legend_visible: false,
+            memo_hud_bind_group: None,
+            memo_hud_texture: None,
+            memo_hud_texture_view: None,
+            memo_hud_uniform_buffer,
+            memo_hud_tex_w: 0,
+            memo_hud_tex_h: 0,
+            memo_hud_visible: false,
             palette_buffer,
             uniform_buffer,
             volume_size,
@@ -1623,21 +1650,23 @@ impl Renderer {
         }
     }
 
-    /// Upload legend text rendered as a bitmap texture. Call when the
-    /// legend content changes (e.g., camera mode switch). Pass empty
-    /// slice to clear.
-    pub fn set_legend_text(&mut self, lines: &[&str]) {
-        if lines.is_empty() {
-            self.legend_bind_group = None;
-            self.legend_texture = None;
-            self.legend_texture_view = None;
-            return;
+    /// Upload a text panel (lines → bitmap → texture → bind group). Shared
+    /// by `set_legend_text` and `set_memo_hud_text`; returns the resources
+    /// the caller should stash. Returns `None` on an empty-panel input
+    /// (empty slice or single-empty-string slice) so the caller can clear.
+    fn build_text_panel_bind_group(
+        &self,
+        lines: &[&str],
+        label_tex: &str,
+        label_bg: &str,
+        uniform_buffer: &wgpu::Buffer,
+    ) -> Option<(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup, u32, u32)> {
+        if lines.is_empty() || lines.iter().all(|l| l.is_empty()) {
+            return None;
         }
 
         let scale = 2u32;
         let (pixels, w, h) = super::font::render_text_rgba(lines, scale);
-        self.legend_tex_w = w;
-        self.legend_tex_h = h;
 
         let size = wgpu::Extent3d {
             width: w,
@@ -1645,7 +1674,7 @@ impl Renderer {
             depth_or_array_layers: 1,
         };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("legend_tex"),
+            label: Some(label_tex),
             size,
             mip_level_count: 1,
             sample_count: 1,
@@ -1671,8 +1700,8 @@ impl Renderer {
         );
         let view = texture.create_view(&Default::default());
 
-        self.legend_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("legend_bg"),
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label_bg),
             layout: &self.legend_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1685,13 +1714,62 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.legend_uniform_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
-        }));
+        });
 
-        self.legend_texture_view = Some(view);
-        self.legend_texture = Some(texture);
+        Some((texture, view, bind_group, w, h))
+    }
+
+    /// Upload legend text rendered as a bitmap texture. Call when the
+    /// legend content changes (e.g., camera mode switch). Pass empty
+    /// slice to clear.
+    pub fn set_legend_text(&mut self, lines: &[&str]) {
+        match self.build_text_panel_bind_group(
+            lines,
+            "legend_tex",
+            "legend_bg",
+            &self.legend_uniform_buffer,
+        ) {
+            Some((texture, view, bind_group, w, h)) => {
+                self.legend_tex_w = w;
+                self.legend_tex_h = h;
+                self.legend_texture_view = Some(view);
+                self.legend_texture = Some(texture);
+                self.legend_bind_group = Some(bind_group);
+            }
+            None => {
+                self.legend_bind_group = None;
+                self.legend_texture = None;
+                self.legend_texture_view = None;
+            }
+        }
+    }
+
+    /// Upload memo-telemetry HUD text (hash-thing-nhwo). Called when the
+    /// cached `memo_summary` refreshes (i.e., after each sim step), so the
+    /// text stays in sync without re-uploading every frame.
+    pub fn set_memo_hud_text(&mut self, lines: &[&str]) {
+        match self.build_text_panel_bind_group(
+            lines,
+            "memo_hud_tex",
+            "memo_hud_bg",
+            &self.memo_hud_uniform_buffer,
+        ) {
+            Some((texture, view, bind_group, w, h)) => {
+                self.memo_hud_tex_w = w;
+                self.memo_hud_tex_h = h;
+                self.memo_hud_texture_view = Some(view);
+                self.memo_hud_texture = Some(texture);
+                self.memo_hud_bind_group = Some(bind_group);
+            }
+            None => {
+                self.memo_hud_bind_group = None;
+                self.memo_hud_texture = None;
+                self.memo_hud_texture_view = None;
+            }
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -2023,6 +2101,44 @@ impl Renderer {
                         &self.legend_uniform_buffer,
                         0,
                         bytemuck::cast_slice(&legend_params),
+                    );
+                    render_pass.set_pipeline(&self.legend_pipeline);
+                    render_pass.set_bind_group(0, bg, &[]);
+                    render_pass.draw(0..6, 0..1);
+                }
+            }
+
+            // Memo telemetry HUD — top-left text panel (hash-thing-nhwo).
+            // Reuses legend_pipeline + legend_bind_group_layout, but has
+            // its own uniform buffer so the two panels can land at
+            // different NDC positions (queue.write_buffer is deferred to
+            // submit — a shared buffer would make both draws read the
+            // final written params).
+            if self.memo_hud_visible {
+                if let Some(bg) = &self.memo_hud_bind_group {
+                    let aspect = self.config.width as f32 / self.config.height as f32;
+                    let tex_aspect = if self.memo_hud_tex_h > 0 {
+                        self.memo_hud_tex_w as f32 / self.memo_hud_tex_h as f32
+                    } else {
+                        1.0
+                    };
+                    // Near-pixel-perfect height: map texture pixels to
+                    // surface pixels (×2 because NDC range is 2.0), then
+                    // clamp so the panel stays readable on tiny windows
+                    // without swallowing big ones. Grows with line count
+                    // so future memo_* fields don't clip.
+                    let quad_h = (self.memo_hud_tex_h as f32 * 2.0
+                        / self.config.height.max(1) as f32)
+                        .clamp(0.08, 0.4);
+                    let quad_w = quad_h * tex_aspect / aspect;
+                    let margin = 0.035;
+                    let quad_left = -1.0 + margin;
+                    let quad_bottom = 1.0 - margin - quad_h;
+                    let memo_params: [f32; 4] = [quad_left, quad_bottom, quad_w, quad_h];
+                    self.queue.write_buffer(
+                        &self.memo_hud_uniform_buffer,
+                        0,
+                        bytemuck::cast_slice(&memo_params),
                     );
                     render_pass.set_pipeline(&self.legend_pipeline);
                     render_pass.set_bind_group(0, bg, &[]);
