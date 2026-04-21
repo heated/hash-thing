@@ -578,6 +578,25 @@ Two caveats on the exponent:
 - **Out-of-band scales still unmeasured.** The fit covers 64³–512³. At 2048³, a single warm step accumulated >15 min of CPU under this harness before being killed — so the 4hkq/slc1 out-of-band benches (`bench_svdag_step_deltas_2048`, `_4096`) need a measurement workflow that tolerates 10–30 min wall per scale, which the current CI-style `#[ignore]` harness does not provide. Filed as `hash-thing-slc1` follow-up.
 - **Scene dependence.** A pathological scene with uniformly-active CA across the whole 4096³ volume would scale misses closer to `L³` (volume), giving ~470k misses/step. Our default terrain+water+sand scene is nowhere near that — active CA is concentrated on a thin fringe (water surface, sand-fall column) whose area scales well below `L²`. The measured 64³–512³ slope is consistent with this physical intuition; the 4096³ span above assumes the scene remains fringe-dominated.
 
+**4.7.2a Out-of-band bench workflow (`hash-thing-dpkz`).** `bench_svdag_step_deltas_2048` and `bench_svdag_step_deltas_4096` are `#[ignore]`-gated and intended to be driven by a long-running wrapper rather than an agent's default 60 s `cargo test` budget. There is no dedicated binary; the workflow is invoke-the-existing-test with a bigger shell timeout. Expected wall-clock per scale (M1-class; ~1.5× faster on M2 16 GB):
+
+| scale | seed | one warm step | total wall (warmup=0, measured=1) |
+|-------|------|---------------|------------------------------------|
+| 1024³ | ~1 s | ~10–20 s      | ~30 s (fits in the default budget) |
+| 2048³ | ~2 s | 45–90 s       | 2–5 min                            |
+| 4096³ | ~3.5 s | ≥60 s (bench_hashlife_4096 SIGKILL profile) | 2–10 min |
+
+Invocation (bump the shell timeout explicitly — don't rely on the default 2 min `Bash` budget):
+
+```text
+cargo test --release --test bench_svdag bench_svdag_step_deltas_4096 \
+    -- --ignored --nocapture
+```
+
+Agent usage pattern: run as a background task (`run_in_background: true`) so the sweep keeps moving while the bench finishes; the result lands as a task-notification. Capture the printed `misses/step`, `slot appends/step`, and `bytes/step` from the bench output and paste them into `§4.7.2` as the 2048³ / 4096³ entry of the miss-count table, then update the pair-wise slope column.
+
+If a longer wall becomes unavoidable (>10 min) or the bench needs to run unattended across reboots, escalate to a dedicated harness binary — but the `#[ignore]`-gated test with a bumped shell timeout covers the current data-point need.
+
 **4.7.3 `hashlife_macro_cache` budget at 4096³.** The cache is a **single** `FxHashMap<(NodeId, u64), NodeId>` (see `src/sim/world.rs:192` and `src/sim/hashlife.rs:406-422`), keyed on `(node, generation)`. There is no per-level multiplication — it is one map, shared across the whole recursion.
 
 Entry cost: `(NodeId, u64) → NodeId` ≈ 16 B/entry including `FxHashMap` overhead. The cache grows with the product of:
