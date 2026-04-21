@@ -747,6 +747,19 @@ fn bench_raycast_4096() {
     bench_raycast("4096³", 12, 10, BenchCamera::empty_corner());
 }
 
+/// Seeded-terrain variant of the 4096³ raycast bench (hash-thing-e092).
+/// The world is already seeded in `bench_raycast`; this variant swaps the
+/// camera to `BenchCamera::app_spawn(4096)`, which mirrors the in-app spawn
+/// pose and produces the hit-dominated primary-ray traffic the perf paper's
+/// §3.10.5 envelope is derived against. Pair with `bench_raycast_4096`
+/// (empty-corner / sky-heavy, best-case floor) to bracket the envelope
+/// between best-case and typical-scene framerate.
+#[test]
+#[ignore]
+fn bench_raycast_4096_app_spawn() {
+    bench_raycast("4096³ app-spawn", 12, 10, BenchCamera::app_spawn(4096));
+}
+
 /// Combined benchmark: SVDAG build + CA step + rebuild + raycast.
 /// Simulates real gameplay: step the CA, rebuild SVDAG, render.
 #[test]

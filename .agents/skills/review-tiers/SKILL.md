@@ -11,9 +11,12 @@ Select the right code review tier based on diff stats and risk signals. Use when
 
 | Tier | Agents | Target % |
 |------|--------|----------|
-| **trident** | 9 (3 models x 3 lenses) + 3 synthesis | 40% |
+| **trident (code)** | 2 Claude (standard + critical) + 3 Codex (standard + critical + evolutionary) + 1 Gemini (standard) + 2 synthesis (standard + critical) | 40% |
+| **trident (plan)** | 2 Claude (standard + adversarial) + 5 Codex (standard + standard-execution + adversarial + adversarial-dependencies + evolutionary) + 1 Gemini (standard) + 2 synthesis (standard + adversarial) | 40% |
 | **triple** | 2 Claude (standard + critical) + 1 Codex (standard) + 1 Gemini (standard) + 1 synthesis | 40% |
 | **dual** | 1 Claude + 1 Codex (standard) | 20% |
+
+Per hash-thing-2kkt: the evolutionary-Claude lens is dropped across both trident variants (Codex covers the evolutionary angle at ~1/3 the Claude token cost), and the evolutionary synthesis step is skipped in both (single remaining source doesn't need synthesis).
 
 Gemini is rate-limited and fails ~50% of the time. If Gemini fails, proceed with remaining results — don't retry.
 

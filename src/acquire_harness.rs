@@ -72,6 +72,9 @@ pub struct PhaseStats {
     pub surface_acquire_cpu: Option<MetricSnapshot>,
     pub render_cpu: Option<MetricSnapshot>,
     pub render_gpu: Option<MetricSnapshot>,
+    // dlse.2.4 — render-pass (blit + overlay) GPU bracket, distinct
+    // from `render_gpu` which measures the compute pass only.
+    pub render_pass_gpu: Option<MetricSnapshot>,
     pub submit_cpu: Option<MetricSnapshot>,
     pub present_cpu: Option<MetricSnapshot>,
 }
@@ -82,6 +85,7 @@ impl PhaseStats {
             surface_acquire_cpu: MetricSnapshot::from_perf(perf, "surface_acquire_cpu"),
             render_cpu: MetricSnapshot::from_perf(perf, "render_cpu"),
             render_gpu: MetricSnapshot::from_perf(perf, "render_gpu"),
+            render_pass_gpu: MetricSnapshot::from_perf(perf, "render_pass_gpu"),
             submit_cpu: MetricSnapshot::from_perf(perf, "submit_cpu"),
             present_cpu: MetricSnapshot::from_perf(perf, "present_cpu"),
         }
@@ -203,6 +207,7 @@ fn render_phase(label: &str, stats: &PhaseStats) -> String {
         ("surface_acquire_cpu", stats.surface_acquire_cpu),
         ("render_cpu", stats.render_cpu),
         ("render_gpu", stats.render_gpu),
+        ("render_pass_gpu", stats.render_pass_gpu),
         ("submit_cpu", stats.submit_cpu),
         ("present_cpu", stats.present_cpu),
     ] {
@@ -420,6 +425,7 @@ mod tests {
             surface_acquire_cpu: Some(snap(25)),
             render_cpu: Some(snap(26)),
             render_gpu: Some(snap(0)),
+            render_pass_gpu: Some(snap(0)),
             submit_cpu: Some(snap(0)),
             present_cpu: Some(snap(0)),
         });
@@ -427,6 +433,7 @@ mod tests {
             surface_acquire_cpu: Some(snap(3)),
             render_cpu: Some(snap(4)),
             render_gpu: Some(snap(0)),
+            render_pass_gpu: Some(snap(0)),
             submit_cpu: Some(snap(0)),
             present_cpu: Some(snap(0)),
         });

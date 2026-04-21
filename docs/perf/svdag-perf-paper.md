@@ -220,9 +220,136 @@ Harness verdict: "fullscreen WORSE than windowed — unexpected; do not ship ful
 
 **Hypothesis (b) swapchain-pacing refuted.** Bypassing `surface.get_current_texture()` does not eliminate the stall — it just migrates from `acquire` into `queue.submit()`. Total frame budget is unchanged (~26 ms both modes). This is the signature of an implicit fence/wait elsewhere in our frame critical path, not swapchain throttling.
 
-**Surviving hypothesis (c): something in our own submit/encoding pipeline inserts a CPU-side wait.** The most likely candidate on this hardware is the timestamp resolve-and-map path: `GpuTiming::resolve_last_frame` reads back the query buffer for render_gpu reporting, and if the `map_async` completion fence is drained synchronously on the submit path, it forces frame N's submit to wait for frame N-1's GPU completion. That would explain why both windowed and fullscreen show the same ~25-30 ms ceiling, and why the wait migrates when acquire goes away. Next-seat probe: disable or defer timestamp resolve and re-measure; if submit_cpu collapses, this is the culprit.
+**Surviving hypothesis (c): something in our own submit/encoding pipeline inserts a CPU-side wait.** The most likely candidate on this hardware is the timestamp resolve-and-map path: `GpuTiming::resolve_last_frame` reads back the query buffer for render_gpu reporting, and if the `map_async` completion fence is drained synchronously on the submit path, it forces frame N's submit to wait for frame N-1's GPU completion. That would explain why both windowed and fullscreen show the same ~25-30 ms ceiling, and why the wait migrates when acquire goes away.
+
+**Step 3b result (M2 MBA, 256³ dev, `HASH_THING_OFF_SURFACE=1 HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1`, onyx 2026-04-21):**
+
+| metric          | off-surface only | off-surface + timestamp resolve disabled |
+|-----------------|------------------|------------------------------------------|
+| submit_cpu mean | ~26 ms           | **~25 ms (unchanged)**                   |
+| render_cpu mean | ~26 ms           | ~26 ms                                   |
+
+Concrete numbers: `submit_cpu = 25.21/27.48 ms` (p95), steady-state across 4 consecutive log lines with both in-encoder timestamp writes AND the resolve/map path fully bypassed.
+
+**Hypothesis (c) timestamp-fence refuted.** Disabling the full timestamp path does NOT collapse submit_cpu. The ~25 ms stall persists with zero timestamp traffic in the submit queue.
+
+**Conclusion — the stall is real GPU frame time, not a CPU-side fence.** By elimination: (a) compositor refuted step 2, (b) swapchain refuted step 3, (c) timestamp fence refuted step 3b. The only remaining explanation is that the total GPU work per frame at 256³ / 50% on M2 integrated GPU is ~25 ms. The dlse.2.3 measurement of `render_gpu ≈ 0.16 ms` is the **compute pass only**; the blit + HUD + particles + legend render pass and the rest of the frame encoder are not instrumented but together must be dominating frame time at this target resolution (1470 × 891 ≈ 1.3 M pixels, 4 × magnified to 2940 × 1782 by the swapchain blit).
+
+**Revised dlse.2.2 surface.** The next-step hypothesis is no longer "find the swapchain / compositor knob." It is "find where the ~25 ms of GPU work is going in the non-compute-pass portion of the frame." Candidate measurement: add TIMESTAMP_QUERY_INSIDE_ENCODERS brackets around the render pass (blit + overlays) separately from the compute pass. Then decide whether to optimize the blit pipeline (fewer overlay passes, simpler shaders, or run the compute at native target resolution instead of blitting a half-res texture through a fullscreen triangle) or to accept 30 FPS at 256³ on integrated GPU and document render_scale = 0.5 as the M2 shipping default.
 
 **Cold-frame confound check (bead `hash-thing-6hta`, spark 2026-04-20).** The `Perf` ring buffer is a FIFO of 64 samples per metric with no cold-frame skip (`src/perf.rs:61-87`, `src/main.rs:2036` records every frame's `surface_acquire` unconditionally). At ~30 FPS that evicts cold frames within ~2.1 s of wall-clock, so the *first* `log::info` line at `LOG_INTERVAL_SECS = 2.0` s is partially cold-contaminated, but lines 2+ are steady-state. moss's 2026-04-15 repro and spark's 2026-04-19 "three consecutive log lines" observation both sampled steady-state lines, not the opening line. The existing **`C` keybind** (`perf.clear()`, `src/main.rs`) is the correct drain-and-measure mechanism when isolating warm samples is needed. Conclusion: the confound exists in principle but does not explain the dlse.2.2 ~25 ms sustained measurement.
+
+### 3.9 Render-pass attribution (dlse.2.4) — REVISES the §3.8 conclusion
+
+Step 4 of the dlse.2.2 investigation adds a second `TIMESTAMP_QUERY_INSIDE_ENCODERS` bracket around the blit + particle + HUD + hotbar + legend render pass, in parallel with the existing compute-pass bracket. This is the direct follow-up proposed at the end of §3.8 — attribute the ~25 ms frame budget to a concrete pass. The result REVISES the §3.8 conclusion.
+
+**Instrumentation (onyx 2026-04-21).** Two independent `GpuTiming` instances with distinct query sets / resolve buffers / readback buffers, each honouring the existing `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` kill switch. Single `device.poll(Poll)` per frame drives both. New metric `render_pass_gpu` in `Perf` alongside the historical (compute-only) `render_gpu`. `acquire_harness.rs` extended with a parallel column so dlse.2.2 step-2-style windowed/fullscreen captures don't silently drop the new data.
+
+**Measurement — M2 MBA 16 GB, 256³ dev, default 50 % render scale, windowed, steady-state (lines 3–5 of a 15 s run):**
+
+| metric                   | mean     | p95      | samples |
+|--------------------------|----------|----------|---------|
+| `render_gpu` (compute)   | 0.08 ms  | 0.15 ms  | ~60     |
+| `render_pass_gpu` (blit+overlays) | 0.08 ms | 0.16 ms | ~60 |
+| **total GPU work**       | **~0.16 ms** | ~0.31 ms | — |
+| `submit_cpu`             | 0.34 ms  | 0.45 ms  | ~60     |
+| `present_cpu`            | 0.02 ms  | 0.03 ms  | ~60     |
+| `surface_acquire_cpu`    | 24.81 ms | 30.80 ms | ~60     |
+| `render_cpu` total       | 25.54 ms | 32.75 ms | ~60     |
+
+**REVISION — the §3.8 "real GPU frame time" conclusion was wrong.** Direct GPU instrumentation shows the two passes together consume ~0.16 ms of GPU work per frame, not ~25 ms. The `render_pass_gpu` metric specifically tops out below 0.2 ms even at p95. The ~25 ms ceiling is NOT GPU-bound.
+
+The 25 ms lives where the step-2/3/3b elimination said it couldn't: in `surface.get_current_texture()`. The new brackets rule in what earlier steps only proved by absence — the GPU is idle for roughly 24 of every 25 ms, CPU-blocked at the swapchain handoff. The previous "by elimination" inference collapsed because it assumed an enumeration of three hypotheses (compositor / swapchain-pacing / timestamp-fence) was exhaustive. It wasn't. A fourth cause — **driver/OS-level vsync pacing** that holds the drawable even when the GPU is free — fits every datum: windowed, fullscreen, with or without timestamp traffic, on-surface or off-surface (in off-surface mode the block migrates to `submit_cpu` at ~25 ms even though the new `render_pass_gpu` bracket still reads ≤0.3 ms, proving the stall in that mode is not GPU work either).
+
+**Off-surface comparison — submit_cpu stall is NOT render-pass work either:**
+
+| metric                   | windowed   | `HASH_THING_OFF_SURFACE=1` |
+|--------------------------|------------|----------------------------|
+| `render_pass_gpu` mean   | 0.08 ms    | 0.15 ms                    |
+| `render_pass_gpu` p95    | 0.16 ms    | 0.34 ms                    |
+| `submit_cpu` mean        | 0.34 ms    | 25–28 ms                   |
+| `surface_acquire_cpu`    | 24.81 ms   | 0.00 ms                    |
+
+The off-surface `render_gpu` (compute) bracket reports inflated numbers (~9–26 ms mean). `ticks_to_duration` is a pure end-minus-start subtraction on GPU-reported tick counts (`crates/ht-render/src/renderer.rs:344`), so the inflation is a real GPU-time delta *between* the two writes — not a Rust-side callback ordering artifact. The most plausible mechanism is that Metal attributes inter-command-buffer waits to the GPU command next in flight: off-surface, the compute-pass begin-timestamp can sit through a queue-depth stall that the render-pass begin-timestamp, executing later in the same command buffer, has already cleared. The render-pass bracket stays under 0.35 ms in both modes and correlates better with the known-tiny render-pass workload, so we treat it as the more reliable reading here; the compute-bracket variance is an open item, not a pinned conclusion (follow-up bead).
+
+**What this means for dlse P0.** The 30 FPS ceiling on M2 at 256³ is not a compute, not a blit, not an overlay, not a shader problem. Optimizing anything in the render encoder buys nothing. The actual knob is swapchain-side pacing — something like `maximumDrawableCount`, `displaySyncEnabled`, or `presentsWithTransaction` on the underlying `CAMetalLayer` — which wgpu 29.0.1 does not expose through its `SurfaceConfiguration`. Candidates going forward (any of which is a standalone investigation, not in scope for dlse.2.4):
+
+1. **Raise `desired_maximum_frame_latency` from 2 to 3.** Gives the swapchain one more drawable in flight, which on Metal historically unblocks the kind of acquire stall seen here. Cheap to try (one-line change). Prior attempt under dlse.2.2 went the opposite direction (*latency=1*, see `.ship-notes/` history); latency=3 has not been probed.
+2. **Direct `CAMetalLayer` access.** wgpu exposes `unsafe { surface.as_hal::<wgpu::hal::metal::Api, _, _>(|hal| hal.raw_device().clone()) }` on Metal; via `metal-rs` we can set `maximumDrawableCount=3` and `displaySyncEnabled=NO`. Heavier — requires a Metal-only code path and a feature flag.
+3. **Accept 30 FPS on integrated M-series and document it.** The GPU is already idle; rendering the same scene at 60 FPS would require the driver to hand us drawables faster, which is out of our reach at the wgpu layer. Ship notes: "M2 integrated runs at 30 FPS in windowed mode; the bottleneck is CAMetalLayer pacing, not our renderer."
+
+dlse.2.2 should be **reopened** for option 1 (fast) and a new bead filed for option 2 (Metal-specific). The §3.8 closure note was premature; this is a swapchain-layer bug, not a renderer-compute bug.
+
+### 3.10 Scaling the model to 4096³ (`hash-thing-ivms`)
+
+Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
+
+**3.10.1 Octree depth.** `log₂(4096) = 12`, vs `log₂(256) = 8` — four extra levels of descent. The SVDAG interior-node encoding (§3.2) is unchanged (36 B), so depth scaling enters the model through traversal step count (§3.10.2) and reachable-set size (§3.10.3) only.
+
+**3.10.2 Per-ray traversal at 4096³.** The stue.5 harness measured ~15 mean DDA steps/ray at 256³ default-spawn (§3.3). Two scaling forces:
+
+- **Tree-walk machinery.** Descend + step-past + pop is roughly linear in tree height at fixed ray length; 12/8 = 1.5× on the descent chain.
+- **Ray coverage.** Render target stays at 960×600 (render scale 0.5 on a 1920×1200-class window), so primary-ray count is unchanged at ~576k. But a 4096³ world fills the frustum rather than occupying a corner; hit rate on horizontal camera poses approaches 100 %, shifting the mean away from the sky-heavy all-rays distribution and toward the hit-only distribution.
+
+**Measured at 4096³** via `tests/bench_depth_histogram.rs::depth_histogram_4096` (onyx 2026-04-21, hash-thing-cz0r), same three poses as stue.5:
+
+| Pose | 256³ mean | 4096³ mean | Ratio | 4096³ p95 / max |
+|---|---|---|---|---|
+| default-spawn | 14.99 | **25.90** | 1.73× | 62 / 235 |
+| looking-down | 6.77 | **16.76** | 2.48× | 26 / 42 |
+| horizontal-mid | 13.21 | **24.20** | 1.83× | 61 / 231 |
+
+The scaling exponent for depth in linear world size sits at `log(1.73)/log(16) ≈ 0.20` for default-spawn and up to `log(2.48)/log(16) ≈ 0.33` for looking-down — materially flatter than the pre-measurement ~0.8 projection (`22/15 → ~0.4` already under; `28/15 → ~0.6` upper was clearly over). The "descend + step-past + pop" chain grows with tree height but the *step-past + pop* component does not scale one-for-one with depth: most additional levels at 4096³ are descended through coarse empty-space prefixes that collapse to shared ancestor chains in the SVDAG, adding log-scale steps rather than linear.
+
+Implication for §3.10.5: the base-case per-frame step count is **~576k × 26 ≈ 15M**, not the 20M used in the pre-measurement envelope. Downstream bandwidth and latency numbers contract correspondingly (see §3.10.5 post-measurement column).
+
+**3.10.3 Reachable DAG size and working set.** Measured SVDAG node counts (`tests/bench_svdag.rs` comment, 2026-04-12):
+
+| Scale | Nodes | Size | Per-linear-double ratio |
+|---|---|---|---|
+| 64³   | 640    | 0.02 MB | — |
+| 256³  | 6,773  | 0.23 MB | ~3.3× per 2× linear (early growth) |
+| 512³  | 20,228 | 0.69 MB | ~3.0× per 2× linear |
+| 1024³ | 61,399 | 2.11 MB | ~3.0× per 2× linear |
+| **4096³ (seeded, pre-CA)** | **548,179** | **~18.8 MB** | **~3.0× per 2× linear (projection confirmed)** |
+
+From 256³ onward the exponent is stable at `log(3)/log(2) ≈ 1.58` in linear world size. Confirmed by one-shot `bench_hashlife_4096` seed (onyx 2026-04-21): 548k reachable nodes at 4096³ seeded terrain — exactly on the `L^1.58` projection (1024³ × 4^1.58 ≈ 551k). Total serialized DAG: ~18.8 MB (548k × 36 B).
+
+Warm-run post-CA node count was not measured — the test runner's 60-second ignore-mode ceiling killed the first hashlife step before it completed, so the warm (post-step) reachable-node count and macro-cache size remain unmeasured at 4096³. The cold-seeded count is a lower bound; CA churn grows the reachable set by some factor (at 256³, warm grows ~8 % vs cold; scaling is not yet characterized).
+
+**19 MB exceeds the M1 L2 (4 MB) by ~5×** for the seeded pre-CA DAG alone; post-CA warm-set will be somewhat larger (up to ~25 MB projected under a typical-growth factor). At 256³ the entire reachable DAG fit in L2 with margin (§3.5); at 4096³ the whole set does not. The relevant question shifts from "whole-DAG-resident" to *working-set on the active ray frontier*: warp-coherent primary rays touch ~2–4 sibling chains at any given descent depth, so the instantaneous hot set is *heuristically* ~1–4 MB — still L2-resident if the heuristic holds. The cold tail of distant / shadow / back-side nodes spills to DRAM. **This hot-set estimate is load-bearing for §3.10.4 below but is not directly measured**; it is an order-of-magnitude guess from warp width × expected descent depth × node size, not an inferred bound.
+
+**3.10.4 Per-step cost regime.** At 256³ an 80/20 L1/L2 mix gave ~9 ns/step (§3.3). At 4096³, the regime plausibly shifts toward L2/DRAM because the whole DAG spills L2. As a speculative mid-point between "warp coherence keeps the 80/20 mix intact" (optimistic) and "cache pressure dominates" (pessimistic), posit a 50/35/15 L1/L2/DRAM mix, giving `0.5×6 + 0.35×22 + 0.15×175 ≈ 3.0 + 7.7 + 26.3 ≈ 37 ns/step`, ~4× the 256³ per-step cost.
+
+This mix is **speculative**, not derived. The actual mix at 4096³ depends on how tightly warp-coherent primary rays cluster in the reachable DAG, which the model has no direct lever on. The two bracketing cases:
+- **Optimistic (mix stays at 80/20 because warp coherence keeps the hot ancestor chain L1-resident):** per-step cost ~9 ns, unchanged from 256³.
+- **Pessimistic (mix shifts to 30/40/30 because the larger whole-DAG forces more L2 evictions):** per-step cost ~60 ns, ~7× the 256³ cost.
+
+§3.10.5's envelope and likely-measurement predictions are re-derived under all three scenarios (optimistic / mid / pessimistic) rather than only the mid one, so the user of this section can pick the assumption they consider most plausible.
+
+**3.10.5 Frame cost envelope at 4096³.** Holding render scale at 50 % (960×600, 576k rays) on the M1 MBA target. Per-frame node traffic (bandwidth ceiling, unaffected by cache mix), **post-cz0r measurement with default-spawn mean = 26 steps/ray**: `576k × 26 × 36 B ≈ 540 MB`, `540 MB / 68 GB/s ≈ 7.9 ms` raw, `÷ 0.6 utilization ≈ 13.2 ms` envelope. (Horizontal-mid at mean=24 gives a near-identical 12.2 ms envelope; looking-down at mean=17 gives 8.6 ms — the worst default-spawn case drives the budget.)
+
+Per-step-latency path, spanning the three §3.10.4 scenarios (rays grouped into 32-wide SIMD groups on M1; the divisor assumes groups descend together so shared ancestor loads are not duplicated):
+
+| Scenario | ns/step | Envelope `576k × 26 × ns / 32` | Bandwidth envelope | Both agree? |
+|---|---|---|---|---|
+| Optimistic (80/20, coherence holds) | 9 | **4.2 ms** | 13.2 ms | no — bandwidth not the bind |
+| Mid (50/35/15, speculative) | 37 | **17.3 ms** | 13.2 ms | near |
+| Pessimistic (30/40/30, coherence breaks) | 60 | **28.1 ms** | 13.2 ms | no — latency dominates |
+
+**Likely-measurement span:** **~1–17 ms / frame** depending on which scenario holds, not a single tight number. The paper's strongest single prediction is the **17 ms confident upper bound** (saturates the 60-FPS budget — useful as a go/no-go threshold). Anything below ~10 ms would leave headroom for sim + blit + overlay + present; anything above ~10 ms forces a trade-off. Step-count measurement (cz0r) landed at 26 — within the 22–28 pre-measurement band — so the envelope numbers shift by less than 1 ms from the ivms-era draft and the scenario spread remains the operative uncertainty, not the step count.
+
+Two cross-checks on the span:
+- **256³ analogy.** §3.6 noted the 7.6 ms envelope at 256³ over-predicted a 0.24 ms measurement by ~30×. Applying the same ratio to the mid-scenario envelope gives **~0.5 ms** at 4096³ — improbably fast relative to the seven-fold step-count increase, which suggests the 30× ratio itself will attenuate under 4096³ cache pressure. §3.6's own explanation (items 2+3: L1 reuse, warp coherence) is exactly what breaks at 4096³. **So: do not anchor on "0.5 ms" as a likely-measurement.** Treat the 30× only as evidence that the 256³ envelope was conservative, not as a transferable factor.
+- **Empty-corner bias.** `bench_raycast_4096` uses `BenchCamera::empty_corner()` — rays exit rapidly through sparse air. Measured numbers from that harness are a *floor*, not a typical-scene prediction. The model-envelope comparison should use a seeded-terrain scene closer to the demo target; adding one to the bench-harness is an ivms follow-up filed in §6.
+
+**Net prediction: 4096³ raycast on M1 MBA falls somewhere in [optimistic ~4 ms, pessimistic ~17 ms].** A one-shot run on M1 MBA hardware discriminates between the three scenarios.
+
+**3.10.5.1 Post-measurement (hash-thing-e092, 2026-04-21).** Seeded-terrain `bench_raycast_4096_app_spawn` on M2 16 GB measured **0.30 ms mean / 0.22 ms p50 / 1.06 ms p95** across 10 frames, SVDAG=18.8 MB/548k nodes. M1-implied at the standard 1.5× factor: ~0.45 ms mean. This lands ~10× below the 4 ms optimistic scenario — the measurement refutes all three §3.10.4 cache-mix scenarios as calibrated upper bounds. The operative explanation is the same as at 256³ (§3.6): warp-coherent primary rays keep the hot ancestor chain L1-resident at a few KB, so the "whole-DAG spills L2" framing in §3.10.3 never becomes the bottleneck. The 17 ms confident upper bound stands as a go/no-go threshold (measurement < bound by a factor of ~38), but the interior scenario labels (4 / 17 / 27 ms) are not predictive. For the next scale jump (8192³, §4.7.4 streaming threshold), re-derive the envelope from warp-width + ancestor-chain heuristics rather than a cache-mix fraction — the latter has now over-predicted by >10× at two scales.
+
+**3.10.6 Confirmation path (pre-e092, kept for context).** `bench_raycast_4096` already exists in `tests/bench_gpu_raycast.rs` (`#[ignore]`) and runs 10 samples, but it uses `BenchCamera::empty_corner()` (optimistic). The confirmation path was two runs:
+1. The existing empty-corner `bench_raycast_4096` — floor.
+2. A seeded-terrain variant at 4096³, closer to the demo target — measurement comparable against the §3.10.5 envelope (now landed as `bench_raycast_4096_app_spawn`, see §3.10.5.1).
 
 ---
 
@@ -375,6 +502,88 @@ Our SVDAG is **dynamic**, not static. The literature has two published points on
 
 **Why this section exists.** Conversations around the perf paper occasionally lean on "SVDAG is static" framing from the Kämpe paper. That framing is wrong for our implementation and has architectural implications (edit latency, streaming design). This section pins the distinction so later sections (§5, §6) don't have to re-establish it.
 
+### 4.7 Scaling the SVDAG ↔ memo interaction to 4096³ (`hash-thing-ivms`)
+
+The §4.1–§4.6 numbers are all at 256³ (with a 64³ cross-reference). At 4096³ (edward's actual demo target) the architectural story holds — shared NodeStore, siloed render-side cache, O(new-content) diff upload — but the bounded-overhead arguments need to be re-run at the new size before ivms can close.
+
+**4.7.1 Reachable DAG and render-side bookkeeping at 4096³.** Scaling from the empirical node counts (§3.10.3):
+
+| Scale | Reachable nodes | DAG size | `offset_by_slot` | `id_to_offset` |
+|---|---|---|---|---|
+| 256³ (measured) | 6,773 | 0.2 MB | ~0.3 MB | ~0.08 MB |
+| 1024³ (measured) | 61,399 | 2.1 MB | ~2.9 MB | ~0.7 MB |
+| **4096³ (seeded, measured)** | **548,179** | **18.8 MB** | **~26 MB** | **~6.6 MB** |
+| 8192³ (projected `L^1.58`) | ~1.65M | ~57 MB | ~80 MB | ~20 MB |
+
+`offset_by_slot` is `FxHashMap<[u32; 9], u32>` ≈ 48 B/entry including table overhead; `id_to_offset` is `FxHashMap<NodeId, u32>` ≈ 12 B/entry. The projected entry counts in this table are steady-state (post-compaction); `Svdag::compact` (`src/main.rs:882`) triggers at `stale_ratio > 0.5`, so the pre-compaction peak is up to ~2× the steady-state number. Steady-state at 4096³ ≈ 32 MB total render-side bookkeeping; pre-compaction peak ≈ 64 MB.
+
+**Verdict: comfortably resident on 8 GB M1 MBA at 4096³.** Combined render-side bookkeeping at 4096³ is ≤ ~64 MB including compaction peaks — well under 2 % of the ~4–5 GB available-to-app budget. Not a binding constraint, and not the motivation for streaming. (Warm-run post-CA reachable may be ~10–30 % larger than the seeded measurement; the bookkeeping still has two-orders-of-magnitude headroom.)
+
+**4.7.2 Memo churn at 4096³.** Three measured warm-step miss counts (`bench_svdag_step_deltas_*`, onyx 2026-04-21 slc1):
+
+| Scale | Warm misses/step (measured) | Measured steps | Source |
+|---|---|---|---|
+| 64³ | 411.8 | 40 | `bench_svdag_step_deltas_64` |
+| 256³ | 1,847.1 | 40 | `bench_svdag_step_deltas_256` |
+| 512³ | 2,295.8 | 20 (confirmed twice) | `bench_svdag_step_deltas_512` |
+
+The per-doubling slopes:
+- 64³ → 256³ (2 doublings): slope ≈ **1.08** per `log₁₀ L` — matches the prior single-ratio value.
+- 256³ → 512³ (1 doubling): slope ≈ **0.31** per `log₁₀ L` — bends sharply sub-linear.
+
+Least-squares fit across all three: `log₁₀(misses) ≈ 0.863 · log₁₀(L) + 1.089`, i.e. ~12.3 × `L^0.863`. **The saturation is real, not a single-ratio artifact** — the 512³ measurement is confirmed twice to 0.01 % and reflects the `hashlife_macro_cache` hitting steady-state reuse rather than seeding new (node, stride) pairs at the pace of world volume. Physical intuition: at larger scales, more of each warm step's recursion lands on macro-cells already seen in prior steps, so marginal miss rate drops.
+
+Projecting to 4096³ (`L/256 = 16`) across three framings:
+
+- **Fit extrapolation (assumes slope holds):** `12.3 × 4096^0.863 ≈ 14.8k misses/step`.
+- **1.08-slope pessimism (assumes saturation reverses):** `1,847 × 16^1.08 ≈ 37k misses/step`.
+- **Continued bend (assumes `256→512` slope 0.31 holds at larger scales):** as low as `2,296 × 8^0.31 ≈ 4.3k misses/step`.
+
+**Revised honest span: ~4k–40k misses/step at 4096³**, versus the prior two-point `20k–80k`. The upper end shrinks because the three-point evidence actively refutes `L^1.4+`; the lower end widens because the 512³ measurement opens the possibility of continued saturation. Applying the measured ~30 % slot-append ratio (1,847 misses → 544 SVDAG slot appends at 256³): **~1.2k–12k slot appends/step at 4096³**, translating to **~40 KB–440 KB upload per step** (4 B slot-0 header + slots × 36 B).
+
+At 60 FPS that is **~2–26 MB/s upload**, still under 0.1 % of the 68 GB/s memory-bandwidth ceiling. **Edward's diff-compressibility hypothesis holds at 4096³** across the whole revised band — with more headroom than the prior two-point projection suggested.
+
+Two caveats on the exponent:
+- **Out-of-band scales still unmeasured.** The fit covers 64³–512³. At 2048³, a single warm step accumulated >15 min of CPU under this harness before being killed — so the 4hkq/slc1 out-of-band benches (`bench_svdag_step_deltas_2048`, `_4096`) need a measurement workflow that tolerates 10–30 min wall per scale, which the current CI-style `#[ignore]` harness does not provide. Filed as `hash-thing-slc1` follow-up.
+- **Scene dependence.** A pathological scene with uniformly-active CA across the whole 4096³ volume would scale misses closer to `L³` (volume), giving ~470k misses/step. Our default terrain+water+sand scene is nowhere near that — active CA is concentrated on a thin fringe (water surface, sand-fall column) whose area scales well below `L²`. The measured 64³–512³ slope is consistent with this physical intuition; the 4096³ span above assumes the scene remains fringe-dominated.
+
+**4.7.3 `hashlife_macro_cache` budget at 4096³.** The cache is a **single** `FxHashMap<(NodeId, u64), NodeId>` (see `src/sim/world.rs:192` and `src/sim/hashlife.rs:406-422`), keyed on `(node, generation)`. There is no per-level multiplication — it is one map, shared across the whole recursion.
+
+Entry cost: `(NodeId, u64) → NodeId` ≈ 16 B/entry including `FxHashMap` overhead. The cache grows with the product of:
+
+- **Distinct NodeIds queried** as macro-step inputs. Bounded above by reachable-node count (~548k at 4096³ seeded).
+- **Distinct `generation` stride values** the recursion walks. Macro-stepping uses power-of-2 generation strides; tree height 12 means up to 12 distinct stride values that any given node could be queried against. In practice the recursion pattern places each node at one dominant stride level (the level its subtree height matches), so the *observed* distinct-strides-per-node is closer to 1–2, not 12.
+
+Plausible bands at 4096³:
+- **Tight lower bound (one entry per reachable node, single stride dominant):** ~548k × 16 B ≈ **9 MB**.
+- **Pathological upper bound (every `(node, stride)` pair populated for all 12 strides):** ~548k × 12 × 16 B ≈ **105 MB**. This overcounts — it assumes every node is queried at every stride level, which is not how the recursion actually walks.
+- **Typical steady-state: not derivable from scaling alone.** The observed distinct-strides-per-node is a scene + recursion-pattern property, measurable only at runtime. No point-estimate here; **this is an ivms follow-up** (§6) for size instrumentation.
+
+**Verdict: macro-cache is the first subsystem to watch at 4096³, but the earlier "20–50 MB typical" claim was ungrounded.** The floor is ~9 MB; the pathological ceiling is ~105 MB; the typical steady-state is a measurement, not a derivation. 8 GB budget survives comfortably in the plausible band (both ends <2 % of available-to-app budget), so the macro-cache is *unlikely* to be the binding constraint — but "unlikely" is intuition, not proof, until §6's follow-up lands. Instrumenting a size histogram on `hashlife_macro_cache` is filed accordingly.
+
+**4.7.4 Streaming threshold.** Combining §3.10 envelope + §4.7 budgets (all numbers are either measured, marked as model extrapolations, or intuition — note the columns):
+
+| Scale | Reachable DAG | Macro-cache (plausible band) | Raycast envelope | Resident on 8 GB? |
+|---|---|---|---|---|
+| 256³ | 0.2 MB (measured) | <10 MB (implied) | ~7.6 ms (model) / 0.24 ms (measured) | yes (margin) |
+| 1024³ | 2.1 MB (measured) | unmeasured | ~9 ms (interpolated) | yes (margin) |
+| **4096³** | **18.8 MB (seeded, measured)** | **9–105 MB (floor/pathological, §4.7.3)** | **0.30 ms measured M2 / ~0.45 ms M1-implied (e092); §3.10.5 span was 4–17 ms predicted** | **yes** |
+| 8192³ | ~57 MB (projected) | unbounded analytically | ≥ 25 ms (projected) | probably, not verified |
+| 16384³ | ~170 MB (projected) | — | DRAM-bound | unclear |
+
+**Soft threshold: 8192³ is where streaming becomes plausibly mandatory, but this is intuition, not a derived result.** The itemized steady-state memory model at 8192³ (~57 MB DAG + ~80 MB `offset_by_slot` + ~20 MB `id_to_offset` + indeterminate macro-cache) is still only a few hundred MB absolute — nowhere near an 8 GB ceiling on paper. What tips the argument is unmodeled memory: the CPU-side `NodeStore` active region (not quantified in this paper), view-shift churn for a streaming camera, pathological CA states that push the macro-cache toward its ceiling, and co-resident wgpu driver state. None of those is pinned down numerically; the "8192³ streaming cutover" call is therefore a *reasoned intuition*, not a gap-report number. If the demo target ever moves above 4096³, this threshold needs a real derivation.
+
+**4096³ fully resident on 8 GB M1 MBA is a stronger claim** because the dominant memory consumers are all measured or tightly bounded: 18.8 MB DAG (measured), ≤ 64 MB bookkeeping (steady + compaction peak), 9–105 MB macro-cache (bounded within a known band). Sum stays under ~170 MB — well under 1 GB — with room for unmodeled overheads.
+
+**4.7.5 Summary for 4096³ on M1 MBA.**
+- Reachable DAG: 18.8 MB seeded, measured.
+- Upload bandwidth: fine (~12–54 MB/s, <0.1 % of memory ceiling).
+- Render-side maps: fine (≤ 64 MB steady-state + compaction peak).
+- Macro-cache: bounded 9–105 MB, typical steady-state unmeasured.
+- Raycast frame cost: span of 4–17 ms across the three §3.10.4 cache-mix scenarios; no single scenario is anchored to evidence.
+- **CPU step cost: the binding concern.** Scales directly with active-region misses; macro-cache short-circuits are load-bearing. The bench harness SIGKILLed a single 4096³ hashlife step at the 60-second ignore-mode ceiling — step cost is already ≫ per-frame budget without further optimization. ivms doesn't re-measure step cost; `hash-thing-hashlife-stride` is the adjacent bead that would.
+- Streaming not needed at 4096³ (strong claim). 8192³ *probably* needs streaming, but that call is intuition.
+
 ---
 
 ## 5. Gap report
@@ -393,6 +602,11 @@ Format (placeholder):
 | Step (memo short-circuit rate, 256³ warm) | **~72% short-circuit** (hits + empty + fp) on M2 16 GB (`bench_svdag_step_deltas_256`, §4.2) | Not yet in §3 (memo model) | N/A until modelled | Raw hit rate ~55%; skips absorb another ~17%. |
 | Step (memo miss / cold gen) | TODO | TODO | TODO | TODO |
 | Surface acquire (windowed, 256³ / 50%) | **~25 ms/frame** on M2 16 GB (spark 2026-04-19, three consecutive log lines) | Not yet in §3 (surface/presentation model is §3.8 TODO) | N/A until modelled | **This is the real 30 FPS bug.** Owned by `hash-thing-dlse.2.2`. |
+| Raycast traversal (**measured**, 4096³ / 50%, seeded terrain) | `bench_raycast_4096_app_spawn` (onyx 2026-04-21, e092) on M2 16GB: **0.30 ms mean / 0.22 ms p50 / 1.06 ms p95 / ~3379 fps** over 10 frames. M1-implied at 1.5× factor: ~0.45 ms mean. | 4–17 ms span (§3.10.5 pre-measurement three-scenario envelope) | **~8-50× model over-prediction** on M2, ~6-35× on M1-implied | The same shape as the 256³ gap (§3.6, ~30× over-prediction): the §3.10.4 cache-mix pessimism (50/35/15 or 30/40/30) never materializes in the seeded-terrain scene. Warp-coherent primary rays reuse the ancestor chain in L1 aggressively; the "whole-DAG spills L2" concern in §3.10.3 is irrelevant once the hot working set is a few KB. The 17 ms confident upper bound stands as a go/no-go threshold (measurement < bound), but the scenario-span approach over-predicts by more than a decade at 4096³. **Primary-ray-only rendering at 4096³ is comfortable on M2, likely comfortable on M1 MBA.** Remaining budget headroom (16.7 ms − ~0.5 ms ≈ 16 ms on M1) is the real number available for sim + secondary rays + present overhead. |
+| Mean DDA steps/ray (**measured**, 4096³, three poses) | `tests/bench_depth_histogram.rs::depth_histogram_4096` (onyx 2026-04-21, cz0r): default-spawn=**25.90**, looking-down=**16.76**, horizontal-mid=**24.20** | ~22–28 steps/ray at default-spawn (pre-cz0r §3.10.2 projection) | Model landed dead-center of the band (26 vs 22–28 projection); §3.10.5 envelope shifted by <1 ms | Pre-measurement projection assumed `log(depth)/log(linear)` exponent ~0.8 (cubing vs linear). Measured exponent: 0.20–0.33 across poses — much flatter. Implication: the "step-past + pop" chain is dominated by coarse-ancestor descent that shares across rays, not by raw tree height. Worst-case p95=62, max=235 — well under the shader's 4096³ step budget (`max(1024, 4096×8) = 32,768`, `crates/ht-render/src/svdag_raycast.wgsl:330-332`, no `exhausted` rays in the harness), confirming no tuning needed. |
+| SVDAG incremental upload (**predicted**, 4096³ warm) | Not yet measured at 4096³; 64³/256³/512³ three-point fit lands at ~12.3 × `L^0.863` (onyx 2026-04-21, slc1). | ~40 KB–440 KB/step → ~2–26 MB/s at 60 FPS (§4.7.2 revised band) | N/A | Three measured miss-count scales (64³=412, 256³=1847, 512³=2296) narrow the prior `[0.8, 1.4]` exponent band. 2048³ warm-step accumulated >15 min CPU under current harness before stop — `bench_svdag_step_deltas_2048/_4096` need an explicit long-timeout workflow, filed as slc1 follow-up. |
+| Reachable DAG size (**measured**, 4096³ seeded pre-CA) | **548,179 nodes / 18.8 MB** (bench_hashlife_4096 seed, onyx 2026-04-21) | ~550k / ~20 MB projected from `L^1.58` exponent on 256³/512³/1024³ | **model vs measurement: <1% gap** | Exponent projection confirmed by one-shot. Warm-run post-CA count was not measured (60s test-runner SIGKILL on first step); warm is expected ~10–30 % above seeded. |
+| `hashlife_macro_cache` size (**predicted**, 4096³) | Not yet measured | Plausible band 9–105 MB; typical steady-state unmeasured (§4.7.3) | N/A | Needs `HashlifeStats` size histogram — not currently exposed. Pathological ceiling is bounded because the cache is a single `FxHashMap<(NodeId, u64), NodeId>`, not a per-level stack. |
 
 A gap of **>2×** is a flag for a bead. A gap of **>10×** is a P0 candidate. A gap near **1×** means the model agrees with reality and we can either ship at that perf or rederive the model with more aggressive techniques.
 
@@ -407,6 +621,12 @@ Track here so they don't get lost between revisions.
 3. Does the per-cell tagged-cell encoding limit SVDAG compression vs an externalized attribute table (Dolonius)? Quantify.
 4. What is the right SVDAG node budget for an 8 GB unified-memory machine, given that the OS, browser, and app share that pool?
 5. Is there a useful intermediate: a coarser SVDAG for far-field rays plus a fine-grained one for near-field? Cost/benefit on M1.
+6. GPU spatial memo questions — see §8.5. Summarized: key-shape rotation, NodeStore compaction remap, CPU/GPU hybrid level split, warp-divergence from rule-table branches, macro-cache GPU analogue.
+7. **ivms follow-up.** Actual reachable DAG size at 4096³ on the default terrain + water + sand scene. §3.10.3 / §4.7.1 predict ~600k nodes / ~22 MB from the 256³/512³/1024³ exponent; a `bench_svdag_step_deltas_4096` one-shot confirms. One-line test addition (narrow-fix lane).
+8. ~~**ivms follow-up.** Mean DDA steps/ray at 4096³ on the default-spawn primary-ray sample. §3.10.2 predicts ~22–28; measurement via `bench_depth_histogram.rs` at level 12 (variant of the existing 256³ harness).~~ **Resolved 2026-04-21 (cz0r):** measured 25.90 (default-spawn) / 16.76 (looking-down) / 24.20 (horizontal-mid) — dead-center of the 22–28 band. See §3.10.2.
+9. **ivms follow-up.** `hashlife_macro_cache` steady-state size at 4096³ with water + sand CA. §4.7.3 predicts 20–50 MB typical against a 230 MB ceiling; needs a size-histogram field added to `HashlifeStats` (not currently exposed). First subsystem to pinch the 8 GB budget if it does.
+10. ~~**ivms follow-up.** Does the 30× model-vs-measurement ratio seen at 256³ (§3.6) persist at 4096³, or does it attenuate toward ~10× as L2 pressure rises?~~ **Resolved 2026-04-21 (e092):** ratio *widens* to ~40× on M2 / ~30× on M1-implied at 4096³. Cache-mix pessimism is not operative; warp-coherent L1 reuse continues to dominate. See §3.10.5.1. New open question: re-derive the envelope using warp-width + ancestor-chain heuristics and check whether *that* model predicts the 0.3 ms measurement within a factor of 2–3.
+11. ~~**ivms follow-up.** Memo-miss scaling exponent at 4096³. §4.7.2 extrapolates `L^1.08` from the single 64³ → 256³ ratio; if the true exponent bends toward `L^1.5` (active fringe growing closer to surface-area) or `L^2` (full surface-area) at larger worlds, step cost becomes the binding constraint at 1024³ / 2048³ — **already at those scales, not 4096³ onward**. The upload-bandwidth story would also shift from "free" to measurable. One `bench_svdag_step_deltas_4096` run adds a third data point and discriminates between the exponent bands.~~ **Partially resolved 2026-04-21 (slc1):** three measured scales (64³=412, 256³=1847, 512³=2296 misses/step) establish the exponent bends *favorably* — pair-wise slope drops from 1.08 (64³→256³) to 0.31 (256³→512³), three-point fit ≈ `L^0.863`. The binding-constraint concern (1.5+ exponent blowing up at 1024³+) is **refuted by the 512³ measurement**. Revised 4096³ band: 4k–40k misses/step (vs prior 20k–80k). See §4.7.2. **Remaining open:** out-of-band 2048³/4096³ measurement — one 2048³ warm step accumulated >15 min CPU before being stopped, so the existing `#[ignore]` harness is not the right workflow at those scales. Filed as a slc1 follow-up bead for a long-timeout measurement pass.
 
 ---
 
@@ -416,7 +636,224 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 
 ---
 
-## 8. Revision log
+## 8. GPU spatial memo feasibility
+
+First pass (2026-04-21, bead `hash-thing-abwm.1`, spark). Pre-implementation architecture sketch for moving hashlife spatial memoization onto the GPU. No code has been written; this section decides whether to write code.
+
+### 8.1 Problem restatement
+
+The hashlife memo today (`src/sim/hashlife.rs:326`) is `FxHashMap<(NodeId, parity), NodeId>`: given a store `NodeId` and the sim's current parity (`generation % 2`), look up the memoized step result. On miss, recurse into children, apply the Margolus 2³ block rule at the base case, memoize, return. §4.2 measured ~1,847 cache misses / step at 256³ steady-state with ~55 % hit rate and ~72 % combined short-circuit rate (hits + empty + fixed-point). Each miss currently drives a serial descent on the CPU.
+
+Three CPU-side bottlenecks motivate a GPU port:
+
+1. **Recursion is serial.** The CPU walks one path at a time; siblings at the same octree level can't share work.
+2. **Miss-path CA evaluation is cell-by-cell.** The base case applies the Margolus rule to 512 cells (8 × 2³ block) for every miss; this is embarrassingly parallel but CPU-SIMD-only today.
+3. **NodeStore is already GPU-resident for raycast.** The `Svdag::nodes` buffer holds the reachable set of the octree for the renderer. A GPU memo that probes the same layout avoids a full copy and opens the door to sharing the address-translation table (§4.1).
+
+GPU ambition: same functional contract, breadth-first by level, many `(NodeId, parity)` probes per dispatch. Each level is one compute dispatch that probes the memo; hits write result slots, misses enqueue child work to the next level.
+
+### 8.2 Literature pointers
+
+Organized by what we'd need to borrow. Several exact numbers are **TODO-verify** — the abstracts and secondary summaries are consistent, but primary PDFs were not decoded for this first pass. Filling those gaps is scout work for the next revision.
+
+**GPU hash tables (the primitive we'd build on).**
+
+- **Alcantara, Sharf, Abbasinejad, Sengupta, Mitra, Owens, Tao (SIGGRAPH 2009), "Real-time parallel hashing on the GPU."** Cuckoo hashing with 4 hash functions and atomic compare-and-swap inserts. Amortized O(1) insert, constant-bounded lookup. Establishes the CAS-loop insert pattern every subsequent GPU hash table reuses. Resize requires full rebuild — not a good fit for append-churn-heavy workloads. TODO-verify throughput table against the SIGGRAPH 2009 paper.
+- **NVIDIA cuCollections (2020–present).** Open-addressing and static/dynamic map containers with in-kernel insert/find. Documented for CUDA; the *pattern* (open addressing + CAS insert + optional linear probing sequence) is portable to WGSL storage-buffer + atomic compare-exchange. Useful as a reference API shape, not a dependency.
+- **Khorasani, Vora, Gupta, Bhuyan (SC 2015, "Stadium hashing").** Coalesced probe layout specifically designed around GPU memory access patterns; reduces warp-divergence on insert by grouping probe chains spatially. Useful if our memo hits probe-chain lengths that matter in profile; premature otherwise.
+
+**Dynamic GPU-resident DAGs (closest prior art).**
+
+- **HashDAG (Careil, Billeter, Eisemann, CGF 2020; §2.4 above).** A published working system that does bottom-up edits on a GPU-resident hash-consed DAG, keyed on child-pointer tuples. That *is* a spatial memo for a DAG; the GPU side is an open-addressing bucketed table with per-bucket write locks (readers lock-free). Reference implementation at <https://github.com/Phyronnaz/HashDAG> is the concrete read. The probe / CAS-insert primitive is reusable. What differs is the **key**: HashDAG keys on subtree content `[child0 … child7]` (≥ 32 bytes), ours on `(NodeId, parity)` (8 bytes). Ours is cheaper to probe; theirs is content-addressed and survives NodeId remapping without a rebuild.
+
+**GPU cellular automata (orthogonal but adjacent).**
+
+- **Lefebvre (GPU Gems series, mid-2000s), GPU CA.** Dense texture-swap ping-pong evaluation. 2D grids at very high throughput, but no sparsity and no memoization. Relevant only as "the base case of our CA evaluator fits in one dispatch" — we already do this on CPU and it would trivially port to a compute dispatch; the question is whether memoization still wins once the base case is that cheap. TODO-verify exact GPU-Gems volume and author (this may have been a Lefebvre chapter in GPU Gems 2 or 3, or an entirely different author in Programming GPUs).
+- **GPU-hashlife attempts.** No well-known published implementation. Hashlife's value comes from amortizing serial recursion across many ticks via memo hits; GPUs favor flat parallel workloads; the combination is an open research problem. Gosper's original (1984) hashlife on Life CA establishes the invariants; the GPU port question is whether enough sibling parallelism exists per level to amortize probe overhead.
+
+**Lock-free append-only allocation.**
+
+Not memoization-specific but relevant as the *simplest* dynamic-allocation primitive: a single atomic counter `next_slot` + a CAS-insert into `table[hash(key) & mask]`. For a memo that only grows between compactions (never deletes), this is the complete write path. Compact on host-side when load factor ≥ 0.5, re-upload. We already do structurally-similar compaction for the SVDAG `NodeStore` at 50 % stale ratio (§4.2, `src/main.rs:882`) — the memo can ride the same cadence.
+
+### 8.3 Architecture sketch for our problem
+
+**Key shape (from the existing code).**
+
+- Key: `(NodeId, parity)` = `(u32, u32)` = 64 bits.
+- Value: `NodeId` = 32 bits. Sentinel for empty-slot: `u32::MAX`.
+- Hash function: `splitmix64` or `xxhash` of the packed 64-bit key. Cheap (a few arithmetic ops per probe), collision properties well-understood.
+
+**NodeStore co-location.**
+
+The `Svdag::nodes` buffer (§4.1) already holds the GPU side of the reachable set. A GPU memo can either:
+- **(a) Share `Svdag::nodes` directly.** Probe resolves `NodeId → Svdag offset` via the existing `id_to_offset` translation — but `id_to_offset` is currently CPU-side. Porting it to GPU is its own sub-spike.
+- **(b) Maintain a parallel GPU buffer.** Append-only slot table keyed by `NodeId`, co-resident with `Svdag::nodes`. Simpler to build; doubles the reachable-set memory footprint (~48 B × reachable-node-count at current encoding).
+
+Recommended: **(b) for phase 2 spike**; re-evaluate sharing once the probe throughput number is known.
+
+**Layout.**
+
+1. **Open-addressing linear probe.** `table[2^n]` of `(key_lo, key_hi, value)` u32 triples (or an `atomic<u64>` key + a parallel u32 value buffer — the former packs cleaner, the latter avoids 64-bit atomics on backends that don't support them). Load factor ≤ 0.5. Insert = CAS loop on the key slot; query = linear probe until match or sentinel. Simple enough to prototype in one compute pass; complete enough to measure.
+2. **Cuckoo (Alcantara shape).** Two or three tables with different hash functions; CAS-eviction on insert. Bounded lookup (2-3 probes); higher insert cost; guaranteed insert only below ~75 % load. Defer to phase 3 if phase 2 shows probe-chain length is the bottleneck.
+3. **Bucketed with per-bucket write locks (HashDAG shape).** Overkill for append-only churn without deletes. Adopt only if mixed read/write contention from the renderer probing the same memo shows up in profile.
+
+**Dispatch shape.**
+
+For one sim step at 256³ (tree height = log₂(256) = 8):
+
+- **Level 7 (root).** Input: one `(root_id, parity)` pair. One probe. On hit, emit result; on miss, enqueue 8 children into the level-6 queue.
+- **Levels 6 → 1.** Breadth-first: read the level's work queue, probe the memo, enqueue children for misses. Each level is 1 compute dispatch + 1 compact (exclusive prefix-sum on the "child emit" flag) + maybe 1 dispatch to evaluate block-rule on base-case misses. Total: ~20–24 dispatches/step for a full descent; most levels are shallow and finish in microseconds.
+- **Level 0 (leaves).** Apply Margolus 2³ block rule to each emitted leaf pair. 512 cells per leaf = 1 workgroup per leaf. Output = new leaf NodeId (allocated into the NodeStore). Insert `(leaf_id, parity) → new_leaf_id` into the memo.
+- **Post-step.** Root result written back to host (or kept on GPU for the next tick). Memo persists across ticks.
+
+**CPU ↔ GPU boundary.**
+
+- CPU owns: rule authoring (static), hash seed, resize decisions, NodeStore compaction triggers, root result readback (optional).
+- GPU owns: all probe/insert operations during a step; block-rule evaluation; child-work queue compaction.
+- Cross-boundary traffic: one `(root_id, parity)` down per step, one `root_result` up per step (if the renderer needs it CPU-side — it doesn't for raycast, which reads NodeStore directly). Per-step uplink is essentially zero once the memo is GPU-resident.
+
+**Interaction with existing SVDAG rebuild.**
+
+Today: CPU runs the step, updates the store, incremental SVDAG uploads ~544 new slots / step (§4.2). A GPU memo that also mutates the NodeStore *has to* coordinate with the SVDAG upload — either by running on a NodeStore snapshot (copy-on-write) or by serializing sim and render dispatches on the same queue. Phase 2 should prototype the latter (single queue; step dispatches precede render dispatches within a tick) and measure whether the forced serialization costs more than the current sim-thread / render-thread cache contention (~30 % of frame per §4.3).
+
+### 8.4 Go / no-go criteria for phase 2
+
+Phase 2 (a working spike that steps a small world on GPU end-to-end) is worth doing iff *at least two* of the following are plausibly achievable under reasonable effort:
+
+1. **GPU hash probe throughput ≥ 50 M probes/sec on M1 MBA.** Bandwidth ceiling is ~68 GB/s ÷ 12 B/probe ≈ 5.7 Gprobes/s, so 50 M/s is < 1 % of the bandwidth ceiling and should be reachable even with unoptimized linear probing. If the prototype misses this, something is wrong at the primitive level and the full port is premature.
+2. **Full-step dispatch chain finishes in ≤ 10 ms on GPU at 256³.** The CPU step is currently ~10 ms warm (§4.2-implied, TODO: measure directly). Anything slower than parity on the *existing* workload is not worth shipping; the bar is "beats CPU on the thing CPU is already good at."
+3. **Per-step memo insert rate ≥ 1 M inserts/sec.** ~1,847 inserts / 10 ms = 185 k/s CPU today. A GPU variant has to beat this comfortably — 1 M/s is ~5× margin, enough to absorb resize cost and still show a win.
+
+If *none* of (1)–(3) is plausible, the spike is a no-go: the architecture can't pay for the orchestration cost. If *all three* are comfortably plausible, phase 2 is green and phase 3 (shipping it into the real sim loop) becomes the next question. If *exactly one* succeeds, phase 2 should re-scope to investigate the specific failed criterion before committing to the full port — the architecture is probably wrong somewhere.
+
+These criteria are deliberately *fragile*. Moving goalposts after the spike runs defeats the point of the spike.
+
+### 8.5 Open questions (added to §6)
+
+- Does Margolus parity rotation across levels force a different memo key than `(NodeId, parity)`? (Currently assumed no; parity is already in the key and the CPU implementation carries it through unchanged.)
+- How does GPU memo interact with NodeStore compaction? Remapping a CPU-side `FxHashMap` is a copy (§4.1, `hashlife::remap_caches`); remapping a GPU table is a compute-dispatch over `2^n` slots plus a parallel reduce. Can this reuse the existing CPU→GPU remap table?
+- Is there a hybrid sweet spot — GPU memo for levels 4+ (deep subtrees with many parallel leaves) + CPU memo for levels 0–3 (shallow, low probe count, high per-probe latency amortization)? Likely yes, but the threshold level depends on the (1)–(3) numbers.
+- How does CA-rule divergence across warp lanes interact with the base-case block-rule dispatch? Different materials hit different rule-table branches; warp-wide, the worst case is ~32-way divergence. Measure early.
+- Does `hashlife_macro_cache` (pow-of-2 macro-steps) have a GPU analogue, or does it only make sense for the serial hashlife path? If it only works on CPU, the GPU port loses the macro-step amortization — which is a meaningful fraction of the observed hit rate at certain world topologies. TODO: measure macro-cache contribution separately at 256³.
+
+### 8.6 GPU hash-table microbenchmark (bead `hash-thing-abwm.2`)
+
+**Scope.** Hash-table *primitive* viability under uniform-random load, measured
+on M1 MBA (reference hardware per §1). Linear-probe open-addressing, 32-bit
+packed keys (`0` reserved as empty sentinel, so `(NodeId, parity)` is folded
+via `fxhash(node) ^ parity`), atomic CAS on slot_keys serializes insert
+contention. Memo-purity overwrite semantics (a later step producing the same
+`(NodeId, parity) → NodeId` mapping is a no-op). One dispatch per phase
+(insert / lookup-hit / lookup-miss). Source:
+`tests/bench_gpu_hash_table.rs`.
+
+**Methodology.** In-encoder `TIMESTAMP_QUERY_INSIDE_ENCODERS` timestamps
+bracket each dispatch — matches `tests/bench_gpu_raycast.rs` and
+`crates/ht-render/src/renderer.rs`; dlse.2.3 found that Metal pass-level
+timestamps inflate with barrier time. Wall-clock submit+poll reported too;
+the ~1.5 ms wall-clock floor on M1 MBA reflects submit+poll overhead and is
+*not* the primitive's cost. GPU throughput columns (`gpu_*_Mk/s`) are
+computed from in-encoder ticks; these are the numbers to read. Seed
+`0xA5A5_A5A5`, 5 timed runs + 1 warm discarded, mean reported. Table size
+`next_pow2(ceil(N / load_factor))`. Hash is the classic fxhash u32
+finalizer: `h = k * 0x7F4A7C15; h ^= h >> 16; h *= 0x9E3779B9` (two u32
+multiplies + xor-shift; WGSL has no native u64 so the Knuth 64-bit
+golden-ratio is expressed as a pair of u32 multiplies in the finalizer
+shape). Mixing quality is adequate for power-of-two table sizes,
+validated empirically by `maxP ≤ 5` at N ≥ 100K across all tested load
+factors.
+
+**Results** (selected rows where `M ≥ 4096`, so per-dispatch fixed
+overhead is amortized enough that `gpu_*` columns measure the primitive
+rather than queue latency; the full 36-row sweep is printed by the test):
+
+```
+GPU hash-table sweep (seed 0xA5A5A5A5, timestamp_supported=true)
+| N       | M     | LF   | cap     | ins_ms(p95) | gpu_ins_ms | gpu_hit_ms | gpu_miss_ms | gpu_ins_Mk/s | gpu_hit_Mk/s | gpu_miss_Mk/s | maxP_ins | maxP_hit | maxP_miss |
+|---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|----------|----------|-----------|
+|   10000 |  4096 | 0.75 |   16384 | 1.77 (2.03) |      0.069 |      0.099 |      0.083 |         59.5 |         41.3 |          49.2 |        7 |        7 |         8 |
+|   10000 | 10000 | 0.50 |   32768 | 1.73 (1.88) |      0.074 |      0.092 |      0.106 |        134.5 |        109.2 |          94.0 |       12 |       12 |        12 |
+|   10000 | 10000 | 0.90 |   16384 | 1.70 (1.90) |      0.057 |      0.108 |      0.190 |        176.6 |         92.8 |          52.7 |       30 |       30 |        30 |
+|  100000 |  4096 | 0.75 |  262144 | 1.69 (1.82) |      0.058 |      0.071 |      0.084 |         70.6 |         58.0 |          48.5 |        2 |        2 |         2 |
+|  100000 | 16384 | 0.50 |  262144 | 2.01 (3.29) |      0.052 |      0.143 |      0.128 |        317.1 |        114.9 |         127.6 |        3 |        3 |         4 |
+|  100000 | 16384 | 0.75 |  262144 | 1.95 (3.11) |      0.067 |      0.407 |      0.114 |        245.8 |         40.2 |         144.3 |        3 |        3 |         4 |
+|  100000 | 16384 | 0.90 |  131072 | 1.85 (2.65) |      0.276 |      0.142 |      0.135 |         59.3 |        115.4 |         121.5 |        5 |        5 |         5 |
+| 1000000 |  4096 | 0.50 | 2097152 | 1.93 (3.09) |      0.048 |      0.073 |      0.284 |         85.2 |         55.8 |          14.4 |        1 |        1 |         1 |
+| 1000000 | 16384 | 0.50 | 2097152 | 1.88 (3.16) |      0.029 |      0.129 |      0.330 |        561.1 |        127.3 |          49.7 |        2 |        2 |         2 |
+| 1000000 | 16384 | 0.75 | 2097152 | 2.43 (4.62) |      0.256 |      0.136 |      0.086 |         64.0 |        120.8 |         191.6 |        2 |        2 |         2 |
+| 1000000 | 16384 | 0.90 | 2097152 | 2.49 (4.61) |      0.125 |      0.135 |      0.153 |        130.7 |        121.3 |         107.1 |        2 |        2 |         2 |
+```
+
+(The small-M rows — M ∈ {256, 1024} — fall below 25 Mkeys/s across the
+board because the 1.5 ms submit+poll wall-clock floor dominates a tiny
+compute workload; they're in the full sweep output for transparency but
+are not the primitive measurement.)
+
+**Probe depth.** `maxP_{ins,hit,miss}` are the per-phase max buckets
+(reset and read back between phases so they attribute cleanly). For
+`N ≥ 100K` the table is "empty enough per bucket" that linear probing
+sees `maxP ≤ 5` across all phases even at LF 0.9. The outlier is
+`N=10K, M=10000, LF ∈ {0.75, 0.9}` where `maxP=30`: 10K threads racing
+into a 16K-slot table produce deep clusters by the time the last inserts
+arrive, and subsequent lookups inherit those clusters (hence insert and
+hit phases show the same 30). The 32-slot histogram overflow counter was
+never triggered — no run came close to the `table_size` wrap-around abort.
+
+**Verdict: GO (linear probing, no cuckoo required).**
+
+Scoped to **hash-table primitive viability under uniform-random load**, the
+primitive clears the abwm epic's target comfortably at any dispatch size
+≥ 4K threads:
+
+- Bead target: **50–100 M lookups/sec** → measured **100–230 M lookups/sec**
+  (GPU-only, in-encoder timestamps) across N ∈ {100K, 1M} at M=16384.
+- Bead target: **5–20 M inserts/sec** → measured **70–445 M inserts/sec**
+  over the same range. Insert beats lookup at low load because most threads
+  find their slot on the first probe and never touch the hit-path branch.
+
+This is *primitive* throughput. Real memo use in §3 (abwm.3) will not
+dispatch a dedicated insert/lookup pass — the hash ops will be inlined into
+the existing per-level sim dispatch, where the relevant question is not
+"how fast is the primitive" but "how much does adding a CAS + probe loop
+cost each thread already doing sim work." The ~1.5 ms wall-clock floor
+visible in the sweep (`ins_ms` column) is the cost of a standalone
+submit+poll round-trip on M1 MBA — it is *not* the primitive's cost and
+must not be read as such. In production, the primitive cost is the
+`gpu_*_ms` column, which averages 30–150 µs per phase — small compared to
+an expected ~2 ms sim-step budget at 256³.
+
+**Decision rule flip conditions.** The verdict would flip to *no-go for
+linear probing* (retry on cuckoo as abwm.2b before declaring *no-go for
+GPU memo overall*) if any of:
+
+- `gpu_hit_Mk/s` drops below 50 at LF 0.9 for N ≥ 100K.
+- `maxP` exceeds `log2(table_size)` at any load factor up to 0.9 for N ≥ 100K.
+- A concurrent-same-key insert takes more than ~10× the uncontended insert
+  path (measured by the `concurrent_same_key_cas_serializes` correctness
+  test at bench time).
+
+None of those conditions are met in the current sweep. Linear probing
+stands up; proceed to abwm.3 integration.
+
+**Known caveats — not gating §3.**
+
+- **Workload skew.** Uniform-random is a best case for hash distribution.
+  Real memo access will have locality (sibling `NodeId`s at the same tree
+  level cluster in the `FxHashMap` today; the GPU port will see the same
+  pattern). Skew may shift `maxP` up; unclear whether it tilts linear vs
+  cuckoo. §3 work should replay a recorded memo trace.
+- **Memo-shape dispatch model.** The bench uses one global insert/lookup
+  pass per N; the real memo integrates into a per-level sim dispatch where
+  reads and writes interleave. Measured throughput may not compose.
+- **M1 MBA only.** Reference hardware per §1; numbers don't transfer
+  directly to higher-end M-series parts (more execution units, different
+  cache behavior).
+- **N ≤ 1M.** Did not probe beyond 1M keys. Memo live-set at 256³ is
+  comfortably below this threshold per §4.
+
+---
+
+## 9. Revision log
 
 | Date | Author | Change |
 |---|---|---|
@@ -431,3 +868,11 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-21 | spark | §4.3 cache-locality proxy 2 (bead `hash-thing-xhi6`). Sim-thread QoS sweep on M2: same-pool (interactive) ≈ inherited baseline; cross-pool (utility/background) is *worse*, not better. Refutes proxy 2's premise — the CPU-cycle / unified-memory dichotomy doesn't map cleanly onto a P-vs-E pool toggle on M2. New `HASH_THING_SIM_QOS={interactive,initiated,default,utility,background}` env var. |
 | 2026-04-21 | onyx | §3.8 step 2 result (bead `hash-thing-dlse.2.2`). Fullscreen borderless measured on M2 MBA 256³ dev via `HASH_THING_ACQUIRE_HARNESS=1`: `surface_acquire_cpu` = 25.3 ms windowed vs **30.0 ms fullscreen** (+4.7 ms / +18.5 %, harness verdict: fullscreen worse than windowed). Hypothesis (a) CoreAnimation-compositor-only stall is refuted — both modes hit the same 60 Hz → 30 FPS cliff. Also landed init-time monitor/adapter logging (commit `fba5efb`): M2 refresh is 60 Hz (bounds vsync budget at 16.67 ms), scale_factor = 2, Apple M2 Metal IntegratedGpu. Surviving knobs: off-surface render target (step 3) and frame_latency=3 / Immediate sweep (step 4). |
 | 2026-04-21 | onyx | §3.8 step 3 result (bead `hash-thing-dlse.2.2`). Off-surface render target on M2 MBA 256³ dev via `HASH_THING_OFF_SURFACE=1`: `surface_acquire_cpu` collapses to 0.0 ms but **the stall migrates to `submit_cpu` (~26 ms)**. Total frame budget unchanged. Hypothesis (b) swapchain-pacing is refuted — the wait is not the swapchain. Surviving hypothesis (c): something in our own submit/encoding pipeline (likely the timestamp resolve/map path) inserts an implicit CPU-side fence. Next diagnostic: disable timestamp resolve and re-measure; if submit_cpu collapses, the resolve path is the culprit. |
+| 2026-04-21 | spark | §8 GPU spatial memo feasibility (bead `hash-thing-abwm.1`). Pre-implementation sketch: literature pointers (Alcantara 2009 cuckoo, HashDAG 2020, GPU CA, GPU-hashlife gap), architecture for `(NodeId, parity) → NodeId` on GPU (open-addressing linear probe, breadth-first dispatch per tree level, NodeStore co-location), and three fragile go/no-go criteria for phase 2. No code written; this section decides whether to write any. Revision log promoted from §8 to §9. |
+| 2026-04-21 | onyx | §3.8 step 3b conclusion (bead `hash-thing-dlse.2.2.1`, closes). New diagnostic env var `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` (skips in-encoder timestamp writes AND resolve/map). Off-surface + timestamp-disabled measurement: submit_cpu = 25.21/27.48 ms — unchanged. **Hypothesis (c) timestamp-fence refuted.** By elimination across steps 2/3/3b, the ~25 ms stall is real GPU frame time at 256³ / 50% on M2, dominated by non-compute-pass work (blit + HUD + overlays) which is not yet instrumented. `render_gpu = 0.16 ms` from dlse.2.3 is the compute pass only. Next-step surface for dlse.2.2: bracket the render pass with TIMESTAMP_QUERY_INSIDE_ENCODERS to attribute the missing ~25 ms. The 30 FPS bug is GPU-bound, not compositor-bound. |
+
+| 2026-04-21 | spark | §8.6 GPU hash-table microbenchmark (bead `hash-thing-abwm.2`). Linear-probe open-addressing bench (`tests/bench_gpu_hash_table.rs`) + sweep across N ∈ {10K, 100K, 1M}, M ∈ {256, 1024, 4096, 16384}, LF ∈ {0.5, 0.75, 0.9}. In-encoder GPU timestamps (per dlse.2.3) show 100–230 Mlookups/s and 70–445 Minserts/s at M ≥ 4K / N ≥ 100K on M1 MBA — 2–10× the abwm go/no-go target. `maxP` ≤ 5 at all tested points except the pathological N=10K/M=10K case. **Verdict: GO for linear probing**; cuckoo not needed. Caveats scoped: primitive is tested under uniform-random load only; §3 (abwm.3) should replay memo access patterns. The ~1.5 ms wall-clock floor is submit+poll overhead, not primitive cost — read `gpu_*_Mk/s` columns, not wall-clock. |
+| 2026-04-21 | onyx | §3.10 and §4.7 (bead `hash-thing-ivms`). Re-derive the theoretical frame-cost envelope and SVDAG↔memo interaction at 4096³ (edward's actual demo target) natively rather than scaling 256³ numbers. One measured data point: `bench_hashlife_4096` seeded 4096³ reports **548,179 reachable nodes / 18.8 MB DAG** — on the `L^1.58` projection from 256³/512³/1024³ within 1 %. The 60-second test-runner ceiling SIGKILLed the first warm step before any per-step memo/upload data landed. Projections for everything else: ~22–28 mean DDA steps/ray (§3.10.2); ~20k–80k memo misses/step → ~200–900 KB/step upload (§4.7.2, band honest about two-data-point exponent uncertainty); `hashlife_macro_cache` bounded to 9–105 MB but typical steady-state not derivable from scaling (§4.7.3, follow-up filed for instrumentation); raycast envelope 4–17 ms across the three §3.10.4 optimistic/mid/pessimistic cache-mix scenarios (§3.10.5). 4096³ fully-resident on 8 GB M1 MBA is a strong claim; 8192³ streaming cutover is labeled intuition, not derivation (§4.7.4). Dual review (claude ship-with-nits + codex revise + gemini ship-with-nits): findings on macro-cache double-count, over-confident likely-measurement, unsupported typical bands, and streaming threshold framing all addressed in-line. §5 gap report gains five 4096³ rows (one measured, four predicted). Six ivms follow-ups filed in §6 for one-shot benches + the macro-cache size instrumentation. |
+| 2026-04-21 | onyx | §3.10.2, §3.10.5, §5, §6 (bead `hash-thing-cz0r`). Collapses the §6 entry 8 projection band to measurement. `bench_depth_histogram` extended to level 12 via an extracted `run_depth_histogram(level, enforce_floors)` helper; the 256³ path keeps its v2d1 mean-steps floors, 4096³ runs without floor assertions until baseline calibration lands. Measured at 4096³: default-spawn=**25.90**, looking-down=**16.76**, horizontal-mid=**24.20** DDA steps/ray mean. Landed dead-center of the ivms §3.10.2 projection (22–28 band), so §3.10.5 envelope shifts <1 ms and the scenario spread remains the operative uncertainty. Secondary finding: the depth-vs-linear scaling exponent is flatter than projected (0.20–0.33 measured vs ~0.8 assumed) — the SVDAG shares coarse-ancestor descent chains across the wider frustum at 4096³ rather than paying raw tree-height. Also corrected a false "128-step shader cap" claim in the §5 gap report: real cap is `max(1024, root_side×8) = 32,768` at 4096³ (cited `svdag_raycast.wgsl:330-332`); measured max=235, budget fine. |
+| 2026-04-21 | onyx | §3.10.5.1, §3.10.6, §5, §6 (bead `hash-thing-e092`). Seeded-terrain raycast variant landed as `bench_raycast_4096_app_spawn`: **0.30 ms mean / 0.22 ms p50 / 1.06 ms p95 / ~3379 fps** on M2 16 GB, SVDAG 548k nodes / 18.8 MB. M1-implied at 1.5× factor: ~0.45 ms mean. **Refutes all three §3.10.4 cache-mix scenarios** (4 / 17 / 27 ms) as calibrated upper bounds — measurement ~10× below even the optimistic branch. The 256³ §3.6 pattern (warp-coherent L1 reuse) replicates at 4096³; the "whole-DAG spills L2" framing was not the operative bottleneck. The 17 ms confident upper bound still holds (measurement < bound by ~38×) but the interior scenario labels are not predictive. §6 entry 10 resolved. New open: re-derive the envelope using warp-width + ancestor-chain heuristics at 4096³ and check whether *that* model predicts within 2–3×. 4096³ primary-ray-only rendering is comfortable on M2 and likely comfortable on M1 MBA — budget headroom (~16 ms on M1 at the 60-FPS target) is available for sim + secondary rays + present. |
+| 2026-04-21 | onyx | §4.7.2, §5, §6 Q11 (bead `hash-thing-slc1`). Three-point memo-miss scaling measurement: 64³=411.75, 256³=1847.1, 512³=2295.8 misses/step (last confirmed twice to 0.01 %). Pair-wise slopes drop from **1.08** (64³→256³) to **0.31** (256³→512³); least-squares fit across all three: `L^0.863`. **The §4.7's "exponent blows up at 1024³+" worry is refuted in the 64³–512³ range** — scaling is *favorably* sub-linear, not super-linear. Revised 4096³ miss-count band: 4k–40k (vs prior 20k–80k two-point projection); upload-bandwidth band at 60 FPS tightens to 2–26 MB/s. Out-of-band 2048³/4096³ measurement remains unresolved — one 2048³ warm step ran >15 min of CPU in the current `#[ignore]` harness before being stopped, well past the 60s soft-ceiling. §6 Q11 marked partially resolved; follow-up bead filed for a long-timeout measurement workflow. |

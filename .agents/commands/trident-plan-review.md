@@ -1,9 +1,9 @@
-# Trident Plan Review: Nine-Agent Plan Review
+# Trident Plan Review: Eight-Agent Plan Review
 
-Run parallel plan reviews with a Codex-heavy nine-review mix: Claude runs the three canonical lenses, Codex runs the three canonical lenses plus two focused extra passes, and Gemini runs a single standard pass. Output lives alongside the input file in a review pack folder.
+Run parallel plan reviews with a Codex-heavy eight-review mix: Claude runs two canonical lenses (standard / adversarial), Codex runs three canonical lenses plus two focused extra passes (standard / standard-execution / adversarial / adversarial-dependencies / evolutionary), and Gemini runs a single standard pass. Per hash-thing-2kkt, the evolutionary-Claude lens is dropped (Codex evolutionary covers the angle at lower cost) and the evolutionary synthesis step is skipped. Output lives alongside the input file in a review pack folder.
 
 **Usage:**
-- `/user:trident-plan-review <file>` — Review a plan/document through all nine agents
+- `/user:trident-plan-review <file>` — Review a plan/document through all eight agents
 - `/user:trident-plan-review <file> <additional notes>` — Review with additional context
 - `$ARGUMENTS` contains the file path and optional additional notes
 
@@ -11,7 +11,7 @@ Run parallel plan reviews with a Codex-heavy nine-review mix: Claude runs the th
 
 ## Critical Rule: READ-ONLY
 
-**This is a read-only command.** All nine review agents and all three synthesis agents must ONLY:
+**This is a read-only command.** All eight review agents and both synthesis agents must ONLY:
 - Read existing files (the plan, prompt files, related context)
 - Write their single designated output file to the review pack folder
 
@@ -33,13 +33,13 @@ Main Agent (Opus 4.6)
 ├── Create review pack folder alongside input file
 ├── Identify related context files for agents
 ├── Write prompt files for Codex/Gemini (file-reference approach)
-├── Launch 9 review agents
-│   ├── 3x Claude — standard, adversarial, evolutionary
+├── Launch 8 review agents
+│   ├── 2x Claude — standard, adversarial
 │   ├── 5x Codex — standard, standard-execution, adversarial, adversarial-dependencies, evolutionary
 │   └── 1x Gemini — standard only
-├── Wait and collect all 9
+├── Wait and collect all 8
 ├── Quality gate — verify output files exist and have substance
-├── Launch 3 synthesis Agents (one per lens)
+├── Launch 2 synthesis Agents (standard, adversarial — no evolutionary synthesis)
 ├── Open synthesis docs
 └── Clean up tmp staging directory
 ```
@@ -191,7 +191,7 @@ cp {INPUT_FILE} "$WS_STAGING/plan-input.md"
 
 For Gemini prompt files, use workspace-local paths for both the framework file and the input file.
 
-### Phase 4: Launch All Nine Agents
+### Phase 4: Launch All Eight Agents
 
 **Launch message template** (for Claude subagents — Codex/Gemini use their prompt files from Phase 3):
 > Read {PROMPT_PATH} for your review approach and thinking framework. Then read {INPUT_FILE} — that is the document you are reviewing.
@@ -208,12 +208,13 @@ For Gemini prompt files, use workspace-local paths for both the framework file a
 
 ---
 
-**Claude agents** (3x) — use the **Agent tool** (parallel subagents):
+**Claude agents** (2x) — use the **Agent tool** (parallel subagents):
 
-Launch three Agent tool calls in a single message with the launch template, substituting:
+Launch two Agent tool calls in a single message with the launch template, substituting:
 - Standard: `PROMPT_PATH=.agents/prompts/PlanReview-Standard.md`, `lens=standard`, `MODEL=Claude`
 - Adversarial: `PROMPT_PATH=.agents/prompts/PlanReview-Adversarial.md`, `lens=adversarial`, `MODEL=Claude`
-- Evolutionary: `PROMPT_PATH=.agents/prompts/PlanReview-Evolutionary.md`, `lens=evolutionary`, `MODEL=Claude`
+
+(No Claude evolutionary pass — Codex evolutionary covers that angle at lower cost per hash-thing-2kkt.)
 
 ---
 
@@ -250,8 +251,8 @@ gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/promp
 **Tell the user:**
 > "Plan: {input_file} | Review Pack: {PACK_DIR}
 >
-> Launched 9 review agents:
-> - Claude (Standard, Adversarial, Evolutionary)
+> Launched 8 review agents:
+> - Claude (Standard, Adversarial)
 > - Codex (Standard, Standard-Execution, Adversarial, Adversarial-Dependencies, Evolutionary)
 > - Gemini (Standard)
 >
@@ -280,11 +281,11 @@ wc -c {PACK_DIR}/*.md
 
 Report any gaps to the user before proceeding to synthesis.
 
-Expected files: `standard-claude.md`, `standard-codex.md`, `standard-codex-execution.md`, `standard-gemini.md`, `adversarial-claude.md`, `adversarial-codex.md`, `adversarial-codex-dependencies.md`, `evolutionary-claude.md`, `evolutionary-codex.md`.
+Expected files: `standard-claude.md`, `standard-codex.md`, `standard-codex-execution.md`, `standard-gemini.md`, `adversarial-claude.md`, `adversarial-codex.md`, `adversarial-codex-dependencies.md`, `evolutionary-codex.md`. (No `evolutionary-claude.md` — that lens was dropped per hash-thing-2kkt.)
 
-### Phase 6: Three Synthesis Agents
+### Phase 6: Two Synthesis Agents
 
-Launch **three Agent tool calls** in a single message. Each synthesizes one lens across its weighted input set.
+Launch **two Agent tool calls** in a single message — one for standard, one for adversarial. The evolutionary lens is not synthesized: Codex's evolutionary pass is the only source and is surfaced as-is.
 
 **Synthesis-Standard Agent:**
 > Read the following three reviews and synthesize them into a single cohesive document:
@@ -319,50 +320,37 @@ Launch **three Agent tool calls** in a single message. Each synthesizes one lens
 > Write your synthesis to: `{PACK_DIR}/synthesis-adversarial.md`
 > Format as a clean, numbered-list-heavy document. Start with an executive summary.
 
-**Synthesis-Evolutionary Agent:**
-> Read the following three reviews and synthesize them into a single cohesive document:
-> - `{PACK_DIR}/evolutionary-claude.md`
-> - `{PACK_DIR}/evolutionary-codex.md`
->
-> These are Evolutionary/Exploratory reviews of the same plan from the Claude/Codex pair. Your job:
-> 1. Consensus direction — evolution paths multiple passes identified
-> 2. Best concrete suggestions — the most actionable ideas across the Claude/Codex pair
-> 3. Wildest mutations — the most creative/ambitious ideas (even if risky)
-> 4. Flywheel opportunities — self-reinforcing loops any model identified
-> 5. Strategic questions for the plan author (deduplicated, numbered)
->
-> Write your synthesis to: `{PACK_DIR}/synthesis-evolutionary.md`
-> Format as a clean, numbered-list-heavy document. Start with an executive summary.
+(No Synthesis-Evolutionary agent — the evolutionary lens has a single source, `evolutionary-codex.md`, which reviewers read directly.)
 
 ### Phase 7: Launch for Review and Clean Up
 
-Once all three synthesis docs are written:
+Once both synthesis docs are written, also open the raw evolutionary-codex review directly (no synthesis for it):
 
 ```bash
 code "{PACK_DIR}/synthesis-standard.md"
 code "{PACK_DIR}/synthesis-adversarial.md"
-code "{PACK_DIR}/synthesis-evolutionary.md"
+code "{PACK_DIR}/evolutionary-codex.md"
 ```
 
 **Clean up tmp staging directory** — only after confirming all review pack files are present:
 ```bash
 # Verify review pack is complete before cleanup
-EXPECTED=12  # 9 reviews + 3 syntheses
+EXPECTED=10  # 8 reviews + 2 syntheses
 ACTUAL=$(ls {PACK_DIR}/*.md | wc -l | tr -d ' ')
-if [ "$ACTUAL" -ge 9 ]; then
+if [ "$ACTUAL" -ge 8 ]; then
     rm -rf notes/.tmp/trident-{REVIEW_ID}
 fi
 ```
 
-(Use 9 as the threshold, not 12 — syntheses are the proof that reviews were consumed. If at least 9 reviews exist, the tmp files served their purpose.)
+(Use 8 as the threshold — syntheses are the proof that reviews were consumed. If at least 8 reviews exist, the tmp files served their purpose.)
 
 Tell the user:
-> "Trident review complete. Three synthesis docs opened:
+> "Trident review complete. Two synthesis docs opened plus raw evolutionary:
 > - `synthesis-standard.md` — analytical consensus
 > - `synthesis-adversarial.md` — critical findings
-> - `synthesis-evolutionary.md` — evolutionary opportunities
+> - `evolutionary-codex.md` — evolutionary opportunities (Codex-only; no synthesis pass)
 >
-> Full review pack (12 files: 9 reviews + 3 syntheses) at: `{PACK_DIR}/`"
+> Full review pack (10 files: 8 reviews + 2 syntheses) at: `{PACK_DIR}/`"
 
 ---
 
@@ -372,4 +360,4 @@ If an agent fails or isn't available, proceed with successful agents. Note failu
 
 ---
 
-Now begin. Parse the file from $ARGUMENTS and orchestrate the nine-agent trident plan review.
+Now begin. Parse the file from $ARGUMENTS and orchestrate the eight-agent trident plan review.

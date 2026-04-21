@@ -11,6 +11,9 @@ bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 rustc-hash = "2"
 
+[dev-dependencies]
+pollster = "0.4"
+
 [lints.rust]
 unused = { level = "deny", priority = -1 }
 dead_code = "warn"

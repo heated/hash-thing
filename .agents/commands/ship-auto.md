@@ -17,8 +17,8 @@ The input is **always** a bd issue id. If no id is provided, fail fast with "shi
 
 Additional defaults locked in by ship-auto (no interview to set them):
 
-- **Plan review tier:** `dual` (1 Claude + 1 Codex)
-- **Code review tier:** inherit from `review-tiers` skill based on diff size; override to `dual` minimum
+- **Plan review tier:** from project `CLAUDE.md` / `AGENTS.md` "Reviews" section, mapped via the bead's priority + change-type row. Pick the tier the table names; when torn between two tiers, pick the bigger one. (No hardcoded floor here — CLAUDE.md owns that.)
+- **Code review tier:** same — from the "Reviews" table in CLAUDE.md.
 - **Preview:** `never`
 - **Manual testing:** `cargo test` / language-native only; no dev server spin-up except in `REPO_KIND=arch`
 
@@ -85,7 +85,7 @@ The bd issue description + comments + linked issues ARE the spec. If after readi
 
 ## Phase 3: Plan Review (automated)
 
-Run a **dual** plan review by default: 1 Claude (standard) + 1 Codex (standard), launched in parallel. Same mechanics as `/ship` Phase 3 but hardwired to dual. Do not wait longer than ~5 min per agent after the fastest peer lands — if one stalls (429 retry loop, etc.), TaskStop it and proceed with the other. Single-agent plan review is acceptable as a fallback, but if BOTH fail, park.
+Run the plan review tier chosen per CLAUDE.md "Reviews" — default for most code-touching beads is triple or trident; dual is the floor, not the target. Launch all peers in parallel. Same mechanics as `/ship` Phase 3. Do not wait longer than ~5 min per agent after the fastest peer lands — if one stalls (429 retry loop, etc.), TaskStop it and proceed with the remainder. If fewer peers than the tier asks for land, accept the partial review but note the gap in the metadata file. If ALL fail, park.
 
 **Interpret review feedback:**
 
@@ -131,7 +131,7 @@ Same as `/ship` Phase 6:
 
 ## Phase 7: Code Review (automated)
 
-Load `review-tiers` skill, compute the tier from the diff, but **override floor to `dual`** — ship-auto never runs `none` or `single` review. Run the review (same mechanics as /ship Phase 6).
+Pick the code review tier from project `CLAUDE.md` "Reviews" table using the bead's change-type row. ship-auto never runs `none` or `single`. When torn between two tiers pick the bigger one. Run the review (same mechanics as /ship Phase 6).
 
 ---
 

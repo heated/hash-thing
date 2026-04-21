@@ -392,6 +392,13 @@ struct App {
     /// so the periodic log can print it even while the next step is on
     /// the background thread (where `self.world` is a placeholder).
     last_memo_summary: String,
+    /// Memo HUD overlay toggle (hash-thing-nhwo). On when
+    /// `HASH_THING_MEMO_HUD=1` is set at startup; renders memo_* stats
+    /// as a top-left text panel. No key-binding — env-var only.
+    memo_hud_visible: bool,
+    /// True when the memo HUD texture needs re-upload (each time
+    /// `last_memo_summary` refreshes or at seed).
+    memo_hud_dirty: bool,
     /// Sim-freeze diagnostic toggle (hash-thing-stue.7). When true, the
     /// background-step dispatch is a no-op: world stays put on the main
     /// thread, generation never advances, and the renderer reads a stable
@@ -523,6 +530,8 @@ impl App {
             fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
+            memo_hud_visible: std::env::var("HASH_THING_MEMO_HUD").ok().as_deref() == Some("1"),
+            memo_hud_dirty: true,
             freeze_sim: std::env::var("HASH_THING_FREEZE_SIM").ok().as_deref() == Some("1"),
             sim_qos: std::env::var("HASH_THING_SIM_QOS")
                 .ok()
@@ -552,8 +561,10 @@ impl App {
 
         // Seed the cached memo summary so the very first periodic log line
         // has a populated column instead of a blank trailing field
-        // (hash-thing-stue.6 reviewer nit).
+        // (hash-thing-stue.6 reviewer nit). Dirty the HUD too so reseeding
+        // here can never race ahead of the construction-time seed.
         app.last_memo_summary = app.world.memo_summary();
+        app.memo_hud_dirty = true;
         let player_pos = app.reset_scene_entities();
         app.spawn_demo_entities();
         log::info!(
@@ -1608,6 +1619,7 @@ impl ApplicationHandler for App {
                                 self.world.queue = queue;
                             }
                             self.last_memo_summary = self.world.memo_summary();
+                            self.memo_hud_dirty = true;
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &mut self.world,
@@ -1951,6 +1963,7 @@ impl ApplicationHandler for App {
                                 // self.world (it's about to be replaced by a
                                 // placeholder again on the next step).
                                 self.last_memo_summary = self.world.memo_summary();
+                                self.memo_hud_dirty = true;
                                 // Entity update on main thread (needs both
                                 // &World and &mut EntityStore).
                                 let mut queue = std::mem::take(&mut self.world.queue);
@@ -2028,6 +2041,17 @@ impl ApplicationHandler for App {
                         if self.legend_visible {
                             renderer.set_legend_text(&Self::legend_lines(self.camera_mode));
                         }
+                    }
+
+                    // Memo HUD overlay (hash-thing-nhwo): propagate
+                    // visibility every frame, re-upload text on dirty.
+                    // Visibility assignment must live outside the dirty
+                    // gate so a future toggle path doesn't get stuck.
+                    renderer.memo_hud_visible = self.memo_hud_visible;
+                    if self.memo_hud_visible && self.memo_hud_dirty {
+                        self.memo_hud_dirty = false;
+                        let lines: Vec<&str> = self.last_memo_summary.split_whitespace().collect();
+                        renderer.set_memo_hud_text(&lines);
                     }
                 }
                 if self.camera_mode == CameraMode::FirstPerson {
@@ -2248,6 +2272,13 @@ impl ApplicationHandler for App {
                     }
                     if let Some(d) = renderer.take_last_gpu_frame_time() {
                         self.perf.record("render_gpu", d);
+                    }
+                    // dlse.2.4: second bracket around the blit + overlay
+                    // render pass. `render_gpu` has always been
+                    // compute-only despite the name; the render-pass
+                    // GPU cost lands in this separate metric.
+                    if let Some(d) = renderer.take_last_render_pass_gpu_frame_time() {
+                        self.perf.record("render_pass_gpu", d);
                     }
                 }
 

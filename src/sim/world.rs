@@ -182,10 +182,11 @@ pub struct World {
     /// for newly-created sibling octants instead of leaving them empty.
     terrain_params: Option<TerrainParams>,
     /// Spatial memoization cache for the recursive Hashlife stepper.
-    /// Key: (NodeId, parity). Identical subtrees anywhere in the world
-    /// share a single cache entry — block-rule partition uses node-local
-    /// alignment so origin is no longer in the key (9ww).
-    pub(crate) hashlife_cache: FxHashMap<(NodeId, u32), NodeId>,
+    /// Key: (NodeId, schedule_phase). Identical subtrees anywhere in the
+    /// world share a single cache entry — block-rule partition uses
+    /// node-local alignment so origin is no longer in the key (9ww).
+    /// `schedule_phase` is `generation % materials.memo_period()` (iowh).
+    pub(crate) hashlife_cache: FxHashMap<(NodeId, u64), NodeId>,
     /// Memoization cache for the exponential Hashlife macro-stepper (6gf.7).
     /// Key: (NodeId, starting generation).
     pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, u64), NodeId>,
@@ -448,6 +449,21 @@ impl World {
     /// table changes even though the octree content does not.
     pub fn set_gol_smoke_rule(&mut self, rule: GameOfLife3D) {
         self.materials = MaterialRegistry::gol_smoke_with_rule(rule);
+        self.invalidate_rule_caches();
+    }
+
+    /// Set the tick_divisor for a material and invalidate memo caches. The
+    /// hashlife cache key is `(NodeId, generation % memo_period())`, so
+    /// changing a divisor changes `memo_period()` and makes existing entries
+    /// unsound. Crate-private because production bakes divisors into the
+    /// registrar; this exists for tests and the future tuning bead (iowh).
+    #[allow(dead_code)]
+    pub(crate) fn set_material_tick_divisor(
+        &mut self,
+        material_id: crate::terrain::materials::MaterialId,
+        divisor: u16,
+    ) {
+        self.materials.set_tick_divisor(material_id, divisor);
         self.invalidate_rule_caches();
     }
 
@@ -896,17 +912,29 @@ impl World {
         let side = self.side();
         let grid = self.flatten();
         let mut next = vec![0 as CellState; side * side * side];
+        let divisor_by_material = self.materials.tick_divisor_flags();
+        let generation = self.generation;
 
-        // Phase 1: cell-wise CaRule pass (Moore neighborhood).
+        // Phase 1: cell-wise CaRule pass (Moore neighborhood). Per-material
+        // tick_divisor gate mirrors the hashlife path (iowh) so the brute and
+        // recursive paths produce identical output at every generation.
         for z in 0..side {
             for y in 0..side {
                 for x in 0..side {
-                    let center = Cell::from_raw(grid[x + y * side + z * side * side]);
+                    let idx = x + y * side + z * side * side;
+                    let raw = grid[idx];
+                    let center = Cell::from_raw(raw);
+                    let mat = center.material() as usize;
+                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                    if divisor > 1 && !generation.is_multiple_of(divisor) {
+                        next[idx] = raw;
+                        continue;
+                    }
                     let neighbors = get_neighbors(&grid, side, x, y, z);
                     let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
                         panic!("missing CaRule for material {}", center.material())
                     });
-                    next[x + y * side + z * side * side] = rule.step_cell(center, &neighbors).raw();
+                    next[idx] = rule.step_cell(center, &neighbors).raw();
                 }
             }
         }
@@ -930,32 +958,76 @@ impl World {
     ///
     /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
     /// distinct rule exists, run it. If zero or multiple: skip (identity).
+    ///
+    /// Under per-material tick_divisors (iowh): when any divisor > 1, iterate
+    /// both offsets and gate each block on its rule's `(generation / divisor) & 1`
+    /// Margolus offset + firing cadence, matching the hashlife path.
     fn step_blocks(&self, grid: &mut [CellState], side: usize) {
-        let offset = if self.generation.is_multiple_of(2) {
-            0
-        } else {
-            1
-        };
+        let block_rule_divisors = self.materials.block_rule_tick_divisors();
+        let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1);
 
-        let mut bz = offset;
-        while bz < side {
-            let mut by = offset;
-            while by < side {
-                let mut bx = offset;
-                while bx < side {
-                    self.apply_block(grid, side, bx, by, bz);
-                    bx += 2;
+        if all_divisors_one {
+            let offset = (self.generation & 1) as usize;
+            let mut bz = offset;
+            while bz < side {
+                let mut by = offset;
+                while by < side {
+                    let mut bx = offset;
+                    while bx < side {
+                        self.apply_block(grid, side, bx, by, bz, None, 0);
+                        bx += 2;
+                    }
+                    by += 2;
                 }
-                by += 2;
+                bz += 2;
             }
-            bz += 2;
+            return;
+        }
+
+        for pass_offset in 0..2usize {
+            let mut bz = pass_offset;
+            while bz < side {
+                let mut by = pass_offset;
+                while by < side {
+                    let mut bx = pass_offset;
+                    while bx < side {
+                        self.apply_block(
+                            grid,
+                            side,
+                            bx,
+                            by,
+                            bz,
+                            Some(&block_rule_divisors),
+                            pass_offset,
+                        );
+                        bx += 2;
+                    }
+                    by += 2;
+                }
+                bz += 2;
+            }
         }
     }
 
     /// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
     ///
     /// Cells outside the grid boundary are treated as empty (absorbing BC).
-    fn apply_block(&self, grid: &mut [CellState], side: usize, bx: usize, by: usize, bz: usize) {
+    ///
+    /// When `block_rule_divisors` is `Some`, gate the rule on its slowed-down
+    /// schedule (iowh): apply only when `generation % divisor == 0` AND the
+    /// rule's offset `(generation / divisor) & 1` equals `pass_offset`. The
+    /// fast path passes `None` and relies on the caller iterating one offset.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_block(
+        &self,
+        grid: &mut [CellState],
+        side: usize,
+        bx: usize,
+        by: usize,
+        bz: usize,
+        block_rule_divisors: Option<&[u16]>,
+        pass_offset: usize,
+    ) {
         // Read the 8 cells. OOB → empty (absorbing boundary).
         let mut block = [Cell::EMPTY; 8];
         for dz in 0..2 {
@@ -982,6 +1054,17 @@ impl World {
             Some(id) => id,
             None => return, // zero or multiple distinct rules → skip
         };
+
+        if let Some(divisors) = block_rule_divisors {
+            let divisor = divisors.get(rule_id.0).copied().unwrap_or(1).max(1) as u64;
+            if !self.generation.is_multiple_of(divisor) {
+                return;
+            }
+            let rule_offset = ((self.generation / divisor) & 1) as usize;
+            if rule_offset != pass_offset {
+                return;
+            }
+        }
 
         let rule = self.materials.block_rule(rule_id);
         let result = rule.step_block(&block);
@@ -4927,6 +5010,37 @@ mod tests {
         assert!(summary.contains("memo_hit="));
         assert!(summary.contains("memo_tbl="));
         assert!(summary.contains("memo_mac="));
+    }
+
+    /// HUD overlay (hash-thing-nhwo) splits `memo_summary` on whitespace
+    /// so each field lands on its own line. Guards against future schema
+    /// changes that would introduce an intra-field space (e.g.
+    /// `memo_tbl=1 234`) which would silently break the HUD layout.
+    #[test]
+    fn memo_summary_splits_cleanly_for_hud_overlay() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+        world.step_recursive();
+
+        let summary = world.memo_summary();
+        let lines: Vec<&str> = summary.split_whitespace().collect();
+
+        assert!(
+            lines.len() >= 3,
+            "memo_summary should split into at least 3 fields, got {lines:?}",
+        );
+        for line in &lines {
+            assert!(
+                line.starts_with("memo_"),
+                "every field must start with memo_ to keep the HUD layout sane, got {line:?}",
+            );
+            assert!(
+                line.len() <= 25,
+                "field too wide for compact HUD panel ({} chars): {line:?}",
+                line.len(),
+            );
+        }
     }
 
     #[test]
