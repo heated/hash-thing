@@ -213,14 +213,18 @@ pub struct World {
     /// grows in the negative direction, origin shifts to keep the old
     /// root's cells at the same world-space positions.
     pub origin: [i64; 3],
-    /// Cumulative old→new NodeId remap across all un-consumed store
-    /// compactions since the last SVDAG sync. Consumed by
-    /// `Svdag::apply_remap()` to keep its persistent cache valid across
-    /// compaction epochs (hash-thing-5bb.11). Compose-on-write: when a
-    /// new compaction publishes B→C while A→B is still pending, they
-    /// are composed into A→C so the renderer sees a single remap
-    /// keyed in its current (A) namespace (hash-thing-rk4n.1).
-    /// `None` after scene resets (the cache should be fully invalidated).
+    /// Old→current NodeId remap pending for the renderer's persistent
+    /// cache (`Svdag::apply_remap`, hash-thing-5bb.11). Keys are
+    /// old-namespace NodeIds that remain reachable across every
+    /// compaction since the last sync; keys GC'd mid-chain are dropped
+    /// (absence == invalidation). Compose-on-write: when a new
+    /// compaction publishes B→C while A→B is still pending, they are
+    /// composed into A→C so the renderer sees a single remap keyed in
+    /// its current (A) namespace (hash-thing-rk4n.1).
+    ///
+    /// `None` on fresh `World::new` (cache is empty by construction).
+    /// `Some(empty)` after `seed_terrain` — the consumer drains and
+    /// calls `apply_remap(&empty)`, which drops every cached entry.
     pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
 }
 
@@ -1990,11 +1994,15 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
-        // New epoch: the renderer's cache must be fully invalidated anyway,
-        // so any un-consumed remap from the previous epoch is stale. Clearing
-        // prevents a subsequent compose-on-write from polluting the new
-        // epoch's published remap with pre-reset keys (hash-thing-rk4n.1).
-        self.last_compaction_remap = None;
+        // New epoch: the renderer's cache holds entries keyed in the previous
+        // epoch's NodeId namespace, which is meaningless against a brand-new
+        // NodeStore. Publishing an *empty* remap drives `Svdag::apply_remap`
+        // to drop every cached entry (absence == invalidation), which is
+        // exactly what a scene reset requires. Leaving it `None` would let
+        // stale low-NodeId cache entries alias against the fresh store's
+        // low NodeIds and produce first-frame corruption after a regenerate
+        // (hash-thing-rk4n.1).
+        self.last_compaction_remap = Some(FxHashMap::default());
         let heightmap = params.to_heightmap();
         let precompute_start = std::time::Instant::now();
         let field = PrecomputedHeightmapField::new(heightmap, self.level)
@@ -2675,6 +2683,66 @@ mod tests {
             world.step();
             sync_svdag_with_world(&mut world, &mut svdag);
             assert_svdag_matches_world(&world, &svdag, &format!("after water-heavy step {step}"));
+        }
+    }
+
+    /// hash-thing-rk4n.1 always-on regression: 64^3 skip-sync variant of
+    /// the 256^3 commit_step repro below. Skipping some sync calls between
+    /// commit_step invocations used to clobber `last_compaction_remap`;
+    /// the compose-on-write fix keeps both remaps live across the gap.
+    /// Kept scaled-down + always-on so CI catches any regression without
+    /// `--ignored` (the 256^3 version runs ~2 min and stays ignored).
+    #[test]
+    fn water_and_sand_skip_sync_keeps_svdag_in_sync_64() {
+        let mut world = World::new(6);
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "initial 64^3 water scene");
+
+        // Sync on a subset of steps so two commit_step calls land between
+        // syncs — the exact pattern that exposed Bug A.
+        for step in 1u32..=20 {
+            world.step();
+            let verify = step <= 4 || step % 2 == 0;
+            if verify {
+                sync_svdag_with_world(&mut world, &mut svdag);
+                assert_svdag_matches_world(
+                    &world,
+                    &svdag,
+                    &format!("after 64^3 skip-sync step {step}"),
+                );
+            }
+        }
+    }
+
+    /// hash-thing-rk4n.1 always-on regression: 64^3 step_recursive variant.
+    /// `maybe_compact` used to never publish its remap, so any compaction
+    /// triggered inside the recursive stepper silently desynced the SVDAG
+    /// cache. Sync every step — if the renderer's cache aliases across a
+    /// maybe_compact store swap, the assertion panics within a few steps.
+    #[test]
+    fn water_and_sand_step_recursive_keeps_svdag_in_sync_64() {
+        let mut world = World::new(6);
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "initial 64^3 water scene");
+
+        for step in 1u32..=20 {
+            world.step_recursive();
+            sync_svdag_with_world(&mut world, &mut svdag);
+            assert_svdag_matches_world(
+                &world,
+                &svdag,
+                &format!("after 64^3 step_recursive {step}"),
+            );
         }
     }
 
