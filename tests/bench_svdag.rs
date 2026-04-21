@@ -167,17 +167,14 @@ fn bench_svdag_step_deltas(label: &str, level: u32, warmup: u32, measured: u32) 
     // Per-step upload bytes = 4 (slot-0 root header rewrite) + delta_u32s * 4 (tail append).
     let mean_upload_bytes = 4.0 + mean_u32 * 4.0;
     let max_upload_bytes = 4 + max_u32 * 4;
-    let hit_rate =
-        hits_total as f64 / (hits_total as f64 + misses_total as f64).max(1.0);
+    let hit_rate = hits_total as f64 / (hits_total as f64 + misses_total as f64).max(1.0);
 
     eprintln!("  warm-window summary (n={measured}):");
     eprintln!(
         "    upload tail u32s/step: mean={:.1} max={} | upload bytes/step: mean={:.0} max={}",
         mean_u32, max_u32, mean_upload_bytes, max_upload_bytes,
     );
-    eprintln!(
-        "    svdag compactions fired: {compact_events} (each = full-buffer re-upload)",
-    );
+    eprintln!("    svdag compactions fired: {compact_events} (each = full-buffer re-upload)",);
     eprintln!(
         "    hashlife: hits={hits_total} misses={misses_total} hit_rate={:.1}% empty_skips={empty_skips_total} fp_skips={fp_skips_total}",
         hit_rate * 100.0,

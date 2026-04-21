@@ -671,7 +671,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
-                "  F11/⌘⌃F Fullscreen   C  Clear perf",
+                "  F11/Cmd+Ctrl+F Fullscreen   C Clear perf",
                 "  Esc Exit",
             ],
             CameraMode::Orbit => vec![
@@ -693,7 +693,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
-                "  F11/⌘⌃F Fullscreen   C  Clear perf",
+                "  F11/Cmd+Ctrl+F Fullscreen   C Clear perf",
                 "  Esc Exit",
             ],
         }
