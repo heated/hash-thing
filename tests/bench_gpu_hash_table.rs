@@ -150,6 +150,10 @@ struct GpuCtx {
     pipeline_insert: wgpu::ComputePipeline,
     pipeline_lookup: wgpu::ComputePipeline,
     timestamp_supported: bool,
+    query_set: Option<wgpu::QuerySet>,
+    query_resolve: Option<wgpu::Buffer>,
+    query_readback: Option<wgpu::Buffer>,
+    timestamp_period_ns: f32,
 }
 
 impl GpuCtx {
@@ -221,6 +225,30 @@ impl GpuCtx {
             })
         };
 
+        let (query_set, query_resolve, query_readback, timestamp_period_ns) = if timestamp_supported
+        {
+            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("hash_ts"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts_resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts_readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            (Some(qs), Some(resolve), Some(readback), queue.get_timestamp_period())
+        } else {
+            (None, None, None, 0.0)
+        };
+
         Some(Self {
             pipeline_reset: mk_pipeline("cs_reset", "cs_reset"),
             pipeline_insert: mk_pipeline("cs_insert", "cs_insert"),
@@ -229,6 +257,10 @@ impl GpuCtx {
             device,
             queue,
             timestamp_supported,
+            query_set,
+            query_resolve,
+            query_readback,
+            timestamp_period_ns,
         })
     }
 }
@@ -492,19 +524,21 @@ fn read_buffer_u32(ctx: &GpuCtx, src: &wgpu::Buffer, n: u32) -> Vec<u32> {
     out
 }
 
-/// Single-phase dispatch with optional timestamp bracketing. Returns wall-clock
-/// submit+poll time; if GPU timestamps are available, the caller can query
-/// `last_gpu_duration` separately via the timestamp buffer (not wired here —
-/// the bench uses wall-clock around submit+poll as ground truth, matching the
-/// dlse.2.3 stance that pass-level Metal timestamps inflate with barrier time).
+/// Single-phase dispatch. Returns (wall_clock, gpu_timestamp_or_none).
+/// In-encoder timestamps bracket the dispatch itself (not the pass), matching
+/// `bench_gpu_raycast.rs`/renderer.rs — dlse.2.3 showed Metal pass-level
+/// timestamps inflate with barrier time, so we use in-encoder writes.
 fn run_phase(
     ctx: &GpuCtx,
     pipeline: &wgpu::ComputePipeline,
     bg: &wgpu::BindGroup,
     n: u32,
-) -> Duration {
+) -> (Duration, Option<Duration>) {
     let start = Instant::now();
     let mut enc = ctx.device.create_command_encoder(&Default::default());
+    if let Some(qs) = &ctx.query_set {
+        enc.write_timestamp(qs, 0);
+    }
     {
         let mut pass = enc.begin_compute_pass(&Default::default());
         pass.set_pipeline(pipeline);
@@ -512,9 +546,38 @@ fn run_phase(
         let groups = n.div_ceil(WORKGROUP_SIZE);
         pass.dispatch_workgroups(groups, 1, 1);
     }
+    if let (Some(qs), Some(resolve), Some(readback)) =
+        (&ctx.query_set, &ctx.query_resolve, &ctx.query_readback)
+    {
+        enc.write_timestamp(qs, 1);
+        enc.resolve_query_set(qs, 0..2, resolve, 0);
+        enc.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
     ctx.queue.submit(Some(enc.finish()));
-    ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-    start.elapsed()
+    let gpu = if let Some(readback) = &ctx.query_readback {
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let _ = rx.recv();
+        let ticks: Option<u64> = {
+            let data = slice.get_mapped_range();
+            let ts: &[u64] = bytemuck::cast_slice(&data);
+            if ts.len() >= 2 && ts[1] > ts[0] {
+                Some(ts[1] - ts[0])
+            } else {
+                None
+            }
+        };
+        readback.unmap();
+        ticks.map(|t| Duration::from_nanos((t as f64 * ctx.timestamp_period_ns as f64) as u64))
+    } else {
+        ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        None
+    };
+    (start.elapsed(), gpu)
 }
 
 // ---------- RNG helpers (SplitMix64, self-contained for reproducibility) ----
@@ -709,6 +772,7 @@ fn concurrent_same_key_cas_serializes() {
 
 // ------------------------------------------------------------- sweep -------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct Row {
     n: u32,
@@ -719,10 +783,16 @@ struct Row {
     insert_p95_ms: f64,
     lookup_hit_mean_ms: f64,
     lookup_miss_mean_ms: f64,
+    gpu_ins_ms: Option<f64>,
+    gpu_hit_ms: Option<f64>,
+    gpu_miss_ms: Option<f64>,
     max_probes: u32,
     insert_mkeys_s: f64,
     lookup_hit_mkeys_s: f64,
     lookup_miss_mkeys_s: f64,
+    gpu_ins_mkeys_s: Option<f64>,
+    gpu_hit_mkeys_s: Option<f64>,
+    gpu_miss_mkeys_s: Option<f64>,
 }
 
 fn p95(samples: &mut [Duration]) -> Duration {
@@ -776,6 +846,9 @@ fn run_sweep_row(
     let mut insert_samples = Vec::with_capacity(timed_runs);
     let mut hit_samples = Vec::with_capacity(timed_runs);
     let mut miss_samples = Vec::with_capacity(timed_runs);
+    let mut gpu_insert: Vec<Duration> = Vec::new();
+    let mut gpu_hit: Vec<Duration> = Vec::new();
+    let mut gpu_miss: Vec<Duration> = Vec::new();
     let mut max_probes = 0u32;
 
     let threads_to_dispatch = m_threads.min(n);
@@ -784,15 +857,25 @@ fn run_sweep_row(
         table.reset(ctx);
         table.write_params(ctx, threads_to_dispatch);
         let bg_ins = table.bind_group(ctx, &keys_buf, &values_buf, &results_buf);
-        let d_ins = run_phase(ctx, &ctx.pipeline_insert, &bg_ins, threads_to_dispatch);
-        let d_hit = run_phase(ctx, &ctx.pipeline_lookup, &bg_ins, threads_to_dispatch);
+        let (w_ins, g_ins) = run_phase(ctx, &ctx.pipeline_insert, &bg_ins, threads_to_dispatch);
+        let (w_hit, g_hit) = run_phase(ctx, &ctx.pipeline_lookup, &bg_ins, threads_to_dispatch);
         let bg_miss = table.bind_group(ctx, &miss_keys_buf, &values_buf, &results_buf);
-        let d_miss = run_phase(ctx, &ctx.pipeline_lookup, &bg_miss, threads_to_dispatch);
+        let (w_miss, g_miss) =
+            run_phase(ctx, &ctx.pipeline_lookup, &bg_miss, threads_to_dispatch);
 
         if pass >= warm_runs {
-            insert_samples.push(d_ins);
-            hit_samples.push(d_hit);
-            miss_samples.push(d_miss);
+            insert_samples.push(w_ins);
+            hit_samples.push(w_hit);
+            miss_samples.push(w_miss);
+            if let Some(d) = g_ins {
+                gpu_insert.push(d);
+            }
+            if let Some(d) = g_hit {
+                gpu_hit.push(d);
+            }
+            if let Some(d) = g_miss {
+                gpu_miss.push(d);
+            }
             let hist = table.read_probe_hist(ctx);
             max_probes = max_probes.max(max_probe_bucket(&hist));
         }
@@ -802,6 +885,9 @@ fn run_sweep_row(
     let hit_mean = mean(&hit_samples);
     let miss_mean = mean(&miss_samples);
     let ins_p95 = p95(&mut insert_samples.clone());
+    let g_ins_mean = if gpu_insert.is_empty() { None } else { Some(mean(&gpu_insert)) };
+    let g_hit_mean = if gpu_hit.is_empty() { None } else { Some(mean(&gpu_hit)) };
+    let g_miss_mean = if gpu_miss.is_empty() { None } else { Some(mean(&gpu_miss)) };
 
     let keys_dispatched = threads_to_dispatch as f64;
     let to_ms = |d: Duration| d.as_secs_f64() * 1_000.0;
@@ -823,10 +909,16 @@ fn run_sweep_row(
         insert_p95_ms: to_ms(ins_p95),
         lookup_hit_mean_ms: to_ms(hit_mean),
         lookup_miss_mean_ms: to_ms(miss_mean),
+        gpu_ins_ms: g_ins_mean.map(to_ms),
+        gpu_hit_ms: g_hit_mean.map(to_ms),
+        gpu_miss_ms: g_miss_mean.map(to_ms),
         max_probes,
         insert_mkeys_s: mkeys_s(ins_mean),
         lookup_hit_mkeys_s: mkeys_s(hit_mean),
         lookup_miss_mkeys_s: mkeys_s(miss_mean),
+        gpu_ins_mkeys_s: g_ins_mean.map(mkeys_s),
+        gpu_hit_mkeys_s: g_hit_mean.map(mkeys_s),
+        gpu_miss_mkeys_s: g_miss_mean.map(mkeys_s),
     }
 }
 
@@ -845,33 +937,37 @@ fn sweep_gpu_hash_throughput() {
         RNG_SEED, ctx.timestamp_supported
     );
     println!(
-        "| N       | M     | LF   | cap     | ins_ms (p95) | hit_ms | miss_ms | ins_Mk/s | hit_Mk/s | miss_Mk/s | maxP |"
+        "| N       | M     | LF   | cap     | ins_ms(p95) | gpu_ins_ms | gpu_hit_ms | gpu_miss_ms | gpu_ins_Mk/s | gpu_hit_Mk/s | gpu_miss_Mk/s | maxP |"
     );
     println!(
-        "|---------|-------|------|---------|--------------|--------|---------|----------|----------|-----------|------|"
+        "|---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|------|"
     );
 
     let ns: [u32; 3] = [10_000, 100_000, 1_000_000];
     let ms: [u32; 4] = [256, 1024, 4096, 16_384];
     let lfs: [f32; 3] = [0.5, 0.75, 0.9];
 
+    let opt_ms = |v: Option<f64>| v.map(|x| format!("{:>10.3}", x)).unwrap_or_else(|| "       n/a".into());
+    let opt_mk = |v: Option<f64>| v.map(|x| format!("{:>12.1}", x)).unwrap_or_else(|| "         n/a".into());
+
     for &n in &ns {
         for &m in &ms {
             for &lf in &lfs {
                 let row = run_sweep_row(&ctx, n, m, lf);
                 println!(
-                    "| {:>7} | {:>5} | {:.2} | {:>7} | {:>5.2} ({:>4.2}) | {:>5.2} | {:>6.2} | {:>8.1} | {:>8.1} | {:>9.1} | {:>4} |",
+                    "| {:>7} | {:>5} | {:.2} | {:>7} | {:>4.2} ({:>4.2}) | {} | {} | {} | {} | {} | {} | {:>4} |",
                     row.n,
                     row.m_threads,
                     row.load_factor,
                     row.capacity,
                     row.insert_mean_ms,
                     row.insert_p95_ms,
-                    row.lookup_hit_mean_ms,
-                    row.lookup_miss_mean_ms,
-                    row.insert_mkeys_s,
-                    row.lookup_hit_mkeys_s,
-                    row.lookup_miss_mkeys_s,
+                    opt_ms(row.gpu_ins_ms),
+                    opt_ms(row.gpu_hit_ms),
+                    opt_ms(row.gpu_miss_ms),
+                    opt_mk(row.gpu_ins_mkeys_s),
+                    opt_mk(row.gpu_hit_mkeys_s),
+                    opt_mk(row.gpu_miss_mkeys_s),
                     row.max_probes,
                 );
             }
