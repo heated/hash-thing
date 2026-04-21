@@ -1423,9 +1423,13 @@ impl ApplicationHandler for App {
                     .create_window(attrs)
                     .expect("failed to create main window"),
             );
-            // Agent/CLI launches on macOS can leave the app alive but unfocused.
+            // Do NOT focus-on-launch by default (edward 2026-04-21): the
+            // game stealing focus mid-dev-loop blocks keyboard input to the
+            // terminal/agent surface. Opt in with HASH_THING_FOCUS=1.
             window.set_visible(true);
-            window.focus_window();
+            if std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1") {
+                window.focus_window();
+            }
             if self.fullscreen_active {
                 // dlse.2.2: env-var opt-in. `Borderless(None)` targets the
                 // monitor currently containing the window. This will fire
