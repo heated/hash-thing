@@ -18,13 +18,18 @@
 //!      (each level n-1), recursively step each → 8 results at level n-2.
 //!      Assemble into the level-(n-1) output.
 //!
-//! Step results are memoized by (NodeId, parity) so identical subtrees anywhere
-//! in the world share a single cache entry per generation. Block-rule partition
-//! uses node-local alignment (9ww), so origin is not in the cache key.
+//! Step results are memoized by (NodeId, schedule_phase) so identical subtrees
+//! anywhere in the world share a single cache entry per generation. Block-rule
+//! partition uses node-local alignment (9ww), so origin is not in the cache key.
+//! `schedule_phase = generation % memo_period()` where `memo_period` is
+//! LCM over materials of `2 * tick_divisor` (iowh). With all divisors = 1 this
+//! reduces to generation parity (period = 2).
+//!
 //! Compaction is deferred (m1f.14): intermediate nodes survive across frames,
 //! enabling cache hits at every recursion level. Periodic compaction triggers
-//! when the store exceeds 2× its post-compaction size. Since parity alternates
-//! 0/1, cache hits occur every OTHER frame for stable subtrees.
+//! when the store exceeds 2× its post-compaction size. With all divisors = 1 the
+//! phase alternates 0/1, so stable subtrees hit the cache every other frame;
+//! with slower divisors hits occur every `memo_period` frames at the same phase.
 //!
 //! **Cache-preserving compaction (m1f.15.4):** The recursive descent builds
 //! intermediate nodes (27 per recursive level) that become cache keys but are
