@@ -173,6 +173,23 @@ This is the **"paper wins"** direction from §0: measurement is faster than the 
 
 The 30 FPS bug on M2 at 256³ / 50% is **not** explained by traversal cost — dlse.2.3 pinned real compute at ~0.16 ms. The 34 ms/frame budget is dominated by `surface_acquire_cpu ≈ 25 ms`. This is outside §3's scope; it is a compositor / swapchain-pacing question, owned by `hash-thing-dlse.2.2` (drawable starvation deep-dive). The perf-paper correlate is §4 ("SVDAG ↔ memo-step interaction") — or, more broadly, that the model should be extended with a §3.8 on surface / presentation cost once we have empirical per-OS numbers.
 
+### 3.8 Present-path inventory (macOS M2 Metal, measured)
+
+Step 1 of `hash-thing-dlse.2.2` logged `surface.get_capabilities` at renderer init (landed commit `4f60ddc` on main, 2026-04-21). M2 MacBook results:
+
+- `surface_caps.present_modes = [Fifo, Immediate]`. **No Mailbox.** wgpu's `AutoVsync` → Fifo, `AutoNoVsync` → Immediate on Metal.
+- `surface_caps.alpha_modes = [Opaque, PostMultiplied]`. Selected Opaque.
+- `surface_caps.formats = [Bgra8UnormSrgb, Bgra8Unorm, Rgba16Float, Rgb10a2Unorm]`. Selected Bgra8UnormSrgb.
+- `desired_maximum_frame_latency = 2`.
+- Window at default launch: physical 2940×1782 (retina 2×), render_scale 0.5 → render target 1470×891 (~1.3 M pixels).
+
+Consequences for the `surface_acquire_cpu ≈ 25 ms` hypothesis:
+- **No Mailbox** rules out "triple-buffer-style unlocked present was available and we just didn't use it." The wgpu present-mode menu on Metal is thinner than on DXGI or Vulkan.
+- moss previously tried `AutoNoVsync` (Immediate) with no improvement. Immediate should have near-zero present-side blocking, yet 25 ms persisted. The wait is therefore **not** a "waiting for vblank / queue full" in the naïve sense.
+- The most plausible remaining causes, in order: (a) CoreAnimation compositor tiling of windowed `CAMetalLayer` forcing a compositor fence per frame; (b) a driver-side acquire throttle that serializes across queue submissions; (c) our own pipeline inserting an implicit CPU wait (e.g., the timestamp resolve mapping path introducing a fence on the wrong submit).
+
+Step 2 (fullscreen borderless) tests hypothesis (a). Step 3 (off-surface render target) tests (b)+(c) by bypassing `surface.get_current_texture()` entirely.
+
 ---
 
 ## 4. SVDAG ↔ memo-step interaction
@@ -234,3 +251,4 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-20 | mayor | Skeleton landed. No content yet — see `hash-thing-stue` for charter and follow-up beads for first revisions. |
 | 2026-04-20 | onyx | §2 first pass (bead stue.1). Six-paper survey: ESVO 2010, SVDAG 2013, SSVDAG 2016, HashDAG 2020, HashDAG-attributes 2023, sparse 64-trees 2024. Each with reported number, implied M1-MBA number, verdict. Several exact numbers flagged TODO-verify (PDFs did not decode via WebFetch); headline figures and verdicts stand. |
 | 2026-04-20 | onyx | §3 theoretical frame-cost model (bead stue.2). Bottom-up derivation from M1 8-core GPU specs (2.6 TFLOPS, 68 GB/s) and the actual 36-byte interior-node encoding in `crates/ht-render/src/svdag.rs`. Predicts ~2 ms SVDAG traversal envelope at 256³ / 576k rays on M1 MBA. §5 gap report populated with raycast rows — measurement (post-dlse.2.3) is ~5-7× faster than model, consistent with shorter-than-assumed effective traversal depth. Surface-acquire row added to route dlse's 30 FPS bug to dlse.2.2; §3.8 surface/presentation model flagged as TODO. |
+| 2026-04-21 | onyx | §3.8 present-path inventory (bead dlse.2.2 step 1, commit `4f60ddc`). macOS M2 Metal exposes only `[Fifo, Immediate]` — no Mailbox. Rules out "triple-buffer-style unlocked present was on the table." The moss/AutoNoVsync null result combined with no-Mailbox narrows the 25 ms `surface_acquire_cpu` bug to compositor fence or driver-internal serialization; step 2 and step 3 of dlse.2.2 will distinguish these. |
