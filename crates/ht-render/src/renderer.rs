@@ -576,6 +576,16 @@ impl Renderer {
         // Default render_scale = 0.5: render at half physical resolution
         // for 4x fewer pixels. Trade sharpness for framerate.
         let render_scale: f32 = 0.5;
+        // dlse.2.2 exp#4: env-var gated so latency=3 (and other values)
+        // can be A/B tested without a default change. Invalid values
+        // fall back silently to DEFAULT_FRAME_LATENCY; the init log
+        // below shows the effective value so typos and any backend
+        // clamping are discoverable.
+        const DEFAULT_FRAME_LATENCY: u32 = 2;
+        let desired_max_frame_latency: u32 = std::env::var("HASH_THING_FRAME_LATENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_FRAME_LATENCY);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -584,7 +594,7 @@ impl Renderer {
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: desired_max_frame_latency,
         };
         log::info!(
             "surface_caps: present_modes={:?} alpha_modes={:?} formats={:?}",
