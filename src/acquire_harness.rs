@@ -11,8 +11,9 @@
 //! 4. `CaptureFullscreen` — record M frames.
 //! 5. `Done` — emit a side-by-side log line, ask the event loop to exit.
 //!
-//! Capture length is clamped by `Perf`'s ring capacity (64); the reported
-//! `n=` in the log is the effective count, not the raw frame count.
+//! Capture length matches `Perf`'s ring capacity (64) so `n=` in the log
+//! equals the number of frames observed in the capture phase (no silent
+//! windowing inside the ring).
 //!
 //! Enable via `HASH_THING_ACQUIRE_HARNESS=1`. When enabled, the harness
 //! forces a windowed start regardless of `HASH_THING_FULLSCREEN`.
@@ -22,7 +23,14 @@ use std::time::Duration;
 use crate::perf::Perf;
 
 const DEFAULT_WARMUP_FRAMES: u32 = 60;
-const DEFAULT_CAPTURE_FRAMES: u32 = 180;
+// Match Perf's ring capacity (crates/.../perf.rs Ring::CAPACITY = 64) so
+// every captured frame contributes to the reported mean/p95. Previously 180
+// — the ring silently retained only the tail 64, inflating the true warmup
+// window from 60 to ~176 frames and making n= vs capture_frames confusing
+// in the log (mixt IMPORTANT #1). Shifts future measurements vs. commit
+// 31df10c by whatever the tail-vs-head delta of those extra 116 frames was
+// on a given run — in practice small for a steady-state workload.
+const DEFAULT_CAPTURE_FRAMES: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -136,6 +144,12 @@ impl Harness {
                     self.windowed = Some(PhaseStats::snapshot(perf));
                     self.phase = Phase::WarmupFullscreen;
                     self.frames_in_phase = 0;
+                    // No ClearPerf here: windowed samples survive through the
+                    // toggle + fullscreen warmup, then the
+                    // WarmupFullscreen -> CaptureFullscreen boundary clears
+                    // before any fullscreen capture starts. Asymmetric vs
+                    // the WarmupWindowed -> CaptureWindowed boundary on
+                    // purpose (mixt IMPORTANT #2).
                     actions.push(Action::ToggleFullscreen);
                 }
             }
@@ -165,7 +179,7 @@ impl Harness {
         let fullscreen = self.fullscreen.unwrap_or_default();
         let verdict = verdict(windowed.surface_acquire_cpu, fullscreen.surface_acquire_cpu);
         let mut out = String::from("dlse.2.2 acquire-harness report\n");
-        out.push_str(&render_phase("windowed  ", &windowed));
+        out.push_str(&render_phase("windowed", &windowed));
         out.push_str(&render_phase("fullscreen", &fullscreen));
         out.push_str(&render_delta(
             windowed.surface_acquire_cpu,
@@ -176,24 +190,33 @@ impl Harness {
     }
 }
 
+// Label column widths. PHASE_LABEL_W fits "fullscreen" (10 chars);
+// METRIC_LABEL_W fits "surface_acquire_cpu" (19). Keeping them as named
+// constants makes future additions (e.g. "mid-transition") a one-line
+// change instead of touching every row (mixt NIT #7).
+const PHASE_LABEL_W: usize = 10;
+const METRIC_LABEL_W: usize = 19;
+
 fn render_phase(label: &str, stats: &PhaseStats) -> String {
     let mut s = String::new();
     for (name, snap) in [
         ("surface_acquire_cpu", stats.surface_acquire_cpu),
-        ("render_cpu         ", stats.render_cpu),
-        ("render_gpu         ", stats.render_gpu),
-        ("submit_cpu         ", stats.submit_cpu),
-        ("present_cpu        ", stats.present_cpu),
+        ("render_cpu", stats.render_cpu),
+        ("render_gpu", stats.render_gpu),
+        ("submit_cpu", stats.submit_cpu),
+        ("present_cpu", stats.present_cpu),
     ] {
         match snap {
             Some(snap) => s.push_str(&format!(
-                "  {label} {name} = {:5.2}/{:5.2} ms (n={})\n",
+                "  {label:<PHASE_LABEL_W$} {name:<METRIC_LABEL_W$} = {:5.2}/{:5.2} ms (n={})\n",
                 snap.mean.as_secs_f64() * 1000.0,
                 snap.p95.as_secs_f64() * 1000.0,
                 snap.samples,
             )),
             None => {
-                s.push_str(&format!("  {label} {name} = (no samples)\n"));
+                s.push_str(&format!(
+                    "  {label:<PHASE_LABEL_W$} {name:<METRIC_LABEL_W$} = (no samples)\n"
+                ));
             }
         }
     }
@@ -220,22 +243,28 @@ fn render_delta(windowed: Option<MetricSnapshot>, fullscreen: Option<MetricSnaps
     )
 }
 
+// Verdict thresholds tied to the dlse.2.2 acceptance rubric: "drop to ≤5 ms
+// → ship fullscreen-default" (mixt NIT #6).
+const SHIP_ACCEPT_MS: f64 = 5.0;
+const INVESTIGATE_CEILING_MS: f64 = 10.0;
+const INVESTIGATE_FLOOR_MS: f64 = 15.0;
+const NOISE_BAND_MS: f64 = 2.0;
+
 /// Turn the windowed vs fullscreen acquire numbers into a short
-/// recommendation. Thresholds match the dlse.2.2 acceptance rubric:
-/// "drop to ≤5 ms → ship fullscreen-default."
+/// recommendation.
 fn verdict(windowed: Option<MetricSnapshot>, fullscreen: Option<MetricSnapshot>) -> &'static str {
     let (Some(w), Some(f)) = (windowed, fullscreen) else {
         return "insufficient samples";
     };
     let w_ms = w.mean.as_secs_f64() * 1000.0;
     let f_ms = f.mean.as_secs_f64() * 1000.0;
-    if f_ms <= 5.0 && w_ms > 5.0 {
+    if f_ms <= SHIP_ACCEPT_MS && w_ms > SHIP_ACCEPT_MS {
         "fullscreen meets ≤5 ms acceptance — ship fullscreen-default"
-    } else if f_ms <= 10.0 && w_ms > 15.0 {
+    } else if f_ms <= INVESTIGATE_CEILING_MS && w_ms > INVESTIGATE_FLOOR_MS {
         "big drop but not ≤5 ms — investigate residual stall before shipping"
-    } else if (w_ms - f_ms).abs() < 2.0 {
+    } else if (w_ms - f_ms).abs() < NOISE_BAND_MS {
         "fullscreen ≈ windowed — acquire stall is not compositor/windowed-path; queue off-surface diagnostic"
-    } else if f_ms > w_ms + 2.0 {
+    } else if f_ms > w_ms + NOISE_BAND_MS {
         "fullscreen WORSE than windowed — unexpected; do not ship fullscreen-default"
     } else {
         "modest improvement — queue off-surface diagnostic (step 3)"

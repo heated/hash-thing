@@ -463,8 +463,14 @@ impl App {
         // The harness owns the windowed→fullscreen transition explicitly;
         // honouring `HASH_THING_FULLSCREEN=1` on top of it would skip the
         // windowed capture phase. Force windowed start when the harness is
-        // on.
+        // on, and log loudly if we clobbered an explicit user request —
+        // otherwise setting both flags is silently confusing (mixt NIT #5).
         if app.acquire_harness.is_some() {
+            if app.fullscreen_active {
+                log::info!(
+                    "HASH_THING_ACQUIRE_HARNESS=1 overrides HASH_THING_FULLSCREEN=1: forcing windowed start so the harness can run its windowed capture phase before toggling to fullscreen"
+                );
+            }
             app.fullscreen_active = false;
         }
 
@@ -1795,7 +1801,16 @@ impl ApplicationHandler for App {
                 // frames to keep coming even if the window manager decides
                 // to unfocus us — otherwise a headless crew launch can
                 // stall forever on frame 0 waiting on focus it'll never
-                // get.
+                // get. The `occluded` half of the bypass is separate from
+                // the `!focused` half: on macOS the compositor may mark a
+                // window occluded during the fullscreen toggle and never
+                // un-occlude before we finish capturing (mixt IMPORTANT
+                // #3). For a one-shot diagnostic we accept that the
+                // "occluded" frames still run — `surface.get_current_texture()`
+                // returns `Occluded` and the renderer early-returns, which
+                // is harmless for the measurement (no perf sample
+                // recorded) and auto-corrects once the compositor re-arms
+                // the surface.
                 if self.acquire_harness.is_none() && (self.occluded || !self.focused) {
                     return;
                 }
