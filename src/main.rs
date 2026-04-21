@@ -339,6 +339,45 @@ fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
     focused && camera_mode == CameraMode::FirstPerson
 }
 
+/// Drop any modifier KeyCodes from `keys` whose combined bit is *not* set in
+/// `state`. Returns the count removed so callers can log only when something
+/// actually changed. hash-thing-hnoh.
+fn reconcile_modifier_keys(
+    state: winit::keyboard::ModifiersState,
+    keys: &mut HashSet<KeyCode>,
+) -> usize {
+    use winit::keyboard::ModifiersState;
+    let mut removed = 0;
+    for (bit, lhs, rhs) in [
+        (
+            ModifiersState::SHIFT,
+            KeyCode::ShiftLeft,
+            KeyCode::ShiftRight,
+        ),
+        (
+            ModifiersState::CONTROL,
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+        ),
+        (ModifiersState::ALT, KeyCode::AltLeft, KeyCode::AltRight),
+        (
+            ModifiersState::SUPER,
+            KeyCode::SuperLeft,
+            KeyCode::SuperRight,
+        ),
+    ] {
+        if !state.contains(bit) {
+            if keys.remove(&lhs) {
+                removed += 1;
+            }
+            if keys.remove(&rhs) {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 impl App {
     fn new(volume_size: u32) -> Self {
         let level = volume_size.trailing_zeros();
@@ -1248,6 +1287,19 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::ModifiersChanged(modifiers) => {
+                // macOS can deliver `flagsChanged:` without a usable NSEvent
+                // keyCode — e.g. when a system shortcut (Cmd+Shift+3) is
+                // intercepted — so winit emits `ModifiersChanged` but no
+                // per-side `KeyboardInput { Released }`. Reconcile `keys_held`
+                // against the combined state bitflag as a best-effort cleanup.
+                // hash-thing-hnoh.
+                let removed = reconcile_modifier_keys(modifiers.state(), &mut self.keys_held);
+                if removed > 0 {
+                    log::debug!("ModifiersChanged reconciled {removed} stuck modifier key(s)",);
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 // Track physical key state for per-frame movement polling.
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
@@ -2070,6 +2122,69 @@ mod tests {
     use super::*;
     use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
     use std::time::Duration;
+
+    #[test]
+    fn reconcile_modifier_keys_drops_only_cleared_bits() {
+        use winit::keyboard::ModifiersState;
+
+        let pre_populate = || -> HashSet<KeyCode> {
+            [
+                KeyCode::ShiftLeft,
+                KeyCode::ShiftRight,
+                KeyCode::ControlLeft,
+                KeyCode::ControlRight,
+                KeyCode::AltLeft,
+                KeyCode::AltRight,
+                KeyCode::SuperLeft,
+                KeyCode::SuperRight,
+                KeyCode::KeyW, // sentinel: must never be touched
+            ]
+            .into_iter()
+            .collect()
+        };
+
+        // All modifier bits clear → every modifier KeyCode drops; KeyW stays.
+        let mut keys = pre_populate();
+        let removed = reconcile_modifier_keys(ModifiersState::empty(), &mut keys);
+        assert_eq!(removed, 8);
+        assert!(keys.contains(&KeyCode::KeyW));
+        assert!(!keys.contains(&KeyCode::ShiftLeft));
+        assert!(!keys.contains(&KeyCode::SuperRight));
+
+        // SHIFT bit held → both Shift KeyCodes stay, others drop.
+        let mut keys = pre_populate();
+        let removed = reconcile_modifier_keys(ModifiersState::SHIFT, &mut keys);
+        assert_eq!(removed, 6);
+        assert!(keys.contains(&KeyCode::ShiftLeft));
+        assert!(keys.contains(&KeyCode::ShiftRight));
+        assert!(!keys.contains(&KeyCode::ControlLeft));
+        assert!(!keys.contains(&KeyCode::AltRight));
+
+        // CONTROL | ALT held → 4 modifier KeyCodes drop.
+        let mut keys = pre_populate();
+        let removed =
+            reconcile_modifier_keys(ModifiersState::CONTROL | ModifiersState::ALT, &mut keys);
+        assert_eq!(removed, 4);
+        assert!(keys.contains(&KeyCode::ControlLeft));
+        assert!(keys.contains(&KeyCode::AltRight));
+        assert!(!keys.contains(&KeyCode::ShiftLeft));
+        assert!(!keys.contains(&KeyCode::SuperLeft));
+
+        // All four bits held → nothing removed.
+        let all = ModifiersState::SHIFT
+            | ModifiersState::CONTROL
+            | ModifiersState::ALT
+            | ModifiersState::SUPER;
+        let mut keys = pre_populate();
+        let removed = reconcile_modifier_keys(all, &mut keys);
+        assert_eq!(removed, 0);
+        assert_eq!(keys.len(), 9);
+
+        // Empty set + all bits clear → no-op, no underflow.
+        let mut keys: HashSet<KeyCode> = HashSet::new();
+        let removed = reconcile_modifier_keys(ModifiersState::empty(), &mut keys);
+        assert_eq!(removed, 0);
+    }
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
