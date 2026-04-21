@@ -439,6 +439,24 @@ impl Renderer {
     pub async fn new(window: Arc<Window>, volume_size: u32) -> Self {
         let size = window.inner_size();
 
+        // hash-thing-dlse.2.2 step 1: log windowing/display context at init so
+        // the 25ms surface_acquire_cpu stall on M2 can be correlated with
+        // monitor refresh rate, scale factor, and which output the window is on.
+        let scale_factor = window.scale_factor();
+        match window.current_monitor() {
+            Some(m) => log::info!(
+                "monitor: name={:?} size={:?} refresh_mHz={:?} scale_factor={} window_scale_factor={}",
+                m.name(),
+                m.size(),
+                m.refresh_rate_millihertz(),
+                m.scale_factor(),
+                scale_factor,
+            ),
+            None => log::info!(
+                "monitor: none reported by winit (scale_factor={scale_factor})"
+            ),
+        }
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             backend_options: Default::default(),
@@ -1091,15 +1109,18 @@ impl Renderer {
             cache: None,
         });
 
+        let adapter_info = adapter.get_info();
+        log::info!(
+            "GPU adapter: name={:?} backend={:?} driver={:?} device_type={:?}",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.driver_info,
+            adapter_info.device_type,
+        );
         let gpu_timing = if timestamp_supported {
             let period_ns = queue.get_timestamp_period();
-            let info = adapter.get_info();
             log::info!(
-                "GPU timestamp_period={period_ns}ns (adapter={:?} backend={:?} driver={:?}) in_encoder={}",
-                info.name,
-                info.backend,
-                info.driver_info,
-                in_encoder_timestamps_supported,
+                "GPU timestamp_period={period_ns}ns in_encoder={in_encoder_timestamps_supported}"
             );
             Some(GpuTiming::new(
                 &device,
