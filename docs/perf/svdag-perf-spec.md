@@ -33,6 +33,7 @@ If you are tuning to a different machine (M2, M3, discrete GPU), you are tuning 
 
 (To be derived from paper §3 and §4.)
 
+- **Aim for a performance local optimum, not the middle.** L2-fit (<~4 MB reachable DAG, ~100k interior nodes) is one such optimum on M1 MBA: bandwidth-free raycast, 3–5× faster than the DRAM regime. It is not the only one — at 4096³ with streaming, the relevant optimum is "streaming-bandwidth-matched active region + high dedup rate." The design principle is to pick an optimum at the current scale and build toward it deliberately, rather than drifting into the space between optima where we pay DRAM costs without a corresponding visual payoff. This is a **game-design input**, not just a tuning target. See SPEC.md "Soft requirements" (2026-04-20 entry) and paper §3.5.
 - TODO — e.g., "Doubling world linear scale costs roughly Nx in raycast time because traversal depth grows by 1 bit and average reachable set grows by ~2x; so 512³ should cost ~2x of 256³, not ~8x."
 - TODO — e.g., "Active-material churn above N cells/generation defeats SVDAG compaction; at that point a flat 3D texture is the right structure."
 - TODO — e.g., "Cross-frame texture dependencies on integrated GPU cost more than they look like they should; prefer ping-pong over single-target."

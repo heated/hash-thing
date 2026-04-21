@@ -1,3 +1,4 @@
+use hash_thing::acquire_harness::{self, Action as HarnessAction};
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
@@ -327,6 +328,18 @@ struct App {
     /// to detect the Cmd+Ctrl+F fullscreen chord (winit does not
     /// surface chords as NamedKey).
     modifiers: winit::keyboard::ModifiersState,
+    /// Cached hashlife memo health summary (hash-thing-stue.6). Refreshed
+    /// on the main thread after each step's world result is merged back,
+    /// so the periodic log can print it even while the next step is on
+    /// the background thread (where `self.world` is a placeholder).
+    last_memo_summary: String,
+    /// Self-driving windowed-vs-fullscreen acquire measurement
+    /// (`dlse.2.2`). `Some` when `HASH_THING_ACQUIRE_HARNESS=1`.
+    /// When active, the harness forces a windowed start, burns a
+    /// warmup window, records capture samples, flips fullscreen,
+    /// records again, logs a side-by-side report, and asks the event
+    /// loop to exit.
+    acquire_harness: Option<acquire_harness::Harness>,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -434,8 +447,27 @@ impl App {
             pending_player_action: None,
             fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
             modifiers: winit::keyboard::ModifiersState::empty(),
+            last_memo_summary: String::new(),
+            acquire_harness: acquire_harness::Harness::from_env(),
         };
+        // The harness owns the windowed→fullscreen transition explicitly;
+        // honouring `HASH_THING_FULLSCREEN=1` on top of it would skip the
+        // windowed capture phase. Force windowed start when the harness is
+        // on, and log loudly if we clobbered an explicit user request —
+        // otherwise setting both flags is silently confusing (mixt NIT #5).
+        if app.acquire_harness.is_some() {
+            if app.fullscreen_active {
+                log::info!(
+                    "HASH_THING_ACQUIRE_HARNESS=1 overrides HASH_THING_FULLSCREEN=1: forcing windowed start so the harness can run its windowed capture phase before toggling to fullscreen"
+                );
+            }
+            app.fullscreen_active = false;
+        }
 
+        // Seed the cached memo summary so the very first periodic log line
+        // has a populated column instead of a blank trailing field
+        // (hash-thing-stue.6 reviewer nit).
+        app.last_memo_summary = app.world.memo_summary();
         let player_pos = app.reset_scene_entities();
         app.spawn_demo_entities();
         log::info!(
@@ -1318,6 +1350,13 @@ impl ApplicationHandler for App {
             let mut renderer =
                 pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
+            // `surface.get_current_texture()` + `present()`; pairs with the
+            // acquire harness to measure whether the ~25 ms surface_acquire
+            // stall is swapchain-pacing (collapses) or elsewhere (persists).
+            if std::env::var("HASH_THING_OFF_SURFACE").ok().as_deref() == Some("1") {
+                renderer.enable_off_surface();
+            }
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
@@ -1474,6 +1513,7 @@ impl ApplicationHandler for App {
                                 self.entities.update(&self.world, &mut queue);
                                 self.world.queue = queue;
                             }
+                            self.last_memo_summary = self.world.memo_summary();
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &mut self.world,
@@ -1746,7 +1786,22 @@ impl ApplicationHandler for App {
                 // stepping the sim + uploading the SVDAG during a 100%-CPU
                 // spin on an invisible surface is exactly what 8jp was about.
                 // `WindowEvent::Occluded(false)` re-arms the loop.
-                if self.occluded || !self.focused {
+                //
+                // Exception: when the acquire-harness is running we want
+                // frames to keep coming even if the window manager decides
+                // to unfocus us — otherwise a headless crew launch can
+                // stall forever on frame 0 waiting on focus it'll never
+                // get. The `occluded` half of the bypass is separate from
+                // the `!focused` half: on macOS the compositor may mark a
+                // window occluded during the fullscreen toggle and never
+                // un-occlude before we finish capturing (mixt IMPORTANT
+                // #3). For a one-shot diagnostic we accept that the
+                // "occluded" frames still run — `surface.get_current_texture()`
+                // returns `Occluded` and the renderer early-returns, which
+                // is harmless for the measurement (no perf sample
+                // recorded) and auto-corrects once the compositor re-arms
+                // the surface.
+                if self.acquire_harness.is_none() && (self.occluded || !self.focused) {
                     return;
                 }
 
@@ -1796,6 +1851,12 @@ impl ApplicationHandler for App {
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
+                                // Refresh cached memo-health summary while the
+                                // real world is in hand (hash-thing-stue.6):
+                                // the (stepping) log branch below cannot read
+                                // self.world (it's about to be replaced by a
+                                // placeholder again on the next step).
+                                self.last_memo_summary = self.world.memo_summary();
                                 // Entity update on main thread (needs both
                                 // &World and &mut EntityStore).
                                 let mut queue = std::mem::take(&mut self.world.queue);
@@ -1836,13 +1897,17 @@ impl ApplicationHandler for App {
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
                     if self.is_stepping() {
                         // World is on the background thread — just show perf.
-                        log::info!("(stepping) | {}", self.perf.summary());
+                        log::info!(
+                            "(stepping) | {} | {}",
+                            self.perf.summary(),
+                            self.last_memo_summary,
+                        );
                     } else {
                         let nodes = self.world.store.stats();
                         self.mem_stats.update(nodes);
                         let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                         log::info!(
-                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
+                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {} | {}",
                             self.world.generation,
                             self.world.population(),
                             svdag_nodes,
@@ -1850,6 +1915,7 @@ impl ApplicationHandler for App {
                             svdag_root_level,
                             self.mem_stats.summary(),
                             self.perf.summary(),
+                            self.last_memo_summary,
                         );
                     }
                     self.log_timer = std::time::Instant::now();
@@ -2104,6 +2170,41 @@ impl ApplicationHandler for App {
                 // Kick off the next background step only after this frame has
                 // finished consuming the live world snapshot.
                 self.maybe_start_background_step();
+
+                // Advance the self-driving acquire harness (dlse.2.2).
+                // Runs after this frame's samples are in `self.perf`, so
+                // snapshots reflect the just-completed capture window.
+                // Two-pass drain: `step()` holds `&mut self.acquire_harness`
+                // + `&self.perf`, so we collect actions first and release
+                // those borrows before dispatching (which can touch `&mut
+                // self.perf`, `&mut self` for the fullscreen toggle, and
+                // `&self.acquire_harness` for the final report).
+                let harness_actions: Vec<HarnessAction> =
+                    if let Some(harness) = self.acquire_harness.as_mut() {
+                        harness.step(&self.perf)
+                    } else {
+                        Vec::new()
+                    };
+                for action in harness_actions {
+                    match action {
+                        HarnessAction::ClearPerf => {
+                            self.perf.clear();
+                            log::info!("acquire-harness: perf cleared");
+                        }
+                        HarnessAction::ToggleFullscreen => {
+                            log::info!(
+                                "acquire-harness: windowed capture done, toggling to fullscreen"
+                            );
+                            self.toggle_fullscreen();
+                        }
+                        HarnessAction::Exit => {
+                            if let Some(h) = self.acquire_harness.as_ref() {
+                                log::info!("{}", h.report());
+                            }
+                            event_loop.exit();
+                        }
+                    }
+                }
 
                 if let Some(window) = &self.window {
                     window.request_redraw();

@@ -190,6 +190,13 @@ pub struct World {
     pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, u64), NodeId>,
     /// Hashlife cache statistics from the most recent step.
     pub hashlife_stats: HashlifeStats,
+    /// Lifetime accumulator across `step_recursive` calls. Unlike
+    /// `hashlife_stats` (reset each step), this aggregates for the life of the
+    /// `World` — enables steady-state hit-rate reporting in the periodic log
+    /// (hash-thing-stue.6). `step_recursive_pow2` is intentionally not folded
+    /// in: it goes through `step_node_macro`, which doesn't touch
+    /// `hashlife_stats` today, so there'd be nothing to add anyway.
+    pub hashlife_stats_total: HashlifeStats,
     /// Store size after the last compaction, used to trigger periodic GC.
     pub(crate) store_size_at_last_compact: usize,
     /// Cache for `inert_uniform_state`: NodeId → Option<CellState>.
@@ -237,6 +244,24 @@ pub struct HashlifeStats {
     pub fixed_point_skips: u64,
     /// Per-level cache miss counts (index = level - 3, since base case is level 3).
     pub misses_by_level: [u64; 32],
+}
+
+impl HashlifeStats {
+    /// Field-wise add `step` into `self`. Keeps the scalar counters and the
+    /// per-level array in sync (hash-thing-stue.6 lifetime accumulator).
+    pub fn accumulate(&mut self, step: &HashlifeStats) {
+        self.cache_hits += step.cache_hits;
+        self.cache_misses += step.cache_misses;
+        self.empty_skips += step.empty_skips;
+        self.fixed_point_skips += step.fixed_point_skips;
+        for (dst, src) in self
+            .misses_by_level
+            .iter_mut()
+            .zip(step.misses_by_level.iter())
+        {
+            *dst += *src;
+        }
+    }
 }
 
 /// Compose two sequential NodeId remaps `A→B` and `B→C` into a single
@@ -290,6 +315,7 @@ impl World {
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
+            hashlife_stats_total: HashlifeStats::default(),
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
@@ -318,6 +344,7 @@ impl World {
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
+            hashlife_stats_total: HashlifeStats::default(),
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
@@ -1805,6 +1832,32 @@ impl World {
 
     pub fn population(&self) -> u64 {
         self.store.population(self.root)
+    }
+
+    /// Compact one-line summary of spatial-memo health for the periodic log
+    /// (hash-thing-stue.6). Uses the lifetime accumulator `hashlife_stats_total`
+    /// for hit rate — so the rate converges toward steady state rather than
+    /// fluctuating with the most recent step. Table sizes are live `.len()`,
+    /// which is the right signal for "is this table about to blow memory."
+    ///
+    /// Format: `memo_hit=<fraction> memo_tbl=<int> memo_mac=<int>`.
+    /// Hit rate prints as `0.000` before any step has run, which is honest:
+    /// no data yet. `memo_mac` stays at 0 on single-step sessions (only
+    /// `step_recursive_pow2` populates the macro cache).
+    pub fn memo_summary(&self) -> String {
+        let stats = &self.hashlife_stats_total;
+        let total = stats.cache_hits + stats.cache_misses;
+        let hit_rate = if total == 0 {
+            0.0
+        } else {
+            stats.cache_hits as f64 / total as f64
+        };
+        format!(
+            "memo_hit={:.3} memo_tbl={} memo_mac={}",
+            hit_rate,
+            self.hashlife_cache.len(),
+            self.hashlife_macro_cache.len(),
+        )
     }
 
     fn spectacle_box(center: [i64; 3], min: [i64; 3], max: [i64; 3]) -> Box3 {
@@ -4721,5 +4774,123 @@ mod tests {
         });
 
         world.apply_mutations();
+    }
+
+    // ---------------------------------------------------------------------
+    // hash-thing-stue.6: spatial-memo telemetry.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn hashlife_stats_accumulate_sums_fields_and_levels_per_index() {
+        let mut total = HashlifeStats::default();
+        let mut a = HashlifeStats::default();
+        let mut b = HashlifeStats::default();
+
+        a.cache_hits = 3;
+        a.cache_misses = 5;
+        a.empty_skips = 7;
+        a.fixed_point_skips = 11;
+        a.misses_by_level[0] = 1;
+        a.misses_by_level[3] = 13;
+        a.misses_by_level[7] = 17;
+
+        b.cache_hits = 2;
+        b.cache_misses = 4;
+        b.empty_skips = 6;
+        b.fixed_point_skips = 8;
+        b.misses_by_level[0] = 10;
+        b.misses_by_level[3] = 100;
+        b.misses_by_level[7] = 1000;
+
+        total.accumulate(&a);
+        total.accumulate(&b);
+
+        assert_eq!(total.cache_hits, 5);
+        assert_eq!(total.cache_misses, 9);
+        assert_eq!(total.empty_skips, 13);
+        assert_eq!(total.fixed_point_skips, 19);
+        assert_eq!(total.misses_by_level[0], 11);
+        assert_eq!(total.misses_by_level[3], 113);
+        assert_eq!(total.misses_by_level[7], 1017);
+        // Untouched indices must remain zero — catches the "summed into
+        // index 0" copy-paste bug.
+        for (i, &v) in total.misses_by_level.iter().enumerate() {
+            if !matches!(i, 0 | 3 | 7) {
+                assert_eq!(v, 0, "misses_by_level[{i}] bled from another index");
+            }
+        }
+    }
+
+    #[test]
+    fn memo_summary_reports_cumulative_hits_after_two_steps() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+
+        world.step_recursive();
+        let after_first = world.hashlife_stats;
+        world.step_recursive();
+        let after_second = world.hashlife_stats;
+
+        let total = &world.hashlife_stats_total;
+        assert!(
+            total.cache_hits + total.cache_misses > 0,
+            "lifetime accumulator must see nonzero activity after stepping",
+        );
+        assert_eq!(
+            total.cache_hits,
+            after_first.cache_hits + after_second.cache_hits,
+            "hits total must equal sum of per-step snapshots",
+        );
+        assert_eq!(
+            total.cache_misses,
+            after_first.cache_misses + after_second.cache_misses,
+            "misses total must equal sum of per-step snapshots",
+        );
+        assert!(
+            total.cache_hits >= after_second.cache_hits,
+            "total must be >= most-recent step",
+        );
+
+        let summary = world.memo_summary();
+        assert!(summary.contains("memo_hit="));
+        assert!(summary.contains("memo_tbl="));
+        assert!(summary.contains("memo_mac="));
+    }
+
+    #[test]
+    fn hashlife_stats_per_step_reset_preserved() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+
+        world.step_recursive();
+        let first_misses = world.hashlife_stats.cache_misses;
+        assert!(first_misses > 0, "first step must produce misses");
+
+        world.step_recursive();
+        let second_misses = world.hashlife_stats.cache_misses;
+
+        // Per-step field still captures only the latest step. If accumulation
+        // accidentally folded into `hashlife_stats` rather than the `_total`
+        // sibling, this would equal `first + second` (the lifetime total).
+        assert_eq!(
+            world.hashlife_stats_total.cache_misses,
+            first_misses + second_misses,
+            "lifetime accumulator must equal exact per-step sum",
+        );
+        assert!(
+            second_misses < first_misses + second_misses,
+            "per-step stats must reset between calls (second={second_misses}, sum={})",
+            first_misses + second_misses,
+        );
+    }
+
+    #[test]
+    fn memo_summary_on_fresh_world_is_zero_rate() {
+        let world = World::new(4);
+        let summary = world.memo_summary();
+        assert!(
+            summary.starts_with("memo_hit=0.000"),
+            "fresh world reports honest zero hit rate, got: {summary}",
+        );
     }
 }
