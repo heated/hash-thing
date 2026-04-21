@@ -551,40 +551,49 @@ the ~1.5 ms wall-clock floor on M1 MBA reflects submit+poll overhead and is
 *not* the primitive's cost. GPU throughput columns (`gpu_*_Mk/s`) are
 computed from in-encoder ticks; these are the numbers to read. Seed
 `0xA5A5_A5A5`, 5 timed runs + 1 warm discarded, mean reported. Table size
-`next_pow2(ceil(N / load_factor))`. Hash constant `0x9E3779B9` (Knuth
-golden-ratio; inlined as a single u32 multiply because WGSL lacks native
-u64).
+`next_pow2(ceil(N / load_factor))`. Hash is the classic fxhash u32
+finalizer: `h = k * 0x7F4A7C15; h ^= h >> 16; h *= 0x9E3779B9` (two u32
+multiplies + xor-shift; WGSL has no native u64 so the Knuth 64-bit
+golden-ratio is expressed as a pair of u32 multiplies in the finalizer
+shape). Mixing quality is adequate for power-of-two table sizes,
+validated empirically by `maxP ≤ 5` at N ≥ 100K across all tested load
+factors.
 
-**Results.**
+**Results** (selected rows where `M ≥ 4096`, so per-dispatch fixed
+overhead is amortized enough that `gpu_*` columns measure the primitive
+rather than queue latency; the full 36-row sweep is printed by the test):
 
 ```
 GPU hash-table sweep (seed 0xA5A5A5A5, timestamp_supported=true)
-| N       | M     | LF   | cap     | ins_ms(p95) | gpu_ins_ms | gpu_hit_ms | gpu_miss_ms | gpu_ins_Mk/s | gpu_hit_Mk/s | gpu_miss_Mk/s | maxP |
-|---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|------|
-|   10000 |  4096 | 0.50 |   32768 | 1.66 (1.68) |      0.043 |      0.157 |      0.273 |         95.2 |         26.1 |          15.0 |    5 |
-|   10000 | 10000 | 0.75 |   16384 | 1.70 (1.83) |      0.055 |      0.074 |      0.275 |        182.3 |        135.5 |          36.3 |   30 |
-|   10000 | 10000 | 0.90 |   16384 | 1.92 (2.93) |      0.087 |      0.080 |      0.079 |        115.1 |        125.3 |         125.8 |   30 |
-|  100000 |  4096 | 0.50 |  262144 | 1.64 (1.80) |      0.059 |      0.036 |      0.057 |         69.9 |        113.1 |          72.0 |    2 |
-|  100000 | 16384 | 0.50 |  262144 | 1.59 (1.60) |      0.037 |      0.071 |      0.083 |        445.3 |        232.0 |         197.9 |    4 |
-|  100000 | 16384 | 0.75 |  262144 | 1.60 (1.66) |      0.055 |      0.089 |      0.067 |        297.9 |        184.1 |         245.7 |    4 |
-|  100000 | 16384 | 0.90 |  131072 | 1.59 (1.65) |      0.046 |      0.077 |      0.083 |        356.4 |        213.8 |         198.0 |    5 |
-| 1000000 |  4096 | 0.50 | 2097152 | 1.59 (1.65) |      0.046 |      0.041 |      0.029 |         88.8 |        100.6 |         139.7 |    1 |
-| 1000000 | 16384 | 0.50 | 2097152 | 1.90 (3.09) |      0.070 |      0.084 |      0.083 |        234.9 |        194.3 |         198.5 |    2 |
-| 1000000 | 16384 | 0.75 | 2097152 | 1.91 (3.11) |      0.150 |      0.104 |      0.091 |        109.0 |        157.9 |         180.0 |    2 |
-| 1000000 | 16384 | 0.90 | 2097152 | 1.93 (3.10) |      0.367 |      0.088 |      0.089 |         44.7 |        186.8 |         184.9 |    2 |
+| N       | M     | LF   | cap     | ins_ms(p95) | gpu_ins_ms | gpu_hit_ms | gpu_miss_ms | gpu_ins_Mk/s | gpu_hit_Mk/s | gpu_miss_Mk/s | maxP_ins | maxP_hit | maxP_miss |
+|---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|----------|----------|-----------|
+|   10000 |  4096 | 0.75 |   16384 | 1.77 (2.03) |      0.069 |      0.099 |      0.083 |         59.5 |         41.3 |          49.2 |        7 |        7 |         8 |
+|   10000 | 10000 | 0.50 |   32768 | 1.73 (1.88) |      0.074 |      0.092 |      0.106 |        134.5 |        109.2 |          94.0 |       12 |       12 |        12 |
+|   10000 | 10000 | 0.90 |   16384 | 1.70 (1.90) |      0.057 |      0.108 |      0.190 |        176.6 |         92.8 |          52.7 |       30 |       30 |        30 |
+|  100000 |  4096 | 0.75 |  262144 | 1.69 (1.82) |      0.058 |      0.071 |      0.084 |         70.6 |         58.0 |          48.5 |        2 |        2 |         2 |
+|  100000 | 16384 | 0.50 |  262144 | 2.01 (3.29) |      0.052 |      0.143 |      0.128 |        317.1 |        114.9 |         127.6 |        3 |        3 |         4 |
+|  100000 | 16384 | 0.75 |  262144 | 1.95 (3.11) |      0.067 |      0.407 |      0.114 |        245.8 |         40.2 |         144.3 |        3 |        3 |         4 |
+|  100000 | 16384 | 0.90 |  131072 | 1.85 (2.65) |      0.276 |      0.142 |      0.135 |         59.3 |        115.4 |         121.5 |        5 |        5 |         5 |
+| 1000000 |  4096 | 0.50 | 2097152 | 1.93 (3.09) |      0.048 |      0.073 |      0.284 |         85.2 |         55.8 |          14.4 |        1 |        1 |         1 |
+| 1000000 | 16384 | 0.50 | 2097152 | 1.88 (3.16) |      0.029 |      0.129 |      0.330 |        561.1 |        127.3 |          49.7 |        2 |        2 |         2 |
+| 1000000 | 16384 | 0.75 | 2097152 | 2.43 (4.62) |      0.256 |      0.136 |      0.086 |         64.0 |        120.8 |         191.6 |        2 |        2 |         2 |
+| 1000000 | 16384 | 0.90 | 2097152 | 2.49 (4.61) |      0.125 |      0.135 |      0.153 |        130.7 |        121.3 |         107.1 |        2 |        2 |         2 |
 ```
 
-(Full 36-row sweep in the test output; table above extracts the rows where
-dispatch size is large enough to amortize the fixed per-dispatch overhead —
-i.e. the rows that actually measure the primitive and not queue latency.)
+(The small-M rows — M ∈ {256, 1024} — fall below 25 Mkeys/s across the
+board because the 1.5 ms submit+poll wall-clock floor dominates a tiny
+compute workload; they're in the full sweep output for transparency but
+are not the primitive measurement.)
 
-**Probe depth.** `maxP` is the 95th-percentile-like max bucket observed
-across the 5 timed runs. For `N ≥ 100K` the table is "empty enough per
-bucket" that linear probing sees `maxP ≤ 5` even at LF 0.9. The outlier
-is `N=10K, M=10000, LF ∈ {0.75, 0.9}` where `maxP=30`: 10K threads racing
+**Probe depth.** `maxP_{ins,hit,miss}` are the per-phase max buckets
+(reset and read back between phases so they attribute cleanly). For
+`N ≥ 100K` the table is "empty enough per bucket" that linear probing
+sees `maxP ≤ 5` across all phases even at LF 0.9. The outlier is
+`N=10K, M=10000, LF ∈ {0.75, 0.9}` where `maxP=30`: 10K threads racing
 into a 16K-slot table produce deep clusters by the time the last inserts
-arrive. The 32-slot histogram overflow counter was never triggered — no
-run came close to the `table_size` wrap-around abort.
+arrive, and subsequent lookups inherit those clusters (hence insert and
+hit phases show the same 30). The 32-slot histogram overflow counter was
+never triggered — no run came close to the `table_size` wrap-around abort.
 
 **Verdict: GO (linear probing, no cuckoo required).**
 

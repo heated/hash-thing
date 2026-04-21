@@ -659,16 +659,16 @@ fn lookup_disjoint_keys_all_miss() {
     let values: Vec<u32> = (0..n).collect();
     let keys_buf = make_input_buffer(&ctx, "keys", &keys);
     let values_buf = make_input_buffer(&ctx, "values", &values);
-    let _results_buf = make_output_buffer(&ctx, "results_ins", n);
+    let insert_results_buf = make_output_buffer(&ctx, "results_ins", n);
     table.write_params(&ctx, n);
-    let bg = table.bind_group(&ctx, &keys_buf, &values_buf, &_results_buf);
+    let bg = table.bind_group(&ctx, &keys_buf, &values_buf, &insert_results_buf);
     let _ = run_phase(&ctx, &ctx.pipeline_insert, &bg, n);
 
     // Disjoint keys for lookup (seed offset avoids any collision).
     let miss_keys = gen_unique_keys(n, RNG_SEED ^ 0xDEAD_BEEF);
     let miss_keys_buf = make_input_buffer(&ctx, "miss_keys", &miss_keys);
-    let miss_results_buf = make_output_buffer(&ctx, "miss_results", n);
-    let bg2 = table.bind_group(&ctx, &miss_keys_buf, &values_buf, &miss_results_buf);
+    let missinsert_results_buf = make_output_buffer(&ctx, "miss_results", n);
+    let bg2 = table.bind_group(&ctx, &miss_keys_buf, &values_buf, &missinsert_results_buf);
     let _ = run_phase(&ctx, &ctx.pipeline_lookup, &bg2, n);
 
     // Any collision between the two key sets would produce a spurious hit;
@@ -677,7 +677,7 @@ fn lookup_disjoint_keys_all_miss() {
     let inserted: std::collections::HashSet<u32> = keys.iter().copied().collect();
     let expected_collisions: usize = miss_keys.iter().filter(|k| inserted.contains(k)).count();
 
-    let results = read_buffer_u32(&ctx, &miss_results_buf, n);
+    let results = read_buffer_u32(&ctx, &missinsert_results_buf, n);
     let got_hits = results.iter().filter(|r| **r != 0xFFFF_FFFF).count();
     assert_eq!(
         got_hits, expected_collisions,
@@ -772,6 +772,9 @@ fn concurrent_same_key_cas_serializes() {
 
 // ------------------------------------------------------------- sweep -------
 
+// Wall-clock `*_mean_ms`/`*_mkeys_s` fields are retained for cross-check but
+// the sweep prints only gpu_* columns; rustc's dead-code analysis doesn't see
+// struct field reads through `Debug` or format strings, so the allow stays.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct Row {
@@ -786,7 +789,9 @@ struct Row {
     gpu_ins_ms: Option<f64>,
     gpu_hit_ms: Option<f64>,
     gpu_miss_ms: Option<f64>,
-    max_probes: u32,
+    max_probes_ins: u32,
+    max_probes_hit: u32,
+    max_probes_miss: u32,
     insert_mkeys_s: f64,
     lookup_hit_mkeys_s: f64,
     lookup_miss_mkeys_s: f64,
@@ -849,7 +854,9 @@ fn run_sweep_row(
     let mut gpu_insert: Vec<Duration> = Vec::new();
     let mut gpu_hit: Vec<Duration> = Vec::new();
     let mut gpu_miss: Vec<Duration> = Vec::new();
-    let mut max_probes = 0u32;
+    let mut max_probes_ins = 0u32;
+    let mut max_probes_hit = 0u32;
+    let mut max_probes_miss = 0u32;
 
     let threads_to_dispatch = m_threads.min(n);
 
@@ -858,10 +865,31 @@ fn run_sweep_row(
         table.write_params(ctx, threads_to_dispatch);
         let bg_ins = table.bind_group(ctx, &keys_buf, &values_buf, &results_buf);
         let (w_ins, g_ins) = run_phase(ctx, &ctx.pipeline_insert, &bg_ins, threads_to_dispatch);
+        let ins_hist = if pass >= warm_runs {
+            let h = table.read_probe_hist(ctx);
+            table.clear_probe_hist(ctx);
+            Some(h)
+        } else {
+            table.clear_probe_hist(ctx);
+            None
+        };
         let (w_hit, g_hit) = run_phase(ctx, &ctx.pipeline_lookup, &bg_ins, threads_to_dispatch);
+        let hit_hist = if pass >= warm_runs {
+            let h = table.read_probe_hist(ctx);
+            table.clear_probe_hist(ctx);
+            Some(h)
+        } else {
+            table.clear_probe_hist(ctx);
+            None
+        };
         let bg_miss = table.bind_group(ctx, &miss_keys_buf, &values_buf, &results_buf);
         let (w_miss, g_miss) =
             run_phase(ctx, &ctx.pipeline_lookup, &bg_miss, threads_to_dispatch);
+        let miss_hist = if pass >= warm_runs {
+            Some(table.read_probe_hist(ctx))
+        } else {
+            None
+        };
 
         if pass >= warm_runs {
             insert_samples.push(w_ins);
@@ -876,8 +904,15 @@ fn run_sweep_row(
             if let Some(d) = g_miss {
                 gpu_miss.push(d);
             }
-            let hist = table.read_probe_hist(ctx);
-            max_probes = max_probes.max(max_probe_bucket(&hist));
+            if let Some(h) = ins_hist {
+                max_probes_ins = max_probes_ins.max(max_probe_bucket(&h));
+            }
+            if let Some(h) = hit_hist {
+                max_probes_hit = max_probes_hit.max(max_probe_bucket(&h));
+            }
+            if let Some(h) = miss_hist {
+                max_probes_miss = max_probes_miss.max(max_probe_bucket(&h));
+            }
         }
     }
 
@@ -912,7 +947,9 @@ fn run_sweep_row(
         gpu_ins_ms: g_ins_mean.map(to_ms),
         gpu_hit_ms: g_hit_mean.map(to_ms),
         gpu_miss_ms: g_miss_mean.map(to_ms),
-        max_probes,
+        max_probes_ins,
+        max_probes_hit,
+        max_probes_miss,
         insert_mkeys_s: mkeys_s(ins_mean),
         lookup_hit_mkeys_s: mkeys_s(hit_mean),
         lookup_miss_mkeys_s: mkeys_s(miss_mean),
@@ -937,10 +974,10 @@ fn sweep_gpu_hash_throughput() {
         RNG_SEED, ctx.timestamp_supported
     );
     println!(
-        "| N       | M     | LF   | cap     | ins_ms(p95) | gpu_ins_ms | gpu_hit_ms | gpu_miss_ms | gpu_ins_Mk/s | gpu_hit_Mk/s | gpu_miss_Mk/s | maxP |"
+        "| N       | M     | LF   | cap     | ins_ms(p95) | gpu_ins_ms | gpu_hit_ms | gpu_miss_ms | gpu_ins_Mk/s | gpu_hit_Mk/s | gpu_miss_Mk/s | maxP_ins | maxP_hit | maxP_miss |"
     );
     println!(
-        "|---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|------|"
+        "|---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|----------|----------|-----------|"
     );
 
     let ns: [u32; 3] = [10_000, 100_000, 1_000_000];
@@ -955,7 +992,7 @@ fn sweep_gpu_hash_throughput() {
             for &lf in &lfs {
                 let row = run_sweep_row(&ctx, n, m, lf);
                 println!(
-                    "| {:>7} | {:>5} | {:.2} | {:>7} | {:>4.2} ({:>4.2}) | {} | {} | {} | {} | {} | {} | {:>4} |",
+                    "| {:>7} | {:>5} | {:.2} | {:>7} | {:>4.2} ({:>4.2}) | {} | {} | {} | {} | {} | {} | {:>8} | {:>8} | {:>9} |",
                     row.n,
                     row.m_threads,
                     row.load_factor,
@@ -968,7 +1005,9 @@ fn sweep_gpu_hash_throughput() {
                     opt_mk(row.gpu_ins_mkeys_s),
                     opt_mk(row.gpu_hit_mkeys_s),
                     opt_mk(row.gpu_miss_mkeys_s),
-                    row.max_probes,
+                    row.max_probes_ins,
+                    row.max_probes_hit,
+                    row.max_probes_miss,
                 );
             }
         }
