@@ -319,6 +319,14 @@ struct App {
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
+    /// Fullscreen toggle state (dlse.2.2). Cycles between None and
+    /// Fullscreen::Borderless(None) via F11 or Cmd+Ctrl+F. Initial
+    /// state set from HASH_THING_FULLSCREEN=1.
+    fullscreen_active: bool,
+    /// Latest modifier key state, tracked via ModifiersChanged, used
+    /// to detect the Cmd+Ctrl+F fullscreen chord (winit does not
+    /// surface chords as NamedKey).
+    modifiers: winit::keyboard::ModifiersState,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -424,6 +432,8 @@ impl App {
             startup_scene_pending: true,
             cursor_captured: false,
             pending_player_action: None,
+            fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
+            modifiers: winit::keyboard::ModifiersState::empty(),
         };
 
         let player_pos = app.reset_scene_entities();
@@ -476,6 +486,60 @@ impl App {
             return;
         }
         self.apply_cursor_capture(should_capture);
+    }
+
+    /// Apply a raw pixel-delta mouse look to the player. Scales by
+    /// `LOOK_SENSITIVITY` and clamps pitch to ±1.4. Shared between the
+    /// `CursorMoved` (uncaptured) and `DeviceEvent::MouseMotion` (captured)
+    /// paths so the two stay in parity by construction (hash-thing-a6t2).
+    fn apply_fps_look(&mut self, dx: f64, dy: f64) {
+        let Some(pid) = self.player_id else { return };
+        let Some(player) = self.entities.get_mut(pid) else {
+            return;
+        };
+        if let sim::EntityKind::Player(ref mut ps) = player.kind {
+            ps.yaw += dx * LOOK_SENSITIVITY;
+            ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
+        }
+    }
+
+    /// Handle a `WindowEvent::CursorMoved` at `(x, y)`. Routes to the player
+    /// (first-person, uncaptured cursor) or the orbit-camera renderer
+    /// depending on mode. Extracted so tests can drive it without a window
+    /// (hash-thing-a6t2).
+    fn handle_cursor_moved(&mut self, x: f64, y: f64) {
+        let should_look = match self.camera_mode {
+            CameraMode::Orbit => self.mouse_pressed,
+            CameraMode::FirstPerson => !self.cursor_captured,
+        };
+        if !should_look {
+            return;
+        }
+        if let Some((lx, ly)) = self.last_mouse {
+            let dx = x - lx;
+            let dy = y - ly;
+            match self.camera_mode {
+                CameraMode::FirstPerson => self.apply_fps_look(dx, dy),
+                CameraMode::Orbit => {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.camera_yaw += dx as f32 * 0.005;
+                        renderer.camera_pitch =
+                            (renderer.camera_pitch + dy as f32 * 0.005).clamp(-1.4, 1.4);
+                    }
+                }
+            }
+        }
+        self.last_mouse = Some((x, y));
+    }
+
+    /// Handle a captured-cursor `DeviceEvent::MouseMotion` delta. No-op
+    /// unless the player is in first-person mode with the cursor grabbed
+    /// (hash-thing-w1yq). Extracted for testability (hash-thing-a6t2).
+    fn handle_mouse_motion(&mut self, dx: f64, dy: f64) {
+        if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
+            return;
+        }
+        self.apply_fps_look(dx, dy);
     }
 
     fn load_initial_scene(&mut self) {
@@ -700,6 +764,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
+                "  F11/Cmd+Ctrl+F Fullscreen   C Clear perf",
                 "  Esc Exit",
             ],
             CameraMode::Orbit => vec![
@@ -721,6 +786,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
+                "  F11/Cmd+Ctrl+F Fullscreen   C Clear perf",
                 "  Esc Exit",
             ],
         }
@@ -728,6 +794,23 @@ impl App {
 
     fn lattice_debug_jumps_enabled(&self) -> bool {
         self.camera_mode == CameraMode::Orbit
+    }
+
+    /// Toggle borderless-fullscreen (dlse.2.2). Logs the chosen variant so
+    /// post-hoc log forensics can tell which state the app was in at
+    /// measurement time.
+    fn toggle_fullscreen(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        self.fullscreen_active = !self.fullscreen_active;
+        let mode = if self.fullscreen_active {
+            Some(winit::window::Fullscreen::Borderless(None))
+        } else {
+            None
+        };
+        log::info!("fullscreen: toggling to {:?}", mode);
+        window.set_fullscreen(mode);
     }
 
     /// Update cached render-side world geometry after world changes.
@@ -1221,6 +1304,15 @@ impl ApplicationHandler for App {
             // Agent/CLI launches on macOS can leave the app alive but unfocused.
             window.set_visible(true);
             window.focus_window();
+            if self.fullscreen_active {
+                // dlse.2.2: env-var opt-in. `Borderless(None)` targets the
+                // monitor currently containing the window. This will fire
+                // `Resized` and transition the macOS Space.
+                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                log::info!(
+                    "fullscreen: entering Borderless(None) at startup (HASH_THING_FULLSCREEN=1)"
+                );
+            }
             self.window = Some(window.clone());
 
             let mut renderer =
@@ -1287,16 +1379,18 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::ModifiersChanged(modifiers) => {
-                // macOS can deliver `flagsChanged:` without a usable NSEvent
-                // keyCode — e.g. when a system shortcut (Cmd+Shift+3) is
-                // intercepted — so winit emits `ModifiersChanged` but no
-                // per-side `KeyboardInput { Released }`. Reconcile `keys_held`
-                // against the combined state bitflag as a best-effort cleanup.
-                // hash-thing-hnoh.
-                let removed = reconcile_modifier_keys(modifiers.state(), &mut self.keys_held);
+            WindowEvent::ModifiersChanged(mods) => {
+                // dlse.2.2: track modifier state for Cmd+Ctrl+F chord detection.
+                self.modifiers = mods.state();
+                // hash-thing-hnoh: macOS can deliver `flagsChanged:` without a
+                // usable NSEvent keyCode — e.g. when a system shortcut
+                // (Cmd+Shift+3) is intercepted — so winit emits
+                // `ModifiersChanged` but no per-side `KeyboardInput { Released }`.
+                // Reconcile `keys_held` against the combined state bitflag as
+                // a best-effort cleanup.
+                let removed = reconcile_modifier_keys(self.modifiers, &mut self.keys_held);
                 if removed > 0 {
-                    log::debug!("ModifiersChanged reconciled {removed} stuck modifier key(s)",);
+                    log::debug!("ModifiersChanged reconciled {removed} stuck modifier key(s)");
                 }
             }
 
@@ -1313,6 +1407,15 @@ impl ApplicationHandler for App {
                     }
                 }
                 if event.state == ElementState::Pressed {
+                    // dlse.2.2: Cmd+Ctrl+F fullscreen chord. Check by physical
+                    // key + modifier state since winit does not surface chords
+                    // as NamedKey and macOS may alter logical_key under Cmd.
+                    if let winit::keyboard::PhysicalKey::Code(KeyCode::KeyF) = event.physical_key {
+                        if self.modifiers.super_key() && self.modifiers.control_key() {
+                            self.toggle_fullscreen();
+                            return;
+                        }
+                    }
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
                             // In orbit mode, Space toggles pause.
@@ -1328,6 +1431,12 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F5) => {
                             self.paused = !self.paused;
                             log::info!("Paused: {}", self.paused);
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
+                            // dlse.2.2: fullscreen toggle. Primary shortcut is
+                            // Cmd+Ctrl+F on macOS (reachable even when F11 is
+                            // swallowed by the window server).
+                            self.toggle_fullscreen();
                         }
                         winit::keyboard::Key::Character("0") => {
                             // Recenter player at world center.
@@ -1480,6 +1589,13 @@ impl ApplicationHandler for App {
                             // staged around the beat waypoints.
                             self.load_demo_spectacle("Reset spectacle gallery");
                         }
+                        winit::keyboard::Key::Character("c") => {
+                            // dlse.2.2: drain perf histograms so the next `P`
+                            // dump reflects only post-clear samples. Needed for
+                            // clean windowed-vs-fullscreen comparisons.
+                            self.perf.clear();
+                            log::info!("perf histograms cleared");
+                        }
                         winit::keyboard::Key::Character("h") => {
                             // Toggle step-count heatmap debug mode.
                             if let Some(renderer) = &mut self.renderer {
@@ -1594,33 +1710,7 @@ impl ApplicationHandler for App {
                 // either stops firing or reports a stationary position, so we
                 // must not feed its deltas into look input — see `device_event`
                 // below. (hash-thing-w1yq)
-                let should_look = match self.camera_mode {
-                    CameraMode::Orbit => self.mouse_pressed,
-                    CameraMode::FirstPerson => !self.cursor_captured,
-                };
-                if should_look {
-                    if let Some((lx, ly)) = self.last_mouse {
-                        let dx = position.x - lx;
-                        let dy = position.y - ly;
-                        if self.camera_mode == CameraMode::FirstPerson {
-                            // Update player yaw/pitch directly.
-                            if let Some(pid) = self.player_id {
-                                if let Some(player) = self.entities.get_mut(pid) {
-                                    if let sim::EntityKind::Player(ref mut ps) = player.kind {
-                                        ps.yaw += dx * LOOK_SENSITIVITY;
-                                        ps.pitch =
-                                            (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
-                                    }
-                                }
-                            }
-                        } else if let Some(renderer) = &mut self.renderer {
-                            renderer.camera_yaw += dx as f32 * 0.005;
-                            renderer.camera_pitch =
-                                (renderer.camera_pitch + dy as f32 * 0.005).clamp(-1.4, 1.4);
-                        }
-                    }
-                    self.last_mouse = Some((position.x, position.y));
-                }
+                self.handle_cursor_moved(position.x, position.y);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -2038,17 +2128,7 @@ impl ApplicationHandler for App {
         let DeviceEvent::MouseMotion { delta: (dx, dy) } = event else {
             return;
         };
-        if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
-            return;
-        }
-        let Some(pid) = self.player_id else { return };
-        let Some(player) = self.entities.get_mut(pid) else {
-            return;
-        };
-        if let sim::EntityKind::Player(ref mut ps) = player.kind {
-            ps.yaw += dx * LOOK_SENSITIVITY;
-            ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
-        }
+        self.handle_mouse_motion(dx, dy);
     }
 }
 
@@ -2501,5 +2581,96 @@ mod tests {
         assert!(!should_capture_cursor(CameraMode::FirstPerson, false));
         assert!(!should_capture_cursor(CameraMode::Orbit, true));
         assert!(!should_capture_cursor(CameraMode::Orbit, false));
+    }
+
+    /// Read the player's `(yaw, pitch)` off the entity store, for tests
+    /// that exercise the mouse-look split (hash-thing-a6t2).
+    fn player_look(app: &mut App) -> (f64, f64) {
+        let pid = app.player_id.expect("player spawned by App::new");
+        let entity = app.entities.get_mut(pid).expect("player entity present");
+        match &entity.kind {
+            sim::EntityKind::Player(ps) => (ps.yaw, ps.pitch),
+            _ => panic!("player_id does not point at a Player entity"),
+        }
+    }
+
+    /// Seed yaw/pitch and `last_mouse` so `handle_cursor_moved` produces a
+    /// non-zero delta on its first call.
+    fn prime_cursor(app: &mut App, start_x: f64, start_y: f64) {
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+        app.last_mouse = Some((start_x, start_y));
+    }
+
+    #[test]
+    fn cursor_moved_first_person_uncaptured_applies_look() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = false;
+        prime_cursor(&mut app, 100.0, 100.0);
+
+        app.handle_cursor_moved(110.0, 105.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch - 5.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cursor_moved_first_person_captured_is_noop() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = true;
+        prime_cursor(&mut app, 100.0, 100.0);
+
+        app.handle_cursor_moved(999.0, 999.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0);
+        assert_eq!(pitch, 0.0);
+    }
+
+    #[test]
+    fn mouse_motion_captured_first_person_applies_look() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = true;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        app.handle_mouse_motion(20.0, -8.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - 20.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch - (-8.0 * LOOK_SENSITIVITY)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mouse_motion_uncaptured_is_noop() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = false;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        app.handle_mouse_motion(999.0, 999.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0);
+        assert_eq!(pitch, 0.0);
+    }
+
+    #[test]
+    fn apply_fps_look_clamps_pitch() {
+        let mut app = App::new(64);
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 1.3);
+
+        // dy large enough to push past the +1.4 clamp.
+        app.apply_fps_look(0.0, 1000.0);
+        let (_yaw, pitch) = player_look(&mut app);
+        assert!((pitch - 1.4).abs() < 1e-12, "pitch should clamp at +1.4");
+
+        // Symmetric negative clamp.
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, -1.3);
+        app.apply_fps_look(0.0, -1000.0);
+        let (_yaw, pitch) = player_look(&mut app);
+        assert!((pitch - -1.4).abs() < 1e-12, "pitch should clamp at -1.4");
     }
 }
