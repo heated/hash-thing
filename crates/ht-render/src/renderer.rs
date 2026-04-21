@@ -2435,23 +2435,69 @@ mod tests {
     }
 
     #[test]
-    fn gpu_timing_two_instances_have_independent_state() {
+    fn gpu_timing_two_instances_have_independent_state_end_to_end() {
         // dlse.2.4 — the compute-pass and render-pass brackets each own
-        // their own GpuTiming. A readback pending on one must not block
-        // the other from starting or from reporting its own idleness.
-        let Some((device, _queue, period, in_encoder)) = try_make_timestamp_device() else {
+        // their own GpuTiming. Driving `compute` through a real
+        // PENDING → READY → IDLE cycle must not drag `render` out of
+        // IDLE. Codex + Claude reviewers flagged the prior IDLE-only
+        // variant of this test as vacuous: `take_resolved()` short-
+        // circuits on !READY so it could not catch a shared-state
+        // regression. This test forces the actual transition by
+        // encoding two `write_timestamp` calls on the encoder, which
+        // only requires TIMESTAMP_QUERY_INSIDE_ENCODERS — no pipeline
+        // or bind-group setup.
+        let Some((device, queue, period, in_encoder)) = try_make_timestamp_device() else {
             return;
         };
-        let compute = GpuTiming::new(&device, period, in_encoder, "test_compute");
-        let render = GpuTiming::new(&device, period, in_encoder, "test_render");
+        if !in_encoder {
+            // Adapter lacks TIMESTAMP_QUERY_INSIDE_ENCODERS; driving the
+            // cycle without a real compute/render pass is not possible.
+            // The per-pass branch is already pinned by
+            // `pass_writes_respects_in_encoder_mode`.
+            return;
+        }
+
+        let compute = GpuTiming::new(&device, period, true, "test_compute");
+        let render = GpuTiming::new(&device, period, true, "test_render");
         assert!(compute.is_idle());
         assert!(render.is_idle());
-        // Distinct label prefixes imply distinct underlying query sets and
-        // buffers; a fresh take_resolved on either must not accidentally
-        // drain the other.
-        assert!(compute.take_resolved().is_none());
-        assert!(render.is_idle());
+
+        // Encode + submit a minimal workload on `compute` only.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_two_instances_encoder"),
+        });
+        compute.write_timestamp_begin(&mut encoder);
+        compute.write_timestamp_end(&mut encoder);
+        compute.encode_resolve(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        compute.request_readback();
+
+        // Pump the `map_async` callback synchronously. The
+        // `wait_indefinitely` variant blocks until every pending
+        // submission + mapping completes, which is the pattern
+        // `tests/bench_gpu_hash_table.rs` uses for the same shape
+        // of readback test.
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        // `compute` must have transitioned to READY; `render` must be
+        // untouched. This is the regression test the reviewers asked
+        // for — if `state` were accidentally shared across instances,
+        // `render.is_idle()` would flip false here.
+        assert!(!compute.is_idle(), "compute should be READY post-poll");
+        assert!(
+            render.is_idle(),
+            "render must NOT be dragged out of IDLE by compute's readback"
+        );
+
+        // Drain compute; confirm it returns a duration (the two
+        // timestamps are close but non-negative per the saturating
+        // subtract in `ticks_to_duration`). Render must still be IDLE.
+        let dur = compute
+            .take_resolved()
+            .expect("compute readback must be ready after Wait poll");
+        let _ = dur; // value is backend-dependent; shape is what we pin.
+        assert!(compute.is_idle(), "compute must return to IDLE after take");
+        assert!(render.is_idle(), "render still untouched");
         assert!(render.take_resolved().is_none());
-        assert!(compute.is_idle());
     }
 }
