@@ -561,8 +561,10 @@ impl App {
 
         // Seed the cached memo summary so the very first periodic log line
         // has a populated column instead of a blank trailing field
-        // (hash-thing-stue.6 reviewer nit).
+        // (hash-thing-stue.6 reviewer nit). Dirty the HUD too so reseeding
+        // here can never race ahead of the construction-time seed.
         app.last_memo_summary = app.world.memo_summary();
+        app.memo_hud_dirty = true;
         let player_pos = app.reset_scene_entities();
         app.spawn_demo_entities();
         log::info!(
