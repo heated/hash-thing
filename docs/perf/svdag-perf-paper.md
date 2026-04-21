@@ -280,6 +280,67 @@ The off-surface `render_gpu` (compute) bracket reports inflated numbers (~9–26
 
 dlse.2.2 should be **reopened** for option 1 (fast) and a new bead filed for option 2 (Metal-specific). The §3.8 closure note was premature; this is a swapchain-layer bug, not a renderer-compute bug.
 
+### 3.10 Scaling the model to 4096³ (`hash-thing-ivms`)
+
+Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
+
+**3.10.1 Octree depth.** `log₂(4096) = 12`, vs `log₂(256) = 8` — four extra levels of descent. The SVDAG interior-node encoding (§3.2) is unchanged (36 B), so depth scaling enters the model through traversal step count (§3.10.2) and reachable-set size (§3.10.3) only.
+
+**3.10.2 Per-ray traversal at 4096³.** The stue.5 harness measured ~15 mean DDA steps/ray at 256³ default-spawn (§3.3). Two scaling forces:
+
+- **Tree-walk machinery.** Descend + step-past + pop is roughly linear in tree height at fixed ray length; 12/8 = 1.5× on the descent chain.
+- **Ray coverage.** Render target stays at 960×600 (render scale 0.5 on a 1920×1200-class window), so primary-ray count is unchanged at ~576k. But a 4096³ world fills the frustum rather than occupying a corner; hit rate on horizontal camera poses approaches 100 %, shifting the mean away from the sky-heavy all-rays distribution (15.0 steps) and toward the hit-only distribution (20.0 steps).
+
+**Projection: mean ~22–28 DDA steps/ray at 4096³ default-spawn**, p95 in the 60-80 range (vs 34 at 256³). Confirm via `tests/bench_depth_histogram.rs` at level 12 — narrow-fix-lane harness variant, filed as ivms follow-up in §6.
+
+**3.10.3 Reachable DAG size and working set.** Measured SVDAG node counts (`tests/bench_svdag.rs` comment, 2026-04-12):
+
+| Scale | Nodes | Size | Per-linear-double ratio |
+|---|---|---|---|
+| 64³   | 640    | 0.02 MB | — |
+| 256³  | 6,773  | 0.23 MB | ~3.3× per 2× linear (early growth) |
+| 512³  | 20,228 | 0.69 MB | ~3.0× per 2× linear |
+| 1024³ | 61,399 | 2.11 MB | ~3.0× per 2× linear |
+| **4096³ (seeded, pre-CA)** | **548,179** | **~18.8 MB** | **~3.0× per 2× linear (projection confirmed)** |
+
+From 256³ onward the exponent is stable at `log(3)/log(2) ≈ 1.58` in linear world size. Confirmed by one-shot `bench_hashlife_4096` seed (onyx 2026-04-21): 548k reachable nodes at 4096³ seeded terrain — exactly on the `L^1.58` projection (1024³ × 4^1.58 ≈ 551k). Total serialized DAG: ~18.8 MB (548k × 36 B).
+
+Warm-run post-CA node count was not measured — the test runner's 60-second ignore-mode ceiling killed the first hashlife step before it completed, so the warm (post-step) reachable-node count and macro-cache size remain unmeasured at 4096³. The cold-seeded count is a lower bound; CA churn grows the reachable set by some factor (at 256³, warm grows ~8 % vs cold; scaling is not yet characterized).
+
+**19 MB exceeds the M1 L2 (4 MB) by ~5×** for the seeded pre-CA DAG alone; post-CA warm-set will be somewhat larger (up to ~25 MB projected under a typical-growth factor). At 256³ the entire reachable DAG fit in L2 with margin (§3.5); at 4096³ the whole set does not. The relevant question shifts from "whole-DAG-resident" to *working-set on the active ray frontier*: warp-coherent primary rays touch ~2–4 sibling chains at any given descent depth, so the instantaneous hot set is *heuristically* ~1–4 MB — still L2-resident if the heuristic holds. The cold tail of distant / shadow / back-side nodes spills to DRAM. **This hot-set estimate is load-bearing for §3.10.4 below but is not directly measured**; it is an order-of-magnitude guess from warp width × expected descent depth × node size, not an inferred bound.
+
+**3.10.4 Per-step cost regime.** At 256³ an 80/20 L1/L2 mix gave ~9 ns/step (§3.3). At 4096³, the regime plausibly shifts toward L2/DRAM because the whole DAG spills L2. As a speculative mid-point between "warp coherence keeps the 80/20 mix intact" (optimistic) and "cache pressure dominates" (pessimistic), posit a 50/35/15 L1/L2/DRAM mix, giving `0.5×6 + 0.35×22 + 0.15×175 ≈ 3.0 + 7.7 + 26.3 ≈ 37 ns/step`, ~4× the 256³ per-step cost.
+
+This mix is **speculative**, not derived. The actual mix at 4096³ depends on how tightly warp-coherent primary rays cluster in the reachable DAG, which the model has no direct lever on. The two bracketing cases:
+- **Optimistic (mix stays at 80/20 because warp coherence keeps the hot ancestor chain L1-resident):** per-step cost ~9 ns, unchanged from 256³.
+- **Pessimistic (mix shifts to 30/40/30 because the larger whole-DAG forces more L2 evictions):** per-step cost ~60 ns, ~7× the 256³ cost.
+
+§3.10.5's envelope and likely-measurement predictions are re-derived under all three scenarios (optimistic / mid / pessimistic) rather than only the mid one, so the user of this section can pick the assumption they consider most plausible.
+
+**3.10.5 Frame cost envelope at 4096³.** Holding render scale at 50 % (960×600, 576k rays) on the M1 MBA target. Per-frame node traffic (bandwidth ceiling, unaffected by cache mix): `576k × 25 × 36 B ≈ 520 MB`, `520 MB / 68 GB/s ≈ 7.6 ms` raw, `÷ 0.6 utilization ≈ 12.7 ms` envelope.
+
+Per-step-latency path, spanning the three §3.10.4 scenarios (rays grouped into 32-wide SIMD groups on M1; the divisor assumes groups descend together so shared ancestor loads are not duplicated):
+
+| Scenario | ns/step | Envelope `576k × 25 × ns / 32` | Bandwidth envelope | Both agree? |
+|---|---|---|---|---|
+| Optimistic (80/20, coherence holds) | 9 | **4.1 ms** | 12.7 ms | no — bandwidth not the bind |
+| Mid (50/35/15, speculative) | 37 | **16.7 ms** | 12.7 ms | near |
+| Pessimistic (30/40/30, coherence breaks) | 60 | **27 ms** | 12.7 ms | no — latency dominates |
+
+**Likely-measurement span:** **~1–17 ms / frame** depending on which scenario holds, not a single tight number. The paper's strongest single prediction is the **17 ms confident upper bound** (saturates the 60-FPS budget — useful as a go/no-go threshold). Anything below ~10 ms would leave headroom for sim + blit + overlay + present; anything above ~10 ms forces a trade-off.
+
+Two cross-checks on the span:
+- **256³ analogy.** §3.6 noted the 7.6 ms envelope at 256³ over-predicted a 0.24 ms measurement by ~30×. Applying the same ratio to the mid-scenario envelope gives **~0.5 ms** at 4096³ — improbably fast relative to the seven-fold step-count increase, which suggests the 30× ratio itself will attenuate under 4096³ cache pressure. §3.6's own explanation (items 2+3: L1 reuse, warp coherence) is exactly what breaks at 4096³. **So: do not anchor on "0.5 ms" as a likely-measurement.** Treat the 30× only as evidence that the 256³ envelope was conservative, not as a transferable factor.
+- **Empty-corner bias.** `bench_raycast_4096` uses `BenchCamera::empty_corner()` — rays exit rapidly through sparse air. Measured numbers from that harness are a *floor*, not a typical-scene prediction. The model-envelope comparison should use a seeded-terrain scene closer to the demo target; adding one to the bench-harness is an ivms follow-up filed in §6.
+
+**Net prediction: 4096³ raycast on M1 MBA falls somewhere in [optimistic ~4 ms, pessimistic ~17 ms].** A one-shot run on M1 MBA hardware discriminates between the three scenarios.
+
+**3.10.6 Confirmation path.** `bench_raycast_4096` already exists in `tests/bench_gpu_raycast.rs` (`#[ignore]`) and runs 10 samples, but it uses `BenchCamera::empty_corner()` (optimistic). The confirmation path is two runs:
+1. The existing empty-corner `bench_raycast_4096` — establishes a floor.
+2. A seeded-terrain variant at 4096³, closer to the demo target — establishes a typical-scene measurement comparable against the §3.10.5 envelope.
+
+If the seeded-terrain measurement lands ≥ 15 ms, §3.10.4's cache-mix pessimistic scenario (30/40/30) is the operative one and 4096³ is not viable as a primary-ray-only scene on M1 MBA. If it lands ≤ 4 ms, the optimistic scenario holds and 4096³ is comfortable. If it lands 4–15 ms (the mid scenario), 4096³ is viable but leaves modest headroom — matters for sim + blit + overlay budgeting.
+
 ---
 
 ## 4. SVDAG ↔ memo-step interaction
@@ -431,6 +492,70 @@ Our SVDAG is **dynamic**, not static. The literature has two published points on
 
 **Why this section exists.** Conversations around the perf paper occasionally lean on "SVDAG is static" framing from the Kämpe paper. That framing is wrong for our implementation and has architectural implications (edit latency, streaming design). This section pins the distinction so later sections (§5, §6) don't have to re-establish it.
 
+### 4.7 Scaling the SVDAG ↔ memo interaction to 4096³ (`hash-thing-ivms`)
+
+The §4.1–§4.6 numbers are all at 256³ (with a 64³ cross-reference). At 4096³ (edward's actual demo target) the architectural story holds — shared NodeStore, siloed render-side cache, O(new-content) diff upload — but the bounded-overhead arguments need to be re-run at the new size before ivms can close.
+
+**4.7.1 Reachable DAG and render-side bookkeeping at 4096³.** Scaling from the empirical node counts (§3.10.3):
+
+| Scale | Reachable nodes | DAG size | `offset_by_slot` | `id_to_offset` |
+|---|---|---|---|---|
+| 256³ (measured) | 6,773 | 0.2 MB | ~0.3 MB | ~0.08 MB |
+| 1024³ (measured) | 61,399 | 2.1 MB | ~2.9 MB | ~0.7 MB |
+| **4096³ (seeded, measured)** | **548,179** | **18.8 MB** | **~26 MB** | **~6.6 MB** |
+| 8192³ (projected `L^1.58`) | ~1.65M | ~57 MB | ~80 MB | ~20 MB |
+
+`offset_by_slot` is `FxHashMap<[u32; 9], u32>` ≈ 48 B/entry including table overhead; `id_to_offset` is `FxHashMap<NodeId, u32>` ≈ 12 B/entry. The projected entry counts in this table are steady-state (post-compaction); `Svdag::compact` (`src/main.rs:882`) triggers at `stale_ratio > 0.5`, so the pre-compaction peak is up to ~2× the steady-state number. Steady-state at 4096³ ≈ 32 MB total render-side bookkeeping; pre-compaction peak ≈ 64 MB.
+
+**Verdict: comfortably resident on 8 GB M1 MBA at 4096³.** Combined render-side bookkeeping at 4096³ is ≤ ~64 MB including compaction peaks — well under 2 % of the ~4–5 GB available-to-app budget. Not a binding constraint, and not the motivation for streaming. (Warm-run post-CA reachable may be ~10–30 % larger than the seeded measurement; the bookkeeping still has two-orders-of-magnitude headroom.)
+
+**4.7.2 Memo churn at 4096³.** Misses/step at 256³ warm: ~1,847; at 64³: ~412 (§4.2). The observed ratio is `log(1847/412) / log(4) ≈ 1.08` in linear world size. **This is a single observed ratio between two data points, treated as a power-law for extrapolation — not a fit.** With only two points, the 1.08 exponent could plausibly be anywhere in roughly `[0.8, 1.4]` and still be consistent with the evidence.
+
+Applying `L^1.08` to 4096³ (`L/256 = 16`) gives ~37k misses/step as a point estimate. Under the `[0.8, 1.4]` exponent band: **~15k misses/step (low) to ~100k misses/step (high)**. Call it **~20k–80k misses/step at 4096³** as an honest span given single-ratio evidence. Applying the measured ~30 % slot-append ratio (1,847 misses → 544 SVDAG slot appends at 256³): **~6k–24k slot appends/step at 4096³**, translating to **~200 KB–900 KB upload per step** (4 B slot-0 header + slots × 36 B).
+
+At 60 FPS that is **~12–54 MB/s upload**, still under 0.1 % of the 68 GB/s memory-bandwidth ceiling. **Edward's diff-compressibility hypothesis holds at 4096³** across the whole exponent band — upload bandwidth is not a frame-budget concern at any plausible scene shape.
+
+Two caveats on the exponent:
+- **Only two data points.** The 1.08 exponent is from 64³ → 256³ only. The 512³/1024³ node-count data in §3.10.3 tracks *reachable* nodes (`L^1.58`), not *per-step memo churn*. A `bench_svdag_step_deltas_4096` one-shot (ivms follow-up, §6) would add a third point and tighten the band.
+- **Scene dependence.** A pathological scene with uniformly-active CA across the whole 4096³ volume would scale misses closer to `L³` (volume), giving ~470k misses/step. Our default terrain+water+sand scene is nowhere near that — active CA is concentrated on a thin fringe (water surface, sand-fall column) whose area scales well below `L²`. The `L^1.08` observation is consistent with this physical intuition; the 4096³ span above assumes the scene remains fringe-dominated.
+
+**4.7.3 `hashlife_macro_cache` budget at 4096³.** The cache is a **single** `FxHashMap<(NodeId, u64), NodeId>` (see `src/sim/world.rs:192` and `src/sim/hashlife.rs:406-422`), keyed on `(node, generation)`. There is no per-level multiplication — it is one map, shared across the whole recursion.
+
+Entry cost: `(NodeId, u64) → NodeId` ≈ 16 B/entry including `FxHashMap` overhead. The cache grows with the product of:
+
+- **Distinct NodeIds queried** as macro-step inputs. Bounded above by reachable-node count (~548k at 4096³ seeded).
+- **Distinct `generation` stride values** the recursion walks. Macro-stepping uses power-of-2 generation strides; tree height 12 means up to 12 distinct stride values that any given node could be queried against. In practice the recursion pattern places each node at one dominant stride level (the level its subtree height matches), so the *observed* distinct-strides-per-node is closer to 1–2, not 12.
+
+Plausible bands at 4096³:
+- **Tight lower bound (one entry per reachable node, single stride dominant):** ~548k × 16 B ≈ **9 MB**.
+- **Pathological upper bound (every `(node, stride)` pair populated for all 12 strides):** ~548k × 12 × 16 B ≈ **105 MB**. This overcounts — it assumes every node is queried at every stride level, which is not how the recursion actually walks.
+- **Typical steady-state: not derivable from scaling alone.** The observed distinct-strides-per-node is a scene + recursion-pattern property, measurable only at runtime. No point-estimate here; **this is an ivms follow-up** (§6) for size instrumentation.
+
+**Verdict: macro-cache is the first subsystem to watch at 4096³, but the earlier "20–50 MB typical" claim was ungrounded.** The floor is ~9 MB; the pathological ceiling is ~105 MB; the typical steady-state is a measurement, not a derivation. 8 GB budget survives comfortably in the plausible band (both ends <2 % of available-to-app budget), so the macro-cache is *unlikely* to be the binding constraint — but "unlikely" is intuition, not proof, until §6's follow-up lands. Instrumenting a size histogram on `hashlife_macro_cache` is filed accordingly.
+
+**4.7.4 Streaming threshold.** Combining §3.10 envelope + §4.7 budgets (all numbers are either measured, marked as model extrapolations, or intuition — note the columns):
+
+| Scale | Reachable DAG | Macro-cache (plausible band) | Raycast envelope | Resident on 8 GB? |
+|---|---|---|---|---|
+| 256³ | 0.2 MB (measured) | <10 MB (implied) | ~7.6 ms (model) / 0.24 ms (measured) | yes (margin) |
+| 1024³ | 2.1 MB (measured) | unmeasured | ~9 ms (interpolated) | yes (margin) |
+| **4096³** | **18.8 MB (seeded, measured)** | **9–105 MB (floor/pathological, §4.7.3)** | **4–17 ms (§3.10.5 span)** | **yes** |
+| 8192³ | ~57 MB (projected) | unbounded analytically | ≥ 25 ms (projected) | probably, not verified |
+| 16384³ | ~170 MB (projected) | — | DRAM-bound | unclear |
+
+**Soft threshold: 8192³ is where streaming becomes plausibly mandatory, but this is intuition, not a derived result.** The itemized steady-state memory model at 8192³ (~57 MB DAG + ~80 MB `offset_by_slot` + ~20 MB `id_to_offset` + indeterminate macro-cache) is still only a few hundred MB absolute — nowhere near an 8 GB ceiling on paper. What tips the argument is unmodeled memory: the CPU-side `NodeStore` active region (not quantified in this paper), view-shift churn for a streaming camera, pathological CA states that push the macro-cache toward its ceiling, and co-resident wgpu driver state. None of those is pinned down numerically; the "8192³ streaming cutover" call is therefore a *reasoned intuition*, not a gap-report number. If the demo target ever moves above 4096³, this threshold needs a real derivation.
+
+**4096³ fully resident on 8 GB M1 MBA is a stronger claim** because the dominant memory consumers are all measured or tightly bounded: 18.8 MB DAG (measured), ≤ 64 MB bookkeeping (steady + compaction peak), 9–105 MB macro-cache (bounded within a known band). Sum stays under ~170 MB — well under 1 GB — with room for unmodeled overheads.
+
+**4.7.5 Summary for 4096³ on M1 MBA.**
+- Reachable DAG: 18.8 MB seeded, measured.
+- Upload bandwidth: fine (~12–54 MB/s, <0.1 % of memory ceiling).
+- Render-side maps: fine (≤ 64 MB steady-state + compaction peak).
+- Macro-cache: bounded 9–105 MB, typical steady-state unmeasured.
+- Raycast frame cost: span of 4–17 ms across the three §3.10.4 cache-mix scenarios; no single scenario is anchored to evidence.
+- **CPU step cost: the binding concern.** Scales directly with active-region misses; macro-cache short-circuits are load-bearing. The bench harness SIGKILLed a single 4096³ hashlife step at the 60-second ignore-mode ceiling — step cost is already ≫ per-frame budget without further optimization. ivms doesn't re-measure step cost; `hash-thing-hashlife-stride` is the adjacent bead that would.
+- Streaming not needed at 4096³ (strong claim). 8192³ *probably* needs streaming, but that call is intuition.
+
 ---
 
 ## 5. Gap report
@@ -449,6 +574,11 @@ Format (placeholder):
 | Step (memo short-circuit rate, 256³ warm) | **~72% short-circuit** (hits + empty + fp) on M2 16 GB (`bench_svdag_step_deltas_256`, §4.2) | Not yet in §3 (memo model) | N/A until modelled | Raw hit rate ~55%; skips absorb another ~17%. |
 | Step (memo miss / cold gen) | TODO | TODO | TODO | TODO |
 | Surface acquire (windowed, 256³ / 50%) | **~25 ms/frame** on M2 16 GB (spark 2026-04-19, three consecutive log lines) | Not yet in §3 (surface/presentation model is §3.8 TODO) | N/A until modelled | **This is the real 30 FPS bug.** Owned by `hash-thing-dlse.2.2`. |
+| Raycast traversal (**predicted**, 4096³ / 50%) | Not yet measured | 4–17 ms span across §3.10.4 optimistic/mid/pessimistic cache-mix scenarios (§3.10.5) | N/A until measured | `bench_raycast_4096` already exists in `tests/bench_gpu_raycast.rs` as `#[ignore]` but uses `empty_corner()` — run it for a floor, then add a seeded-terrain variant to compare against the envelope. Confident upper bound 17 ms would saturate the 60-FPS budget. |
+| Mean DDA steps/ray (**predicted**, 4096³ default-spawn) | Not yet measured | ~22–28 steps/ray (§3.10.2) vs 15 at 256³ | N/A until measured | Variant of `tests/bench_depth_histogram.rs` at level 12 confirms. Range derives from `20 steps × 1.5 tree-depth-scalar` on hit-dominated camera poses, with the sky-heavy 47% miss share shrinking at 4096³. Worst-case budget headroom still comfortable (128-step shader cap). |
+| SVDAG incremental upload (**predicted**, 4096³ warm) | Not yet measured | ~200 KB–900 KB/step → ~12–54 MB/s at 60 FPS (§4.7.2) | N/A | `bench_svdag_step_deltas_4096` does not exist; variant of the 256³ one is a one-liner. `L^1.08` scaling is empirical from *one ratio* (64³→256³); span widened to `[0.8, 1.4]` exponent band reflecting single-data-point uncertainty. |
+| Reachable DAG size (**measured**, 4096³ seeded pre-CA) | **548,179 nodes / 18.8 MB** (bench_hashlife_4096 seed, onyx 2026-04-21) | ~550k / ~20 MB projected from `L^1.58` exponent on 256³/512³/1024³ | **model vs measurement: <1% gap** | Exponent projection confirmed by one-shot. Warm-run post-CA count was not measured (60s test-runner SIGKILL on first step); warm is expected ~10–30 % above seeded. |
+| `hashlife_macro_cache` size (**predicted**, 4096³) | Not yet measured | Plausible band 9–105 MB; typical steady-state unmeasured (§4.7.3) | N/A | Needs `HashlifeStats` size histogram — not currently exposed. Pathological ceiling is bounded because the cache is a single `FxHashMap<(NodeId, u64), NodeId>`, not a per-level stack. |
 
 A gap of **>2×** is a flag for a bead. A gap of **>10×** is a P0 candidate. A gap near **1×** means the model agrees with reality and we can either ship at that perf or rederive the model with more aggressive techniques.
 
@@ -464,6 +594,11 @@ Track here so they don't get lost between revisions.
 4. What is the right SVDAG node budget for an 8 GB unified-memory machine, given that the OS, browser, and app share that pool?
 5. Is there a useful intermediate: a coarser SVDAG for far-field rays plus a fine-grained one for near-field? Cost/benefit on M1.
 6. GPU spatial memo questions — see §8.5. Summarized: key-shape rotation, NodeStore compaction remap, CPU/GPU hybrid level split, warp-divergence from rule-table branches, macro-cache GPU analogue.
+7. **ivms follow-up.** Actual reachable DAG size at 4096³ on the default terrain + water + sand scene. §3.10.3 / §4.7.1 predict ~600k nodes / ~22 MB from the 256³/512³/1024³ exponent; a `bench_svdag_step_deltas_4096` one-shot confirms. One-line test addition (narrow-fix lane).
+8. **ivms follow-up.** Mean DDA steps/ray at 4096³ on the default-spawn primary-ray sample. §3.10.2 predicts ~22–28; measurement via `bench_depth_histogram.rs` at level 12 (variant of the existing 256³ harness).
+9. **ivms follow-up.** `hashlife_macro_cache` steady-state size at 4096³ with water + sand CA. §4.7.3 predicts 20–50 MB typical against a 230 MB ceiling; needs a size-histogram field added to `HashlifeStats` (not currently exposed). First subsystem to pinch the 8 GB budget if it does.
+10. **ivms follow-up.** Does the 30× model-vs-measurement ratio seen at 256³ (§3.6) persist at 4096³, or does it attenuate toward ~10× as L2 pressure rises? One `bench_raycast_4096` run on M1 MBA resolves the 13–17 ms envelope vs 1–4 ms likely-measurement spread in §3.10.5. Answer flips §3.10.4's cache-mix assumption (50/35/15 vs staying at 80/20/0).
+11. **ivms follow-up.** Memo-miss scaling exponent at 4096³. §4.7.2 extrapolates `L^1.08` from the single 64³ → 256³ ratio; if the true exponent bends toward `L^1.5` (active fringe growing closer to surface-area) or `L^2` (full surface-area) at larger worlds, step cost becomes the binding constraint at 1024³ / 2048³ — **already at those scales, not 4096³ onward**. The upload-bandwidth story would also shift from "free" to measurable. One `bench_svdag_step_deltas_4096` run adds a third data point and discriminates between the exponent bands.
 
 ---
 
@@ -709,3 +844,4 @@ stands up; proceed to abwm.3 integration.
 | 2026-04-21 | onyx | §3.8 step 3b conclusion (bead `hash-thing-dlse.2.2.1`, closes). New diagnostic env var `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` (skips in-encoder timestamp writes AND resolve/map). Off-surface + timestamp-disabled measurement: submit_cpu = 25.21/27.48 ms — unchanged. **Hypothesis (c) timestamp-fence refuted.** By elimination across steps 2/3/3b, the ~25 ms stall is real GPU frame time at 256³ / 50% on M2, dominated by non-compute-pass work (blit + HUD + overlays) which is not yet instrumented. `render_gpu = 0.16 ms` from dlse.2.3 is the compute pass only. Next-step surface for dlse.2.2: bracket the render pass with TIMESTAMP_QUERY_INSIDE_ENCODERS to attribute the missing ~25 ms. The 30 FPS bug is GPU-bound, not compositor-bound. |
 
 | 2026-04-21 | spark | §8.6 GPU hash-table microbenchmark (bead `hash-thing-abwm.2`). Linear-probe open-addressing bench (`tests/bench_gpu_hash_table.rs`) + sweep across N ∈ {10K, 100K, 1M}, M ∈ {256, 1024, 4096, 16384}, LF ∈ {0.5, 0.75, 0.9}. In-encoder GPU timestamps (per dlse.2.3) show 100–230 Mlookups/s and 70–445 Minserts/s at M ≥ 4K / N ≥ 100K on M1 MBA — 2–10× the abwm go/no-go target. `maxP` ≤ 5 at all tested points except the pathological N=10K/M=10K case. **Verdict: GO for linear probing**; cuckoo not needed. Caveats scoped: primitive is tested under uniform-random load only; §3 (abwm.3) should replay memo access patterns. The ~1.5 ms wall-clock floor is submit+poll overhead, not primitive cost — read `gpu_*_Mk/s` columns, not wall-clock. |
+| 2026-04-21 | onyx | §3.10 and §4.7 (bead `hash-thing-ivms`). Re-derive the theoretical frame-cost envelope and SVDAG↔memo interaction at 4096³ (edward's actual demo target) natively rather than scaling 256³ numbers. One measured data point: `bench_hashlife_4096` seeded 4096³ reports **548,179 reachable nodes / 18.8 MB DAG** — on the `L^1.58` projection from 256³/512³/1024³ within 1 %. The 60-second test-runner ceiling SIGKILLed the first warm step before any per-step memo/upload data landed. Projections for everything else: ~22–28 mean DDA steps/ray (§3.10.2); ~20k–80k memo misses/step → ~200–900 KB/step upload (§4.7.2, band honest about two-data-point exponent uncertainty); `hashlife_macro_cache` bounded to 9–105 MB but typical steady-state not derivable from scaling (§4.7.3, follow-up filed for instrumentation); raycast envelope 4–17 ms across the three §3.10.4 optimistic/mid/pessimistic cache-mix scenarios (§3.10.5). 4096³ fully-resident on 8 GB M1 MBA is a strong claim; 8192³ streaming cutover is labeled intuition, not derivation (§4.7.4). Dual review (claude ship-with-nits + codex revise + gemini ship-with-nits): findings on macro-cache double-count, over-confident likely-measurement, unsupported typical bands, and streaming threshold framing all addressed in-line. §5 gap report gains five 4096³ rows (one measured, four predicted). Six ivms follow-ups filed in §6 for one-shot benches + the macro-cache size instrumentation. |
