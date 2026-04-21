@@ -1026,6 +1026,13 @@ impl Renderer {
 
         let gpu_timing = if timestamp_supported {
             let period_ns = queue.get_timestamp_period();
+            let info = adapter.get_info();
+            log::info!(
+                "GPU timestamp_period={period_ns}ns (adapter={:?} backend={:?} driver={:?})",
+                info.name,
+                info.backend,
+                info.driver_info,
+            );
             Some(GpuTiming::new(&device, period_ns))
         } else {
             None
