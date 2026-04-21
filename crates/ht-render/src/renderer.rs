@@ -474,9 +474,8 @@ impl Renderer {
         // and reports ~0.2ms for the same dispatch that the windowed app
         // measures at ~30ms — this flag switches the app to the same
         // pattern so we're comparing like with like.
-        let in_encoder_timestamps_supported =
-            timestamp_supported
-                && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let in_encoder_timestamps_supported = timestamp_supported
+            && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         if timestamp_supported {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         } else {
@@ -521,7 +520,9 @@ impl Renderer {
         };
         log::info!(
             "surface_caps: present_modes={:?} alpha_modes={:?} formats={:?}",
-            surface_caps.present_modes, surface_caps.alpha_modes, surface_caps.formats,
+            surface_caps.present_modes,
+            surface_caps.alpha_modes,
+            surface_caps.formats,
         );
         log::info!(
             "surface_config: present_mode={:?} alpha_mode={:?} format={:?} max_frame_latency={} render_scale={} size={}x{} (physical={}x{})",
@@ -1572,6 +1573,14 @@ impl Renderer {
             let s = self.render_scale;
             self.config.width = ((width as f32 * s) as u32).max(1);
             self.config.height = ((height as f32 * s) as u32).max(1);
+            log::info!(
+                "resize: physical={}x{} render_scale={} config={}x{} (dlse.2.2 pixel-workload log)",
+                width,
+                height,
+                s,
+                self.config.width,
+                self.config.height,
+            );
             self.surface.configure(&self.device, &self.config);
             // Recreate storage texture to match new dimensions (5bb.6.1).
             self.recreate_raycast_texture();
