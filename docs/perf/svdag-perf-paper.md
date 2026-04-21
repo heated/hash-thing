@@ -292,6 +292,25 @@ Delta latency=3 − latency=2: **+1.22 ms (+4.6%) worse**, well inside run-to-ru
  
 Plan + code-review artifacts for the scaffolding commit live in `.ship-notes/plan-dlse22-exp4-latency3.md`, `.ship-notes/plan-review-dlse22exp4-{claude,codex}.md`, and `.ship-notes/code-review-lat-scaffold-{claude,codex}.md`. The env var stays in place for future diagnostic use but does not become the default. Next dlse.2.2 candidate: option 2 above (direct `CAMetalLayer` access via wgpu hal) or option 3 (accept 30 FPS on M2 integrated and document it).
 
+**What wgpu 29.0.1 actually sets on the CAMetalLayer** (source: `wgpu-hal-29.0.1/src/metal/surface.rs:70-109`, audited 2026-04-21 by onyx as the grounding step for candidate #2):
+
+| CAMetalLayer property          | wgpu 29.0.1 setting                                     | knob we control                                              |
+|--------------------------------|---------------------------------------------------------|--------------------------------------------------------------|
+| `maximumDrawableCount`         | `maximum_frame_latency + 1` (so latency=2 → 3 drawables) | `SurfaceConfiguration.desired_maximum_frame_latency`         |
+| `displaySyncEnabled`           | `true` if `PresentMode::Fifo`, `false` if `Immediate`   | `SurfaceConfiguration.present_mode`                          |
+| `allowsNextDrawableTimeout`    | **`false`** (blocks indefinitely on acquire)            | not exposed                                                  |
+| `framebufferOnly`              | `true` when usage is `COLOR_TARGET` (our case)          | indirectly via `SurfaceConfiguration.usage`                  |
+| `presentsWithTransaction`      | never set — layer default (`false`)                     | not exposed                                                  |
+| `wantsExtendedDynamicRangeContent` | `true` iff format is `Rgba16Float`                  | `SurfaceConfiguration.format`                                |
+
+**Implication for the remaining hypothesis space.** The candidate #1 probe already swept `maximumDrawableCount` across {2, 3, 4}; none moved the stall. Earlier moss 2026-04-15 probe swept `displaySyncEnabled` across {true, false}; neither moved the stall. Those are the two knobs wgpu exposes. So the stall is *not* a drawable-count ceiling and *not* a vsync-sync policy. Both knobs that we can change via `SurfaceConfiguration` have now been shown to not be the cause. Any remaining progress has to be either:
+
+- **Candidate #2a** — reach through `surface.as_hal::<wgpu::hal::metal::Api, _, _>()` and set properties wgpu does not expose: `presentsWithTransaction = false` (already the default, probably a no-op) or drive presentation via a `CADisplayLink`-paced loop rather than winit's `RedrawRequested`. A CADisplayLink tick is the macOS-idiomatic pacing source for windowed Metal apps and is how `MTKView` internally drives its delegate; winit does not integrate with it.
+- **Candidate #2b** — replace the winit-driven `RedrawRequested` loop with a `MTKView`-equivalent render loop, either by constructing an `MTKView` manually or by driving redraws off a `CADisplayLink` callback. Both bypass winit's event-loop pacing; the second is the smaller delta.
+- **Candidate #3** — accept that windowed-mode macOS composition adds ~16–25 ms pacing overhead, document it, and set expectations that 60 FPS is a true-fullscreen-only target on M-series integrated GPUs.
+
+Candidate #2a is the narrowest thing still worth trying before conceding to #3: it's a one-dispatch experiment that keeps winit's window but supplies our own redraw cadence. If a CADisplayLink-paced loop still shows `surface_acquire_cpu ≥ 16 ms` on M2, that is a strong signal the root cause is WindowServer composition and not our pacing choice, which is as close to a root-cause conclusion as this bead can get at the wgpu layer.
+
 ### 3.10 Scaling the model to 4096³ (`hash-thing-ivms`)
 
 Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
