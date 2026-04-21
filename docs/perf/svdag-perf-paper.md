@@ -280,6 +280,18 @@ The off-surface `render_gpu` (compute) bracket reports inflated numbers (~9–26
 
 dlse.2.2 should be **reopened** for option 1 (fast) and a new bead filed for option 2 (Metal-specific). The §3.8 closure note was premature; this is a swapchain-layer bug, not a renderer-compute bug.
 
+**Candidate #1 probe — `desired_maximum_frame_latency=3` (dlse.2.2 exp#4).** Onyx 2026-04-21: env-var scaffolding (`HASH_THING_FRAME_LATENCY=N`) landed at 165f784; measurement run via the self-driving acquire-harness on M2, 60 Hz external display, 256³ world, release build, seven runs total. The harness does 60 warmup frames + 64 capture frames per phase, so each arm-row below is n=64 windowed / n=64 fullscreen. Discarding the first-build-after-launch run as a one-shot outlier (12.31 ms — did not reproduce in any subsequent run):
+
+| `desired_maximum_frame_latency` | windowed `surface_acquire_cpu` mean (ms) | runs (windowed mean, ms)       |
+|---------------------------------|------------------------------------------|--------------------------------|
+| 1                               | 29.26 (n=1)                              | 29.26                          |
+| 2 (current default)             | **26.81 (n=5)**                          | 26.44 / 26.83 / 27.40 / 26.79 / 26.58 |
+| 3                               | 28.03 (n=3)                              | 29.42 / 26.72 / 27.95          |
+ 
+Delta latency=3 − latency=2: **+1.22 ms (+4.6%) worse**, well inside run-to-run noise and the opposite direction from the hypothesis. Monotonicity check: latency=1 is also worse than latency=2, so the current default is the local sweet spot — there is no larger-latency knee to find by going higher. **Candidate #1 is ruled out.** None of the three latencies comes anywhere near the ≥30% reduction acceptance threshold from the dlse.2.2 plan review.
+ 
+Plan + code-review artifacts for the scaffolding commit live in `.ship-notes/plan-dlse22-exp4-latency3.md`, `.ship-notes/plan-review-dlse22exp4-{claude,codex}.md`, and `.ship-notes/code-review-lat-scaffold-{claude,codex}.md`. The env var stays in place for future diagnostic use but does not become the default. Next dlse.2.2 candidate: option 2 above (direct `CAMetalLayer` access via wgpu hal) or option 3 (accept 30 FPS on M2 integrated and document it).
+
 ### 3.10 Scaling the model to 4096³ (`hash-thing-ivms`)
 
 Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
