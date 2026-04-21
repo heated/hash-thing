@@ -1711,7 +1711,9 @@ impl Renderer {
                     return FrameOutcome::Timeout;
                 }
             };
-            let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let view = st
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
             (Some(st), view)
         };
         let surface_acquire = acquire_start.elapsed();

@@ -59,6 +59,8 @@ impl World {
         self.root = result;
         let step_stats = self.hashlife_stats;
         self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
 
         // Post-step gravity gap-fill: prevents Margolus rarefaction.
         // Applied on the flattened grid (same as brute-force path) because
@@ -104,6 +106,8 @@ impl World {
         self.root = result;
         let step_stats = self.hashlife_stats;
         self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
         self.generation += self.recursive_pow2_step_count();
 
         self.maybe_compact();
