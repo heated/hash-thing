@@ -51,7 +51,7 @@ Cross-reference for implied-number math: M1 MBA 8-core GPU ≈ 2.6 TFLOPS FP32, 
 - **Core idea.** Generalize SVO to a DAG by hash-consing subtrees. Empty and repeated regions both get deduplicated. Enables representing binary voxel scenes at 128K³ that would never fit as flat grids or plain SVOs.
 - **Reported number.** 170 MRays/sec (ambient occlusion) / 240 MRays/sec (shadows) on NVIDIA GTX 680 at "competitive with or faster than state-of-the-art triangle ray tracing" for the Epic Citadel scene voxelized to 128K³, **945 MB GPU memory** vs. ~5.1 GB for the equivalent SVO. (Source: semanticscholar summary; TODO-verify against the SIGGRAPH 2013 PDF.)
 - **Implied on M1 MBA.** GTX 680 has ≈ 192 GB/s bandwidth and 3.1 TFLOPS. M1 8-core is ~3× less bandwidth and ~1.2× less compute. Expect **~50-80 MRays/s primary / shadow** on the same algorithm at the same memory layout, for a scene that actually fits. Our 256³ demo at 50% render scale is ~576k rays/frame, so this predicts ~7-12 ms/frame for just the SVDAG traversal. Our headless bench already reports 0.19 ms mean — but our world is a 256³ instead of 128K³, and the tree is much shallower (log₂ 256 = 8 vs. log₂ 128K ≈ 17), so we do ~half the per-ray memory walk. The numbers are internally consistent.
-- **Verdict.** **This is the paper we are implementing.** Our octree is hash-consed; our GPU upload is SVDAG-shaped. Every architectural decision in the SVDAG path descends from this paper. Nothing to adopt; it's already the baseline.
+- **Verdict.** **Our GPU node encoding and upload shape descend from here, but our update model does not.** Kämpe's SVDAG is build-once-render-forever: a scene is offline-DAG-ified and then traced as a static structure. Our implementation rebuilds the CPU-side SVDAG serialization *every sim tick* from the live hash-consed octree — see §4.6 for how that differs from both Kämpe (static) and HashDAG (GPU-resident dynamic). Our octree is still hash-consed; our GPU buffer layout is still Kämpe-shaped. But "this is the paper we are implementing" undersells the delta on update semantics.
 
 ### 2.3 Villanueva, Marton, Gobbetti (2016/2017), "Symmetry-aware Sparse Voxel DAGs" (SSVDAG)
 
@@ -284,6 +284,30 @@ Both are measurable on M1/M2 without privileged counters. Filing as follow-up: `
 
 The *next* scale where the boundary might matter is the streaming regime (`hash-thing-cswp`): with 4096³+ worlds and view-distance streaming, the reachable-set churn per view-shift is much larger than per-generation churn, and the `offset_by_slot` cache growth becomes a real memory consideration. File a new `stue` child when the streaming work gets close.
 
+### 4.6 Update model comparison (static / GPU-dynamic / rebuild-per-tick)
+
+Our SVDAG is **dynamic**, not static. The literature has two published points on the update-model axis, and we sit at a third.
+
+| System | Update model | Where it lives | Update cost |
+|---|---|---|---|
+| Kämpe 2013 (§2.2) | **Static.** Build once, trace forever. | CPU offline, then frozen GPU buffer. | No updates. A scene change requires a full offline rebuild. |
+| HashDAG / Careil 2020 (§2.4) | **GPU-dynamic.** Edits mutate the same DAG in place. | GPU hash table resident in VRAM. | Single GPU hash probe per edited leaf + log-height promotion. Sub-millisecond localized edits on discrete GPUs. |
+| **This codebase** | **CPU-dynamic rebuild-per-tick.** Rebuild the SVDAG serialization each sim tick from the live hash-consed octree, upload the diff. | CPU `NodeStore` + `Svdag::nodes` + `offset_by_slot`; GPU just holds the serialized bytes. | O(new slots) per step. Measured at 256³ steady state: ~544 new slots/step → ~19.6 KB appended/step (§4.4). Update depth is not a special case in the code path. |
+
+**Concrete evidence we handle arbitrary-depth updates natively.** The Margolus stepper in `sim/margolus.rs` mutates the octree at whatever depth the affected 2³ block lands at. The SVDAG rebuild in `crates/ht-render/src/svdag.rs` (via `Svdag::update`) walks whatever subset of NodeIds changed, hash-cons-dedups them against `offset_by_slot`, appends new slots to `Svdag::nodes`, and ships the tail. Nothing in that path is depth-conditional. The ~544 appends/step measurement at 256³ with water+sand churn (§4.4) is direct evidence that water-driven updates at leaf/near-leaf depth flow through the same path as higher-depth structural changes.
+
+**Trade-offs of our model.**
+
+- **Win over Kämpe (static):** the world is a live CA simulation; a static SVDAG would require a full rebuild per tick, which dominates the frame budget even at 256³ (cold rebuild is ~258 KB). We rebuild *the diff*, not the whole thing, and the diff is O(changed subtrees).
+- **Win over HashDAG (GPU-dynamic):** no GPU hash table to maintain, no VRAM pressure from the table itself, no inserts racing with reads. We upload bytes, not hash-table operations. Portability win on platforms with limited unified memory (M1 MBA 8 GB target).
+- **Loss vs HashDAG:** we pay an upload step per sim tick. At 256³ that's ~1.2 MB/s, deeply irrelevant relative to 68 GB/s unified-memory bandwidth (§4.4). At streaming-scale 4096³+ worlds this stops being free — see §5 gap report and `hash-thing-cswp`.
+- **Loss vs Kämpe:** we spend CPU cycles rebuilding the serialization every tick. The rebuild is threaded with the background sim step (`x5w`), so it's not serialized against rendering, but CPU is not infinite and this is the single largest CPU cost outside the stepper itself.
+- **Memory overhead specific to our path.** `offset_by_slot` (~48 B/entry) and `id_to_offset` (~12 B/entry) are address-translation tables between content-stable NodeIds and position-stable serialized offsets. Bounded by `Svdag::compact` at `stale_ratio > 0.5`. So render-side bookkeeping stays O(reachable) within a factor of 2 — see §4.1.
+
+**Upload bandwidth degrades when dedup rate drops.** Engineered scenes (terrain + gravity-driven CA) hit ~99% dedup in steady state (4892 new u32s/step ÷ ~66k total u32s ≈ 7.4% of full re-upload). Fully-unique-churn scenes (pathological stress) fall back to linear-in-reachable-set. The current worst case we've measured is the 79 KB/step spike in §4.4, still two orders of magnitude under the cold-rebuild cost.
+
+**Why this section exists.** Conversations around the perf paper occasionally lean on "SVDAG is static" framing from the Kämpe paper. That framing is wrong for our implementation and has architectural implications (edit latency, streaming design). This section pins the distinction so later sections (§5, §6) don't have to re-establish it.
+
 ---
 
 ## 5. Gap report
@@ -335,3 +359,4 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-21 | onyx | §3.8 present-path inventory (bead dlse.2.2 step 1, commit `4f60ddc`). macOS M2 Metal exposes only `[Fifo, Immediate]` — no Mailbox. Rules out "triple-buffer-style unlocked present was on the table." The moss/AutoNoVsync null result combined with no-Mailbox narrows the 25 ms `surface_acquire_cpu` bug to compositor fence or driver-internal serialization; step 2 and step 3 of dlse.2.2 will distinguish these. |
 | 2026-04-20 | spark | §4 populated (bead stue.3). Answered Q1 (store is shared; render-side cache is a bounded address-translation layer), Q2 (~1,847 hashlife misses/step at 256³ → ~544 SVDAG slot appends/step; ~72% short-circuit rate), Q4 (~19.6 KB mean / ~79 KB max upload per step at 256³, confirming edward's diff-compressibility hypothesis). Q3 (cache locality) deferred with two empirical-proxy experiments for follow-up. Measurements land via new `tests/bench_svdag.rs::bench_svdag_step_deltas_*`. |
 | 2026-04-20 | spark | §3.8 cold-frame confound check (bead `hash-thing-6hta`). `Perf` ring buffer is FIFO-64 with no cold-frame skip; at ~30 FPS cold frames evict within ~2.1 s, so the first log line is partially contaminated but steady-state lines (which all prior dlse.2.2 observations sampled) are clean. Does not invalidate the 25 ms surface_acquire finding. |
+| 2026-04-21 | onyx | §2.2 verdict + new §4.6 "Update model comparison" (bead `hash-thing-jl4d`). Clarifies that our SVDAG is **dynamic** — rebuild-per-tick on CPU with O(new-slot) diff upload — rather than static Kämpe or GPU-resident HashDAG. Pins the distinction so later discussion does not re-establish it. Evidence: ~544 slot appends/step at 256³ warm with arbitrary-depth CA churn (§4.4) flows through the same code path as structural changes. |
