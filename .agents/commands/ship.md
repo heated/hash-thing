@@ -282,7 +282,7 @@ Load the `review-tiers` skill, compute the tier from the diff, and log the resul
 
 ### Trident (9-way)
 
-Run `/trident-code-review` — 9 agents (3 models × 3 lenses) + 3 synthesis. Full details in that command.
+Run `/trident-code-review` — 6 agents (2 Claude + 3 Codex + 1 Gemini) + 2 synthesis (standard + critical; evolutionary not synthesized per hash-thing-2kkt). Full details in that command.
 
 ### Triple (4-way)
 

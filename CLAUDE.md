@@ -2,7 +2,7 @@
 
 ## Crew default workflow
 
-**Every code-touching bead runs `/ship-auto <bd-id>`.** See `.agents/commands/ship-auto.md`. Headless — no human plan-gate — **but plan review and code review still run** (tiers per `.agents/skills/review-tiers/`, dual minimum). Trident is **3 Claude + 3 Codex + 1 Gemini**.
+**Every code-touching bead runs `/ship-auto <bd-id>`.** See `.agents/commands/ship-auto.md`. Headless — no human plan-gate — **but plan review and code review still run** (tiers per `.agents/skills/review-tiers/`, dual minimum). Trident is **2 Claude + 3 Codex + 1 Gemini** (per hash-thing-2kkt: evolutionary-Claude lens dropped, Codex covers the evolutionary angle).
 
 Escalate by parking the bead (`status=blocked` + structured ESCALATION comment), never by `AskUserQuestion`. The human sweeps `bd list --status blocked` on their own cadence.
 
@@ -57,7 +57,7 @@ This project is designed to work with **any of three CLI agents**: Claude Code (
 - **`.agents/skills/`** holds the skill definitions the workflows reference, most importantly `review-tiers/SKILL.md` which `/ship` reads to pick its review tier.
 - **Refreshing from `~/.claude/`**: if edward updates his global Claude config, re-sync via `.agents/README.md`'s refresh command. Drift is a file the claude-md-edit queue (or any seat noticing stale content) should refile.
 
-**Why this matters for cost**: edward's Claude Code $200/month plan maxes out when trident is all-Claude (9 Claude agents). Shifting to multi-modal trident — **3 Claude + 3 Codex + 1 Gemini** — saves roughly 2/3 of Claude token spend. Only works if Codex and Gemini sessions can read the same project instructions and workflows, which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
+**Why this matters for cost**: edward's Claude Code $200/month plan maxes out when trident is all-Claude (9 Claude agents). Shifting to multi-modal trident — **2 Claude + 3 Codex + 1 Gemini** — saves roughly 2/3 of Claude token spend. Only works if Codex and Gemini sessions can read the same project instructions and workflows, which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
 
 **When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
 

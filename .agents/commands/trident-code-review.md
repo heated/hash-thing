@@ -1,16 +1,16 @@
-# Trident Code Review: Seven-Agent Code Review (3-3-1)
+# Trident Code Review: Six-Agent Code Review (2-3-1)
 
-Run parallel code reviews with a balanced seven-review mix: Claude and Codex each run the three canonical lenses (standard / critical / evolutionary), and Gemini runs a single standard pass. Output lives in a review pack folder under `~/at/arch/notes/`.
+Run parallel code reviews with a Codex-heavy six-review mix: Claude runs two lenses (standard / critical), Codex runs the three canonical lenses (standard / critical / evolutionary), and Gemini runs a single standard pass. Per hash-thing-2kkt, the evolutionary-Claude lens is dropped (Codex evolutionary covers the angle at lower cost) and the evolutionary synthesis step is skipped. Output lives in a review pack folder under `~/at/arch/notes/`.
 
 **Usage:**
-- `/trident-code-review` — Review current branch with all seven agents
+- `/trident-code-review` — Review current branch with all six agents
 - `/trident-code-review [context]` — Review with additional context: `$ARGUMENTS`
 
 ---
 
 ## Critical Rule: READ-ONLY
 
-**This is a read-only command.** All nine review agents and all three synthesis agents must ONLY:
+**This is a read-only command.** All six review agents and both synthesis agents must ONLY:
 - Read existing files (source code, prompt files, related context)
 - Write their single designated output file to the review pack folder
 
@@ -33,18 +33,18 @@ Main Agent (Opus 4.6)
 ├── Generate context document
 ├── Identify related context files for agents
 ├── Write prompt files for Codex/Gemini (file-reference approach)
-├── Launch 7 review agents
-│   ├── 3x Claude — standard, critical, evolutionary
+├── Launch 6 review agents
+│   ├── 2x Claude — standard, critical
 │   ├── 3x Codex — standard, critical, evolutionary
 │   └── 1x Gemini — standard only
-├── Wait and collect all 7
+├── Wait and collect all 6
 ├── Quality gate — verify output files exist and have substance
-├── Launch 3 synthesis Agents (one per lens)
+├── Launch 2 synthesis Agents (standard, critical — no evolutionary synthesis)
 ├── Open synthesis docs
 └── Clean up tmp staging directory
 ```
 
-After all 9 complete, launch 3 synthesis agents (one per lens), then open the synthesis docs.
+After all 6 complete, launch 2 synthesis agents (standard + critical), then open the synthesis docs. Evolutionary-Codex output is surfaced as-is without a synthesis pass (single source; nothing to synthesize).
 
 ---
 
@@ -54,7 +54,6 @@ After all 9 complete, launch 3 synthesis agents (one per lens), then open the sy
 |-------|------|------|---------|
 | Claude | Agent | Standard | Agent tool with standard prompt |
 | Claude | Agent | Critical | Agent tool with critical prompt |
-| Claude | Agent | Evolutionary | Agent tool with evolutionary prompt |
 | Codex | Bash | Standard | `env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read {prompt_file}..." 2>&1 \| tee {log}` |
 | Codex | Bash | Critical | same pattern |
 | Codex | Bash | Evolutionary | same pattern |
@@ -178,20 +177,20 @@ Save for report filenames.
 
 **For Codex and Gemini**, use the file-reference approach to avoid shell escaping issues. Write each agent's full prompt to a tmp file rather than passing it inline.
 
-First, concatenate the canonical review prompts with the context document:
+First, concatenate the canonical review prompts with the context document. Claude uses two lenses (standard + critical); the evolutionary lens is Codex-only:
 
 ```bash
-# Standard prompt
+# Standard prompt (used by Claude, Codex, Gemini)
 cat .agents/commands/code_review.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-standard.md
 
-# Critical prompt
+# Critical prompt (used by Claude, Codex)
 cat .agents/commands/code_review_critical.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-critical.md
 
-# Evolutionary prompt
+# Evolutionary prompt (Codex-only — no Claude evolutionary pass)
 cat .agents/prompts/CodeReview-Evolutionary.md > notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
 echo -e "\n\n---\n\n**Additional Context:** $ARGUMENTS\n\n---\n\n# CONTEXT DOCUMENT\n" >> notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
 cat notes/.tmp/trident-{REVIEW_ID}/team-review-context.md >> notes/.tmp/trident-{REVIEW_ID}/trident-review-evolutionary.md
@@ -224,7 +223,7 @@ cp .agents/prompts/CodeReview-Evolutionary.md notes/.tmp/trident-{REVIEW_ID}/
 
 For Gemini prompt files, use workspace-local paths for both the framework file and the context document.
 
-### Phase 5: Create Review Pack and Launch All Seven Agents
+### Phase 5: Create Review Pack and Launch All Six Agents
 
 Create the review pack folder:
 ```bash
@@ -232,7 +231,7 @@ PACK_DIR=~/at/arch/notes/trident-review-{REVIEW_ID}-pack-{TIMESTAMP}
 mkdir -p "$PACK_DIR"
 ```
 
-Launch all seven review agents with `run_in_background: true` for Bash agents. Claude agents use the Agent tool (3 calls in a single message).
+Launch all six review agents with `run_in_background: true` for Bash agents. Claude agents use the Agent tool (2 calls in a single message).
 
 **Launch message template** (for Claude subagents — Codex/Gemini use their prompt files from Phase 4):
 
@@ -250,12 +249,13 @@ Launch all seven review agents with `run_in_background: true` for Bash agents. C
 
 ---
 
-**Claude agents** (3x) — use the **Agent tool** (parallel subagents):
+**Claude agents** (2x) — use the **Agent tool** (parallel subagents):
 
-Launch three Agent tool calls in a single message with the launch template, substituting:
+Launch two Agent tool calls in a single message with the launch template, substituting:
 - Standard: `lens=standard`
 - Critical: `lens=critical`
-- Evolutionary: `lens=evolutionary`
+
+(No Claude evolutionary pass — Codex evolutionary covers that angle at lower cost per hash-thing-2kkt.)
 
 ---
 
@@ -293,8 +293,8 @@ gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/promp
 **Tell the user:**
 > "Context prepared. Test results: {service: PASS/FAIL for each changed service}
 >
-> Launched 7 review agents:
-> - Claude (Standard, Critical, Evolutionary)
+> Launched 6 review agents:
+> - Claude (Standard, Critical)
 > - Codex (Standard, Critical, Evolutionary)
 > - Gemini (Standard)
 >
@@ -338,11 +338,11 @@ wc -c {PACK_DIR}/*.md
 
 Report any gaps to the user before proceeding to synthesis.
 
-Expected files: `standard-claude.md`, `standard-codex.md`, `standard-gemini.md`, `critical-claude.md`, `critical-codex.md`, `evolutionary-claude.md`, `evolutionary-codex.md`.
+Expected files: `standard-claude.md`, `standard-codex.md`, `standard-gemini.md`, `critical-claude.md`, `critical-codex.md`, `evolutionary-codex.md`. (No `evolutionary-claude.md` — that lens was dropped per hash-thing-2kkt.)
 
-### Phase 7: Three Synthesis Agents
+### Phase 7: Two Synthesis Agents
 
-Launch **three Agent tool calls** in a single message. Each synthesizes one lens across its weighted input set.
+Launch **two Agent tool calls** in a single message — one for standard, one for critical. The evolutionary lens is not synthesized: Codex's evolutionary pass is the only source and is surfaced as-is.
 
 **Synthesis-Standard Agent:**
 > Read all Standard code reviews for {REVIEW_ID}:
@@ -377,50 +377,36 @@ Launch **three Agent tool calls** in a single message. Each synthesizes one lens
 > Write to: `{PACK_DIR}/synthesis-critical.md`
 > Format as numbered lists. Start with executive summary and production readiness verdict.
 
-**Synthesis-Evolutionary Agent:**
-> Read all Evolutionary code reviews for {REVIEW_ID}:
-> - `{PACK_DIR}/evolutionary-claude.md`
-> - `{PACK_DIR}/evolutionary-codex.md`
->
-> **THIS IS A READ-ONLY REVIEW.** Your ONLY output is the synthesis file specified below. Do NOT commit, push, modify existing files, or take any action beyond writing this single file.
->
-> Synthesize into a single document. Focus on:
-> 1. Consensus direction — evolution paths multiple passes identified
-> 2. Best concrete suggestions — most actionable ideas across the Claude/Codex pair
-> 3. Wildest mutations — creative/ambitious ideas worth exploring
-> 4. Leverage points and flywheel opportunities
->
-> Write to: `{PACK_DIR}/synthesis-evolutionary.md`
-> Format as numbered lists. Start with executive summary of biggest opportunities.
+(No Synthesis-Evolutionary agent — the evolutionary lens has a single source, `evolutionary-codex.md`, which reviewers read directly.)
 
 ### Phase 8: Launch for Review and Clean Up
 
-Once all three synthesis docs are written:
+Once both synthesis docs are written, also open the raw evolutionary-codex review directly (no synthesis for it):
 
 ```bash
 code "{PACK_DIR}/synthesis-standard.md"
 code "{PACK_DIR}/synthesis-critical.md"
-code "{PACK_DIR}/synthesis-evolutionary.md"
+code "{PACK_DIR}/evolutionary-codex.md"
 ```
 
 **Clean up tmp staging directory** — only after confirming review pack files are present:
 ```bash
 # Verify review pack is complete before cleanup
 ACTUAL=$(ls {PACK_DIR}/*.md 2>/dev/null | wc -l | tr -d ' ')
-if [ "$ACTUAL" -ge 7 ]; then
+if [ "$ACTUAL" -ge 6 ]; then
     rm -rf notes/.tmp/trident-{REVIEW_ID}
 fi
 ```
 
-(Use 7 as the threshold — if at least 7 reviews exist, the tmp files served their purpose.)
+(Use 6 as the threshold — if at least 6 reviews exist, the tmp files served their purpose.)
 
 Tell the user:
-> "Trident code review complete. Three synthesis docs opened:
+> "Trident code review complete. Two synthesis docs opened plus raw evolutionary:
 > - `synthesis-standard.md` — analytical consensus and merge verdict
 > - `synthesis-critical.md` — adversarial findings and production readiness
-> - `synthesis-evolutionary.md` — creative opportunities and evolution paths
+> - `evolutionary-codex.md` — creative opportunities (Codex-only; no synthesis pass)
 >
-> Full review pack (10 files: 7 reviews + 3 syntheses) at: `{PACK_DIR}/`"
+> Full review pack (8 files: 6 reviews + 2 syntheses) at: `{PACK_DIR}/`"
 
 ---
 
@@ -430,4 +416,4 @@ If an agent fails or isn't available, proceed with successful agents. Note failu
 
 ---
 
-Now begin. Prepare context, run tests, and orchestrate the seven-agent trident code review.
+Now begin. Prepare context, run tests, and orchestrate the six-agent trident code review.
