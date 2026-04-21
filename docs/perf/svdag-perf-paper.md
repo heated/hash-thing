@@ -311,6 +311,12 @@ Plan + code-review artifacts for the scaffolding commit live in `.ship-notes/pla
 
 Candidate #2a is the narrowest thing still worth trying before conceding to #3: it's a one-dispatch experiment that keeps winit's window but supplies our own redraw cadence. If a CADisplayLink-paced loop still shows `surface_acquire_cpu ≥ 16 ms` on M2, that is a strong signal the root cause is WindowServer composition and not our pacing choice, which is as close to a root-cause conclusion as this bead can get at the wgpu layer.
 
+**Candidate #2a refined — acquire-as-late-as-possible (Apple Metal Best Practices).** Literature pass 2026-04-21 (onyx) surfaced a much cheaper experiment than the `surface.as_hal` / `CADisplayLink` reroute. Apple's [Metal Best Practices Guide — Drawables](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/Drawables.html) states:
+
+> "Always acquire a drawable as late as possible; preferably, immediately before encoding an on-screen render pass. A frame's CPU work may include dynamic data updates and off-screen render passes that you can perform before acquiring a drawable."
+
+Our `Renderer::render` (`crates/ht-render/src/renderer.rs:1843`) calls `surface.get_current_texture()` *before* the SVDAG raycast compute dispatch (`renderer.rs:1989`) — the exact anti-pattern the doc warns about. Our compute pass writes to an off-screen `raycast_texture` that the on-screen render pass later blits from, so the Apple-sanctioned reorder is a mechanical move: encode compute first, then acquire the drawable immediately before the render-pass encode. This is the same class of fix Flutter Impeller shipped on iOS for the same symptom (flutter/flutter#138490). No `surface.as_hal`, no `CADisplayLink`, no unsafe code. Tracked as `hash-thing-dlse.2.2.1`; candidate #2a/#2b above remain as the fallbacks if the reorder doesn't land the signal.
+
 ### 3.10 Scaling the model to 4096³ (`hash-thing-ivms`)
 
 Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
