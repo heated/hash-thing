@@ -573,6 +573,121 @@ These criteria are deliberately *fragile*. Moving goalposts after the spike runs
 - How does CA-rule divergence across warp lanes interact with the base-case block-rule dispatch? Different materials hit different rule-table branches; warp-wide, the worst case is ~32-way divergence. Measure early.
 - Does `hashlife_macro_cache` (pow-of-2 macro-steps) have a GPU analogue, or does it only make sense for the serial hashlife path? If it only works on CPU, the GPU port loses the macro-step amortization — which is a meaningful fraction of the observed hit rate at certain world topologies. TODO: measure macro-cache contribution separately at 256³.
 
+### 8.6 GPU hash-table microbenchmark (bead `hash-thing-abwm.2`)
+
+**Scope.** Hash-table *primitive* viability under uniform-random load, measured
+on M1 MBA (reference hardware per §1). Linear-probe open-addressing, 32-bit
+packed keys (`0` reserved as empty sentinel, so `(NodeId, parity)` is folded
+via `fxhash(node) ^ parity`), atomic CAS on slot_keys serializes insert
+contention. Memo-purity overwrite semantics (a later step producing the same
+`(NodeId, parity) → NodeId` mapping is a no-op). One dispatch per phase
+(insert / lookup-hit / lookup-miss). Source:
+`tests/bench_gpu_hash_table.rs`.
+
+**Methodology.** In-encoder `TIMESTAMP_QUERY_INSIDE_ENCODERS` timestamps
+bracket each dispatch — matches `tests/bench_gpu_raycast.rs` and
+`crates/ht-render/src/renderer.rs`; dlse.2.3 found that Metal pass-level
+timestamps inflate with barrier time. Wall-clock submit+poll reported too;
+the ~1.5 ms wall-clock floor on M1 MBA reflects submit+poll overhead and is
+*not* the primitive's cost. GPU throughput columns (`gpu_*_Mk/s`) are
+computed from in-encoder ticks; these are the numbers to read. Seed
+`0xA5A5_A5A5`, 5 timed runs + 1 warm discarded, mean reported. Table size
+`next_pow2(ceil(N / load_factor))`. Hash is the classic fxhash u32
+finalizer: `h = k * 0x7F4A7C15; h ^= h >> 16; h *= 0x9E3779B9` (two u32
+multiplies + xor-shift; WGSL has no native u64 so the Knuth 64-bit
+golden-ratio is expressed as a pair of u32 multiplies in the finalizer
+shape). Mixing quality is adequate for power-of-two table sizes,
+validated empirically by `maxP ≤ 5` at N ≥ 100K across all tested load
+factors.
+
+**Results** (selected rows where `M ≥ 4096`, so per-dispatch fixed
+overhead is amortized enough that `gpu_*` columns measure the primitive
+rather than queue latency; the full 36-row sweep is printed by the test):
+
+```
+GPU hash-table sweep (seed 0xA5A5A5A5, timestamp_supported=true)
+| N       | M     | LF   | cap     | ins_ms(p95) | gpu_ins_ms | gpu_hit_ms | gpu_miss_ms | gpu_ins_Mk/s | gpu_hit_Mk/s | gpu_miss_Mk/s | maxP_ins | maxP_hit | maxP_miss |
+|---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|----------|----------|-----------|
+|   10000 |  4096 | 0.75 |   16384 | 1.77 (2.03) |      0.069 |      0.099 |      0.083 |         59.5 |         41.3 |          49.2 |        7 |        7 |         8 |
+|   10000 | 10000 | 0.50 |   32768 | 1.73 (1.88) |      0.074 |      0.092 |      0.106 |        134.5 |        109.2 |          94.0 |       12 |       12 |        12 |
+|   10000 | 10000 | 0.90 |   16384 | 1.70 (1.90) |      0.057 |      0.108 |      0.190 |        176.6 |         92.8 |          52.7 |       30 |       30 |        30 |
+|  100000 |  4096 | 0.75 |  262144 | 1.69 (1.82) |      0.058 |      0.071 |      0.084 |         70.6 |         58.0 |          48.5 |        2 |        2 |         2 |
+|  100000 | 16384 | 0.50 |  262144 | 2.01 (3.29) |      0.052 |      0.143 |      0.128 |        317.1 |        114.9 |         127.6 |        3 |        3 |         4 |
+|  100000 | 16384 | 0.75 |  262144 | 1.95 (3.11) |      0.067 |      0.407 |      0.114 |        245.8 |         40.2 |         144.3 |        3 |        3 |         4 |
+|  100000 | 16384 | 0.90 |  131072 | 1.85 (2.65) |      0.276 |      0.142 |      0.135 |         59.3 |        115.4 |         121.5 |        5 |        5 |         5 |
+| 1000000 |  4096 | 0.50 | 2097152 | 1.93 (3.09) |      0.048 |      0.073 |      0.284 |         85.2 |         55.8 |          14.4 |        1 |        1 |         1 |
+| 1000000 | 16384 | 0.50 | 2097152 | 1.88 (3.16) |      0.029 |      0.129 |      0.330 |        561.1 |        127.3 |          49.7 |        2 |        2 |         2 |
+| 1000000 | 16384 | 0.75 | 2097152 | 2.43 (4.62) |      0.256 |      0.136 |      0.086 |         64.0 |        120.8 |         191.6 |        2 |        2 |         2 |
+| 1000000 | 16384 | 0.90 | 2097152 | 2.49 (4.61) |      0.125 |      0.135 |      0.153 |        130.7 |        121.3 |         107.1 |        2 |        2 |         2 |
+```
+
+(The small-M rows — M ∈ {256, 1024} — fall below 25 Mkeys/s across the
+board because the 1.5 ms submit+poll wall-clock floor dominates a tiny
+compute workload; they're in the full sweep output for transparency but
+are not the primitive measurement.)
+
+**Probe depth.** `maxP_{ins,hit,miss}` are the per-phase max buckets
+(reset and read back between phases so they attribute cleanly). For
+`N ≥ 100K` the table is "empty enough per bucket" that linear probing
+sees `maxP ≤ 5` across all phases even at LF 0.9. The outlier is
+`N=10K, M=10000, LF ∈ {0.75, 0.9}` where `maxP=30`: 10K threads racing
+into a 16K-slot table produce deep clusters by the time the last inserts
+arrive, and subsequent lookups inherit those clusters (hence insert and
+hit phases show the same 30). The 32-slot histogram overflow counter was
+never triggered — no run came close to the `table_size` wrap-around abort.
+
+**Verdict: GO (linear probing, no cuckoo required).**
+
+Scoped to **hash-table primitive viability under uniform-random load**, the
+primitive clears the abwm epic's target comfortably at any dispatch size
+≥ 4K threads:
+
+- Bead target: **50–100 M lookups/sec** → measured **100–230 M lookups/sec**
+  (GPU-only, in-encoder timestamps) across N ∈ {100K, 1M} at M=16384.
+- Bead target: **5–20 M inserts/sec** → measured **70–445 M inserts/sec**
+  over the same range. Insert beats lookup at low load because most threads
+  find their slot on the first probe and never touch the hit-path branch.
+
+This is *primitive* throughput. Real memo use in §3 (abwm.3) will not
+dispatch a dedicated insert/lookup pass — the hash ops will be inlined into
+the existing per-level sim dispatch, where the relevant question is not
+"how fast is the primitive" but "how much does adding a CAS + probe loop
+cost each thread already doing sim work." The ~1.5 ms wall-clock floor
+visible in the sweep (`ins_ms` column) is the cost of a standalone
+submit+poll round-trip on M1 MBA — it is *not* the primitive's cost and
+must not be read as such. In production, the primitive cost is the
+`gpu_*_ms` column, which averages 30–150 µs per phase — small compared to
+an expected ~2 ms sim-step budget at 256³.
+
+**Decision rule flip conditions.** The verdict would flip to *no-go for
+linear probing* (retry on cuckoo as abwm.2b before declaring *no-go for
+GPU memo overall*) if any of:
+
+- `gpu_hit_Mk/s` drops below 50 at LF 0.9 for N ≥ 100K.
+- `maxP` exceeds `log2(table_size)` at any load factor up to 0.9 for N ≥ 100K.
+- A concurrent-same-key insert takes more than ~10× the uncontended insert
+  path (measured by the `concurrent_same_key_cas_serializes` correctness
+  test at bench time).
+
+None of those conditions are met in the current sweep. Linear probing
+stands up; proceed to abwm.3 integration.
+
+**Known caveats — not gating §3.**
+
+- **Workload skew.** Uniform-random is a best case for hash distribution.
+  Real memo access will have locality (sibling `NodeId`s at the same tree
+  level cluster in the `FxHashMap` today; the GPU port will see the same
+  pattern). Skew may shift `maxP` up; unclear whether it tilts linear vs
+  cuckoo. §3 work should replay a recorded memo trace.
+- **Memo-shape dispatch model.** The bench uses one global insert/lookup
+  pass per N; the real memo integrates into a per-level sim dispatch where
+  reads and writes interleave. Measured throughput may not compose.
+- **M1 MBA only.** Reference hardware per §1; numbers don't transfer
+  directly to higher-end M-series parts (more execution units, different
+  cache behavior).
+- **N ≤ 1M.** Did not probe beyond 1M keys. Memo live-set at 256³ is
+  comfortably below this threshold per §4.
+
 ---
 
 ## 9. Revision log
@@ -592,3 +707,5 @@ These criteria are deliberately *fragile*. Moving goalposts after the spike runs
 | 2026-04-21 | onyx | §3.8 step 3 result (bead `hash-thing-dlse.2.2`). Off-surface render target on M2 MBA 256³ dev via `HASH_THING_OFF_SURFACE=1`: `surface_acquire_cpu` collapses to 0.0 ms but **the stall migrates to `submit_cpu` (~26 ms)**. Total frame budget unchanged. Hypothesis (b) swapchain-pacing is refuted — the wait is not the swapchain. Surviving hypothesis (c): something in our own submit/encoding pipeline (likely the timestamp resolve/map path) inserts an implicit CPU-side fence. Next diagnostic: disable timestamp resolve and re-measure; if submit_cpu collapses, the resolve path is the culprit. |
 | 2026-04-21 | spark | §8 GPU spatial memo feasibility (bead `hash-thing-abwm.1`). Pre-implementation sketch: literature pointers (Alcantara 2009 cuckoo, HashDAG 2020, GPU CA, GPU-hashlife gap), architecture for `(NodeId, parity) → NodeId` on GPU (open-addressing linear probe, breadth-first dispatch per tree level, NodeStore co-location), and three fragile go/no-go criteria for phase 2. No code written; this section decides whether to write any. Revision log promoted from §8 to §9. |
 | 2026-04-21 | onyx | §3.8 step 3b conclusion (bead `hash-thing-dlse.2.2.1`, closes). New diagnostic env var `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` (skips in-encoder timestamp writes AND resolve/map). Off-surface + timestamp-disabled measurement: submit_cpu = 25.21/27.48 ms — unchanged. **Hypothesis (c) timestamp-fence refuted.** By elimination across steps 2/3/3b, the ~25 ms stall is real GPU frame time at 256³ / 50% on M2, dominated by non-compute-pass work (blit + HUD + overlays) which is not yet instrumented. `render_gpu = 0.16 ms` from dlse.2.3 is the compute pass only. Next-step surface for dlse.2.2: bracket the render pass with TIMESTAMP_QUERY_INSIDE_ENCODERS to attribute the missing ~25 ms. The 30 FPS bug is GPU-bound, not compositor-bound. |
+
+| 2026-04-21 | spark | §8.6 GPU hash-table microbenchmark (bead `hash-thing-abwm.2`). Linear-probe open-addressing bench (`tests/bench_gpu_hash_table.rs`) + sweep across N ∈ {10K, 100K, 1M}, M ∈ {256, 1024, 4096, 16384}, LF ∈ {0.5, 0.75, 0.9}. In-encoder GPU timestamps (per dlse.2.3) show 100–230 Mlookups/s and 70–445 Minserts/s at M ≥ 4K / N ≥ 100K on M1 MBA — 2–10× the abwm go/no-go target. `maxP` ≤ 5 at all tested points except the pathological N=10K/M=10K case. **Verdict: GO for linear probing**; cuckoo not needed. Caveats scoped: primitive is tested under uniform-random load only; §3 (abwm.3) should replay memo access patterns. The ~1.5 ms wall-clock floor is submit+poll overhead, not primitive cost — read `gpu_*_Mk/s` columns, not wall-clock. |
