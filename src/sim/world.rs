@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 
 use super::mutation::{MutationQueue, WorldMutation};
@@ -190,6 +191,19 @@ pub struct World {
     pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, u64), NodeId>,
     /// Hashlife cache statistics from the most recent step.
     pub hashlife_stats: HashlifeStats,
+    /// Lifetime accumulator across `step_recursive` calls. Unlike
+    /// `hashlife_stats` (reset each step), this aggregates for the life of the
+    /// `World` — enables steady-state hit-rate reporting in the periodic log
+    /// (hash-thing-stue.6). `step_recursive_pow2` is intentionally not folded
+    /// in: it goes through `step_node_macro`, which doesn't touch
+    /// `hashlife_stats` today, so there'd be nothing to add anyway.
+    pub hashlife_stats_total: HashlifeStats,
+    /// Sliding window of per-step `(cache_hits, cache_misses)` used to
+    /// compute a window-minus-lifetime hit-rate delta (hash-thing-o2es).
+    /// The churn signal catches regressions that would be smoothed out by
+    /// the lifetime denominator; positive delta = recent steps cache better
+    /// than the running average, negative = recent regression.
+    pub memo_window: MemoWindow,
     /// Store size after the last compaction, used to trigger periodic GC.
     pub(crate) store_size_at_last_compact: usize,
     /// Cache for `inert_uniform_state`: NodeId → Option<CellState>.
@@ -213,10 +227,18 @@ pub struct World {
     /// grows in the negative direction, origin shifts to keep the old
     /// root's cells at the same world-space positions.
     pub origin: [i64; 3],
-    /// Old→new NodeId remap from the most recent store compaction.
-    /// Consumed by `Svdag::apply_remap()` to keep its persistent cache
-    /// valid across compaction epochs (hash-thing-5bb.11).
-    /// `None` after scene resets (the cache should be fully invalidated).
+    /// Old→current NodeId remap pending for the renderer's persistent
+    /// cache (`Svdag::apply_remap`, hash-thing-5bb.11). Keys are
+    /// old-namespace NodeIds that remain reachable across every
+    /// compaction since the last sync; keys GC'd mid-chain are dropped
+    /// (absence == invalidation). Compose-on-write: when a new
+    /// compaction publishes B→C while A→B is still pending, they are
+    /// composed into A→C so the renderer sees a single remap keyed in
+    /// its current (A) namespace (hash-thing-rk4n.1).
+    ///
+    /// `None` on fresh `World::new` (cache is empty by construction).
+    /// `Some(empty)` after `seed_terrain` — the consumer drains and
+    /// calls `apply_remap(&empty)`, which drops every cached entry.
     pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
 }
 
@@ -229,6 +251,103 @@ pub struct HashlifeStats {
     pub fixed_point_skips: u64,
     /// Per-level cache miss counts (index = level - 3, since base case is level 3).
     pub misses_by_level: [u64; 32],
+}
+
+impl HashlifeStats {
+    /// Field-wise add `step` into `self`. Keeps the scalar counters and the
+    /// per-level array in sync (hash-thing-stue.6 lifetime accumulator).
+    pub fn accumulate(&mut self, step: &HashlifeStats) {
+        self.cache_hits += step.cache_hits;
+        self.cache_misses += step.cache_misses;
+        self.empty_skips += step.empty_skips;
+        self.fixed_point_skips += step.fixed_point_skips;
+        for (dst, src) in self
+            .misses_by_level
+            .iter_mut()
+            .zip(step.misses_by_level.iter())
+        {
+            *dst += *src;
+        }
+    }
+}
+
+/// Fixed-capacity ring of recent per-step `(cache_hits, cache_misses)` pairs
+/// for the window-delta hit-rate signal (hash-thing-o2es). A regression that
+/// halves hit rate would otherwise be buried under the lifetime accumulator's
+/// denominator; subtracting the lifetime rate from the window rate surfaces
+/// the step-to-step churn directly.
+///
+/// Capacity is 20 entries: short enough that the window diverges from the
+/// lifetime average within a single 2 s log interval at 256³ (~6 steps/s on
+/// M2 MBA), long enough to smooth per-step noise on a busy scene. While the
+/// window is still filling (step count < CAPACITY) window_rate == lifetime
+/// and churn reports `+0.000`, which is the honest "not enough data yet"
+/// signal.
+#[derive(Clone, Debug, Default)]
+pub struct MemoWindow {
+    samples: VecDeque<(u64, u64)>,
+}
+
+impl MemoWindow {
+    pub const CAPACITY: usize = 20;
+
+    /// Append one step's `(cache_hits, cache_misses)`, evicting the oldest
+    /// entry once the ring is full.
+    pub fn push(&mut self, hits: u64, misses: u64) {
+        if self.samples.len() == Self::CAPACITY {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((hits, misses));
+    }
+
+    /// `(hits, misses)` summed across the window. `(0, 0)` when empty.
+    pub fn totals(&self) -> (u64, u64) {
+        self.samples
+            .iter()
+            .fold((0, 0), |acc, (h, m)| (acc.0 + h, acc.1 + m))
+    }
+
+    /// Hit rate over the window. `0.0` when empty or when the window has
+    /// seen no cache traffic (both counters zero).
+    pub fn hit_rate(&self) -> f64 {
+        let (h, m) = self.totals();
+        let total = h + m;
+        if total == 0 {
+            0.0
+        } else {
+            h as f64 / total as f64
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
+/// Compose two sequential NodeId remaps `A→B` and `B→C` into a single
+/// `A→C` remap. A key `k_a` in `existing` whose value `v_b` is not a key
+/// in `new` is dropped: the node survived compaction 1 but was
+/// garbage-collected by compaction 2, so the renderer's cache entry for
+/// `k_a` should be invalidated. `Svdag::apply_remap`
+/// (`crates/ht-render/src/svdag.rs:173`) rebuilds `id_to_offset` from the
+/// remap and drops any entries whose `old_id` is not a key, so absence
+/// from the composed map is the correct invalidation signal
+/// (hash-thing-rk4n.1).
+pub(super) fn compose_remap(
+    existing: FxHashMap<NodeId, NodeId>,
+    new: &FxHashMap<NodeId, NodeId>,
+) -> FxHashMap<NodeId, NodeId> {
+    let mut out = FxHashMap::with_capacity_and_hasher(existing.len(), Default::default());
+    for (k_a, v_b) in existing {
+        if let Some(&v_c) = new.get(&v_b) {
+            out.insert(k_a, v_c);
+        }
+    }
+    out
 }
 
 impl World {
@@ -260,6 +379,8 @@ impl World {
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
+            hashlife_stats_total: HashlifeStats::default(),
+            memo_window: MemoWindow::default(),
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
@@ -288,6 +409,8 @@ impl World {
             hashlife_cache: FxHashMap::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
+            hashlife_stats_total: HashlifeStats::default(),
+            memo_window: MemoWindow::default(),
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
@@ -1777,6 +1900,40 @@ impl World {
         self.store.population(self.root)
     }
 
+    /// Compact one-line summary of spatial-memo health for the periodic log
+    /// (hash-thing-stue.6, extended by hash-thing-o2es). Uses the lifetime
+    /// accumulator `hashlife_stats_total` for hit rate — so the rate
+    /// converges toward steady state rather than fluctuating with the most
+    /// recent step. Table sizes are live `.len()`, which is the right
+    /// signal for "is this table about to blow memory."
+    ///
+    /// Format: `memo_hit=<fraction> memo_churn=<signed-fraction>
+    /// memo_tbl=<int> memo_mac=<int>`.
+    ///
+    /// `memo_churn` is `window_hit_rate − lifetime_hit_rate` over the last
+    /// `MemoWindow::CAPACITY` steps. Positive = recent steps cache better
+    /// than the running average (e.g. cache warmup). Negative = recent
+    /// regression. `+0.000` before any step has run (both rates are 0).
+    /// `memo_mac` stays at 0 on single-step sessions (only
+    /// `step_recursive_pow2` populates the macro cache).
+    pub fn memo_summary(&self) -> String {
+        let stats = &self.hashlife_stats_total;
+        let total = stats.cache_hits + stats.cache_misses;
+        let hit_rate = if total == 0 {
+            0.0
+        } else {
+            stats.cache_hits as f64 / total as f64
+        };
+        let churn = self.memo_window.hit_rate() - hit_rate;
+        format!(
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={}",
+            hit_rate,
+            churn,
+            self.hashlife_cache.len(),
+            self.hashlife_macro_cache.len(),
+        )
+    }
+
     fn spectacle_box(center: [i64; 3], min: [i64; 3], max: [i64; 3]) -> Box3 {
         Box3::new(
             [center[0] + min[0], center[1] + min[1], center[2] + min[2]],
@@ -1935,7 +2092,10 @@ impl World {
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
-        self.last_compaction_remap = Some(remap);
+        self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
+            Some(existing) => compose_remap(existing, &remap),
+            None => remap,
+        });
         self.hashlife_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -1961,6 +2121,15 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // New epoch: the renderer's cache holds entries keyed in the previous
+        // epoch's NodeId namespace, which is meaningless against a brand-new
+        // NodeStore. Publishing an *empty* remap drives `Svdag::apply_remap`
+        // to drop every cached entry (absence == invalidation), which is
+        // exactly what a scene reset requires. Leaving it `None` would let
+        // stale low-NodeId cache entries alias against the fresh store's
+        // low NodeIds and produce first-frame corruption after a regenerate
+        // (hash-thing-rk4n.1).
+        self.last_compaction_remap = Some(FxHashMap::default());
         let heightmap = params.to_heightmap();
         let precompute_start = std::time::Instant::now();
         let field = PrecomputedHeightmapField::new(heightmap, self.level)
@@ -2644,36 +2813,93 @@ mod tests {
         }
     }
 
-    /// hash-thing-rk4n repro: walk the default water scene past ground-impact
-    /// at the scale edward reports corruption on (256^3), using the brute-force
-    /// `step()` path which always runs `commit_step` (store-compact every tick).
-    /// Skipping some sync calls mimics dropped render frames and exposes
-    /// `World::last_compaction_remap` being single-buffered: two successive
-    /// `commit_step` calls without an intervening `sync_svdag_with_world`
-    /// clobber the first remap, and the SVDAG's persistent NodeId cache
-    /// decodes subsequent nodes from the wrong store generation.
-    ///
-    /// Water pool sits at `water_y = center + center/4` with `pool_depth =
-    /// (side/32).max(2)`. At 256^3 the pool bottom is ~32 cells above the
-    /// mid-terrain floor, so it needs ~32 steps for impact plus a comfortable
-    /// tail. 60 total steps covers the impact and ~20 steps after, the window
-    /// edward named.
-    ///
-    /// Marked `#[ignore]` because 60 steps at 256^3 plus periodic exhaustive
-    /// 16.7M-voxel verification is too slow for the default test run. Invoke
-    /// with `cargo test --release -- --ignored
-    /// water_and_sand_256_commit_step_skip_sync_corrupts_svdag`.
+    /// hash-thing-rk4n.1 always-on regression: 64^3 skip-sync variant of
+    /// the 256^3 commit_step repro below. Skipping some sync calls between
+    /// commit_step invocations used to clobber `last_compaction_remap`;
+    /// the compose-on-write fix keeps both remaps live across the gap.
+    /// Kept scaled-down + always-on so CI catches any regression without
+    /// `--ignored` (the 256^3 version runs ~2 min and stays ignored).
     #[test]
-    #[ignore]
-    fn water_and_sand_256_commit_step_skip_sync_corrupts_svdag() {
-        let mut world = World::new(8); // 256^3, matches the default visual repro.
-        let params = TerrainParams::for_level(8);
+    fn water_and_sand_skip_sync_keeps_svdag_in_sync_64() {
+        let mut world = World::new(6);
+        let params = TerrainParams::for_level(6);
         let _ = world.seed_terrain(&params);
         world.seed_water_and_sand();
 
         let mut svdag = Svdag::new();
         sync_svdag_with_world(&mut world, &mut svdag);
-        assert_svdag_matches_world(&world, &svdag, "initial 256^3 water scene");
+        assert_svdag_matches_world(&world, &svdag, "initial 64^3 water scene");
+
+        // Sync on a subset of steps so two commit_step calls land between
+        // syncs — the exact pattern that exposed Bug A.
+        for step in 1u32..=20 {
+            world.step();
+            let verify = step <= 4 || step % 2 == 0;
+            if verify {
+                sync_svdag_with_world(&mut world, &mut svdag);
+                assert_svdag_matches_world(
+                    &world,
+                    &svdag,
+                    &format!("after 64^3 skip-sync step {step}"),
+                );
+            }
+        }
+    }
+
+    /// hash-thing-rk4n.1 always-on regression: 64^3 step_recursive variant.
+    /// `maybe_compact` used to never publish its remap, so any compaction
+    /// triggered inside the recursive stepper silently desynced the SVDAG
+    /// cache. Sync every step — if the renderer's cache aliases across a
+    /// maybe_compact store swap, the assertion panics within a few steps.
+    #[test]
+    fn water_and_sand_step_recursive_keeps_svdag_in_sync_64() {
+        let mut world = World::new(6);
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "initial 64^3 water scene");
+
+        for step in 1u32..=20 {
+            world.step_recursive();
+            sync_svdag_with_world(&mut world, &mut svdag);
+            assert_svdag_matches_world(
+                &world,
+                &svdag,
+                &format!("after 64^3 step_recursive {step}"),
+            );
+        }
+    }
+
+    /// hash-thing-rk4n regression: walks the default water scene past
+    /// ground-impact using the brute-force `step()` path which runs
+    /// `commit_step` (store-compact every tick). Skipping some sync calls
+    /// mimics dropped render frames and used to expose
+    /// `last_compaction_remap` being single-buffered: two successive
+    /// `commit_step` calls without an intervening sync clobbered the first
+    /// remap, so the SVDAG cache decoded subsequent nodes from the wrong
+    /// store generation. Fixed in rk4n.1 by compose-on-write
+    /// (see `compose_remap`); this test stays as a regression guard.
+    ///
+    /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
+    /// always-on under the 60s soft-max (~10s observed). With the fix
+    /// reverted, the assertion fires at step 42 with ~254k mismatches.
+    /// Water pool sits at `water_y = center + center/4` with
+    /// `pool_depth = (side/32).max(2)` — at 128^3 the pool bottom is ~16
+    /// cells above the mid-terrain floor, so 60 steps covers impact plus
+    /// tail comfortably.
+    #[test]
+    fn water_and_sand_128_commit_step_skip_sync_corrupts_svdag() {
+        let mut world = World::new(7);
+        let params = TerrainParams::for_level(7);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "initial 128^3 water scene");
 
         // Mirror the "occasionally drop a render frame" pattern: verify most
         // steps but skip some past step 40 so two commit_step calls can land
@@ -2687,28 +2913,33 @@ mod tests {
                 assert_svdag_matches_world(
                     &world,
                     &svdag,
-                    &format!("after 256^3 water step {step}"),
+                    &format!("after 128^3 water step {step}"),
                 );
             }
         }
     }
 
-    /// hash-thing-rk4n companion probe: production uses `step_recursive`,
-    /// whose `maybe_compact` re-stores without publishing the remap on
-    /// `last_compaction_remap`. Sync every step so this test cannot be
-    /// excused by skipped-frame behavior; if it fails, the SVDAG cache is
-    /// aliasing across a silent store swap.
+    /// hash-thing-rk4n companion regression: production uses
+    /// `step_recursive`, whose `maybe_compact` used to re-store without
+    /// publishing the remap on `last_compaction_remap`. Sync every step
+    /// so this test cannot be excused by skipped-frame behavior; if it
+    /// fails, the SVDAG cache is aliasing across a silent store swap.
+    /// Fixed in rk4n.1 by publishing the remap with compose-on-write;
+    /// this test stays as a regression guard.
+    ///
+    /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
+    /// always-on under the 60s soft-max (~5s observed). With the fix
+    /// reverted, the assertion fires at step 24 with ~974k mismatches.
     #[test]
-    #[ignore]
-    fn water_and_sand_256_step_recursive_with_sync_every_step() {
-        let mut world = World::new(8);
-        let params = TerrainParams::for_level(8);
+    fn water_and_sand_128_step_recursive_with_sync_every_step() {
+        let mut world = World::new(7);
+        let params = TerrainParams::for_level(7);
         let _ = world.seed_terrain(&params);
         world.seed_water_and_sand();
 
         let mut svdag = Svdag::new();
         sync_svdag_with_world(&mut world, &mut svdag);
-        assert_svdag_matches_world(&world, &svdag, "initial 256^3 water scene");
+        assert_svdag_matches_world(&world, &svdag, "initial 128^3 water scene");
 
         for step in 1u32..=60 {
             world.step_recursive();
@@ -2716,7 +2947,7 @@ mod tests {
             assert_svdag_matches_world(
                 &world,
                 &svdag,
-                &format!("after 256^3 step_recursive {step}"),
+                &format!("after 128^3 step_recursive {step}"),
             );
         }
     }
@@ -4615,5 +4846,210 @@ mod tests {
         });
 
         world.apply_mutations();
+    }
+
+    // ---------------------------------------------------------------------
+    // hash-thing-stue.6: spatial-memo telemetry.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn hashlife_stats_accumulate_sums_fields_and_levels_per_index() {
+        let mut total = HashlifeStats::default();
+        let mut a = HashlifeStats::default();
+        let mut b = HashlifeStats::default();
+
+        a.cache_hits = 3;
+        a.cache_misses = 5;
+        a.empty_skips = 7;
+        a.fixed_point_skips = 11;
+        a.misses_by_level[0] = 1;
+        a.misses_by_level[3] = 13;
+        a.misses_by_level[7] = 17;
+
+        b.cache_hits = 2;
+        b.cache_misses = 4;
+        b.empty_skips = 6;
+        b.fixed_point_skips = 8;
+        b.misses_by_level[0] = 10;
+        b.misses_by_level[3] = 100;
+        b.misses_by_level[7] = 1000;
+
+        total.accumulate(&a);
+        total.accumulate(&b);
+
+        assert_eq!(total.cache_hits, 5);
+        assert_eq!(total.cache_misses, 9);
+        assert_eq!(total.empty_skips, 13);
+        assert_eq!(total.fixed_point_skips, 19);
+        assert_eq!(total.misses_by_level[0], 11);
+        assert_eq!(total.misses_by_level[3], 113);
+        assert_eq!(total.misses_by_level[7], 1017);
+        // Untouched indices must remain zero — catches the "summed into
+        // index 0" copy-paste bug.
+        for (i, &v) in total.misses_by_level.iter().enumerate() {
+            if !matches!(i, 0 | 3 | 7) {
+                assert_eq!(v, 0, "misses_by_level[{i}] bled from another index");
+            }
+        }
+    }
+
+    #[test]
+    fn memo_summary_reports_cumulative_hits_after_two_steps() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+
+        world.step_recursive();
+        let after_first = world.hashlife_stats;
+        world.step_recursive();
+        let after_second = world.hashlife_stats;
+
+        let total = &world.hashlife_stats_total;
+        assert!(
+            total.cache_hits + total.cache_misses > 0,
+            "lifetime accumulator must see nonzero activity after stepping",
+        );
+        assert_eq!(
+            total.cache_hits,
+            after_first.cache_hits + after_second.cache_hits,
+            "hits total must equal sum of per-step snapshots",
+        );
+        assert_eq!(
+            total.cache_misses,
+            after_first.cache_misses + after_second.cache_misses,
+            "misses total must equal sum of per-step snapshots",
+        );
+        assert!(
+            total.cache_hits >= after_second.cache_hits,
+            "total must be >= most-recent step",
+        );
+
+        let summary = world.memo_summary();
+        assert!(summary.contains("memo_hit="));
+        assert!(summary.contains("memo_tbl="));
+        assert!(summary.contains("memo_mac="));
+    }
+
+    #[test]
+    fn hashlife_stats_per_step_reset_preserved() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+
+        world.step_recursive();
+        let first_misses = world.hashlife_stats.cache_misses;
+        assert!(first_misses > 0, "first step must produce misses");
+
+        world.step_recursive();
+        let second_misses = world.hashlife_stats.cache_misses;
+
+        // Per-step field still captures only the latest step. If accumulation
+        // accidentally folded into `hashlife_stats` rather than the `_total`
+        // sibling, this would equal `first + second` (the lifetime total).
+        assert_eq!(
+            world.hashlife_stats_total.cache_misses,
+            first_misses + second_misses,
+            "lifetime accumulator must equal exact per-step sum",
+        );
+        assert!(
+            second_misses < first_misses + second_misses,
+            "per-step stats must reset between calls (second={second_misses}, sum={})",
+            first_misses + second_misses,
+        );
+    }
+
+    #[test]
+    fn memo_summary_on_fresh_world_is_zero_rate() {
+        let world = World::new(4);
+        let summary = world.memo_summary();
+        assert!(
+            summary.starts_with("memo_hit=0.000"),
+            "fresh world reports honest zero hit rate, got: {summary}",
+        );
+        assert!(
+            summary.contains("memo_churn=+0.000"),
+            "fresh world reports honest zero churn, got: {summary}",
+        );
+    }
+
+    #[test]
+    fn memo_window_push_evicts_oldest_past_capacity() {
+        let mut window = MemoWindow::default();
+        for i in 0..(MemoWindow::CAPACITY as u64 + 5) {
+            // Inject i hits / 1 miss each — after eviction the window holds
+            // the most recent CAPACITY entries.
+            window.push(i, 1);
+        }
+        assert_eq!(window.len(), MemoWindow::CAPACITY);
+        let (hits, misses) = window.totals();
+        // Window now holds hits [5..CAPACITY+5), each with 1 miss.
+        let expected_hits: u64 = (5u64..5 + MemoWindow::CAPACITY as u64).sum();
+        assert_eq!(hits, expected_hits);
+        assert_eq!(misses, MemoWindow::CAPACITY as u64);
+    }
+
+    #[test]
+    fn memo_window_hit_rate_matches_lifetime_before_capacity() {
+        // While step count < CAPACITY the window IS the lifetime — both rates
+        // must be identical, so `memo_churn` reports a clean +0.000. This is
+        // the contract the log format relies on before enough steps accrue.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+
+        world.step_recursive();
+        world.step_recursive();
+        world.step_recursive();
+
+        assert!(
+            world.memo_window.len() <= MemoWindow::CAPACITY,
+            "window must not exceed capacity",
+        );
+        assert!(world.memo_window.len() < MemoWindow::CAPACITY);
+
+        let (win_hits, win_misses) = world.memo_window.totals();
+        let total = &world.hashlife_stats_total;
+        assert_eq!(
+            win_hits, total.cache_hits,
+            "pre-capacity window totals must match lifetime",
+        );
+        assert_eq!(
+            win_misses, total.cache_misses,
+            "pre-capacity window totals must match lifetime",
+        );
+
+        let summary = world.memo_summary();
+        assert!(
+            summary.contains("memo_churn=+0.000"),
+            "churn must be exactly 0 while window still filling, got: {summary}",
+        );
+    }
+
+    #[test]
+    fn memo_window_hit_rate_diverges_past_capacity() {
+        // After CAPACITY+1 steps the oldest entry is evicted from the window
+        // but retained by `hashlife_stats_total`. Construct a case where the
+        // oldest entry has a different hit ratio than the remaining window so
+        // we can observe divergence.
+        let mut window = MemoWindow::default();
+        // First push: all-miss (forces lifetime_hits / lifetime_misses split).
+        window.push(0, 10);
+        // Fill remaining CAPACITY - 1 slots with all-hit, to push the window
+        // above an all-miss starting floor.
+        for _ in 0..(MemoWindow::CAPACITY - 1) {
+            window.push(10, 0);
+        }
+        // At CAPACITY: 1 all-miss + (CAPACITY-1) all-hit → window rate =
+        // (CAPACITY-1)*10 / CAPACITY*10. Push one more all-hit → oldest
+        // (all-miss) evicts → window becomes all-hit, rate → 1.0.
+        let pre_push_rate = window.hit_rate();
+        window.push(10, 0);
+        let post_push_rate = window.hit_rate();
+
+        assert!(
+            post_push_rate > pre_push_rate,
+            "evicting the all-miss oldest entry must raise the window rate",
+        );
+        assert!(
+            (post_push_rate - 1.0).abs() < 1e-9,
+            "after eviction window is all-hit → rate = 1.0, got {post_push_rate}",
+        );
     }
 }

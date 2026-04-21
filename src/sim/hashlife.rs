@@ -57,6 +57,10 @@ impl World {
         let parity = (self.generation % 2) as u32;
         let result = self.step_node(padded_root, padded_level, parity);
         self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
 
         // Post-step gravity gap-fill: prevents Margolus rarefaction.
         // Applied on the flattened grid (same as brute-force path) because
@@ -95,10 +99,15 @@ impl World {
             self.block_rule_present = None; // brute-force may have consumed block-rule cells
             return;
         }
+        self.hashlife_stats = super::world::HashlifeStats::default();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         let result = self.step_node_macro(padded_root, padded_level, self.generation);
         self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
         self.generation += self.recursive_pow2_step_count();
 
         self.maybe_compact();
@@ -128,6 +137,13 @@ impl World {
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
+        // Publish to the renderer-facing slot with compose-on-write so back-to-back
+        // compactions without an intervening SVDAG sync don't clobber the A→B map
+        // with B→C (hash-thing-rk4n.1).
+        self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
+            Some(existing) => super::world::compose_remap(existing, &remap),
+            None => remap,
+        });
         self.store_size_at_last_compact = self.store.stats();
     }
 
@@ -346,22 +362,30 @@ impl World {
         // Empty nodes step to empty across any number of generations:
         // identity^N = identity. CaRule-only worlds (macro path prerequisite).
         if self.store.population(node) == 0 {
+            self.hashlife_stats.empty_skips += 1;
             return self.store.empty(level - 1);
         }
 
         // Fixed-point: uniform inert subtree → same material, smaller node.
         if let Some(state) = self.inert_uniform_state(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
             return self.store.uniform(level - 1, state);
         }
 
         // All-inert: mixed materials but all noop → center extract.
         if self.is_all_inert(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
             return self.center_node(node, level);
         }
 
         let key = (node, generation);
         if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
+            self.hashlife_stats.cache_hits += 1;
             return cached;
+        }
+        self.hashlife_stats.cache_misses += 1;
+        if (level as usize) >= 3 {
+            self.hashlife_stats.misses_by_level[(level - 3) as usize] += 1;
         }
 
         let result = if level == 3 {

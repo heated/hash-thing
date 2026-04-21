@@ -28,6 +28,65 @@ const DEFAULT_VOLUME_SIZE: u32 = 2048;
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
+/// Thin wrapper over macOS `pthread_set_qos_class_self_np` used as the
+/// xhi6 diagnostic knob (proxy 2 for SVDAG↔sim cache-locality work).
+/// `parse` maps the `HASH_THING_SIM_QOS` env string to a `qos_class_t`
+/// constant; `apply` installs it on the *current* thread. No-ops on
+/// non-macOS targets so the cross-compile stays green.
+mod thread_qos {
+    #[cfg(target_os = "macos")]
+    mod imp {
+        pub const USER_INTERACTIVE: u32 = 0x21;
+        pub const USER_INITIATED: u32 = 0x19;
+        pub const DEFAULT: u32 = 0x15;
+        pub const UTILITY: u32 = 0x11;
+        pub const BACKGROUND: u32 = 0x09;
+
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+
+        pub fn apply(qos: u32) {
+            // SAFETY: Apple-documented libc entrypoint. Both inputs are
+            // ABI-compatible primitives; no memory is exchanged.
+            let rc = unsafe { pthread_set_qos_class_self_np(qos, 0) };
+            if rc == 0 {
+                log::info!("sim thread QoS set to 0x{qos:02x}");
+            } else {
+                log::warn!("pthread_set_qos_class_self_np failed: rc={rc} qos=0x{qos:02x}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    mod imp {
+        pub const USER_INTERACTIVE: u32 = 1;
+        pub const USER_INITIATED: u32 = 2;
+        pub const DEFAULT: u32 = 3;
+        pub const UTILITY: u32 = 4;
+        pub const BACKGROUND: u32 = 5;
+
+        pub fn apply(_qos: u32) {
+            log::warn!("HASH_THING_SIM_QOS set but target is not macOS; ignoring");
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<u32> {
+        match s {
+            "interactive" => Some(imp::USER_INTERACTIVE),
+            "initiated" => Some(imp::USER_INITIATED),
+            "default" => Some(imp::DEFAULT),
+            "utility" => Some(imp::UTILITY),
+            "background" => Some(imp::BACKGROUND),
+            _ => None,
+        }
+    }
+
+    pub fn apply(qos: u32) {
+        imp::apply(qos);
+    }
+}
+
 /// One-line gen summary. Centralised so the `App::new` startup path and the
 /// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
 /// classify_calls / nodes_delta / noise_fraction fields; the rest is carried
@@ -328,6 +387,26 @@ struct App {
     /// to detect the Cmd+Ctrl+F fullscreen chord (winit does not
     /// surface chords as NamedKey).
     modifiers: winit::keyboard::ModifiersState,
+    /// Cached hashlife memo health summary (hash-thing-stue.6). Refreshed
+    /// on the main thread after each step's world result is merged back,
+    /// so the periodic log can print it even while the next step is on
+    /// the background thread (where `self.world` is a placeholder).
+    last_memo_summary: String,
+    /// Sim-freeze diagnostic toggle (hash-thing-stue.7). When true, the
+    /// background-step dispatch is a no-op: world stays put on the main
+    /// thread, generation never advances, and the renderer reads a stable
+    /// SVDAG every frame. Used to measure renderer-only frame cost without
+    /// sim/render unified-memory contention. Set via `HASH_THING_FREEZE_SIM=1`.
+    freeze_sim: bool,
+    /// macOS QoS class to apply to the background sim thread (hash-thing-xhi6
+    /// proxy 2). `Some` → the thread calls `pthread_set_qos_class_self_np`
+    /// at entry. `USER_INTERACTIVE` keeps sim in the P-core pool alongside
+    /// the main render thread; `BACKGROUND` steers it toward E-cores.
+    /// Comparing the two isolates CPU-cycle contention (same pool = slower)
+    /// from unified-memory cache contention (no change either way). `None`
+    /// leaves the thread at its inherited QoS. Set via
+    /// `HASH_THING_SIM_QOS={interactive|initiated|default|utility|background}`.
+    sim_qos: Option<u32>,
     /// Self-driving windowed-vs-fullscreen acquire measurement
     /// (`dlse.2.2`). `Some` when `HASH_THING_ACQUIRE_HARNESS=1`.
     /// When active, the harness forces a windowed start, burns a
@@ -443,16 +522,38 @@ impl App {
             pending_player_action: None,
             fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
             modifiers: winit::keyboard::ModifiersState::empty(),
+            last_memo_summary: String::new(),
+            freeze_sim: std::env::var("HASH_THING_FREEZE_SIM").ok().as_deref() == Some("1"),
+            sim_qos: std::env::var("HASH_THING_SIM_QOS")
+                .ok()
+                .as_deref()
+                .and_then(thread_qos::parse),
             acquire_harness: acquire_harness::Harness::from_env(),
         };
+        if app.freeze_sim {
+            log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
+        }
+        if let Some(qos) = app.sim_qos {
+            log::info!("HASH_THING_SIM_QOS active: sim thread will request QoS 0x{qos:02x} (xhi6 diagnostic)");
+        }
         // The harness owns the windowed→fullscreen transition explicitly;
         // honouring `HASH_THING_FULLSCREEN=1` on top of it would skip the
         // windowed capture phase. Force windowed start when the harness is
-        // on.
+        // on, and log loudly if we clobbered an explicit user request —
+        // otherwise setting both flags is silently confusing (mixt NIT #5).
         if app.acquire_harness.is_some() {
+            if app.fullscreen_active {
+                log::info!(
+                    "HASH_THING_ACQUIRE_HARNESS=1 overrides HASH_THING_FULLSCREEN=1: forcing windowed start so the harness can run its windowed capture phase before toggling to fullscreen"
+                );
+            }
             app.fullscreen_active = false;
         }
 
+        // Seed the cached memo summary so the very first periodic log line
+        // has a populated column instead of a blank trailing field
+        // (hash-thing-stue.6 reviewer nit).
+        app.last_memo_summary = app.world.memo_summary();
         let player_pos = app.reset_scene_entities();
         app.spawn_demo_entities();
         log::info!(
@@ -722,14 +823,18 @@ impl App {
     }
 
     fn maybe_start_background_step(&mut self) {
-        if self.paused || self.is_stepping() {
+        if self.paused || self.is_stepping() || self.freeze_sim {
             return;
         }
         self.step_start = std::time::Instant::now();
         // Move world to the background thread only after the frame has
         // consumed the live snapshot for movement, interaction, and render.
         let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
+        let sim_qos = self.sim_qos;
         self.step_handle = Some(std::thread::spawn(move || {
+            if let Some(qos) = sim_qos {
+                thread_qos::apply(qos);
+            }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 world.apply_mutations();
                 world.spawn_clones();
@@ -1335,6 +1440,13 @@ impl ApplicationHandler for App {
             let mut renderer =
                 pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
+            // `surface.get_current_texture()` + `present()`; pairs with the
+            // acquire harness to measure whether the ~25 ms surface_acquire
+            // stall is swapchain-pacing (collapses) or elsewhere (persists).
+            if std::env::var("HASH_THING_OFF_SURFACE").ok().as_deref() == Some("1") {
+                renderer.enable_off_surface();
+            }
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
@@ -1491,6 +1603,7 @@ impl ApplicationHandler for App {
                                 self.entities.update(&self.world, &mut queue);
                                 self.world.queue = queue;
                             }
+                            self.last_memo_summary = self.world.memo_summary();
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &mut self.world,
@@ -1768,7 +1881,16 @@ impl ApplicationHandler for App {
                 // frames to keep coming even if the window manager decides
                 // to unfocus us — otherwise a headless crew launch can
                 // stall forever on frame 0 waiting on focus it'll never
-                // get.
+                // get. The `occluded` half of the bypass is separate from
+                // the `!focused` half: on macOS the compositor may mark a
+                // window occluded during the fullscreen toggle and never
+                // un-occlude before we finish capturing (mixt IMPORTANT
+                // #3). For a one-shot diagnostic we accept that the
+                // "occluded" frames still run — `surface.get_current_texture()`
+                // returns `Occluded` and the renderer early-returns, which
+                // is harmless for the measurement (no perf sample
+                // recorded) and auto-corrects once the compositor re-arms
+                // the surface.
                 if self.acquire_harness.is_none() && (self.occluded || !self.focused) {
                     return;
                 }
@@ -1819,6 +1941,12 @@ impl ApplicationHandler for App {
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
+                                // Refresh cached memo-health summary while the
+                                // real world is in hand (hash-thing-stue.6):
+                                // the (stepping) log branch below cannot read
+                                // self.world (it's about to be replaced by a
+                                // placeholder again on the next step).
+                                self.last_memo_summary = self.world.memo_summary();
                                 // Entity update on main thread (needs both
                                 // &World and &mut EntityStore).
                                 let mut queue = std::mem::take(&mut self.world.queue);
@@ -1859,13 +1987,17 @@ impl ApplicationHandler for App {
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
                     if self.is_stepping() {
                         // World is on the background thread — just show perf.
-                        log::info!("(stepping) | {}", self.perf.summary());
+                        log::info!(
+                            "(stepping) | {} | {}",
+                            self.perf.summary(),
+                            self.last_memo_summary,
+                        );
                     } else {
                         let nodes = self.world.store.stats();
                         self.mem_stats.update(nodes);
                         let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                         log::info!(
-                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
+                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {} | {}",
                             self.world.generation,
                             self.world.population(),
                             svdag_nodes,
@@ -1873,6 +2005,7 @@ impl ApplicationHandler for App {
                             svdag_root_level,
                             self.mem_stats.summary(),
                             self.perf.summary(),
+                            self.last_memo_summary,
                         );
                     }
                     self.log_timer = std::time::Instant::now();

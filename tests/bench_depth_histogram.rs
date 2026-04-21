@@ -249,6 +249,7 @@ fn depth_histogram_256() {
 
     let t0 = std::time::Instant::now();
     let mut exhausted_by_pose: Vec<(&str, u32)> = Vec::new();
+    let mut mean_drift: Vec<(&str, f64, f64)> = Vec::new();
     for cam in &poses {
         eprintln!();
         eprintln!("pose: {}", cam.label);
@@ -273,6 +274,18 @@ fn depth_histogram_256() {
             .collect();
         print_histogram("all ", &combined);
         exhausted_by_pose.push((cam.label, stats.exhausted));
+
+        // Order-of-magnitude mean-steps floor per pose (hash-thing-v2d1). The
+        // [0,1]^3 sentinel above catches gross position drift, but a silent
+        // rewrite of yaw/pitch/FOV could keep the camera inside the cube while
+        // invalidating the sample. Thresholds are ~50% of the 2026-04-20
+        // measured means (15.0 / 6.8 / 13.2) -- low enough to survive terrain
+        // tweaks, high enough to notice an order-of-magnitude regression.
+        let expected_min = expected_min_mean(cam.label);
+        let (mean, _, _, _) = summarize(&combined);
+        if mean < expected_min {
+            mean_drift.push((cam.label, mean, expected_min));
+        }
     }
 
     let elapsed_s = t0.elapsed().as_secs_f64();
@@ -291,4 +304,23 @@ fn depth_histogram_256() {
         "exhausted rays would poison the histogram — step_budget is too low \
          or the scene hit a pathological case. Per-pose counts: {bad:?}"
     );
+
+    assert!(
+        mean_drift.is_empty(),
+        "mean-steps floor violated — likely silent drift in BenchCamera::app_spawn \
+         yaw/pitch/FOV or the screen math in run_pose. Per-pose (label, measured, floor): \
+         {mean_drift:?}"
+    );
+}
+
+fn expected_min_mean(label: &str) -> f64 {
+    if label.starts_with("default-spawn") {
+        10.0
+    } else if label.starts_with("looking-down") {
+        3.0
+    } else if label.starts_with("horizontal-mid") {
+        8.0
+    } else {
+        0.0
+    }
 }

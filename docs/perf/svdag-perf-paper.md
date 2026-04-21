@@ -199,6 +199,29 @@ Consequences for the `surface_acquire_cpu ≈ 25 ms` hypothesis:
 
 Step 2 (fullscreen borderless) tests hypothesis (a). Step 3 (off-surface render target) tests (b)+(c) by bypassing `surface.get_current_texture()` entirely.
 
+**Step 2 result (M2 MBA, 256³ dev, acquire harness, onyx 2026-04-21):**
+
+| mode                     | surface_acquire_cpu mean | p95     | render_gpu mean |
+|--------------------------|--------------------------|---------|-----------------|
+| windowed                 | 25.31 ms                 | 32.37 ms | 0.09 ms         |
+| `Fullscreen::Borderless` | 29.99 ms                 | 32.57 ms | 0.09 ms         |
+| delta                    | **+4.68 ms (+18.5%)**   | ≈ same   | unchanged       |
+
+Harness verdict: "fullscreen WORSE than windowed — unexpected; do not ship fullscreen-default." **Hypothesis (a) refuted on M2.** Both modes pin at the same 60 Hz → 30 FPS cliff (p95 ~32 ms ≈ 2 × 16.67 ms missed-vsync doubled-frame pattern). The acquire stall is not a CoreAnimation-compositor-only artifact; it's at least as bad (and slightly worse) under borderless fullscreen.
+
+**Step 3 result (M2 MBA, 256³ dev, `HASH_THING_OFF_SURFACE=1`, onyx 2026-04-21):**
+
+| metric                 | windowed baseline | off-surface |
+|------------------------|-------------------|-------------|
+| surface_acquire_cpu    | 25.3 ms           | **0.0 ms**  |
+| submit_cpu             | ~0.3 ms           | **~26 ms**  |
+| render_cpu             | 25.7 ms           | 26.3 ms     |
+| total frame budget     | ~26 ms            | ~26 ms      |
+
+**Hypothesis (b) swapchain-pacing refuted.** Bypassing `surface.get_current_texture()` does not eliminate the stall — it just migrates from `acquire` into `queue.submit()`. Total frame budget is unchanged (~26 ms both modes). This is the signature of an implicit fence/wait elsewhere in our frame critical path, not swapchain throttling.
+
+**Surviving hypothesis (c): something in our own submit/encoding pipeline inserts a CPU-side wait.** The most likely candidate on this hardware is the timestamp resolve-and-map path: `GpuTiming::resolve_last_frame` reads back the query buffer for render_gpu reporting, and if the `map_async` completion fence is drained synchronously on the submit path, it forces frame N's submit to wait for frame N-1's GPU completion. That would explain why both windowed and fullscreen show the same ~25-30 ms ceiling, and why the wait migrates when acquire goes away. Next-seat probe: disable or defer timestamp resolve and re-measure; if submit_cpu collapses, this is the culprit.
+
 **Cold-frame confound check (bead `hash-thing-6hta`, spark 2026-04-20).** The `Perf` ring buffer is a FIFO of 64 samples per metric with no cold-frame skip (`src/perf.rs:61-87`, `src/main.rs:2036` records every frame's `surface_acquire` unconditionally). At ~30 FPS that evicts cold frames within ~2.1 s of wall-clock, so the *first* `log::info` line at `LOG_INTERVAL_SECS = 2.0` s is partially cold-contaminated, but lines 2+ are steady-state. moss's 2026-04-15 repro and spark's 2026-04-19 "three consecutive log lines" observation both sampled steady-state lines, not the opening line. The existing **`C` keybind** (`perf.clear()`, `src/main.rs`) is the correct drain-and-measure mechanism when isolating warm samples is needed. Conclusion: the confound exists in principle but does not explain the dlse.2.2 ~25 ms sustained measurement.
 
 ---
@@ -249,14 +272,58 @@ First pass (2026-04-20, bead `hash-thing-stue.3`, spark). Measurements from `tes
 
 ### 4.3 Cache locality across the boundary
 
-**Deferred — not yet measurable with available tools.** A proper answer requires shared-L2/L3 traffic counters separated by producer (sim writes vs renderer reads), which Metal does not expose to unprivileged processes on macOS. `powermetrics --samplers gpu_power` gives aggregate GPU memory bandwidth but not eviction-attributed-to-side-A.
+**Empirical answer (proxy 1, hash-thing-stue.7): contention is present and material at the boundary, ~30 % of windowed frame cost on M2 MBA at 256³.**
 
-Two empirical signals we could use as proxies:
+**Direct counters remain unavailable.** A causal answer requires shared-L2/L3 traffic counters separated by producer (sim writes vs renderer reads), which Metal does not expose to unprivileged processes. `powermetrics --samplers gpu_power` gives aggregate GPU memory bandwidth but not eviction-attributed-to-side-A.
 
-1. **Back-to-back per-frame latency with sim disabled** (freeze `world.generation` and skip `step_recursive`) vs sim enabled. If renderer-only frames are measurably faster on M-series under windowed vs fullscreen, unified-memory contention is likely. `hash-thing-dlse.2.2` is already investigating surface-acquire dominance in the windowed path; freezing sim is a small add.
-2. **Thread-parked vs running sim during a renderer micro-bench.** Instead of freezing, pin sim to another core and compare renderer frame time vs sim on the same core as the render submit. If same-core-sim is slower, cache contention is the likely driver; if equal, memory bandwidth is fungible.
+**Proxy 1 — sim-frozen vs sim-running per-frame latency.** `HASH_THING_FREEZE_SIM=1` disables `maybe_start_background_step` so the sim never advances; renderer keeps reading the same SVDAG every frame. Bench profile, 256³ default scene (terrain + water + sand), windowed at default 50 % render scale, M2 MBA 8 GB:
 
-Both are measurable on M1/M2 without privileged counters. Filing as follow-up: `hash-thing-stue.7` (cache locality empirical proxies). Not blocking the §5 gap report.
+| run                 | render_cpu mean | render_gpu mean | surface_acquire_cpu mean |
+|---------------------|-----------------|-----------------|--------------------------|
+| sim-running (n=4)   | ~26.9 ms        | ~0.11 ms        | ~26.5 ms                 |
+| sim-frozen  (n=5)   | ~18.8 ms        | ~0.08 ms        | ~18.5 ms                 |
+| **delta**           | **−8.1 ms (−30 %)** | −0.03 ms    | **−8.0 ms (−30 %)**      |
+
+Samples taken from a 14-second windowed run, dropping the first log line (warmup) for each mode. Data: `.ship-notes/stue.7-cache-locality-2026-04-21.md` (raw log lines preserved alongside the analysis).
+
+**What proxy 1 cannot distinguish.** This delta could be driven by either:
+
+- **CPU contention.** `step_recursive` is a hot single-threaded user of one P-core. Freezing sim returns that core's cycles to OS / wgpu / display-server work that surface acquire transitively waits on.
+- **Unified-memory cache contention.** Sim writes evict renderer-relevant lines from shared L2; freezing sim leaves renderer's working set warm.
+
+The two hypotheses predict the same `surface_acquire_cpu` reduction. Disambiguating needs proxy 2 (same-core vs different-core sim scheduling), executed as `hash-thing-xhi6` (see proxy-2 results immediately below).
+
+**What proxy 1 does establish.**
+1. Renderer-only steady-state at 256 ³ on this hardware lives at **~18 ms surface_acquire_cpu**, not the ~26 ms we see with sim live. The remaining ~18 ms is a windowed-presentation floor (consistent with `dlse.2.2` findings — that path is acquire-dominated independently of sim).
+2. **Sim does meaningfully impact frame budget**, even though the renderer reads a coherent SVDAG snapshot per frame and the sim runs on a separate `std::thread`. The "background sim is free" assumption is wrong by ~8 ms at this scale.
+3. **render_gpu is unaffected** (0.11 → 0.08 ms, both well below noise). The contention shows up in CPU-side acquire, not on-GPU compute. So at this scale, a GPU-side memo (parent bead `hash-thing-abwm`) is not motivated by *renderer* contention; it would be motivated by step latency itself.
+
+**Implication for §3 frame budget.** The §3.1 budget assumed sim and render were independent on a separate-thread M-series. They aren't quite — sim costs the renderer ~8 ms / frame at 256 ³. At 4096³ the sim cost is ~64× larger (linear in node count for active-region work) but rendering is also more memory-bound, so the contention term may grow faster than linear. Re-derive at 4096³ when `hash-thing-ivms` lands.
+
+**Verdict status:** **contention present, magnitude ~30 % of windowed frame at 256³, driver (CPU vs cache) unresolved by proxy 1.** See proxy 2 immediately below.
+
+**Proxy 2 — sim-thread QoS sweep (hash-thing-xhi6).** `HASH_THING_SIM_QOS=<class>` calls `pthread_set_qos_class_self_np` from inside the spawned background-step thread. macOS schedulers steer `BACKGROUND` / `UTILITY` toward the E-cluster and `INTERACTIVE` / `INITIATED` toward the P-cluster. The renderer / main thread runs at the inherited QoS (`USER_INITIATED` for winit + AppKit), so `interactive` keeps sim and render in the same pool, and `background` moves sim to a different pool. Same scene / build / sample protocol as proxy 1. n=5 each (post-warmup), runs cooled between conditions where possible.
+
+| QoS                 | step (mean) | surface_acquire_cpu (mean) | Δ vs interactive | sim cluster |
+|---------------------|-------------|----------------------------|------------------|-------------|
+| interactive         | 371 ms      | 25.5 ms                    | (baseline)       | P           |
+| utility             | 803 ms      | 31.1 ms                    | +5.6 ms          | mixed → E   |
+| background          | 1327 ms     | 40.0 ms                    | +14.5 ms         | E           |
+| (sim-frozen, proxy 1)| —          | 18.5 ms                    | −7.0 ms          | n/a         |
+
+`render_gpu` stayed at ~0.12 ms across all conditions (QoS-independent, same as proxy 1).
+
+**What proxy 2 was supposed to deliver.** The bead's premise: if same-pool sim runs the renderer faster than different-pool sim, CPU-cycle contention is dominant; if equal, unified-memory bandwidth is dominant.
+
+**What proxy 2 actually shows.** Different-pool sim runs the renderer *slower*, in proportion to how badly the sim itself is throttled by E-cluster scheduling. So:
+- Same-pool (interactive, ~25.5 ms) is statistically indistinguishable from the inherited baseline (~26.5 ms in proxy 1) — the inherited QoS is already same-pool. There is no QoS knob that *reduces* the contention, only knobs that make it worse.
+- Cross-pool sim adds a *new* cost (cross-cluster coherence traffic on the system-level cache, sim-throughput-dependent placeholder-swap pacing, or both) that swamps any saving from removing CPU-pool sharing.
+
+**Conclusion.** Proxy 2's premise is refuted: the CPU-cycle / unified-memory dichotomy doesn't cleanly map to a P-vs-E pool toggle on M2. Two possibilities remain: (a) CPU-cycle contention is not dominant and a new cross-cluster cost dwarfs whatever savings proxy 2 was trying to surface; (b) CPU-cycle contention is dominant, but the new cross-cluster cost on M2 outweighs the saving by ~5–14 ms. Either way, the clean disambiguation isn't available from QoS scheduling on this hardware.
+
+**M2 MBA thermal caveat.** The fanless M2 throttles after ~2 sustained 14 s benches (step time grows 5–10× on the second-or-later run). The numbers above used the ordering `interactive → utility → background` with cool-downs; sustained thermal load is itself a confound for any longer-running sweep on this chassis. Raw evidence at `.ship-notes/xhi6-cache-locality-proxy2-2026-04-21.md`.
+
+**Verdict (proxy 1 + proxy 2):** sim ↔ renderer contention at the SVDAG boundary is real (~8 ms / 30 % at 256³ windowed), `render_gpu` is uninvolved, and the contention is CPU-side / unified-memory-side. Neither proxy disambiguates which of the two CPU-side mechanisms dominates. A useful next proxy would hold sim CPU work constant while toggling its memory-access footprint (e.g. read-only step pass vs mutate-only step pass), or read per-thread `task_thread_times_info` directly to attribute time without leaning on QoS-class scheduling.
 
 ### 4.4 Per-step upload volume to `Svdag::nodes`
 
@@ -360,3 +427,7 @@ Reserved for things we have actually argued through to a confident "no." Empty f
 | 2026-04-20 | spark | §4 populated (bead stue.3). Answered Q1 (store is shared; render-side cache is a bounded address-translation layer), Q2 (~1,847 hashlife misses/step at 256³ → ~544 SVDAG slot appends/step; ~72% short-circuit rate), Q4 (~19.6 KB mean / ~79 KB max upload per step at 256³, confirming edward's diff-compressibility hypothesis). Q3 (cache locality) deferred with two empirical-proxy experiments for follow-up. Measurements land via new `tests/bench_svdag.rs::bench_svdag_step_deltas_*`. |
 | 2026-04-20 | spark | §3.8 cold-frame confound check (bead `hash-thing-6hta`). `Perf` ring buffer is FIFO-64 with no cold-frame skip; at ~30 FPS cold frames evict within ~2.1 s, so the first log line is partially contaminated but steady-state lines (which all prior dlse.2.2 observations sampled) are clean. Does not invalidate the 25 ms surface_acquire finding. |
 | 2026-04-21 | onyx | §2.2 verdict + new §4.6 "Update model comparison" (bead `hash-thing-jl4d`). Clarifies that our SVDAG is **dynamic** — rebuild-per-tick on CPU with O(new-slot) diff upload — rather than static Kämpe or GPU-resident HashDAG. Pins the distinction so later discussion does not re-establish it. Evidence: ~544 slot appends/step at 256³ warm with arbitrary-depth CA churn (§4.4) flows through the same code path as structural changes. |
+| 2026-04-21 | spark | §4.3 cache-locality proxy 1 (bead `hash-thing-stue.7`). Sim-frozen vs sim-running 256³ windowed: ~30 % of windowed frame cost on M2 MBA is sim ↔ render contention at the SVDAG boundary. Driver (CPU vs cache) unresolved by proxy 1. New `HASH_THING_FREEZE_SIM=1` diagnostic env var. |
+| 2026-04-21 | spark | §4.3 cache-locality proxy 2 (bead `hash-thing-xhi6`). Sim-thread QoS sweep on M2: same-pool (interactive) ≈ inherited baseline; cross-pool (utility/background) is *worse*, not better. Refutes proxy 2's premise — the CPU-cycle / unified-memory dichotomy doesn't map cleanly onto a P-vs-E pool toggle on M2. New `HASH_THING_SIM_QOS={interactive,initiated,default,utility,background}` env var. |
+| 2026-04-21 | onyx | §3.8 step 2 result (bead `hash-thing-dlse.2.2`). Fullscreen borderless measured on M2 MBA 256³ dev via `HASH_THING_ACQUIRE_HARNESS=1`: `surface_acquire_cpu` = 25.3 ms windowed vs **30.0 ms fullscreen** (+4.7 ms / +18.5 %, harness verdict: fullscreen worse than windowed). Hypothesis (a) CoreAnimation-compositor-only stall is refuted — both modes hit the same 60 Hz → 30 FPS cliff. Also landed init-time monitor/adapter logging (commit `fba5efb`): M2 refresh is 60 Hz (bounds vsync budget at 16.67 ms), scale_factor = 2, Apple M2 Metal IntegratedGpu. Surviving knobs: off-surface render target (step 3) and frame_latency=3 / Immediate sweep (step 4). |
+| 2026-04-21 | onyx | §3.8 step 3 result (bead `hash-thing-dlse.2.2`). Off-surface render target on M2 MBA 256³ dev via `HASH_THING_OFF_SURFACE=1`: `surface_acquire_cpu` collapses to 0.0 ms but **the stall migrates to `submit_cpu` (~26 ms)**. Total frame budget unchanged. Hypothesis (b) swapchain-pacing is refuted — the wait is not the swapchain. Surviving hypothesis (c): something in our own submit/encoding pipeline (likely the timestamp resolve/map path) inserts an implicit CPU-side fence. Next diagnostic: disable timestamp resolve and re-measure; if submit_cpu collapses, the resolve path is the culprit. |

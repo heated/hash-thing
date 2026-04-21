@@ -423,12 +423,39 @@ pub struct Renderer {
     /// Most recent CPU-side frame phase timings, consumed by
     /// `take_last_cpu_phase_times()` so callers can record them once.
     last_cpu_phase_times: Option<RendererCpuPhaseTimes>,
+    /// Off-surface diagnostic target (hash-thing-dlse.2.2 step 3). When
+    /// `Some`, `render()` bypasses `surface.get_current_texture()` and
+    /// `surface_texture.present()` entirely, rendering into this throwaway
+    /// texture instead. Lets us measure whether the ~25 ms
+    /// `surface_acquire_cpu` stall is swapchain/drawable pacing (collapses
+    /// when the surface is out of the loop) or something else in the
+    /// submit/encode path (persists). Env-var gated at startup; zero-cost
+    /// in normal runs.
+    off_surface_target: Option<wgpu::Texture>,
     start_time: Instant,
 }
 
 impl Renderer {
     pub async fn new(window: Arc<Window>, volume_size: u32) -> Self {
         let size = window.inner_size();
+
+        // hash-thing-dlse.2.2 step 1: log windowing/display context at init so
+        // the 25ms surface_acquire_cpu stall on M2 can be correlated with
+        // monitor refresh rate, scale factor, and which output the window is on.
+        let scale_factor = window.scale_factor();
+        match window.current_monitor() {
+            Some(m) => log::info!(
+                "monitor: name={:?} size={:?} refresh_mHz={:?} scale_factor={} window_scale_factor={}",
+                m.name(),
+                m.size(),
+                m.refresh_rate_millihertz(),
+                m.scale_factor(),
+                scale_factor,
+            ),
+            None => log::info!(
+                "monitor: none reported by winit (scale_factor={scale_factor})"
+            ),
+        }
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -1082,15 +1109,18 @@ impl Renderer {
             cache: None,
         });
 
+        let adapter_info = adapter.get_info();
+        log::info!(
+            "GPU adapter: name={:?} backend={:?} driver={:?} device_type={:?}",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.driver_info,
+            adapter_info.device_type,
+        );
         let gpu_timing = if timestamp_supported {
             let period_ns = queue.get_timestamp_period();
-            let info = adapter.get_info();
             log::info!(
-                "GPU timestamp_period={period_ns}ns (adapter={:?} backend={:?} driver={:?}) in_encoder={}",
-                info.name,
-                info.backend,
-                info.driver_info,
-                in_encoder_timestamps_supported,
+                "GPU timestamp_period={period_ns}ns in_encoder={in_encoder_timestamps_supported}"
             );
             Some(GpuTiming::new(
                 &device,
@@ -1157,8 +1187,43 @@ impl Renderer {
             gpu_timing,
             last_gpu_frame_time: None,
             last_cpu_phase_times: None,
+            off_surface_target: None,
             start_time: Instant::now(),
         }
+    }
+
+    /// Enable off-surface render mode for the dlse.2.2 step-3 diagnostic.
+    /// Allocates a throwaway render target matching the current surface
+    /// config; subsequent `render()` calls skip `get_current_texture()` +
+    /// `present()` and draw into this texture instead.
+    ///
+    /// Known quirk: `render_gpu` may report `(no samples)` while off-surface
+    /// is active. Off-surface frames complete in ~1 ms CPU-side, so the
+    /// next frame's `GpuTiming::poll` fires before the prior frame's
+    /// `map_async` readback callback lands. The diagnostic's primary signal
+    /// (`surface_acquire_cpu`, `render_cpu`) is CPU-side and unaffected.
+    pub fn enable_off_surface(&mut self) {
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("off_surface_target"),
+            size: wgpu::Extent3d {
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        log::info!(
+            "off-surface diagnostic enabled: {}x{} {:?} (dlse.2.2 step 3)",
+            self.config.width,
+            self.config.height,
+            self.config.format,
+        );
+        self.off_surface_target = Some(tex);
     }
 
     /// Create the storage texture used as compute raycast output (5bb.6.1).
@@ -1584,6 +1649,9 @@ impl Renderer {
             self.surface.configure(&self.device, &self.config);
             // Recreate storage texture to match new dimensions (5bb.6.1).
             self.recreate_raycast_texture();
+            if self.off_surface_target.is_some() {
+                self.enable_off_surface();
+            }
         }
     }
 
@@ -1606,39 +1674,49 @@ impl Renderer {
         // No catch-all: `CurrentSurfaceTexture` is not `#[non_exhaustive]`, so
         // any future wgpu variant becomes a compile error pointing here,
         // instead of getting silently swallowed (hash-thing-8jp I1a).
+        //
+        // Off-surface diagnostic (dlse.2.2 step 3): when
+        // `self.off_surface_target` is `Some`, bypass the surface entirely
+        // and draw into the throwaway texture. `surface_acquire` records
+        // ~0 in that mode.
         let acquire_start = Instant::now();
-        let surface_texture = match self.surface.get_current_texture() {
-            CurrentSurfaceTexture::Success(tex) | CurrentSurfaceTexture::Suboptimal(tex) => tex,
-            CurrentSurfaceTexture::Occluded => return FrameOutcome::Occluded,
-            CurrentSurfaceTexture::Timeout => {
-                log::warn!("surface texture acquire: Timeout");
-                return FrameOutcome::Timeout;
-            }
-            CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return FrameOutcome::Reconfigured;
-            }
-            CurrentSurfaceTexture::Lost => {
-                log::error!("surface texture Lost — reconfiguring");
-                self.surface.configure(&self.device, &self.config);
-                return FrameOutcome::Reconfigured;
-            }
-            // A validation error was raised inside `get_current_texture`
-            // and captured by an error scope. The surface itself is fine —
-            // no reconfigure needed — but the caller should request the
-            // next frame so rendering resumes after the programmer/driver
-            // issue is resolved. Logged at error level so it actually
-            // surfaces during GPU debugging.
-            CurrentSurfaceTexture::Validation => {
-                log::error!("surface texture acquire: Validation error");
-                return FrameOutcome::Timeout;
-            }
+        let (surface_texture, view) = if let Some(off) = self.off_surface_target.as_ref() {
+            let view = off.create_view(&wgpu::TextureViewDescriptor::default());
+            (None, view)
+        } else {
+            let st = match self.surface.get_current_texture() {
+                CurrentSurfaceTexture::Success(tex) | CurrentSurfaceTexture::Suboptimal(tex) => tex,
+                CurrentSurfaceTexture::Occluded => return FrameOutcome::Occluded,
+                CurrentSurfaceTexture::Timeout => {
+                    log::warn!("surface texture acquire: Timeout");
+                    return FrameOutcome::Timeout;
+                }
+                CurrentSurfaceTexture::Outdated => {
+                    self.surface.configure(&self.device, &self.config);
+                    return FrameOutcome::Reconfigured;
+                }
+                CurrentSurfaceTexture::Lost => {
+                    log::error!("surface texture Lost — reconfiguring");
+                    self.surface.configure(&self.device, &self.config);
+                    return FrameOutcome::Reconfigured;
+                }
+                // A validation error was raised inside `get_current_texture`
+                // and captured by an error scope. The surface itself is fine —
+                // no reconfigure needed — but the caller should request the
+                // next frame so rendering resumes after the programmer/driver
+                // issue is resolved. Logged at error level so it actually
+                // surfaces during GPU debugging.
+                CurrentSurfaceTexture::Validation => {
+                    log::error!("surface texture acquire: Validation error");
+                    return FrameOutcome::Timeout;
+                }
+            };
+            let view = st
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            (Some(st), view)
         };
         let surface_acquire = acquire_start.elapsed();
-
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
 
         // Camera
         let (sin_yaw, cos_yaw) = self.camera_yaw.sin_cos();
@@ -1848,7 +1926,9 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         let submit = submit_start.elapsed();
         let present_start = Instant::now();
-        surface_texture.present();
+        if let Some(st) = surface_texture {
+            st.present();
+        }
         let present = present_start.elapsed();
         self.last_cpu_phase_times = Some(RendererCpuPhaseTimes {
             surface_acquire,
