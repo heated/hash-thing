@@ -333,6 +333,12 @@ struct App {
     /// so the periodic log can print it even while the next step is on
     /// the background thread (where `self.world` is a placeholder).
     last_memo_summary: String,
+    /// Sim-freeze diagnostic toggle (hash-thing-stue.7). When true, the
+    /// background-step dispatch is a no-op: world stays put on the main
+    /// thread, generation never advances, and the renderer reads a stable
+    /// SVDAG every frame. Used to measure renderer-only frame cost without
+    /// sim/render unified-memory contention. Set via `HASH_THING_FREEZE_SIM=1`.
+    freeze_sim: bool,
     /// Self-driving windowed-vs-fullscreen acquire measurement
     /// (`dlse.2.2`). `Some` when `HASH_THING_ACQUIRE_HARNESS=1`.
     /// When active, the harness forces a windowed start, burns a
@@ -448,8 +454,12 @@ impl App {
             fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
+            freeze_sim: std::env::var("HASH_THING_FREEZE_SIM").ok().as_deref() == Some("1"),
             acquire_harness: acquire_harness::Harness::from_env(),
         };
+        if app.freeze_sim {
+            log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
+        }
         // The harness owns the windowed→fullscreen transition explicitly;
         // honouring `HASH_THING_FULLSCREEN=1` on top of it would skip the
         // windowed capture phase. Force windowed start when the harness is
@@ -731,7 +741,7 @@ impl App {
     }
 
     fn maybe_start_background_step(&mut self) {
-        if self.paused || self.is_stepping() {
+        if self.paused || self.is_stepping() || self.freeze_sim {
             return;
         }
         self.step_start = std::time::Instant::now();
