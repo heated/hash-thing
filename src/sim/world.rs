@@ -213,9 +213,13 @@ pub struct World {
     /// grows in the negative direction, origin shifts to keep the old
     /// root's cells at the same world-space positions.
     pub origin: [i64; 3],
-    /// Old→new NodeId remap from the most recent store compaction.
-    /// Consumed by `Svdag::apply_remap()` to keep its persistent cache
-    /// valid across compaction epochs (hash-thing-5bb.11).
+    /// Cumulative old→new NodeId remap across all un-consumed store
+    /// compactions since the last SVDAG sync. Consumed by
+    /// `Svdag::apply_remap()` to keep its persistent cache valid across
+    /// compaction epochs (hash-thing-5bb.11). Compose-on-write: when a
+    /// new compaction publishes B→C while A→B is still pending, they
+    /// are composed into A→C so the renderer sees a single remap
+    /// keyed in its current (A) namespace (hash-thing-rk4n.1).
     /// `None` after scene resets (the cache should be fully invalidated).
     pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
 }
@@ -229,6 +233,28 @@ pub struct HashlifeStats {
     pub fixed_point_skips: u64,
     /// Per-level cache miss counts (index = level - 3, since base case is level 3).
     pub misses_by_level: [u64; 32],
+}
+
+/// Compose two sequential NodeId remaps `A→B` and `B→C` into a single
+/// `A→C` remap. A key `k_a` in `existing` whose value `v_b` is not a key
+/// in `new` is dropped: the node survived compaction 1 but was
+/// garbage-collected by compaction 2, so the renderer's cache entry for
+/// `k_a` should be invalidated. `Svdag::apply_remap`
+/// (`crates/ht-render/src/svdag.rs:173`) rebuilds `id_to_offset` from the
+/// remap and drops any entries whose `old_id` is not a key, so absence
+/// from the composed map is the correct invalidation signal
+/// (hash-thing-rk4n.1).
+pub(super) fn compose_remap(
+    existing: FxHashMap<NodeId, NodeId>,
+    new: &FxHashMap<NodeId, NodeId>,
+) -> FxHashMap<NodeId, NodeId> {
+    let mut out = FxHashMap::with_capacity_and_hasher(existing.len(), Default::default());
+    for (k_a, v_b) in existing {
+        if let Some(&v_c) = new.get(&v_b) {
+            out.insert(k_a, v_c);
+        }
+    }
+    out
 }
 
 impl World {
@@ -1935,7 +1961,10 @@ impl World {
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
-        self.last_compaction_remap = Some(remap);
+        self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
+            Some(existing) => compose_remap(existing, &remap),
+            None => remap,
+        });
         self.hashlife_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -1961,6 +1990,11 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // New epoch: the renderer's cache must be fully invalidated anyway,
+        // so any un-consumed remap from the previous epoch is stale. Clearing
+        // prevents a subsequent compose-on-write from polluting the new
+        // epoch's published remap with pre-reset keys (hash-thing-rk4n.1).
+        self.last_compaction_remap = None;
         let heightmap = params.to_heightmap();
         let precompute_start = std::time::Instant::now();
         let field = PrecomputedHeightmapField::new(heightmap, self.level)
@@ -2644,14 +2678,16 @@ mod tests {
         }
     }
 
-    /// hash-thing-rk4n repro: walk the default water scene past ground-impact
-    /// at the scale edward reports corruption on (256^3), using the brute-force
-    /// `step()` path which always runs `commit_step` (store-compact every tick).
-    /// Skipping some sync calls mimics dropped render frames and exposes
-    /// `World::last_compaction_remap` being single-buffered: two successive
-    /// `commit_step` calls without an intervening `sync_svdag_with_world`
-    /// clobber the first remap, and the SVDAG's persistent NodeId cache
-    /// decodes subsequent nodes from the wrong store generation.
+    /// hash-thing-rk4n regression: walks the default water scene past
+    /// ground-impact at the scale edward reports corruption on (256^3),
+    /// using the brute-force `step()` path which runs `commit_step`
+    /// (store-compact every tick). Skipping some sync calls mimics
+    /// dropped render frames and used to expose `last_compaction_remap`
+    /// being single-buffered: two successive `commit_step` calls without
+    /// an intervening sync clobbered the first remap, so the SVDAG cache
+    /// decoded subsequent nodes from the wrong store generation.
+    /// Fixed in rk4n.1 by compose-on-write (see `compose_remap`); this
+    /// test stays as a regression guard.
     ///
     /// Water pool sits at `water_y = center + center/4` with `pool_depth =
     /// (side/32).max(2)`. At 256^3 the pool bottom is ~32 cells above the
@@ -2693,11 +2729,13 @@ mod tests {
         }
     }
 
-    /// hash-thing-rk4n companion probe: production uses `step_recursive`,
-    /// whose `maybe_compact` re-stores without publishing the remap on
-    /// `last_compaction_remap`. Sync every step so this test cannot be
-    /// excused by skipped-frame behavior; if it fails, the SVDAG cache is
-    /// aliasing across a silent store swap.
+    /// hash-thing-rk4n companion regression: production uses
+    /// `step_recursive`, whose `maybe_compact` used to re-store without
+    /// publishing the remap on `last_compaction_remap`. Sync every step
+    /// so this test cannot be excused by skipped-frame behavior; if it
+    /// fails, the SVDAG cache is aliasing across a silent store swap.
+    /// Fixed in rk4n.1 by publishing the remap with compose-on-write;
+    /// this test stays as a regression guard.
     #[test]
     #[ignore]
     fn water_and_sand_256_step_recursive_with_sync_every_step() {

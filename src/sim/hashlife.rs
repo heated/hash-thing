@@ -128,6 +128,13 @@ impl World {
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
+        // Publish to the renderer-facing slot with compose-on-write so back-to-back
+        // compactions without an intervening SVDAG sync don't clobber the A→B map
+        // with B→C (hash-thing-rk4n.1).
+        self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
+            Some(existing) => super::world::compose_remap(existing, &remap),
+            None => remap,
+        });
         self.store_size_at_last_compact = self.store.stats();
     }
 
