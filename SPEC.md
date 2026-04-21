@@ -368,6 +368,8 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 6. Consider SSVDAG / transform-aware compression once baseline is stable.
 7. Consider LOD streaming (Aokana-style) when scaling to 4096³+.
 
+**Performance ownership:** mayor seat owns the SVDAG performance story top-down. See `docs/perf/svdag-perf-paper.md` (long form, living) and `docs/perf/svdag-perf-spec.md` (re-derived intuition). Reference hardware: M1 MacBook Air 8 GB. Bead: `hash-thing-stue`.
+
 ### Distribution
 
 - **Native binaries for Mac, Linux, Windows from day one.** `cargo build --release` with target triples. CI matrix via GitHub Actions.
