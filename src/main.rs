@@ -439,6 +439,60 @@ impl App {
         self.apply_cursor_capture(should_capture);
     }
 
+    /// Apply a raw pixel-delta mouse look to the player. Scales by
+    /// `LOOK_SENSITIVITY` and clamps pitch to ±1.4. Shared between the
+    /// `CursorMoved` (uncaptured) and `DeviceEvent::MouseMotion` (captured)
+    /// paths so the two stay in parity by construction (hash-thing-a6t2).
+    fn apply_fps_look(&mut self, dx: f64, dy: f64) {
+        let Some(pid) = self.player_id else { return };
+        let Some(player) = self.entities.get_mut(pid) else {
+            return;
+        };
+        if let sim::EntityKind::Player(ref mut ps) = player.kind {
+            ps.yaw += dx * LOOK_SENSITIVITY;
+            ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
+        }
+    }
+
+    /// Handle a `WindowEvent::CursorMoved` at `(x, y)`. Routes to the player
+    /// (first-person, uncaptured cursor) or the orbit-camera renderer
+    /// depending on mode. Extracted so tests can drive it without a window
+    /// (hash-thing-a6t2).
+    fn handle_cursor_moved(&mut self, x: f64, y: f64) {
+        let should_look = match self.camera_mode {
+            CameraMode::Orbit => self.mouse_pressed,
+            CameraMode::FirstPerson => !self.cursor_captured,
+        };
+        if !should_look {
+            return;
+        }
+        if let Some((lx, ly)) = self.last_mouse {
+            let dx = x - lx;
+            let dy = y - ly;
+            match self.camera_mode {
+                CameraMode::FirstPerson => self.apply_fps_look(dx, dy),
+                CameraMode::Orbit => {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.camera_yaw += dx as f32 * 0.005;
+                        renderer.camera_pitch =
+                            (renderer.camera_pitch + dy as f32 * 0.005).clamp(-1.4, 1.4);
+                    }
+                }
+            }
+        }
+        self.last_mouse = Some((x, y));
+    }
+
+    /// Handle a captured-cursor `DeviceEvent::MouseMotion` delta. No-op
+    /// unless the player is in first-person mode with the cursor grabbed
+    /// (hash-thing-w1yq). Extracted for testability (hash-thing-a6t2).
+    fn handle_mouse_motion(&mut self, dx: f64, dy: f64) {
+        if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
+            return;
+        }
+        self.apply_fps_look(dx, dy);
+    }
+
     fn load_initial_scene(&mut self) {
         let terrain_params = terrain::TerrainParams::for_level(self.volume_size.trailing_zeros());
         let stats = self
@@ -1542,33 +1596,7 @@ impl ApplicationHandler for App {
                 // either stops firing or reports a stationary position, so we
                 // must not feed its deltas into look input — see `device_event`
                 // below. (hash-thing-w1yq)
-                let should_look = match self.camera_mode {
-                    CameraMode::Orbit => self.mouse_pressed,
-                    CameraMode::FirstPerson => !self.cursor_captured,
-                };
-                if should_look {
-                    if let Some((lx, ly)) = self.last_mouse {
-                        let dx = position.x - lx;
-                        let dy = position.y - ly;
-                        if self.camera_mode == CameraMode::FirstPerson {
-                            // Update player yaw/pitch directly.
-                            if let Some(pid) = self.player_id {
-                                if let Some(player) = self.entities.get_mut(pid) {
-                                    if let sim::EntityKind::Player(ref mut ps) = player.kind {
-                                        ps.yaw += dx * LOOK_SENSITIVITY;
-                                        ps.pitch =
-                                            (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
-                                    }
-                                }
-                            }
-                        } else if let Some(renderer) = &mut self.renderer {
-                            renderer.camera_yaw += dx as f32 * 0.005;
-                            renderer.camera_pitch =
-                                (renderer.camera_pitch + dy as f32 * 0.005).clamp(-1.4, 1.4);
-                        }
-                    }
-                    self.last_mouse = Some((position.x, position.y));
-                }
+                self.handle_cursor_moved(position.x, position.y);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1986,17 +2014,7 @@ impl ApplicationHandler for App {
         let DeviceEvent::MouseMotion { delta: (dx, dy) } = event else {
             return;
         };
-        if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
-            return;
-        }
-        let Some(pid) = self.player_id else { return };
-        let Some(player) = self.entities.get_mut(pid) else {
-            return;
-        };
-        if let sim::EntityKind::Player(ref mut ps) = player.kind {
-            ps.yaw += dx * LOOK_SENSITIVITY;
-            ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
-        }
+        self.handle_mouse_motion(dx, dy);
     }
 }
 
@@ -2386,5 +2404,96 @@ mod tests {
         assert!(!should_capture_cursor(CameraMode::FirstPerson, false));
         assert!(!should_capture_cursor(CameraMode::Orbit, true));
         assert!(!should_capture_cursor(CameraMode::Orbit, false));
+    }
+
+    /// Read the player's `(yaw, pitch)` off the entity store, for tests
+    /// that exercise the mouse-look split (hash-thing-a6t2).
+    fn player_look(app: &mut App) -> (f64, f64) {
+        let pid = app.player_id.expect("player spawned by App::new");
+        let entity = app.entities.get_mut(pid).expect("player entity present");
+        match &entity.kind {
+            sim::EntityKind::Player(ps) => (ps.yaw, ps.pitch),
+            _ => panic!("player_id does not point at a Player entity"),
+        }
+    }
+
+    /// Seed yaw/pitch and `last_mouse` so `handle_cursor_moved` produces a
+    /// non-zero delta on its first call.
+    fn prime_cursor(app: &mut App, start_x: f64, start_y: f64) {
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+        app.last_mouse = Some((start_x, start_y));
+    }
+
+    #[test]
+    fn cursor_moved_first_person_uncaptured_applies_look() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = false;
+        prime_cursor(&mut app, 100.0, 100.0);
+
+        app.handle_cursor_moved(110.0, 105.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch - 5.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cursor_moved_first_person_captured_is_noop() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = true;
+        prime_cursor(&mut app, 100.0, 100.0);
+
+        app.handle_cursor_moved(999.0, 999.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0);
+        assert_eq!(pitch, 0.0);
+    }
+
+    #[test]
+    fn mouse_motion_captured_first_person_applies_look() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = true;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        app.handle_mouse_motion(20.0, -8.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - 20.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch - (-8.0 * LOOK_SENSITIVITY)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mouse_motion_uncaptured_is_noop() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.cursor_captured = false;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        app.handle_mouse_motion(999.0, 999.0);
+
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0);
+        assert_eq!(pitch, 0.0);
+    }
+
+    #[test]
+    fn apply_fps_look_clamps_pitch() {
+        let mut app = App::new(64);
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 1.3);
+
+        // dy large enough to push past the +1.4 clamp.
+        app.apply_fps_look(0.0, 1000.0);
+        let (_yaw, pitch) = player_look(&mut app);
+        assert!((pitch - 1.4).abs() < 1e-12, "pitch should clamp at +1.4");
+
+        // Symmetric negative clamp.
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, -1.3);
+        app.apply_fps_look(0.0, -1000.0);
+        let (_yaw, pitch) = player_look(&mut app);
+        assert!((pitch - -1.4).abs() < 1e-12, "pitch should clamp at -1.4");
     }
 }
