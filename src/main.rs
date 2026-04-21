@@ -327,6 +327,11 @@ struct App {
     /// to detect the Cmd+Ctrl+F fullscreen chord (winit does not
     /// surface chords as NamedKey).
     modifiers: winit::keyboard::ModifiersState,
+    /// Cached hashlife memo health summary (hash-thing-stue.6). Refreshed
+    /// on the main thread after each step's world result is merged back,
+    /// so the periodic log can print it even while the next step is on
+    /// the background thread (where `self.world` is a placeholder).
+    last_memo_summary: String,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -434,8 +439,13 @@ impl App {
             pending_player_action: None,
             fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
             modifiers: winit::keyboard::ModifiersState::empty(),
+            last_memo_summary: String::new(),
         };
 
+        // Seed the cached memo summary so the very first periodic log line
+        // has a populated column instead of a blank trailing field
+        // (hash-thing-stue.6 reviewer nit).
+        app.last_memo_summary = app.world.memo_summary();
         let player_pos = app.reset_scene_entities();
         app.spawn_demo_entities();
         log::info!(
@@ -1474,6 +1484,7 @@ impl ApplicationHandler for App {
                                 self.entities.update(&self.world, &mut queue);
                                 self.world.queue = queue;
                             }
+                            self.last_memo_summary = self.world.memo_summary();
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &mut self.world,
@@ -1796,6 +1807,12 @@ impl ApplicationHandler for App {
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
+                                // Refresh cached memo-health summary while the
+                                // real world is in hand (hash-thing-stue.6):
+                                // the (stepping) log branch below cannot read
+                                // self.world (it's about to be replaced by a
+                                // placeholder again on the next step).
+                                self.last_memo_summary = self.world.memo_summary();
                                 // Entity update on main thread (needs both
                                 // &World and &mut EntityStore).
                                 let mut queue = std::mem::take(&mut self.world.queue);
@@ -1836,13 +1853,17 @@ impl ApplicationHandler for App {
                 if self.log_timer.elapsed().as_secs_f64() >= LOG_INTERVAL_SECS {
                     if self.is_stepping() {
                         // World is on the background thread — just show perf.
-                        log::info!("(stepping) | {}", self.perf.summary());
+                        log::info!(
+                            "(stepping) | {} | {}",
+                            self.perf.summary(),
+                            self.last_memo_summary,
+                        );
                     } else {
                         let nodes = self.world.store.stats();
                         self.mem_stats.update(nodes);
                         let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                         log::info!(
-                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {}",
+                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {} | {}",
                             self.world.generation,
                             self.world.population(),
                             svdag_nodes,
@@ -1850,6 +1871,7 @@ impl ApplicationHandler for App {
                             svdag_root_level,
                             self.mem_stats.summary(),
                             self.perf.summary(),
+                            self.last_memo_summary,
                         );
                     }
                     self.log_timer = std::time::Instant::now();
