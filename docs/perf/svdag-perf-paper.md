@@ -249,14 +249,35 @@ First pass (2026-04-20, bead `hash-thing-stue.3`, spark). Measurements from `tes
 
 ### 4.3 Cache locality across the boundary
 
-**Deferred — not yet measurable with available tools.** A proper answer requires shared-L2/L3 traffic counters separated by producer (sim writes vs renderer reads), which Metal does not expose to unprivileged processes on macOS. `powermetrics --samplers gpu_power` gives aggregate GPU memory bandwidth but not eviction-attributed-to-side-A.
+**Empirical answer (proxy 1, hash-thing-stue.7): contention is present and material at the boundary, ~30 % of windowed frame cost on M2 MBA at 256³.**
 
-Two empirical signals we could use as proxies:
+**Direct counters remain unavailable.** A causal answer requires shared-L2/L3 traffic counters separated by producer (sim writes vs renderer reads), which Metal does not expose to unprivileged processes. `powermetrics --samplers gpu_power` gives aggregate GPU memory bandwidth but not eviction-attributed-to-side-A.
 
-1. **Back-to-back per-frame latency with sim disabled** (freeze `world.generation` and skip `step_recursive`) vs sim enabled. If renderer-only frames are measurably faster on M-series under windowed vs fullscreen, unified-memory contention is likely. `hash-thing-dlse.2.2` is already investigating surface-acquire dominance in the windowed path; freezing sim is a small add.
-2. **Thread-parked vs running sim during a renderer micro-bench.** Instead of freezing, pin sim to another core and compare renderer frame time vs sim on the same core as the render submit. If same-core-sim is slower, cache contention is the likely driver; if equal, memory bandwidth is fungible.
+**Proxy 1 — sim-frozen vs sim-running per-frame latency.** `HASH_THING_FREEZE_SIM=1` disables `maybe_start_background_step` so the sim never advances; renderer keeps reading the same SVDAG every frame. Bench profile, 256³ default scene (terrain + water + sand), windowed at default 50 % render scale, M2 MBA 8 GB:
 
-Both are measurable on M1/M2 without privileged counters. Filing as follow-up: `hash-thing-stue.7` (cache locality empirical proxies). Not blocking the §5 gap report.
+| run                 | render_cpu mean | render_gpu mean | surface_acquire_cpu mean |
+|---------------------|-----------------|-----------------|--------------------------|
+| sim-running (n=4)   | ~26.9 ms        | ~0.11 ms        | ~26.5 ms                 |
+| sim-frozen  (n=5)   | ~18.8 ms        | ~0.08 ms        | ~18.5 ms                 |
+| **delta**           | **−8.1 ms (−30 %)** | −0.03 ms    | **−8.0 ms (−30 %)**      |
+
+Samples taken from a 14-second windowed run, dropping the first log line (warmup) for each mode. Data: `.ship-notes/stue.7-cache-locality-2026-04-21.md` (raw log lines preserved alongside the analysis).
+
+**What proxy 1 cannot distinguish.** This delta could be driven by either:
+
+- **CPU contention.** `step_recursive` is a hot single-threaded user of one P-core. Freezing sim returns that core's cycles to OS / wgpu / display-server work that surface acquire transitively waits on.
+- **Unified-memory cache contention.** Sim writes evict renderer-relevant lines from shared L2; freezing sim leaves renderer's working set warm.
+
+The two hypotheses predict the same `surface_acquire_cpu` reduction. Disambiguating needs proxy 2 (same-core vs different-core sim scheduling), which is open as `hash-thing-xhi6` follow-up.
+
+**What proxy 1 does establish.**
+1. Renderer-only steady-state at 256 ³ on this hardware lives at **~18 ms surface_acquire_cpu**, not the ~26 ms we see with sim live. The remaining ~18 ms is a windowed-presentation floor (consistent with `dlse.2.2` findings — that path is acquire-dominated independently of sim).
+2. **Sim does meaningfully impact frame budget**, even though the renderer reads a coherent SVDAG snapshot per frame and the sim runs on a separate `std::thread`. The "background sim is free" assumption is wrong by ~8 ms at this scale.
+3. **render_gpu is unaffected** (0.11 → 0.08 ms, both well below noise). The contention shows up in CPU-side acquire, not on-GPU compute. So at this scale, a GPU-side memo (parent bead `hash-thing-abwm`) is not motivated by *renderer* contention; it would be motivated by step latency itself.
+
+**Implication for §3 frame budget.** The §3.1 budget assumed sim and render were independent on a separate-thread M-series. They aren't quite — sim costs the renderer ~8 ms / frame at 256 ³. At 4096³ the sim cost is ~64× larger (linear in node count for active-region work) but rendering is also more memory-bound, so the contention term may grow faster than linear. Re-derive at 4096³ when `hash-thing-ivms` lands.
+
+**Verdict status:** **contention present, magnitude ~30 % of windowed frame at 256³, driver (CPU vs cache) unresolved.** Follow-up bead filed for proxy 2.
 
 ### 4.4 Per-step upload volume to `Svdag::nodes`
 
