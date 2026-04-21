@@ -98,6 +98,11 @@ impl World {
             self.level
         );
         if self.has_block_rule_cells() {
+            // Fallback: `step_node_macro`'s base case runs CaRule+BlockRule only,
+            // omitting the per-generation `gravity_gap_fill` that `World::step()`
+            // applies. See `investigation_4497_macro_vs_brute_with_block_rules`
+            // for the empirical baseline (27% cell divergence, gap-fill signature
+            // at y=0) and hash-thing-gzio for the replacement experiment.
             let steps = self.recursive_pow2_step_count();
             for _ in 0..steps {
                 self.step();
