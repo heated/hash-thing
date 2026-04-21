@@ -3,6 +3,7 @@ pub use ht_octree as octree;
 pub use ht_octree::rng;
 pub use ht_render as render;
 
+pub mod acquire_harness;
 pub mod perf;
 pub mod player;
 pub mod sim;

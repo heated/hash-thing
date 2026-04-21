@@ -213,6 +213,18 @@ impl Perf {
     pub fn sample_count(&self, name: &'static str) -> usize {
         self.rings.get(name).map(|r| r.len).unwrap_or(0)
     }
+
+    /// Mean / p95 / sample-count for one named metric. Returns `None` if no
+    /// samples have been recorded under `name` since the last `clear()`.
+    /// Added for the dlse.2.2 acquire-harness snapshot; same numbers the
+    /// `summary()` line uses.
+    pub fn stats(&self, name: &'static str) -> Option<(Duration, Duration, usize)> {
+        let ring = self.rings.get(name)?;
+        if ring.len == 0 {
+            return None;
+        }
+        Some((ring.mean(), ring.p95(), ring.len))
+    }
 }
 
 /// Scope-bound timer returned by [`Perf::start`].
