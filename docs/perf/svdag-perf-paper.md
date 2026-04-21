@@ -123,12 +123,19 @@ So one traversal step costs **~36 B of GPU memory traffic** plus a handful of AL
 
 ### 3.3 Per-ray cost
 
-**Average traversal depth.** Worst case at 256³ is `log₂(256) = 8` levels. But real rays in our scene terminate early:
-- **Sky rays** (most of the upper half of the image) hit one or two empty-parent nodes at the root levels and exit before descending past depth 2-3.
-- **Terrain rays** hit solid regions after ~5-6 descents on average for the current terrain generator (which produces flat ground with occasional vertical features).
-- **Occluded rays** (blocked by foreground geometry) terminate at whatever depth the first hit sits — similar to terrain rays.
+**Average traversal steps.** Worst case at 256³ is `log₂(256) = 8` levels of descent, but the relevant quantity for bandwidth is **total DDA steps per ray** (descend + step-past + pop), not just descent depth. Measured empirically for the **default-spawn primary-ray sample** at 256³ / 960×540 (hash-thing-stue.5, `tests/bench_depth_histogram.rs`, seeded terrain via `TerrainParams::for_level(8)`):
 
-Weighted guess: **~4 dependent-load steps per ray on average**, 8 worst case. Follow-up bead should instrument this directly.
+| Ray class | Share | Mean steps | p50 | p95 | Max |
+|---|---|---|---|---|---|
+| Hit (terrain) | 53% | 20.0 | 17 | 38 | 84 |
+| Miss (sky) | 47% | 9.3 | 9 | 22 | 64 |
+| **All primary rays** | **100%** | **15.0** | **13** | **34** | **84** |
+
+Two cross-check poses from the same harness: looking straight down (100% hit, mean 6.8, p95 10) and horizontal-at-mid (y=0.5, 55% hit, mean 13.2). No rays exhausted the step budget in 3×518k samples.
+
+The prior model guessed ~4 steps/ray. The measured mean is **~4× larger**. The under-count came from conflating "descent depth" (~5-6 for terrain at 256³) with "total DDA steps" — each sibling the ray grazes past counts, and the integer-DDA step-past + pop machinery produces several steps per hit beyond the final descent chain. Sky rays terminate much faster than hits because the root cube's empty neighborhood lets them exit after a few coarse steps, but they are not a tiny fraction of the frame: ~47% at default-spawn.
+
+*Scope note:* these numbers are for the default-spawn primary-ray sample only. Secondary rays (shadows, GI) would have a different distribution; broader scene coverage would need a live-telemetry path, out of scope for stue.5.
 
 **Per-step latency.** On an integrated unified-memory GPU, a dependent u32×9 load:
 - L1 hit (same cache line as previous step, common when rays in a warp share ancestors): ~4-8 ns amortized.
@@ -137,15 +144,15 @@ Weighted guess: **~4 dependent-load steps per ray on average**, 8 worst case. Fo
 
 Assume an 80/20 L1/L2 mix for the typical ray: `0.8 × 6 ns + 0.2 × 22 ns ≈ 9 ns per step`.
 
-**Per ray:** 4 steps × 9 ns ≈ **36 ns**. But SIMD: rays in a 32-lane warp share ancestor loads, so the *warp* costs more like `max(per-lane steps) × per-step` with coherent coalescing. For primary rays with tight screen-space locality, expected throughput is near the bandwidth ceiling, not per-lane latency.
+**Per ray:** 15 steps × 9 ns ≈ **135 ns** (using the measured mean from §3.3). SIMD: rays in a 32-lane warp share ancestor loads, so the *warp* costs more like `max(per-lane steps) × per-step` with coherent coalescing. For primary rays with tight screen-space locality, expected throughput is near the bandwidth ceiling, not per-lane latency.
 
 ### 3.4 Frame cost at 256³ × 50% render scale
 
-576k rays × 4 steps/ray × 36 B/step = **~83 MB of node traffic per frame**.
+576k rays × 15 steps/ray (measured mean, §3.3) × 36 B/step = **~311 MB of node traffic per frame**.
 
-At 68 GB/s, this is `83 MB / 68 GB/s ≈ 1.2 ms` in bandwidth-limited form. The shader also writes 576k pixels × 8 B (Rgba16Float) = 4.6 MB per frame — another ~0.07 ms. Plus instruction-issue overhead and imperfect bandwidth utilization (realistic peak is ~60% of spec on Apple Silicon for ray-tracing workloads) gives a **predicted envelope of ≈ 2.0 ms / frame** on M1 MBA for pure SVDAG traversal + raycast write.
+At 68 GB/s, this is `311 MB / 68 GB/s ≈ 4.6 ms` in bandwidth-limited form. The shader also writes 576k pixels × 8 B (Rgba16Float) = 4.6 MB per frame — another ~0.07 ms. Plus instruction-issue overhead and imperfect bandwidth utilization (realistic peak is ~60% of spec on Apple Silicon for ray-tracing workloads) gives a **predicted envelope of ≈ 7.6 ms / frame** on M1 MBA for pure SVDAG traversal + raycast write. (Pre-stue.5 this section predicted ~2 ms using a 4-step guess; measurement now pushes it upward to ~7.6 ms, *widening* the gap vs the ~0.24 ms measurement — see §3.6.)
 
-**Total frame at 60 FPS target = 16.67 ms.** SVDAG traversal alone should fit in ~2 ms, leaving ~14 ms for sim step + SVDAG upload + surface acquire + blit + HUD. Tight but feasible.
+**Total frame at 60 FPS target = 16.67 ms.** If the naive 7.6 ms bandwidth envelope were reality, SVDAG traversal alone would eat nearly half the budget. In practice measurement sits near 0.24 ms on M1-implied (§3.6), so the envelope is a *loose upper bound* — the real frame cost is set by how well the per-step cost amortizes against cache reuse, not the worst-case step × bytes product.
 
 ### 3.5 Working-set check
 
@@ -155,17 +162,19 @@ This is the model's strongest prediction: **at 256³ the SVDAG frame-cost on M1 
 
 ### 3.6 Gap vs measurement
 
-The gap-report row (see §5) compares this 2 ms envelope against:
+The gap-report row (see §5) compares the §3.4 envelope (7.6 ms post-stue.5) against:
 
 - **Headless bench (`bench_gpu_raycast`) at 256³ app-spawn, 1920×1080 on M2 16 GB:** 0.19 ms mean / 0.45 ms p95. Scaled down to M1 MBA (≈ 0.67× memory bandwidth, roughly 1.5× runtime): **predicted M1 MBA headless ≈ 0.3 ms at 1920×1080, ≈ 0.1 ms at our 960×600 windowed target.**
 - **Windowed app at 256³ / 50% on M2 16 GB (post-dlse.2.3, commit 8648dc0):** render_gpu ≈ 0.16 ms mean. Scaled to M1: **predicted ≈ 0.24 ms**. Consistent with the bench.
 - **Windowed app at 256³ / 50% on M2 16 GB (pre-dlse.2.3):** ~30 ms mean. This was a measurement artifact from ComputePassTimestampWrites charging Metal barrier waits to the compute pass timestamp; the underlying wall time was never 30 ms. See dlse.2.3 for the forensic chain and spark/cairn's hypothesis triage history.
 
-The model predicts **2 ms envelope** and measurement is **0.24 ms on M1-implied**. Gap is ~8× under-prediction by the model. Candidate explanations:
+The model predicts **7.6 ms envelope** (post-stue.5, with measured mean = 15 steps/ray) and measurement is **0.24 ms on M1-implied**. Gap is **~32× over-prediction** by the model. Candidate explanations, re-weighted after stue.5 ruled out the "depth too short" hypothesis:
 
-1. **Effective traversal depth is shorter than 4** — most rays terminate at depth 1-2 because the top of the octree has huge empty/solid subtrees that exit immediately. Likely. Add instrumentation.
-2. **Per-step cost is smaller than 9 ns** — the working set fits entirely in L1 per tile, and the shader-wide prefetch overlaps the next load with current ALU. Possible.
-3. **The 60% bandwidth-utilization factor is too pessimistic for this access pattern** — SVDAG access is warp-coherent and hits the DAG hot set hard; utilization closer to 80-90%.
+1. ~~Effective traversal depth is shorter than 4.~~ **Refuted by hash-thing-stue.5:** measured mean is ~15 steps/ray, *higher* than the pre-stue.5 guess of 4. Whatever is closing the gap, it is not a shorter effective traversal. This correction makes the gap wider, not narrower — the other two explanations must together account for a ~32× factor instead of ~8×.
+2. **Per-step cost is smaller than 9 ns** — the working set fits entirely in L1 per tile, and the shader-wide prefetch overlaps the next load with current ALU. The 9 ns figure assumed an 80/20 L1/L2 mix; if reuse is nearly 100% L1 for primary rays (warp shares the same ancestor chain for most of descent), per-step cost could plausibly be 2-3 ns.
+3. **The 60% bandwidth-utilization factor is too pessimistic for this access pattern** — SVDAG access is warp-coherent and hits the DAG hot set hard; utilization closer to 80-90%. More importantly, once the working set is L1-resident, "bandwidth" is L1 bandwidth (per-SM, ~1 TB/s class), not the 68 GB/s unified-memory spec — a full order of magnitude above what the envelope assumes.
+
+Hypotheses 2 and 3 together (`2-3 ns/step × L1-bandwidth regime`) are the **leading-hypothesis** explanation for the 32× factor. stue.5 does not directly measure cache residency or utilization — it refutes explanation 1 and narrows the search, but does not pin the remaining cause. Direct confirmation would take a GPU-side counter pass (hit-rate / throughput telemetry) out of scope for this bead. Treat the paper's bandwidth envelope as a DRAM-limit ceiling, not a predicted steady-state cost.
 
 This is the **"paper wins"** direction from §0: measurement is faster than the model expected, which means the model is conservative and we have headroom to burn on correctness features (attributes, LOD) before we approach the ceiling.
 
@@ -285,8 +294,8 @@ Format (placeholder):
 
 | Subsystem | Measured (ref HW) | Theoretical (§3) | Gap | Status |
 |---|---|---|---|---|
-| Raycast traversal (headless, 256³, 1920×1080) | **0.19 ms mean / 0.45 ms p95** on M2 16 GB (`bench_gpu_raycast::bench_raycast_256_app_spawn`, spark 2026-04-15); M1-implied ≈ 0.3 ms | ~2.0 ms envelope on M1 MBA (§3.4) | ~7× model over-predicts | Measurement faster than model. Likely cause: effective traversal depth < 4 (§3.6). Follow-up bead: instrument per-ray depth histogram. |
-| Raycast traversal (windowed, 256³ / 50% render scale) | **0.16 ms mean** on M2 16 GB, post-dlse.2.3 (commit 8648dc0, TIMESTAMP_QUERY_INSIDE_ENCODERS); M1-implied ≈ 0.24 ms | ~1.2 ms envelope on M1 MBA at 960×600 (§3.4 × 0.6 for smaller ray count) | ~5× model over-predicts | Matches headless bench within factor of 2. Windowed ≠ slow; prior "30 ms" was measurement artifact. |
+| Raycast traversal (headless, 256³, 1920×1080) | **0.19 ms mean / 0.45 ms p95** on M2 16 GB (`bench_gpu_raycast::bench_raycast_256_app_spawn`, spark 2026-04-15); M1-implied ≈ 0.3 ms | ~7.6 ms envelope on M1 MBA (§3.4, post-stue.5 with measured 15 steps/ray) | ~25× model over-predicts | Gap widened after hash-thing-stue.5 measured mean steps ≈ 15 (vs prior guess of 4), which pushed the envelope from ~2 ms to ~7.6 ms. The prior "depth < 4" gap explanation was refuted; leading hypothesis for the remaining factor is L1 cache residency + warp-coherent reuse (§3.6 items 2+3), not yet directly measured. |
+| Raycast traversal (windowed, 256³ / 50% render scale) | **0.16 ms mean** on M2 16 GB, post-dlse.2.3 (commit 8648dc0, TIMESTAMP_QUERY_INSIDE_ENCODERS); M1-implied ≈ 0.24 ms | ~4.6 ms envelope on M1 MBA at 960×600 (§3.4 × 0.6 for smaller ray count, post-stue.5) | ~19× model over-predicts | Matches headless bench within factor of 2. Windowed ≠ slow; prior "30 ms" was measurement artifact. |
 | SVDAG build (cold, 256³ terrain+water+sand) | **~1.08 ms** on M2 16 GB, release (`bench_svdag_step_deltas_256`, spark 2026-04-20); M1-implied ≈ 1.6 ms | Not yet in §3 (cold-build model) | N/A until modelled | One-shot cost; steady-state uses incremental path. |
 | SVDAG incremental upload (256³, warm, per step) | **mean 19.6 KB, max 79 KB** on M2 16 GB (`bench_svdag_step_deltas_256`, spark 2026-04-20 — §4.4) | Not yet modelled (§3 is raycast-only) | N/A until modelled | O(new-content). ~1.2 MB/s at 60 FPS — negligible vs 68 GB/s ceiling. |
 | SVDAG compaction | Not observed in 40-step warm window at 256³ (§4.4) | N/A | N/A | Fires only when `stale_ratio > 0.5`; not a steady-state cost. |

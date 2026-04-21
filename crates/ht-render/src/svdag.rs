@@ -385,10 +385,10 @@ impl Svdag {
 // the traversal reproduces identically on the CPU, where we can dump state.
 // ----------------------------------------------------------------------------
 
-// CPU debug-trace helpers. Used ad-hoc when investigating shader bugs;
-// no automated tests currently call this module, but keeping it compiling
-// is the whole point.
-#[cfg(test)]
+// CPU debug-trace helpers. Used ad-hoc when investigating shader bugs
+// and by the hash-thing-stue.5 traversal-step histogram harness
+// (`tests/bench_depth_histogram.rs`). Kept `pub` so integration tests
+// in the downstream `hash_thing` crate can call it directly.
 #[allow(unused_imports, dead_code)]
 pub mod cpu_trace {
     use super::*;
