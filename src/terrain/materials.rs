@@ -19,24 +19,16 @@ pub type MaterialId = u16;
 
 pub const INITIAL_MATERIAL_SLOTS: usize = 256;
 
-/// Greatest common divisor for u32. Used to collapse shared BlockRule divisors
-/// when multiple materials point at the same rule with different divisors.
-fn gcd_u32(a: u32, b: u32) -> u32 {
-    let (mut a, mut b) = (a, b);
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
-    }
-    a
-}
-
-/// Least common multiple for u64. Used to compute the memo schedule period.
+/// Least common multiple for u64. Panics if the registry would produce a
+/// memo period that overflows u64 (requires truly pathological divisors;
+/// surface the error at registry-build time rather than silently wrapping).
 fn lcm_u64(a: u64, b: u64) -> u64 {
     if a == 0 || b == 0 {
         return 0;
     }
-    a / gcd_u64(a, b) * b
+    (a / gcd_u64(a, b))
+        .checked_mul(b)
+        .expect("tick_divisor LCM overflowed u64 — pick smaller divisors")
 }
 
 fn gcd_u64(a: u64, b: u64) -> u64 {
@@ -721,6 +713,7 @@ impl MaterialRegistry {
             },
         );
 
+        registry.validate_shared_block_rule_divisors();
         registry
     }
 
@@ -733,6 +726,7 @@ impl MaterialRegistry {
         let rule_id = registry.register_rule(rule);
         registry.assign_rule(AIR_MATERIAL_ID, rule_id);
         registry.assign_rule(STONE_MATERIAL_ID, rule_id);
+        registry.validate_shared_block_rule_divisors();
         registry
     }
 
@@ -798,32 +792,52 @@ impl MaterialRegistry {
             .collect()
     }
 
-    /// Per-block-rule tick_divisor, indexed by BlockRuleId. Because multiple
-    /// materials can share one BlockRule, the divisor for a shared rule is the
-    /// GCD of its users' divisors — any tick where ANY user fires must apply
-    /// the rule. If no material references a rule id (dead rule), returns 1.
+    /// Per-block-rule tick_divisor, indexed by BlockRuleId. Materials sharing
+    /// a BlockRule must share a tick_divisor — this is validated at registry
+    /// build time via [`Self::validate_shared_block_rule_divisors`]. If no
+    /// material references a rule id (dead rule), returns 1.
     pub fn block_rule_tick_divisors(&self) -> Vec<u16> {
-        let mut per_rule = vec![0u32; self.block_rules.len()];
+        let mut per_rule = vec![0u16; self.block_rules.len()];
         for entry in self.entries.iter().filter_map(|e| e.as_ref()) {
             if let Some(BlockRuleId(id)) = entry.block_rule_id {
-                let d = entry.tick_divisor.max(1) as u32;
-                per_rule[id] = if per_rule[id] == 0 {
-                    d
-                } else {
-                    gcd_u32(per_rule[id], d)
-                };
+                per_rule[id] = entry.tick_divisor.max(1);
             }
         }
         per_rule
             .into_iter()
-            .map(|d| {
-                if d == 0 {
-                    1
-                } else {
-                    d.min(u16::MAX as u32) as u16
-                }
-            })
+            .map(|d| if d == 0 { 1 } else { d })
             .collect()
+    }
+
+    /// Panic if any two materials sharing one BlockRule have different
+    /// `tick_divisor`s. Called once at registry construction — follow-up beads
+    /// that expose tick_divisor via config must call this after mutation.
+    ///
+    /// Rationale (iowh review): collapsing mixed divisors via GCD silently
+    /// nullifies the slower material's divisor ("A says every 4, B says every
+    /// 6, rule fires every 2"). That is a semantic lie. Requiring sharers to
+    /// agree keeps "per-material tick_divisor" an honest contract.
+    pub fn validate_shared_block_rule_divisors(&self) {
+        let mut per_rule: Vec<Option<(u16, MaterialId)>> = vec![None; self.block_rules.len()];
+        for (material_id, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            let Some(BlockRuleId(id)) = entry.block_rule_id else {
+                continue;
+            };
+            let d = entry.tick_divisor.max(1);
+            match per_rule[id] {
+                None => per_rule[id] = Some((d, material_id as MaterialId)),
+                Some((first_d, first_mat)) if first_d != d => {
+                    panic!(
+                        "shared BlockRule {} has mixed tick_divisors: material {} = {}, \
+                         material {} = {}. Materials that share a BlockRule must share a \
+                         tick_divisor (iowh invariant).",
+                        id, first_mat, first_d, material_id, d
+                    );
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     /// The schedule period of the memo key: the smallest `T` such that for any
@@ -880,16 +894,26 @@ impl MaterialRegistry {
             .block_rule_id = Some(block_rule_id);
     }
 
-    /// Set the tick divisor for an existing material. Divisor is clamped to
-    /// `>= 1` in accessor paths, but callers should pass `>= 1` for clarity.
-    /// Crate-private because the shipping path bakes divisors into registrar
-    /// constructors; this exists for tests and for the future tuning bead.
+    /// Set the tick divisor for an existing material.
+    ///
+    /// Panics if `divisor == 0`. Must be called **before stepping**: this does
+    /// not invalidate the hashlife memo caches, so stale cache entries indexed
+    /// under a prior `memo_period()` would return incorrect results on the
+    /// next step. Prefer [`crate::sim::world::World::set_material_tick_divisor`]
+    /// which clears the caches. Crate-private because the shipping path bakes
+    /// divisors into registrar constructors; this exists for tests and for the
+    /// future tuning bead.
     #[allow(dead_code)]
     pub(crate) fn set_tick_divisor(&mut self, material_id: MaterialId, divisor: u16) {
+        assert!(
+            divisor >= 1,
+            "tick_divisor must be >= 1 (got {divisor} for material {material_id})"
+        );
         self.entries[material_id as usize]
             .as_mut()
             .unwrap_or_else(|| panic!("material {material_id} must exist to set tick_divisor"))
             .tick_divisor = divisor;
+        self.validate_shared_block_rule_divisors();
     }
 
     /// Look up a block rule by ID. Used by `World::step_blocks()`.
@@ -1457,11 +1481,41 @@ mod tests {
     }
 
     #[test]
-    fn block_rule_tick_divisors_uses_gcd_for_shared_rules() {
+    fn block_rule_tick_divisors_matches_uniform_sharers() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
         let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
-        // Two materials sharing one BlockRule with different divisors.
+        // Two materials sharing one BlockRule with the SAME divisor.
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+        registry.validate_shared_block_rule_divisors();
+        let divisors = registry.block_rule_tick_divisors();
+        assert_eq!(divisors[block_rule_id.0], 4);
+    }
+
+    /// T3 (iowh review): materials sharing a BlockRule must share a
+    /// tick_divisor. Rejecting mixed divisors at registry-build time is the
+    /// explicit invariant that replaces the old silent-GCD collapse.
+    #[test]
+    #[should_panic(expected = "mixed tick_divisors")]
+    fn validate_rejects_mixed_divisors_on_shared_block_rule() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
         registry.insert(
             0,
             MaterialEntry {
@@ -1478,9 +1532,42 @@ mod tests {
                 ..entry_with(rule_id, [1.0; 4])
             },
         );
-        let divisors = registry.block_rule_tick_divisors();
-        // GCD(4, 6) = 2 — rule fires whenever either user fires.
-        assert_eq!(divisors[block_rule_id.0], 2);
+        registry.validate_shared_block_rule_divisors();
+    }
+
+    /// T4 (iowh review): `set_tick_divisor(0)` panics rather than silently
+    /// clamping. Protects the dispatcher's `is_multiple_of` gate and the
+    /// author's expectation that `>= 1` means "fires at least every N ticks".
+    #[test]
+    #[should_panic(expected = "tick_divisor must be >= 1")]
+    fn set_tick_divisor_rejects_zero() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        registry.insert(0, entry_with(rule_id, [0.0; 4]));
+        registry.set_tick_divisor(0, 0);
+    }
+
+    /// T4 (iowh review): `lcm_u64` panics on u64 overflow rather than
+    /// silently wrapping. Five distinct large primes near 2^16, each the
+    /// tick_divisor of one material, produce a memo_period of
+    /// `2 * p1 * p2 * p3 * p4 * p5 ≈ 2.4e24`, which overflows u64.
+    #[test]
+    #[should_panic(expected = "overflowed u64")]
+    fn memo_period_panics_on_overflow() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        // Distinct primes near 2^16 (coprime to each other and to 2).
+        let primes: [u16; 5] = [65521, 65519, 65497, 65479, 65449];
+        for (i, &p) in primes.iter().enumerate() {
+            registry.insert(
+                i as MaterialId,
+                MaterialEntry {
+                    tick_divisor: p,
+                    ..entry_with(rule_id, [0.0; 4])
+                },
+            );
+        }
+        let _ = registry.memo_period();
     }
 
     #[test]

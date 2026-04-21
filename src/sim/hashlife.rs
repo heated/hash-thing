@@ -60,7 +60,7 @@ impl World {
         // period grows to LCM(2*d_i) so identical inputs at the same schedule
         // phase always produce identical outputs (iowh).
         let period = self.materials.memo_period();
-        let phase = (self.generation % period) as u32;
+        let phase = self.generation % period;
         let result = self.step_node(padded_root, padded_level, phase);
         self.root = result;
         let step_stats = self.hashlife_stats;
@@ -248,12 +248,12 @@ impl World {
     /// Remap hashlife cache keys and values through a compaction remap table.
     /// Entries referencing unreachable nodes (not in remap) are dropped.
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
-        // Remap hashlife_cache: (NodeId, parity) → NodeId
+        // Remap hashlife_cache: (NodeId, schedule_phase) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
         self.hashlife_cache.reserve(old_cache.len());
-        for ((node, parity), result) in old_cache {
+        for ((node, phase), result) in old_cache {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
-                self.hashlife_cache.insert((new_node, parity), new_result);
+                self.hashlife_cache.insert((new_node, phase), new_result);
             }
         }
 
@@ -309,7 +309,7 @@ impl World {
     /// memo_period()` where memo_period = LCM over materials of 2*divisor
     /// (iowh). Identical subtrees at the same schedule_phase always produce
     /// identical outputs (9ww + iowh).
-    fn step_node(&mut self, node: NodeId, level: u32, schedule_phase: u32) -> NodeId {
+    fn step_node(&mut self, node: NodeId, level: u32, schedule_phase: u64) -> NodeId {
         assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
@@ -360,7 +360,7 @@ impl World {
     /// that the caller uses to distinguish memo entries; it is redundant with
     /// `self.generation % memo_period` for a given step, but kept in the
     /// signature so step_node's call is symmetric with step_recursive_case.
-    fn step_base_case(&mut self, node: NodeId, _schedule_phase: u32) -> NodeId {
+    fn step_base_case(&mut self, node: NodeId, _schedule_phase: u64) -> NodeId {
         // Stack-allocated grid avoids heap allocation per base case (~16K calls).
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
@@ -664,7 +664,7 @@ impl World {
     }
 
     /// Recursive case: level ≥ 3.
-    fn step_recursive_case(&mut self, node: NodeId, level: u32, schedule_phase: u32) -> NodeId {
+    fn step_recursive_case(&mut self, node: NodeId, level: u32, schedule_phase: u64) -> NodeId {
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
@@ -1473,10 +1473,98 @@ mod tests {
         );
 
         // After 3 steps slow fires again (pre-step gen=2); fast keeps falling.
+        // Slow should now have 2 firings total; fast had 3. Capture fast's
+        // 2-firing state before its 3rd step, so we can assert slow catches
+        // up to it after its 2nd firing.
+        let fast_after_2_firings = fast.flatten();
         fast.step_recursive();
         slow.step_recursive();
-        // Slow world is always exactly 1 firing behind fast world — they
-        // produce the same sequence of state snapshots just offset.
+        assert_eq!(
+            slow.flatten(),
+            fast_after_2_firings,
+            "slow world after 2 firings must match fast world after 2 firings \
+             (1 firing behind fast's 3 firings)"
+        );
+    }
+
+    /// T1 (iowh review): CaRule-only divisor gating. FIRE has a CaRule
+    /// (FanDrivenRule wrapping FireRule) but no BlockRule, so it exercises the
+    /// CaRule gate at `src/sim/hashlife.rs:461` in isolation from the BlockRule
+    /// path. A lone fire cell with no fuel disappears on the next rule firing.
+    /// With divisor=2 the firing happens at gen 0, 2, 4, ... and is skipped
+    /// at 1, 3, 5, ... so a fire cell seeded at gen=1 must survive one step.
+    #[test]
+    fn tick_divisor_carule_only_fire_gate() {
+        use crate::terrain::materials::FIRE_MATERIAL_ID;
+        let mut fast = World::new(3); // 8³, divisor=1 (default)
+        let mut slow = World::new(3); // 8³, divisor=2 for fire
+        slow.materials.set_tick_divisor(FIRE_MATERIAL_ID, 2);
+
+        let fire = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
+
+        // Step 1 (pre-gen=0): both worlds fire the CaRule (0 % 2 == 0 for slow).
+        // Seed a lone fire cell (no fuel), both worlds should kill it.
+        for w in [&mut fast, &mut slow] {
+            w.set(wc(4), wc(4), wc(4), fire);
+        }
+        fast.step_recursive();
+        slow.step_recursive();
+        assert_eq!(fast.generation, 1);
+        assert_eq!(slow.generation, 1);
+
+        // Re-seed fire at gen=1. Step once more.
+        // Fast (d=1): CaRule fires at gen=1 → fire dies.
+        // Slow (d=2): CaRule skipped at gen=1 (1 % 2 == 1) → fire stays.
+        for w in [&mut fast, &mut slow] {
+            w.set(wc(4), wc(4), wc(4), fire);
+        }
+        fast.step_recursive();
+        slow.step_recursive();
+
+        let fast_cell = Cell::from_raw(fast.get(wc(4), wc(4), wc(4)));
+        let slow_cell = Cell::from_raw(slow.get(wc(4), wc(4), wc(4)));
+        assert!(
+            fast_cell.is_empty(),
+            "fast world fires CaRule at gen=1 → fire must die"
+        );
+        assert_eq!(
+            slow_cell.material(),
+            FIRE_MATERIAL_ID,
+            "slow world skips CaRule at gen=1 under divisor=2 → fire must persist"
+        );
+    }
+
+    /// T2 (iowh review): Margolus alternation under a slow tick schedule
+    /// preserves mass conservation. The alternation formula
+    /// `(generation / divisor) & 1` means that over the rule's own firing
+    /// cadence, offsets alternate 0,1,0,1 — not over the raw generation
+    /// counter (which would pin the rule to offset 0 forever when d > 1).
+    /// Regression: water with divisor=2 running many generations must
+    /// conserve mass exactly the way divisor=1 water does.
+    #[test]
+    fn tick_divisor_two_preserves_water_mass_conservation() {
+        use crate::terrain::materials::WATER_MATERIAL_ID;
+        let mut world = World::new(5); // 32³
+        world.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+        for y in 8..24 {
+            world.set(
+                wc(16),
+                wc(y),
+                wc(16),
+                Cell::pack(WATER_MATERIAL_ID, 0).raw(),
+            );
+        }
+        let initial = count_material(&world, 32, WATER_MATERIAL_ID);
+        assert_eq!(initial, 16);
+
+        for step in 0..16 {
+            world.step_recursive();
+            let n = count_material(&world, 32, WATER_MATERIAL_ID);
+            assert_eq!(
+                n, initial,
+                "mass lost at step {step} under divisor=2: expected {initial}, got {n}"
+            );
+        }
     }
 
     /// Memo soundness: a world stepped forward with prior cache entries must
