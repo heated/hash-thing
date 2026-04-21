@@ -57,6 +57,8 @@ impl World {
         let parity = (self.generation % 2) as u32;
         let result = self.step_node(padded_root, padded_level, parity);
         self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
 
         // Post-step gravity gap-fill: prevents Margolus rarefaction.
         // Applied on the flattened grid (same as brute-force path) because
