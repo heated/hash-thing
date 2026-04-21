@@ -1,6 +1,6 @@
 # SVDAG Performance Paper (Living Document)
 
-**Ownership:** the **crew** owns this document. Any seat may write into it under a sub-bead of `hash-thing-stue`. **Mayor's role** is to surface decisions, re-derive the spec from the paper, redirect investigations that the paper rules in/out, and keep the document coherent — not to write all of it. Mayor does not gate edits.
+**Ownership:** mayor owns project-level movement (decomposition, surfacing, keeping it advancing); crew owns execution (claims sub-beads of `hash-thing-stue`, writes into the paper). Roles defined in `.agents/skills/mayor/SKILL.md`.
 
 **Status:** Skeleton. First real revisions pending (see bead `hash-thing-stue` children — claimable by any seat).
 

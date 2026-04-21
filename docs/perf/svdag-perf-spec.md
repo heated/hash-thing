@@ -2,7 +2,7 @@
 
 **Last re-derived:** 2026-04-20 (skeleton — no derivation yet)
 **Source of truth:** `docs/perf/svdag-perf-paper.md`. If this spec disagrees with the paper, the paper wins.
-**Ownership:** the crew, with mayor as the surfacing/coordination layer. See the paper's ownership note for details.
+**Ownership:** see the paper's ownership note (and `.agents/skills/mayor/SKILL.md`).
 
 This document is the **short form**. It exists to be referenced from code review, bead descriptions, and other docs without forcing readers through the full paper. Re-derived periodically — never edited in isolation.
 
