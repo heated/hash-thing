@@ -319,6 +319,14 @@ struct App {
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
+    /// Fullscreen toggle state (dlse.2.2). Cycles between None and
+    /// Fullscreen::Borderless(None) via F11 or Cmd+Ctrl+F. Initial
+    /// state set from HASH_THING_FULLSCREEN=1.
+    fullscreen_active: bool,
+    /// Latest modifier key state, tracked via ModifiersChanged, used
+    /// to detect the Cmd+Ctrl+F fullscreen chord (winit does not
+    /// surface chords as NamedKey).
+    modifiers: winit::keyboard::ModifiersState,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -385,6 +393,8 @@ impl App {
             startup_scene_pending: true,
             cursor_captured: false,
             pending_player_action: None,
+            fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
+            modifiers: winit::keyboard::ModifiersState::empty(),
         };
 
         let player_pos = app.reset_scene_entities();
@@ -661,6 +671,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
+                "  F11/⌘⌃F Fullscreen   C  Clear perf",
                 "  Esc Exit",
             ],
             CameraMode::Orbit => vec![
@@ -682,6 +693,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
+                "  F11/⌘⌃F Fullscreen   C  Clear perf",
                 "  Esc Exit",
             ],
         }
@@ -689,6 +701,23 @@ impl App {
 
     fn lattice_debug_jumps_enabled(&self) -> bool {
         self.camera_mode == CameraMode::Orbit
+    }
+
+    /// Toggle borderless-fullscreen (dlse.2.2). Logs the chosen variant so
+    /// post-hoc log forensics can tell which state the app was in at
+    /// measurement time.
+    fn toggle_fullscreen(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        self.fullscreen_active = !self.fullscreen_active;
+        let mode = if self.fullscreen_active {
+            Some(winit::window::Fullscreen::Borderless(None))
+        } else {
+            None
+        };
+        log::info!("fullscreen: toggling to {:?}", mode);
+        window.set_fullscreen(mode);
     }
 
     /// Update cached render-side world geometry after world changes.
@@ -1182,6 +1211,15 @@ impl ApplicationHandler for App {
             // Agent/CLI launches on macOS can leave the app alive but unfocused.
             window.set_visible(true);
             window.focus_window();
+            if self.fullscreen_active {
+                // dlse.2.2: env-var opt-in. `Borderless(None)` targets the
+                // monitor currently containing the window. This will fire
+                // `Resized` and transition the macOS Space.
+                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                log::info!(
+                    "fullscreen: entering Borderless(None) at startup (HASH_THING_FULLSCREEN=1)"
+                );
+            }
             self.window = Some(window.clone());
 
             let mut renderer =
@@ -1248,6 +1286,11 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::ModifiersChanged(mods) => {
+                // dlse.2.2: track modifier state for Cmd+Ctrl+F chord detection.
+                self.modifiers = mods.state();
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 // Track physical key state for per-frame movement polling.
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
@@ -1261,6 +1304,15 @@ impl ApplicationHandler for App {
                     }
                 }
                 if event.state == ElementState::Pressed {
+                    // dlse.2.2: Cmd+Ctrl+F fullscreen chord. Check by physical
+                    // key + modifier state since winit does not surface chords
+                    // as NamedKey and macOS may alter logical_key under Cmd.
+                    if let winit::keyboard::PhysicalKey::Code(KeyCode::KeyF) = event.physical_key {
+                        if self.modifiers.super_key() && self.modifiers.control_key() {
+                            self.toggle_fullscreen();
+                            return;
+                        }
+                    }
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
                             // In orbit mode, Space toggles pause.
@@ -1276,6 +1328,12 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F5) => {
                             self.paused = !self.paused;
                             log::info!("Paused: {}", self.paused);
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
+                            // dlse.2.2: fullscreen toggle. Primary shortcut is
+                            // Cmd+Ctrl+F on macOS (reachable even when F11 is
+                            // swallowed by the window server).
+                            self.toggle_fullscreen();
                         }
                         winit::keyboard::Key::Character("0") => {
                             // Recenter player at world center.
@@ -1427,6 +1485,13 @@ impl ApplicationHandler for App {
                             // Default demo gallery: deterministic local fire/water set pieces
                             // staged around the beat waypoints.
                             self.load_demo_spectacle("Reset spectacle gallery");
+                        }
+                        winit::keyboard::Key::Character("c") => {
+                            // dlse.2.2: drain perf histograms so the next `P`
+                            // dump reflects only post-clear samples. Needed for
+                            // clean windowed-vs-fullscreen comparisons.
+                            self.perf.clear();
+                            log::info!("perf histograms cleared");
                         }
                         winit::keyboard::Key::Character("h") => {
                             // Toggle step-count heatmap debug mode.
