@@ -194,7 +194,7 @@ Then pull the next task off `bd ready` and start a fresh `/ship` on it. When the
 
 Runs automatically once the human has approved the plan in Phase 2b, using the **plan review tier** chosen in Phase 1.
 
-- **Trident:** 9-way review of `$NOTES_DIR/plan-{BRANCH_ID}.md` (see `/trident-plan-review`)
+- **Trident:** 8-way review of `$NOTES_DIR/plan-{BRANCH_ID}.md` (see `/trident-plan-review`)
 - **Triple:** 2 Claude (standard + critical) + 1 Codex + 1 Gemini (standard each) + synthesis
 - **Dual:** 1 Claude + 1 Codex (standard)
 - **Single:** Claude only
@@ -280,7 +280,7 @@ When any phase commits:
 
 Load the `review-tiers` skill, compute the tier from the diff, and log the result in the metadata file. Then run the matching review:
 
-### Trident (9-way)
+### Trident (6-way)
 
 Run `/trident-code-review` — 6 agents (2 Claude + 3 Codex + 1 Gemini) + 2 synthesis (standard + critical; evolutionary not synthesized per hash-thing-2kkt). Full details in that command.
 

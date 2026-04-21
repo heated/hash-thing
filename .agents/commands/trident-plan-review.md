@@ -3,7 +3,7 @@
 Run parallel plan reviews with a Codex-heavy eight-review mix: Claude runs two canonical lenses (standard / adversarial), Codex runs three canonical lenses plus two focused extra passes (standard / standard-execution / adversarial / adversarial-dependencies / evolutionary), and Gemini runs a single standard pass. Per hash-thing-2kkt, the evolutionary-Claude lens is dropped (Codex evolutionary covers the angle at lower cost) and the evolutionary synthesis step is skipped. Output lives alongside the input file in a review pack folder.
 
 **Usage:**
-- `/user:trident-plan-review <file>` — Review a plan/document through all nine agents
+- `/user:trident-plan-review <file>` — Review a plan/document through all eight agents
 - `/user:trident-plan-review <file> <additional notes>` — Review with additional context
 - `$ARGUMENTS` contains the file path and optional additional notes
 
@@ -191,7 +191,7 @@ cp {INPUT_FILE} "$WS_STAGING/plan-input.md"
 
 For Gemini prompt files, use workspace-local paths for both the framework file and the input file.
 
-### Phase 4: Launch All Nine Agents
+### Phase 4: Launch All Eight Agents
 
 **Launch message template** (for Claude subagents — Codex/Gemini use their prompt files from Phase 3):
 > Read {PROMPT_PATH} for your review approach and thinking framework. Then read {INPUT_FILE} — that is the document you are reviewing.
