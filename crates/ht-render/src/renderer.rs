@@ -1175,6 +1175,12 @@ impl Renderer {
     /// Allocates a throwaway render target matching the current surface
     /// config; subsequent `render()` calls skip `get_current_texture()` +
     /// `present()` and draw into this texture instead.
+    ///
+    /// Known quirk: `render_gpu` may report `(no samples)` while off-surface
+    /// is active. Off-surface frames complete in ~1 ms CPU-side, so the
+    /// next frame's `GpuTiming::poll` fires before the prior frame's
+    /// `map_async` readback callback lands. The diagnostic's primary signal
+    /// (`surface_acquire_cpu`, `render_cpu`) is CPU-side and unaffected.
     pub fn enable_off_surface(&mut self) {
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("off_surface_target"),
@@ -1653,10 +1659,11 @@ impl Renderer {
         // and draw into the throwaway texture. `surface_acquire` records
         // ~0 in that mode.
         let acquire_start = Instant::now();
-        let surface_texture = if self.off_surface_target.is_some() {
-            None
+        let (surface_texture, view) = if let Some(off) = self.off_surface_target.as_ref() {
+            let view = off.create_view(&wgpu::TextureViewDescriptor::default());
+            (None, view)
         } else {
-            Some(match self.surface.get_current_texture() {
+            let st = match self.surface.get_current_texture() {
                 CurrentSurfaceTexture::Success(tex) | CurrentSurfaceTexture::Suboptimal(tex) => tex,
                 CurrentSurfaceTexture::Occluded => return FrameOutcome::Occluded,
                 CurrentSurfaceTexture::Timeout => {
@@ -1682,20 +1689,11 @@ impl Renderer {
                     log::error!("surface texture acquire: Validation error");
                     return FrameOutcome::Timeout;
                 }
-            })
+            };
+            let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (Some(st), view)
         };
         let surface_acquire = acquire_start.elapsed();
-
-        let view = match &surface_texture {
-            Some(st) => st
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default()),
-            None => self
-                .off_surface_target
-                .as_ref()
-                .expect("off_surface_target is Some when surface_texture is None")
-                .create_view(&wgpu::TextureViewDescriptor::default()),
-        };
 
         // Camera
         let (sin_yaw, cos_yaw) = self.camera_yaw.sin_cos();
