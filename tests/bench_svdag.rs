@@ -254,3 +254,48 @@ fn bench_svdag_step_deltas_512() {
 fn bench_svdag_step_deltas_1024() {
     bench_svdag_step_deltas("1024³", 10, 0, 2);
 }
+
+/// 2048³ variant — out-of-band only. Extrapolating from the 512³→1024³
+/// latency growth observed by heyw (~7x per 2× linear step), a single
+/// warm step at 2048³ sits around 30–60s on M1-class hardware. One
+/// measured=1, warmup=0 step takes roughly 45–90s wall — exceeds the
+/// 60s test-runner ceiling.
+///
+/// Invoke out-of-band with an explicit longer timeout:
+/// ```text
+/// cargo test --release --test bench_svdag bench_svdag_step_deltas_2048 \
+///     -- --ignored --nocapture
+/// ```
+/// (Shell-level timeout as high as your patience; agent sweeps should
+/// bump the bash timeout explicitly rather than relying on the default.)
+///
+/// Value: gives slc1 its fifth data point for the memo-miss scaling
+/// exponent fit, which currently relies on only four scales (64³, 256³,
+/// 512³, 1024³). See hash-thing-4hkq.
+#[test]
+#[ignore]
+fn bench_svdag_step_deltas_2048() {
+    bench_svdag_step_deltas("2048³", 11, 0, 1);
+}
+
+/// 4096³ variant — strictly out-of-band. Expected wall time 2–5 minutes
+/// (seed ~3.5s, one warm step >60s based on bench_hashlife_4096's
+/// SIGKILL profile, plus SVDAG build overhead). Not runnable under any
+/// automated sweep; bump the shell timeout manually and expect to wait.
+///
+/// Invoke:
+/// ```text
+/// cargo test --release --test bench_svdag bench_svdag_step_deltas_4096 \
+///     -- --ignored --nocapture
+/// ```
+///
+/// Value: anchors the high end of the slc1 scaling-exponent fit. The
+/// 548k-node seeded measurement from ivms already lives in the perf
+/// paper; this bench adds the matching per-step miss-count and upload
+/// data point, which the memo-churn projections in §4.7 currently lack
+/// at 4096³.
+#[test]
+#[ignore]
+fn bench_svdag_step_deltas_4096() {
+    bench_svdag_step_deltas("4096³", 12, 0, 1);
+}
