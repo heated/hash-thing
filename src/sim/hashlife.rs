@@ -97,10 +97,13 @@ impl World {
             self.block_rule_present = None; // brute-force may have consumed block-rule cells
             return;
         }
+        self.hashlife_stats = super::world::HashlifeStats::default();
         let padded_root = self.pad_root();
         let padded_level = self.level + 1;
         let result = self.step_node_macro(padded_root, padded_level, self.generation);
         self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
         self.generation += self.recursive_pow2_step_count();
 
         self.maybe_compact();
@@ -355,22 +358,30 @@ impl World {
         // Empty nodes step to empty across any number of generations:
         // identity^N = identity. CaRule-only worlds (macro path prerequisite).
         if self.store.population(node) == 0 {
+            self.hashlife_stats.empty_skips += 1;
             return self.store.empty(level - 1);
         }
 
         // Fixed-point: uniform inert subtree → same material, smaller node.
         if let Some(state) = self.inert_uniform_state(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
             return self.store.uniform(level - 1, state);
         }
 
         // All-inert: mixed materials but all noop → center extract.
         if self.is_all_inert(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
             return self.center_node(node, level);
         }
 
         let key = (node, generation);
         if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
+            self.hashlife_stats.cache_hits += 1;
             return cached;
+        }
+        self.hashlife_stats.cache_misses += 1;
+        if (level as usize) >= 3 {
+            self.hashlife_stats.misses_by_level[(level - 3) as usize] += 1;
         }
 
         let result = if level == 3 {
