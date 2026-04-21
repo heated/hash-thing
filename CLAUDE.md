@@ -1,8 +1,27 @@
 # Agent Instructions
 
-## ⚠ FEATURE FREEZE — effective 2026-04-13
+## Crew default workflow
 
-**All new feature work is paused.** No new features, no perf work, no refactors land on main until the codebase integrity audit (hash-thing-882n) clears. Bug fixes to existing broken behavior may continue. Check `bd show hash-thing-882n` for status. This freeze applies to all crew members and all worktrees.
+**Every code-touching bead runs `/ship-auto <bd-id>`.** See `.agents/commands/ship-auto.md`. Headless — no human plan-gate — **but plan review and code review still run** (tiers per `.agents/skills/review-tiers/`, dual minimum). Trident is **3 Claude + 3 Codex + 1 Gemini**.
+
+Escalate by parking the bead (`status=blocked` + structured ESCALATION comment), never by `AskUserQuestion`. The human sweeps `bd list --status blocked` on their own cadence.
+
+**Narrow exception lane — may proceed without full /ship-auto** (per moss's 882n.7.1 proposal):
+- Audit / triage / review / harness work.
+- Narrow bug fixes that restore documented broken behavior: ≤2 files **or** ≤300 LOC, **no** invariant-path changes (store / hashlife / world / svdag / wgsl / rule-system).
+- Diagnostics, repro harnesses, assertions, test additions, logging, small reverts.
+- Review/audit setup work that doesn't change ship policy.
+
+**Must go through /ship-auto** (no exception lane):
+- New features or capability expansion, even if small.
+- Broad refactors / cross-module cleanups whose main value is code quality.
+- Algorithm, caching, serialization, buffer-layout, renderer/sim contract changes.
+- Changes to invariant-bearing paths.
+- Crew-policy changes that alter review gates, landing rules, or what counts as done.
+
+If ambiguous, route through /ship-auto. An extra review is cheap; a shipped bug in invariant-bearing code is not.
+
+The prior blanket feature freeze (2026-04-13 → 2026-04-19) is dropped; this directive replaces it as the durable rigor posture.
 
 ---
 
@@ -36,7 +55,7 @@ This project is designed to work with **any of three CLI agents**: Claude Code (
 - **`.agents/skills/`** holds the skill definitions the workflows reference, most importantly `review-tiers/SKILL.md` which `/ship` reads to pick its review tier.
 - **Refreshing from `~/.claude/`**: if edward updates his global Claude config, re-sync via `.agents/README.md`'s refresh command. Drift is a file the claude-md-edit queue (or any seat noticing stale content) should refile.
 
-**Why this matters for cost**: edward's Claude Code $200/month plan is maxing out. Shifting review workload from all-Claude trident (9 Claude agents) to real-trident (3 Claude + 3 Codex + 3 Gemini) saves ~2/3 of Claude token spend. That only works if Codex and Gemini sessions can read the same project instructions and workflows — which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
+**Why this matters for cost**: edward's Claude Code $200/month plan maxes out when trident is all-Claude (9 Claude agents). Shifting to multi-modal trident — **3 Claude + 3 Codex + 1 Gemini** — saves roughly 2/3 of Claude token spend. Only works if Codex and Gemini sessions can read the same project instructions and workflows, which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
 
 **When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
 
