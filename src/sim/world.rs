@@ -2363,6 +2363,39 @@ pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &
     }
 }
 
+/// 1D column variant of [`gravity_gap_fill`] (hash-thing-jw3k.1).
+///
+/// Operates on a single `(x, z)` column (length = `side`), mutating in place.
+/// Returns `true` when any swap fired so callers can skip the splice step
+/// for unchanged columns.
+///
+/// In-place mutation is load-bearing: the 3D loop evaluates `y = 1..side-1`
+/// in order and later iterations read values that earlier iterations wrote.
+/// A fresh-read variant (read whole column, write to an out-buffer) would
+/// diverge on cascade patterns like `[B, A, B, B]` — see Rev 2 plan tests.
+pub fn gravity_gap_fill_column(column: &mut [CellState], materials: &MaterialRegistry) -> bool {
+    let side = column.len();
+    if side < 3 {
+        return false;
+    }
+    let mut changed = false;
+    for y in 1..side - 1 {
+        let below = Cell::from_raw(column[y - 1]);
+        let cur = Cell::from_raw(column[y]);
+        let above = Cell::from_raw(column[y + 1]);
+        if cur.is_empty()
+            && !above.is_empty()
+            && materials.block_rule_id_for_cell(above).is_some()
+            && !below.is_empty()
+            && materials.block_rule_id_for_cell(below).is_some()
+        {
+            column.swap(y, y + 1);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Get the 26 Moore neighbors of a cell. Out-of-bounds neighbors are
 /// `Cell::EMPTY` (absorbing boundary), matching hashlife's infinite-world
 /// semantics.
@@ -5387,5 +5420,112 @@ mod tests {
             (post_push_rate - 1.0).abs() < 1e-9,
             "after eviction window is all-hit → rate = 1.0, got {post_push_rate}",
         );
+    }
+
+    // ---- 1D gravity_gap_fill_column tests (hash-thing-jw3k.1) ----
+
+    /// Build a test material registry where `STONE` is a block-rule material
+    /// and air (0) is empty. Matches what the default sim registry gives us.
+    fn gap_fill_materials() -> MaterialRegistry {
+        MaterialRegistry::terrain_defaults()
+    }
+
+    /// SAND has the gravity block_rule in terrain_defaults; STONE is inert.
+    /// Tests below use SAND for the "block_rule" role.
+    fn sand_cell() -> CellState {
+        SAND
+    }
+
+    #[test]
+    fn gap_fill_column_empty_no_op() {
+        let mat = gap_fill_materials();
+        let mut col: Vec<CellState> = vec![0; 8];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert!(col.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn gap_fill_column_solid_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col: Vec<CellState> = vec![sand; 8];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert!(col.iter().all(|&c| c == sand));
+    }
+
+    #[test]
+    fn gap_fill_column_block_air_block_triple_swaps() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        // y=1 sees below=sand, above=sand → swap cell[1] with cell[2].
+        assert_eq!(col, vec![sand, sand, 0]);
+    }
+
+    #[test]
+    fn gap_fill_column_block_air_air_block_no_swap() {
+        // Rev 2 fix: both above AND below must be block_rule; two adjacent
+        // airs in the middle fail the predicate on both y=1 and y=2.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, 0, sand];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, 0, 0, sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_cascade_babab() {
+        // [B,A,B,A,B]: y=1 swaps (above=B, below=B) → [B,B,A,A,B].
+        // y=2 above=A → skip. y=3 below=A → skip. Single-pass semantics.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand, 0, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, sand, 0, 0, sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_in_place_vs_fresh_read_divergence() {
+        // [B,A,B,B] under in-place semantics:
+        //   y=1: above=B, below=B → swap 1↔2 → [B,B,A,B]
+        //   y=2: cur=A (freshly swapped), above=B, below=B → swap 2↔3 → [B,B,B,A]
+        // A fresh-read variant would end at [B,B,A,B] (y=2 reads original B at idx 2).
+        // This test pins that gravity_gap_fill_column mutates in place.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(
+            col,
+            vec![sand, sand, sand, 0],
+            "in-place semantics: y=2 must see the fresh value written at y=1",
+        );
+    }
+
+    #[test]
+    fn gap_fill_column_boundary_y0_and_y_max_untouched() {
+        let mat = gap_fill_materials();
+        // Air at y=0 and y=side-1 never participates (y ranges 1..side-1).
+        let mut col: Vec<CellState> = vec![0, 0, 0];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+    }
+
+    #[test]
+    fn gap_fill_column_side_1_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_side_2_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, 0]);
     }
 }

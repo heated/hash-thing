@@ -43,20 +43,33 @@ use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 
 /// Per-phase micro-timing of one [`World::step_recursive_profiled`] invocation
-/// (hash-thing-jw3k diagnostic harness). All fields are microseconds.
+/// (hash-thing-jw3k diagnostic harness). All `_us` fields are microseconds.
+///
+/// hash-thing-jw3k.1 split: `flatten_us + gap_fill_loop_us + from_flat_us`
+/// (full-world flatten/fill/rebuild round-trip) was replaced by
+/// `column_walk_us + splice_us + dirty_columns` (per-column walk + targeted
+/// splice for columns that changed). The total phase name is still "gap_fill";
+/// see [`Self::gap_fill_us`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepProfile {
     pub total_us: u64,
     pub step_node_us: u64,
-    pub flatten_us: u64,
-    pub gap_fill_loop_us: u64,
-    pub from_flat_us: u64,
+    /// Time spent walking all columns (flatten per column + 1D gap_fill).
+    pub column_walk_us: u64,
+    /// Time spent in [`NodeStore::splice_column`] for columns that changed.
+    /// Subset of `column_walk_us` — reported separately so callers can tell
+    /// whether rebuild cost or walk cost dominates.
+    pub splice_us: u64,
+    /// Count of columns where `gravity_gap_fill_column` reported a change
+    /// (i.e. triggered a splice). Lets the bench verify the ~10% dirty
+    /// assumption against real scene dynamics.
+    pub dirty_columns: u32,
     pub compact_us: u64,
 }
 
 impl StepProfile {
     pub fn gap_fill_us(&self) -> u64 {
-        self.flatten_us + self.gap_fill_loop_us + self.from_flat_us
+        self.column_walk_us
     }
 }
 
@@ -92,18 +105,72 @@ impl World {
             .push(step_stats.cache_hits, step_stats.cache_misses);
 
         // Post-step gravity gap-fill: prevents Margolus rarefaction.
-        // Applied on the flattened grid (same as brute-force path) because
-        // gap-fill is a non-local vertical operation that doesn't decompose
-        // into hashlife's recursive structure.
         if self.has_block_rule_cells() {
-            let side = self.side();
-            let mut grid = self.store.flatten(self.root, side);
-            super::world::gravity_gap_fill(&mut grid, side, &self.materials);
-            self.root = self.store.from_flat(&grid, side);
+            self.apply_gap_fill_column_path();
         }
 
         self.generation += 1;
 
+        self.maybe_compact();
+    }
+
+    /// Per-column gap-fill path (hash-thing-jw3k.1). Walks each `(x, z)`
+    /// column through the octree, runs the 1D gap-fill on the extracted
+    /// cells, and splices back only when the column changed. Preserves
+    /// hash-cons sharing for the majority of columns that don't change.
+    ///
+    /// Caller is responsible for gating on `has_block_rule_cells()`.
+    pub fn apply_gap_fill_column_path(&mut self) {
+        let side = self.side();
+        let mut column: Vec<CellState> = vec![0; side];
+        for z in 0..side as u64 {
+            for x in 0..side as u64 {
+                self.store.flatten_column_into(self.root, x, z, &mut column);
+                if super::world::gravity_gap_fill_column(&mut column, &self.materials) {
+                    self.root = self.store.splice_column(self.root, x, z, &column);
+                }
+            }
+        }
+    }
+
+    /// Old full-world gap-fill path, preserved for the cross-check regression
+    /// test (`step_recursive_column_gap_fill_matches_flatten_rebuild_per_step`).
+    /// Flattens the whole world, runs the 3D `gravity_gap_fill`, rebuilds
+    /// from the flat buffer. Scoped for deletion in a follow-up bead once the
+    /// column path has been running without drift in CI for multiple gens.
+    #[cfg(test)]
+    pub fn apply_gap_fill_via_flatten_rebuild(&mut self) {
+        let side = self.side();
+        let mut grid = self.store.flatten(self.root, side);
+        super::world::gravity_gap_fill(&mut grid, side, &self.materials);
+        self.root = self.store.from_flat(&grid, side);
+    }
+
+    /// Test-only: run only the Margolus/hashlife portion of `step_recursive`,
+    /// stopping before the post-step gap-fill. Used by the cross-check
+    /// regression test to sandwich the column path and the flatten-rebuild
+    /// path around a common pre-gap-fill root.
+    #[cfg(test)]
+    pub fn step_margolus_only(&mut self) {
+        assert!(self.level >= 3);
+        self.hashlife_stats = super::world::HashlifeStats::default();
+        let padded_root = self.pad_root();
+        let padded_level = self.level + 1;
+        let period = self.materials.memo_period();
+        let phase = self.generation % period;
+        let result = self.step_node(padded_root, padded_level, phase);
+        self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
+    }
+
+    /// Test-only: finish a step that was started via `step_margolus_only`
+    /// and gap-filled externally. Advances generation and runs `maybe_compact`.
+    #[cfg(test)]
+    pub fn finalize_step_after_external_gap_fill(&mut self) {
+        self.generation += 1;
         self.maybe_compact();
     }
 
@@ -131,18 +198,24 @@ impl World {
         self.memo_window
             .push(step_stats.cache_hits, step_stats.cache_misses);
 
-        let (flatten_us, gap_fill_loop_us, from_flat_us) = if self.has_block_rule_cells() {
+        let (column_walk_us, splice_us, dirty_columns) = if self.has_block_rule_cells() {
             let side = self.side();
-            let t_flat = std::time::Instant::now();
-            let mut grid = self.store.flatten(self.root, side);
-            let flat_us = t_flat.elapsed().as_micros() as u64;
-            let t_gf = std::time::Instant::now();
-            super::world::gravity_gap_fill(&mut grid, side, &self.materials);
-            let gf_us = t_gf.elapsed().as_micros() as u64;
-            let t_ff = std::time::Instant::now();
-            self.root = self.store.from_flat(&grid, side);
-            let ff_us = t_ff.elapsed().as_micros() as u64;
-            (flat_us, gf_us, ff_us)
+            let mut column: Vec<CellState> = vec![0; side];
+            let mut splice_us: u64 = 0;
+            let mut dirty: u32 = 0;
+            let t_walk = std::time::Instant::now();
+            for z in 0..side as u64 {
+                for x in 0..side as u64 {
+                    self.store.flatten_column_into(self.root, x, z, &mut column);
+                    if super::world::gravity_gap_fill_column(&mut column, &self.materials) {
+                        let t_sp = std::time::Instant::now();
+                        self.root = self.store.splice_column(self.root, x, z, &column);
+                        splice_us += t_sp.elapsed().as_micros() as u64;
+                        dirty += 1;
+                    }
+                }
+            }
+            (t_walk.elapsed().as_micros() as u64, splice_us, dirty)
         } else {
             (0, 0, 0)
         };
@@ -156,9 +229,9 @@ impl World {
         StepProfile {
             total_us: t0.elapsed().as_micros() as u64,
             step_node_us,
-            flatten_us,
-            gap_fill_loop_us,
-            from_flat_us,
+            column_walk_us,
+            splice_us,
+            dirty_columns,
             compact_us,
         }
     }
@@ -1813,5 +1886,93 @@ mod tests {
             warm_after, fresh_after,
             "cached step must match fresh step at generation {STEPS} + 1"
         );
+    }
+
+    // ---- hash-thing-jw3k.1 cross-check: column-path == flatten-rebuild ----
+
+    /// Same-store hash-cons regression for the new column-local gap-fill path.
+    /// For each generation we snapshot the pre-gap-fill root, run the column
+    /// path, capture its root, reset to the snapshot, run the legacy
+    /// flatten/gap_fill/from_flat path on the same store, and assert the two
+    /// resulting roots are identical NodeIds. Same-store canonicality means
+    /// NodeId equality is sufficient — two hash-consed DAGs that encode the
+    /// same grid must land on the same id in the same store.
+    #[test]
+    fn step_recursive_column_gap_fill_matches_flatten_rebuild_per_step() {
+        use crate::terrain::TerrainParams;
+
+        let mut world = World::new(7);
+        let params = TerrainParams::for_level(7);
+        world.seed_terrain(&params).unwrap();
+        world.seed_water_and_sand();
+
+        const GENS: u32 = 16;
+        for gen in 0..GENS {
+            world.step_margolus_only();
+            let pre_root = world.root;
+
+            world.apply_gap_fill_column_path();
+            let root_via_column = world.root;
+
+            world.root = pre_root;
+            world.apply_gap_fill_via_flatten_rebuild();
+            let root_via_flatten = world.root;
+
+            assert_eq!(
+                root_via_column, root_via_flatten,
+                "gen {gen}: column-path root must match flatten-rebuild root \
+                 (same-store hash-cons NodeId equality)",
+            );
+
+            world.root = root_via_column;
+            world.finalize_step_after_external_gap_fill();
+        }
+    }
+
+    // ---- hash-thing-jw3k.1 targeted column-path tests ----
+
+    #[test]
+    fn column_path_all_air_level3_no_change() {
+        let mut world = World::new(3);
+        let pre = world.root;
+        world.apply_gap_fill_column_path();
+        assert_eq!(world.root, pre, "all-air world must not change");
+    }
+
+    #[test]
+    fn column_path_all_sand_level3_no_change() {
+        let mut world = World::new(3);
+        let side = world.side() as u64;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    world.set(wc(x), wc(y), wc(z), crate::terrain::materials::SAND);
+                }
+            }
+        }
+        let pre = world.root;
+        world.apply_gap_fill_column_path();
+        assert_eq!(world.root, pre, "all-sand world has no gaps to fill");
+    }
+
+    /// Triple pattern at a boundary (0,0,0)-(0,2,0) → gap_fill_column swaps.
+    /// Confirms column walking reaches boundary (x,z) coordinates correctly.
+    #[test]
+    fn column_path_boundary_corner_triple_swaps() {
+        use crate::terrain::materials::SAND;
+        let mut world = World::new(3);
+        // sand at y=0 and y=2, air at y=1, all at (x=0,z=0)
+        world.set(wc(0), wc(0), wc(0), SAND);
+        world.set(wc(0), wc(2), wc(0), SAND);
+
+        world.apply_gap_fill_column_path();
+
+        // After gap_fill: sand at y=0 and y=1, air at y=2
+        let side = world.side();
+        let grid = world.store.flatten(world.root, side);
+        let idx = |x: usize, y: usize, z: usize| x + y * side + z * side * side;
+        assert_eq!(grid[idx(0, 0, 0)], SAND, "y=0 unchanged");
+        assert_eq!(grid[idx(0, 1, 0)], SAND, "y=1 received sand from y=2");
+        assert_eq!(grid[idx(0, 2, 0)], 0, "y=2 became air");
     }
 }
