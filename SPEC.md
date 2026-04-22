@@ -313,6 +313,25 @@ Possible encoding (illustrative, not final):
 
 Open questions: whether the breakable/unbreakable distinction belongs in the cell ID or in a material property table. Whether "structural" should be a bit flag or a range. Whether indirection (cell points to extension table) is worth the hashlife-memo complexity.
 
+### World scale
+
+**One cell ≠ one meter.** Cells are a sub-meter spatial unit; `CELLS_PER_METER`
+(declared in src/scale.rs, currently `4.0`) converts player-facing physical
+quantities (m/s, gravity, bounding box, interact range) to cells. At the
+current setting each cell is 0.25 m along a world axis, so the default
+`DEFAULT_VOLUME_SIZE = 8192` world is 2048 m on a side, with 8192³ ≈ 5.5 × 10¹¹
+cells worth of addressable resolution. The DAG never pays for unique cells,
+only for unique sub-tree structure, so the cell count is set aggressively.
+
+**The knob is designed to move.** Bumping `CELLS_PER_METER` (and
+`DEFAULT_VOLUME_SIZE` in lockstep so the world-in-meters stays fixed) shrinks
+cells further — move away from Minecraft-scale blocks toward
+particle/sand-grain resolution. Terrain generator parameters are expressed in
+scaled cells via `TerrainParams::for_level` and follow along automatically;
+demo waypoints are fractions of the world side; rendering normalizes to
+`[0,1]` so neither needs per-bump retuning. See hash-thing-69cq for the first
+bump (1.0 → 4.0 cells/m, 2048³ → 8192³).
+
 ### Simulation model
 
 **Hybrid Path D: reaction-phase (pure CA) + movement-phase (Margolus blocks).** Both phases operate directly on the octree via recursive Hashlife stepping; the flatten-to-grid path is a temporary testing scaffold only.

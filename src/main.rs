@@ -1,6 +1,7 @@
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
+use hash_thing::scale::CELLS_PER_METER;
 use hash_thing::sim;
 use hash_thing::terrain;
 
@@ -19,7 +20,7 @@ use winit::{
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
 
-const DEFAULT_VOLUME_SIZE: u32 = 2048;
+const DEFAULT_VOLUME_SIZE: u32 = 8192;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -866,7 +867,7 @@ impl App {
         let Some(player) = self.entities.get_mut(pid) else {
             return false;
         };
-        player.pos = [center[0], center[1] + 2.0, center[2]];
+        player.pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         true
     }
 
@@ -884,7 +885,7 @@ impl App {
                 held_material: 1,
             });
         let center = self.world_center();
-        let pos = [center[0], center[1] + 2.0, center[2]];
+        let pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         self.entities = sim::EntityStore::new();
         self.player_id = Some(self.entities.add(
             pos,
@@ -896,25 +897,41 @@ impl App {
 
     fn spawn_demo_entities(&mut self) {
         let center = self.world_center();
-        let mid_y = center[1] + 1.0;
+        let mid_y = center[1] + 1.0 * CELLS_PER_METER;
         self.entities.add(
-            [center[0] - 10.0, mid_y, center[2] - 4.0],
+            [
+                center[0] - 10.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 4.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::geyser()),
         );
         self.entities.add(
-            [center[0] + 10.0, mid_y + 2.0, center[2] + 6.0],
+            [
+                center[0] + 10.0 * CELLS_PER_METER,
+                mid_y + 2.0 * CELLS_PER_METER,
+                center[2] + 6.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::volcano()),
         );
         self.entities.add(
-            [center[0] + 2.0, mid_y, center[2] - 12.0],
+            [
+                center[0] + 2.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 12.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::whirlpool()),
         );
         for offset in [-8.0, 0.0, 8.0] {
             self.entities.add(
-                [center[0] + offset, mid_y, center[2] + 12.0],
+                [
+                    center[0] + offset * CELLS_PER_METER,
+                    mid_y,
+                    center[2] + 12.0 * CELLS_PER_METER,
+                ],
                 [0.0; 3],
                 sim::EntityKind::Critter(sim::CritterState::new(
                     hash_thing::terrain::materials::VINE_MATERIAL_ID,
@@ -1813,8 +1830,16 @@ impl ApplicationHandler for App {
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
                         winit::keyboard::Key::Character("s")
-                            if self.camera_mode == CameraMode::Orbit && !self.is_stepping() =>
+                            if self.camera_mode != CameraMode::Orbit =>
                         {
+                            log::debug!("s ignored: single-step only in Orbit mode (current=FPS)");
+                        }
+                        winit::keyboard::Key::Character("s") if self.is_stepping() => {
+                            log::debug!(
+                                "s ignored: single-step denied while background step is in flight"
+                            );
+                        }
+                        winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
@@ -1913,7 +1938,9 @@ impl ApplicationHandler for App {
                                         sim::GameOfLife3D::new(4, 7, 6, 8),
                                         "Pyroclastic",
                                     ),
-                                    _ => {}
+                                    _ => log::debug!(
+                                        "digit {digit} ignored in Orbit mode: rule selection uses 1-4 only"
+                                    ),
                                 }
                             }
                         }
@@ -1975,10 +2002,15 @@ impl ApplicationHandler for App {
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
                         }
+                        winit::keyboard::Key::Character("p") if self.is_stepping() => {
+                            log::debug!(
+                                "p ignored: perf dump denied while background step is in flight"
+                            );
+                        }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
                         // cadence.
-                        winit::keyboard::Key::Character("p") if !self.is_stepping() => {
+                        winit::keyboard::Key::Character("p") => {
                             let nodes = self.world.store.stats();
                             self.mem_stats.update(nodes);
                             let (svdag_nodes, svdag_bytes, svdag_root_level) =
@@ -2360,7 +2392,7 @@ impl ApplicationHandler for App {
                         // Skipped during background step — world is placeholder.
                         if !self.is_stepping() {
                             if let Some(p) = self.entities.get_mut(pid) {
-                                const GROWTH_MARGIN: f64 = 8.0;
+                                const GROWTH_MARGIN: f64 = 8.0 * CELLS_PER_METER;
                                 let origin = self.world.origin;
                                 let side = self.world.side() as f64;
                                 let pos = p.pos;
@@ -3024,7 +3056,10 @@ mod tests {
             .find(|entity| entity.id == pid)
             .expect("player entity should still exist");
         let center = app.world_center();
-        assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
+        assert_eq!(
+            player.pos,
+            [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]]
+        );
     }
 
     #[test]
