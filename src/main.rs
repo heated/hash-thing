@@ -197,6 +197,15 @@ enum PendingSceneSwap {
     LoadLatticePanoramaDemo,
 }
 
+impl PendingSceneSwap {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LoadLatticeDemo => "lattice_demo",
+            Self::LoadLatticePanoramaDemo => "lattice_panorama",
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LatticeDemoBeat {
@@ -965,7 +974,7 @@ impl App {
     /// sides so repro sessions can tell "queued vs dropped" apart.
     fn request_scene_swap(&mut self, swap: PendingSceneSwap) {
         if self.is_stepping() {
-            log::info!("Scene swap queued during step: {:?}", swap);
+            log::info!("Scene swap queued during step: {}", swap.label());
             self.pending_scene_swap = Some(swap);
         } else {
             self.dispatch_scene_swap(swap);
@@ -983,7 +992,7 @@ impl App {
         let Some(swap) = self.pending_scene_swap.take() else {
             return;
         };
-        log::info!("Scene swap executing after step: {:?}", swap);
+        log::info!("Scene swap executing after step: {}", swap.label());
         self.dispatch_scene_swap(swap);
     }
 
@@ -1439,10 +1448,6 @@ impl App {
     }
 
     fn load_lattice_demo(&mut self) {
-        log::info!(
-            "load_lattice_demo entered (stepping={})",
-            self.is_stepping()
-        );
         if self.is_stepping() {
             // Without this log the `n` key looks dead during a long sim
             // step — see hash-thing-1a1n. The completion log at the end
@@ -1485,10 +1490,6 @@ impl App {
     }
 
     fn load_lattice_panorama_demo(&mut self) {
-        log::info!(
-            "load_lattice_panorama_demo entered (stepping={})",
-            self.is_stepping()
-        );
         self.start_lattice_short_demo_cut();
     }
 
