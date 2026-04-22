@@ -465,6 +465,17 @@ fn smooth_fps(prev: f64, instant: f64, alpha: f64) -> f64 {
     }
 }
 
+/// Split the per-frame elapsed time into `(dt_wall, dt_clamped)`.
+///
+/// The clamped value keeps xa7 player movement bounded under a hiccup
+/// (pos += vel * dt); the wall value feeds the d9af EWMA title readout
+/// so real sub-10-FPS frames aren't capped at "10 FPS" (hash-thing-dvzl).
+fn compute_frame_dts(elapsed: std::time::Duration) -> (f64, f64) {
+    let dt_wall = elapsed.as_secs_f64();
+    let dt_clamped = dt_wall.min(0.1);
+    (dt_wall, dt_clamped)
+}
+
 fn default_legend_visibility(_mode: CameraMode) -> bool {
     // Default-on until proper demo lineup lands (edward 2026-04-21).
     true
@@ -2009,8 +2020,12 @@ impl ApplicationHandler for App {
                     self.load_initial_scene();
                 }
 
-                // Frame delta time for frame-rate-independent movement (xa7).
-                let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
+                // Frame delta time. `dt` is clamped to 0.1s for xa7
+                // player movement (a 500ms hiccup must not teleport the
+                // player). `dt_wall` is the unclamped wall-clock value for
+                // the EWMA title readout — without it, sub-10-FPS frames
+                // all report "10 FPS" because 1.0 / 0.1 = 10 (dvzl).
+                let (dt_wall, dt) = compute_frame_dts(self.last_frame.elapsed());
                 self.last_frame = std::time::Instant::now();
                 self.update_lattice_short_demo_cut();
 
@@ -2021,8 +2036,8 @@ impl ApplicationHandler for App {
                 // dt==0 (back-to-back redraws within one timer tick) skips
                 // the update rather than blending a 0-FPS sample that
                 // would silently decay the readout by 5%.
-                if dt > 0.0 {
-                    self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt, 0.05);
+                if dt_wall > 0.0 {
+                    self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
                 }
                 if let Some(window) = &self.window {
                     if let Some(renderer) = &self.renderer {
@@ -2558,6 +2573,26 @@ mod tests {
             s = smooth_fps(s, 60.0, 0.05);
         }
         assert!((s - 60.0).abs() < 0.1, "expected ~60, got {s}");
+    }
+
+    // hash-thing-dvzl: the EWMA title readout must not get the 100ms
+    // clamp, or frames slower than 10 FPS all round-trip to exactly "10".
+    // xa7 movement still uses the clamped value.
+
+    #[test]
+    fn compute_frame_dts_preserves_wall_for_slow_frames() {
+        let (wall, clamped) = compute_frame_dts(Duration::from_millis(200));
+        assert!((wall - 0.2).abs() < 1e-12, "wall dt must not clamp; got {wall}");
+        assert!((clamped - 0.1).abs() < 1e-12, "clamped dt must cap at 0.1; got {clamped}");
+    }
+
+    #[test]
+    fn compute_frame_dts_matches_below_clamp() {
+        // At typical frame times the two values coincide — the clamp only
+        // bites above 100ms.
+        let (wall, clamped) = compute_frame_dts(Duration::from_millis(16));
+        assert!((wall - 0.016).abs() < 1e-12);
+        assert!((clamped - 0.016).abs() < 1e-12);
     }
 
     #[test]
