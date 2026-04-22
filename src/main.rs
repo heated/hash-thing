@@ -178,6 +178,21 @@ enum PendingPlayerAction {
     PlaceClone,
 }
 
+/// Scene-swap request queued while a background sim step is in flight.
+///
+/// Keeps `pending_scene_swap` separate from `pending_player_action`: player
+/// actions are FIFO lightweight edits against the next live world, while
+/// scene swaps replace the world/entities/render state wholesale. A later
+/// scene-selection key overwrites the queued request, and any direct scene
+/// load (including `R`/reset and `T`/terrain) clears it — if the user has
+/// already picked something else, a stale queued swap would feel like a
+/// surprise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingSceneSwap {
+    LoadLatticeDemo,
+    LoadLatticePanoramaDemo,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LatticeDemoBeat {
@@ -378,6 +393,10 @@ struct App {
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
+    /// Defer a scene-swap requested while stepping; drained after step
+    /// completion in the same slot as `pending_player_action`. Last-write
+    /// wins; any unrelated scene-change key clears it. (hash-thing-a9jd)
+    pending_scene_swap: Option<PendingSceneSwap>,
     /// Latest modifier key state, tracked via ModifiersChanged. Feeds
     /// `reconcile_modifier_keys` to clear stuck physical-key entries
     /// when a modifier change arrives without a matching Released event.
@@ -520,6 +539,7 @@ impl App {
             startup_scene_pending: true,
             cursor_captured: false,
             pending_player_action: None,
+            pending_scene_swap: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
             memo_hud_visible: std::env::var("HASH_THING_MEMO_HUD").ok().as_deref() == Some("1"),
@@ -535,7 +555,9 @@ impl App {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
         }
         if let Some(qos) = app.sim_qos {
-            log::info!("HASH_THING_SIM_QOS active: sim thread will request QoS 0x{qos:02x} (xhi6 diagnostic)");
+            log::info!(
+                "HASH_THING_SIM_QOS active: sim thread will request QoS 0x{qos:02x} (xhi6 diagnostic)"
+            );
         }
 
         // Seed the cached memo summary so the very first periodic log line
@@ -552,7 +574,9 @@ impl App {
             player_pos[1],
             player_pos[2]
         );
-        log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
+        log::info!(
+            "Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit"
+        );
 
         app
     }
@@ -868,6 +892,33 @@ impl App {
         }
     }
 
+    /// Queue a scene swap when the sim step is on the background thread, or
+    /// run it immediately otherwise (hash-thing-a9jd). The logs name both
+    /// sides so repro sessions can tell "queued vs dropped" apart.
+    fn request_scene_swap(&mut self, swap: PendingSceneSwap) {
+        if self.is_stepping() {
+            log::info!("Scene swap queued during step: {:?}", swap);
+            self.pending_scene_swap = Some(swap);
+        } else {
+            self.dispatch_scene_swap(swap);
+        }
+    }
+
+    fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
+        match swap {
+            PendingSceneSwap::LoadLatticeDemo => self.load_lattice_demo(),
+            PendingSceneSwap::LoadLatticePanoramaDemo => self.load_lattice_panorama_demo(),
+        }
+    }
+
+    fn run_pending_scene_swap(&mut self) {
+        let Some(swap) = self.pending_scene_swap.take() else {
+            return;
+        };
+        log::info!("Scene swap executing after step: {:?}", swap);
+        self.dispatch_scene_swap(swap);
+    }
+
     /// Legend text lines for the current camera mode.
     fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
         match mode {
@@ -908,7 +959,7 @@ impl App {
                 "  M  Gyroid     N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
-                "  V  DEV tweet reveal",
+                "  V  Panorama reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
@@ -1286,6 +1337,8 @@ impl App {
         if self.is_stepping() {
             return;
         }
+        // a9jd: a successful scene load supersedes any queued lattice swap.
+        self.pending_scene_swap = None;
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let stats = self.world.seed_gyroid_megastructure();
@@ -1318,6 +1371,10 @@ impl App {
     }
 
     fn load_lattice_demo(&mut self) {
+        log::info!(
+            "load_lattice_demo entered (stepping={})",
+            self.is_stepping()
+        );
         if self.is_stepping() {
             return;
         }
@@ -1354,6 +1411,10 @@ impl App {
     }
 
     fn load_lattice_panorama_demo(&mut self) {
+        log::info!(
+            "load_lattice_panorama_demo entered (stepping={})",
+            self.is_stepping()
+        );
         self.start_lattice_short_demo_cut();
     }
 
@@ -1361,6 +1422,8 @@ impl App {
         if self.is_stepping() {
             return;
         }
+        // a9jd: a successful scene load supersedes any queued lattice swap.
+        self.pending_scene_swap = None;
         let nodes_before = self.world.store.stats();
         let start = std::time::Instant::now();
         let stats = self
@@ -1604,6 +1667,9 @@ impl ApplicationHandler for App {
                         }
                         winit::keyboard::Key::Character("g") if !self.is_stepping() => {
                             // Swap to the single retained GoL smoke seed.
+                            // a9jd: supersede any queued lattice swap so the
+                            // user's latest scene pick wins.
+                            self.pending_scene_swap = None;
                             self.world = sim::World::new(self.volume_size.trailing_zeros());
                             self.world.set_gol_smoke_rule(self.gol_smoke_rule);
                             self.world.seed_center(12, 0.35);
@@ -1627,7 +1693,7 @@ impl ApplicationHandler for App {
                             self.load_gyroid_demo();
                         }
                         winit::keyboard::Key::Character("n") => {
-                            self.load_lattice_demo();
+                            self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
                         }
                         winit::keyboard::Key::Character("[")
                             if self.lattice_debug_jumps_enabled() =>
@@ -1654,10 +1720,13 @@ impl ApplicationHandler for App {
                         {
                             self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
                         }
-                        winit::keyboard::Key::Character("v")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.load_lattice_panorama_demo();
+                        winit::keyboard::Key::Character("v") => {
+                            // a9jd: the short-demo cut is the user-facing
+                            // demo entry (not an orbit-only debug jump),
+                            // so no camera-mode gate. `[`, `]`, `u`/`i`/`o`
+                            // keep their debug gates — those are genuine
+                            // beat-cycle jumps.
+                            self.request_scene_swap(PendingSceneSwap::LoadLatticePanoramaDemo);
                         }
                         winit::keyboard::Key::Character(
                             n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
@@ -1941,6 +2010,7 @@ impl ApplicationHandler for App {
 
                 if !self.is_stepping() {
                     self.run_pending_player_action();
+                    self.run_pending_scene_swap();
                 }
 
                 // Wall-clock perf summary (hash-thing-q63). Sits outside the
@@ -2306,7 +2376,7 @@ fn main() {
     log::info!("  N: lattice walk-through demo");
     log::info!("  [/] DEV previous/next lattice jump (orbit mode)");
     log::info!("  U/I/O: DEV intro/interior/reveal lattice jumps (orbit mode)");
-    log::info!("  V: DEV panoramic lattice reveal jump (orbit mode)");
+    log::info!("  V: Panoramic lattice reveal (timed demo cut)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
@@ -2554,9 +2624,11 @@ mod tests {
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
         assert!(!lines.iter().any(|line| line.contains("Fly down")));
         assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(!lines
-            .iter()
-            .any(|line| line.contains("DEV intro/interior/reveal")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("DEV intro/interior/reveal"))
+        );
         assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
@@ -2565,9 +2637,11 @@ mod tests {
     fn orbit_legend_marks_lattice_jumps_as_debug() {
         let lines = App::legend_lines(CameraMode::Orbit);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("DEV intro/interior/reveal")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("DEV intro/interior/reveal"))
+        );
         assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
