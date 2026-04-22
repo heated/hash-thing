@@ -2938,6 +2938,16 @@ mod tests {
             ),
             BeatAdvance::Hold
         );
+        // Boundary is inclusive (>=): elapsed == INTERIOR_AT must advance.
+        // Pins the semantics so a future refactor to strict `>` would flip
+        // this test.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(LatticeShortDemoCut::INTERIOR_AT)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
+        );
         assert_eq!(
             LatticeShortDemoCut::advance(
                 Some(LatticeDemoBeat::Intro),
