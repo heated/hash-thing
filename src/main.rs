@@ -27,6 +27,11 @@ const DEFAULT_VOLUME_SIZE: u32 = 2048;
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
+/// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
+/// the threshold at which a human reads a changing number without
+/// jitter (hash-thing-4ioh).
+const TITLE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Thin wrapper over macOS `pthread_set_qos_class_self_np` used as the
 /// xhi6 diagnostic knob (proxy 2 for SVDAG↔sim cache-locality work).
 /// `parse` maps the `HASH_THING_SIM_QOS` env string to a `qos_class_t`
@@ -195,6 +200,10 @@ enum PendingPlayerAction {
 enum PendingSceneSwap {
     LoadLatticeDemo,
     LoadLatticePanoramaDemo,
+    ResetTerrain,
+    LoadGyroid,
+    LoadDemoSpectacle,
+    ResetGolSmoke,
 }
 
 impl PendingSceneSwap {
@@ -202,6 +211,10 @@ impl PendingSceneSwap {
         match self {
             Self::LoadLatticeDemo => "lattice_demo",
             Self::LoadLatticePanoramaDemo => "lattice_panorama",
+            Self::ResetTerrain => "terrain_reset",
+            Self::LoadGyroid => "gyroid",
+            Self::LoadDemoSpectacle => "demo_spectacle",
+            Self::ResetGolSmoke => "gol_smoke_reset",
         }
     }
 }
@@ -401,6 +414,11 @@ struct App {
     /// just for the human skimming the title bar (hash-thing-d9af).
     /// Zero sentinel: first frame seeds the filter at its instant value.
     smoothed_fps: f64,
+    /// Throttle for `window.set_title` — at 60 FPS an unthrottled
+    /// title update is unreadable even with EWMA smoothing, and the
+    /// OS sees 60 title rewrites per second. Rewrite at ~4 Hz
+    /// (hash-thing-4ioh). `None` before the first title update.
+    last_title_update: Option<std::time::Instant>,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -509,6 +527,16 @@ fn compute_frame_dts(elapsed: std::time::Duration) -> (f64, f64) {
     (dt_wall, dt_clamped)
 }
 
+/// Title-refresh throttle gate (hash-thing-4ioh). Returns `true` on
+/// the first call (`last` is `None`) and on any call at least
+/// `TITLE_REFRESH_INTERVAL` past the previous refresh.
+fn should_refresh_title(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= TITLE_REFRESH_INTERVAL,
+    }
+}
+
 fn default_legend_visibility(_mode: CameraMode) -> bool {
     // Default-on until proper demo lineup lands (edward 2026-04-21).
     true
@@ -592,6 +620,10 @@ impl App {
             noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
             smoothed_fps: 0.0,
+            // None so the first frame refreshes the title immediately
+            // — without an `Instant` sentinel before the monotonic
+            // epoch, which could underflow on some platforms.
+            last_title_update: None,
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
@@ -1018,6 +1050,15 @@ impl App {
                 let _ = self.load_lattice_demo();
             }
             PendingSceneSwap::LoadLatticePanoramaDemo => self.load_lattice_panorama_demo(),
+            PendingSceneSwap::ResetTerrain => self.load_terrain_scene(
+                "Reset terrain",
+                terrain::TerrainParams::for_level(self.volume_size.trailing_zeros()),
+            ),
+            PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
+            PendingSceneSwap::LoadDemoSpectacle => {
+                self.load_demo_spectacle("Reset spectacle gallery")
+            }
+            PendingSceneSwap::ResetGolSmoke => self.reset_gol_smoke_scene(),
         }
     }
 
@@ -1489,6 +1530,30 @@ impl App {
         );
     }
 
+    fn reset_gol_smoke_scene(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.set_gol_smoke_rule(self.gol_smoke_rule);
+        self.world.seed_center(12, 0.35);
+        self.gol_smoke_scene = true;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
+    }
+
     fn load_lattice_demo(&mut self) -> Option<sim::DemoLayout> {
         if self.is_stepping() {
             // Without this log the `n` key looks dead during a long sim
@@ -1616,6 +1681,11 @@ impl ApplicationHandler for App {
                 &mut self.last_svdag_stats,
             );
             self.sync_cursor_capture();
+            // 4ioh: new window starts with the bootstrap title. Clear
+            // the throttle sentinel so the first real frame refreshes
+            // the title immediately instead of waiting out the 250 ms
+            // interval from a previous window's refresh.
+            self.last_title_update = None;
             // Some macOS / agent launches do not schedule an initial redraw
             // on their own. Arm the first frame explicitly so startup scene
             // generation and the steady redraw loop can begin.
@@ -1769,64 +1839,21 @@ impl ApplicationHandler for App {
                                 self.world.population()
                             );
                         }
-                        winit::keyboard::Key::Character("r") => {
-                            // a9jd: latest scene pick wins. Clear *before* the
-                            // loader so it fires even if the loader drops
-                            // under `is_stepping()`.
-                            self.pending_scene_swap = None;
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
-                        }
-                        winit::keyboard::Key::Character("t") => {
-                            // Plain terrain remains available as an explicit
-                            // toggle, but is no longer the default scene.
-                            self.pending_scene_swap = None;
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
+                        winit::keyboard::Key::Character("r" | "t") => {
+                            // Queue through PendingSceneSwap so a press during
+                            // a background sim step lands at the next step
+                            // boundary instead of being silently dropped by
+                            // load_terrain_scene's is_stepping guard
+                            // (hash-thing-u5ik). `r` and `t` share the same
+                            // terrain reset today; split in the future if the
+                            // keys diverge.
+                            self.request_scene_swap(PendingSceneSwap::ResetTerrain);
                         }
                         winit::keyboard::Key::Character("g") => {
-                            // a9jd: clear the queue unconditionally so a `g`
-                            // during a background step supersedes a queued
-                            // lattice swap, even though the actual load is
-                            // dropped below.
-                            self.pending_scene_swap = None;
-                            if !self.is_stepping() {
-                                // Swap to the single retained GoL smoke seed.
-                                self.world = sim::World::new(self.volume_size.trailing_zeros());
-                                self.world.set_gol_smoke_rule(self.gol_smoke_rule);
-                                self.world.seed_center(12, 0.35);
-                                self.gol_smoke_scene = true;
-                                self.paused = true;
-                                self.perf.clear();
-                                self.mem_stats.reset_peaks();
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                                Self::upload_volume(
-                                    &mut self.renderer,
-                                    &mut self.world,
-                                    &mut self.svdag,
-                                    &mut self.last_svdag_stats,
-                                );
-                                self.sync_render_cache();
-                                log::info!(
-                                    "Reset GoL smoke sphere: pop={}",
-                                    self.world.population()
-                                );
-                            }
+                            self.request_scene_swap(PendingSceneSwap::ResetGolSmoke);
                         }
                         winit::keyboard::Key::Character("m") => {
-                            self.pending_scene_swap = None;
-                            self.load_gyroid_demo();
+                            self.request_scene_swap(PendingSceneSwap::LoadGyroid);
                         }
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
@@ -1893,8 +1920,7 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("b") => {
                             // Default demo gallery: deterministic local fire/water set pieces
                             // staged around the beat waypoints.
-                            self.pending_scene_swap = None;
-                            self.load_demo_spectacle("Reset spectacle gallery");
+                            self.request_scene_swap(PendingSceneSwap::LoadDemoSpectacle);
                         }
                         winit::keyboard::Key::Character("c") => {
                             // dlse.2.2: drain perf histograms so the next `P`
@@ -2086,13 +2112,22 @@ impl ApplicationHandler for App {
                 if dt_wall > 0.0 {
                     self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
                 }
-                if let Some(window) = &self.window {
-                    if let Some(renderer) = &self.renderer {
-                        let scale_pct = (renderer.render_scale * 100.0) as u32;
-                        window.set_title(&format!(
-                            "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                            self.smoothed_fps, self.volume_size, scale_pct,
-                        ));
+                // Throttle title refresh to ~4 Hz. EWMA-smoothed
+                // FPS still jitters between integer readings on the
+                // {:.0} boundary (e.g. 59/60 flicker), and 60 title
+                // rewrites per second hands the OS more repaint work
+                // than a human can read anyway (hash-thing-4ioh).
+                let now = std::time::Instant::now();
+                if should_refresh_title(self.last_title_update, now) {
+                    if let Some(window) = &self.window {
+                        if let Some(renderer) = &self.renderer {
+                            let scale_pct = (renderer.render_scale * 100.0) as u32;
+                            window.set_title(&format!(
+                                "hash-thing | {:.0} FPS | {}³ | scale {}%",
+                                self.smoothed_fps, self.volume_size, scale_pct,
+                            ));
+                            self.last_title_update = Some(now);
+                        }
                     }
                 }
 
@@ -2646,6 +2681,29 @@ mod tests {
         let (wall, clamped) = compute_frame_dts(Duration::from_millis(16));
         assert!((wall - 0.016).abs() < 1e-12);
         assert!((clamped - 0.016).abs() < 1e-12);
+    }
+
+    // hash-thing-4ioh: title-refresh throttle fires on the first frame
+    // (`None` seed) and then suppresses rewrites until the interval
+    // elapses. At 60 FPS this collapses ~15 per-frame rewrites into one.
+    #[test]
+    fn should_refresh_title_fires_on_first_frame() {
+        let now = std::time::Instant::now();
+        assert!(should_refresh_title(None, now));
+    }
+
+    #[test]
+    fn should_refresh_title_suppresses_within_interval() {
+        let last = std::time::Instant::now();
+        let soon = last + TITLE_REFRESH_INTERVAL / 2;
+        assert!(!should_refresh_title(Some(last), soon));
+    }
+
+    #[test]
+    fn should_refresh_title_fires_at_interval_boundary() {
+        let last = std::time::Instant::now();
+        let later = last + TITLE_REFRESH_INTERVAL;
+        assert!(should_refresh_title(Some(last), later));
     }
 
     #[test]
