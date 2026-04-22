@@ -27,6 +27,11 @@ const DEFAULT_VOLUME_SIZE: u32 = 2048;
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
+/// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
+/// the threshold at which a human reads a changing number without
+/// jitter (hash-thing-4ioh).
+const TITLE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Thin wrapper over macOS `pthread_set_qos_class_self_np` used as the
 /// xhi6 diagnostic knob (proxy 2 for SVDAG↔sim cache-locality work).
 /// `parse` maps the `HASH_THING_SIM_QOS` env string to a `qos_class_t`
@@ -377,6 +382,11 @@ struct App {
     /// just for the human skimming the title bar (hash-thing-d9af).
     /// Zero sentinel: first frame seeds the filter at its instant value.
     smoothed_fps: f64,
+    /// Throttle for `window.set_title` — at 60 FPS an unthrottled
+    /// title update is unreadable even with EWMA smoothing, and the
+    /// OS sees 60 title rewrites per second. Rewrite at ~4 Hz
+    /// (hash-thing-4ioh). `None` before the first title update.
+    last_title_update: Option<std::time::Instant>,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -485,6 +495,16 @@ fn compute_frame_dts(elapsed: std::time::Duration) -> (f64, f64) {
     (dt_wall, dt_clamped)
 }
 
+/// Title-refresh throttle gate (hash-thing-4ioh). Returns `true` on
+/// the first call (`last` is `None`) and on any call at least
+/// `TITLE_REFRESH_INTERVAL` past the previous refresh.
+fn should_refresh_title(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= TITLE_REFRESH_INTERVAL,
+    }
+}
+
 fn default_legend_visibility(_mode: CameraMode) -> bool {
     // Default-on until proper demo lineup lands (edward 2026-04-21).
     true
@@ -568,6 +588,10 @@ impl App {
             noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
             smoothed_fps: 0.0,
+            // None so the first frame refreshes the title immediately
+            // — without an `Instant` sentinel before the monotonic
+            // epoch, which could underflow on some platforms.
+            last_title_update: None,
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
@@ -657,8 +681,7 @@ impl App {
     }
 
     fn sync_cursor_capture(&mut self) {
-        let should_capture =
-            should_capture_cursor(self.camera_mode, self.focused, self.occluded);
+        let should_capture = should_capture_cursor(self.camera_mode, self.focused, self.occluded);
         if should_capture == self.cursor_captured {
             return;
         }
@@ -1460,9 +1483,7 @@ impl App {
             // Without this log the `n` key looks dead during a long sim
             // step — see hash-thing-1a1n. The completion log at the end
             // of this function covers the success path.
-            log::info!(
-                "load_lattice_demo: deferred — background sim step in flight"
-            );
+            log::info!("load_lattice_demo: deferred — background sim step in flight");
             return;
         }
         let start = std::time::Instant::now();
@@ -1583,6 +1604,11 @@ impl ApplicationHandler for App {
                 &mut self.last_svdag_stats,
             );
             self.sync_cursor_capture();
+            // 4ioh: new window starts with the bootstrap title. Clear
+            // the throttle sentinel so the first real frame refreshes
+            // the title immediately instead of waiting out the 250 ms
+            // interval from a previous window's refresh.
+            self.last_title_update = None;
             // Some macOS / agent launches do not schedule an initial redraw
             // on their own. Arm the first frame explicitly so startup scene
             // generation and the steady redraw loop can begin.
@@ -2053,13 +2079,22 @@ impl ApplicationHandler for App {
                 if dt_wall > 0.0 {
                     self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
                 }
-                if let Some(window) = &self.window {
-                    if let Some(renderer) = &self.renderer {
-                        let scale_pct = (renderer.render_scale * 100.0) as u32;
-                        window.set_title(&format!(
-                            "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                            self.smoothed_fps, self.volume_size, scale_pct,
-                        ));
+                // Throttle title refresh to ~4 Hz. EWMA-smoothed
+                // FPS still jitters between integer readings on the
+                // {:.0} boundary (e.g. 59/60 flicker), and 60 title
+                // rewrites per second hands the OS more repaint work
+                // than a human can read anyway (hash-thing-4ioh).
+                let now = std::time::Instant::now();
+                if should_refresh_title(self.last_title_update, now) {
+                    if let Some(window) = &self.window {
+                        if let Some(renderer) = &self.renderer {
+                            let scale_pct = (renderer.render_scale * 100.0) as u32;
+                            window.set_title(&format!(
+                                "hash-thing | {:.0} FPS | {}³ | scale {}%",
+                                self.smoothed_fps, self.volume_size, scale_pct,
+                            ));
+                            self.last_title_update = Some(now);
+                        }
                     }
                 }
 
@@ -2596,8 +2631,14 @@ mod tests {
     #[test]
     fn compute_frame_dts_preserves_wall_for_slow_frames() {
         let (wall, clamped) = compute_frame_dts(Duration::from_millis(200));
-        assert!((wall - 0.2).abs() < 1e-12, "wall dt must not clamp; got {wall}");
-        assert!((clamped - 0.1).abs() < 1e-12, "clamped dt must cap at 0.1; got {clamped}");
+        assert!(
+            (wall - 0.2).abs() < 1e-12,
+            "wall dt must not clamp; got {wall}"
+        );
+        assert!(
+            (clamped - 0.1).abs() < 1e-12,
+            "clamped dt must cap at 0.1; got {clamped}"
+        );
     }
 
     #[test]
@@ -2607,6 +2648,29 @@ mod tests {
         let (wall, clamped) = compute_frame_dts(Duration::from_millis(16));
         assert!((wall - 0.016).abs() < 1e-12);
         assert!((clamped - 0.016).abs() < 1e-12);
+    }
+
+    // hash-thing-4ioh: title-refresh throttle fires on the first frame
+    // (`None` seed) and then suppresses rewrites until the interval
+    // elapses. At 60 FPS this collapses ~15 per-frame rewrites into one.
+    #[test]
+    fn should_refresh_title_fires_on_first_frame() {
+        let now = std::time::Instant::now();
+        assert!(should_refresh_title(None, now));
+    }
+
+    #[test]
+    fn should_refresh_title_suppresses_within_interval() {
+        let last = std::time::Instant::now();
+        let soon = last + TITLE_REFRESH_INTERVAL / 2;
+        assert!(!should_refresh_title(Some(last), soon));
+    }
+
+    #[test]
+    fn should_refresh_title_fires_at_interval_boundary() {
+        let last = std::time::Instant::now();
+        let later = last + TITLE_REFRESH_INTERVAL;
+        assert!(should_refresh_title(Some(last), later));
     }
 
     #[test]
@@ -2833,11 +2897,9 @@ mod tests {
     fn orbit_legend_marks_lattice_jumps_as_debug() {
         let lines = App::legend_lines(CameraMode::Orbit);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("DEV intro/interior/reveal"))
-        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("DEV intro/interior/reveal")));
         // a9jd: `[`, `]`, `U`/`I`/`O` remain DEV beat-cycle jumps, but `V`
         // is the user-facing panorama reveal — not a DEV-only key.
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
@@ -3005,8 +3067,7 @@ mod tests {
         for mode in [CameraMode::FirstPerson, CameraMode::Orbit] {
             for focused in [false, true] {
                 for occluded in [false, true] {
-                    let expected =
-                        mode == CameraMode::FirstPerson && focused && !occluded;
+                    let expected = mode == CameraMode::FirstPerson && focused && !occluded;
                     assert_eq!(
                         should_capture_cursor(mode, focused, occluded),
                         expected,
@@ -3125,7 +3186,10 @@ mod tests {
         }
         let (yaw, _pitch) = player_look(&mut app);
         assert!(yaw >= -pi, "yaw {yaw} below -π after accumulation");
-        assert!(yaw < pi, "yaw {yaw} not strictly below +π after accumulation");
+        assert!(
+            yaw < pi,
+            "yaw {yaw} not strictly below +π after accumulation"
+        );
     }
 
     #[test]
@@ -3234,7 +3298,10 @@ mod tests {
         // Post-flip: MouseMotion must now be dropped.
         app.handle_mouse_motion(999.0, 999.0);
         let (yaw, pitch) = player_look(&mut app);
-        assert!((yaw - yaw_cap).abs() < 1e-12, "MouseMotion dropped after flip");
+        assert!(
+            (yaw - yaw_cap).abs() < 1e-12,
+            "MouseMotion dropped after flip"
+        );
         assert!((pitch - pitch_cap).abs() < 1e-12);
 
         // Post-flip: CursorMoved must apply again. Re-seed so the first
@@ -3332,8 +3399,7 @@ mod tests {
         let mut app = App::new(64);
         app.enter_occluded_state();
         // Pretend the app sat paused for two seconds.
-        app.last_frame = std::time::Instant::now()
-            - std::time::Duration::from_secs(2);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
         app.leave_occluded_state();
 
