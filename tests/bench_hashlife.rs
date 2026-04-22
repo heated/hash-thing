@@ -1,10 +1,12 @@
 //! Hashlife step benchmarks at multiple world scales (m1f.1).
 //!
-//! Run with: `cargo test --release -p hash-thing --test bench_hashlife -- --ignored --nocapture`
+//! Run with: `cargo test --profile bench -p hash-thing --test bench_hashlife -- --ignored --nocapture`
 //!
 //! These are `#[ignore]` tests, not criterion benchmarks, to avoid adding
-//! dependencies. The `--release` flag is critical — debug builds are 10-50x
-//! slower and not representative of real performance.
+//! dependencies. `--profile bench` is the intended perf profile per repo
+//! policy — it inherits release opts but drops LTO for fast iteration and
+//! stays representative for relative latency comparisons (debug builds are
+//! 10-50x slower and not representative).
 //!
 //! Confidence note: this file is observational only. It prints timings and
 //! cache stats for manual comparison; it does not enforce a machine-checked

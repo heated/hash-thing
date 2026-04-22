@@ -438,9 +438,19 @@ impl NodeStore {
     /// Mirrors `flatten_column_into`'s topology walk; rebuilds interior nodes
     /// along the column path and reuses hash-cons for off-path subtrees.
     /// Intermediate `Leaf(state)` nodes are expanded into 8 uniform children
-    /// before descending — same pattern as `set_cell_at`. If the column is
-    /// identical to the one already present, hash-cons deduplication returns
-    /// the original root NodeId (structural-sharing regression signal).
+    /// before descending — same pattern as `set_cell_at`.
+    ///
+    /// **Identity / sharing guarantee** (subtle): if the column is identical
+    /// to the one already present AND no intermediate `Leaf(state)` node
+    /// sits along the column path, hash-cons deduplication returns the
+    /// original root NodeId. If a raw `Leaf(state)` child IS along the path,
+    /// it gets canonicalized to `uniform(level-1, state)` (the expanded
+    /// form), and the returned root has a new NodeId even though the grid
+    /// is unchanged. See test
+    /// `splice_column_identity_through_raw_leaf_child_expands_but_grid_matches`
+    /// for the pinned behavior. Production gap-fill only reaches here when
+    /// the column actually changed, so this structural drift is bounded in
+    /// jw3k.1; making splice canonical-preserving is scoped for a follow-up.
     pub fn splice_column(
         &mut self,
         root: NodeId,
@@ -2200,6 +2210,58 @@ mod tests {
         // Other columns in the stone subtree untouched.
         assert_eq!(store.get_cell(new_root, 0, 2, 0), stone);
         assert_eq!(store.get_cell(new_root, 3, 2, 3), stone);
+    }
+
+    /// Pins current splice behavior through an intermediate raw `Leaf(s)`
+    /// child (compressed-subtree representation). On identity splice, the
+    /// Leaf child is expanded to its `uniform(level-1, s)` form — grid is
+    /// preserved, but the root NodeId is NOT the same as the input.
+    ///
+    /// This drops structural sharing for compressed subtrees touched by an
+    /// identity splice. In the jw3k.1 production path, `splice_column` is
+    /// only called when `gravity_gap_fill_column` actually mutated the
+    /// column, so identity-through-Leaf is not hit — but callers using
+    /// `splice_column` outside the gap-fill gate should be aware.
+    ///
+    /// Follow-up bead (jw3k.3 / jw3k.2) scoped to make splice preserve the
+    /// compressed form via post-build canonicalization.
+    #[test]
+    fn splice_column_identity_through_raw_leaf_child_expands_but_grid_matches() {
+        let mut store = NodeStore::new();
+        let stone = mat(0x301);
+        // Level-2 interior (side=4). children[0] is raw Leaf(stone) — a
+        // compressed level-1 uniform-stone subtree (distinct from
+        // uniform(1, stone) which is interior(1, [leaf(stone); 8])).
+        let leaf_stone = store.leaf(stone);
+        let empty_l1 = store.empty(1);
+        let mut children = [empty_l1; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(2, children);
+
+        // Column at (x=0, z=0) passes through children[0] for y<2.
+        let mut col = vec![0 as CellState; 4];
+        store.flatten_column_into(root, 0, 0, &mut col);
+        assert_eq!(col, vec![stone, stone, 0, 0], "column read correctly");
+
+        // Identity splice — column unchanged from what flatten gave us.
+        let new_root = store.splice_column(root, 0, 0, &col);
+
+        // Grid equivalence holds.
+        for y in 0..4u64 {
+            let expected = if y < 2 { stone } else { 0 };
+            assert_eq!(
+                store.get_cell(new_root, 0, y, 0),
+                expected,
+                "grid preserved at (0,{y},0)",
+            );
+        }
+        // Document: root NodeId changes because raw Leaf gets canonicalized.
+        // (If this ever starts asserting root == new_root after a canonical-
+        // izing splice fix, update this test's header comment.)
+        assert_ne!(
+            new_root, root,
+            "current behavior: raw Leaf child is expanded to uniform form",
+        );
     }
 
     #[test]
