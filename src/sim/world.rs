@@ -3080,8 +3080,7 @@ mod tests {
         let stats = &world.hashlife_stats_total;
         let p1 = stats.phase1_ns;
         let p2 = stats.phase2_ns;
-        let pct =
-            |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
+        let pct = |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
         eprintln!("--- hashlife phase timing scout: 64^3 water, {N_STEPS} steps ---");
         eprintln!("  wall_total:    {:.2} ms", wall_total_ns as f64 / 1e6);
         eprintln!(
@@ -3109,8 +3108,7 @@ mod tests {
             "  cache_hits={} cache_misses={} (hit_rate={:.3})",
             stats.cache_hits,
             stats.cache_misses,
-            stats.cache_hits as f64
-                / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+            stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
         );
     }
 
@@ -3744,8 +3742,18 @@ mod tests {
     }
 
     /// Wire a gravity block rule onto specific materials and return the world.
+    ///
+    /// Materials sharing a BlockRule must share a `tick_divisor` (iowh
+    /// invariant, enforced at rebuild time per hash-thing-lw75.1.1). WATER
+    /// ships with `tick_divisor = 2`; every other terrain material defaults
+    /// to 1. Normalize all wired materials to `tick_divisor = 1` before
+    /// assigning, so the gravity tests exercise single-step drops under one
+    /// consistent schedule.
     fn gravity_world(materials_with_gravity: &[u16]) -> World {
         let mut world = World::new(3); // 8x8x8
+        for &mat_id in materials_with_gravity {
+            world.set_material_tick_divisor(mat_id, 1);
+        }
         let gravity_id = world
             .materials
             .register_block_rule(GravityBlockRule::new(simple_density));

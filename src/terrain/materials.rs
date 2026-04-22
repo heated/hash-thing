@@ -817,21 +817,42 @@ impl MaterialRegistry {
     /// Rebuild both tick-divisor caches. Called after every mutation path that
     /// could change either the per-material divisors or the block-rule table.
     /// Cost is O(entries + block_rules) — small constants in practice.
+    ///
+    /// Panics if any two materials sharing one BlockRule have different
+    /// `tick_divisor`s (iowh invariant). Enforcing here — rather than only in
+    /// [`Self::validate_shared_block_rule_divisors`] called at end-of-
+    /// construction — catches mismatch at the mutator boundary, so any
+    /// future construction path that forgets the trailing validate call still
+    /// fails loudly instead of silently picking last-wins (hash-thing-lw75.1.1).
     fn rebuild_tick_caches(&mut self) {
         self.cached_tick_divisor_flags = self
             .entries
             .iter()
             .map(|entry| entry.as_ref().map(|e| e.tick_divisor.max(1)).unwrap_or(1))
             .collect();
-        let mut per_rule = vec![0u16; self.block_rules.len()];
-        for entry in self.entries.iter().filter_map(|e| e.as_ref()) {
-            if let Some(BlockRuleId(id)) = entry.block_rule_id {
-                per_rule[id] = entry.tick_divisor.max(1);
+        let mut per_rule: Vec<Option<(u16, MaterialId)>> = vec![None; self.block_rules.len()];
+        for (material_id, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            let Some(BlockRuleId(id)) = entry.block_rule_id else {
+                continue;
+            };
+            let d = entry.tick_divisor.max(1);
+            match per_rule[id] {
+                None => per_rule[id] = Some((d, material_id as MaterialId)),
+                Some((first_d, first_mat)) if first_d != d => {
+                    panic!(
+                        "shared BlockRule {} has mixed tick_divisors: material {} = {}, \
+                         material {} = {}. Materials that share a BlockRule must share a \
+                         tick_divisor (iowh invariant).",
+                        id, first_mat, first_d, material_id, d
+                    );
+                }
+                Some(_) => {}
             }
         }
         self.cached_block_rule_tick_divisors = per_rule
             .into_iter()
-            .map(|d| if d == 0 { 1 } else { d })
+            .map(|slot| slot.map(|(d, _)| d).unwrap_or(1))
             .collect();
     }
 
@@ -941,7 +962,6 @@ impl MaterialRegistry {
             .as_mut()
             .unwrap_or_else(|| panic!("material {material_id} must exist to set tick_divisor"))
             .tick_divisor = divisor;
-        self.validate_shared_block_rule_divisors();
         self.rebuild_tick_caches();
     }
 
@@ -1607,6 +1627,68 @@ mod tests {
         registry.validate_shared_block_rule_divisors();
     }
 
+    /// hash-thing-lw75.1.1: the shared-BlockRule invariant must fire at the
+    /// mutator boundary, not only from a trailing `validate_shared_block_rule_divisors`
+    /// call. Omits the explicit validate — if `rebuild_tick_caches` doesn't
+    /// catch the mismatch, the test fails. Guards against a future
+    /// construction path that forgets the trailing validate call.
+    #[test]
+    #[should_panic(expected = "mixed tick_divisors")]
+    fn insert_rejects_mixed_divisors_on_shared_block_rule_without_explicit_validate() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        // Second insert must panic from inside rebuild_tick_caches — no
+        // trailing validate_shared_block_rule_divisors() call.
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 6,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+    }
+
+    /// hash-thing-lw75.1.1: parallel coverage for the `assign_block_rule`
+    /// mutator path. Two materials with mismatched `tick_divisor`s sharing one
+    /// `BlockRule` via post-insert assignment must panic from rebuild, without
+    /// any explicit validate call.
+    #[test]
+    #[should_panic(expected = "mixed tick_divisors")]
+    fn assign_block_rule_rejects_mixed_divisors_without_explicit_validate() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: None,
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 6,
+                block_rule_id: None,
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+        registry.assign_block_rule(0, block_rule_id);
+        // Second assign must panic from inside rebuild_tick_caches.
+        registry.assign_block_rule(1, block_rule_id);
+    }
+
     /// T4 (iowh review): `set_tick_divisor(0)` panics rather than silently
     /// clamping. Protects the dispatcher's `is_multiple_of` gate and the
     /// author's expectation that `>= 1` means "fires at least every N ticks".
@@ -1662,7 +1744,8 @@ mod tests {
     fn block_rule_tick_divisors_cache_tracks_post_insert_reassignment() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
-        let first_block_rule = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let first_block_rule =
+            registry.register_block_rule(GravityBlockRule::new(material_density));
         registry.insert(
             0,
             MaterialEntry {
