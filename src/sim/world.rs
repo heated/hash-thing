@@ -5109,6 +5109,10 @@ mod tests {
         assert!(summary.contains("memo_tbl="));
         assert!(summary.contains("memo_mac="));
         assert!(summary.contains("memo_mac_bytes="));
+        // hash-thing-71mp: guard the phase-timing output contract so the
+        // fields can't silently disappear under a future refactor.
+        assert!(summary.contains("p1="));
+        assert!(summary.contains("p2="));
     }
 
     /// hash-thing-z7uu: `macro_cache_bytes_est()` must equal
