@@ -435,6 +435,15 @@ struct App {
     /// just for the human skimming the title bar (hash-thing-d9af).
     /// Zero sentinel: first frame seeds the filter at its instant value.
     smoothed_fps: f64,
+    /// Set by reset sites that `last_frame = Instant::now()` outside the
+    /// redraw hot path (focus-gain, unocclude). The next RedrawRequested
+    /// sees a `dt_wall` that measures the event-dispatch-to-redraw gap
+    /// (microseconds), not a real frame; blending `1/dt_wall` into the
+    /// EWMA would spike the displayed FPS to millions and decay it over
+    /// many seconds. Consumed (cleared) on the first redraw after the
+    /// reset so subsequent frames measure normally (hash-thing-dxjb;
+    /// same class as hash-thing-6e4a, cold-startup path).
+    suppress_next_fps_sample: bool,
     /// Throttle for `window.set_title` — at 60 FPS an unthrottled
     /// title update is unreadable even with EWMA smoothing, and the
     /// OS sees 60 title rewrites per second. Rewrite at ~4 Hz
@@ -647,6 +656,7 @@ impl App {
             noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
             smoothed_fps: 0.0,
+            suppress_next_fps_sample: false,
             // None so the first frame refreshes the title immediately
             // — without an `Instant` sentinel before the monotonic
             // epoch, which could underflow on some platforms.
@@ -765,12 +775,30 @@ impl App {
     fn leave_occluded_state(&mut self) {
         self.occluded = false;
         self.last_mouse = None;
-        // Reset the frame timer so the next RedrawRequested sees a near-zero
-        // dt instead of `last_frame.elapsed()` clamped to 100ms — otherwise
-        // the resume frame poisons the EWMA FPS readout and applies a full
-        // 100ms player-movement step (hash-thing-xysz).
-        self.last_frame = std::time::Instant::now();
+        self.mark_resume_edge();
         self.sync_cursor_capture();
+    }
+
+    /// Post-pause resume edge (focus-gain, unocclude). The redraw loop
+    /// stops advancing while paused, so the next RedrawRequested would
+    /// see `last_frame.elapsed()` clamped to 100 ms — that's a full 100
+    /// ms player-movement step on a single frame (hash-thing-xysz) and
+    /// a huge dt that decays the EWMA FPS downward for seconds. Reset
+    /// `last_frame` to "now" so the next frame measures only the real
+    /// gap. BUT the very next RedrawRequested fires microseconds after
+    /// this reset, so `dt_wall` becomes the event-dispatch-to-redraw gap
+    /// — tiny — and blending `1/dt_wall` into the EWMA would spike the
+    /// readout into the millions (hash-thing-dxjb). Pair the reset with
+    /// `suppress_next_fps_sample = true` so the next FPS sample is
+    /// skipped, not blended. The two operations are one contract; this
+    /// helper is the only site that implements it — do not inline it.
+    /// (Cold-start scene-load has the same shape at
+    /// `WindowEvent::RedrawRequested` / `startup_scene_pending`;
+    /// routing that through this helper is hash-thing-6e4a's
+    /// territory, currently blocked on breakdown review.)
+    fn mark_resume_edge(&mut self) {
+        self.last_frame = std::time::Instant::now();
+        self.suppress_next_fps_sample = true;
     }
 
     /// Apply a raw pixel-delta mouse look to the player. Scales by
@@ -840,6 +868,24 @@ impl App {
             return;
         }
         self.apply_fps_look(dx, dy);
+    }
+
+    /// Blend `1 / dt_wall` into the EWMA-smoothed FPS readout, or skip
+    /// when a reset site has flagged this frame as bogus (hash-thing-dxjb).
+    /// A bogus frame is one where `last_frame` was reset outside the
+    /// redraw hot path (focus-gain, unocclude) so `dt_wall` is the event-
+    /// dispatch-to-redraw gap (microseconds), not a real frame. `dt==0`
+    /// (back-to-back redraws within one timer tick) is also skipped to
+    /// avoid blending a 0-FPS sample that would silently decay the
+    /// readout by 5%.
+    fn apply_fps_sample(&mut self, dt_wall: f64) {
+        if self.suppress_next_fps_sample {
+            self.suppress_next_fps_sample = false;
+            return;
+        }
+        if dt_wall > 0.0 {
+            self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
+        }
     }
 
     fn load_initial_scene(&mut self) {
@@ -1802,10 +1848,7 @@ impl ApplicationHandler for App {
                 self.focused = focused;
                 if focused {
                     self.last_mouse = None;
-                    // See leave_occluded_state: resume edges must reset the
-                    // frame timer or the first RedrawRequested dt clamps at
-                    // 100ms (hash-thing-xysz).
-                    self.last_frame = std::time::Instant::now();
+                    self.mark_resume_edge();
                     self.sync_cursor_capture();
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -2178,6 +2221,14 @@ impl ApplicationHandler for App {
                     // hundreds of ms at 256³. Reset so the first real frame's
                     // dt measures the frame, not the cold-start work
                     // (hash-thing-q07n; same pattern as xysz for resume edges).
+                    // NOTE: unlike `mark_resume_edge`, this site does NOT set
+                    // `suppress_next_fps_sample` — the dt_wall computed below
+                    // still feeds the EWMA with a microsecond-scale sample,
+                    // producing the "5,000,000 FPS on startup" readout
+                    // (hash-thing-6e4a). Routing this reset through
+                    // `mark_resume_edge` is 6e4a's fix, currently blocked on
+                    // breakdown review. When 6e4a unblocks, replace the
+                    // assignment below with `self.mark_resume_edge();`.
                     self.last_frame = std::time::Instant::now();
                 }
 
@@ -2190,16 +2241,7 @@ impl ApplicationHandler for App {
                 self.last_frame = std::time::Instant::now();
                 self.update_lattice_short_demo_cut();
 
-                // Update window title with smoothed FPS + resolution.
-                // EWMA smoothing keeps the readout readable at low FPS
-                // where a single slow frame would otherwise jerk the
-                // displayed number by several units (hash-thing-d9af).
-                // dt==0 (back-to-back redraws within one timer tick) skips
-                // the update rather than blending a 0-FPS sample that
-                // would silently decay the readout by 5%.
-                if dt_wall > 0.0 {
-                    self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
-                }
+                self.apply_fps_sample(dt_wall);
                 // Throttle title refresh to ~4 Hz. EWMA-smoothed
                 // FPS still jitters between integer readings on the
                 // {:.0} boundary (e.g. 59/60 flicker), and 60 title
@@ -3672,23 +3714,95 @@ mod tests {
         );
     }
 
-    // hash-thing-xysz: the redraw handler early-returns while paused so
-    // `last_frame` stops advancing. Resuming without a reset clamps the
-    // first dt to the 100ms guard, poisoning the EWMA and player movement.
+    // hash-thing-xysz + hash-thing-dxjb: the redraw handler early-returns
+    // while paused so `last_frame` stops advancing. Resuming without a
+    // reset clamps the first dt to the 100ms guard (xysz); resetting
+    // without suppressing the next FPS sample blends a microsecond
+    // dt_wall into the EWMA (dxjb). `mark_resume_edge` does both as one
+    // step; `leave_occluded_state_routes_through_mark_resume_edge` (below)
+    // verifies the unocclude path calls it.
+
+    // hash-thing-dxjb: the focus/unocclude resets happen outside the
+    // redraw hot path. The next RedrawRequested sees a near-zero dt —
+    // blending 1/dt_wall into the EWMA would spike the displayed FPS
+    // into the millions and take many seconds to decay. The paired
+    // `suppress_next_fps_sample` flag defuses that. Both resume edges
+    // route through `mark_resume_edge`, so the invariant (reset +
+    // suppress in lockstep) cannot drift by construction.
 
     #[test]
-    fn leave_occluded_state_resets_last_frame() {
+    fn mark_resume_edge_resets_last_frame_and_flags_suppress() {
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.suppress_next_fps_sample = false;
+
+        app.mark_resume_edge();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "mark_resume_edge must reset last_frame; elapsed was {:?}",
+            app.last_frame.elapsed()
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "mark_resume_edge must flag the next FPS sample as bogus"
+        );
+    }
+
+    #[test]
+    fn leave_occluded_state_routes_through_mark_resume_edge() {
         let mut app = App::new(64);
         app.enter_occluded_state();
-        // Pretend the app sat paused for two seconds.
+        app.suppress_next_fps_sample = false;
         app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
         app.leave_occluded_state();
 
         assert!(
             app.last_frame.elapsed() < std::time::Duration::from_millis(50),
-            "leave_occluded_state must reset last_frame; elapsed was {:?}",
-            app.last_frame.elapsed()
+            "unocclude must reset last_frame via mark_resume_edge"
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "unocclude must flag suppression via mark_resume_edge"
+        );
+    }
+
+    #[test]
+    fn apply_fps_sample_consumes_suppress_flag_without_blending() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 120.0;
+        app.suppress_next_fps_sample = true;
+
+        // A microsecond dt would normally push smoothed_fps past 50000
+        // in a single 0.05-alpha blend — verify we skip entirely.
+        app.apply_fps_sample(1e-6);
+
+        assert_eq!(
+            app.smoothed_fps, 120.0,
+            "suppress flag must skip the EWMA update on the flagged frame"
+        );
+        assert!(
+            !app.suppress_next_fps_sample,
+            "flag must be consumed after the suppressed frame"
+        );
+    }
+
+    #[test]
+    fn apply_fps_sample_blends_after_suppress_consumed() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 60.0;
+        app.suppress_next_fps_sample = true;
+
+        // First call: bogus frame, skipped.
+        app.apply_fps_sample(1e-6);
+        // Second call: real 60 FPS frame, should blend (identity here).
+        app.apply_fps_sample(1.0 / 60.0);
+
+        assert!(
+            (app.smoothed_fps - 60.0).abs() < 1e-9,
+            "subsequent real frames must blend normally; got {}",
+            app.smoothed_fps
         );
     }
 
