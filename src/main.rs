@@ -1183,6 +1183,11 @@ impl App {
             renderer.camera_pitch = pose.pitch;
             renderer.camera_dist = pose.dist;
         }
+        // Scene swaps and lattice beats can flip into Orbit from captured
+        // FPS (hash-thing-c4sm). Without this sync, `cursor_captured` stays
+        // true while `should_capture_cursor` is false, so the cursor is
+        // grabbed but no input path drives the orbit.
+        self.sync_cursor_capture();
     }
 
     fn load_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
@@ -3495,6 +3500,33 @@ mod tests {
             app.focused,
             app.occluded,
         ));
+    }
+
+    #[test]
+    fn apply_orbit_camera_pose_clears_cursor_captured_from_fps() {
+        // hash-thing-c4sm: scene swaps (V panorama) and lattice beats that
+        // terminate in Orbit previously left `cursor_captured = true` if the
+        // player was in captured FPS, because `apply_orbit_camera_pose`
+        // didn't sync cursor state. Symptom: grabbed cursor with no input
+        // path driving the orbit until the next focus/occlusion transition.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.cursor_captured = true;
+        let pose = OrbitCameraPose {
+            target: [0.0, 0.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            dist: 1.0,
+        };
+
+        app.apply_orbit_camera_pose(pose);
+
+        assert_eq!(app.camera_mode, CameraMode::Orbit);
+        assert!(
+            !app.cursor_captured,
+            "apply_orbit_camera_pose must sync cursor capture; orbit mode never captures",
+        );
     }
 
     // hash-thing-xysz: the redraw handler early-returns while paused so
