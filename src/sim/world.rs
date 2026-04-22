@@ -1048,7 +1048,7 @@ impl World {
                             bx,
                             by,
                             bz,
-                            Some(&block_rule_divisors),
+                            Some(block_rule_divisors),
                             pass_offset,
                         );
                         bx += 2;
