@@ -158,6 +158,16 @@ These are terrain/world presets — each would be a different terrain stack + ma
 >
 > **Demo materials (Powder Game set):** Sand, water, lava, steam, fire, oil, gunpowder, ice, acid, clone, plant/vine, stone, dirt. Space reserved for non-powder mechanics later. Fan and metal are easy future adds.
 
+### Alternate game directions to track (2026-04-21)
+
+> Basically, I think there's two more directions we could take this game. In one of them, we try to be satisfactory or factorio but in 3D. And in the other, we try to do something like Zachtronics or a puzzle game. So maybe a puzzle game that involves cellular automata mechanics or something. or just massive physical scale things. I want you to track those as directions we can go, and potentially block some future stuff on that sort of thing. We're not going to block the demo for now, but we might want to pivot to this direction and then make a different demo.
+
+Two alternate directions, tracked but not yet chosen:
+1. **3D Factorio / Satisfactory** — logistics / automation game in 3D voxel CA space.
+2. **Zachtronics-style puzzle** — CA-mechanics puzzles, or puzzles that exploit massive physical scale.
+
+Current demo (megastructure "sandbox → wow reveal") is not blocked on this choice. But future work that would lock us out of either direction should be flagged before landing. If the crew is ever weighing two implementations and one preserves optionality toward these, prefer that one.
+
 ---
 
 ## Extracted requirements (derived from the user's words above)
