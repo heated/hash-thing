@@ -1225,10 +1225,20 @@ impl App {
     /// from every scene loader so a scene swap can't leave the window-title
     /// FPS EWMA, perf histograms, and memory peak-marks anchored to the
     /// previous scene's regime (hash-thing-6nsh).
+    ///
+    /// Route the `last_frame` + `suppress_next_fps_sample` reset through
+    /// `mark_resume_edge` (hash-thing-v79j). The scene loaders that call
+    /// this helper then run terrain gen + SVDAG upload — hundreds of ms at
+    /// 256³ — before the next redraw. Without the resume edge, the first
+    /// post-swap `dt_wall` captures that upload time, and with
+    /// `smoothed_fps == 0.0` the `smooth_fps` zero-sentinel seeds the EWMA
+    /// at ~3 FPS (`1 / 0.33s`). Same shape as hash-thing-dxjb (focus edge)
+    /// and hash-thing-6e4a (cold-start).
     fn reset_scene_perf_state(&mut self) {
         self.perf.clear();
         self.mem_stats.reset_peaks();
         self.smoothed_fps = 0.0;
+        self.mark_resume_edge();
     }
 
     /// Get the player's eye position and look direction.
@@ -3009,6 +3019,30 @@ mod tests {
         app.reset_scene_perf_state();
 
         assert_eq!(app.smoothed_fps, 0.0);
+    }
+
+    #[test]
+    fn reset_scene_perf_state_routes_through_mark_resume_edge() {
+        // hash-thing-v79j: scene loaders call reset_scene_perf_state then
+        // spend hundreds of ms on terrain gen + SVDAG upload before the
+        // next redraw. Without the mark_resume_edge pairing, the first
+        // post-swap dt_wall captures that upload time and seeds the EWMA
+        // at ~3 FPS via the smooth_fps zero-sentinel branch.
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.suppress_next_fps_sample = false;
+
+        app.reset_scene_perf_state();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "scene reset must refresh last_frame via mark_resume_edge; elapsed was {:?}",
+            app.last_frame.elapsed()
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "scene reset must flag the next FPS sample as bogus via mark_resume_edge"
+        );
     }
 
     #[test]
