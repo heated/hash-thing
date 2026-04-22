@@ -1,6 +1,7 @@
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
+use hash_thing::scale::CELLS_PER_METER;
 use hash_thing::sim;
 use hash_thing::terrain;
 
@@ -19,7 +20,7 @@ use winit::{
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
 
-const DEFAULT_VOLUME_SIZE: u32 = 2048;
+const DEFAULT_VOLUME_SIZE: u32 = 8192;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -657,8 +658,7 @@ impl App {
     }
 
     fn sync_cursor_capture(&mut self) {
-        let should_capture =
-            should_capture_cursor(self.camera_mode, self.focused, self.occluded);
+        let should_capture = should_capture_cursor(self.camera_mode, self.focused, self.occluded);
         if should_capture == self.cursor_captured {
             return;
         }
@@ -811,7 +811,7 @@ impl App {
         let Some(player) = self.entities.get_mut(pid) else {
             return false;
         };
-        player.pos = [center[0], center[1] + 2.0, center[2]];
+        player.pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         true
     }
 
@@ -829,7 +829,7 @@ impl App {
                 held_material: 1,
             });
         let center = self.world_center();
-        let pos = [center[0], center[1] + 2.0, center[2]];
+        let pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         self.entities = sim::EntityStore::new();
         self.player_id = Some(self.entities.add(
             pos,
@@ -841,25 +841,41 @@ impl App {
 
     fn spawn_demo_entities(&mut self) {
         let center = self.world_center();
-        let mid_y = center[1] + 1.0;
+        let mid_y = center[1] + 1.0 * CELLS_PER_METER;
         self.entities.add(
-            [center[0] - 10.0, mid_y, center[2] - 4.0],
+            [
+                center[0] - 10.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 4.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::geyser()),
         );
         self.entities.add(
-            [center[0] + 10.0, mid_y + 2.0, center[2] + 6.0],
+            [
+                center[0] + 10.0 * CELLS_PER_METER,
+                mid_y + 2.0 * CELLS_PER_METER,
+                center[2] + 6.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::volcano()),
         );
         self.entities.add(
-            [center[0] + 2.0, mid_y, center[2] - 12.0],
+            [
+                center[0] + 2.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 12.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::whirlpool()),
         );
         for offset in [-8.0, 0.0, 8.0] {
             self.entities.add(
-                [center[0] + offset, mid_y, center[2] + 12.0],
+                [
+                    center[0] + offset * CELLS_PER_METER,
+                    mid_y,
+                    center[2] + 12.0 * CELLS_PER_METER,
+                ],
                 [0.0; 3],
                 sim::EntityKind::Critter(sim::CritterState::new(
                     hash_thing::terrain::materials::VINE_MATERIAL_ID,
@@ -1460,9 +1476,7 @@ impl App {
             // Without this log the `n` key looks dead during a long sim
             // step — see hash-thing-1a1n. The completion log at the end
             // of this function covers the success path.
-            log::info!(
-                "load_lattice_demo: deferred — background sim step in flight"
-            );
+            log::info!("load_lattice_demo: deferred — background sim step in flight");
             return;
         }
         let start = std::time::Instant::now();
@@ -2292,7 +2306,7 @@ impl ApplicationHandler for App {
                         // Skipped during background step — world is placeholder.
                         if !self.is_stepping() {
                             if let Some(p) = self.entities.get_mut(pid) {
-                                const GROWTH_MARGIN: f64 = 8.0;
+                                const GROWTH_MARGIN: f64 = 8.0 * CELLS_PER_METER;
                                 let origin = self.world.origin;
                                 let side = self.world.side() as f64;
                                 let pos = p.pos;
@@ -2596,8 +2610,14 @@ mod tests {
     #[test]
     fn compute_frame_dts_preserves_wall_for_slow_frames() {
         let (wall, clamped) = compute_frame_dts(Duration::from_millis(200));
-        assert!((wall - 0.2).abs() < 1e-12, "wall dt must not clamp; got {wall}");
-        assert!((clamped - 0.1).abs() < 1e-12, "clamped dt must cap at 0.1; got {clamped}");
+        assert!(
+            (wall - 0.2).abs() < 1e-12,
+            "wall dt must not clamp; got {wall}"
+        );
+        assert!(
+            (clamped - 0.1).abs() < 1e-12,
+            "clamped dt must cap at 0.1; got {clamped}"
+        );
     }
 
     #[test]
@@ -2833,11 +2853,9 @@ mod tests {
     fn orbit_legend_marks_lattice_jumps_as_debug() {
         let lines = App::legend_lines(CameraMode::Orbit);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("DEV intro/interior/reveal"))
-        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("DEV intro/interior/reveal")));
         // a9jd: `[`, `]`, `U`/`I`/`O` remain DEV beat-cycle jumps, but `V`
         // is the user-facing panorama reveal — not a DEV-only key.
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
@@ -2890,7 +2908,10 @@ mod tests {
             .find(|entity| entity.id == pid)
             .expect("player entity should still exist");
         let center = app.world_center();
-        assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
+        assert_eq!(
+            player.pos,
+            [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]]
+        );
     }
 
     #[test]
@@ -3005,8 +3026,7 @@ mod tests {
         for mode in [CameraMode::FirstPerson, CameraMode::Orbit] {
             for focused in [false, true] {
                 for occluded in [false, true] {
-                    let expected =
-                        mode == CameraMode::FirstPerson && focused && !occluded;
+                    let expected = mode == CameraMode::FirstPerson && focused && !occluded;
                     assert_eq!(
                         should_capture_cursor(mode, focused, occluded),
                         expected,
@@ -3125,7 +3145,10 @@ mod tests {
         }
         let (yaw, _pitch) = player_look(&mut app);
         assert!(yaw >= -pi, "yaw {yaw} below -π after accumulation");
-        assert!(yaw < pi, "yaw {yaw} not strictly below +π after accumulation");
+        assert!(
+            yaw < pi,
+            "yaw {yaw} not strictly below +π after accumulation"
+        );
     }
 
     #[test]
@@ -3234,7 +3257,10 @@ mod tests {
         // Post-flip: MouseMotion must now be dropped.
         app.handle_mouse_motion(999.0, 999.0);
         let (yaw, pitch) = player_look(&mut app);
-        assert!((yaw - yaw_cap).abs() < 1e-12, "MouseMotion dropped after flip");
+        assert!(
+            (yaw - yaw_cap).abs() < 1e-12,
+            "MouseMotion dropped after flip"
+        );
         assert!((pitch - pitch_cap).abs() < 1e-12);
 
         // Post-flip: CursorMoved must apply again. Re-seed so the first
@@ -3332,8 +3358,7 @@ mod tests {
         let mut app = App::new(64);
         app.enter_occluded_state();
         // Pretend the app sat paused for two seconds.
-        app.last_frame = std::time::Instant::now()
-            - std::time::Duration::from_secs(2);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
         app.leave_occluded_state();
 

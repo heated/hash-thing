@@ -50,26 +50,28 @@ pub enum CameraMode {
     FirstPerson,
 }
 
-/// Player movement speed in cells per second.
-pub const PLAYER_SPEED: f64 = 9.0;
+use crate::scale::CELLS_PER_METER;
+
+/// Player ground-movement speed (m/s). ~9 m/s is a fast human run.
+pub const PLAYER_SPEED: f64 = 9.0 * CELLS_PER_METER;
 /// Sprint multiplier.
 pub const PLAYER_SPRINT: f64 = 2.5;
-/// Jump launch speed in cells per second.
-pub const PLAYER_JUMP_SPEED: f64 = 8.5;
-/// Downward acceleration in cells per second squared.
-pub const PLAYER_GRAVITY: f64 = 28.0;
-/// Player bounding box half-width on X/Z (cells).
-pub const PLAYER_HALF_W: f64 = 0.3;
-/// Player height (cells).
-pub const PLAYER_HEIGHT: f64 = 1.6;
-/// Maximum vertical lift the collision solver will try to clear a low ledge.
-const STEP_UP_HEIGHT: f64 = 1.0;
-/// Maximum drop to snap down to a nearby floor when moving horizontally.
-const GROUND_SNAP_HEIGHT: f64 = 0.35;
-/// Mouse look sensitivity (radians per pixel).
+/// Jump launch speed (m/s).
+pub const PLAYER_JUMP_SPEED: f64 = 8.5 * CELLS_PER_METER;
+/// Downward acceleration (m/s²). Higher than real-world 9.8 for game-feel.
+pub const PLAYER_GRAVITY: f64 = 28.0 * CELLS_PER_METER;
+/// Player bounding box half-width on X/Z (m).
+pub const PLAYER_HALF_W: f64 = 0.3 * CELLS_PER_METER;
+/// Player height (m).
+pub const PLAYER_HEIGHT: f64 = 1.6 * CELLS_PER_METER;
+/// Maximum vertical lift the collision solver will try to clear a low ledge (m).
+const STEP_UP_HEIGHT: f64 = 1.0 * CELLS_PER_METER;
+/// Maximum drop to snap down to a nearby floor when moving horizontally (m).
+const GROUND_SNAP_HEIGHT: f64 = 0.35 * CELLS_PER_METER;
+/// Mouse look sensitivity (radians per pixel). Angular; scale-invariant.
 pub const LOOK_SENSITIVITY: f64 = 0.003;
-/// Maximum raycast range for block place/break (in cells).
-pub const INTERACT_RANGE: f64 = 40.0;
+/// Maximum raycast range for block place/break (m).
+pub const INTERACT_RANGE: f64 = 40.0 * CELLS_PER_METER;
 
 const GROUND_CONTACT_EPSILON: f64 = 0.05;
 const VERTICAL_COLLISION_STEPS: usize = 12;
@@ -133,14 +135,14 @@ impl FirstPersonCameraFeel {
             };
         }
 
-        let active = grounded && planar_speed > 0.1;
+        let active = grounded && planar_speed > 0.1 * CELLS_PER_METER;
         if !self.initialized {
             self.moving = active;
             self.grounded = grounded;
             self.initialized = true;
         }
         if active {
-            let cadence_hz = 1.2 + planar_speed * 0.12;
+            let cadence_hz = 1.2 + planar_speed * (0.12 / CELLS_PER_METER);
             self.phase = (self.phase + dt * cadence_hz * std::f64::consts::TAU)
                 .rem_euclid(std::f64::consts::TAU);
         }
@@ -148,12 +150,12 @@ impl FirstPersonCameraFeel {
         let speed_ratio = (planar_speed / (PLAYER_SPEED * PLAYER_SPRINT)).clamp(0.0, 1.0);
         let bob_gain = if sprinting { 1.3 } else { 1.0 };
         let target_vertical = if active {
-            -self.phase.sin().abs() * (0.012 + 0.014 * speed_ratio) * bob_gain
+            -self.phase.sin().abs() * (0.012 + 0.014 * speed_ratio) * bob_gain * CELLS_PER_METER
         } else {
             0.0
         };
         let target_lateral = if active {
-            self.phase.cos() * (0.005 + 0.007 * speed_ratio) * bob_gain
+            self.phase.cos() * (0.005 + 0.007 * speed_ratio) * bob_gain * CELLS_PER_METER
         } else {
             0.0
         };
@@ -163,10 +165,14 @@ impl FirstPersonCameraFeel {
         self.lateral += (target_lateral - self.lateral) * smoothing;
 
         if self.initialized && active != self.moving {
-            self.impulse = if active { 0.010 } else { -0.012 };
+            self.impulse = if active {
+                0.010 * CELLS_PER_METER
+            } else {
+                -0.012 * CELLS_PER_METER
+            };
         }
         if self.initialized && grounded && !self.grounded {
-            self.impulse = self.impulse.min(-0.016);
+            self.impulse = self.impulse.min(-0.016 * CELLS_PER_METER);
         }
         self.impulse *= (-dt * 10.0).exp();
 
@@ -736,15 +742,25 @@ mod tests {
 
     #[test]
     fn apply_movement_slides_along_wall() {
-        // Wall at z=2, player at z=3.5 moving into it on Z
-        let world = world_with_wall(5, 4, 2);
-        let pos = [4.5, 4.5, 3.5];
-        let delta = [0.5, 0.0, -1.5]; // would go into wall on Z
+        // 1m cube wall at m-coord (5, 4, 2). Player at (4.5, 4.5, 3.5) m
+        // moving +X and -Z; wall blocks Z but not X. Test uses a 32³ world
+        // so the scaled player AABB (2.4 × 6.4 × 2.4 cells) fits.
+        let mut world = World::new(5);
+        let material = Cell::pack(1, 0).raw();
+        let s = CELLS_PER_METER as i64;
+        for cx in 5 * s..6 * s {
+            for cy in 4 * s..5 * s {
+                for cz in 2 * s..3 * s {
+                    world.set(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz), material);
+                }
+            }
+        }
+        let m = |v: f64| v * CELLS_PER_METER;
+        let pos = [m(4.5), m(4.5), m(3.5)];
+        let delta = [m(0.5), 0.0, m(-1.5)];
         let new_pos = apply_movement(&world, &pos, &delta);
-        // X should have moved (no wall at x=5 for the new Z)
-        assert!((new_pos[0] - 5.0).abs() < 1e-9);
-        // Z should be rejected — moving to 2.0 would collide with wall at (5,4,2)
-        assert!((new_pos[2] - 3.5).abs() < 1e-9);
+        assert!((new_pos[0] - m(5.0)).abs() < 1e-6);
+        assert!((new_pos[2] - m(3.5)).abs() < 1e-6);
     }
 
     #[test]
@@ -831,18 +847,35 @@ mod tests {
 
     #[test]
     fn apply_movement_steps_up_one_block_ledge() {
-        let mut world = world_with_floor(0, 0, 7, 0, 7);
+        // 1m-thick floor + 1m-tall ledge cube. Player walks forward and
+        // STEP_UP_HEIGHT (1 m) should land feet on top of the ledge.
+        let mut world = World::new(5);
         let material = Cell::pack(1, 0).raw();
-        world.set(WorldCoord(4), WorldCoord(1), WorldCoord(3), material);
-        let pos = [3.5, 1.0, 3.5];
-        let delta = [0.8, 0.0, 0.0];
+        let s = CELLS_PER_METER as i64;
+        for cx in 0..8 * s {
+            for cy in 0..s {
+                for cz in 0..8 * s {
+                    world.set(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz), material);
+                }
+            }
+        }
+        for cx in 4 * s..5 * s {
+            for cy in s..2 * s {
+                for cz in 3 * s..4 * s {
+                    world.set(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz), material);
+                }
+            }
+        }
+        let m = |v: f64| v * CELLS_PER_METER;
+        let pos = [m(3.5), m(1.0), m(3.5)];
+        let delta = [m(0.8), 0.0, 0.0];
         let new_pos = apply_movement(&world, &pos, &delta);
         assert!(
-            (new_pos[0] - 4.3).abs() < 1e-9,
+            (new_pos[0] - m(4.3)).abs() < 1e-6,
             "horizontal move should clear the ledge"
         );
         assert!(
-            (new_pos[1] - 2.0).abs() < 1e-9,
+            (new_pos[1] - m(2.0)).abs() < 1e-6,
             "step-up should land the player on top of the ledge"
         );
     }
