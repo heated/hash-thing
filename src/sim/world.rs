@@ -1826,11 +1826,15 @@ impl World {
         );
         self.fill_box(entry_passage, AIR);
         self.fill_floor(entry_passage, DIRT);
-        // At world levels ≥ 7, the atrium's z-offset grows with cell_size
-        // while the corridor's tunnel_half_w is clamped, leaving a solid gap
-        // between corridor.max[2] and atrium.min[2]. Carve a bridge at the
-        // corridor_turn x so the route walk_route lands inside a traversable
-        // tunnel (hash-thing-dyqr).
+        // Bridge the stone slab between corridor.max[2] and atrium.min[2].
+        // At every level atrium.min[2] (lo[2]+cell_size) sits strictly past
+        // corridor.max[2] (corridor_z+tunnel_half_w), so without this carve
+        // the walk_route's corridor_turn → atrium_entry segment is blocked.
+        // The gap is small at level ≤ 6 and grows with cell_size at higher
+        // levels, which is what stranded the level-8 traversability test in
+        // hash-thing-69cq until dyqr. The carve lands before the `atrium`
+        // fill_box below, so any overlap at atrium.min[2] is overwritten by
+        // the atrium's own AIR/STONE pass.
         let corridor_turn_x = corridor.max[0] - 2;
         let tunnel_half_w = (corridor.max[2] - corridor.min[2]) / 2;
         let atrium_entry_passage = Box3::new(
@@ -1873,7 +1877,7 @@ impl World {
         );
 
         let corridor_mid = [corridor.center()[0], corridor.min[1], corridor.center()[2]];
-        let corridor_turn = [corridor.max[0] - 2, corridor.min[1], corridor.center()[2]];
+        let corridor_turn = [corridor_turn_x, corridor.min[1], corridor.center()[2]];
         let atrium_entry = [corridor_turn[0], atrium.min[1], atrium.min[2] + 1];
         let atrium_center = [atrium.center()[0], atrium.min[1], atrium.center()[2]];
         let reveal_center = [balcony.center()[0], balcony.min[1], balcony.center()[2]];
@@ -3273,14 +3277,16 @@ mod tests {
 
     #[test]
     fn lattice_progression_demo_route_is_player_traversable_end_to_end() {
-        let mut w = World::new(8);
-        let layout = w.seed_lattice_progression_demo();
-        let route = std::iter::once(walk_cell(layout.player_pos))
-            .chain(layout.walk_route)
-            .collect::<Vec<_>>();
+        for level in [7u32, 8] {
+            let mut w = World::new(level);
+            let layout = w.seed_lattice_progression_demo();
+            let route = std::iter::once(walk_cell(layout.player_pos))
+                .chain(layout.walk_route)
+                .collect::<Vec<_>>();
 
-        for segment in route.windows(2) {
-            assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            for segment in route.windows(2) {
+                assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            }
         }
     }
 
