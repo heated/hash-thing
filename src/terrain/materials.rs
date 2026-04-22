@@ -422,10 +422,8 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_water_rule,
                 block_rule_id: Some(water_fluid_block_rule),
-                // rvsh: edward-picked water cadence — water falls every
-                // other tick so the 'sheet of water' scene reads as liquid
-                // instead of fast-plummeting blocks. Changing this also
-                // expands memo_period from 2 to 4.
+                // Water falls on every other tick so it reads as liquid.
+                // Expands memo_period from 2 to 4 (see rvsh).
                 tick_divisor: 2,
             },
         );
@@ -1108,22 +1106,37 @@ mod tests {
 
     #[test]
     fn water_ships_with_tick_divisor_two_from_terrain_defaults() {
-        // rvsh: edward picked water tick_divisor=2. Pins the default so a
-        // future materials refactor can't accidentally revert it to 1 (which
-        // would visibly double water fall speed) without the test flagging.
+        // Pins the default so a future materials refactor can't accidentally
+        // revert it to 1 (which would visibly double water fall speed)
+        // without the test flagging. See rvsh.
         let registry = MaterialRegistry::terrain_defaults();
         let water = registry.entry(WATER_MATERIAL_ID).unwrap();
         assert_eq!(
             water.tick_divisor, 2,
             "water must ship with tick_divisor=2 (edward pick on hash-thing-rvsh)"
         );
-        // Every other material stays at 1 under rvsh scope — guard against
-        // accidentally bumping sand/lava along with water.
-        for id in [SAND_MATERIAL_ID, LAVA_MATERIAL_ID, FIRE_MATERIAL_ID] {
-            let entry = registry.entry(id).unwrap();
+    }
+
+    #[test]
+    fn non_water_materials_stay_at_tick_divisor_one() {
+        // rvsh moved water only. Sand, lava, acid, oil, fire and other
+        // materials must remain at 1 until a separate bead tunes them —
+        // a sloppy "bump everyone" refactor would slow fire/CA dynamics
+        // unintentionally. Enumerate every registered material and flag
+        // any that drifted off 1 except water.
+        let registry = MaterialRegistry::terrain_defaults();
+        let flags = registry.tick_divisor_flags();
+        for (id, divisor) in flags.iter().enumerate() {
+            if id as u16 == WATER_MATERIAL_ID {
+                continue;
+            }
+            let Some(entry) = registry.entry(id as u16) else {
+                continue;
+            };
             assert_eq!(
-                entry.tick_divisor, 1,
-                "material {id} ({}) must remain at tick_divisor=1; rvsh only moved water",
+                *divisor, 1,
+                "material {id} ({}) must remain at tick_divisor=1; \
+                 rvsh moved water only",
                 entry.visual.label
             );
         }
