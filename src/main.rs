@@ -2823,6 +2823,43 @@ mod tests {
     }
 
     #[test]
+    fn apply_fps_look_wraps_yaw_past_pi() {
+        // hash-thing-u0uf invariant: apply_fps_look must keep accumulated
+        // yaw in [-π, π) so the f32 downcast for rendering stays precise.
+        let mut app = App::new(64);
+        let pi = std::f64::consts::PI;
+        app.reset_player_pose([0.0, 0.0, 0.0], pi - 0.01, 0.0);
+
+        // 10 px * LOOK_SENSITIVITY(0.003) = 0.03 rad → crosses +π by 0.02.
+        app.apply_fps_look(10.0, 0.0);
+        let (yaw, _pitch) = player_look(&mut app);
+        assert!(yaw >= -pi, "yaw {yaw} below -π after wrap");
+        assert!(yaw < pi, "yaw {yaw} not strictly below +π after wrap");
+        let expected = -pi + 0.02;
+        assert!(
+            (yaw - expected).abs() < 1e-10,
+            "yaw {yaw} did not wrap to {expected}"
+        );
+    }
+
+    #[test]
+    fn apply_fps_look_bounds_yaw_across_many_rotations() {
+        // hash-thing-u0uf: even under an absurd event storm the wrap
+        // invariant must hold — this is the regression guard for "someone
+        // removed the wrap and nothing else noticed."
+        let mut app = App::new(64);
+        let pi = std::f64::consts::PI;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        for _ in 0..100 {
+            app.apply_fps_look(10_000.0, 0.0);
+        }
+        let (yaw, _pitch) = player_look(&mut app);
+        assert!(yaw >= -pi, "yaw {yaw} below -π after accumulation");
+        assert!(yaw < pi, "yaw {yaw} not strictly below +π after accumulation");
+    }
+
+    #[test]
     fn apply_fps_look_clamps_pitch() {
         let mut app = App::new(64);
         app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 1.3);
