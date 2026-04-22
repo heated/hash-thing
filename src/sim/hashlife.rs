@@ -374,7 +374,9 @@ impl World {
         // Stack-allocated grid avoids heap allocation per base case (~16K calls).
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, self.generation);
+        let (next, p1_ns, p2_ns) = self.step_grid_once(&grid, self.generation);
+        self.hashlife_stats.phase1_ns += p1_ns;
+        self.hashlife_stats.phase2_ns += p2_ns;
         self.center_level3_grid_to_node(&next)
     }
 
@@ -426,8 +428,10 @@ impl World {
     fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, generation);
-        let next = self.step_grid_once(&next, generation + 1);
+        let (next, p1_ns_a, p2_ns_a) = self.step_grid_once(&grid, generation);
+        let (next, p1_ns_b, p2_ns_b) = self.step_grid_once(&next, generation + 1);
+        self.hashlife_stats.phase1_ns += p1_ns_a + p1_ns_b;
+        self.hashlife_stats.phase2_ns += p2_ns_a + p2_ns_b;
         self.center_level3_grid_to_node(&next)
     }
 
@@ -435,13 +439,22 @@ impl World {
         &self,
         grid: &[CellState],
         generation: u64,
-    ) -> [CellState; LEVEL3_CELL_COUNT] {
+    ) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
         let side = LEVEL3_SIDE;
         // Phase 1: CaRule on interior cells (1..side-1 on each axis).
         // The outermost ring cannot be evolved correctly because its neighbors
         // would wrap outside the padded region. Callers only extract the center
         // that remains valid after the requested number of steps.
         let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+        // Phase 1 timer covers both the per-call setup (noop_flags,
+        // tick_divisor_flags) AND the cell loop. Setup still allocates a
+        // fresh Vec<bool> today (hash-thing-2z3g is the deferred cache
+        // for noop_flags; tick_divisor_flags was cached by hash-thing-5yxk).
+        // Attributing setup to p1 keeps p1+p2 close to the full
+        // step_grid_once wall time — if a future investigator sees
+        // p1+p2 ≪ observed step time, the missing cost is memo
+        // lookup/insert or `next`-array zeroing, not hidden setup.
+        let phase1_start = std::time::Instant::now();
         // Precompute per-material noop flag to avoid vtable dispatch per cell.
         // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
         // entirely (next is zero-initialized). For GoL, air participates in birth
@@ -481,6 +494,8 @@ impl World {
             }
         }
 
+        let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
+
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
         // Node-local alignment (9ww): partition is determined by grid-local
         // coordinates, not world-space origin. With per-rule tick_divisors
@@ -488,6 +503,10 @@ impl World {
         // derived from its slowed-down tick schedule — this preserves Margolus
         // mass-conservation alternation for slowed rules. Default d=1 reduces
         // to `generation % 2`, identical to pre-iowh behavior.
+        //
+        // Phase 2 timer covers the block_rule_tick_divisors cache read and
+        // the per-block loop, symmetric with Phase 1 covering its setup.
+        let phase2_start = std::time::Instant::now();
         let block_rule_divisors = self.materials.block_rule_tick_divisors();
 
         // Fast path: when all divisors are 1 (period 2), every rule uses the
@@ -539,8 +558,9 @@ impl World {
                 }
             }
         }
+        let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
 
-        next
+        (next, phase1_ns, phase2_ns)
     }
 
     fn center_level3_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {

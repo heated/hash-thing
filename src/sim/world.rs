@@ -290,6 +290,13 @@ pub struct HashlifeStats {
     pub fixed_point_skips: u64,
     /// Per-level cache miss counts (index = level - 3, since base case is level 3).
     pub misses_by_level: [u64; 32],
+    /// Cumulative nanoseconds spent in `step_grid_once` Phase 1 (per-cell
+    /// CaRule) across all memo-miss base cases in one step (hash-thing-71mp).
+    pub phase1_ns: u64,
+    /// Cumulative nanoseconds spent in `step_grid_once` Phase 2 (per-block
+    /// BlockRule / Margolus) across all memo-miss base cases in one step
+    /// (hash-thing-71mp).
+    pub phase2_ns: u64,
 }
 
 impl HashlifeStats {
@@ -300,6 +307,8 @@ impl HashlifeStats {
         self.cache_misses += step.cache_misses;
         self.empty_skips += step.empty_skips;
         self.fixed_point_skips += step.fixed_point_skips;
+        self.phase1_ns += step.phase1_ns;
+        self.phase2_ns += step.phase2_ns;
         for (dst, src) in self
             .misses_by_level
             .iter_mut()
@@ -2067,7 +2076,8 @@ impl World {
     /// the right signal for "is this table about to blow memory."
     ///
     /// Format: `memo_hit=<fraction> memo_churn=<signed-fraction>
-    /// memo_tbl=<int> memo_mac=<int> memo_mac_bytes=<int>`.
+    /// memo_tbl=<int> memo_mac=<int> memo_mac_bytes=<int>
+    /// p1=<ms>ms p2=<ms>ms`.
     ///
     /// `memo_churn` is `window_hit_rate − lifetime_hit_rate` over the last
     /// `MemoWindow::CAPACITY` steps. Positive = recent steps cache better
@@ -2075,6 +2085,12 @@ impl World {
     /// regression. `+0.000` before any step has run (both rates are 0).
     /// `memo_mac` / `memo_mac_bytes` stay at 0 on single-step sessions
     /// (only `step_recursive_pow2` populates the macro cache).
+    ///
+    /// `p1` / `p2` are the last step's per-phase wall times inside
+    /// `step_grid_once` (Phase 1 = per-cell CaRule, Phase 2 = per-block
+    /// BlockRule / Margolus). Reported per-step (not lifetime) so the
+    /// number reflects current sim cost rather than an ever-growing sum
+    /// (hash-thing-71mp).
     pub fn memo_summary(&self) -> String {
         let stats = &self.hashlife_stats_total;
         let total = stats.cache_hits + stats.cache_misses;
@@ -2084,13 +2100,18 @@ impl World {
             stats.cache_hits as f64 / total as f64
         };
         let churn = self.memo_window.hit_rate() - hit_rate;
+        let last_step = &self.hashlife_stats;
+        let p1_ms = last_step.phase1_ns as f64 / 1_000_000.0;
+        let p2_ms = last_step.phase2_ns as f64 / 1_000_000.0;
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={}",
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} p1={:.2}ms p2={:.2}ms",
             hit_rate,
             churn,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
             self.macro_cache_bytes_est(),
+            p1_ms,
+            p2_ms,
         )
     }
 
@@ -3031,6 +3052,66 @@ mod tests {
                 &format!("after 64^3 step_recursive {step}"),
             );
         }
+    }
+
+    /// hash-thing-2z3g scout: measure p1/p2 wall-time share on the default
+    /// water scene. Prints cumulative phase1_ns / phase2_ns across N steps
+    /// so a reader can decide whether noop_flags caching (2z3g) is worth
+    /// doing — the gate is "does Phase 1 dominate, and if so is allocation
+    /// a big enough chunk to matter."
+    ///
+    /// Run: `cargo test --profile bench --lib
+    /// hashlife_phase_timing_scout_water_64 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "scout/profiling — prints timing, no assertions"]
+    fn hashlife_phase_timing_scout_water_64() {
+        let mut world = World::new(6);
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        const N_STEPS: u32 = 20;
+        let wall_start = std::time::Instant::now();
+        for _ in 0..N_STEPS {
+            world.step_recursive();
+        }
+        let wall_total_ns = wall_start.elapsed().as_nanos() as u64;
+
+        let stats = &world.hashlife_stats_total;
+        let p1 = stats.phase1_ns;
+        let p2 = stats.phase2_ns;
+        let pct =
+            |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
+        eprintln!("--- hashlife phase timing scout: 64^3 water, {N_STEPS} steps ---");
+        eprintln!("  wall_total:    {:.2} ms", wall_total_ns as f64 / 1e6);
+        eprintln!(
+            "  phase1_total:  {:.2} ms ({:.1}% of wall)",
+            p1 as f64 / 1e6,
+            pct(p1),
+        );
+        eprintln!(
+            "  phase2_total:  {:.2} ms ({:.1}% of wall)",
+            p2 as f64 / 1e6,
+            pct(p2),
+        );
+        eprintln!(
+            "  p1+p2:         {:.2} ms ({:.1}% of wall — remainder is memo lookup/insert, `next` zeroing, dispatch)",
+            (p1 + p2) as f64 / 1e6,
+            pct(p1 + p2),
+        );
+        eprintln!(
+            "  per-step avg:  p1={:.3}ms p2={:.3}ms wall={:.3}ms",
+            p1 as f64 / 1e6 / N_STEPS as f64,
+            p2 as f64 / 1e6 / N_STEPS as f64,
+            wall_total_ns as f64 / 1e6 / N_STEPS as f64,
+        );
+        eprintln!(
+            "  cache_hits={} cache_misses={} (hit_rate={:.3})",
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cache_hits as f64
+                / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+        );
     }
 
     /// hash-thing-rk4n regression: walks the default water scene past
@@ -5088,6 +5169,10 @@ mod tests {
         assert!(summary.contains("memo_tbl="));
         assert!(summary.contains("memo_mac="));
         assert!(summary.contains("memo_mac_bytes="));
+        // hash-thing-71mp: guard the phase-timing output contract so the
+        // fields can't silently disappear under a future refactor.
+        assert!(summary.contains("p1="));
+        assert!(summary.contains("p2="));
     }
 
     /// hash-thing-z7uu: `macro_cache_bytes_est()` must equal
@@ -5120,7 +5205,12 @@ mod tests {
     /// HUD overlay (hash-thing-nhwo) splits `memo_summary` on whitespace
     /// so each field lands on its own line. Guards against future schema
     /// changes that would introduce an intra-field space (e.g.
-    /// `memo_tbl=1 234`) which would silently break the HUD layout.
+    /// `memo_tbl=1 234`) which would silently break the HUD layout, and
+    /// against per-field widths that overflow the compact HUD panel.
+    ///
+    /// Prefix allow-list covers `memo_` (cache fields) and `p1` / `p2`
+    /// (per-step phase timings from hash-thing-71mp, which are part of
+    /// the same HUD block but semantically not memo state).
     #[test]
     fn memo_summary_splits_cleanly_for_hud_overlay() {
         let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
@@ -5137,8 +5227,8 @@ mod tests {
         );
         for line in &lines {
             assert!(
-                line.starts_with("memo_"),
-                "every field must start with memo_ to keep the HUD layout sane, got {line:?}",
+                line.starts_with("memo_") || line.starts_with("p1=") || line.starts_with("p2="),
+                "field must use an approved HUD prefix (memo_ / p1 / p2), got {line:?}",
             );
             assert!(
                 line.len() <= 25,
@@ -5172,6 +5262,33 @@ mod tests {
             second_misses < first_misses + second_misses,
             "per-step stats must reset between calls (second={second_misses}, sum={})",
             first_misses + second_misses,
+        );
+    }
+
+    #[test]
+    fn step_grid_once_phase_timings_accumulated_on_memo_miss() {
+        // hash-thing-71mp: HashlifeStats.phase1_ns and .phase2_ns must be
+        // non-zero after a real (memo-missing) step. On a fresh one-cell
+        // world, step_recursive drops into step_base_case at least once
+        // for the L3 node containing the seed — that's enough to tick
+        // both phase timers past zero. Exact values are platform-dependent
+        // (Instant::now resolution varies), so we only assert > 0.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+
+        let stats = &world.hashlife_stats;
+        assert!(
+            stats.cache_misses > 0,
+            "test precondition: seeded step should have at least one memo miss",
+        );
+        assert!(
+            stats.phase1_ns > 0,
+            "phase1_ns should accumulate across step_grid_once calls, got 0",
+        );
+        assert!(
+            stats.phase2_ns > 0,
+            "phase2_ns should accumulate across step_grid_once calls, got 0",
         );
     }
 
