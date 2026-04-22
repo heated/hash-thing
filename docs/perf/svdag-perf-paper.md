@@ -311,6 +311,23 @@ Plan + code-review artifacts for the scaffolding commit live in `.ship-notes/pla
 
 Candidate #2a is the narrowest thing still worth trying before conceding to #3: it's a one-dispatch experiment that keeps winit's window but supplies our own redraw cadence. If a CADisplayLink-paced loop still shows `surface_acquire_cpu ≥ 16 ms` on M2, that is a strong signal the root cause is WindowServer composition and not our pacing choice, which is as close to a root-cause conclusion as this bead can get at the wgpu layer.
 
+**Candidate #2a refined — acquire-as-late-as-possible (Apple Metal Best Practices).** Literature pass 2026-04-21 (onyx) surfaced a much cheaper experiment than the `surface.as_hal` / `CADisplayLink` reroute. Apple's [Metal Best Practices Guide — Drawables](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/Drawables.html) states:
+
+> "Always acquire a drawable as late as possible; preferably, immediately before encoding an on-screen render pass. A frame's CPU work may include dynamic data updates and off-screen render passes that you can perform before acquiring a drawable."
+
+Our `Renderer::render` (`crates/ht-render/src/renderer.rs:1843`) calls `surface.get_current_texture()` *before* the SVDAG raycast compute dispatch (`renderer.rs:1989`) — the exact anti-pattern the doc warns about. Our compute pass writes to an off-screen `raycast_texture` that the on-screen render pass later blits from, so the Apple-sanctioned reorder is a mechanical move: encode compute first, then acquire the drawable immediately before the render-pass encode. This is the same class of fix Flutter Impeller shipped on iOS for the same symptom (flutter/flutter#138490). No `surface.as_hal`, no `CADisplayLink`, no unsafe code. Tracked as `hash-thing-dlse.2.2.2`; candidate #2a/#2b above remain as the fallbacks if the reorder doesn't land the signal.
+
+**Candidate #2a outcome 2026-04-21 (onyx) — null result + paper correction.** Shipped the reorder (move `get_current_texture()` after the compute-pass encode, immediately before the on-screen render pass), built both pre- and post-reorder `--profile bench` binaries of `hash-thing 256`, ran each for 35 s on M2 with `RUST_LOG=info`, and compared `surface_acquire_cpu`. Reviewer pass was clean (2 Claude + 1 Codex reviewers, all ship-verdict; full wgpu 29.0.1 + Metal HAL audit of the drop-encoder path confirmed no leak / no partial submit). The measurement was the deciding input, and the measurement said the reorder does not move the signal:
+
+| window (s) | before mean (ms) | before p95 (ms) | after mean (ms) | after p95 (ms) |
+|-----------:|-----------------:|----------------:|----------------:|---------------:|
+| 0–14 (warmup) | 24.67 | ~32.4 | 24.49 | ~33.1 |
+| 14–35 (steady) | 13.40 | 15.64 | 13.46 | 15.53 |
+
+Per-run raw rows are in `/tmp/before-dlse222-long.log` and `/tmp/after-dlse222-long.log`; full methodology is in `.ship-notes/plan-dlse222-late-acquire.md`. Delta is within timer noise in both windows. Reverted the `renderer.rs` reorder per the plan's rollback criterion; `dlse.2.2.2` is closed as a ship-safe but effect-less fix.
+
+The instructive finding, though, is not the null — it is the **steady-state column**. `surface_acquire_cpu` settles to ~13.5 ms mean / ~15.6 ms p95 after ~14–16 s of runtime on both binaries, not the ~25 ms that §3.8 documented as "pinned." Two runs on the same binary reproduce the step-down to within 0.1 ms. That means the ~25 ms stall this subsection has been chasing is **not a steady-state pin**; it is a ~14-s warmup-period behaviour of the WindowServer / CAMetalLayer pacing that self-resolves. Steady-state 13.5 ms is consistent with a 60 Hz vsync budget (16.67 ms) minus our own ~3 ms of CPU work, which is exactly the regime we expected 60 FPS to live in. §3.8's original capture window (~10 s warm, skip first line) was inside the warmup phase and mis-attributed a transient to a pin. That explains why every knob probe under §3.8 — `maximumDrawableCount`, `displaySyncEnabled`, `present_mode`, and now the late-acquire reorder — failed to move the number: nothing in that plane *should* move a warmup transient, because the steady-state number is already ~60 FPS. The warmup stall itself is still worth characterising (tracked as a new bead), but the framing of dlse.2.2 shifts: the windowed-mode 30 FPS we have been debugging is a "first ~14 s" figure, not "the FPS." Candidate #3 (accept 30 FPS as the windowed floor) is weakened by this; candidate #2b (MTKView / `CADisplayLink` drive) is no longer obviously needed at all for steady state. Measurement on longer-baseline windows supersedes §3.8's original attribution; §3.8 and the dlse.2.2 candidate enumeration above should be read as historical context for a transient that does not actually pin.
+
 ### 3.10 Scaling the model to 4096³ (`hash-thing-ivms`)
 
 Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
@@ -381,6 +398,20 @@ Two cross-checks on the span:
 **3.10.6 Confirmation path (pre-e092, kept for context).** `bench_raycast_4096` already exists in `tests/bench_gpu_raycast.rs` (`#[ignore]`) and runs 10 samples, but it uses `BenchCamera::empty_corner()` (optimistic). The confirmation path was two runs:
 1. The existing empty-corner `bench_raycast_4096` — floor.
 2. A seeded-terrain variant at 4096³, closer to the demo target — measurement comparable against the §3.10.5 envelope (now landed as `bench_raycast_4096_app_spawn`, see §3.10.5.1).
+
+### 3.11 GPU cost at 1024³/100% is real — the "ramp" is pipeline fill (`hash-thing-dlse.3`)
+
+Bead filed 2026-04-21 from a 1024³ repro where `surface_acquire_cpu` grew monotonically from 54 ms at t=0 to 187 ms at t=20 s and plateaued. Initial suspects: sim-thread starvation (refuted by `HASH_THING_FREEZE_SIM=1` — ramp still occurs) and GPU-queue backpressure accumulation.
+
+The decisive A/B was `HASH_THING_OFF_SURFACE=1`: with no swapchain, `surface_acquire_cpu` drops to 0.01 ms and the ramp **moves to `submit_cpu`** (13 → 154 ms, plateau 154 ms). Meanwhile `render_gpu` reads 3.76 ms for the first ~10 s, then jumps to 53 ms mean / **151 ms max** once the timestamp-query ring buffer catches up. Plateau self-consistency: `submit_cpu ≈ render_gpu max`. The GPU is genuinely spending ~150 ms/frame on the compute raycast at 2940×1782 × 1024³.
+
+Two corrections to the earlier framing:
+1. **`render_gpu` / `render_pass_gpu` undercount by ~30×**, because the timestamp writes cover only the on-screen render pass, not the compute dispatch where the raycast lives. §3.8's "~1 ms GPU" — used to argue the `surface_acquire_cpu` stall was *not* GPU-bound — was reading 1/30 of the actual work. (A follow-up bead adds a compute-pass `GpuTiming` instance; `hash-thing-fitq`.)
+2. **The ramp is not an accumulating queue.** It is a pipelined CPU-GPU system reaching its steady-state backpressure. Frame 0 submits to an empty GPU; frame N submits and waits on frame N-K to retire; as K fills (`maximumDrawableCount` + command-buffer depth), steady-state submit time converges to actual GPU frame time. The linear shape of the 13 → 154 ms off-surface climb is exactly the shape of a bounded pipeline filling.
+
+Surface-attached plateau (187 ms) minus off-surface plateau (154 ms) ≈ 33 ms of compositor + drawable-acquisition overhead, consistent with the CAMetalLayer path. The camera-recenter snap-back is plausibly a world-state transition to shallow traversal / empty rays for a few frames — the pipeline drains and refills, giving the same ramp from a lower starting cost — not a sim-state reset.
+
+**Budget implication.** On M2 integrated, 1024³ × 100% scale is GPU-bound at ~6 FPS; no amount of compositor tuning fixes that. `render_scale = 0.5` as the default puts us near the M2 budget at 1024³. A world-size-aware auto-picker is filed as `hash-thing-zytn` (blocked on fitq for a trustworthy GPU signal).
 
 ---
 
@@ -577,6 +608,25 @@ At 60 FPS that is **~2–26 MB/s upload**, still under 0.1 % of the 68 GB/s memo
 Two caveats on the exponent:
 - **Out-of-band scales still unmeasured.** The fit covers 64³–512³. At 2048³, a single warm step accumulated >15 min of CPU under this harness before being killed — so the 4hkq/slc1 out-of-band benches (`bench_svdag_step_deltas_2048`, `_4096`) need a measurement workflow that tolerates 10–30 min wall per scale, which the current CI-style `#[ignore]` harness does not provide. Filed as `hash-thing-slc1` follow-up.
 - **Scene dependence.** A pathological scene with uniformly-active CA across the whole 4096³ volume would scale misses closer to `L³` (volume), giving ~470k misses/step. Our default terrain+water+sand scene is nowhere near that — active CA is concentrated on a thin fringe (water surface, sand-fall column) whose area scales well below `L²`. The measured 64³–512³ slope is consistent with this physical intuition; the 4096³ span above assumes the scene remains fringe-dominated.
+
+**4.7.2a Out-of-band bench workflow (`hash-thing-dpkz`).** `bench_svdag_step_deltas_2048` and `bench_svdag_step_deltas_4096` are `#[ignore]`-gated and intended to be driven by a long-running wrapper rather than an agent's default 60 s `cargo test` budget. There is no dedicated binary; the workflow is invoke-the-existing-test with a bigger shell timeout. Expected wall-clock per scale (M1-class; ~1.5× faster on M2 16 GB):
+
+| scale | seed | one warm step | total wall (warmup=0, measured=1) |
+|-------|------|---------------|------------------------------------|
+| 1024³ | ~1 s | ~10–20 s      | ~30 s (fits in the default budget) |
+| 2048³ | ~2 s | 45–90 s       | 2–5 min                            |
+| 4096³ | ~3.5 s | ≥60 s (bench_hashlife_4096 SIGKILL profile) | 2–10 min |
+
+Invocation (bump the shell timeout explicitly — don't rely on the default 2 min `Bash` budget):
+
+```text
+cargo test --release --test bench_svdag bench_svdag_step_deltas_4096 \
+    -- --ignored --nocapture
+```
+
+Agent usage pattern: run as a background task (`run_in_background: true`) so the sweep keeps moving while the bench finishes; the result lands as a task-notification. Capture the printed `misses/step`, `slot appends/step`, and `bytes/step` from the bench output and paste them into `§4.7.2` as the 2048³ / 4096³ entry of the miss-count table, then update the pair-wise slope column.
+
+If a longer wall becomes unavoidable (>10 min) or the bench needs to run unattended across reboots, escalate to a dedicated harness binary — but the `#[ignore]`-gated test with a bumped shell timeout covers the current data-point need.
 
 **4.7.3 `hashlife_macro_cache` budget at 4096³.** The cache is a **single** `FxHashMap<(NodeId, u64), NodeId>` (see `src/sim/world.rs:192` and `src/sim/hashlife.rs:406-422`), keyed on `(node, generation)`. There is no per-level multiplication — it is one map, shared across the whole recursion.
 
