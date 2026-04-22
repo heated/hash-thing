@@ -512,10 +512,12 @@ impl NodeStore {
         // Leaf(s) expanded above: the untouched siblings are guaranteed to
         // be leaf(s), and if the recursions also returned leaf(s), the
         // whole subtree is uniform s and collapses to Leaf(s). Skipping
-        // canonicalization on the Interior input case preserves NodeId
-        // identity for heterogeneous trees (siblings might already be in
-        // non-canonical uniform-Interior form and mixing Leaf with Interior
-        // siblings would break identity splice). (jw3k.3)
+        // canonicalization on the Interior input case (no opportunistic
+        // canonicalization of pre-existing non-canonical uniform interiors)
+        // preserves NodeId identity for heterogeneous trees: if we
+        // opportunistically collapsed `Interior(L, [leaf(s); 8])` to Leaf(s)
+        // on ascent, an identity splice through uniform(L, s) would return
+        // a different NodeId than the input. (jw3k.3)
         if let Some(s) = was_leaf_state {
             let target = self.leaf(s);
             if new_children.iter().all(|&c| c == target) {
@@ -2262,6 +2264,48 @@ mod tests {
         assert_eq!(
             new_root, root,
             "canonicalization restores original NodeId on identity splice",
+        );
+    }
+
+    /// jw3k.3 combined stress: mixed heterogeneous tree where children[0]
+    /// is a raw Leaf(stone) and other children are a heterogeneous fill.
+    /// Identity splice over multiple (x, z) columns (some through the raw
+    /// Leaf, some through Interior siblings) must leave node_count stable.
+    #[test]
+    fn splice_column_identity_mixed_tree_no_node_growth() {
+        let mut store = NodeStore::new();
+        let side = 4;
+        let stone = mat(0x301);
+        // Level-2 tree. children[0] is raw Leaf(stone); children[1..7] get
+        // a heterogeneous fill (varied cells in each level-1 subtree).
+        let leaf_stone = store.leaf(stone);
+        let (hetero_sub_seed, _) = fill_heterogeneous(&mut store, 2);
+        let hetero_sub = hetero_sub_seed;
+        let mut children = [hetero_sub; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(2, children);
+
+        let before = store.node_count();
+        // Repeat identity splice over every (x, z) column — mix of
+        // raw-Leaf path (x<2, z<2) and Interior paths (others). None
+        // should allocate new nodes.
+        for _ in 0..8 {
+            for z in 0..side as u64 {
+                for x in 0..side as u64 {
+                    let mut col = vec![0 as CellState; side];
+                    store.flatten_column_into(root, x, z, &mut col);
+                    let new_root = store.splice_column(root, x, z, &col);
+                    assert_eq!(
+                        new_root, root,
+                        "identity splice at ({x},{z}) must preserve NodeId",
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            store.node_count(),
+            before,
+            "mixed-tree identity splices must not grow node count",
         );
     }
 
