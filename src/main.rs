@@ -363,6 +363,11 @@ struct App {
     /// Last frame timestamp for delta-time computation. Player movement
     /// is multiplied by dt so speed is frame-rate-independent (xa7).
     last_frame: std::time::Instant,
+    /// EWMA-smoothed FPS for the window title. Instantaneous `1/dt`
+    /// jumps ±5 between frames at 20-30 FPS; the smoothed readout is
+    /// just for the human skimming the title bar (hash-thing-d9af).
+    /// Zero sentinel: first frame seeds the filter at its instant value.
+    smoothed_fps: f64,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -449,6 +454,17 @@ fn should_warn_about_slow_dev_step(
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
+/// EWMA smoother for the window-title FPS readout (hash-thing-d9af).
+/// `prev <= 0.0` is the first-frame sentinel — seed the filter at the
+/// instant value so the title doesn't crawl up from zero.
+fn smooth_fps(prev: f64, instant: f64, alpha: f64) -> f64 {
+    if prev <= 0.0 {
+        instant
+    } else {
+        alpha * instant + (1.0 - alpha) * prev
+    }
+}
+
 fn default_legend_visibility(_mode: CameraMode) -> bool {
     // Default-on until proper demo lineup lands (edward 2026-04-21).
     true
@@ -528,6 +544,7 @@ impl App {
             occluded: false,
             noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
+            smoothed_fps: 0.0,
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
@@ -671,6 +688,13 @@ impl App {
     /// Handle a captured-cursor `DeviceEvent::MouseMotion` delta. No-op
     /// unless the player is in first-person mode with the cursor grabbed
     /// (hash-thing-w1yq). Extracted for testability (hash-thing-a6t2).
+    ///
+    /// Deltas are intentionally **device-agnostic**: `DeviceId` is not
+    /// inspected, so an external mouse and a trackpad driven in the same
+    /// frame sum into a single FPS-look delta. A 3D game has no concept
+    /// of "which device owns the camera," and winit already delivers one
+    /// `MouseMotion` per device per frame, so summing is the natural
+    /// behavior (hash-thing-i7gt, follow-up to hash-thing-a6t2).
     fn handle_mouse_motion(&mut self, dx: f64, dy: f64) {
         if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
             return;
@@ -1379,6 +1403,12 @@ impl App {
             self.is_stepping()
         );
         if self.is_stepping() {
+            // Without this log the `n` key looks dead during a long sim
+            // step — see hash-thing-1a1n. The completion log at the end
+            // of this function covers the success path.
+            log::info!(
+                "load_lattice_demo: deferred — background sim step in flight"
+            );
             return;
         }
         let start = std::time::Instant::now();
@@ -1710,30 +1740,27 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
                         }
-                        winit::keyboard::Key::Character("[")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.cycle_lattice_demo_beat(-1);
-                        }
-                        winit::keyboard::Key::Character("]")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.cycle_lattice_demo_beat(1);
-                        }
-                        winit::keyboard::Key::Character("u")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Intro);
-                        }
-                        winit::keyboard::Key::Character("i")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Interior);
-                        }
-                        winit::keyboard::Key::Character("o")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
+                        winit::keyboard::Key::Character(k @ ("[" | "]" | "u" | "i" | "o")) => {
+                            // Lattice-demo debug jumps are orbit-only:
+                            // teleporting the camera between scripted
+                            // beats is useful when previewing the demo,
+                            // less so while the player is walking around
+                            // in FPS mode. Log the silent branch so the
+                            // key doesn't feel dead (hash-thing-1a1n).
+                            if self.lattice_debug_jumps_enabled() {
+                                match k {
+                                    "[" => self.cycle_lattice_demo_beat(-1),
+                                    "]" => self.cycle_lattice_demo_beat(1),
+                                    "u" => self.select_lattice_demo_beat(LatticeDemoBeat::Intro),
+                                    "i" => self.select_lattice_demo_beat(LatticeDemoBeat::Interior),
+                                    "o" => self.select_lattice_demo_beat(LatticeDemoBeat::Panorama),
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                log::info!(
+                                    "{k}: lattice debug jump — orbit mode only (Tab to switch camera)"
+                                );
+                            }
                         }
                         winit::keyboard::Key::Character("v") => {
                             // a9jd: the short-demo cut is the user-facing
@@ -1943,14 +1970,22 @@ impl ApplicationHandler for App {
                 self.last_frame = std::time::Instant::now();
                 self.update_lattice_short_demo_cut();
 
-                // Update window title with FPS + resolution.
+                // Update window title with smoothed FPS + resolution.
+                // EWMA smoothing keeps the readout readable at low FPS
+                // where a single slow frame would otherwise jerk the
+                // displayed number by several units (hash-thing-d9af).
+                // dt==0 (back-to-back redraws within one timer tick) skips
+                // the update rather than blending a 0-FPS sample that
+                // would silently decay the readout by 5%.
+                if dt > 0.0 {
+                    self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt, 0.05);
+                }
                 if let Some(window) = &self.window {
-                    let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
                     if let Some(renderer) = &self.renderer {
                         let scale_pct = (renderer.render_scale * 100.0) as u32;
                         window.set_title(&format!(
                             "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                            fps, self.volume_size, scale_pct,
+                            self.smoothed_fps, self.volume_size, scale_pct,
                         ));
                     }
                 }
@@ -2449,6 +2484,38 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn smooth_fps_seeds_from_zero_prev_returns_instant() {
+        assert_eq!(smooth_fps(0.0, 60.0, 0.05), 60.0);
+        // Negative prev (shouldn't occur in practice) hits the same
+        // sentinel branch rather than producing a nonsense blend.
+        assert_eq!(smooth_fps(-1.0, 20.0, 0.1), 20.0);
+    }
+
+    #[test]
+    fn smooth_fps_weights_new_sample_by_alpha() {
+        // 0.1 * 20 + 0.9 * 100 = 92.0. Round-trip through f64 to avoid
+        // flaky equality; the arithmetic is exact for these values.
+        assert!((smooth_fps(100.0, 20.0, 0.1) - 92.0).abs() < 1e-12);
+        // alpha=0 pins to prev (filter is frozen).
+        assert_eq!(smooth_fps(42.0, 1.0, 0.0), 42.0);
+        // alpha=1 snaps to the instant sample (no smoothing).
+        assert_eq!(smooth_fps(42.0, 1.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn smooth_fps_converges_to_steady_instant() {
+        // Drive the filter with a constant 60 FPS from a distant start
+        // and assert it settles within a plausible window. At alpha=0.05
+        // the 99% settle is log(0.01) / log(0.95) ≈ 90 samples, so 200
+        // iterations is plenty of headroom.
+        let mut s = 10.0;
+        for _ in 0..200 {
+            s = smooth_fps(s, 60.0, 0.05);
+        }
+        assert!((s - 60.0).abs() < 0.1, "expected ~60, got {s}");
+    }
+
+    #[test]
     fn reconcile_modifier_keys_drops_only_cleared_bits() {
         use winit::keyboard::ModifiersState;
 
@@ -2924,5 +2991,114 @@ mod tests {
         app.apply_fps_look(0.0, -1000.0);
         let (_yaw, pitch) = player_look(&mut app);
         assert!((pitch - -1.4).abs() < 1e-12, "pitch should clamp at -1.4");
+    }
+
+    // hash-thing-9r62 regression: drive the cursor_captured flag through the
+    // real apply_cursor_capture entry point rather than direct field writes,
+    // so the state machine + event-routing contract are both covered (not
+    // just the gating logic).
+
+    #[test]
+    fn apply_cursor_capture_without_window_forces_uncaptured() {
+        // App::new leaves window = None (winit attaches it in resumed()).
+        // The entry point's no-window fallback must force cursor_captured =
+        // false no matter which direction is requested — otherwise the flag
+        // can report "captured" while there is no actual OS-level grab,
+        // which is the state w1yq debugged.
+        let mut app = App::new(64);
+        assert!(app.window.is_none(), "App::new must not attach a window");
+
+        app.apply_cursor_capture(true);
+        assert!(
+            !app.cursor_captured,
+            "no-window apply_cursor_capture(true) must not claim capture"
+        );
+
+        app.apply_cursor_capture(false);
+        assert!(
+            !app.cursor_captured,
+            "no-window apply_cursor_capture(false) must stay uncaptured"
+        );
+    }
+
+    #[test]
+    fn apply_cursor_capture_release_routes_events_uncaptured() {
+        // Going through apply_cursor_capture(false) from a captured state
+        // must leave the event routing in the uncaptured regime: CursorMoved
+        // drives look, DeviceEvent::MouseMotion is a noop.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        // Setup pretends we were captured; the *entry point under test* is
+        // the release call that follows.
+        app.cursor_captured = true;
+
+        app.apply_cursor_capture(false);
+        assert!(!app.cursor_captured);
+
+        // MouseMotion must be dropped in uncaptured FP.
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0, "MouseMotion must not apply after release");
+        assert_eq!(pitch, 0.0);
+
+        // CursorMoved must now apply (after the seeding call).
+        prime_cursor(&mut app, 100.0, 100.0);
+        app.handle_cursor_moved(110.0, 95.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch - (-5.0) * LOOK_SENSITIVITY).abs() < 1e-12);
+    }
+
+    #[test]
+    fn apply_cursor_capture_flip_drops_in_flight_captured_events() {
+        // Cross-stream ordering hazard (F1 from the w1yq triple-tier synth):
+        // MouseMotion events in flight across a capture → release flip must
+        // stop applying as soon as the flag flips. CursorMoved events must
+        // begin applying again after the flip (post-seed).
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        // Pre-flip: we believed we had capture. MouseMotion applies here.
+        app.cursor_captured = true;
+        app.handle_mouse_motion(10.0, 6.0);
+        let (yaw_cap, pitch_cap) = player_look(&mut app);
+        assert!((yaw_cap - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch_cap - 6.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+
+        // Same-frame CursorMoved while still captured is a noop.
+        prime_cursor_preserving_look(&mut app, 500.0, 500.0);
+        app.handle_cursor_moved(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - yaw_cap).abs() < 1e-12);
+        assert!((pitch - pitch_cap).abs() < 1e-12);
+
+        // Release via the real entry point.
+        app.apply_cursor_capture(false);
+        assert!(!app.cursor_captured);
+
+        // Post-flip: MouseMotion must now be dropped.
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - yaw_cap).abs() < 1e-12, "MouseMotion dropped after flip");
+        assert!((pitch - pitch_cap).abs() < 1e-12);
+
+        // Post-flip: CursorMoved must apply again. Re-seed so the first
+        // real delta is predictable — otherwise an untouched last_mouse
+        // from pre-flip would produce a huge one-shot delta.
+        prime_cursor_preserving_look(&mut app, 200.0, 200.0);
+        app.handle_cursor_moved(220.0, 180.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - (yaw_cap + 20.0 * LOOK_SENSITIVITY)).abs() < 1e-12);
+        assert!((pitch - (pitch_cap + (-20.0) * LOOK_SENSITIVITY)).abs() < 1e-12);
+    }
+
+    /// Seed `last_mouse` without resetting player yaw/pitch. Used when a
+    /// test builds up yaw/pitch in stages and does not want the anchor
+    /// reset to clear the player pose.
+    fn prime_cursor_preserving_look(app: &mut App, start_x: f64, start_y: f64) {
+        app.last_mouse = Some((start_x, start_y));
     }
 }

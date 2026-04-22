@@ -2034,22 +2034,47 @@ impl World {
         self.store.population(self.root)
     }
 
+    /// Bytes-per-entry estimate for `hashlife_macro_cache` (hash-thing-z7uu).
+    /// Key is `(NodeId, u64)` → u32 + u64 with u64 alignment pads the key
+    /// tuple to 16 bytes; value is `NodeId` (u32) padded to 8 under the
+    /// outer tuple's 8-byte alignment. Total stored bytes = 24. Add 8 bytes
+    /// for the hashbrown SwissTable control byte plus load-factor slack
+    /// (~0.875) — gives ~32 bytes/entry, matching the perf paper §4.7.3
+    /// projection. Compile-time constant so the arithmetic stays auditable.
+    pub const MACRO_CACHE_BYTES_PER_ENTRY: usize =
+        std::mem::size_of::<((NodeId, u64), NodeId)>() + 8;
+
+    /// Live count of entries in `hashlife_macro_cache`. Exposed so
+    /// observers (perf HUD, bench harnesses) don't have to reach into a
+    /// `pub(crate)` field.
+    pub fn macro_cache_entries(&self) -> usize {
+        self.hashlife_macro_cache.len()
+    }
+
+    /// Approximate byte footprint of `hashlife_macro_cache` (entries ×
+    /// `MACRO_CACHE_BYTES_PER_ENTRY`). Closes the perf paper §5 band that
+    /// had a 9 MB floor / 105 MB ceiling projection at 4096³ with no
+    /// runtime measurement behind it.
+    pub fn macro_cache_bytes_est(&self) -> usize {
+        self.macro_cache_entries() * Self::MACRO_CACHE_BYTES_PER_ENTRY
+    }
+
     /// Compact one-line summary of spatial-memo health for the periodic log
-    /// (hash-thing-stue.6, extended by hash-thing-o2es). Uses the lifetime
-    /// accumulator `hashlife_stats_total` for hit rate — so the rate
-    /// converges toward steady state rather than fluctuating with the most
-    /// recent step. Table sizes are live `.len()`, which is the right
-    /// signal for "is this table about to blow memory."
+    /// (hash-thing-stue.6, extended by hash-thing-o2es, hash-thing-z7uu).
+    /// Uses the lifetime accumulator `hashlife_stats_total` for hit rate —
+    /// so the rate converges toward steady state rather than fluctuating
+    /// with the most recent step. Table sizes are live `.len()`, which is
+    /// the right signal for "is this table about to blow memory."
     ///
     /// Format: `memo_hit=<fraction> memo_churn=<signed-fraction>
-    /// memo_tbl=<int> memo_mac=<int>`.
+    /// memo_tbl=<int> memo_mac=<int> memo_mac_bytes=<int>`.
     ///
     /// `memo_churn` is `window_hit_rate − lifetime_hit_rate` over the last
     /// `MemoWindow::CAPACITY` steps. Positive = recent steps cache better
     /// than the running average (e.g. cache warmup). Negative = recent
     /// regression. `+0.000` before any step has run (both rates are 0).
-    /// `memo_mac` stays at 0 on single-step sessions (only
-    /// `step_recursive_pow2` populates the macro cache).
+    /// `memo_mac` / `memo_mac_bytes` stay at 0 on single-step sessions
+    /// (only `step_recursive_pow2` populates the macro cache).
     pub fn memo_summary(&self) -> String {
         let stats = &self.hashlife_stats_total;
         let total = stats.cache_hits + stats.cache_misses;
@@ -2060,11 +2085,12 @@ impl World {
         };
         let churn = self.memo_window.hit_rate() - hit_rate;
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={}",
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={}",
             hit_rate,
             churn,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
+            self.macro_cache_bytes_est(),
         )
     }
 
@@ -5061,6 +5087,34 @@ mod tests {
         assert!(summary.contains("memo_hit="));
         assert!(summary.contains("memo_tbl="));
         assert!(summary.contains("memo_mac="));
+        assert!(summary.contains("memo_mac_bytes="));
+    }
+
+    /// hash-thing-z7uu: `macro_cache_bytes_est()` must equal
+    /// `macro_cache_entries() * MACRO_CACHE_BYTES_PER_ENTRY`. Guards the
+    /// arithmetic from drifting if the struct is refactored (e.g. someone
+    /// swaps in a different map type with different overhead).
+    #[test]
+    fn macro_cache_bytes_est_equals_entries_times_per_entry() {
+        // Fresh world: no steps, macro cache empty.
+        let world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        assert_eq!(world.macro_cache_entries(), 0);
+        assert_eq!(world.macro_cache_bytes_est(), 0);
+
+        // Drive a pow2 step to seed the macro cache.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive_pow2();
+
+        let entries = world.macro_cache_entries();
+        assert_eq!(
+            world.macro_cache_bytes_est(),
+            entries * World::MACRO_CACHE_BYTES_PER_ENTRY,
+        );
+        const _: () = assert!(
+            World::MACRO_CACHE_BYTES_PER_ENTRY >= 24,
+            "per-entry estimate must cover at least key+value payload bytes",
+        );
     }
 
     /// HUD overlay (hash-thing-nhwo) splits `memo_summary` on whitespace

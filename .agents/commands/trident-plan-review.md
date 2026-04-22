@@ -288,7 +288,7 @@ Expected files: `standard-claude.md`, `standard-codex.md`, `standard-codex-execu
 Launch **two Agent tool calls** in a single message — one for standard, one for adversarial. The evolutionary lens is not synthesized: Codex's evolutionary pass is the only source and is surfaced as-is.
 
 **Synthesis-Standard Agent:**
-> Read the following three reviews and synthesize them into a single cohesive document:
+> Read the following four reviews and synthesize them into a single cohesive document:
 > - `{PACK_DIR}/standard-claude.md`
 > - `{PACK_DIR}/standard-codex.md`
 > - `{PACK_DIR}/standard-codex-execution.md`
@@ -299,7 +299,7 @@ Launch **two Agent tool calls** in a single message — one for standard, one fo
 > 2. Where do they diverge? (the disagreement itself is signal)
 > 3. What unique insights did only one pass surface?
 > 4. Consolidated questions for the plan author (deduplicated, numbered)
-> 5. Overall readiness verdict synthesized across all three
+> 5. Overall readiness verdict synthesized across all four passes
 >
 > Write your synthesis to: `{PACK_DIR}/synthesis-standard.md`
 > Format as a clean, numbered-list-heavy document. Start with an executive summary.
