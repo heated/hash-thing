@@ -2874,7 +2874,10 @@ mod tests {
     /// the class of bug cannot regress silently.
     #[test]
     fn lattice_demo_waypoints_do_not_collide_with_scene() {
-        let mut world = sim::World::new(6);
+        // Level 8: 69cq (CELLS_PER_METER=4) requires lattice rooms to fit
+        // a 6.4-cell-tall player; the other lattice spawn tests moved to
+        // level 8 for the same reason.
+        let mut world = sim::World::new(8);
         let layout = world.seed_lattice_progression_demo();
         let side = world.side();
         for beat in [
@@ -3164,39 +3167,49 @@ mod tests {
 
     #[test]
     fn background_step_starts_after_live_world_player_update() {
-        let mut app = App::new(8);
+        // 69cq scale: volume_size bumped 8→32 so the 8 m physical world
+        // fits after CELLS_PER_METER=4. Fixtures are sized in meters and
+        // scaled through CELLS_PER_METER so the physical layout matches
+        // the pre-scale intent (3 m × 3 m × 1 m floor slab; 1 m × 2 m ×
+        // 1 m column 1 m north of the player).
+        let mut app = App::new(32);
         app.paused = false;
         app.keys_held.insert(KeyCode::KeyW);
         let stone = hash_thing::octree::Cell::pack(1, 0).raw();
-        for x in 3..=5 {
-            for z in 3..=5 {
-                app.world.set(
-                    sim::WorldCoord(x),
-                    sim::WorldCoord(0),
-                    sim::WorldCoord(z),
-                    stone,
-                );
+        let s = CELLS_PER_METER as i64;
+        let m = |v: f64| v * CELLS_PER_METER;
+        for x in 3 * s..6 * s {
+            for y in 0..s {
+                for z in 3 * s..6 * s {
+                    app.world.set(
+                        sim::WorldCoord(x),
+                        sim::WorldCoord(y),
+                        sim::WorldCoord(z),
+                        stone,
+                    );
+                }
             }
         }
-        app.world.set(
-            sim::WorldCoord(4),
-            sim::WorldCoord(1),
-            sim::WorldCoord(3),
-            stone,
-        );
-        app.world.set(
-            sim::WorldCoord(4),
-            sim::WorldCoord(2),
-            sim::WorldCoord(3),
-            stone,
-        );
-        app.reset_player_pose([4.5, 1.0, 4.5], 0.0, 0.0);
+        for x in 4 * s..5 * s {
+            for y in s..3 * s {
+                for z in 3 * s..4 * s {
+                    app.world.set(
+                        sim::WorldCoord(x),
+                        sim::WorldCoord(y),
+                        sim::WorldCoord(z),
+                        stone,
+                    );
+                }
+            }
+        }
+        let spawn = [m(4.5), m(1.0), m(4.5)];
+        app.reset_player_pose(spawn, 0.0, 0.0);
 
         let pid = app.player_id.expect("player should exist");
         let speed = PLAYER_SPEED;
         let step = player::step_grounded_movement(
             &app.world,
-            &[4.5, 1.0, 4.5],
+            &spawn,
             0.0,
             player::GroundedMoveInput {
                 yaw: 0.0,
@@ -3218,7 +3231,7 @@ mod tests {
             .unwrap_or(0.0);
         let delta = player::compute_move_delta(yaw, [1.0, 0.0, 0.0], speed, 0.1);
         assert!(
-            4.5 + delta[2] < expected_z,
+            spawn[2] + delta[2] < expected_z,
             "free-fly would move farther through the wall than grounded movement"
         );
 
