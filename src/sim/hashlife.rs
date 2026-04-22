@@ -529,7 +529,7 @@ impl World {
                                 bz,
                                 pass_offset,
                                 generation,
-                                &block_rule_divisors,
+                                block_rule_divisors,
                             );
                             bx += 2;
                         }
