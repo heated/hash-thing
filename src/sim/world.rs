@@ -73,6 +73,44 @@ pub struct WorldCoord(pub i64);
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct LocalCoord(pub u64);
 
+/// Read-only voxel-grid view for queries that must outlive a mutable borrow
+/// of the full [`World`].
+///
+/// Holds only the data needed to answer [`get`](Self::get) — a clone of the
+/// octree store plus the three metadata fields. No caches, no pending
+/// mutations. The main thread refreshes this snapshot each time a sim step
+/// finishes (and once more when the next step kicks off) so player collision
+/// during a background step sees a stable world instead of falling through
+/// `World::placeholder` or switching to free-fly physics (hash-thing-0s9v).
+///
+/// Staleness: during an in-flight step the snapshot reflects the world state
+/// as it entered that step, for the entire duration of the step. Expected
+/// drift is negligible at sim tick rates; long steps (100s of ms at 4096³)
+/// may briefly let the player clip through a cell that was just cleared or
+/// stand inside a cell that just became solid, self-correcting on step
+/// completion.
+#[derive(Clone)]
+pub struct CollisionSnapshot {
+    store: NodeStore,
+    root: NodeId,
+    level: u32,
+    origin: [i64; 3],
+}
+
+impl CollisionSnapshot {
+    pub fn get(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = 1i64 << self.level;
+        if lx < 0 || ly < 0 || lz < 0 || lx >= side || ly >= side || lz >= side {
+            return 0;
+        }
+        self.store
+            .get_cell(self.root, lx as u64, ly as u64, lz as u64)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DemoLayout {
     pub player_pos: [f64; 3],
@@ -647,6 +685,19 @@ impl World {
         self.ensure_region(min, max);
         self.queue
             .push(WorldMutation::FillRegion { min, max, state });
+    }
+
+    /// Extract a read-only [`CollisionSnapshot`] view of the current voxel
+    /// grid. Clones the octree store and copies the three metadata fields;
+    /// does not copy any step caches. Used by the main thread to retain a
+    /// usable voxel grid across a background sim step (hash-thing-0s9v).
+    pub fn collision_snapshot(&self) -> CollisionSnapshot {
+        CollisionSnapshot {
+            store: self.store.clone(),
+            root: self.root,
+            level: self.level,
+            origin: self.origin,
+        }
     }
 
     /// Get a cell.

@@ -280,6 +280,56 @@ The off-surface `render_gpu` (compute) bracket reports inflated numbers (~9–26
 
 dlse.2.2 should be **reopened** for option 1 (fast) and a new bead filed for option 2 (Metal-specific). The §3.8 closure note was premature; this is a swapchain-layer bug, not a renderer-compute bug.
 
+**Candidate #1 probe — `desired_maximum_frame_latency=3` (dlse.2.2 exp#4).** Onyx 2026-04-21: env-var scaffolding (`HASH_THING_FRAME_LATENCY=N`) landed at 165f784; measurement run via the self-driving acquire-harness on M2, 60 Hz external display, 256³ world, release build, seven runs total. The harness does 60 warmup frames + 64 capture frames per phase, so each arm-row below is n=64 windowed / n=64 fullscreen. Discarding the first-build-after-launch run as a one-shot outlier (12.31 ms — did not reproduce in any subsequent run):
+
+| `desired_maximum_frame_latency` | windowed `surface_acquire_cpu` mean (ms) | runs (windowed mean, ms)       |
+|---------------------------------|------------------------------------------|--------------------------------|
+| 1                               | 29.26 (n=1)                              | 29.26                          |
+| 2 (current default)             | **26.81 (n=5)**                          | 26.44 / 26.83 / 27.40 / 26.79 / 26.58 |
+| 3                               | 28.03 (n=3)                              | 29.42 / 26.72 / 27.95          |
+ 
+Delta latency=3 − latency=2: **+1.22 ms (+4.6%) worse**, well inside run-to-run noise and the opposite direction from the hypothesis. Monotonicity check: latency=1 is also worse than latency=2, so the current default is the local sweet spot — there is no larger-latency knee to find by going higher. **Candidate #1 is ruled out.** None of the three latencies comes anywhere near the ≥30% reduction acceptance threshold from the dlse.2.2 plan review.
+ 
+Plan + code-review artifacts for the scaffolding commit live in `.ship-notes/plan-dlse22-exp4-latency3.md`, `.ship-notes/plan-review-dlse22exp4-{claude,codex}.md`, and `.ship-notes/code-review-lat-scaffold-{claude,codex}.md`. The env var stays in place for future diagnostic use but does not become the default. Next dlse.2.2 candidate: option 2 above (direct `CAMetalLayer` access via wgpu hal) or option 3 (accept 30 FPS on M2 integrated and document it).
+
+**What wgpu 29.0.1 actually sets on the CAMetalLayer** (source: `wgpu-hal-29.0.1/src/metal/surface.rs:70-109`, audited 2026-04-21 by onyx as the grounding step for candidate #2):
+
+| CAMetalLayer property          | wgpu 29.0.1 setting                                     | knob we control                                              |
+|--------------------------------|---------------------------------------------------------|--------------------------------------------------------------|
+| `maximumDrawableCount`         | `maximum_frame_latency + 1` (so latency=2 → 3 drawables) | `SurfaceConfiguration.desired_maximum_frame_latency`         |
+| `displaySyncEnabled`           | `true` if `PresentMode::Fifo`, `false` if `Immediate`   | `SurfaceConfiguration.present_mode`                          |
+| `allowsNextDrawableTimeout`    | **`false`** (blocks indefinitely on acquire)            | not exposed                                                  |
+| `framebufferOnly`              | `true` when usage is `COLOR_TARGET` (our case)          | indirectly via `SurfaceConfiguration.usage`                  |
+| `presentsWithTransaction`      | never set — layer default (`false`)                     | not exposed                                                  |
+| `wantsExtendedDynamicRangeContent` | `true` iff format is `Rgba16Float`                  | `SurfaceConfiguration.format`                                |
+
+**Implication for the remaining hypothesis space.** The candidate #1 probe already swept `maximumDrawableCount` across {2, 3, 4}; none moved the stall. Earlier moss 2026-04-15 probe swept `displaySyncEnabled` across {true, false}; neither moved the stall. Those are the two knobs wgpu exposes. So the stall is *not* a drawable-count ceiling and *not* a vsync-sync policy. Both knobs that we can change via `SurfaceConfiguration` have now been shown to not be the cause. Any remaining progress has to be either:
+
+- **Candidate #2a** — reach through `surface.as_hal::<wgpu::hal::metal::Api, _, _>()` and set properties wgpu does not expose: `presentsWithTransaction = false` (already the default, probably a no-op) or drive presentation via a `CADisplayLink`-paced loop rather than winit's `RedrawRequested`. A CADisplayLink tick is the macOS-idiomatic pacing source for windowed Metal apps and is how `MTKView` internally drives its delegate; winit does not integrate with it.
+- **Candidate #2b** — replace the winit-driven `RedrawRequested` loop with a `MTKView`-equivalent render loop, either by constructing an `MTKView` manually or by driving redraws off a `CADisplayLink` callback. Both bypass winit's event-loop pacing; the second is the smaller delta.
+- **Candidate #3** — accept that windowed-mode macOS composition adds ~16–25 ms pacing overhead, document it, and set expectations that 60 FPS is a true-fullscreen-only target on M-series integrated GPUs.
+
+Candidate #2a is the narrowest thing still worth trying before conceding to #3: it's a one-dispatch experiment that keeps winit's window but supplies our own redraw cadence. If a CADisplayLink-paced loop still shows `surface_acquire_cpu ≥ 16 ms` on M2, that is a strong signal the root cause is WindowServer composition and not our pacing choice, which is as close to a root-cause conclusion as this bead can get at the wgpu layer.
+
+**Candidate #2a refined — acquire-as-late-as-possible (Apple Metal Best Practices).** Literature pass 2026-04-21 (onyx) surfaced a much cheaper experiment than the `surface.as_hal` / `CADisplayLink` reroute. Apple's [Metal Best Practices Guide — Drawables](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/Drawables.html) states:
+
+> "Always acquire a drawable as late as possible; preferably, immediately before encoding an on-screen render pass. A frame's CPU work may include dynamic data updates and off-screen render passes that you can perform before acquiring a drawable."
+
+Our `Renderer::render` (`crates/ht-render/src/renderer.rs:1843`) calls `surface.get_current_texture()` *before* the SVDAG raycast compute dispatch (`renderer.rs:1989`) — the exact anti-pattern the doc warns about. Our compute pass writes to an off-screen `raycast_texture` that the on-screen render pass later blits from, so the Apple-sanctioned reorder is a mechanical move: encode compute first, then acquire the drawable immediately before the render-pass encode. This is the same class of fix Flutter Impeller shipped on iOS for the same symptom (flutter/flutter#138490). No `surface.as_hal`, no `CADisplayLink`, no unsafe code. Tracked as `hash-thing-dlse.2.2.2`; candidate #2a/#2b above remain as the fallbacks if the reorder doesn't land the signal.
+
+**Candidate #2a outcome 2026-04-21 (onyx) — null result + paper correction.** Shipped the reorder (move `get_current_texture()` after the compute-pass encode, immediately before the on-screen render pass), built both pre- and post-reorder `--profile bench` binaries of `hash-thing 256`, ran each for 35 s on M2 with `RUST_LOG=info`, and compared `surface_acquire_cpu`. Reviewer pass was clean (2 Claude + 1 Codex reviewers, all ship-verdict; full wgpu 29.0.1 + Metal HAL audit of the drop-encoder path confirmed no leak / no partial submit). The measurement was the deciding input, and the measurement said the reorder does not move the signal:
+
+| window (s) | before mean (ms) | before p95 (ms) | after mean (ms) | after p95 (ms) |
+|-----------:|-----------------:|----------------:|----------------:|---------------:|
+| 0–14 (warmup) | 24.67 | ~32.4 | 24.49 | ~33.1 |
+| 14–35 (steady) | 13.40 | 15.64 | 13.46 | 15.53 |
+
+Per-run raw rows are in `/tmp/before-dlse222-long.log` and `/tmp/after-dlse222-long.log`; full methodology is in `.ship-notes/plan-dlse222-late-acquire.md`. Delta is within timer noise in both windows. Reverted the `renderer.rs` reorder per the plan's rollback criterion; `dlse.2.2.2` is closed as a ship-safe but effect-less fix.
+
+The instructive finding, though, is not the null — it is the **steady-state column**. `surface_acquire_cpu` settles to ~13.5 ms mean / ~15.6 ms p95 after ~14–16 s of runtime on both binaries, not the ~25 ms that §3.8 documented as "pinned." Two runs on the same binary reproduce the step-down to within 0.1 ms. That means the ~25 ms stall this subsection has been chasing is **not a steady-state pin**; it is a ~14-s warmup-period behaviour of the WindowServer / CAMetalLayer pacing that self-resolves. Steady-state 13.5 ms is consistent with a 60 Hz vsync budget (16.67 ms) minus our own ~3 ms of CPU work, which is exactly the regime we expected 60 FPS to live in. §3.8's original capture window (~10 s warm, skip first line) was inside the warmup phase and mis-attributed a transient to a pin. That explains why every knob probe under §3.8 — `maximumDrawableCount`, `displaySyncEnabled`, `present_mode`, and now the late-acquire reorder — failed to move the number: nothing in that plane *should* move a warmup transient, because the steady-state number is already ~60 FPS. The warmup stall itself is still worth characterising (tracked as a new bead), but the framing of dlse.2.2 shifts: the windowed-mode 30 FPS we have been debugging is a "first ~14 s" figure, not "the FPS." Candidate #3 (accept 30 FPS as the windowed floor) is weakened by this; candidate #2b (MTKView / `CADisplayLink` drive) is no longer obviously needed at all for steady state. Measurement on longer-baseline windows supersedes §3.8's original attribution; §3.8 and the dlse.2.2 candidate enumeration above should be read as historical context for a transient that does not actually pin.
+
+**Addendum 2026-04-21 (`hash-thing-dlse.2.2.3`, warmup shape).** A 60 s per-generation trace of the same 256³/50% run (`/tmp/dlse223-full.log`, 29 samples) shows the "14-s warmup" is imprecise. The actual shape is: **climb 23 → 34 ms over t=2-14** (same pipeline-fill shape dlse.3 documents at 1024³), a sharp kink at t=14-16 coincident with a memo cache trim (memo_tbl 31298 → 8372), a plateau at 26-27 ms through t=26, then a gradual 8-s step-down t=26-34 to ~11 ms steady. The step-down correlates with step-duration stabilising (640 → 860 ms) and memo_hit plateauing — as sim generations slow, svdag rebuild / upload pressure drops. The "warmup" is therefore not a single WindowServer negotiation event: it is a composite of CPU-GPU pipeline fill (same mechanism as dlse.3), memo-cache warmup, and sim-step-rate stabilisation. The 0-14 / 14-35 split in the table above puts the tail of the step-down into the steady column, which pulls the steady mean toward its elevated end; the true post-stabilisation mean is closer to ~11 ms. The broad conclusion (steady is in the 60 FPS regime, no compositor knob fixes this) stands.
+
 ### 3.10 Scaling the model to 4096³ (`hash-thing-ivms`)
 
 Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
@@ -350,6 +400,20 @@ Two cross-checks on the span:
 **3.10.6 Confirmation path (pre-e092, kept for context).** `bench_raycast_4096` already exists in `tests/bench_gpu_raycast.rs` (`#[ignore]`) and runs 10 samples, but it uses `BenchCamera::empty_corner()` (optimistic). The confirmation path was two runs:
 1. The existing empty-corner `bench_raycast_4096` — floor.
 2. A seeded-terrain variant at 4096³, closer to the demo target — measurement comparable against the §3.10.5 envelope (now landed as `bench_raycast_4096_app_spawn`, see §3.10.5.1).
+
+### 3.11 GPU cost at 1024³/100% is real — the "ramp" is pipeline fill (`hash-thing-dlse.3`)
+
+Bead filed 2026-04-21 from a 1024³ repro where `surface_acquire_cpu` grew monotonically from 54 ms at t=0 to 187 ms at t=20 s and plateaued. Initial suspects: sim-thread starvation (refuted by `HASH_THING_FREEZE_SIM=1` — ramp still occurs) and GPU-queue backpressure accumulation.
+
+The decisive A/B was `HASH_THING_OFF_SURFACE=1`: with no swapchain, `surface_acquire_cpu` drops to 0.01 ms and the ramp **moves to `submit_cpu`** (13 → 154 ms, plateau 154 ms). Meanwhile `render_gpu` reads 3.76 ms for the first ~10 s, then jumps to 53 ms mean / **151 ms max** once the timestamp-query ring buffer catches up. Plateau self-consistency: `submit_cpu ≈ render_gpu max`. The GPU is genuinely spending ~150 ms/frame on the compute raycast at 2940×1782 × 1024³.
+
+Two corrections to the earlier framing:
+1. **`render_gpu` / `render_pass_gpu` undercount by ~30×**, because the timestamp writes cover only the on-screen render pass, not the compute dispatch where the raycast lives. §3.8's "~1 ms GPU" — used to argue the `surface_acquire_cpu` stall was *not* GPU-bound — was reading 1/30 of the actual work. (A follow-up bead adds a compute-pass `GpuTiming` instance; `hash-thing-fitq`.)
+2. **The ramp is not an accumulating queue.** It is a pipelined CPU-GPU system reaching its steady-state backpressure. Frame 0 submits to an empty GPU; frame N submits and waits on frame N-K to retire; as K fills (`maximumDrawableCount` + command-buffer depth), steady-state submit time converges to actual GPU frame time. The linear shape of the 13 → 154 ms off-surface climb is exactly the shape of a bounded pipeline filling.
+
+Surface-attached plateau (187 ms) minus off-surface plateau (154 ms) ≈ 33 ms of compositor + drawable-acquisition overhead, consistent with the CAMetalLayer path. The camera-recenter snap-back is plausibly a world-state transition to shallow traversal / empty rays for a few frames — the pipeline drains and refills, giving the same ramp from a lower starting cost — not a sim-state reset.
+
+**Budget implication.** On M2 integrated, 1024³ × 100% scale is GPU-bound at ~6 FPS; no amount of compositor tuning fixes that. `render_scale = 0.5` as the default puts us near the M2 budget at 1024³. A world-size-aware auto-picker is filed as `hash-thing-zytn` (blocked on fitq for a trustworthy GPU signal).
 
 ---
 
@@ -547,6 +611,25 @@ Two caveats on the exponent:
 - **Out-of-band scales still unmeasured.** The fit covers 64³–512³. At 2048³, a single warm step accumulated >15 min of CPU under this harness before being killed — so the 4hkq/slc1 out-of-band benches (`bench_svdag_step_deltas_2048`, `_4096`) need a measurement workflow that tolerates 10–30 min wall per scale, which the current CI-style `#[ignore]` harness does not provide. Filed as `hash-thing-slc1` follow-up.
 - **Scene dependence.** A pathological scene with uniformly-active CA across the whole 4096³ volume would scale misses closer to `L³` (volume), giving ~470k misses/step. Our default terrain+water+sand scene is nowhere near that — active CA is concentrated on a thin fringe (water surface, sand-fall column) whose area scales well below `L²`. The measured 64³–512³ slope is consistent with this physical intuition; the 4096³ span above assumes the scene remains fringe-dominated.
 
+**4.7.2a Out-of-band bench workflow (`hash-thing-dpkz`).** `bench_svdag_step_deltas_2048` and `bench_svdag_step_deltas_4096` are `#[ignore]`-gated and intended to be driven by a long-running wrapper rather than an agent's default 60 s `cargo test` budget. There is no dedicated binary; the workflow is invoke-the-existing-test with a bigger shell timeout. Expected wall-clock per scale (M1-class; ~1.5× faster on M2 16 GB):
+
+| scale | seed | one warm step | total wall (warmup=0, measured=1) |
+|-------|------|---------------|------------------------------------|
+| 1024³ | ~1 s | ~10–20 s      | ~30 s (fits in the default budget) |
+| 2048³ | ~2 s | 45–90 s       | 2–5 min                            |
+| 4096³ | ~3.5 s | ≥60 s (bench_hashlife_4096 SIGKILL profile) | 2–10 min |
+
+Invocation (bump the shell timeout explicitly — don't rely on the default 2 min `Bash` budget):
+
+```text
+cargo test --release --test bench_svdag bench_svdag_step_deltas_4096 \
+    -- --ignored --nocapture
+```
+
+Agent usage pattern: run as a background task (`run_in_background: true`) so the sweep keeps moving while the bench finishes; the result lands as a task-notification. Capture the printed `misses/step`, `slot appends/step`, and `bytes/step` from the bench output and paste them into `§4.7.2` as the 2048³ / 4096³ entry of the miss-count table, then update the pair-wise slope column.
+
+If a longer wall becomes unavoidable (>10 min) or the bench needs to run unattended across reboots, escalate to a dedicated harness binary — but the `#[ignore]`-gated test with a bumped shell timeout covers the current data-point need.
+
 **4.7.3 `hashlife_macro_cache` budget at 4096³.** The cache is a **single** `FxHashMap<(NodeId, u64), NodeId>` (see `src/sim/world.rs:192` and `src/sim/hashlife.rs:406-422`), keyed on `(node, generation)`. There is no per-level multiplication — it is one map, shared across the whole recursion.
 
 Entry cost: `(NodeId, u64) → NodeId` ≈ 16 B/entry including `FxHashMap` overhead. The cache grows with the product of:
@@ -601,7 +684,7 @@ Format (placeholder):
 | SVDAG compaction | Not observed in 40-step warm window at 256³ (§4.4) | N/A | N/A | Fires only when `stale_ratio > 0.5`; not a steady-state cost. |
 | Step (memo short-circuit rate, 256³ warm) | **~72% short-circuit** (hits + empty + fp) on M2 16 GB (`bench_svdag_step_deltas_256`, §4.2) | Not yet in §3 (memo model) | N/A until modelled | Raw hit rate ~55%; skips absorb another ~17%. |
 | Step (memo miss / cold gen) | TODO | TODO | TODO | TODO |
-| Surface acquire (windowed, 256³ / 50%) | **~25 ms/frame** on M2 16 GB (spark 2026-04-19, three consecutive log lines) | Not yet in §3 (surface/presentation model is §3.8 TODO) | N/A until modelled | **This is the real 30 FPS bug.** Owned by `hash-thing-dlse.2.2`. |
+| Surface acquire (windowed, 256³ / 50%) | **~25 ms/frame** on M2 16 GB (moss/spark/onyx 2026-04-15 → 2026-04-21; n≈60 per run, multiple harness replications in §3.9) | Modelled in §3.8 + §3.9: not a swapchain or compositor knob — **wgpu's two exposed CAMetalLayer knobs (drawable count, display-sync) are both empirically null**. Surviving hypothesis: WindowServer composition pacing of windowed `CAMetalLayer`, not reachable through `SurfaceConfiguration`. | ~25 ms above the 16.67 ms 60 Hz budget | **This is the real 30 FPS bug on M2.** Owned by `hash-thing-dlse.2.2`. Remaining candidates: #2a CADisplayLink-paced loop via `surface.as_hal`, #2b MTKView-equivalent rewrite, #3 accept 30 FPS on integrated M-series windowed. |
 | Raycast traversal (**measured**, 4096³ / 50%, seeded terrain) | `bench_raycast_4096_app_spawn` (onyx 2026-04-21, e092) on M2 16GB: **0.30 ms mean / 0.22 ms p50 / 1.06 ms p95 / ~3379 fps** over 10 frames. M1-implied at 1.5× factor: ~0.45 ms mean. | 4–17 ms span (§3.10.5 pre-measurement three-scenario envelope) | **~8-50× model over-prediction** on M2, ~6-35× on M1-implied | The same shape as the 256³ gap (§3.6, ~30× over-prediction): the §3.10.4 cache-mix pessimism (50/35/15 or 30/40/30) never materializes in the seeded-terrain scene. Warp-coherent primary rays reuse the ancestor chain in L1 aggressively; the "whole-DAG spills L2" concern in §3.10.3 is irrelevant once the hot working set is a few KB. The 17 ms confident upper bound stands as a go/no-go threshold (measurement < bound), but the scenario-span approach over-predicts by more than a decade at 4096³. **Primary-ray-only rendering at 4096³ is comfortable on M2, likely comfortable on M1 MBA.** Remaining budget headroom (16.7 ms − ~0.5 ms ≈ 16 ms on M1) is the real number available for sim + secondary rays + present overhead. |
 | Mean DDA steps/ray (**measured**, 4096³, three poses) | `tests/bench_depth_histogram.rs::depth_histogram_4096` (onyx 2026-04-21, cz0r): default-spawn=**25.90**, looking-down=**16.76**, horizontal-mid=**24.20** | ~22–28 steps/ray at default-spawn (pre-cz0r §3.10.2 projection) | Model landed dead-center of the band (26 vs 22–28 projection); §3.10.5 envelope shifted by <1 ms | Pre-measurement projection assumed `log(depth)/log(linear)` exponent ~0.8 (cubing vs linear). Measured exponent: 0.20–0.33 across poses — much flatter. Implication: the "step-past + pop" chain is dominated by coarse-ancestor descent that shares across rays, not by raw tree height. Worst-case p95=62, max=235 — well under the shader's 4096³ step budget (`max(1024, 4096×8) = 32,768`, `crates/ht-render/src/svdag_raycast.wgsl:330-332`, no `exhausted` rays in the harness), confirming no tuning needed. |
 | SVDAG incremental upload (**predicted**, 4096³ warm) | Not yet measured at 4096³; 64³/256³/512³ three-point fit lands at ~12.3 × `L^0.863` (onyx 2026-04-21, slc1). | ~40 KB–440 KB/step → ~2–26 MB/s at 60 FPS (§4.7.2 revised band) | N/A | Three measured miss-count scales (64³=412, 256³=1847, 512³=2296) narrow the prior `[0.8, 1.4]` exponent band. 2048³ warm-step accumulated >15 min CPU under current harness before stop — `bench_svdag_step_deltas_2048/_4096` need an explicit long-timeout workflow, filed as slc1 follow-up. |
@@ -740,11 +823,14 @@ These criteria are deliberately *fragile*. Moving goalposts after the spike runs
 
 **Scope.** Hash-table *primitive* viability under uniform-random load, measured
 on M1 MBA (reference hardware per §1). Linear-probe open-addressing, 32-bit
-packed keys (`0` reserved as empty sentinel, so `(NodeId, parity)` is folded
-via `fxhash(node) ^ parity`), atomic CAS on slot_keys serializes insert
-contention. Memo-purity overwrite semantics (a later step producing the same
-`(NodeId, parity) → NodeId` mapping is a no-op). One dispatch per phase
-(insert / lookup-hit / lookup-miss). Source:
+packed keys (`0` reserved as empty sentinel). The microbench exercises
+already-packed `u32` keys drawn from a SplitMix64 stream; the production
+memo shape `(NodeId, parity) → NodeId` would fold into the same key width
+via `fxhash(node) ^ parity` but that fold is not exercised here — the
+bench measures the table primitive, not the key-derivation path. Atomic
+CAS on slot_keys serializes insert contention. Memo-purity overwrite
+semantics (a later step producing the same mapping is a no-op). One
+dispatch per phase (insert / lookup-hit / lookup-miss). Source:
 `tests/bench_gpu_hash_table.rs`.
 
 **Methodology.** In-encoder `TIMESTAMP_QUERY_INSIDE_ENCODERS` timestamps
@@ -773,7 +859,7 @@ GPU hash-table sweep (seed 0xA5A5A5A5, timestamp_supported=true)
 |---------|-------|------|---------|-------------|------------|------------|-------------|--------------|--------------|---------------|----------|----------|-----------|
 |   10000 |  4096 | 0.75 |   16384 | 1.77 (2.03) |      0.069 |      0.099 |      0.083 |         59.5 |         41.3 |          49.2 |        7 |        7 |         8 |
 |   10000 | 10000 | 0.50 |   32768 | 1.73 (1.88) |      0.074 |      0.092 |      0.106 |        134.5 |        109.2 |          94.0 |       12 |       12 |        12 |
-|   10000 | 10000 | 0.90 |   16384 | 1.70 (1.90) |      0.057 |      0.108 |      0.190 |        176.6 |         92.8 |          52.7 |       30 |       30 |        30 |
+|   10000 | 10000 | 0.90 |   16384 | 1.70 (1.90) |      0.057 |      0.108 |      0.190 |        176.6 |         92.8 |          52.7 |       30 |       30 |        38 |
 |  100000 |  4096 | 0.75 |  262144 | 1.69 (1.82) |      0.058 |      0.071 |      0.084 |         70.6 |         58.0 |          48.5 |        2 |        2 |         2 |
 |  100000 | 16384 | 0.50 |  262144 | 2.01 (3.29) |      0.052 |      0.143 |      0.128 |        317.1 |        114.9 |         127.6 |        3 |        3 |         4 |
 |  100000 | 16384 | 0.75 |  262144 | 1.95 (3.11) |      0.067 |      0.407 |      0.114 |        245.8 |         40.2 |         144.3 |        3 |        3 |         4 |
@@ -789,15 +875,23 @@ board because the 1.5 ms submit+poll wall-clock floor dominates a tiny
 compute workload; they're in the full sweep output for transparency but
 are not the primitive measurement.)
 
-**Probe depth.** `maxP_{ins,hit,miss}` are the per-phase max buckets
-(reset and read back between phases so they attribute cleanly). For
-`N ≥ 100K` the table is "empty enough per bucket" that linear probing
-sees `maxP ≤ 5` across all phases even at LF 0.9. The outlier is
-`N=10K, M=10000, LF ∈ {0.75, 0.9}` where `maxP=30`: 10K threads racing
-into a 16K-slot table produce deep clusters by the time the last inserts
-arrive, and subsequent lookups inherit those clusters (hence insert and
-hit phases show the same 30). The 32-slot histogram overflow counter was
-never triggered — no run came close to the `table_size` wrap-around abort.
+*Footnote on the `M` column:* the sweep axis is
+`m_threads ∈ {256, 1024, 4096, 16384}`, but the dispatch size printed
+is `threads_to_dispatch = m_threads.min(n)`. At `N=10000`, the
+`m_threads=16384` row prints as `M=10000` — same sweep configuration,
+clipped to the input size.
+
+**Probe depth.** `maxP_{ins,hit,miss}` report the exact max probe count
+observed per phase, captured by an `atomicMax(&max_probes_exact[0], probes)`
+scalar inside the WGSL shader (cleared and read back between phases).
+Under `N ≥ 100K` the table is "empty enough per bucket" that linear
+probing sees `maxP ≤ 5` across all phases even at LF 0.9. The outlier
+is `N=10K, M=10000, LF ∈ {0.75, 0.9}` where insert/hit saturate near 30
+and the miss path reaches 38 at LF 0.9: 10K threads racing into a
+16K-slot table produce deep clusters, lookup-hit inherits them, and
+lookup-miss walks slightly further since miss probes follow the same
+clusters and only terminate on an empty slot. None of these approached
+the `table_size` wrap-around abort in `cs_insert` / `cs_lookup`.
 
 **Verdict: GO (linear probing, no cuckoo required).**
 
@@ -828,9 +922,12 @@ GPU memo overall*) if any of:
 
 - `gpu_hit_Mk/s` drops below 50 at LF 0.9 for N ≥ 100K.
 - `maxP` exceeds `log2(table_size)` at any load factor up to 0.9 for N ≥ 100K.
-- A concurrent-same-key insert takes more than ~10× the uncontended insert
-  path (measured by the `concurrent_same_key_cas_serializes` correctness
-  test at bench time).
+- Concurrent same-key inserts fail to serialize to exactly one winner.
+  The `concurrent_same_key_cas_serializes` correctness test asserts this
+  invariant (plus that the winning slot's value equals the shared value)
+  but does not time the contended vs uncontended dispatch; a timed
+  slowdown measurement belongs to abwm.3 where real contention lives on
+  the sim dispatch.
 
 None of those conditions are met in the current sweep. Linear probing
 stands up; proceed to abwm.3 integration.
@@ -876,3 +973,4 @@ stands up; proceed to abwm.3 integration.
 | 2026-04-21 | onyx | §3.10.2, §3.10.5, §5, §6 (bead `hash-thing-cz0r`). Collapses the §6 entry 8 projection band to measurement. `bench_depth_histogram` extended to level 12 via an extracted `run_depth_histogram(level, enforce_floors)` helper; the 256³ path keeps its v2d1 mean-steps floors, 4096³ runs without floor assertions until baseline calibration lands. Measured at 4096³: default-spawn=**25.90**, looking-down=**16.76**, horizontal-mid=**24.20** DDA steps/ray mean. Landed dead-center of the ivms §3.10.2 projection (22–28 band), so §3.10.5 envelope shifts <1 ms and the scenario spread remains the operative uncertainty. Secondary finding: the depth-vs-linear scaling exponent is flatter than projected (0.20–0.33 measured vs ~0.8 assumed) — the SVDAG shares coarse-ancestor descent chains across the wider frustum at 4096³ rather than paying raw tree-height. Also corrected a false "128-step shader cap" claim in the §5 gap report: real cap is `max(1024, root_side×8) = 32,768` at 4096³ (cited `svdag_raycast.wgsl:330-332`); measured max=235, budget fine. |
 | 2026-04-21 | onyx | §3.10.5.1, §3.10.6, §5, §6 (bead `hash-thing-e092`). Seeded-terrain raycast variant landed as `bench_raycast_4096_app_spawn`: **0.30 ms mean / 0.22 ms p50 / 1.06 ms p95 / ~3379 fps** on M2 16 GB, SVDAG 548k nodes / 18.8 MB. M1-implied at 1.5× factor: ~0.45 ms mean. **Refutes all three §3.10.4 cache-mix scenarios** (4 / 17 / 27 ms) as calibrated upper bounds — measurement ~10× below even the optimistic branch. The 256³ §3.6 pattern (warp-coherent L1 reuse) replicates at 4096³; the "whole-DAG spills L2" framing was not the operative bottleneck. The 17 ms confident upper bound still holds (measurement < bound by ~38×) but the interior scenario labels are not predictive. §6 entry 10 resolved. New open: re-derive the envelope using warp-width + ancestor-chain heuristics at 4096³ and check whether *that* model predicts within 2–3×. 4096³ primary-ray-only rendering is comfortable on M2 and likely comfortable on M1 MBA — budget headroom (~16 ms on M1 at the 60-FPS target) is available for sim + secondary rays + present. |
 | 2026-04-21 | onyx | §4.7.2, §5, §6 Q11 (bead `hash-thing-slc1`). Three-point memo-miss scaling measurement: 64³=411.75, 256³=1847.1, 512³=2295.8 misses/step (last confirmed twice to 0.01 %). Pair-wise slopes drop from **1.08** (64³→256³) to **0.31** (256³→512³); least-squares fit across all three: `L^0.863`. **The §4.7's "exponent blows up at 1024³+" worry is refuted in the 64³–512³ range** — scaling is *favorably* sub-linear, not super-linear. Revised 4096³ miss-count band: 4k–40k (vs prior 20k–80k two-point projection); upload-bandwidth band at 60 FPS tightens to 2–26 MB/s. Out-of-band 2048³/4096³ measurement remains unresolved — one 2048³ warm step ran >15 min of CPU in the current `#[ignore]` harness before being stopped, well past the 60s soft-ceiling. §6 Q11 marked partially resolved; follow-up bead filed for a long-timeout measurement workflow. |
+| 2026-04-21 | spark | §8.6 retro follow-ups (bead `hash-thing-ta8j`). Replaced the saturating 32-bucket probe-depth histogram with an exact `atomicMax` scalar in the WGSL shader — the N=10K/M=10K/LF=0.9 row's `maxP_miss` resolves from saturated-30 to exact 38 (insert/hit are confirmed exactly 30, not saturated). Added a cross-dispatch-fence comment in `cs_insert` warning a future abwm.3 integrator that queue-submit ordering is load-bearing and WGSL has no release-store. Softened flip condition #3 to match what the correctness test actually asserts (serialization of concurrent same-key inserts + value assertion on the winning slot) rather than an unmeasured 10× slowdown claim. Tightened §8.6 Scope prose to describe the packed-u32 keys the harness actually runs, not the production `(NodeId, parity)` fold (which lives in abwm.3). M-column footnote added. No verdict change: GO for linear probing still holds. |

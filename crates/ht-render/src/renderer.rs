@@ -575,7 +575,13 @@ impl Renderer {
 
         // Default render_scale = 0.5: render at half physical resolution
         // for 4x fewer pixels. Trade sharpness for framerate.
-        let render_scale: f32 = 0.5;
+        // dlse.3 diagnostic: HASH_THING_RENDER_SCALE=1.0 skips the
+        // manual bracket-key adjustment for A/B runs.
+        let render_scale: f32 = std::env::var("HASH_THING_RENDER_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|s: &f32| (0.25..=1.0).contains(s))
+            .unwrap_or(0.5);
         // dlse.2.2 exp#4: env-var gated so latency=3 (and other values)
         // can be A/B tested without a default change. Invalid values
         // fall back silently to DEFAULT_FRAME_LATENCY; the init log
@@ -1258,7 +1264,7 @@ impl Renderer {
             camera_target: [0.5, 0.5, 0.5],
             debug_mode: 0,
             lod_bias: 1.0,
-            render_scale: 0.5,
+            render_scale,
             gpu_timing,
             gpu_timing_render_pass,
             last_gpu_frame_time: None,

@@ -1,4 +1,3 @@
-use hash_thing::acquire_harness::{self, Action as HarnessAction};
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
@@ -379,13 +378,9 @@ struct App {
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
-    /// Fullscreen toggle state (dlse.2.2). Cycles between None and
-    /// Fullscreen::Borderless(None) via F11 or Cmd+Ctrl+F. Initial
-    /// state set from HASH_THING_FULLSCREEN=1.
-    fullscreen_active: bool,
-    /// Latest modifier key state, tracked via ModifiersChanged, used
-    /// to detect the Cmd+Ctrl+F fullscreen chord (winit does not
-    /// surface chords as NamedKey).
+    /// Latest modifier key state, tracked via ModifiersChanged. Feeds
+    /// `reconcile_modifier_keys` to clear stuck physical-key entries
+    /// when a modifier change arrives without a matching Released event.
     modifiers: winit::keyboard::ModifiersState,
     /// Cached hashlife memo health summary (hash-thing-stue.6). Refreshed
     /// on the main thread after each step's world result is merged back,
@@ -414,13 +409,11 @@ struct App {
     /// leaves the thread at its inherited QoS. Set via
     /// `HASH_THING_SIM_QOS={interactive|initiated|default|utility|background}`.
     sim_qos: Option<u32>,
-    /// Self-driving windowed-vs-fullscreen acquire measurement
-    /// (`dlse.2.2`). `Some` when `HASH_THING_ACQUIRE_HARNESS=1`.
-    /// When active, the harness forces a windowed start, burns a
-    /// warmup window, records capture samples, flips fullscreen,
-    /// records again, logs a side-by-side report, and asks the event
-    /// loop to exit.
-    acquire_harness: Option<acquire_harness::Harness>,
+    /// Read-only voxel-grid view kept on the main thread so player collision
+    /// can run every frame even while a background sim step owns the mutable
+    /// [`sim::World`] (hash-thing-0s9v). Refreshed at step start, step
+    /// completion, and after [`sim::World::ensure_region`] grows the world.
+    collision_snapshot: Option<sim::CollisionSnapshot>,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -527,7 +520,6 @@ impl App {
             startup_scene_pending: true,
             cursor_captured: false,
             pending_player_action: None,
-            fullscreen_active: std::env::var("HASH_THING_FULLSCREEN").ok().as_deref() == Some("1"),
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
             memo_hud_visible: std::env::var("HASH_THING_MEMO_HUD").ok().as_deref() == Some("1"),
@@ -537,26 +529,13 @@ impl App {
                 .ok()
                 .as_deref()
                 .and_then(thread_qos::parse),
-            acquire_harness: acquire_harness::Harness::from_env(),
+            collision_snapshot: None,
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
         }
         if let Some(qos) = app.sim_qos {
             log::info!("HASH_THING_SIM_QOS active: sim thread will request QoS 0x{qos:02x} (xhi6 diagnostic)");
-        }
-        // The harness owns the windowed→fullscreen transition explicitly;
-        // honouring `HASH_THING_FULLSCREEN=1` on top of it would skip the
-        // windowed capture phase. Force windowed start when the harness is
-        // on, and log loudly if we clobbered an explicit user request —
-        // otherwise setting both flags is silently confusing (mixt NIT #5).
-        if app.acquire_harness.is_some() {
-            if app.fullscreen_active {
-                log::info!(
-                    "HASH_THING_ACQUIRE_HARNESS=1 overrides HASH_THING_FULLSCREEN=1: forcing windowed start so the harness can run its windowed capture phase before toggling to fullscreen"
-                );
-            }
-            app.fullscreen_active = false;
         }
 
         // Seed the cached memo summary so the very first periodic log line
@@ -838,6 +817,20 @@ impl App {
             return;
         }
         self.step_start = std::time::Instant::now();
+        // Refresh the main-thread collision snapshot BEFORE moving the world
+        // to the step thread. Player collision during the step reads from
+        // this snapshot, not the placeholder we're about to swap in
+        // (hash-thing-0s9v). Timed so we can validate the clone-cost
+        // estimate against live sweeps.
+        //
+        // Ordering invariant: the snapshot MUST be set before `step_handle`
+        // becomes `Some(...)`. `is_stepping()` ⟺ `step_handle.is_some()`, and
+        // grounded movement unwraps `collision_snapshot` via `expect` when
+        // stepping; inverting these lines would expose that expect.
+        {
+            let _t = self.perf.start("collision_snapshot_refresh");
+            self.collision_snapshot = Some(self.world.collision_snapshot());
+        }
         // Move world to the background thread only after the frame has
         // consumed the live snapshot for movement, interaction, and render.
         let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
@@ -897,7 +890,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
-                "  F11/Cmd+Ctrl+F Fullscreen   C Clear perf",
+                "  C  Clear perf",
                 "  Esc Exit",
             ],
             CameraMode::Orbit => vec![
@@ -919,7 +912,7 @@ impl App {
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
-                "  F11/Cmd+Ctrl+F Fullscreen   C Clear perf",
+                "  C  Clear perf",
                 "  Esc Exit",
             ],
         }
@@ -927,23 +920,6 @@ impl App {
 
     fn lattice_debug_jumps_enabled(&self) -> bool {
         self.camera_mode == CameraMode::Orbit
-    }
-
-    /// Toggle borderless-fullscreen (dlse.2.2). Logs the chosen variant so
-    /// post-hoc log forensics can tell which state the app was in at
-    /// measurement time.
-    fn toggle_fullscreen(&mut self) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
-        self.fullscreen_active = !self.fullscreen_active;
-        let mode = if self.fullscreen_active {
-            Some(winit::window::Fullscreen::Borderless(None))
-        } else {
-            None
-        };
-        log::info!("fullscreen: toggling to {:?}", mode);
-        window.set_fullscreen(mode);
     }
 
     /// Update cached render-side world geometry after world changes.
@@ -1434,17 +1410,12 @@ impl ApplicationHandler for App {
                     .create_window(attrs)
                     .expect("failed to create main window"),
             );
-            // Agent/CLI launches on macOS can leave the app alive but unfocused.
+            // Do NOT focus-on-launch by default (edward 2026-04-21): the
+            // game stealing focus mid-dev-loop blocks keyboard input to the
+            // terminal/agent surface. Opt in with HASH_THING_FOCUS=1.
             window.set_visible(true);
-            window.focus_window();
-            if self.fullscreen_active {
-                // dlse.2.2: env-var opt-in. `Borderless(None)` targets the
-                // monitor currently containing the window. This will fire
-                // `Resized` and transition the macOS Space.
-                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
-                log::info!(
-                    "fullscreen: entering Borderless(None) at startup (HASH_THING_FULLSCREEN=1)"
-                );
+            if std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1") {
+                window.focus_window();
             }
             self.window = Some(window.clone());
 
@@ -1547,15 +1518,6 @@ impl ApplicationHandler for App {
                     }
                 }
                 if event.state == ElementState::Pressed {
-                    // dlse.2.2: Cmd+Ctrl+F fullscreen chord. Check by physical
-                    // key + modifier state since winit does not surface chords
-                    // as NamedKey and macOS may alter logical_key under Cmd.
-                    if let winit::keyboard::PhysicalKey::Code(KeyCode::KeyF) = event.physical_key {
-                        if self.modifiers.super_key() && self.modifiers.control_key() {
-                            self.toggle_fullscreen();
-                            return;
-                        }
-                    }
                     match event.logical_key.as_ref() {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => {
                             // In orbit mode, Space toggles pause.
@@ -1571,12 +1533,6 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F5) => {
                             self.paused = !self.paused;
                             log::info!("Paused: {}", self.paused);
-                        }
-                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
-                            // dlse.2.2: fullscreen toggle. Primary shortcut is
-                            // Cmd+Ctrl+F on macOS (reachable even when F11 is
-                            // swallowed by the window server).
-                            self.toggle_fullscreen();
                         }
                         winit::keyboard::Key::Character("0") => {
                             // Recenter player at world center.
@@ -1888,22 +1844,7 @@ impl ApplicationHandler for App {
                 // stepping the sim + uploading the SVDAG during a 100%-CPU
                 // spin on an invisible surface is exactly what 8jp was about.
                 // `WindowEvent::Occluded(false)` re-arms the loop.
-                //
-                // Exception: when the acquire-harness is running we want
-                // frames to keep coming even if the window manager decides
-                // to unfocus us — otherwise a headless crew launch can
-                // stall forever on frame 0 waiting on focus it'll never
-                // get. The `occluded` half of the bypass is separate from
-                // the `!focused` half: on macOS the compositor may mark a
-                // window occluded during the fullscreen toggle and never
-                // un-occlude before we finish capturing (mixt IMPORTANT
-                // #3). For a one-shot diagnostic we accept that the
-                // "occluded" frames still run — `surface.get_current_texture()`
-                // returns `Occluded` and the renderer early-returns, which
-                // is harmless for the measurement (no perf sample
-                // recorded) and auto-corrects once the compositor re-arms
-                // the surface.
-                if self.acquire_harness.is_none() && (self.occluded || !self.focused) {
+                if self.occluded || !self.focused {
                     return;
                 }
 
@@ -1953,6 +1894,16 @@ impl ApplicationHandler for App {
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
+                                // Refresh the collision snapshot from the
+                                // just-returned world so the next frame's
+                                // player physics reads post-step geometry
+                                // (hash-thing-0s9v). Same clone-cost surface
+                                // as the step-start refresh; timed under the
+                                // same metric so sweeps see both samples.
+                                {
+                                    let _t = self.perf.start("collision_snapshot_refresh");
+                                    self.collision_snapshot = Some(self.world.collision_snapshot());
+                                }
                                 // Refresh cached memo-health summary while the
                                 // real world is in hand (hash-thing-stue.6):
                                 // the (stepping) log branch below cannot read
@@ -2103,34 +2054,34 @@ impl ApplicationHandler for App {
 
                         let stepping = self.is_stepping();
                         let mut camera_grounded = false;
+                        // 0s9v: grounded physics every frame. During
+                        // background steps, collide against a snapshot of
+                        // the step-entry world instead of the placeholder.
+                        let grid: &dyn player::VoxelGrid = if stepping {
+                            self.collision_snapshot
+                                .as_ref()
+                                .expect("collision snapshot refreshed at step start")
+                        } else {
+                            &self.world
+                        };
                         if let Some(p) = self.entities.get_mut(pid) {
-                            if stepping {
-                                // Free-fly: no collision while world is on
-                                // the background thread (x5w).
-                                p.pos[0] += delta[0];
-                                p.pos[1] += delta[1];
-                                p.pos[2] += delta[2];
-                            } else {
-                                let step = player::step_grounded_movement(
-                                    &self.world,
-                                    &p.pos,
-                                    p.vel[1],
-                                    player::GroundedMoveInput {
-                                        yaw,
-                                        move_input: [fwd, right],
-                                        speed,
-                                        dt,
-                                        jump_requested,
-                                    },
-                                );
-                                p.pos = step.pos;
-                                p.vel[1] = step.vertical_velocity;
-                            }
+                            let step = player::step_grounded_movement(
+                                grid,
+                                &p.pos,
+                                p.vel[1],
+                                player::GroundedMoveInput {
+                                    yaw,
+                                    move_input: [fwd, right],
+                                    speed,
+                                    dt,
+                                    jump_requested,
+                                },
+                            );
+                            p.pos = step.pos;
+                            p.vel[1] = step.vertical_velocity;
                         }
-                        if !stepping {
-                            if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
-                                camera_grounded = player::is_grounded(&self.world, &p.pos);
-                            }
+                        if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
+                            camera_grounded = player::is_grounded(grid, &p.pos);
                         }
                         let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
                         // hash-thing-m1f.4 / 37r: grow the world when the
@@ -2164,6 +2115,18 @@ impl ApplicationHandler for App {
                                     ];
                                     let old_level = self.world.level;
                                     self.world.ensure_region(min, max);
+                                    // 0s9v: ensure_region may grow the
+                                    // world; refresh the collision snapshot
+                                    // so the next background step starts
+                                    // from the grown state. Timed under the
+                                    // same metric as the other two refresh
+                                    // sites so sweeps observe the full
+                                    // clone-cost distribution.
+                                    {
+                                        let _t = self.perf.start("collision_snapshot_refresh");
+                                        self.collision_snapshot =
+                                            Some(self.world.collision_snapshot());
+                                    }
                                     if self.world.level != old_level {
                                         log::info!(
                                             "World grew: level {} → {} (side {}, origin {:?})",
@@ -2291,41 +2254,6 @@ impl ApplicationHandler for App {
                 // Kick off the next background step only after this frame has
                 // finished consuming the live world snapshot.
                 self.maybe_start_background_step();
-
-                // Advance the self-driving acquire harness (dlse.2.2).
-                // Runs after this frame's samples are in `self.perf`, so
-                // snapshots reflect the just-completed capture window.
-                // Two-pass drain: `step()` holds `&mut self.acquire_harness`
-                // + `&self.perf`, so we collect actions first and release
-                // those borrows before dispatching (which can touch `&mut
-                // self.perf`, `&mut self` for the fullscreen toggle, and
-                // `&self.acquire_harness` for the final report).
-                let harness_actions: Vec<HarnessAction> =
-                    if let Some(harness) = self.acquire_harness.as_mut() {
-                        harness.step(&self.perf)
-                    } else {
-                        Vec::new()
-                    };
-                for action in harness_actions {
-                    match action {
-                        HarnessAction::ClearPerf => {
-                            self.perf.clear();
-                            log::info!("acquire-harness: perf cleared");
-                        }
-                        HarnessAction::ToggleFullscreen => {
-                            log::info!(
-                                "acquire-harness: windowed capture done, toggling to fullscreen"
-                            );
-                            self.toggle_fullscreen();
-                        }
-                        HarnessAction::Exit => {
-                            if let Some(h) = self.acquire_harness.as_ref() {
-                                log::info!("{}", h.report());
-                            }
-                            event_loop.exit();
-                        }
-                    }
-                }
 
                 if let Some(window) = &self.window {
                     window.request_redraw();
