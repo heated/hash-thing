@@ -101,6 +101,31 @@ pub const FAN: CellState = Cell::pack(FAN_MATERIAL_ID, 0).raw();
 pub const FIREWORK: CellState = Cell::pack(FIREWORK_MATERIAL_ID, 0).raw();
 pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
 
+/// Pack a CLONE cell whose metadata slot carries the source material id.
+///
+/// The "spawn material X" payload is stashed in the Cell's 6-bit metadata
+/// field (`Cell::MAX_METADATA = 63`) rather than a side-table, so this
+/// path caps source materials at 63 even though `Cell::MAX_MATERIAL` is
+/// 1023. Current live materials all fit, but the cap is latent: adding a
+/// material id > 63 would silently route through `Cell::pack`'s generic
+/// "metadata overflows 6 bits" assert at two call sites
+/// (`World::place_clone_source`, main's clone-block placement). Readback
+/// lives in `World::spawn_clones` via `cell.metadata()`, which is
+/// implicitly bounded the same way — a widener (side-table keyed by CLONE
+/// position) would need to update the readback too. Tracked by
+/// hash-thing-457f.
+#[inline]
+pub fn pack_clone_source(source_material: MaterialId) -> CellState {
+    assert!(
+        source_material <= Cell::MAX_METADATA,
+        "clone source_material {} exceeds 6-bit cap (MAX_METADATA = {}); \
+         widen encoding via side-table (hash-thing-457f)",
+        source_material,
+        Cell::MAX_METADATA,
+    );
+    Cell::pack(CLONE_MATERIAL_ID, source_material).raw()
+}
+
 /// Density lookup for block rules (gravity, fluid). Maps material ID → density.
 ///
 /// Values here must match `MaterialPhysicalProperties::density` in `terrain_defaults()`.
@@ -1803,5 +1828,23 @@ mod tests {
             divisors[first_block_rule.0], 1,
             "old slot reverts to 1 when no entry references it"
         );
+    }
+
+    #[test]
+    fn pack_clone_source_accepts_at_cap() {
+        // Boundary: MAX_METADATA itself must pack without panic.
+        let state = pack_clone_source(Cell::MAX_METADATA);
+        let cell = Cell::from_raw(state);
+        assert_eq!(cell.material(), CLONE_MATERIAL_ID);
+        assert_eq!(cell.metadata(), Cell::MAX_METADATA);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds 6-bit cap")]
+    fn pack_clone_source_rejects_material_over_cap() {
+        // Guards the call-site-local message (not the encoding cap itself,
+        // which `Cell::pack` still enforces one layer deeper). Widening the
+        // encoding per hash-thing-457f would update both messages together.
+        let _ = pack_clone_source(Cell::MAX_METADATA + 1);
     }
 }

@@ -1477,11 +1477,7 @@ impl App {
                 return;
             }
             // Encode the source material in clone block metadata.
-            let state = hash_thing::octree::Cell::pack(
-                hash_thing::terrain::materials::CLONE_MATERIAL_ID,
-                held_material,
-            )
-            .raw();
+            let state = hash_thing::terrain::materials::pack_clone_source(held_material);
             let pos = [prev[0], prev[1], prev[2]];
             self.world.set(
                 sim::WorldCoord(pos[0]),

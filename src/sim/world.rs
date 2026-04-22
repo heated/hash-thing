@@ -9,8 +9,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE, FIREWORK, GRASS, LAVA,
-    OIL, SAND, STONE, VINE, WATER,
+    pack_clone_source, BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE,
+    FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -1760,8 +1760,13 @@ impl World {
         }
     }
 
+    /// Place a CLONE cell that spawns `source_material` downstream.
+    ///
+    /// Routes through `pack_clone_source` to centralize the 6-bit cap +
+    /// panic message (hash-thing-457f). The sister site at
+    /// `main.rs::place_clone_block` uses the same helper.
     fn place_clone_source(&mut self, pos: [i64; 3], source_material: u16) {
-        let state = Cell::pack(CLONE_MATERIAL_ID, source_material).raw();
+        let state = pack_clone_source(source_material);
         self.set(
             WorldCoord(pos[0]),
             WorldCoord(pos[1]),
