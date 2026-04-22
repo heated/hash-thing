@@ -706,17 +706,22 @@ mod tests {
         let tangential_mag = (vel[0] * vel[0] + vel[2] * vel[2]).sqrt();
 
         // Radius is cell-scaled in [0.75, 0.95] * CELLS_PER_METER; tangential
-        // magnitude is therefore linear in CELLS_PER_METER. If `speed` were
-        // `0.22 * CELLS_PER_METER`, tangential_mag would scale as k² instead.
+        // magnitude must therefore stay in `[0.75, 0.95] * k * 0.22` (linear
+        // in k). The band is expressed against the *literal* 0.22, not
+        // `state.speed` — if `speed` were reverted to `0.22 * CELLS_PER_METER`,
+        // `tangential_mag` would balloon to roughly `0.85 * k² * 0.22` and
+        // blow past the upper bound for any k > 1.
         let k = CELLS_PER_METER;
         assert!(
             radius >= 0.75 * k - 1e-9 && radius <= 0.95 * k + 1e-9,
             "radius {radius} outside [0.75*k, 0.95*k] for k={k}",
         );
-        let expected_mag = radius * state.speed;
+        let low = 0.75 * k * 0.22;
+        let high = 0.95 * k * 0.22;
         assert!(
-            (tangential_mag - expected_mag).abs() < 1e-9,
-            "tangential speed {tangential_mag} should equal radius*speed {expected_mag}",
+            tangential_mag >= low - 1e-9 && tangential_mag <= high + 1e-9,
+            "tangential_mag {tangential_mag} outside linear-in-k band [{low}, {high}]; \
+             did `speed` get rescaled to `0.22 * CELLS_PER_METER`?",
         );
     }
 

@@ -1,4 +1,4 @@
-// Workspace crate re-exports — external API unchanged.
+// Workspace crate re-exports.
 pub use ht_octree as octree;
 pub use ht_octree::rng;
 pub use ht_render as render;
