@@ -399,6 +399,20 @@ Two cross-checks on the span:
 1. The existing empty-corner `bench_raycast_4096` — floor.
 2. A seeded-terrain variant at 4096³, closer to the demo target — measurement comparable against the §3.10.5 envelope (now landed as `bench_raycast_4096_app_spawn`, see §3.10.5.1).
 
+### 3.11 GPU cost at 1024³/100% is real — the "ramp" is pipeline fill (`hash-thing-dlse.3`)
+
+Bead filed 2026-04-21 from a 1024³ repro where `surface_acquire_cpu` grew monotonically from 54 ms at t=0 to 187 ms at t=20 s and plateaued. Initial suspects: sim-thread starvation (refuted by `HASH_THING_FREEZE_SIM=1` — ramp still occurs) and GPU-queue backpressure accumulation.
+
+The decisive A/B was `HASH_THING_OFF_SURFACE=1`: with no swapchain, `surface_acquire_cpu` drops to 0.01 ms and the ramp **moves to `submit_cpu`** (13 → 154 ms, plateau 154 ms). Meanwhile `render_gpu` reads 3.76 ms for the first ~10 s, then jumps to 53 ms mean / **151 ms max** once the timestamp-query ring buffer catches up. Plateau self-consistency: `submit_cpu ≈ render_gpu max`. The GPU is genuinely spending ~150 ms/frame on the compute raycast at 2940×1782 × 1024³.
+
+Two corrections to the earlier framing:
+1. **`render_gpu` / `render_pass_gpu` undercount by ~30×**, because the timestamp writes cover only the on-screen render pass, not the compute dispatch where the raycast lives. §3.8's "~1 ms GPU" — used to argue the `surface_acquire_cpu` stall was *not* GPU-bound — was reading 1/30 of the actual work. (A follow-up bead adds a compute-pass `GpuTiming` instance; `hash-thing-fitq`.)
+2. **The ramp is not an accumulating queue.** It is a pipelined CPU-GPU system reaching its steady-state backpressure. Frame 0 submits to an empty GPU; frame N submits and waits on frame N-K to retire; as K fills (`maximumDrawableCount` + command-buffer depth), steady-state submit time converges to actual GPU frame time. The linear shape of the 13 → 154 ms off-surface climb is exactly the shape of a bounded pipeline filling.
+
+Surface-attached plateau (187 ms) minus off-surface plateau (154 ms) ≈ 33 ms of compositor + drawable-acquisition overhead, consistent with the CAMetalLayer path. The camera-recenter snap-back is plausibly a world-state transition to shallow traversal / empty rays for a few frames — the pipeline drains and refills, giving the same ramp from a lower starting cost — not a sim-state reset.
+
+**Budget implication.** On M2 integrated, 1024³ × 100% scale is GPU-bound at ~6 FPS; no amount of compositor tuning fixes that. `render_scale = 0.5` as the default puts us near the M2 budget at 1024³. A world-size-aware auto-picker is filed as `hash-thing-zytn` (blocked on fitq for a trustworthy GPU signal).
+
 ---
 
 ## 4. SVDAG ↔ memo-step interaction
