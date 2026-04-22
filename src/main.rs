@@ -409,6 +409,11 @@ struct App {
     /// leaves the thread at its inherited QoS. Set via
     /// `HASH_THING_SIM_QOS={interactive|initiated|default|utility|background}`.
     sim_qos: Option<u32>,
+    /// Read-only voxel-grid view kept on the main thread so player collision
+    /// can run every frame even while a background sim step owns the mutable
+    /// [`sim::World`] (hash-thing-0s9v). Refreshed at step start, step
+    /// completion, and after [`sim::World::ensure_region`] grows the world.
+    collision_snapshot: Option<sim::CollisionSnapshot>,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -524,6 +529,7 @@ impl App {
                 .ok()
                 .as_deref()
                 .and_then(thread_qos::parse),
+            collision_snapshot: None,
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
@@ -811,6 +817,20 @@ impl App {
             return;
         }
         self.step_start = std::time::Instant::now();
+        // Refresh the main-thread collision snapshot BEFORE moving the world
+        // to the step thread. Player collision during the step reads from
+        // this snapshot, not the placeholder we're about to swap in
+        // (hash-thing-0s9v). Timed so we can validate the clone-cost
+        // estimate against live sweeps.
+        //
+        // Ordering invariant: the snapshot MUST be set before `step_handle`
+        // becomes `Some(...)`. `is_stepping()` ⟺ `step_handle.is_some()`, and
+        // grounded movement unwraps `collision_snapshot` via `expect` when
+        // stepping; inverting these lines would expose that expect.
+        {
+            let _t = self.perf.start("collision_snapshot_refresh");
+            self.collision_snapshot = Some(self.world.collision_snapshot());
+        }
         // Move world to the background thread only after the frame has
         // consumed the live snapshot for movement, interaction, and render.
         let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
@@ -1874,6 +1894,16 @@ impl ApplicationHandler for App {
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
+                                // Refresh the collision snapshot from the
+                                // just-returned world so the next frame's
+                                // player physics reads post-step geometry
+                                // (hash-thing-0s9v). Same clone-cost surface
+                                // as the step-start refresh; timed under the
+                                // same metric so sweeps see both samples.
+                                {
+                                    let _t = self.perf.start("collision_snapshot_refresh");
+                                    self.collision_snapshot = Some(self.world.collision_snapshot());
+                                }
                                 // Refresh cached memo-health summary while the
                                 // real world is in hand (hash-thing-stue.6):
                                 // the (stepping) log branch below cannot read
@@ -2024,34 +2054,34 @@ impl ApplicationHandler for App {
 
                         let stepping = self.is_stepping();
                         let mut camera_grounded = false;
+                        // 0s9v: grounded physics every frame. During
+                        // background steps, collide against a snapshot of
+                        // the step-entry world instead of the placeholder.
+                        let grid: &dyn player::VoxelGrid = if stepping {
+                            self.collision_snapshot
+                                .as_ref()
+                                .expect("collision snapshot refreshed at step start")
+                        } else {
+                            &self.world
+                        };
                         if let Some(p) = self.entities.get_mut(pid) {
-                            if stepping {
-                                // Free-fly: no collision while world is on
-                                // the background thread (x5w).
-                                p.pos[0] += delta[0];
-                                p.pos[1] += delta[1];
-                                p.pos[2] += delta[2];
-                            } else {
-                                let step = player::step_grounded_movement(
-                                    &self.world,
-                                    &p.pos,
-                                    p.vel[1],
-                                    player::GroundedMoveInput {
-                                        yaw,
-                                        move_input: [fwd, right],
-                                        speed,
-                                        dt,
-                                        jump_requested,
-                                    },
-                                );
-                                p.pos = step.pos;
-                                p.vel[1] = step.vertical_velocity;
-                            }
+                            let step = player::step_grounded_movement(
+                                grid,
+                                &p.pos,
+                                p.vel[1],
+                                player::GroundedMoveInput {
+                                    yaw,
+                                    move_input: [fwd, right],
+                                    speed,
+                                    dt,
+                                    jump_requested,
+                                },
+                            );
+                            p.pos = step.pos;
+                            p.vel[1] = step.vertical_velocity;
                         }
-                        if !stepping {
-                            if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
-                                camera_grounded = player::is_grounded(&self.world, &p.pos);
-                            }
+                        if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
+                            camera_grounded = player::is_grounded(grid, &p.pos);
                         }
                         let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
                         // hash-thing-m1f.4 / 37r: grow the world when the
@@ -2085,6 +2115,18 @@ impl ApplicationHandler for App {
                                     ];
                                     let old_level = self.world.level;
                                     self.world.ensure_region(min, max);
+                                    // 0s9v: ensure_region may grow the
+                                    // world; refresh the collision snapshot
+                                    // so the next background step starts
+                                    // from the grown state. Timed under the
+                                    // same metric as the other two refresh
+                                    // sites so sweeps observe the full
+                                    // clone-cost distribution.
+                                    {
+                                        let _t = self.perf.start("collision_snapshot_refresh");
+                                        self.collision_snapshot =
+                                            Some(self.world.collision_snapshot());
+                                    }
                                     if self.world.level != old_level {
                                         log::info!(
                                             "World grew: level {} → {} (side {}, origin {:?})",

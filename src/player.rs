@@ -1,9 +1,45 @@
 //! Player controller: collision, raycast, movement.
 //!
-//! Pure functions operating on `World` + position data, extracted from
+//! Pure functions operating on a voxel grid + position data, extracted from
 //! main.rs for testability (hash-thing-d6m).
+//!
+//! Collision helpers are generic over the [`VoxelGrid`] trait so the main
+//! thread can feed them either the live [`World`] or a cheap read-only
+//! [`CollisionSnapshot`] cloned at sim-step boundaries. The snapshot variant
+//! keeps player physics running every frame while a background sim step owns
+//! the mutable `World` (hash-thing-0s9v).
 
-use crate::sim::{World, WorldCoord};
+use crate::octree::CellState;
+use crate::sim::{CollisionSnapshot, World, WorldCoord};
+
+mod sealed {
+    use crate::sim::{CollisionSnapshot, World};
+    pub trait Sealed {}
+    impl Sealed for World {}
+    impl Sealed for CollisionSnapshot {}
+}
+
+/// Read-only voxel-grid surface needed by player collision / raycast.
+///
+/// Sealed: the generic helpers in this module accept either the live
+/// [`World`] or a cheap read-only [`CollisionSnapshot`], and no other
+/// implementations are meaningful. The `sealed::Sealed` supertrait prevents
+/// downstream crates from adding impls.
+pub trait VoxelGrid: sealed::Sealed {
+    fn cell_at(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState;
+}
+
+impl VoxelGrid for World {
+    fn cell_at(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        self.get(x, y, z)
+    }
+}
+
+impl VoxelGrid for CollisionSnapshot {
+    fn cell_at(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        self.get(x, y, z)
+    }
+}
 
 /// Camera mode: orbit around a target point, or first-person at the player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,7 +182,7 @@ impl FirstPersonCameraFeel {
 }
 
 /// Check if the player's AABB at `pos` overlaps any solid cell.
-pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
+pub fn player_collides<W: VoxelGrid + ?Sized>(world: &W, pos: &[f64; 3]) -> bool {
     let hw = PLAYER_HALF_W;
     let x_min = (pos[0] - hw).floor() as i64;
     let x_max = (pos[0] + hw).floor() as i64;
@@ -157,7 +193,7 @@ pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
     for cx in x_min..=x_max {
         for cy in y_min..=y_max {
             for cz in z_min..=z_max {
-                let cell = world.get(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz));
+                let cell = world.cell_at(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz));
                 if cell != 0 {
                     return true;
                 }
@@ -167,7 +203,7 @@ pub fn player_collides(world: &World, pos: &[f64; 3]) -> bool {
     false
 }
 
-fn player_supported_at_y(world: &World, pos: &[f64; 3], support_y: i64) -> bool {
+fn player_supported_at_y<W: VoxelGrid + ?Sized>(world: &W, pos: &[f64; 3], support_y: i64) -> bool {
     let hw = PLAYER_HALF_W;
     let x_min = (pos[0] - hw).floor() as i64;
     let x_max = (pos[0] + hw).floor() as i64;
@@ -175,7 +211,7 @@ fn player_supported_at_y(world: &World, pos: &[f64; 3], support_y: i64) -> bool 
     let z_max = (pos[2] + hw).floor() as i64;
     for cx in x_min..=x_max {
         for cz in z_min..=z_max {
-            if world.get(WorldCoord(cx), WorldCoord(support_y), WorldCoord(cz)) != 0 {
+            if world.cell_at(WorldCoord(cx), WorldCoord(support_y), WorldCoord(cz)) != 0 {
                 return true;
             }
         }
@@ -183,7 +219,11 @@ fn player_supported_at_y(world: &World, pos: &[f64; 3], support_y: i64) -> bool 
     false
 }
 
-fn snap_down_to_support(world: &World, pos: &[f64; 3], max_drop: f64) -> Option<[f64; 3]> {
+fn snap_down_to_support<W: VoxelGrid + ?Sized>(
+    world: &W,
+    pos: &[f64; 3],
+    max_drop: f64,
+) -> Option<[f64; 3]> {
     let top_support = pos[1].floor() as i64 - 1;
     let bottom_support = (pos[1] - max_drop).floor() as i64 - 1;
     for support_y in (bottom_support..=top_support).rev() {
@@ -202,7 +242,12 @@ fn snap_down_to_support(world: &World, pos: &[f64; 3], max_drop: f64) -> Option<
     None
 }
 
-fn try_step_move(world: &World, pos: &[f64; 3], axis: usize, delta: f64) -> Option<[f64; 3]> {
+fn try_step_move<W: VoxelGrid + ?Sized>(
+    world: &W,
+    pos: &[f64; 3],
+    axis: usize,
+    delta: f64,
+) -> Option<[f64; 3]> {
     if axis == 1 || delta.abs() < 1e-9 {
         return None;
     }
@@ -219,7 +264,7 @@ fn try_step_move(world: &World, pos: &[f64; 3], axis: usize, delta: f64) -> Opti
     snap_down_to_support(world, &raised, STEP_UP_HEIGHT)
 }
 
-fn is_contact_grounded(world: &World, pos: &[f64; 3]) -> bool {
+fn is_contact_grounded<W: VoxelGrid + ?Sized>(world: &W, pos: &[f64; 3]) -> bool {
     let mut probe = *pos;
     probe[1] -= GROUND_CONTACT_EPSILON;
     player_collides(world, &probe)
@@ -227,14 +272,14 @@ fn is_contact_grounded(world: &World, pos: &[f64; 3]) -> bool {
 
 /// Report whether the player is standing on support or close enough to snap
 /// onto it; camera feel should read those states as grounded locomotion.
-pub fn is_grounded(world: &World, pos: &[f64; 3]) -> bool {
+pub fn is_grounded<W: VoxelGrid + ?Sized>(world: &W, pos: &[f64; 3]) -> bool {
     let support_y = pos[1].floor() as i64 - 1;
     player_supported_at_y(world, pos, support_y)
         || snap_down_to_support(world, pos, GROUND_SNAP_HEIGHT).is_some()
 }
 
-fn raycast_cells_with_range(
-    world: &World,
+fn raycast_cells_with_range<W: VoxelGrid + ?Sized>(
+    world: &W,
     origin: [f64; 3],
     dir: [f64; 3],
     max_dist: f64,
@@ -273,7 +318,7 @@ fn raycast_cells_with_range(
     let max_steps = (max_dist.ceil() as usize).saturating_mul(2).max(1);
     let mut prev = pos;
     for _ in 0..max_steps {
-        let cell = world.get(WorldCoord(pos[0]), WorldCoord(pos[1]), WorldCoord(pos[2]));
+        let cell = world.cell_at(WorldCoord(pos[0]), WorldCoord(pos[1]), WorldCoord(pos[2]));
         if cell != 0 {
             return Some((pos, prev));
         }
@@ -327,7 +372,11 @@ fn ray_aabb_entry_t(origin: [f64; 3], dir: [f64; 3], cell: [i64; 3]) -> Option<f
 
 /// Return whether `target` is directly visible from `origin` through empty
 /// cells. Used to keep particle billboards from drawing through voxel walls.
-pub fn has_line_of_sight(world: &World, origin: [f64; 3], target: [f64; 3]) -> bool {
+pub fn has_line_of_sight<W: VoxelGrid + ?Sized>(
+    world: &W,
+    origin: [f64; 3],
+    target: [f64; 3],
+) -> bool {
     let delta = [
         target[0] - origin[0],
         target[1] - origin[1],
@@ -347,8 +396,8 @@ pub fn has_line_of_sight(world: &World, origin: [f64; 3], target: [f64; 3]) -> b
 /// DDA raycast through the cell grid. Returns `(hit_cell, prev_cell)` —
 /// `hit_cell` is the first solid cell along the ray, `prev_cell` is the
 /// empty cell just before it (for block placement).
-pub fn raycast_cells(
-    world: &World,
+pub fn raycast_cells<W: VoxelGrid + ?Sized>(
+    world: &W,
     origin: [f64; 3],
     dir: [f64; 3],
 ) -> Option<([i64; 3], [i64; 3])> {
@@ -397,8 +446,8 @@ pub fn compute_move_delta(yaw: f64, input: [f64; 3], speed: f64, dt: f64) -> [f6
 
 /// Apply a movement delta with per-axis collision resolution.
 /// Returns the new position after sliding along walls.
-fn apply_movement_internal(
-    world: &World,
+fn apply_movement_internal<W: VoxelGrid + ?Sized>(
+    world: &W,
     pos: &[f64; 3],
     delta: &[f64; 3],
     grounded: bool,
@@ -424,11 +473,19 @@ fn apply_movement_internal(
     new_pos
 }
 
-pub fn apply_movement(world: &World, pos: &[f64; 3], delta: &[f64; 3]) -> [f64; 3] {
+pub fn apply_movement<W: VoxelGrid + ?Sized>(
+    world: &W,
+    pos: &[f64; 3],
+    delta: &[f64; 3],
+) -> [f64; 3] {
     apply_movement_internal(world, pos, delta, true)
 }
 
-fn apply_vertical_movement(world: &World, pos: &[f64; 3], delta_y: f64) -> ([f64; 3], bool) {
+fn apply_vertical_movement<W: VoxelGrid + ?Sized>(
+    world: &W,
+    pos: &[f64; 3],
+    delta_y: f64,
+) -> ([f64; 3], bool) {
     if delta_y.abs() < 1e-9 {
         return (*pos, false);
     }
@@ -457,8 +514,8 @@ fn apply_vertical_movement(world: &World, pos: &[f64; 3], delta_y: f64) -> ([f64
 }
 
 /// Apply one grounded first-person movement step with jump/gravity.
-pub fn step_grounded_movement(
-    world: &World,
+pub fn step_grounded_movement<W: VoxelGrid + ?Sized>(
+    world: &W,
     pos: &[f64; 3],
     vertical_velocity: f64,
     input: GroundedMoveInput,
@@ -804,5 +861,153 @@ mod tests {
             (new_pos[1] - 1.0).abs() < 1e-9,
             "small drops should snap back onto the floor"
         );
+    }
+
+    #[test]
+    fn collision_snapshot_matches_live_world() {
+        // 0s9v: the snapshot used during background steps must answer
+        // collision queries identically to the live world it was cloned
+        // from. Otherwise grounded physics drifts between step boundaries.
+        let mut world = world_with_floor(0, 0, 7, 0, 7);
+        let material = Cell::pack(1, 0).raw();
+        world.set(WorldCoord(4), WorldCoord(1), WorldCoord(3), material);
+        world.set(WorldCoord(2), WorldCoord(2), WorldCoord(2), material);
+        let snapshot = world.collision_snapshot();
+
+        let sample_positions = [
+            [3.5, 1.0, 3.5],
+            [4.0, 1.0, 3.5],
+            [4.0, 2.0, 3.5],
+            [3.5, 1.2, 3.5],
+            [1.5, 2.5, 1.5],
+            [7.0, 0.5, 7.0],
+        ];
+        for pos in sample_positions {
+            assert_eq!(
+                player_collides(&world, &pos),
+                player_collides(&snapshot, &pos),
+                "player_collides disagrees at {:?}",
+                pos,
+            );
+            assert_eq!(
+                is_grounded(&world, &pos),
+                is_grounded(&snapshot, &pos),
+                "is_grounded disagrees at {:?}",
+                pos,
+            );
+        }
+
+        // Vertical-movement cases exercise the exact surface 0s9v is meant
+        // to stabilize: gravity fall (vy < 0) and active jump (vy > 0,
+        // jump_requested). Both must agree live-vs-snapshot frame-by-frame.
+        let dt = 1.0 / 60.0;
+        let gravity_cases = [
+            (
+                GroundedMoveInput {
+                    yaw: 0.0,
+                    move_input: [0.0, 0.0],
+                    speed: PLAYER_SPEED,
+                    dt,
+                    jump_requested: false,
+                },
+                -4.0,
+            ),
+            (
+                GroundedMoveInput {
+                    yaw: 0.5,
+                    move_input: [1.0, 0.0],
+                    speed: PLAYER_SPEED,
+                    dt,
+                    jump_requested: false,
+                },
+                0.0,
+            ),
+            (
+                GroundedMoveInput {
+                    yaw: 0.0,
+                    move_input: [0.0, 0.0],
+                    speed: PLAYER_SPEED,
+                    dt,
+                    jump_requested: true,
+                },
+                0.0,
+            ),
+            (
+                GroundedMoveInput {
+                    yaw: 0.0,
+                    move_input: [1.0, 0.0],
+                    speed: PLAYER_SPEED * PLAYER_SPRINT,
+                    dt,
+                    jump_requested: true,
+                },
+                PLAYER_JUMP_SPEED,
+            ),
+        ];
+        for (input, vy0) in gravity_cases {
+            for pos in sample_positions {
+                let live = step_grounded_movement(&world, &pos, vy0, input);
+                let snap = step_grounded_movement(&snapshot, &pos, vy0, input);
+                assert_eq!(
+                    live.pos, snap.pos,
+                    "step pos disagrees (vy0={vy0}, jump={}) at {:?}",
+                    input.jump_requested, pos,
+                );
+                assert_eq!(
+                    live.vertical_velocity, snap.vertical_velocity,
+                    "step vy disagrees (vy0={vy0}, jump={}) at {:?}",
+                    input.jump_requested, pos,
+                );
+                assert_eq!(
+                    live.grounded, snap.grounded,
+                    "step grounded disagrees (vy0={vy0}, jump={}) at {:?}",
+                    input.jump_requested, pos,
+                );
+            }
+        }
+
+        // OOB probes: negative and beyond-side coords must read as empty in
+        // both views. A silent divergence in CollisionSnapshot::get's bounds
+        // check would let stepping-era physics walk through a wall.
+        let oob = [
+            [WorldCoord(-1), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(-1), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(0), WorldCoord(-1)],
+            [WorldCoord(9999), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(9999), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(0), WorldCoord(9999)],
+        ];
+        for [x, y, z] in oob {
+            assert_eq!(world.get(x, y, z), snapshot.get(x, y, z));
+            assert_eq!(world.get(x, y, z), 0);
+        }
+
+        // Shifted-origin: after ensure_region grows the world away from
+        // origin 0, the snapshot's local-coord translation must still match
+        // the live world.
+        let mut shifted = world_with_floor(0, 0, 7, 0, 7);
+        shifted.ensure_region(
+            [WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)],
+            [WorldCoord(12), WorldCoord(12), WorldCoord(12)],
+        );
+        shifted.set(WorldCoord(-2), WorldCoord(2), WorldCoord(-2), material);
+        let shifted_snap = shifted.collision_snapshot();
+        let shifted_samples = [
+            [WorldCoord(-2), WorldCoord(2), WorldCoord(-2)],
+            [WorldCoord(-3), WorldCoord(2), WorldCoord(-2)],
+            [WorldCoord(0), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(4), WorldCoord(1), WorldCoord(3)],
+            [WorldCoord(-5), WorldCoord(-5), WorldCoord(-5)],
+            [WorldCoord(100), WorldCoord(0), WorldCoord(0)],
+        ];
+        for [x, y, z] in shifted_samples {
+            assert_eq!(
+                shifted.get(x, y, z),
+                shifted_snap.get(x, y, z),
+                "shifted snapshot disagrees at ({}, {}, {})",
+                x.0,
+                y.0,
+                z.0,
+            );
+        }
     }
 }
