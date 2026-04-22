@@ -16,26 +16,56 @@
 //! stepper populates `hashlife_macro_cache`. The regular per-generation
 //! `step_recursive` leaves it empty (see the `memo_mac` comment in
 //! `memo_summary()`).
+//!
+//! Why GoL worlds and not terrain: `step_recursive_pow2` bails out to a
+//! brute-force per-step loop whenever any block-rule cell is present
+//! (`src/sim/hashlife.rs:105-116`). Terrain seeds water/sand, which are
+//! block-rule materials, so a terrain world leaves the macro cache empty
+//! — the exact opposite of what we want to measure. Seeding a GoL-only
+//! world keeps the hashlife macro stepper on its happy path.
 
 use hash_thing::octree::Cell;
 use hash_thing::sim::{GameOfLife3D, World, WorldCoord};
-use hash_thing::terrain::materials::STONE;
-use hash_thing::terrain::TerrainParams;
 
-/// Seed a terrain world, drive a single `step_recursive_pow2` call to fill
-/// the macro cache, and print occupancy.
+/// Seed a GoL world with a scattered live pattern, drive a single
+/// `step_recursive_pow2` call to fill the macro cache, and print occupancy.
 fn measure(label: &str, level: u32) {
     let side = 1u64 << level;
     eprintln!("--- {label} (level={level}, side={side}³) ---");
 
     let mut world = World::new(level);
-    let params = TerrainParams::for_level(level);
-    let _ = world
-        .seed_terrain(&params)
-        .expect("level-derived terrain params must validate");
+    world.set_gol_smoke_rule(GameOfLife3D::new(0, 6, 1, 3));
 
-    // Pre-step entries should be zero: seed_terrain doesn't touch the macro
-    // cache, and no hashlife step has run yet.
+    // Scatter live cells on a coarse lattice so the hashlife recursion has
+    // to descend multiple branches, producing a representative cache
+    // occupancy rather than a degenerate single-branch path. A 16³ seed
+    // lattice keeps cost bounded while still exercising many octree nodes.
+    let side_i = side as i64;
+    let seed_stride = (side_i / 16).max(1);
+    let mut seeded = 0usize;
+    let mut z = 0i64;
+    while z < side_i {
+        let mut y = 0i64;
+        while y < side_i {
+            let mut x = 0i64;
+            while x < side_i {
+                world.set(
+                    WorldCoord(x),
+                    WorldCoord(y),
+                    WorldCoord(z),
+                    Cell::pack(1, 0).raw(),
+                );
+                seeded += 1;
+                x += seed_stride;
+            }
+            y += seed_stride;
+        }
+        z += seed_stride;
+    }
+    eprintln!("  seeded {seeded} live cells (stride={seed_stride})");
+
+    // Pre-step: set() mutates the octree but leaves the macro cache at
+    // zero — no hashlife step has run yet.
     assert_eq!(
         world.macro_cache_entries(),
         0,
@@ -55,9 +85,15 @@ fn measure(label: &str, level: u32) {
     );
     eprintln!("  {}", world.memo_summary());
 
-    // Sanity: the estimator must be a linear function of entries, no
-    // surprise zero or overflow. This pairs with the unit test in
-    // `src/sim/world.rs` that checks the arithmetic on small worlds.
+    // Sanity: the macro stepper on a live GoL world must actually fill the
+    // cache. Zero would mean either the seed didn't land or the stepper
+    // bailed out — either way, the printed number is meaningless for the
+    // perf paper.
+    assert!(
+        entries > 0,
+        "pow2 step on seeded GoL world at level {level} produced an empty \
+         macro cache — regression in step_recursive_pow2 or seeding?",
+    );
     assert_eq!(bytes, entries * World::MACRO_CACHE_BYTES_PER_ENTRY);
     assert!(
         bytes < 4 * 1024 * 1024 * 1024,
@@ -65,9 +101,8 @@ fn measure(label: &str, level: u32) {
     );
 }
 
-/// Ignored because pow2 macro steps on terrain at level ≥ 8 blow past the
-/// 60s test-runner ceiling. Agents/crew should run this manually when
-/// updating perf paper §5.
+/// Ignored because pow2 macro steps at level ≥ 8 can run long. Agents/crew
+/// should run this manually when updating perf paper §5.
 #[test]
 #[ignore]
 fn macro_cache_size_scales() {
@@ -105,8 +140,4 @@ fn macro_cache_bytes_est_nonzero_after_pow2_step() {
         world.macro_cache_bytes_est(),
         entries * World::MACRO_CACHE_BYTES_PER_ENTRY,
     );
-
-    // Unused-import guard: force STONE to be evaluated so rustc doesn't
-    // warn if the bench ever stops referencing materials directly.
-    let _ = STONE;
 }
