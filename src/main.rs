@@ -662,6 +662,11 @@ impl App {
     fn leave_occluded_state(&mut self) {
         self.occluded = false;
         self.last_mouse = None;
+        // Reset the frame timer so the next RedrawRequested sees a near-zero
+        // dt instead of `last_frame.elapsed()` clamped to 100ms — otherwise
+        // the resume frame poisons the EWMA FPS readout and applies a full
+        // 100ms player-movement step (hash-thing-xysz).
+        self.last_frame = std::time::Instant::now();
         self.sync_cursor_capture();
     }
 
@@ -1601,6 +1606,10 @@ impl ApplicationHandler for App {
                 self.focused = focused;
                 if focused {
                     self.last_mouse = None;
+                    // See leave_occluded_state: resume edges must reset the
+                    // frame timer or the first RedrawRequested dt clamps at
+                    // 100ms (hash-thing-xysz).
+                    self.last_frame = std::time::Instant::now();
                     self.sync_cursor_capture();
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -3226,6 +3235,27 @@ mod tests {
             app.focused,
             app.occluded,
         ));
+    }
+
+    // hash-thing-xysz: the redraw handler early-returns while paused so
+    // `last_frame` stops advancing. Resuming without a reset clamps the
+    // first dt to the 100ms guard, poisoning the EWMA and player movement.
+
+    #[test]
+    fn leave_occluded_state_resets_last_frame() {
+        let mut app = App::new(64);
+        app.enter_occluded_state();
+        // Pretend the app sat paused for two seconds.
+        app.last_frame = std::time::Instant::now()
+            - std::time::Duration::from_secs(2);
+
+        app.leave_occluded_state();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "leave_occluded_state must reset last_frame; elapsed was {:?}",
+            app.last_frame.elapsed()
+        );
     }
 
     /// Seed `last_mouse` without resetting player yaw/pitch. Used when a
