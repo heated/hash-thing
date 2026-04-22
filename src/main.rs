@@ -643,6 +643,13 @@ impl App {
     /// Handle a captured-cursor `DeviceEvent::MouseMotion` delta. No-op
     /// unless the player is in first-person mode with the cursor grabbed
     /// (hash-thing-w1yq). Extracted for testability (hash-thing-a6t2).
+    ///
+    /// Deltas are intentionally **device-agnostic**: `DeviceId` is not
+    /// inspected, so an external mouse and a trackpad driven in the same
+    /// frame sum into a single FPS-look delta. A 3D game has no concept
+    /// of "which device owns the camera," and winit already delivers one
+    /// `MouseMotion` per device per frame, so summing is the natural
+    /// behavior (hash-thing-i7gt, follow-up to hash-thing-a6t2).
     fn handle_mouse_motion(&mut self, dx: f64, dy: f64) {
         if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
             return;
