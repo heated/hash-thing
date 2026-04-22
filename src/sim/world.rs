@@ -1826,6 +1826,27 @@ impl World {
         );
         self.fill_box(entry_passage, AIR);
         self.fill_floor(entry_passage, DIRT);
+        // At world levels ≥ 7, the atrium's z-offset grows with cell_size
+        // while the corridor's tunnel_half_w is clamped, leaving a solid gap
+        // between corridor.max[2] and atrium.min[2]. Carve a bridge at the
+        // corridor_turn x so the route walk_route lands inside a traversable
+        // tunnel (hash-thing-dyqr).
+        let corridor_turn_x = corridor.max[0] - 2;
+        let tunnel_half_w = (corridor.max[2] - corridor.min[2]) / 2;
+        let atrium_entry_passage = Box3::new(
+            [
+                corridor_turn_x - tunnel_half_w,
+                corridor.min[1],
+                corridor.max[2],
+            ],
+            [
+                corridor_turn_x + tunnel_half_w,
+                corridor.max[1],
+                atrium.min[2],
+            ],
+        );
+        self.fill_box(atrium_entry_passage, AIR);
+        self.fill_floor(atrium_entry_passage, DIRT);
         self.fill_box(tease_a, AIR);
         self.fill_box(tease_b, AIR);
         self.fill_box(atrium, AIR);
@@ -3250,13 +3271,7 @@ mod tests {
         }
     }
 
-    // Pre-existing demo geometry bug: at world levels ≥7, tunnel_half_w grows
-    // faster than the atrium offset (lo[2]+cell_size), leaving a solid gap
-    // between corridor and atrium. The scale bump (hash-thing-69cq) forced a
-    // level-6→8 jump to fit the 1.6 m player, which exposed the bug. Tracked
-    // in hash-thing-dyqr; un-ignore once the demo carves the connector.
     #[test]
-    #[ignore = "hash-thing-dyqr: lattice demo corridor→atrium gap at level≥7"]
     fn lattice_progression_demo_route_is_player_traversable_end_to_end() {
         let mut w = World::new(8);
         let layout = w.seed_lattice_progression_demo();
