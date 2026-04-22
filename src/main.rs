@@ -200,6 +200,10 @@ enum PendingPlayerAction {
 enum PendingSceneSwap {
     LoadLatticeDemo,
     LoadLatticePanoramaDemo,
+    ResetTerrain,
+    LoadGyroid,
+    LoadDemoSpectacle,
+    ResetGolSmoke,
 }
 
 impl PendingSceneSwap {
@@ -207,6 +211,10 @@ impl PendingSceneSwap {
         match self {
             Self::LoadLatticeDemo => "lattice_demo",
             Self::LoadLatticePanoramaDemo => "lattice_panorama",
+            Self::ResetTerrain => "terrain_reset",
+            Self::LoadGyroid => "gyroid",
+            Self::LoadDemoSpectacle => "demo_spectacle",
+            Self::ResetGolSmoke => "gol_smoke_reset",
         }
     }
 }
@@ -1016,6 +1024,15 @@ impl App {
         match swap {
             PendingSceneSwap::LoadLatticeDemo => self.load_lattice_demo(),
             PendingSceneSwap::LoadLatticePanoramaDemo => self.load_lattice_panorama_demo(),
+            PendingSceneSwap::ResetTerrain => self.load_terrain_scene(
+                "Reset terrain",
+                terrain::TerrainParams::for_level(self.volume_size.trailing_zeros()),
+            ),
+            PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
+            PendingSceneSwap::LoadDemoSpectacle => {
+                self.load_demo_spectacle("Reset spectacle gallery")
+            }
+            PendingSceneSwap::ResetGolSmoke => self.reset_gol_smoke_scene(),
         }
     }
 
@@ -1478,6 +1495,30 @@ impl App {
         );
     }
 
+    fn reset_gol_smoke_scene(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.set_gol_smoke_rule(self.gol_smoke_rule);
+        self.world.seed_center(12, 0.35);
+        self.gol_smoke_scene = true;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
+    }
+
     fn load_lattice_demo(&mut self) {
         if self.is_stepping() {
             // Without this log the `n` key looks dead during a long sim
@@ -1762,64 +1803,21 @@ impl ApplicationHandler for App {
                                 self.world.population()
                             );
                         }
-                        winit::keyboard::Key::Character("r") => {
-                            // a9jd: latest scene pick wins. Clear *before* the
-                            // loader so it fires even if the loader drops
-                            // under `is_stepping()`.
-                            self.pending_scene_swap = None;
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
-                        }
-                        winit::keyboard::Key::Character("t") => {
-                            // Plain terrain remains available as an explicit
-                            // toggle, but is no longer the default scene.
-                            self.pending_scene_swap = None;
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
+                        winit::keyboard::Key::Character("r" | "t") => {
+                            // Queue through PendingSceneSwap so a press during
+                            // a background sim step lands at the next step
+                            // boundary instead of being silently dropped by
+                            // load_terrain_scene's is_stepping guard
+                            // (hash-thing-u5ik). `r` and `t` share the same
+                            // terrain reset today; split in the future if the
+                            // keys diverge.
+                            self.request_scene_swap(PendingSceneSwap::ResetTerrain);
                         }
                         winit::keyboard::Key::Character("g") => {
-                            // a9jd: clear the queue unconditionally so a `g`
-                            // during a background step supersedes a queued
-                            // lattice swap, even though the actual load is
-                            // dropped below.
-                            self.pending_scene_swap = None;
-                            if !self.is_stepping() {
-                                // Swap to the single retained GoL smoke seed.
-                                self.world = sim::World::new(self.volume_size.trailing_zeros());
-                                self.world.set_gol_smoke_rule(self.gol_smoke_rule);
-                                self.world.seed_center(12, 0.35);
-                                self.gol_smoke_scene = true;
-                                self.paused = true;
-                                self.perf.clear();
-                                self.mem_stats.reset_peaks();
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                                Self::upload_volume(
-                                    &mut self.renderer,
-                                    &mut self.world,
-                                    &mut self.svdag,
-                                    &mut self.last_svdag_stats,
-                                );
-                                self.sync_render_cache();
-                                log::info!(
-                                    "Reset GoL smoke sphere: pop={}",
-                                    self.world.population()
-                                );
-                            }
+                            self.request_scene_swap(PendingSceneSwap::ResetGolSmoke);
                         }
                         winit::keyboard::Key::Character("m") => {
-                            self.pending_scene_swap = None;
-                            self.load_gyroid_demo();
+                            self.request_scene_swap(PendingSceneSwap::LoadGyroid);
                         }
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
@@ -1886,8 +1884,7 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("b") => {
                             // Default demo gallery: deterministic local fire/water set pieces
                             // staged around the beat waypoints.
-                            self.pending_scene_swap = None;
-                            self.load_demo_spectacle("Reset spectacle gallery");
+                            self.request_scene_swap(PendingSceneSwap::LoadDemoSpectacle);
                         }
                         winit::keyboard::Key::Character("c") => {
                             // dlse.2.2: drain perf histograms so the next `P`
