@@ -1,7 +1,7 @@
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
-use hash_thing::scale::CELLS_PER_METER;
+use hash_thing::scale::{CELLS_PER_METER, DEFAULT_VOLUME_SIZE, GROWTH_MARGIN};
 use hash_thing::sim;
 use hash_thing::terrain;
 
@@ -19,8 +19,6 @@ use winit::{
 };
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
-
-const DEFAULT_VOLUME_SIZE: u32 = 8192;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -2415,7 +2413,6 @@ impl ApplicationHandler for App {
                         // Skipped during background step — world is placeholder.
                         if !self.is_stepping() {
                             if let Some(p) = self.entities.get_mut(pid) {
-                                const GROWTH_MARGIN: f64 = 8.0 * CELLS_PER_METER;
                                 let origin = self.world.origin;
                                 let side = self.world.side() as f64;
                                 let pos = p.pos;

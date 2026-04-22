@@ -679,6 +679,47 @@ mod tests {
         }
     }
 
+    /// Regression: `EmitterState::whirlpool().speed` stays an angular rate
+    /// (scale-invariant), never `0.22 * CELLS_PER_METER`.
+    ///
+    /// The orbit offset in `emitter_particle` is already cell-scaled
+    /// (`radius = (0.75 + ...) * CELLS_PER_METER`). Pre-69cq the speed was
+    /// also scaled, so the tangential velocity `orbit * speed` picked up
+    /// `CELLS_PER_METER²` — the k² bug. The fix is to leave `speed` alone;
+    /// this test pins that invariant and also checks that the computed
+    /// tangential magnitude matches `radius * speed` (i.e. linear in k,
+    /// not quadratic).
+    #[test]
+    fn whirlpool_speed_is_scale_invariant_angular_rate() {
+        assert_eq!(EmitterState::whirlpool().speed, 0.22);
+
+        // Run the emitter with zero spread so jitter drops out, isolating
+        // the tangential component for the k² check.
+        let mut state = EmitterState::whirlpool();
+        state.spread = 0.0;
+        let pos = [0.0, 0.0, 0.0];
+        let (spawn, vel, _) = emitter_particle(EntityId(0), pos, &state, 0);
+
+        let orbit_x = spawn[0] - pos[0];
+        let orbit_z = spawn[2] - pos[2];
+        let radius = (orbit_x * orbit_x + orbit_z * orbit_z).sqrt();
+        let tangential_mag = (vel[0] * vel[0] + vel[2] * vel[2]).sqrt();
+
+        // Radius is cell-scaled in [0.75, 0.95] * CELLS_PER_METER; tangential
+        // magnitude is therefore linear in CELLS_PER_METER. If `speed` were
+        // `0.22 * CELLS_PER_METER`, tangential_mag would scale as k² instead.
+        let k = CELLS_PER_METER;
+        assert!(
+            radius >= 0.75 * k - 1e-9 && radius <= 0.95 * k + 1e-9,
+            "radius {radius} outside [0.75*k, 0.95*k] for k={k}",
+        );
+        let expected_mag = radius * state.speed;
+        assert!(
+            (tangential_mag - expected_mag).abs() < 1e-9,
+            "tangential speed {tangential_mag} should equal radius*speed {expected_mag}",
+        );
+    }
+
     #[test]
     fn critter_hops_from_ground() {
         let mut store = EntityStore::new();
