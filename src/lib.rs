@@ -5,8 +5,11 @@ pub use ht_render as render;
 
 pub mod perf;
 pub mod player;
+pub mod scale;
 pub mod sim;
 pub mod terrain;
+
+pub use scale::{meters_to_cells, CELLS_PER_METER};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

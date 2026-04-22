@@ -1,6 +1,7 @@
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
+use hash_thing::scale::CELLS_PER_METER;
 use hash_thing::sim;
 use hash_thing::terrain;
 
@@ -19,7 +20,7 @@ use winit::{
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
 
-const DEFAULT_VOLUME_SIZE: u32 = 2048;
+const DEFAULT_VOLUME_SIZE: u32 = 8192;
 
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
@@ -282,52 +283,76 @@ struct DemoWaypoint {
     camera: OrbitCameraPose,
 }
 
-fn lattice_demo_waypoint(side: usize, beat: LatticeDemoBeat) -> DemoWaypoint {
-    let side = side as f64;
-    let center = side * 0.5;
+fn lattice_demo_waypoint(
+    side: usize,
+    layout: &sim::DemoLayout,
+    beat: LatticeDemoBeat,
+) -> DemoWaypoint {
+    // ptew: derive player positions from the actual scene anchors so the
+    // spawn is always in carved-AIR cells with scene-provided floor
+    // support. The previous implementation used hardcoded `side * k`
+    // fractions that drifted deep inside lattice pillars whenever scene
+    // geometry evolved.
+    let inv_side = 1.0 / side as f32;
+    let center_xz =
+        |c: [i64; 3]| -> [f64; 3] { [c[0] as f64 + 0.5, c[1] as f64, c[2] as f64 + 0.5] };
+    let to_normalized = |p: [f64; 3]| -> [f32; 3] {
+        [
+            p[0] as f32 * inv_side,
+            p[1] as f32 * inv_side,
+            p[2] as f32 * inv_side,
+        ]
+    };
     match beat {
-        LatticeDemoBeat::Intro => {
-            let offset = side * 0.28;
+        LatticeDemoBeat::Intro => DemoWaypoint {
+            label: "intro",
+            player: PlayerPose {
+                pos: layout.player_pos,
+                yaw: layout.player_yaw,
+                pitch: layout.player_pitch,
+            },
+            camera: OrbitCameraPose {
+                target: to_normalized(layout.player_pos),
+                yaw: -3.0 * std::f32::consts::FRAC_PI_4,
+                pitch: 0.08,
+                dist: 0.34,
+            },
+        },
+        LatticeDemoBeat::Interior => {
+            let pos = center_xz(layout.atrium_center);
             DemoWaypoint {
-                label: "intro",
+                label: "interior",
                 player: PlayerPose {
-                    pos: [center - offset, side * 0.34, center - offset],
-                    yaw: -3.0 * std::f64::consts::FRAC_PI_4,
-                    pitch: -0.08,
+                    pos,
+                    yaw: std::f64::consts::FRAC_PI_2,
+                    pitch: -0.12,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.36, 0.34, 0.36],
-                    yaw: -3.0 * std::f32::consts::FRAC_PI_4,
-                    pitch: 0.08,
-                    dist: 0.34,
+                    target: to_normalized(pos),
+                    yaw: std::f32::consts::FRAC_PI_2,
+                    pitch: 0.10,
+                    dist: 0.22,
                 },
             }
         }
-        LatticeDemoBeat::Interior => DemoWaypoint {
-            label: "interior",
-            player: PlayerPose {
-                pos: [center + side * 0.04, side * 0.46, center + side * 0.10],
-                yaw: std::f64::consts::FRAC_PI_2,
-                pitch: -0.12,
-            },
-            camera: OrbitCameraPose {
-                target: [0.54, 0.46, 0.50],
-                yaw: std::f32::consts::FRAC_PI_2,
-                pitch: 0.10,
-                dist: 0.22,
-            },
-        },
         LatticeDemoBeat::Panorama => {
-            let offset = side * 0.22;
+            let pos = center_xz(layout.reveal_center);
+            // Aim the orbit camera at the midpoint between the player on the
+            // balcony and the panorama volume so the reveal frames both.
+            let panorama_mid: [f64; 3] = [
+                (layout.reveal_center[0] + layout.panorama_center[0]) as f64 * 0.5,
+                (layout.reveal_center[1] + layout.panorama_center[1]) as f64 * 0.5,
+                (layout.reveal_center[2] + layout.panorama_center[2]) as f64 * 0.5,
+            ];
             DemoWaypoint {
                 label: "panorama",
                 player: PlayerPose {
-                    pos: [center + offset, side * 0.58, center + offset],
+                    pos,
                     yaw: std::f64::consts::FRAC_PI_4,
                     pitch: 0.24,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.62, 0.72, 0.62],
+                    target: to_normalized(panorama_mid),
                     yaw: std::f32::consts::FRAC_PI_4,
                     pitch: 0.32,
                     dist: 0.82,
@@ -842,7 +867,7 @@ impl App {
         let Some(player) = self.entities.get_mut(pid) else {
             return false;
         };
-        player.pos = [center[0], center[1] + 2.0, center[2]];
+        player.pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         true
     }
 
@@ -860,7 +885,7 @@ impl App {
                 held_material: 1,
             });
         let center = self.world_center();
-        let pos = [center[0], center[1] + 2.0, center[2]];
+        let pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         self.entities = sim::EntityStore::new();
         self.player_id = Some(self.entities.add(
             pos,
@@ -872,25 +897,41 @@ impl App {
 
     fn spawn_demo_entities(&mut self) {
         let center = self.world_center();
-        let mid_y = center[1] + 1.0;
+        let mid_y = center[1] + 1.0 * CELLS_PER_METER;
         self.entities.add(
-            [center[0] - 10.0, mid_y, center[2] - 4.0],
+            [
+                center[0] - 10.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 4.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::geyser()),
         );
         self.entities.add(
-            [center[0] + 10.0, mid_y + 2.0, center[2] + 6.0],
+            [
+                center[0] + 10.0 * CELLS_PER_METER,
+                mid_y + 2.0 * CELLS_PER_METER,
+                center[2] + 6.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::volcano()),
         );
         self.entities.add(
-            [center[0] + 2.0, mid_y, center[2] - 12.0],
+            [
+                center[0] + 2.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 12.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::whirlpool()),
         );
         for offset in [-8.0, 0.0, 8.0] {
             self.entities.add(
-                [center[0] + offset, mid_y, center[2] + 12.0],
+                [
+                    center[0] + offset * CELLS_PER_METER,
+                    mid_y,
+                    center[2] + 12.0 * CELLS_PER_METER,
+                ],
                 [0.0; 3],
                 sim::EntityKind::Critter(sim::CritterState::new(
                     hash_thing::terrain::materials::VINE_MATERIAL_ID,
@@ -1022,7 +1063,9 @@ impl App {
 
     fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
         match swap {
-            PendingSceneSwap::LoadLatticeDemo => self.load_lattice_demo(),
+            PendingSceneSwap::LoadLatticeDemo => {
+                let _ = self.load_lattice_demo();
+            }
             PendingSceneSwap::LoadLatticePanoramaDemo => self.load_lattice_panorama_demo(),
             PendingSceneSwap::ResetTerrain => self.load_terrain_scene(
                 "Reset terrain",
@@ -1143,8 +1186,17 @@ impl App {
     }
 
     fn load_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
-        self.load_lattice_demo();
-        let waypoint = lattice_demo_waypoint(self.world.side(), beat);
+        // Reseed the scene and use the fresh DemoLayout anchors — direct
+        // return rather than an App-side cache so a stale layout can never
+        // drive a waypoint into unrelated geometry (hash-thing-ptew).
+        let Some(layout) = self.load_lattice_demo() else {
+            // Background sim step in flight — load_lattice_demo already
+            // logged the deferral. Skip the waypoint too; applying a
+            // lattice-shaped pose on top of the previous scene is exactly
+            // the class of bug that ptew is about.
+            return;
+        };
+        let waypoint = lattice_demo_waypoint(self.world.side(), &layout, beat);
         self.apply_player_pose(waypoint.player);
         self.apply_orbit_camera_pose(waypoint.camera);
         self.current_demo_beat = Some(beat);
@@ -1519,13 +1571,13 @@ impl App {
         log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
     }
 
-    fn load_lattice_demo(&mut self) {
+    fn load_lattice_demo(&mut self) -> Option<sim::DemoLayout> {
         if self.is_stepping() {
             // Without this log the `n` key looks dead during a long sim
             // step — see hash-thing-1a1n. The completion log at the end
             // of this function covers the success path.
             log::info!("load_lattice_demo: deferred — background sim step in flight");
-            return;
+            return None;
         }
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
@@ -1557,6 +1609,7 @@ impl App {
             elapsed.as_secs_f64() * 1000.0,
             layout.reveal_center,
         );
+        Some(layout)
     }
 
     fn load_lattice_panorama_demo(&mut self) {
@@ -1777,8 +1830,16 @@ impl ApplicationHandler for App {
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
                         winit::keyboard::Key::Character("s")
-                            if self.camera_mode == CameraMode::Orbit && !self.is_stepping() =>
+                            if self.camera_mode != CameraMode::Orbit =>
                         {
+                            log::debug!("s ignored: single-step only in Orbit mode (current=FPS)");
+                        }
+                        winit::keyboard::Key::Character("s") if self.is_stepping() => {
+                            log::debug!(
+                                "s ignored: single-step denied while background step is in flight"
+                            );
+                        }
+                        winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
@@ -1877,7 +1938,9 @@ impl ApplicationHandler for App {
                                         sim::GameOfLife3D::new(4, 7, 6, 8),
                                         "Pyroclastic",
                                     ),
-                                    _ => {}
+                                    _ => log::debug!(
+                                        "digit {digit} ignored in Orbit mode: rule selection uses 1-4 only"
+                                    ),
                                 }
                             }
                         }
@@ -1939,10 +2002,15 @@ impl ApplicationHandler for App {
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
                         }
+                        winit::keyboard::Key::Character("p") if self.is_stepping() => {
+                            log::debug!(
+                                "p ignored: perf dump denied while background step is in flight"
+                            );
+                        }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
                         // cadence.
-                        winit::keyboard::Key::Character("p") if !self.is_stepping() => {
+                        winit::keyboard::Key::Character("p") => {
                             let nodes = self.world.store.stats();
                             self.mem_stats.update(nodes);
                             let (svdag_nodes, svdag_bytes, svdag_root_level) =
@@ -2324,7 +2392,7 @@ impl ApplicationHandler for App {
                         // Skipped during background step — world is placeholder.
                         if !self.is_stepping() {
                             if let Some(p) = self.entities.get_mut(pid) {
-                                const GROWTH_MARGIN: f64 = 8.0;
+                                const GROWTH_MARGIN: f64 = 8.0 * CELLS_PER_METER;
                                 let origin = self.world.origin;
                                 let side = self.world.side() as f64;
                                 let pos = p.pos;
@@ -2735,22 +2803,27 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
+        let mut world = sim::World::new(6); // side 64
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
         for beat in [
             LatticeDemoBeat::Intro,
             LatticeDemoBeat::Interior,
             LatticeDemoBeat::Panorama,
         ] {
-            let waypoint = lattice_demo_waypoint(2048, beat);
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
             for axis in [0, 1, 2] {
                 assert!(waypoint.player.pos[axis] > 0.0);
-                assert!(waypoint.player.pos[axis] < 2048.0);
+                assert!(waypoint.player.pos[axis] < side as f64);
             }
         }
     }
 
     #[test]
     fn lattice_panorama_waypoint_faces_inward_and_upward() {
-        let waypoint = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let waypoint = lattice_demo_waypoint(world.side(), &layout, LatticeDemoBeat::Panorama);
         let (_eye, dir) = player::eye_ray(
             &waypoint.player.pos,
             waypoint.player.yaw,
@@ -2763,12 +2836,46 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_are_distinct() {
-        let intro = lattice_demo_waypoint(512, LatticeDemoBeat::Intro);
-        let interior = lattice_demo_waypoint(512, LatticeDemoBeat::Interior);
-        let panorama = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        let intro = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Intro);
+        let interior = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Interior);
+        let panorama = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Panorama);
         assert_ne!(intro.label, interior.label);
         assert_ne!(interior.label, panorama.label);
         assert_ne!(intro.player.pos, panorama.player.pos);
+    }
+
+    /// ptew: player was landing embedded in solid lattice cells because
+    /// the beat waypoints were hardcoded normalized fractions that did
+    /// not track the scene geometry. This test seeds the real scene and
+    /// asserts that every beat's spawn cell is walkable AND grounded, so
+    /// the class of bug cannot regress silently.
+    #[test]
+    fn lattice_demo_waypoints_do_not_collide_with_scene() {
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        for beat in [
+            LatticeDemoBeat::Intro,
+            LatticeDemoBeat::Interior,
+            LatticeDemoBeat::Panorama,
+        ] {
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
+            assert!(
+                !player::player_collides(&world, &waypoint.player.pos),
+                "{:?} waypoint must spawn in AIR: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+            assert!(
+                player::is_grounded(&world, &waypoint.player.pos),
+                "{:?} waypoint must have floor support: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+        }
     }
 
     #[test]
@@ -2949,7 +3056,10 @@ mod tests {
             .find(|entity| entity.id == pid)
             .expect("player entity should still exist");
         let center = app.world_center();
-        assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
+        assert_eq!(
+            player.pos,
+            [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]]
+        );
     }
 
     #[test]
