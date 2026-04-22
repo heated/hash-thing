@@ -848,8 +848,7 @@ impl App {
         self.reset_scene_entities();
         self.spawn_demo_entities();
         self.paused = false;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
         }
@@ -1171,6 +1170,16 @@ impl App {
         self.render_inv_size = 1.0 / self.world.side() as f32;
     }
 
+    /// Drop any perf / FPS state carried over from a prior scene. Called
+    /// from every scene loader so a scene swap can't leave the window-title
+    /// FPS EWMA, perf histograms, and memory peak-marks anchored to the
+    /// previous scene's regime (hash-thing-6nsh).
+    fn reset_scene_perf_state(&mut self) {
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        self.smoothed_fps = 0.0;
+    }
+
     /// Get the player's eye position and look direction.
     fn player_eye_ray(&self) -> Option<([f64; 3], [f64; 3])> {
         let pid = self.player_id?;
@@ -1397,8 +1406,7 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = true;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
         }
@@ -1468,12 +1476,8 @@ impl App {
             if prev == hit {
                 return;
             }
-            // Encode the source material in clone block metadata.
-            let state = hash_thing::octree::Cell::pack(
-                hash_thing::terrain::materials::CLONE_MATERIAL_ID,
-                held_material,
-            )
-            .raw();
+            // Pack held material as the clone source (see pack_clone_source).
+            let state = hash_thing::terrain::materials::pack_clone_source(held_material);
             let pos = [prev[0], prev[1], prev[2]];
             self.world.set(
                 sim::WorldCoord(pos[0]),
@@ -1506,8 +1510,7 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = true;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
         }
@@ -1549,8 +1552,7 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = false; // Let materials interact immediately.
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
         }
@@ -1580,8 +1582,7 @@ impl App {
         self.world.seed_center(12, 0.35);
         self.gol_smoke_scene = true;
         self.paused = true;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
         }
@@ -1613,8 +1614,7 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = false; // Let materials interact immediately.
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials.color_palette_rgba());
         }
@@ -1656,8 +1656,7 @@ impl App {
         self.noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
         self.gol_smoke_scene = false;
         self.paused = true;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
@@ -2922,6 +2921,20 @@ mod tests {
         assert_eq!(LatticeDemoBeat::Intro.label(), "intro");
         assert_eq!(LatticeDemoBeat::Interior.label(), "interior");
         assert_eq!(LatticeDemoBeat::Panorama.label(), "panorama");
+    }
+
+    #[test]
+    fn reset_scene_perf_state_zeroes_smoothed_fps() {
+        // hash-thing-6nsh: scene loaders previously cleared perf rings and
+        // mem_stats peaks but left smoothed_fps anchored to the previous
+        // scene, so the window-title FPS EWMA lied for many refreshes
+        // after a scene with a very different render cost.
+        let mut app = App::new(64);
+        app.smoothed_fps = 240.0;
+
+        app.reset_scene_perf_state();
+
+        assert_eq!(app.smoothed_fps, 0.0);
     }
 
     #[test]

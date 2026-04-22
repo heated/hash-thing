@@ -9,8 +9,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE, FIREWORK, GRASS, LAVA,
-    OIL, SAND, STONE, VINE, WATER,
+    pack_clone_source, BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE,
+    FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -1760,8 +1760,13 @@ impl World {
         }
     }
 
+    /// Place a CLONE cell that spawns `source_material` downstream.
+    ///
+    /// Routes through `pack_clone_source` to centralize the 6-bit cap +
+    /// panic message (hash-thing-457f). The sister site at
+    /// `main.rs::place_clone_block` uses the same helper.
     fn place_clone_source(&mut self, pos: [i64; 3], source_material: u16) {
-        let state = Cell::pack(CLONE_MATERIAL_ID, source_material).raw();
+        let state = pack_clone_source(source_material);
         self.set(
             WorldCoord(pos[0]),
             WorldCoord(pos[1]),
@@ -1826,6 +1831,31 @@ impl World {
         );
         self.fill_box(entry_passage, AIR);
         self.fill_floor(entry_passage, DIRT);
+        // Bridge the stone slab between corridor.max[2] and atrium.min[2].
+        // At every level atrium.min[2] (lo[2]+cell_size) sits strictly past
+        // corridor.max[2] (corridor_z+tunnel_half_w), so without this carve
+        // the walk_route's corridor_turn → atrium_entry segment is blocked.
+        // The gap is small at level ≤ 6 and grows with cell_size at higher
+        // levels, which is what stranded the level-8 traversability test in
+        // hash-thing-69cq until dyqr. The carve lands before the `atrium`
+        // fill_box below, so any overlap at atrium.min[2] is overwritten by
+        // the atrium's own AIR/STONE pass.
+        let corridor_turn_x = corridor.max[0] - 2;
+        let tunnel_half_w = (corridor.max[2] - corridor.min[2]) / 2;
+        let atrium_entry_passage = Box3::new(
+            [
+                corridor_turn_x - tunnel_half_w,
+                corridor.min[1],
+                corridor.max[2],
+            ],
+            [
+                corridor_turn_x + tunnel_half_w,
+                corridor.max[1],
+                atrium.min[2],
+            ],
+        );
+        self.fill_box(atrium_entry_passage, AIR);
+        self.fill_floor(atrium_entry_passage, DIRT);
         self.fill_box(tease_a, AIR);
         self.fill_box(tease_b, AIR);
         self.fill_box(atrium, AIR);
@@ -1852,7 +1882,7 @@ impl World {
         );
 
         let corridor_mid = [corridor.center()[0], corridor.min[1], corridor.center()[2]];
-        let corridor_turn = [corridor.max[0] - 2, corridor.min[1], corridor.center()[2]];
+        let corridor_turn = [corridor_turn_x, corridor.min[1], corridor.center()[2]];
         let atrium_entry = [corridor_turn[0], atrium.min[1], atrium.min[2] + 1];
         let atrium_center = [atrium.center()[0], atrium.min[1], atrium.center()[2]];
         let reveal_center = [balcony.center()[0], balcony.min[1], balcony.center()[2]];
@@ -2266,10 +2296,11 @@ impl World {
         // so memory tracks live-scene size, not cumulative history.
         // See hash-thing-88d.
         //
-        // Brute-force compaction remaps all NodeIds without updating
-        // hashlife_cache, so clear it to prevent stale cross-path hits.
-        // Keep the remap so Svdag can update its persistent NodeId cache
-        // (hash-thing-5bb.11: O(changed) instead of O(reachable)).
+        // Brute-force compaction remaps every live NodeId into a fresh
+        // store namespace, so clear all four hashlife caches to prevent
+        // stale cross-path hits. Keep the remap so Svdag can update its
+        // persistent NodeId cache (hash-thing-5bb.11: O(changed) instead
+        // of O(reachable)).
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
@@ -2278,6 +2309,7 @@ impl World {
             None => remap,
         });
         self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
     }
@@ -3250,22 +3282,18 @@ mod tests {
         }
     }
 
-    // Pre-existing demo geometry bug: at world levels ≥7, tunnel_half_w grows
-    // faster than the atrium offset (lo[2]+cell_size), leaving a solid gap
-    // between corridor and atrium. The scale bump (hash-thing-69cq) forced a
-    // level-6→8 jump to fit the 1.6 m player, which exposed the bug. Tracked
-    // in hash-thing-dyqr; un-ignore once the demo carves the connector.
     #[test]
-    #[ignore = "hash-thing-dyqr: lattice demo corridor→atrium gap at level≥7"]
     fn lattice_progression_demo_route_is_player_traversable_end_to_end() {
-        let mut w = World::new(8);
-        let layout = w.seed_lattice_progression_demo();
-        let route = std::iter::once(walk_cell(layout.player_pos))
-            .chain(layout.walk_route)
-            .collect::<Vec<_>>();
+        for level in [7u32, 8] {
+            let mut w = World::new(level);
+            let layout = w.seed_lattice_progression_demo();
+            let route = std::iter::once(walk_cell(layout.player_pos))
+                .chain(layout.walk_route)
+                .collect::<Vec<_>>();
 
-        for segment in route.windows(2) {
-            assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            for segment in route.windows(2) {
+                assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            }
         }
     }
 
@@ -4494,6 +4522,30 @@ mod tests {
         assert!(world.queue.is_empty());
         assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
         assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    /// commit_step rebuilds the NodeStore via `compacted_with_remap`, so every
+    /// NodeId key in every hashlife cache is invalidated. The macro cache was
+    /// historically omitted from the clear-list, leaving stale `(NodeId, u64)`
+    /// keys pointing at a dead namespace — which `maybe_compact` would then
+    /// treat as extra roots and feed back into compaction (hash-thing-w1bs).
+    #[test]
+    fn commit_step_clears_hashlife_macro_cache() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive_pow2();
+        assert!(
+            !world.hashlife_macro_cache.is_empty(),
+            "precondition: step_recursive_pow2 must populate the macro cache"
+        );
+
+        world.step();
+
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "commit_step must clear the macro cache; stale NodeId keys would \
+             alias into the freshly-compacted store"
+        );
     }
 
     #[test]
