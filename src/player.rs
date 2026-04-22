@@ -766,19 +766,35 @@ mod tests {
 
     #[test]
     fn apply_movement_no_collision_moves_freely() {
-        let world = World::new(3);
-        let pos = [4.0, 4.0, 4.0];
-        let delta = [1.0, 0.0, -1.0];
+        // Empty 32³ world (level 5 = 8 m at k=4); positions in meters so the
+        // assertion remains meter-invariant across `CELLS_PER_METER` bumps.
+        let world = World::new(5);
+        let m = |v: f64| v * CELLS_PER_METER;
+        let pos = [m(4.0), m(4.0), m(4.0)];
+        let delta = [m(1.0), 0.0, m(-1.0)];
         let new_pos = apply_movement(&world, &pos, &delta);
-        assert!((new_pos[0] - 5.0).abs() < 1e-9);
-        assert!((new_pos[2] - 3.0).abs() < 1e-9);
+        assert!((new_pos[0] - m(5.0)).abs() < 1e-9);
+        assert!((new_pos[2] - m(3.0)).abs() < 1e-9);
     }
 
     #[test]
     fn grounded_step_jumps_only_when_supported() {
-        let world = world_with_floor(0, 0, 7, 0, 7);
+        // 1 m-thick floor over an 8 m × 8 m tile; player feet at 1 m so the
+        // AABB (1.6 m tall) clears the ground. Scale-invariant: the jump
+        // only has to produce a positive Δy and positive vertical velocity.
+        let mut world = World::new(5);
+        let material = Cell::pack(1, 0).raw();
+        let s = CELLS_PER_METER as i64;
+        for cx in 0..8 * s {
+            for cy in 0..s {
+                for cz in 0..8 * s {
+                    world.set(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz), material);
+                }
+            }
+        }
+        let m = |v: f64| v * CELLS_PER_METER;
         let dt = 1.0 / 60.0;
-        let start = [4.0, 1.0, 4.0];
+        let start = [m(4.0), m(1.0), m(4.0)];
 
         let jumped = step_grounded_movement(
             &world,
@@ -895,16 +911,29 @@ mod tests {
 
     #[test]
     fn apply_movement_snaps_down_small_floor_gap() {
-        let world = world_with_floor(0, 0, 7, 0, 7);
-        let pos = [3.5, 1.2, 3.5];
-        let delta = [0.4, 0.0, 0.0];
+        // 1 m-thick floor over an 8 m × 8 m tile. Player starts 0.2 m above
+        // the floor top (well inside GROUND_SNAP_HEIGHT = 0.35 m) and moves
+        // 0.4 m horizontally; snap-down must land feet at 1 m.
+        let mut world = World::new(5);
+        let material = Cell::pack(1, 0).raw();
+        let s = CELLS_PER_METER as i64;
+        for cx in 0..8 * s {
+            for cy in 0..s {
+                for cz in 0..8 * s {
+                    world.set(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz), material);
+                }
+            }
+        }
+        let m = |v: f64| v * CELLS_PER_METER;
+        let pos = [m(3.5), m(1.2), m(3.5)];
+        let delta = [m(0.4), 0.0, 0.0];
         let new_pos = apply_movement(&world, &pos, &delta);
         assert!(
-            (new_pos[0] - 3.9).abs() < 1e-9,
+            (new_pos[0] - m(3.9)).abs() < 1e-6,
             "horizontal movement should still apply"
         );
         assert!(
-            (new_pos[1] - 1.0).abs() < 1e-9,
+            (new_pos[1] - m(1.0)).abs() < 1e-6,
             "small drops should snap back onto the floor"
         );
     }
