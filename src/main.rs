@@ -2231,14 +2231,17 @@ impl ApplicationHandler for App {
                     // hundreds of ms at 256³. Reset so the first real frame's
                     // dt measures the frame, not the cold-start work
                     // (hash-thing-q07n; same pattern as xysz for resume edges).
-                    // NOTE: unlike `mark_resume_edge`, this site does NOT set
-                    // `suppress_next_fps_sample` — the dt_wall computed below
-                    // still feeds the EWMA with a microsecond-scale sample,
-                    // producing the "5,000,000 FPS on startup" readout
-                    // (hash-thing-6e4a). Routing this reset through
-                    // `mark_resume_edge` is 6e4a's fix, currently blocked on
-                    // breakdown review. When 6e4a unblocks, replace the
-                    // assignment below with `self.mark_resume_edge();`.
+                    //
+                    // Post-hash-thing-v79j: `load_initial_scene` calls
+                    // `reset_scene_perf_state` (src/main.rs:902), which now
+                    // routes through `mark_resume_edge` — so the suppress
+                    // flag is already set when execution reaches here. The
+                    // assignment below refreshes `last_frame` a second time
+                    // to skip over the terrain-gen + upload window that ran
+                    // between `mark_resume_edge` at the top of the scene
+                    // loader and this point. 6e4a's remaining scope is
+                    // tidying this to a direct `mark_resume_edge` call for
+                    // symmetry with the other resume edges.
                     self.last_frame = std::time::Instant::now();
                 }
 
