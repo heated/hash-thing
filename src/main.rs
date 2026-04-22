@@ -645,6 +645,26 @@ impl App {
         self.apply_cursor_capture(should_capture);
     }
 
+    // Two entry points latch `self.occluded = true`: the winit
+    // `WindowEvent::Occluded(true)` event and the `FrameOutcome::Occluded`
+    // belt-and-suspenders path in `RedrawRequested`. Both must clear the
+    // same transient input state and sync cursor capture or `cursor_captured`
+    // drifts from the OS-level grab (hash-thing-w0o9). Extract a helper so
+    // the two paths cannot diverge.
+    fn enter_occluded_state(&mut self) {
+        self.occluded = true;
+        self.keys_held.clear();
+        self.jump_was_held = false;
+        self.last_mouse = None;
+        self.sync_cursor_capture();
+    }
+
+    fn leave_occluded_state(&mut self) {
+        self.occluded = false;
+        self.last_mouse = None;
+        self.sync_cursor_capture();
+    }
+
     /// Apply a raw pixel-delta mouse look to the player. Scales by
     /// `LOOK_SENSITIVITY` and clamps pitch to ±1.4. Shared between the
     /// `CursorMoved` (uncaptured) and `DeviceEvent::MouseMotion` (captured)
@@ -1567,15 +1587,10 @@ impl ApplicationHandler for App {
             // signal — macOS Mission Control / Spaces can revoke the cursor
             // grab here without a Focused(false) event (hash-thing-w0o9).
             WindowEvent::Occluded(occluded) => {
-                self.occluded = occluded;
                 if occluded {
-                    self.keys_held.clear();
-                    self.jump_was_held = false;
-                    self.last_mouse = None;
-                    self.sync_cursor_capture();
+                    self.enter_occluded_state();
                 } else {
-                    self.last_mouse = None;
-                    self.sync_cursor_capture();
+                    self.leave_occluded_state();
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -2395,9 +2410,10 @@ impl ApplicationHandler for App {
                 // before winit fires `WindowEvent::Occluded(true)` (some
                 // platforms are lazy about that event), latch the flag here
                 // so the next RedrawRequested short-circuits at the top of
-                // the arm.
+                // the arm. Route through the same helper as the winit event
+                // so cursor capture releases on this path too (w0o9).
                 if matches!(outcome, Some(render::FrameOutcome::Occluded)) {
-                    self.occluded = true;
+                    self.enter_occluded_state();
                     return;
                 }
 
@@ -3137,10 +3153,12 @@ mod tests {
     }
 
     // hash-thing-w0o9: occlusion (macOS Mission Control / Spaces) must
-    // release cursor capture even when Focused(false) never fires.
+    // release cursor capture even when Focused(false) never fires. Drive
+    // through `enter_occluded_state` so the winit-event path and the
+    // `FrameOutcome::Occluded` latch path are both covered (Codex blocker).
 
     #[test]
-    fn sync_cursor_capture_releases_on_occlusion() {
+    fn enter_occluded_state_releases_cursor_capture() {
         let mut app = App::new(64);
         app.camera_mode = CameraMode::FirstPerson;
         app.focused = true;
@@ -3148,13 +3166,19 @@ mod tests {
         // Simulate a successful grab from before the occlusion event.
         app.cursor_captured = true;
 
-        app.occluded = true;
-        app.sync_cursor_capture();
+        app.enter_occluded_state();
 
+        assert!(app.occluded, "enter_occluded_state must latch occluded");
         assert!(
             !app.cursor_captured,
             "occlusion must flip cursor_captured even while focused"
         );
+        assert!(
+            app.keys_held.is_empty(),
+            "transient key state must clear on occlusion"
+        );
+        assert!(!app.jump_was_held);
+        assert!(app.last_mouse.is_none());
     }
 
     #[test]
@@ -3169,13 +3193,39 @@ mod tests {
         app.cursor_captured = true;
         app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
 
-        app.occluded = true;
-        app.sync_cursor_capture();
+        app.enter_occluded_state();
 
         app.handle_mouse_motion(999.0, 999.0);
         let (yaw, pitch) = player_look(&mut app);
         assert_eq!(yaw, 0.0);
         assert_eq!(pitch, 0.0);
+    }
+
+    #[test]
+    fn leave_occluded_state_restores_should_capture() {
+        // Recovery path (Gemini nit): after occlude → un-occlude while
+        // still focused in FirstPerson, the capture predicate must want
+        // to re-grab. We can't verify the actual OS grab without a window,
+        // but the predicate is what sync_cursor_capture consults.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.enter_occluded_state();
+        assert!(!should_capture_cursor(
+            app.camera_mode,
+            app.focused,
+            app.occluded,
+        ));
+
+        app.leave_occluded_state();
+
+        assert!(!app.occluded);
+        assert!(app.last_mouse.is_none());
+        assert!(should_capture_cursor(
+            app.camera_mode,
+            app.focused,
+            app.occluded,
+        ));
     }
 
     /// Seed `last_mouse` without resetting player yaw/pitch. Used when a
