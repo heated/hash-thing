@@ -523,6 +523,12 @@ struct App {
     /// [`sim::World`] (hash-thing-0s9v). Refreshed at step start, step
     /// completion, and after [`sim::World::ensure_region`] grows the world.
     collision_snapshot: Option<sim::CollisionSnapshot>,
+    /// Cached fullscreen state for auto-clearing perf histograms on
+    /// windowed↔fullscreen transitions (hash-thing-0zrc). Queried each
+    /// `Resized` against `window.fullscreen().is_some()`; a mismatch
+    /// means the OS just toggled fullscreen, which matters for dlse.2.2
+    /// A/B perf comparisons.
+    was_fullscreen: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -681,6 +687,7 @@ impl App {
                 .as_deref()
                 .and_then(thread_qos::parse),
             collision_snapshot: None,
+            was_fullscreen: false,
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
@@ -1218,10 +1225,20 @@ impl App {
     /// from every scene loader so a scene swap can't leave the window-title
     /// FPS EWMA, perf histograms, and memory peak-marks anchored to the
     /// previous scene's regime (hash-thing-6nsh).
+    ///
+    /// Route the `last_frame` + `suppress_next_fps_sample` reset through
+    /// `mark_resume_edge` (hash-thing-v79j). The scene loaders that call
+    /// this helper then run terrain gen + SVDAG upload — hundreds of ms at
+    /// 256³ — before the next redraw. Without the resume edge, the first
+    /// post-swap `dt_wall` captures that upload time, and with
+    /// `smoothed_fps == 0.0` the `smooth_fps` zero-sentinel seeds the EWMA
+    /// at ~3 FPS (`1 / 0.33s`). Same shape as hash-thing-dxjb (focus edge)
+    /// and hash-thing-6e4a (cold-start).
     fn reset_scene_perf_state(&mut self) {
         self.perf.clear();
         self.mem_stats.reset_peaks();
         self.smoothed_fps = 0.0;
+        self.mark_resume_edge();
     }
 
     /// Get the player's eye position and look direction.
@@ -1790,6 +1807,34 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
+                // hash-thing-0zrc: detect OS-initiated windowed<->fullscreen
+                // transitions by diffing cached state against the current
+                // `window.fullscreen()`. winit 0.30 has no dedicated
+                // `FullscreenChanged` event; on macOS/Windows the toggle
+                // surfaces as `Resized`, so this is the idiomatic hook.
+                // Pre-transition samples belong to a different regime
+                // (different render-target size, GPU bottleneck mix), so
+                // dropping them gives dlse.2.2 A/B comparisons a clean slate.
+                //
+                // Scope: strictly windowed<->fullscreen. Same-mode regime
+                // changes — monitor swap while fullscreen, DPI change,
+                // windowed drag — are intentionally out of scope and left
+                // to scene-reset paths or follow-up beads. We call the
+                // narrow `self.perf.clear()` (not `reset_scene_perf_state`)
+                // because the bead is scoped to perf histograms; FPS EWMA
+                // and mem peaks are left alone on purpose.
+                if let Some(window) = self.window.as_ref() {
+                    let now_fullscreen = window.fullscreen().is_some();
+                    if now_fullscreen != self.was_fullscreen {
+                        log::info!(
+                            "fullscreen transition {}→{}: clearing perf histograms (hash-thing-0zrc)",
+                            self.was_fullscreen,
+                            now_fullscreen,
+                        );
+                        self.perf.clear();
+                        self.was_fullscreen = now_fullscreen;
+                    }
+                }
             }
 
             // Pause the redraw treadmill while the window is hidden
@@ -2186,14 +2231,17 @@ impl ApplicationHandler for App {
                     // hundreds of ms at 256³. Reset so the first real frame's
                     // dt measures the frame, not the cold-start work
                     // (hash-thing-q07n; same pattern as xysz for resume edges).
-                    // NOTE: unlike `mark_resume_edge`, this site does NOT set
-                    // `suppress_next_fps_sample` — the dt_wall computed below
-                    // still feeds the EWMA with a microsecond-scale sample,
-                    // producing the "5,000,000 FPS on startup" readout
-                    // (hash-thing-6e4a). Routing this reset through
-                    // `mark_resume_edge` is 6e4a's fix, currently blocked on
-                    // breakdown review. When 6e4a unblocks, replace the
-                    // assignment below with `self.mark_resume_edge();`.
+                    //
+                    // Post-hash-thing-v79j: `load_initial_scene` calls
+                    // `reset_scene_perf_state` (src/main.rs:902), which now
+                    // routes through `mark_resume_edge` — so the suppress
+                    // flag is already set when execution reaches here. The
+                    // assignment below refreshes `last_frame` a second time
+                    // to skip over the terrain-gen + upload window that ran
+                    // between `mark_resume_edge` at the top of the scene
+                    // loader and this point. 6e4a's remaining scope is
+                    // tidying this to a direct `mark_resume_edge` call for
+                    // symmetry with the other resume edges.
                     self.last_frame = std::time::Instant::now();
                 }
 
@@ -2974,6 +3022,30 @@ mod tests {
         app.reset_scene_perf_state();
 
         assert_eq!(app.smoothed_fps, 0.0);
+    }
+
+    #[test]
+    fn reset_scene_perf_state_routes_through_mark_resume_edge() {
+        // hash-thing-v79j: scene loaders call reset_scene_perf_state then
+        // spend hundreds of ms on terrain gen + SVDAG upload before the
+        // next redraw. Without the mark_resume_edge pairing, the first
+        // post-swap dt_wall captures that upload time and seeds the EWMA
+        // at ~3 FPS via the smooth_fps zero-sentinel branch.
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.suppress_next_fps_sample = false;
+
+        app.reset_scene_perf_state();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "scene reset must refresh last_frame via mark_resume_edge; elapsed was {:?}",
+            app.last_frame.elapsed()
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "scene reset must flag the next FPS sample as bogus via mark_resume_edge"
+        );
     }
 
     #[test]
