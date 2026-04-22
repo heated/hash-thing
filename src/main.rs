@@ -2018,6 +2018,11 @@ impl ApplicationHandler for App {
                 if self.startup_scene_pending {
                     self.startup_scene_pending = false;
                     self.load_initial_scene();
+                    // load_initial_scene runs terrain gen + SVDAG upload —
+                    // hundreds of ms at 256³. Reset so the first real frame's
+                    // dt measures the frame, not the cold-start work
+                    // (hash-thing-q07n; same pattern as xysz for resume edges).
+                    self.last_frame = std::time::Instant::now();
                 }
 
                 // Frame delta time. `dt` is clamped to 0.1s for xa7
