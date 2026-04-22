@@ -172,6 +172,11 @@ pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
     rules: Vec<Box<dyn CaRule + Send>>,
     block_rules: Vec<Box<dyn BlockRule + Send>>,
+    // Caches rebuilt after any mutation touching entries / block_rules (hash-thing-5yxk).
+    // The sim step hot path reads these every tick; recomputing per step would
+    // allocate two Vec<u16> per step, which shows up in jw3k-class profiles.
+    cached_tick_divisor_flags: Vec<u16>,
+    cached_block_rule_tick_divisors: Vec<u16>,
 }
 
 impl Clone for MaterialRegistry {
@@ -180,6 +185,8 @@ impl Clone for MaterialRegistry {
             entries: self.entries.clone(),
             rules: self.rules.iter().map(|r| r.clone_box()).collect(),
             block_rules: self.block_rules.iter().map(|r| r.clone_box()).collect(),
+            cached_tick_divisor_flags: self.cached_tick_divisor_flags.clone(),
+            cached_block_rule_tick_divisors: self.cached_block_rule_tick_divisors.clone(),
         }
     }
 }
@@ -199,6 +206,8 @@ impl MaterialRegistry {
             entries: Vec::with_capacity(INITIAL_MATERIAL_SLOTS),
             rules: Vec::new(),
             block_rules: Vec::new(),
+            cached_tick_divisor_flags: Vec::new(),
+            cached_block_rule_tick_divisors: Vec::new(),
         }
     }
 
@@ -787,28 +796,43 @@ impl MaterialRegistry {
 
     /// Per-material tick_divisor, indexed by material id. Unregistered slots
     /// return 1 (no skip). Used by the step dispatcher to gate per-tick firing.
-    pub fn tick_divisor_flags(&self) -> Vec<u16> {
-        self.entries
-            .iter()
-            .map(|entry| entry.as_ref().map(|e| e.tick_divisor.max(1)).unwrap_or(1))
-            .collect()
+    ///
+    /// Returns a slice into the cache refreshed by any mutation path
+    /// (`insert`, `set_tick_divisor`, `register_block_rule`, `assign_block_rule`)
+    /// so the sim step hot path avoids the per-tick Vec alloc (hash-thing-5yxk).
+    pub fn tick_divisor_flags(&self) -> &[u16] {
+        &self.cached_tick_divisor_flags
     }
 
     /// Per-block-rule tick_divisor, indexed by BlockRuleId. Materials sharing
     /// a BlockRule must share a tick_divisor — this is validated at registry
     /// build time via [`Self::validate_shared_block_rule_divisors`]. If no
     /// material references a rule id (dead rule), returns 1.
-    pub fn block_rule_tick_divisors(&self) -> Vec<u16> {
+    ///
+    /// Slice into the cache; see [`Self::tick_divisor_flags`].
+    pub fn block_rule_tick_divisors(&self) -> &[u16] {
+        &self.cached_block_rule_tick_divisors
+    }
+
+    /// Rebuild both tick-divisor caches. Called after every mutation path that
+    /// could change either the per-material divisors or the block-rule table.
+    /// Cost is O(entries + block_rules) — small constants in practice.
+    fn rebuild_tick_caches(&mut self) {
+        self.cached_tick_divisor_flags = self
+            .entries
+            .iter()
+            .map(|entry| entry.as_ref().map(|e| e.tick_divisor.max(1)).unwrap_or(1))
+            .collect();
         let mut per_rule = vec![0u16; self.block_rules.len()];
         for entry in self.entries.iter().filter_map(|e| e.as_ref()) {
             if let Some(BlockRuleId(id)) = entry.block_rule_id {
                 per_rule[id] = entry.tick_divisor.max(1);
             }
         }
-        per_rule
+        self.cached_block_rule_tick_divisors = per_rule
             .into_iter()
             .map(|d| if d == 0 { 1 } else { d })
-            .collect()
+            .collect();
     }
 
     /// Panic if any two materials sharing one BlockRule have different
@@ -884,6 +908,7 @@ impl MaterialRegistry {
     {
         let id = BlockRuleId(self.block_rules.len());
         self.block_rules.push(Box::new(rule));
+        self.rebuild_tick_caches();
         id
     }
 
@@ -894,6 +919,7 @@ impl MaterialRegistry {
                 panic!("material {material_id} must exist before assigning a block rule")
             })
             .block_rule_id = Some(block_rule_id);
+        self.rebuild_tick_caches();
     }
 
     /// Set the tick divisor for an existing material.
@@ -916,6 +942,7 @@ impl MaterialRegistry {
             .unwrap_or_else(|| panic!("material {material_id} must exist to set tick_divisor"))
             .tick_divisor = divisor;
         self.validate_shared_block_rule_divisors();
+        self.rebuild_tick_caches();
     }
 
     /// Look up a block rule by ID. Used by `World::step_blocks()`.
@@ -929,6 +956,7 @@ impl MaterialRegistry {
             self.entries.resize(material_id + 1, None);
         }
         self.entries[material_id] = Some(entry);
+        self.rebuild_tick_caches();
     }
 
     fn assign_rule(&mut self, material_id: MaterialId, rule_id: RuleId) {
@@ -1622,5 +1650,43 @@ mod tests {
         // No material references this block rule — treat as divisor=1.
         let divisors = registry.block_rule_tick_divisors();
         assert_eq!(divisors[block_rule_id.0], 1);
+    }
+
+    /// hash-thing-5yxk: mutation paths that don't touch `tick_divisor` directly
+    /// (`register_block_rule` growing the slot count; `assign_block_rule`
+    /// pointing an existing entry at a newly-registered rule) still need to
+    /// rebuild the block-rule divisor cache. Tests that the cache reflects
+    /// post-insert reconfiguration rather than being frozen at registry
+    /// construction time.
+    #[test]
+    fn block_rule_tick_divisors_cache_tracks_post_insert_reassignment() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let first_block_rule = registry.register_block_rule(GravityBlockRule::new(material_density));
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 3,
+                block_rule_id: Some(first_block_rule),
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        // Register a second block rule AFTER the insert — cache length must grow.
+        let second_block_rule =
+            registry.register_block_rule(FluidBlockRule::new(material_density, 1));
+        assert_eq!(
+            registry.block_rule_tick_divisors().len(),
+            2,
+            "cache must grow when register_block_rule runs post-insert"
+        );
+        // Point the existing material at the new rule — its slot must now
+        // carry the material's divisor, and the old slot must revert to 1.
+        registry.assign_block_rule(0, second_block_rule);
+        let divisors = registry.block_rule_tick_divisors();
+        assert_eq!(divisors[second_block_rule.0], 3, "assign must update cache");
+        assert_eq!(
+            divisors[first_block_rule.0], 1,
+            "old slot reverts to 1 when no entry references it"
+        );
     }
 }
