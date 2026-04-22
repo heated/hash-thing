@@ -344,6 +344,11 @@ struct App {
     /// Last frame timestamp for delta-time computation. Player movement
     /// is multiplied by dt so speed is frame-rate-independent (xa7).
     last_frame: std::time::Instant,
+    /// EWMA-smoothed FPS for the window title. Instantaneous `1/dt`
+    /// jumps ±5 between frames at 20-30 FPS; the smoothed readout is
+    /// just for the human skimming the title bar (hash-thing-d9af).
+    /// Zero sentinel: first frame seeds the filter at its instant value.
+    smoothed_fps: f64,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -426,6 +431,17 @@ fn should_warn_about_slow_dev_step(
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
+/// EWMA smoother for the window-title FPS readout (hash-thing-d9af).
+/// `prev <= 0.0` is the first-frame sentinel — seed the filter at the
+/// instant value so the title doesn't crawl up from zero.
+fn smooth_fps(prev: f64, instant: f64, alpha: f64) -> f64 {
+    if prev <= 0.0 {
+        instant
+    } else {
+        alpha * instant + (1.0 - alpha) * prev
+    }
+}
+
 fn default_legend_visibility(_mode: CameraMode) -> bool {
     // Default-on until proper demo lineup lands (edward 2026-04-21).
     true
@@ -505,6 +521,7 @@ impl App {
             occluded: false,
             noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
+            smoothed_fps: 0.0,
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
@@ -1865,14 +1882,18 @@ impl ApplicationHandler for App {
                 self.last_frame = std::time::Instant::now();
                 self.update_lattice_short_demo_cut();
 
-                // Update window title with FPS + resolution.
+                // Update window title with smoothed FPS + resolution.
+                // EWMA smoothing keeps the readout readable at low FPS
+                // where a single slow frame would otherwise jerk the
+                // displayed number by several units (hash-thing-d9af).
+                let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+                self.smoothed_fps = smooth_fps(self.smoothed_fps, instant_fps, 0.05);
                 if let Some(window) = &self.window {
-                    let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
                     if let Some(renderer) = &self.renderer {
                         let scale_pct = (renderer.render_scale * 100.0) as u32;
                         window.set_title(&format!(
                             "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                            fps, self.volume_size, scale_pct,
+                            self.smoothed_fps, self.volume_size, scale_pct,
                         ));
                     }
                 }
@@ -2359,6 +2380,38 @@ mod tests {
     use super::*;
     use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
     use std::time::Duration;
+
+    #[test]
+    fn smooth_fps_seeds_from_zero_prev_returns_instant() {
+        assert_eq!(smooth_fps(0.0, 60.0, 0.05), 60.0);
+        // Negative prev (shouldn't occur in practice) hits the same
+        // sentinel branch rather than producing a nonsense blend.
+        assert_eq!(smooth_fps(-1.0, 20.0, 0.1), 20.0);
+    }
+
+    #[test]
+    fn smooth_fps_weights_new_sample_by_alpha() {
+        // 0.1 * 20 + 0.9 * 100 = 92.0. Round-trip through f64 to avoid
+        // flaky equality; the arithmetic is exact for these values.
+        assert!((smooth_fps(100.0, 20.0, 0.1) - 92.0).abs() < 1e-12);
+        // alpha=0 pins to prev (filter is frozen).
+        assert_eq!(smooth_fps(42.0, 1.0, 0.0), 42.0);
+        // alpha=1 snaps to the instant sample (no smoothing).
+        assert_eq!(smooth_fps(42.0, 1.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn smooth_fps_converges_to_steady_instant() {
+        // Drive the filter with a constant 60 FPS from a distant start
+        // and assert it settles within a plausible window. At alpha=0.05
+        // the 99% settle is log(0.01) / log(0.95) ≈ 90 samples, so 200
+        // iterations is plenty of headroom.
+        let mut s = 10.0;
+        for _ in 0..200 {
+            s = smooth_fps(s, 60.0, 0.05);
+        }
+        assert!((s - 60.0).abs() < 0.1, "expected ~60, got {s}");
+    }
 
     #[test]
     fn reconcile_modifier_keys_drops_only_cleared_bits() {
