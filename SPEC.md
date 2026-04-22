@@ -332,6 +332,11 @@ demo waypoints are fractions of the world side; rendering normalizes to
 `[0,1]` so neither needs per-bump retuning. See hash-thing-69cq for the first
 bump (1.0 → 4.0 cells/m, 2048³ → 8192³).
 
+**Addressability headroom.** `WorldCoord` is `i64`, so per-axis coordinates
+can represent cell positions far past any plausible scale-knob bump: at
+`CELLS_PER_METER_INT = 16` a 2048-meter world spans 32,768 cells per axis,
+comfortably inside `i64::MAX`.
+
 ### Simulation model
 
 **Hybrid Path D: reaction-phase (pure CA) + movement-phase (Margolus blocks).** Both phases operate directly on the octree via recursive Hashlife stepping; the flatten-to-grid path is a temporary testing scaffold only.
