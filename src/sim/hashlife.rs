@@ -1531,6 +1531,10 @@ mod tests {
     fn tick_divisor_two_halves_water_block_rule_firing_cadence() {
         let mut fast = World::new(4); // 16³, every tick
         let mut slow = World::new(4); // 16³, every other tick
+        // rvsh: terrain_defaults now ships water at divisor=2, so `fast`
+        // must explicitly reset to 1 to keep this test a d=1 vs d=2 contrast
+        // independent of the registry's default pick.
+        fast.materials.set_tick_divisor(WATER_MATERIAL_ID, 1);
         slow.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
 
         let water = Cell::pack(WATER_MATERIAL_ID, 0).raw();

@@ -422,7 +422,11 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_water_rule,
                 block_rule_id: Some(water_fluid_block_rule),
-                tick_divisor: 1,
+                // rvsh: edward-picked water cadence — water falls every
+                // other tick so the 'sheet of water' scene reads as liquid
+                // instead of fast-plummeting blocks. Changing this also
+                // expands memo_period from 2 to 4.
+                tick_divisor: 2,
             },
         );
         registry.insert(
@@ -1103,6 +1107,29 @@ mod tests {
     }
 
     #[test]
+    fn water_ships_with_tick_divisor_two_from_terrain_defaults() {
+        // rvsh: edward picked water tick_divisor=2. Pins the default so a
+        // future materials refactor can't accidentally revert it to 1 (which
+        // would visibly double water fall speed) without the test flagging.
+        let registry = MaterialRegistry::terrain_defaults();
+        let water = registry.entry(WATER_MATERIAL_ID).unwrap();
+        assert_eq!(
+            water.tick_divisor, 2,
+            "water must ship with tick_divisor=2 (edward pick on hash-thing-rvsh)"
+        );
+        // Every other material stays at 1 under rvsh scope — guard against
+        // accidentally bumping sand/lava along with water.
+        for id in [SAND_MATERIAL_ID, LAVA_MATERIAL_ID, FIRE_MATERIAL_ID] {
+            let entry = registry.entry(id).unwrap();
+            assert_eq!(
+                entry.tick_divisor, 1,
+                "material {id} ({}) must remain at tick_divisor=1; rvsh only moved water",
+                entry.visual.label
+            );
+        }
+    }
+
+    #[test]
     fn terrain_defaults_share_dissolvable_rule_for_terrain_solids() {
         let registry = MaterialRegistry::terrain_defaults();
         let stone = registry.entry(STONE_MATERIAL_ID).unwrap();
@@ -1405,12 +1432,16 @@ mod tests {
     }
 
     #[test]
-    fn memo_period_all_default_divisors_is_two() {
+    fn memo_period_terrain_defaults_is_four_under_water_divisor_two() {
+        // rvsh: water ships at tick_divisor=2, so memo_period is LCM of
+        // 2 (every other material) and 2*2=4 (water) = 4. Before rvsh
+        // this was 2 (all divisors at 1). Any future default bump should
+        // flow through this assertion.
         let registry = MaterialRegistry::terrain_defaults();
         assert_eq!(
             registry.memo_period(),
-            2,
-            "with all tick_divisor=1, memo_period must be LCM(2,2,...) = 2 — identical to today's parity key"
+            4,
+            "with water tick_divisor=2 and every other material at 1, memo_period must be LCM(2, 4) = 4"
         );
     }
 
