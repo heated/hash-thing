@@ -967,7 +967,7 @@ impl App {
                 "  R  Reset      G  GoL bloom",
                 "  M  Gyroid     N  Lattice walk",
                 "  V  Panorama reveal",
-                "  [/]UIO  DEV jumps (Tab for orbit)",
+                "  [/] U/I/O  DEV jumps (Tab for orbit)",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
@@ -2727,8 +2727,12 @@ mod tests {
         // the full orbit-mode entry wording.
         let dev_jump_line = lines
             .iter()
-            .find(|line| line.contains("[/]UIO"))
+            .find(|line| line.contains("[/]") && line.contains("U/I/O"))
             .expect("FPS legend should list the orbit-only DEV jump keys");
+        assert!(
+            dev_jump_line.contains("DEV"),
+            "DEV jump legend line should label the keys as DEV: {dev_jump_line}"
+        );
         assert!(
             dev_jump_line.contains("Tab") || dev_jump_line.contains("orbit"),
             "DEV jump legend line should point users at Tab/orbit: {dev_jump_line}"
