@@ -643,6 +643,13 @@ impl App {
     /// Handle a captured-cursor `DeviceEvent::MouseMotion` delta. No-op
     /// unless the player is in first-person mode with the cursor grabbed
     /// (hash-thing-w1yq). Extracted for testability (hash-thing-a6t2).
+    ///
+    /// Deltas are intentionally **device-agnostic**: `DeviceId` is not
+    /// inspected, so an external mouse and a trackpad driven in the same
+    /// frame sum into a single FPS-look delta. A 3D game has no concept
+    /// of "which device owns the camera," and winit already delivers one
+    /// `MouseMotion` per device per frame, so summing is the natural
+    /// behavior (hash-thing-i7gt, follow-up to hash-thing-a6t2).
     fn handle_mouse_motion(&mut self, dx: f64, dy: f64) {
         if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
             return;
@@ -2822,5 +2829,114 @@ mod tests {
         app.apply_fps_look(0.0, -1000.0);
         let (_yaw, pitch) = player_look(&mut app);
         assert!((pitch - -1.4).abs() < 1e-12, "pitch should clamp at -1.4");
+    }
+
+    // hash-thing-9r62 regression: drive the cursor_captured flag through the
+    // real apply_cursor_capture entry point rather than direct field writes,
+    // so the state machine + event-routing contract are both covered (not
+    // just the gating logic).
+
+    #[test]
+    fn apply_cursor_capture_without_window_forces_uncaptured() {
+        // App::new leaves window = None (winit attaches it in resumed()).
+        // The entry point's no-window fallback must force cursor_captured =
+        // false no matter which direction is requested — otherwise the flag
+        // can report "captured" while there is no actual OS-level grab,
+        // which is the state w1yq debugged.
+        let mut app = App::new(64);
+        assert!(app.window.is_none(), "App::new must not attach a window");
+
+        app.apply_cursor_capture(true);
+        assert!(
+            !app.cursor_captured,
+            "no-window apply_cursor_capture(true) must not claim capture"
+        );
+
+        app.apply_cursor_capture(false);
+        assert!(
+            !app.cursor_captured,
+            "no-window apply_cursor_capture(false) must stay uncaptured"
+        );
+    }
+
+    #[test]
+    fn apply_cursor_capture_release_routes_events_uncaptured() {
+        // Going through apply_cursor_capture(false) from a captured state
+        // must leave the event routing in the uncaptured regime: CursorMoved
+        // drives look, DeviceEvent::MouseMotion is a noop.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        // Setup pretends we were captured; the *entry point under test* is
+        // the release call that follows.
+        app.cursor_captured = true;
+
+        app.apply_cursor_capture(false);
+        assert!(!app.cursor_captured);
+
+        // MouseMotion must be dropped in uncaptured FP.
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0, "MouseMotion must not apply after release");
+        assert_eq!(pitch, 0.0);
+
+        // CursorMoved must now apply (after the seeding call).
+        prime_cursor(&mut app, 100.0, 100.0);
+        app.handle_cursor_moved(110.0, 95.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch - (-5.0) * LOOK_SENSITIVITY).abs() < 1e-12);
+    }
+
+    #[test]
+    fn apply_cursor_capture_flip_drops_in_flight_captured_events() {
+        // Cross-stream ordering hazard (F1 from the w1yq triple-tier synth):
+        // MouseMotion events in flight across a capture → release flip must
+        // stop applying as soon as the flag flips. CursorMoved events must
+        // begin applying again after the flip (post-seed).
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        // Pre-flip: we believed we had capture. MouseMotion applies here.
+        app.cursor_captured = true;
+        app.handle_mouse_motion(10.0, 6.0);
+        let (yaw_cap, pitch_cap) = player_look(&mut app);
+        assert!((yaw_cap - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch_cap - 6.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+
+        // Same-frame CursorMoved while still captured is a noop.
+        prime_cursor_preserving_look(&mut app, 500.0, 500.0);
+        app.handle_cursor_moved(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - yaw_cap).abs() < 1e-12);
+        assert!((pitch - pitch_cap).abs() < 1e-12);
+
+        // Release via the real entry point.
+        app.apply_cursor_capture(false);
+        assert!(!app.cursor_captured);
+
+        // Post-flip: MouseMotion must now be dropped.
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - yaw_cap).abs() < 1e-12, "MouseMotion dropped after flip");
+        assert!((pitch - pitch_cap).abs() < 1e-12);
+
+        // Post-flip: CursorMoved must apply again. Re-seed so the first
+        // real delta is predictable — otherwise an untouched last_mouse
+        // from pre-flip would produce a huge one-shot delta.
+        prime_cursor_preserving_look(&mut app, 200.0, 200.0);
+        app.handle_cursor_moved(220.0, 180.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - (yaw_cap + 20.0 * LOOK_SENSITIVITY)).abs() < 1e-12);
+        assert!((pitch - (pitch_cap + (-20.0) * LOOK_SENSITIVITY)).abs() < 1e-12);
+    }
+
+    /// Seed `last_mouse` without resetting player yaw/pitch. Used when a
+    /// test builds up yaw/pitch in stages and does not want the anchor
+    /// reset to clear the player pose.
+    fn prime_cursor_preserving_look(app: &mut App, start_x: f64, start_y: f64) {
+        app.last_mouse = Some((start_x, start_y));
     }
 }
