@@ -597,16 +597,24 @@ impl App {
     }
 
     /// Apply a raw pixel-delta mouse look to the player. Scales by
-    /// `LOOK_SENSITIVITY` and clamps pitch to ±1.4. Shared between the
-    /// `CursorMoved` (uncaptured) and `DeviceEvent::MouseMotion` (captured)
-    /// paths so the two stay in parity by construction (hash-thing-a6t2).
+    /// `LOOK_SENSITIVITY`, wraps yaw to `[-π, π)`, and clamps pitch to
+    /// ±1.4. Shared between the `CursorMoved` (uncaptured) and
+    /// `DeviceEvent::MouseMotion` (captured) paths so the two stay in
+    /// parity by construction (hash-thing-a6t2). Wrapping keeps the f32
+    /// downcast for rendering precise over arbitrarily long sessions
+    /// (hash-thing-u0uf, follow-up to hash-thing-w1yq).
     fn apply_fps_look(&mut self, dx: f64, dy: f64) {
         let Some(pid) = self.player_id else { return };
         let Some(player) = self.entities.get_mut(pid) else {
             return;
         };
         if let sim::EntityKind::Player(ref mut ps) = player.kind {
-            ps.yaw += dx * LOOK_SENSITIVITY;
+            let yaw = ps.yaw + dx * LOOK_SENSITIVITY;
+            // Centered wrap (around 0, matching reset_player_pose's
+            // "straight ahead = 0" convention). rem_euclid would land in
+            // [0, τ) instead; [-π, π) keeps sign symmetry with pose code.
+            let tau = std::f64::consts::TAU;
+            ps.yaw = yaw - tau * ((yaw + std::f64::consts::PI) / tau).floor();
             ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
         }
     }
