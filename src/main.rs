@@ -770,15 +770,30 @@ impl App {
     fn leave_occluded_state(&mut self) {
         self.occluded = false;
         self.last_mouse = None;
-        // Reset the frame timer so the next RedrawRequested sees a near-zero
-        // dt instead of `last_frame.elapsed()` clamped to 100ms — otherwise
-        // the resume frame poisons the EWMA FPS readout and applies a full
-        // 100ms player-movement step (hash-thing-xysz). The near-zero dt
-        // that results would itself poison the EWMA (1/dt = millions) —
-        // dxjb — so suppress the next FPS sample.
+        self.mark_resume_edge();
+        self.sync_cursor_capture();
+    }
+
+    /// Post-pause resume edge (focus-gain, unocclude). The redraw loop
+    /// stops advancing while paused, so the next RedrawRequested would
+    /// see `last_frame.elapsed()` clamped to 100 ms — that's a full 100
+    /// ms player-movement step on a single frame (hash-thing-xysz) and
+    /// a huge dt that decays the EWMA FPS downward for seconds. Reset
+    /// `last_frame` to "now" so the next frame measures only the real
+    /// gap. BUT the very next RedrawRequested fires microseconds after
+    /// this reset, so `dt_wall` becomes the event-dispatch-to-redraw gap
+    /// — tiny — and blending `1/dt_wall` into the EWMA would spike the
+    /// readout into the millions (hash-thing-dxjb). Pair the reset with
+    /// `suppress_next_fps_sample = true` so the next FPS sample is
+    /// skipped, not blended. The two operations are one contract; this
+    /// helper is the only site that implements it — do not inline it.
+    /// (Cold-start scene-load has the same shape at
+    /// `WindowEvent::RedrawRequested` / `startup_scene_pending`;
+    /// routing that through this helper is hash-thing-6e4a's
+    /// territory, currently blocked on breakdown review.)
+    fn mark_resume_edge(&mut self) {
         self.last_frame = std::time::Instant::now();
         self.suppress_next_fps_sample = true;
-        self.sync_cursor_capture();
     }
 
     /// Apply a raw pixel-delta mouse look to the player. Scales by
@@ -1800,13 +1815,7 @@ impl ApplicationHandler for App {
                 self.focused = focused;
                 if focused {
                     self.last_mouse = None;
-                    // See leave_occluded_state: resume edges must reset the
-                    // frame timer or the first RedrawRequested dt clamps at
-                    // 100ms (hash-thing-xysz). Paired suppression avoids
-                    // the symmetric poison at the bottom of the dt range
-                    // (dxjb).
-                    self.last_frame = std::time::Instant::now();
-                    self.suppress_next_fps_sample = true;
+                    self.mark_resume_edge();
                     self.sync_cursor_capture();
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -2179,6 +2188,14 @@ impl ApplicationHandler for App {
                     // hundreds of ms at 256³. Reset so the first real frame's
                     // dt measures the frame, not the cold-start work
                     // (hash-thing-q07n; same pattern as xysz for resume edges).
+                    // NOTE: unlike `mark_resume_edge`, this site does NOT set
+                    // `suppress_next_fps_sample` — the dt_wall computed below
+                    // still feeds the EWMA with a microsecond-scale sample,
+                    // producing the "5,000,000 FPS on startup" readout
+                    // (hash-thing-6e4a). Routing this reset through
+                    // `mark_resume_edge` is 6e4a's fix, currently blocked on
+                    // breakdown review. When 6e4a unblocks, replace the
+                    // assignment below with `self.mark_resume_edge();`.
                     self.last_frame = std::time::Instant::now();
                 }
 
@@ -3665,43 +3682,57 @@ mod tests {
         );
     }
 
-    // hash-thing-xysz: the redraw handler early-returns while paused so
-    // `last_frame` stops advancing. Resuming without a reset clamps the
-    // first dt to the 100ms guard, poisoning the EWMA and player movement.
+    // hash-thing-xysz + hash-thing-dxjb: the redraw handler early-returns
+    // while paused so `last_frame` stops advancing. Resuming without a
+    // reset clamps the first dt to the 100ms guard (xysz); resetting
+    // without suppressing the next FPS sample blends a microsecond
+    // dt_wall into the EWMA (dxjb). `mark_resume_edge` does both as one
+    // step; `leave_occluded_state_routes_through_mark_resume_edge` (below)
+    // verifies the unocclude path calls it.
+
+    // hash-thing-dxjb: the focus/unocclude resets happen outside the
+    // redraw hot path. The next RedrawRequested sees a near-zero dt —
+    // blending 1/dt_wall into the EWMA would spike the displayed FPS
+    // into the millions and take many seconds to decay. The paired
+    // `suppress_next_fps_sample` flag defuses that. Both resume edges
+    // route through `mark_resume_edge`, so the invariant (reset +
+    // suppress in lockstep) cannot drift by construction.
 
     #[test]
-    fn leave_occluded_state_resets_last_frame() {
+    fn mark_resume_edge_resets_last_frame_and_flags_suppress() {
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.suppress_next_fps_sample = false;
+
+        app.mark_resume_edge();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "mark_resume_edge must reset last_frame; elapsed was {:?}",
+            app.last_frame.elapsed()
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "mark_resume_edge must flag the next FPS sample as bogus"
+        );
+    }
+
+    #[test]
+    fn leave_occluded_state_routes_through_mark_resume_edge() {
         let mut app = App::new(64);
         app.enter_occluded_state();
-        // Pretend the app sat paused for two seconds.
+        app.suppress_next_fps_sample = false;
         app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
         app.leave_occluded_state();
 
         assert!(
             app.last_frame.elapsed() < std::time::Duration::from_millis(50),
-            "leave_occluded_state must reset last_frame; elapsed was {:?}",
-            app.last_frame.elapsed()
+            "unocclude must reset last_frame via mark_resume_edge"
         );
-    }
-
-    // hash-thing-dxjb: the focus/unocclude resets happen outside the
-    // redraw hot path. The next RedrawRequested sees a near-zero dt —
-    // blending 1/dt_wall into the EWMA would spike the displayed FPS
-    // into the millions and take many seconds to decay. The paired
-    // `suppress_next_fps_sample` flag defuses that.
-
-    #[test]
-    fn leave_occluded_state_flags_suppress_next_fps_sample() {
-        let mut app = App::new(64);
-        app.enter_occluded_state();
-        app.suppress_next_fps_sample = false;
-
-        app.leave_occluded_state();
-
         assert!(
             app.suppress_next_fps_sample,
-            "unocclude resets last_frame, so the next FPS sample is bogus"
+            "unocclude must flag suppression via mark_resume_edge"
         );
     }
 
