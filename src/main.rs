@@ -1753,11 +1753,20 @@ impl ApplicationHandler for App {
                 }
                 // hash-thing-0zrc: detect OS-initiated windowed<->fullscreen
                 // transitions by diffing cached state against the current
-                // `window.fullscreen()`. Pre-transition samples belong to a
-                // different regime, so clear perf histograms on toggle for
-                // clean dlse.2.2 A/B comparisons. Plain resizes (window drag
-                // across monitors, DPI change) are no-ops because both sides
-                // of the compare stay equal.
+                // `window.fullscreen()`. winit 0.30 has no dedicated
+                // `FullscreenChanged` event; on macOS/Windows the toggle
+                // surfaces as `Resized`, so this is the idiomatic hook.
+                // Pre-transition samples belong to a different regime
+                // (different render-target size, GPU bottleneck mix), so
+                // dropping them gives dlse.2.2 A/B comparisons a clean slate.
+                //
+                // Scope: strictly windowed<->fullscreen. Same-mode regime
+                // changes — monitor swap while fullscreen, DPI change,
+                // windowed drag — are intentionally out of scope and left
+                // to scene-reset paths or follow-up beads. We call the
+                // narrow `self.perf.clear()` (not `reset_scene_perf_state`)
+                // because the bead is scoped to perf histograms; FPS EWMA
+                // and mem peaks are left alone on purpose.
                 if let Some(window) = self.window.as_ref() {
                     let now_fullscreen = window.fullscreen().is_some();
                     if now_fullscreen != self.was_fullscreen {
