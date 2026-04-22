@@ -112,8 +112,10 @@ pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
 /// (`World::place_clone_source`, main's clone-block placement). Readback
 /// lives in `World::spawn_clones` via `cell.metadata()`, which is
 /// implicitly bounded the same way — a widener (side-table keyed by CLONE
-/// position) would need to update the readback too. Tracked by
-/// hash-thing-457f.
+/// position) would need to update the readback and the
+/// `progression_waterfall_stays_visually_contiguous` test's `metadata()`
+/// assertion (src/sim/world.rs:3400) that checks the source id round-trip.
+/// Tracked by hash-thing-457f.
 #[inline]
 pub fn pack_clone_source(source_material: MaterialId) -> CellState {
     assert!(

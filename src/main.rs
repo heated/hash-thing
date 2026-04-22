@@ -1476,7 +1476,7 @@ impl App {
             if prev == hit {
                 return;
             }
-            // Encode the source material in clone block metadata.
+            // Pack held material as the clone source (see pack_clone_source).
             let state = hash_thing::terrain::materials::pack_clone_source(held_material);
             let pos = [prev[0], prev[1], prev[2]];
             self.world.set(
