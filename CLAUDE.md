@@ -44,7 +44,7 @@ Mac integrated GPU works — wgpu/Metal renders fine. Agents can launch the app,
 
 ## Build profiles
 
-Default to dev. `--profile bench` for perf work. `--release` only for distributable artifacts.
+Default to dev. **Use `--profile bench` for perf work — not `--release`.** `bench` inherits release's `opt-level = 3` but drops LTO and keeps `debug = 1`, so it builds fast on iteration and stays representative for *relative* perf comparisons (which is all we measure). `--release` is reserved for distributable artifacts only. If you catch yourself typing `cargo build --release` while measuring latency, stop and switch to `--profile bench` — otherwise you wait on LTO for no measurement benefit.
 
 ## Agent surface — where project skills and commands live
 
