@@ -650,20 +650,24 @@ impl Renderer {
         let physical_pixels: u64 = (size.width as u64) * (size.height as u64);
         let (render_scale, scale_source) =
             resolved_render_scale(env_raw.as_deref(), physical_pixels, volume_size);
-        let auto_for_log = auto_render_scale(physical_pixels, volume_size);
-        let target_for_log = target_pixels_for_volume(volume_size);
         match scale_source {
             RenderScaleSource::EnvOverride => log::info!(
                 "render_scale={:.3} (HASH_THING_RENDER_SCALE override; auto-pick would have been {:.3})",
-                render_scale, auto_for_log,
+                render_scale,
+                auto_render_scale(physical_pixels, volume_size),
             ),
             RenderScaleSource::AutoPicked => log::info!(
-                "render_scale={:.3} (auto: volume_size={}, physical={}x{}, target={} px) — override with HASH_THING_RENDER_SCALE or use +/- keys at runtime",
-                render_scale, volume_size, size.width, size.height, target_for_log,
+                "render_scale={:.3} (auto: volume_size={}, physical={}x{}, target={} px) — override with HASH_THING_RENDER_SCALE or use = / - keys at runtime",
+                render_scale,
+                volume_size,
+                size.width,
+                size.height,
+                target_pixels_for_volume(volume_size),
             ),
             RenderScaleSource::EnvInvalidFallback => log::info!(
-                "HASH_THING_RENDER_SCALE={:?} invalid (must be in 0.25..=1.0); auto-picked {:.3} instead",
-                env_raw, render_scale,
+                "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.25..=1.0); auto-picked {:.3} instead",
+                env_raw.as_deref().unwrap_or(""),
+                render_scale,
             ),
         }
         // dlse.2.2 exp#4: env-var gated so latency=3 (and other values)
