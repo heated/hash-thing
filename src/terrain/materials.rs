@@ -204,6 +204,11 @@ pub struct MaterialRegistry {
     // allocate two Vec<u16> per step, which shows up in jw3k-class profiles.
     cached_tick_divisor_flags: Vec<u16>,
     cached_block_rule_tick_divisors: Vec<u16>,
+    // hash-thing-2z3g: per-material noop flag, rebuilt under the same
+    // invalidation set as the tick caches. Reads from the sim step inner
+    // dispatch; without caching, the old `noop_flags()` allocated a
+    // Vec<bool> on every call.
+    cached_noop_flags: Vec<bool>,
 }
 
 impl Clone for MaterialRegistry {
@@ -214,6 +219,7 @@ impl Clone for MaterialRegistry {
             block_rules: self.block_rules.iter().map(|r| r.clone_box()).collect(),
             cached_tick_divisor_flags: self.cached_tick_divisor_flags.clone(),
             cached_block_rule_tick_divisors: self.cached_block_rule_tick_divisors.clone(),
+            cached_noop_flags: self.cached_noop_flags.clone(),
         }
     }
 }
@@ -235,6 +241,7 @@ impl MaterialRegistry {
             block_rules: Vec::new(),
             cached_tick_divisor_flags: Vec::new(),
             cached_block_rule_tick_divisors: Vec::new(),
+            cached_noop_flags: Vec::new(),
         }
     }
 
@@ -809,16 +816,14 @@ impl MaterialRegistry {
     /// Precomputed per-material-ID noop flag for hot-loop CaRule skipping.
     /// `result[material_id] == true` iff the material's CaRule is noop (identity).
     /// Avoids vtable dispatch per cell in the base-case inner loop.
-    pub fn noop_flags(&self) -> Vec<bool> {
-        self.entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .as_ref()
-                    .map(|e| self.rules[e.rule_id.0].is_noop())
-                    .unwrap_or(false)
-            })
-            .collect()
+    ///
+    /// Slice into the cache refreshed by any mutation path that could change
+    /// per-material rule assignment (`insert`, `assign_rule`) or material slot
+    /// presence (`insert`). Rules themselves are append-only after
+    /// registration, so their `is_noop` result is fixed once inserted
+    /// (hash-thing-2z3g).
+    pub fn noop_flags(&self) -> &[bool] {
+        &self.cached_noop_flags
     }
 
     /// Per-material tick_divisor, indexed by material id. Unregistered slots
@@ -880,6 +885,24 @@ impl MaterialRegistry {
         self.cached_block_rule_tick_divisors = per_rule
             .into_iter()
             .map(|slot| slot.map(|(d, _)| d).unwrap_or(1))
+            .collect();
+        // hash-thing-2z3g: noop_flags share the same invalidation set as
+        // the tick caches (insert / assign_block_rule / set_tick_divisor /
+        // register_block_rule) plus `assign_rule`, which also calls this.
+        //
+        // An out-of-bounds `rule_id` is treated as non-noop rather than
+        // panicking here — that keeps rebuild_tick_caches compatible with
+        // the "insert corrupt entry, catch it later via `validate()`"
+        // pattern that `validate_catches_invalid_rule_id` exercises.
+        self.cached_noop_flags = self
+            .entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .and_then(|e| self.rules.get(e.rule_id.0).map(|r| r.is_noop()))
+                    .unwrap_or(false)
+            })
             .collect();
     }
 
@@ -1011,6 +1034,10 @@ impl MaterialRegistry {
             .as_mut()
             .expect("material must exist before assigning a rule")
             .rule_id = rule_id;
+        // hash-thing-2z3g: rule_id drives the noop cache. Today all
+        // `assign_rule` callers run before stepping, but the rebuild is
+        // cheap (O(entries + block_rules)) and keeps the invariant local.
+        self.rebuild_tick_caches();
     }
 
     /// Validate the registry for internal consistency. Returns a list of
@@ -1580,6 +1607,52 @@ mod tests {
         let flags = registry.tick_divisor_flags();
         assert_eq!(flags[0], 1);
         assert_eq!(flags[1], 4);
+    }
+
+    #[test]
+    fn noop_flags_returns_per_material_values() {
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        let non_noop_id = registry.register_rule(FireRule {
+            fuel_materials: vec![],
+            quencher_material: 0,
+        });
+        registry.insert(0, entry_with(noop_id, [0.0; 4]));
+        registry.insert(1, entry_with(non_noop_id, [1.0; 4]));
+        let flags = registry.noop_flags();
+        assert!(flags[0], "NoopRule must report as noop");
+        assert!(!flags[1], "FireRule must not report as noop");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_assign_rule() {
+        // hash-thing-2z3g: assign_rule swaps a material's rule_id, which can
+        // flip its noop flag. The cache must reflect the post-assign state.
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        let non_noop_id = registry.register_rule(FireRule {
+            fuel_materials: vec![],
+            quencher_material: 0,
+        });
+        registry.insert(0, entry_with(non_noop_id, [0.0; 4]));
+        assert!(!registry.noop_flags()[0], "pre-assign: non-noop rule");
+        registry.assign_rule(0, noop_id);
+        assert!(registry.noop_flags()[0], "post-assign: noop rule");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_insert() {
+        // hash-thing-2z3g: insert on a new slot grows the cache so the caller
+        // can index by the new material id without a panic or stale false.
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        assert!(registry.noop_flags().is_empty());
+        registry.insert(2, entry_with(noop_id, [0.0; 4]));
+        let flags = registry.noop_flags();
+        assert_eq!(flags.len(), 3, "slots 0..=2 all present after insert(2)");
+        assert!(!flags[0], "unregistered slot 0 defaults to non-noop");
+        assert!(!flags[1], "unregistered slot 1 defaults to non-noop");
+        assert!(flags[2], "slot 2 got a NoopRule");
     }
 
     #[test]

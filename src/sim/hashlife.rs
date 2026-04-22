@@ -594,13 +594,12 @@ impl World {
         // that remains valid after the requested number of steps.
         let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
         // Phase 1 timer covers both the per-call setup (noop_flags,
-        // tick_divisor_flags) AND the cell loop. Setup still allocates a
-        // fresh Vec<bool> today (hash-thing-2z3g is the deferred cache
-        // for noop_flags; tick_divisor_flags was cached by hash-thing-5yxk).
-        // Attributing setup to p1 keeps p1+p2 close to the full
-        // step_grid_once wall time — if a future investigator sees
-        // p1+p2 ≪ observed step time, the missing cost is memo
-        // lookup/insert or `next`-array zeroing, not hidden setup.
+        // tick_divisor_flags) AND the cell loop. Both caches are now slice
+        // reads into MaterialRegistry (tick_divisor_flags by hash-thing-5yxk,
+        // noop_flags by hash-thing-2z3g). Attributing setup to p1 keeps
+        // p1+p2 close to the full step_grid_once wall time — if a future
+        // investigator sees p1+p2 ≪ observed step time, the missing cost is
+        // memo lookup/insert or `next`-array zeroing, not hidden setup.
         let phase1_start = std::time::Instant::now();
         // Precompute per-material noop flag to avoid vtable dispatch per cell.
         // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
