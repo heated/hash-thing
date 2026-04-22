@@ -261,17 +261,39 @@ struct LatticeShortDemoCut {
     started_at: std::time::Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeatAdvance {
+    /// Advance to a different beat this frame.
+    Set(LatticeDemoBeat),
+    /// Cut has finished; clear `short_demo_cut`.
+    End,
+    /// Stay on the current beat.
+    Hold,
+}
+
 impl LatticeShortDemoCut {
-    fn beat_for_elapsed(elapsed: std::time::Duration) -> Option<LatticeDemoBeat> {
+    const INTERIOR_AT: f32 = 2.0;
+    const PANORAMA_AT: f32 = 4.5;
+    const END_AT: f32 = 8.0;
+
+    /// Decide the next beat given the current beat and wall-clock elapsed.
+    /// Advances at most one step per call so a long frame (OS pause,
+    /// long sim step, heavy SVDAG upload) cannot jump Intro → Panorama
+    /// and skip Interior entirely (hash-thing-x1lg). After a stall, the
+    /// next redraw walks forward one step; the frame after that walks the
+    /// remaining step, so each beat is displayed for at least one frame.
+    fn advance(current: Option<LatticeDemoBeat>, elapsed: std::time::Duration) -> BeatAdvance {
         let secs = elapsed.as_secs_f32();
-        if secs < 2.0 {
-            Some(LatticeDemoBeat::Intro)
-        } else if secs < 4.5 {
-            Some(LatticeDemoBeat::Interior)
-        } else if secs < 8.0 {
-            Some(LatticeDemoBeat::Panorama)
-        } else {
-            None
+        match current {
+            None => BeatAdvance::Set(LatticeDemoBeat::Intro),
+            Some(LatticeDemoBeat::Intro) if secs >= Self::INTERIOR_AT => {
+                BeatAdvance::Set(LatticeDemoBeat::Interior)
+            }
+            Some(LatticeDemoBeat::Interior) if secs >= Self::PANORAMA_AT => {
+                BeatAdvance::Set(LatticeDemoBeat::Panorama)
+            }
+            Some(LatticeDemoBeat::Panorama) if secs >= Self::END_AT => BeatAdvance::End,
+            _ => BeatAdvance::Hold,
         }
     }
 }
@@ -1183,6 +1205,11 @@ impl App {
             renderer.camera_pitch = pose.pitch;
             renderer.camera_dist = pose.dist;
         }
+        // Scene swaps and lattice beats can flip into Orbit from captured
+        // FPS (hash-thing-c4sm). Without this sync, `cursor_captured` stays
+        // true while `should_capture_cursor` is false, so the cursor is
+        // grabbed but no input path drives the orbit.
+        self.sync_cursor_capture();
     }
 
     fn load_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
@@ -1231,13 +1258,10 @@ impl App {
         let Some(cut) = self.short_demo_cut else {
             return;
         };
-        match LatticeShortDemoCut::beat_for_elapsed(cut.started_at.elapsed()) {
-            Some(beat) => {
-                if self.current_demo_beat != Some(beat) {
-                    self.load_lattice_demo_beat(beat);
-                }
-            }
-            None => self.short_demo_cut = None,
+        match LatticeShortDemoCut::advance(self.current_demo_beat, cut.started_at.elapsed()) {
+            BeatAdvance::Set(beat) => self.load_lattice_demo_beat(beat),
+            BeatAdvance::End => self.short_demo_cut = None,
+            BeatAdvance::Hold => {}
         }
     }
 
@@ -2901,21 +2925,87 @@ mod tests {
     fn lattice_short_demo_cut_advances_in_story_order() {
         use std::time::Duration;
 
+        // None → Intro regardless of elapsed (initial entry).
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(0.0)),
-            Some(LatticeDemoBeat::Intro)
+            LatticeShortDemoCut::advance(None, Duration::from_secs_f32(0.0)),
+            BeatAdvance::Set(LatticeDemoBeat::Intro)
+        );
+        // Hold Intro until the 2s boundary.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(1.5)
+            ),
+            BeatAdvance::Hold
+        );
+        // Boundary is inclusive (>=): elapsed == INTERIOR_AT must advance.
+        // Pins the semantics so a future refactor to strict `>` would flip
+        // this test.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(LatticeShortDemoCut::INTERIOR_AT)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
         );
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(2.1)),
-            Some(LatticeDemoBeat::Interior)
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(2.1)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
         );
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(5.0)),
-            Some(LatticeDemoBeat::Panorama)
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Interior),
+                Duration::from_secs_f32(5.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Panorama)
         );
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(8.1)),
-            None
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Panorama),
+                Duration::from_secs_f32(8.1)
+            ),
+            BeatAdvance::End
+        );
+    }
+
+    #[test]
+    fn lattice_short_demo_cut_does_not_skip_interior_on_long_frame() {
+        // hash-thing-x1lg: a long frame (OS pause, long sim step, SVDAG
+        // upload) that jumps wall-clock from ~0s to >4.5s must not
+        // transition Intro → Panorama in one step. Interior must be
+        // displayed for at least one frame, preserving story order.
+        use std::time::Duration;
+
+        // Elapsed past the Panorama threshold but currently on Intro:
+        // should advance to Interior (one step), not skip to Panorama.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(5.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
+        );
+        // Same elapsed again the next frame, now on Interior: advances
+        // to Panorama on the very next frame.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Interior),
+                Duration::from_secs_f32(5.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Panorama)
+        );
+        // Elapsed past the End threshold but still on Intro: one step
+        // to Interior, not straight to End. Protects the cut from being
+        // torn down before the user sees any middle beat.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(10.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
         );
     }
 
@@ -3495,6 +3585,33 @@ mod tests {
             app.focused,
             app.occluded,
         ));
+    }
+
+    #[test]
+    fn apply_orbit_camera_pose_clears_cursor_captured_from_fps() {
+        // hash-thing-c4sm: scene swaps (V panorama) and lattice beats that
+        // terminate in Orbit previously left `cursor_captured = true` if the
+        // player was in captured FPS, because `apply_orbit_camera_pose`
+        // didn't sync cursor state. Symptom: grabbed cursor with no input
+        // path driving the orbit until the next focus/occlusion transition.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.cursor_captured = true;
+        let pose = OrbitCameraPose {
+            target: [0.0, 0.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            dist: 1.0,
+        };
+
+        app.apply_orbit_camera_pose(pose);
+
+        assert_eq!(app.camera_mode, CameraMode::Orbit);
+        assert!(
+            !app.cursor_captured,
+            "apply_orbit_camera_pose must sync cursor capture; orbit mode never captures",
+        );
     }
 
     // hash-thing-xysz: the redraw handler early-returns while paused so
