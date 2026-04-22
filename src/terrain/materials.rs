@@ -1689,6 +1689,38 @@ mod tests {
         registry.assign_block_rule(1, block_rule_id);
     }
 
+    /// hash-thing-lw75.1.1: parallel coverage for the `set_tick_divisor`
+    /// mutator path. Two materials initially share a BlockRule with a
+    /// consistent divisor (4); diverging one via `set_tick_divisor` must
+    /// panic from rebuild — the explicit validate call that used to live
+    /// inside `set_tick_divisor` was removed in this change, so rebuild is
+    /// the sole enforcer.
+    #[test]
+    #[should_panic(expected = "mixed tick_divisors")]
+    fn set_tick_divisor_rejects_mixed_divisors_on_shared_block_rule() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+        // Diverging one sharer must panic from inside rebuild_tick_caches.
+        registry.set_tick_divisor(1, 6);
+    }
+
     /// T4 (iowh review): `set_tick_divisor(0)` panics rather than silently
     /// clamping. Protects the dispatcher's `is_multiple_of` gate and the
     /// author's expectation that `>= 1` means "fires at least every N ticks".
