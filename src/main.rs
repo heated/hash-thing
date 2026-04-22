@@ -514,6 +514,12 @@ struct App {
     /// [`sim::World`] (hash-thing-0s9v). Refreshed at step start, step
     /// completion, and after [`sim::World::ensure_region`] grows the world.
     collision_snapshot: Option<sim::CollisionSnapshot>,
+    /// Cached fullscreen state for auto-clearing perf histograms on
+    /// windowed↔fullscreen transitions (hash-thing-0zrc). Queried each
+    /// `Resized` against `window.fullscreen().is_some()`; a mismatch
+    /// means the OS just toggled fullscreen, which matters for dlse.2.2
+    /// A/B perf comparisons.
+    was_fullscreen: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -671,6 +677,7 @@ impl App {
                 .as_deref()
                 .and_then(thread_qos::parse),
             collision_snapshot: None,
+            was_fullscreen: false,
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
@@ -1743,6 +1750,25 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
+                }
+                // hash-thing-0zrc: detect OS-initiated windowed<->fullscreen
+                // transitions by diffing cached state against the current
+                // `window.fullscreen()`. Pre-transition samples belong to a
+                // different regime, so clear perf histograms on toggle for
+                // clean dlse.2.2 A/B comparisons. Plain resizes (window drag
+                // across monitors, DPI change) are no-ops because both sides
+                // of the compare stay equal.
+                if let Some(window) = self.window.as_ref() {
+                    let now_fullscreen = window.fullscreen().is_some();
+                    if now_fullscreen != self.was_fullscreen {
+                        log::info!(
+                            "fullscreen transition {}→{}: clearing perf histograms (hash-thing-0zrc)",
+                            self.was_fullscreen,
+                            now_fullscreen,
+                        );
+                        self.perf.clear();
+                        self.was_fullscreen = now_fullscreen;
+                    }
                 }
             }
 
