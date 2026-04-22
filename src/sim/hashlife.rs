@@ -446,6 +446,15 @@ impl World {
         // would wrap outside the padded region. Callers only extract the center
         // that remains valid after the requested number of steps.
         let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+        // Phase 1 timer covers both the per-call setup (noop_flags,
+        // tick_divisor_flags) AND the cell loop. Setup still allocates a
+        // fresh Vec<bool> today (hash-thing-2z3g is the deferred cache
+        // for noop_flags; tick_divisor_flags was cached by hash-thing-5yxk).
+        // Attributing setup to p1 keeps p1+p2 close to the full
+        // step_grid_once wall time — if a future investigator sees
+        // p1+p2 ≪ observed step time, the missing cost is memo
+        // lookup/insert or `next`-array zeroing, not hidden setup.
+        let phase1_start = std::time::Instant::now();
         // Precompute per-material noop flag to avoid vtable dispatch per cell.
         // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
         // entirely (next is zero-initialized). For GoL, air participates in birth
@@ -453,7 +462,6 @@ impl World {
         let noop_by_material = self.materials.noop_flags();
         let divisor_by_material = self.materials.tick_divisor_flags();
         let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
-        let phase1_start = std::time::Instant::now();
         for z in 1..side - 1 {
             for y in 1..side - 1 {
                 for x in 1..side - 1 {
@@ -495,8 +503,11 @@ impl World {
         // derived from its slowed-down tick schedule — this preserves Margolus
         // mass-conservation alternation for slowed rules. Default d=1 reduces
         // to `generation % 2`, identical to pre-iowh behavior.
-        let block_rule_divisors = self.materials.block_rule_tick_divisors();
+        //
+        // Phase 2 timer covers the block_rule_tick_divisors cache read and
+        // the per-block loop, symmetric with Phase 1 covering its setup.
         let phase2_start = std::time::Instant::now();
+        let block_rule_divisors = self.materials.block_rule_tick_divisors();
 
         // Fast path: when all divisors are 1 (period 2), every rule uses the
         // same offset = generation % 2. Keep the old single-offset loop to
