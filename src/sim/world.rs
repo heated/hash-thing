@@ -98,19 +98,11 @@ pub struct CollisionSnapshot {
 }
 
 impl CollisionSnapshot {
-    pub fn side(&self) -> u64 {
-        1u64 << self.level
-    }
-
-    pub fn origin(&self) -> [i64; 3] {
-        self.origin
-    }
-
     pub fn get(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
         let lx = x.0 - self.origin[0];
         let ly = y.0 - self.origin[1];
         let lz = z.0 - self.origin[2];
-        let side = self.side() as i64;
+        let side = 1i64 << self.level;
         if lx < 0 || ly < 0 || lz < 0 || lx >= side || ly >= side || lz >= side {
             return 0;
         }

@@ -12,13 +12,20 @@
 use crate::octree::CellState;
 use crate::sim::{CollisionSnapshot, World, WorldCoord};
 
+mod sealed {
+    use crate::sim::{CollisionSnapshot, World};
+    pub trait Sealed {}
+    impl Sealed for World {}
+    impl Sealed for CollisionSnapshot {}
+}
+
 /// Read-only voxel-grid surface needed by player collision / raycast.
 ///
-/// The trait exists only to let the generic helpers in this module accept
-/// both the live [`World`] and a cheap read-only [`CollisionSnapshot`]; it
-/// is not intended for external impls. The two impls below are the only
-/// ones expected to exist.
-pub trait VoxelGrid {
+/// Sealed: the generic helpers in this module accept either the live
+/// [`World`] or a cheap read-only [`CollisionSnapshot`], and no other
+/// implementations are meaningful. The `sealed::Sealed` supertrait prevents
+/// downstream crates from adding impls.
+pub trait VoxelGrid: sealed::Sealed {
     fn cell_at(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState;
 }
 
@@ -890,26 +897,116 @@ mod tests {
             );
         }
 
-        let step_input = GroundedMoveInput {
-            yaw: 0.5,
-            move_input: [1.0, 0.0],
-            speed: PLAYER_SPEED,
-            dt: 1.0 / 60.0,
-            jump_requested: false,
-        };
-        for pos in sample_positions {
-            let live = step_grounded_movement(&world, &pos, 0.0, step_input);
-            let snap = step_grounded_movement(&snapshot, &pos, 0.0, step_input);
-            assert_eq!(live.pos, snap.pos, "step pos disagrees at {:?}", pos);
+        // Vertical-movement cases exercise the exact surface 0s9v is meant
+        // to stabilize: gravity fall (vy < 0) and active jump (vy > 0,
+        // jump_requested). Both must agree live-vs-snapshot frame-by-frame.
+        let dt = 1.0 / 60.0;
+        let gravity_cases = [
+            (
+                GroundedMoveInput {
+                    yaw: 0.0,
+                    move_input: [0.0, 0.0],
+                    speed: PLAYER_SPEED,
+                    dt,
+                    jump_requested: false,
+                },
+                -4.0,
+            ),
+            (
+                GroundedMoveInput {
+                    yaw: 0.5,
+                    move_input: [1.0, 0.0],
+                    speed: PLAYER_SPEED,
+                    dt,
+                    jump_requested: false,
+                },
+                0.0,
+            ),
+            (
+                GroundedMoveInput {
+                    yaw: 0.0,
+                    move_input: [0.0, 0.0],
+                    speed: PLAYER_SPEED,
+                    dt,
+                    jump_requested: true,
+                },
+                0.0,
+            ),
+            (
+                GroundedMoveInput {
+                    yaw: 0.0,
+                    move_input: [1.0, 0.0],
+                    speed: PLAYER_SPEED * PLAYER_SPRINT,
+                    dt,
+                    jump_requested: true,
+                },
+                PLAYER_JUMP_SPEED,
+            ),
+        ];
+        for (input, vy0) in gravity_cases {
+            for pos in sample_positions {
+                let live = step_grounded_movement(&world, &pos, vy0, input);
+                let snap = step_grounded_movement(&snapshot, &pos, vy0, input);
+                assert_eq!(
+                    live.pos, snap.pos,
+                    "step pos disagrees (vy0={vy0}, jump={}) at {:?}",
+                    input.jump_requested, pos,
+                );
+                assert_eq!(
+                    live.vertical_velocity, snap.vertical_velocity,
+                    "step vy disagrees (vy0={vy0}, jump={}) at {:?}",
+                    input.jump_requested, pos,
+                );
+                assert_eq!(
+                    live.grounded, snap.grounded,
+                    "step grounded disagrees (vy0={vy0}, jump={}) at {:?}",
+                    input.jump_requested, pos,
+                );
+            }
+        }
+
+        // OOB probes: negative and beyond-side coords must read as empty in
+        // both views. A silent divergence in CollisionSnapshot::get's bounds
+        // check would let stepping-era physics walk through a wall.
+        let oob = [
+            [WorldCoord(-1), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(-1), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(0), WorldCoord(-1)],
+            [WorldCoord(9999), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(9999), WorldCoord(0)],
+            [WorldCoord(0), WorldCoord(0), WorldCoord(9999)],
+        ];
+        for [x, y, z] in oob {
+            assert_eq!(world.get(x, y, z), snapshot.get(x, y, z));
+            assert_eq!(world.get(x, y, z), 0);
+        }
+
+        // Shifted-origin: after ensure_region grows the world away from
+        // origin 0, the snapshot's local-coord translation must still match
+        // the live world.
+        let mut shifted = world_with_floor(0, 0, 7, 0, 7);
+        shifted.ensure_region(
+            [WorldCoord(-4), WorldCoord(-4), WorldCoord(-4)],
+            [WorldCoord(12), WorldCoord(12), WorldCoord(12)],
+        );
+        shifted.set(WorldCoord(-2), WorldCoord(2), WorldCoord(-2), material);
+        let shifted_snap = shifted.collision_snapshot();
+        let shifted_samples = [
+            [WorldCoord(-2), WorldCoord(2), WorldCoord(-2)],
+            [WorldCoord(-3), WorldCoord(2), WorldCoord(-2)],
+            [WorldCoord(0), WorldCoord(0), WorldCoord(0)],
+            [WorldCoord(4), WorldCoord(1), WorldCoord(3)],
+            [WorldCoord(-5), WorldCoord(-5), WorldCoord(-5)],
+            [WorldCoord(100), WorldCoord(0), WorldCoord(0)],
+        ];
+        for [x, y, z] in shifted_samples {
             assert_eq!(
-                live.vertical_velocity, snap.vertical_velocity,
-                "step vy disagrees at {:?}",
-                pos,
-            );
-            assert_eq!(
-                live.grounded, snap.grounded,
-                "step grounded disagrees at {:?}",
-                pos,
+                shifted.get(x, y, z),
+                shifted_snap.get(x, y, z),
+                "shifted snapshot disagrees at ({}, {}, {})",
+                x.0,
+                y.0,
+                z.0,
             );
         }
     }
