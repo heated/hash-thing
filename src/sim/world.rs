@@ -2303,6 +2303,7 @@ impl World {
             None => remap,
         });
         self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
     }
@@ -4515,6 +4516,30 @@ mod tests {
         assert!(world.queue.is_empty());
         assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
         assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    /// commit_step rebuilds the NodeStore via `compacted_with_remap`, so every
+    /// NodeId key in every hashlife cache is invalidated. The macro cache was
+    /// historically omitted from the clear-list, leaving stale `(NodeId, u64)`
+    /// keys pointing at a dead namespace — which `maybe_compact` would then
+    /// treat as extra roots and feed back into compaction (hash-thing-w1bs).
+    #[test]
+    fn commit_step_clears_hashlife_macro_cache() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive_pow2();
+        assert!(
+            !world.hashlife_macro_cache.is_empty(),
+            "precondition: step_recursive_pow2 must populate the macro cache"
+        );
+
+        world.step();
+
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "commit_step must clear the macro cache; stale NodeId keys would \
+             alias into the freshly-compacted store"
+        );
     }
 
     #[test]
