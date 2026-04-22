@@ -470,8 +470,11 @@ fn default_legend_visibility(_mode: CameraMode) -> bool {
     true
 }
 
-fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
-    focused && camera_mode == CameraMode::FirstPerson
+fn should_capture_cursor(camera_mode: CameraMode, focused: bool, occluded: bool) -> bool {
+    // Occlusion (e.g. macOS Mission Control) can revoke the OS-level grab
+    // without a Focused(false) event — hash-thing-w0o9. Treat it as
+    // defocus-equivalent so cursor_captured cannot outlive the real grab.
+    focused && !occluded && camera_mode == CameraMode::FirstPerson
 }
 
 /// Drop any modifier KeyCodes from `keys` whose combined bit is *not* set in
@@ -634,7 +637,8 @@ impl App {
     }
 
     fn sync_cursor_capture(&mut self) {
-        let should_capture = should_capture_cursor(self.camera_mode, self.focused);
+        let should_capture =
+            should_capture_cursor(self.camera_mode, self.focused, self.occluded);
         if should_capture == self.cursor_captured {
             return;
         }
@@ -1559,10 +1563,19 @@ impl ApplicationHandler for App {
             // Pause the redraw treadmill while the window is hidden
             // (minimized, behind another window, screen locked). On un-occlude,
             // re-arm the loop with a single `request_redraw`. See
-            // hash-thing-8jp.
+            // hash-thing-8jp. Also treat occlusion as a capture-blocking
+            // signal — macOS Mission Control / Spaces can revoke the cursor
+            // grab here without a Focused(false) event (hash-thing-w0o9).
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
-                if !occluded {
+                if occluded {
+                    self.keys_held.clear();
+                    self.jump_was_held = false;
+                    self.last_mouse = None;
+                    self.sync_cursor_capture();
+                } else {
+                    self.last_mouse = None;
+                    self.sync_cursor_capture();
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -2911,11 +2924,23 @@ mod tests {
     }
 
     #[test]
-    fn cursor_capture_requires_first_person_and_focus() {
-        assert!(should_capture_cursor(CameraMode::FirstPerson, true));
-        assert!(!should_capture_cursor(CameraMode::FirstPerson, false));
-        assert!(!should_capture_cursor(CameraMode::Orbit, true));
-        assert!(!should_capture_cursor(CameraMode::Orbit, false));
+    fn cursor_capture_requires_first_person_focused_and_unoccluded() {
+        // Only (FirstPerson, focused, !occluded) should grab. Occluded is the
+        // hash-thing-w0o9 axis: macOS Mission Control revokes the OS-level
+        // grab via Occluded(true) without firing Focused(false).
+        for mode in [CameraMode::FirstPerson, CameraMode::Orbit] {
+            for focused in [false, true] {
+                for occluded in [false, true] {
+                    let expected =
+                        mode == CameraMode::FirstPerson && focused && !occluded;
+                    assert_eq!(
+                        should_capture_cursor(mode, focused, occluded),
+                        expected,
+                        "mode={mode:?} focused={focused} occluded={occluded}"
+                    );
+                }
+            }
+        }
     }
 
     /// Read the player's `(yaw, pitch)` off the entity store, for tests
@@ -3109,6 +3134,48 @@ mod tests {
         let (yaw, pitch) = player_look(&mut app);
         assert!((yaw - (yaw_cap + 20.0 * LOOK_SENSITIVITY)).abs() < 1e-12);
         assert!((pitch - (pitch_cap + (-20.0) * LOOK_SENSITIVITY)).abs() < 1e-12);
+    }
+
+    // hash-thing-w0o9: occlusion (macOS Mission Control / Spaces) must
+    // release cursor capture even when Focused(false) never fires.
+
+    #[test]
+    fn sync_cursor_capture_releases_on_occlusion() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.occluded = false;
+        // Simulate a successful grab from before the occlusion event.
+        app.cursor_captured = true;
+
+        app.occluded = true;
+        app.sync_cursor_capture();
+
+        assert!(
+            !app.cursor_captured,
+            "occlusion must flip cursor_captured even while focused"
+        );
+    }
+
+    #[test]
+    fn mouse_motion_after_occlusion_is_noop() {
+        // End-to-end proof: once occlusion has flipped capture off, ghost
+        // DeviceEvent::MouseMotion deltas delivered during the Space swap
+        // must not reach the player pose.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.occluded = false;
+        app.cursor_captured = true;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        app.occluded = true;
+        app.sync_cursor_capture();
+
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0);
+        assert_eq!(pitch, 0.0);
     }
 
     /// Seed `last_mouse` without resetting player yaw/pitch. Used when a
