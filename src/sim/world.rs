@@ -2291,10 +2291,11 @@ impl World {
         // so memory tracks live-scene size, not cumulative history.
         // See hash-thing-88d.
         //
-        // Brute-force compaction remaps all NodeIds without updating
-        // hashlife_cache, so clear it to prevent stale cross-path hits.
-        // Keep the remap so Svdag can update its persistent NodeId cache
-        // (hash-thing-5bb.11: O(changed) instead of O(reachable)).
+        // Brute-force compaction remaps every live NodeId into a fresh
+        // store namespace, so clear all four hashlife caches to prevent
+        // stale cross-path hits. Keep the remap so Svdag can update its
+        // persistent NodeId cache (hash-thing-5bb.11: O(changed) instead
+        // of O(reachable)).
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
