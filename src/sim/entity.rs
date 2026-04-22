@@ -113,7 +113,10 @@ impl EmitterState {
             period: 4,
             burst_count: 3,
             particle_ttl: 14,
-            speed: 0.22 * CELLS_PER_METER,
+            // Angular rate (radians/tick-ish); multiplied by the cell-scaled
+            // orbit offset in emitter_particle, so leaving it unscaled keeps
+            // tangential velocity linear (not quadratic) in CELLS_PER_METER.
+            speed: 0.22,
             spread: 0.08 * CELLS_PER_METER,
             age: 0,
         }

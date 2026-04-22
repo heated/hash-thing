@@ -73,7 +73,8 @@ pub const LOOK_SENSITIVITY: f64 = 0.003;
 /// Maximum raycast range for block place/break (m).
 pub const INTERACT_RANGE: f64 = 40.0 * CELLS_PER_METER;
 
-const GROUND_CONTACT_EPSILON: f64 = 0.05;
+/// Grounded-probe tolerance (m). Preserves ~5 cm margin at any scale.
+const GROUND_CONTACT_EPSILON: f64 = 0.05 * CELLS_PER_METER;
 const VERTICAL_COLLISION_STEPS: usize = 12;
 
 /// Result of one grounded-movement step.
@@ -813,9 +814,21 @@ mod tests {
 
     #[test]
     fn grounded_step_gravity_lands_back_on_floor() {
-        let world = world_with_floor(0, 0, 7, 0, 7);
+        // 1m-thick floor over an 8m×8m tile, player dropped from 4m up.
+        // Meter-scaled fixture so the player AABB (1.6m tall) fits.
+        let mut world = World::new(5);
+        let material = Cell::pack(1, 0).raw();
+        let s = CELLS_PER_METER as i64;
+        for cx in 0..8 * s {
+            for cy in 0..s {
+                for cz in 0..8 * s {
+                    world.set(WorldCoord(cx), WorldCoord(cy), WorldCoord(cz), material);
+                }
+            }
+        }
+        let m = |v: f64| v * CELLS_PER_METER;
         let dt = 1.0 / 60.0;
-        let mut pos = [4.0, 4.0, 4.0];
+        let mut pos = [m(4.0), m(4.0), m(4.0)];
         let mut vertical_velocity = 0.0;
         let mut grounded = false;
 
@@ -841,7 +854,7 @@ mod tests {
         }
 
         assert!(grounded);
-        assert!((pos[1] - 1.0).abs() < 0.01);
+        assert!((pos[1] - m(1.0)).abs() < 0.01);
         assert!(vertical_velocity.abs() < 1e-9);
     }
 
