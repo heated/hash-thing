@@ -691,16 +691,24 @@ impl App {
     }
 
     /// Apply a raw pixel-delta mouse look to the player. Scales by
-    /// `LOOK_SENSITIVITY` and clamps pitch to ±1.4. Shared between the
-    /// `CursorMoved` (uncaptured) and `DeviceEvent::MouseMotion` (captured)
-    /// paths so the two stay in parity by construction (hash-thing-a6t2).
+    /// `LOOK_SENSITIVITY`, wraps yaw to `[-π, π)`, and clamps pitch to
+    /// ±1.4. Shared between the `CursorMoved` (uncaptured) and
+    /// `DeviceEvent::MouseMotion` (captured) paths so the two stay in
+    /// parity by construction (hash-thing-a6t2). Wrapping keeps the f32
+    /// downcast for rendering precise over arbitrarily long sessions
+    /// (hash-thing-u0uf, follow-up to hash-thing-w1yq).
     fn apply_fps_look(&mut self, dx: f64, dy: f64) {
         let Some(pid) = self.player_id else { return };
         let Some(player) = self.entities.get_mut(pid) else {
             return;
         };
         if let sim::EntityKind::Player(ref mut ps) = player.kind {
-            ps.yaw += dx * LOOK_SENSITIVITY;
+            let yaw = ps.yaw + dx * LOOK_SENSITIVITY;
+            // Centered wrap (around 0, matching reset_player_pose's
+            // "straight ahead = 0" convention). rem_euclid would land in
+            // [0, τ) instead; [-π, π) keeps sign symmetry with pose code.
+            let tau = std::f64::consts::TAU;
+            ps.yaw = yaw - tau * ((yaw + std::f64::consts::PI) / tau).floor();
             ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
         }
     }
@@ -3081,6 +3089,43 @@ mod tests {
         let (yaw, pitch) = player_look(&mut app);
         assert_eq!(yaw, 0.0);
         assert_eq!(pitch, 0.0);
+    }
+
+    #[test]
+    fn apply_fps_look_wraps_yaw_past_pi() {
+        // hash-thing-u0uf invariant: apply_fps_look must keep accumulated
+        // yaw in [-π, π) so the f32 downcast for rendering stays precise.
+        let mut app = App::new(64);
+        let pi = std::f64::consts::PI;
+        app.reset_player_pose([0.0, 0.0, 0.0], pi - 0.01, 0.0);
+
+        // 10 px * LOOK_SENSITIVITY(0.003) = 0.03 rad → crosses +π by 0.02.
+        app.apply_fps_look(10.0, 0.0);
+        let (yaw, _pitch) = player_look(&mut app);
+        assert!(yaw >= -pi, "yaw {yaw} below -π after wrap");
+        assert!(yaw < pi, "yaw {yaw} not strictly below +π after wrap");
+        let expected = -pi + 0.02;
+        assert!(
+            (yaw - expected).abs() < 1e-10,
+            "yaw {yaw} did not wrap to {expected}"
+        );
+    }
+
+    #[test]
+    fn apply_fps_look_bounds_yaw_across_many_rotations() {
+        // hash-thing-u0uf: even under an absurd event storm the wrap
+        // invariant must hold — this is the regression guard for "someone
+        // removed the wrap and nothing else noticed."
+        let mut app = App::new(64);
+        let pi = std::f64::consts::PI;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        for _ in 0..100 {
+            app.apply_fps_look(10_000.0, 0.0);
+        }
+        let (yaw, _pitch) = player_look(&mut app);
+        assert!(yaw >= -pi, "yaw {yaw} below -π after accumulation");
+        assert!(yaw < pi, "yaw {yaw} not strictly below +π after accumulation");
     }
 
     #[test]
