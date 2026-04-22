@@ -1886,8 +1886,12 @@ impl ApplicationHandler for App {
                 // EWMA smoothing keeps the readout readable at low FPS
                 // where a single slow frame would otherwise jerk the
                 // displayed number by several units (hash-thing-d9af).
-                let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
-                self.smoothed_fps = smooth_fps(self.smoothed_fps, instant_fps, 0.05);
+                // dt==0 (back-to-back redraws within one timer tick) skips
+                // the update rather than blending a 0-FPS sample that
+                // would silently decay the readout by 5%.
+                if dt > 0.0 {
+                    self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt, 0.05);
+                }
                 if let Some(window) = &self.window {
                     if let Some(renderer) = &self.renderer {
                         let scale_pct = (renderer.render_scale * 100.0) as u32;
