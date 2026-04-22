@@ -438,19 +438,16 @@ impl NodeStore {
     /// Mirrors `flatten_column_into`'s topology walk; rebuilds interior nodes
     /// along the column path and reuses hash-cons for off-path subtrees.
     /// Intermediate `Leaf(state)` nodes are expanded into 8 uniform children
-    /// before descending — same pattern as `set_cell_at`.
+    /// before descending (same pattern as `set_cell_at`), then canonicalized
+    /// back to compressed `Leaf(s)` form on the way up when the resulting
+    /// subtree is uniform.
     ///
-    /// **Identity / sharing guarantee** (subtle): if the column is identical
-    /// to the one already present AND no intermediate `Leaf(state)` node
-    /// sits along the column path, hash-cons deduplication returns the
-    /// original root NodeId. If a raw `Leaf(state)` child IS along the path,
-    /// it gets canonicalized to `uniform(level-1, state)` (the expanded
-    /// form), and the returned root has a new NodeId even though the grid
-    /// is unchanged. See test
-    /// `splice_column_identity_through_raw_leaf_child_expands_but_grid_matches`
-    /// for the pinned behavior. Production gap-fill only reaches here when
-    /// the column actually changed, so this structural drift is bounded in
-    /// jw3k.1; making splice canonical-preserving is scoped for a follow-up.
+    /// **Identity guarantee**: if the column is identical to the one
+    /// already present, the returned root NodeId equals the input root via
+    /// hash-cons, including when a raw `Leaf(state)` sits along the column
+    /// path — the expand-then-canonicalize round-trip preserves identity.
+    /// See tests `splice_column_identity_returns_same_nodeid` and
+    /// `splice_column_identity_through_raw_leaf_child_preserves_nodeid`.
     pub fn splice_column(
         &mut self,
         root: NodeId,
@@ -486,12 +483,17 @@ impl NodeStore {
         if level == 0 {
             return self.leaf(column[0]);
         }
-        let children = match *self.get(node) {
+        // Expand intermediate Leaf(s) to [Leaf(s); 8] — each child is
+        // itself a compressed uniform-s subtree at the level below. Keeping
+        // the compressed form on untouched siblings is what lets the
+        // rebuild canonicalize back to Leaf(s) and round-trip to the input
+        // NodeId on identity splice. (jw3k.3)
+        let (children, was_leaf_state) = match *self.get(node) {
             Node::Leaf(s) => {
-                let child = self.uniform(level - 1, s);
-                [child; 8]
+                let child = self.leaf(s);
+                ([child; 8], Some(s))
             }
-            Node::Interior { children, .. } => children,
+            Node::Interior { children, .. } => (children, None),
         };
         let half = 1u64 << (level - 1);
         let ox = if x >= half { 1u32 } else { 0 };
@@ -506,6 +508,22 @@ impl NodeStore {
         let mut new_children = children;
         new_children[idx_lo] = new_lo;
         new_children[idx_hi] = new_hi;
+        // Canonicalize back to Leaf form *only* when the input was itself a
+        // Leaf(s) expanded above: the untouched siblings are guaranteed to
+        // be leaf(s), and if the recursions also returned leaf(s), the
+        // whole subtree is uniform s and collapses to Leaf(s). Skipping
+        // canonicalization on the Interior input case (no opportunistic
+        // canonicalization of pre-existing non-canonical uniform interiors)
+        // preserves NodeId identity for heterogeneous trees: if we
+        // opportunistically collapsed `Interior(L, [leaf(s); 8])` to Leaf(s)
+        // on ascent, an identity splice through uniform(L, s) would return
+        // a different NodeId than the input. (jw3k.3)
+        if let Some(s) = was_leaf_state {
+            let target = self.leaf(s);
+            if new_children.iter().all(|&c| c == target) {
+                return target;
+            }
+        }
         self.interior(level, new_children)
     }
 
@@ -2212,21 +2230,12 @@ mod tests {
         assert_eq!(store.get_cell(new_root, 3, 2, 3), stone);
     }
 
-    /// Pins current splice behavior through an intermediate raw `Leaf(s)`
-    /// child (compressed-subtree representation). On identity splice, the
-    /// Leaf child is expanded to its `uniform(level-1, s)` form — grid is
-    /// preserved, but the root NodeId is NOT the same as the input.
-    ///
-    /// This drops structural sharing for compressed subtrees touched by an
-    /// identity splice. In the jw3k.1 production path, `splice_column` is
-    /// only called when `gravity_gap_fill_column` actually mutated the
-    /// column, so identity-through-Leaf is not hit — but callers using
-    /// `splice_column` outside the gap-fill gate should be aware.
-    ///
-    /// Follow-up bead (jw3k.3 / jw3k.2) scoped to make splice preserve the
-    /// compressed form via post-build canonicalization.
+    /// jw3k.3 canonicalization: identity splice through an intermediate
+    /// raw `Leaf(s)` child preserves the original root NodeId. The Leaf is
+    /// expanded on descent and canonicalized back to `Leaf(s)` on ascent,
+    /// so hash-cons resolves the final interior to the same id as input.
     #[test]
-    fn splice_column_identity_through_raw_leaf_child_expands_but_grid_matches() {
+    fn splice_column_identity_through_raw_leaf_child_preserves_nodeid() {
         let mut store = NodeStore::new();
         let stone = mat(0x301);
         // Level-2 interior (side=4). children[0] is raw Leaf(stone) — a
@@ -2238,15 +2247,12 @@ mod tests {
         children[0] = leaf_stone;
         let root = store.interior(2, children);
 
-        // Column at (x=0, z=0) passes through children[0] for y<2.
         let mut col = vec![0 as CellState; 4];
         store.flatten_column_into(root, 0, 0, &mut col);
         assert_eq!(col, vec![stone, stone, 0, 0], "column read correctly");
 
-        // Identity splice — column unchanged from what flatten gave us.
         let new_root = store.splice_column(root, 0, 0, &col);
 
-        // Grid equivalence holds.
         for y in 0..4u64 {
             let expected = if y < 2 { stone } else { 0 };
             assert_eq!(
@@ -2255,12 +2261,80 @@ mod tests {
                 "grid preserved at (0,{y},0)",
             );
         }
-        // Document: root NodeId changes because raw Leaf gets canonicalized.
-        // (If this ever starts asserting root == new_root after a canonical-
-        // izing splice fix, update this test's header comment.)
-        assert_ne!(
+        assert_eq!(
             new_root, root,
-            "current behavior: raw Leaf child is expanded to uniform form",
+            "canonicalization restores original NodeId on identity splice",
+        );
+    }
+
+    /// jw3k.3 combined stress: mixed heterogeneous tree where children[0]
+    /// is a raw Leaf(stone) and other children are a heterogeneous fill.
+    /// Identity splice over multiple (x, z) columns (some through the raw
+    /// Leaf, some through Interior siblings) must leave node_count stable.
+    #[test]
+    fn splice_column_identity_mixed_tree_no_node_growth() {
+        let mut store = NodeStore::new();
+        let side = 4;
+        let stone = mat(0x301);
+        // Level-2 tree. children[0] is raw Leaf(stone); children[1..7] get
+        // a heterogeneous fill (varied cells in each level-1 subtree).
+        let leaf_stone = store.leaf(stone);
+        let (hetero_sub_seed, _) = fill_heterogeneous(&mut store, 2);
+        let hetero_sub = hetero_sub_seed;
+        let mut children = [hetero_sub; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(2, children);
+
+        let before = store.node_count();
+        // Repeat identity splice over every (x, z) column — mix of
+        // raw-Leaf path (x<2, z<2) and Interior paths (others). None
+        // should allocate new nodes.
+        for _ in 0..8 {
+            for z in 0..side as u64 {
+                for x in 0..side as u64 {
+                    let mut col = vec![0 as CellState; side];
+                    store.flatten_column_into(root, x, z, &mut col);
+                    let new_root = store.splice_column(root, x, z, &col);
+                    assert_eq!(
+                        new_root, root,
+                        "identity splice at ({x},{z}) must preserve NodeId",
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            store.node_count(),
+            before,
+            "mixed-tree identity splices must not grow node count",
+        );
+    }
+
+    /// jw3k.3: identity splice through a raw Leaf child must not grow the
+    /// node count. Regression guard on the canonicalization in
+    /// splice_column_rec.
+    #[test]
+    fn splice_column_identity_through_raw_leaf_no_node_growth() {
+        let mut store = NodeStore::new();
+        let stone = mat(0x301);
+        let leaf_stone = store.leaf(stone);
+        let empty_l1 = store.empty(1);
+        let mut children = [empty_l1; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(2, children);
+
+        let mut col = vec![0 as CellState; 4];
+        store.flatten_column_into(root, 0, 0, &mut col);
+        let before = store.node_count();
+        // Many identity splices through the raw-Leaf column must not
+        // allocate new nodes — each expand+canonicalize round-trip
+        // resolves to the pre-existing Leaf(s) id.
+        for _ in 0..32 {
+            let _ = store.splice_column(root, 0, 0, &col);
+        }
+        assert_eq!(
+            store.node_count(),
+            before,
+            "identity splice through raw Leaf must not grow node count",
         );
     }
 
