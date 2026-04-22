@@ -967,6 +967,7 @@ impl App {
                 "  R  Reset      G  GoL bloom",
                 "  M  Gyroid     N  Lattice walk",
                 "  V  Panorama reveal",
+                "  [/]UIO  DEV jumps (Tab for orbit)",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
@@ -1757,7 +1758,13 @@ impl ApplicationHandler for App {
                                     _ => unreachable!(),
                                 }
                             } else {
-                                log::info!(
+                                // debug!, not info!: winit delivers key-repeat
+                                // events and the default filter is `info`, so
+                                // holding `[` would spam the console at
+                                // ~30 lines/sec. Discoverability now lives in
+                                // the FPS legend line; the log is a fallback
+                                // for RUST_LOG=debug sessions (hash-thing-ibe0).
+                                log::debug!(
                                     "{k}: lattice debug jump — orbit mode only (Tab to switch camera)"
                                 );
                             }
@@ -2709,17 +2716,22 @@ mod tests {
     }
 
     #[test]
-    fn first_person_legend_hides_lattice_debug_jumps() {
+    fn first_person_legend_notes_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
         assert!(lines.iter().any(|line| line.contains("Space       Leap")));
         assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
         assert!(!lines.iter().any(|line| line.contains("Fly down")));
-        assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
+        // ibe0: FPS legend should mention the orbit-only DEV jumps so users
+        // pressing `[/]UIO` in FPS mode know where to look, without copying
+        // the full orbit-mode entry wording.
+        let dev_jump_line = lines
+            .iter()
+            .find(|line| line.contains("[/]UIO"))
+            .expect("FPS legend should list the orbit-only DEV jump keys");
         assert!(
-            !lines
-                .iter()
-                .any(|line| line.contains("DEV intro/interior/reveal"))
+            dev_jump_line.contains("Tab") || dev_jump_line.contains("orbit"),
+            "DEV jump legend line should point users at Tab/orbit: {dev_jump_line}"
         );
         // a9jd: V is user-facing in every camera mode now (not a DEV jump).
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
