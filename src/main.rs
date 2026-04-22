@@ -182,11 +182,15 @@ enum PendingPlayerAction {
 ///
 /// Keeps `pending_scene_swap` separate from `pending_player_action`: player
 /// actions are FIFO lightweight edits against the next live world, while
-/// scene swaps replace the world/entities/render state wholesale. A later
-/// scene-selection key overwrites the queued request, and any direct scene
-/// load (including `R`/reset and `T`/terrain) clears it — if the user has
-/// already picked something else, a stale queued swap would feel like a
-/// surprise.
+/// scene swaps replace the world/entities/render state wholesale. Last
+/// write wins: pressing another scene-selection key (`g`, `m`, `r`, `t`,
+/// `b`, or another `n`/`v`) clears the queue *at key-press time*, even
+/// when the new loader early-returns under `is_stepping()`. That way a
+/// stale queued swap can't land after the user has already picked
+/// something else. If both a player action and a scene swap are queued
+/// when the step finishes, the scene swap wins and the player action is
+/// dropped — the action was queued against a world we're about to
+/// discard, so replaying it would just do wasted upload work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingSceneSwap {
     LoadLatticeDemo,
@@ -938,6 +942,7 @@ impl App {
                 "  T  Terrain    B  Spectacle",
                 "  R  Reset      G  GoL bloom",
                 "  M  Gyroid     N  Lattice walk",
+                "  V  Panorama reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
@@ -1337,8 +1342,6 @@ impl App {
         if self.is_stepping() {
             return;
         }
-        // a9jd: a successful scene load supersedes any queued lattice swap.
-        self.pending_scene_swap = None;
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let stats = self.world.seed_gyroid_megastructure();
@@ -1422,8 +1425,6 @@ impl App {
         if self.is_stepping() {
             return;
         }
-        // a9jd: a successful scene load supersedes any queued lattice swap.
-        self.pending_scene_swap = None;
         let nodes_before = self.world.store.stats();
         let start = std::time::Instant::now();
         let stats = self
@@ -1648,6 +1649,10 @@ impl ApplicationHandler for App {
                             );
                         }
                         winit::keyboard::Key::Character("r") => {
+                            // a9jd: latest scene pick wins. Clear *before* the
+                            // loader so it fires even if the loader drops
+                            // under `is_stepping()`.
+                            self.pending_scene_swap = None;
                             self.load_terrain_scene(
                                 "Reset terrain",
                                 terrain::TerrainParams::for_level(
@@ -1658,6 +1663,7 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("t") => {
                             // Plain terrain remains available as an explicit
                             // toggle, but is no longer the default scene.
+                            self.pending_scene_swap = None;
                             self.load_terrain_scene(
                                 "Reset terrain",
                                 terrain::TerrainParams::for_level(
@@ -1665,31 +1671,40 @@ impl ApplicationHandler for App {
                                 ),
                             );
                         }
-                        winit::keyboard::Key::Character("g") if !self.is_stepping() => {
-                            // Swap to the single retained GoL smoke seed.
-                            // a9jd: supersede any queued lattice swap so the
-                            // user's latest scene pick wins.
+                        winit::keyboard::Key::Character("g") => {
+                            // a9jd: clear the queue unconditionally so a `g`
+                            // during a background step supersedes a queued
+                            // lattice swap, even though the actual load is
+                            // dropped below.
                             self.pending_scene_swap = None;
-                            self.world = sim::World::new(self.volume_size.trailing_zeros());
-                            self.world.set_gol_smoke_rule(self.gol_smoke_rule);
-                            self.world.seed_center(12, 0.35);
-                            self.gol_smoke_scene = true;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.upload_palette(&self.world.materials.color_palette_rgba());
+                            if !self.is_stepping() {
+                                // Swap to the single retained GoL smoke seed.
+                                self.world = sim::World::new(self.volume_size.trailing_zeros());
+                                self.world.set_gol_smoke_rule(self.gol_smoke_rule);
+                                self.world.seed_center(12, 0.35);
+                                self.gol_smoke_scene = true;
+                                self.paused = true;
+                                self.perf.clear();
+                                self.mem_stats.reset_peaks();
+                                if let Some(renderer) = &mut self.renderer {
+                                    renderer
+                                        .upload_palette(&self.world.materials.color_palette_rgba());
+                                }
+                                Self::upload_volume(
+                                    &mut self.renderer,
+                                    &mut self.world,
+                                    &mut self.svdag,
+                                    &mut self.last_svdag_stats,
+                                );
+                                self.sync_render_cache();
+                                log::info!(
+                                    "Reset GoL smoke sphere: pop={}",
+                                    self.world.population()
+                                );
                             }
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &mut self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            self.sync_render_cache();
-                            log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
                         }
                         winit::keyboard::Key::Character("m") => {
+                            self.pending_scene_swap = None;
                             self.load_gyroid_demo();
                         }
                         winit::keyboard::Key::Character("n") => {
@@ -1754,6 +1769,7 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("b") => {
                             // Default demo gallery: deterministic local fire/water set pieces
                             // staged around the beat waypoints.
+                            self.pending_scene_swap = None;
                             self.load_demo_spectacle("Reset spectacle gallery");
                         }
                         winit::keyboard::Key::Character("c") => {
@@ -2009,8 +2025,17 @@ impl ApplicationHandler for App {
                 }
 
                 if !self.is_stepping() {
-                    self.run_pending_player_action();
+                    // a9jd: drain a queued scene swap FIRST. If one is set, the
+                    // pending player action was queued against the world
+                    // that's about to be discarded, so running it first would
+                    // do a full SVDAG rebuild/upload that the scene swap
+                    // immediately throws away. Dropping the player action in
+                    // that case matches "latest intent wins."
+                    if self.pending_scene_swap.is_some() {
+                        self.pending_player_action = None;
+                    }
                     self.run_pending_scene_swap();
+                    self.run_pending_player_action();
                 }
 
                 // Wall-clock perf summary (hash-thing-q63). Sits outside the
@@ -2629,7 +2654,8 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("DEV intro/interior/reveal"))
         );
-        assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
+        // a9jd: V is user-facing in every camera mode now (not a DEV jump).
+        assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
 
@@ -2642,7 +2668,9 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("DEV intro/interior/reveal"))
         );
-        assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
+        // a9jd: `[`, `]`, `U`/`I`/`O` remain DEV beat-cycle jumps, but `V`
+        // is the user-facing panorama reveal — not a DEV-only key.
+        assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
 
