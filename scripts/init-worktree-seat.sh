@@ -35,9 +35,19 @@ repo_root_from_common_git() {
     git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git$||'
 }
 
-# --- Fast path: if seat file already exists, do nothing. ---------------------
-# This is the hot path — fires on every SessionStart — and needs to stay cheap.
+# --- Fast path: seat already assigned. ---------------------------------------
+# Hot path — fires on every SessionStart — must stay cheap. Worktrees seeded
+# before fb68cb0 (or with a hand-written `.beads/actor`) lack `.beads/redirect`,
+# which leaves bare `bd` in embedded mode. Backfill idempotently and exit.
 if [[ -f .beads/actor ]]; then
+    if [[ ! -f .beads/redirect ]]; then
+        # `|| true` so `set -euo pipefail` doesn't trip if we're invoked outside
+        # a git worktree — the fast path runs before the safety rails.
+        REPO_ROOT=$(repo_root_from_common_git || true)
+        if [[ -n "$REPO_ROOT" && -d "$REPO_ROOT/.beads" ]]; then
+            echo "$REPO_ROOT/.beads" > .beads/redirect
+        fi
+    fi
     exit 0
 fi
 

@@ -28,6 +28,11 @@ const DEFAULT_VOLUME_SIZE: u32 = 8192;
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 
+/// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
+/// the threshold at which a human reads a changing number without
+/// jitter (hash-thing-4ioh).
+const TITLE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Thin wrapper over macOS `pthread_set_qos_class_self_np` used as the
 /// xhi6 diagnostic knob (proxy 2 for SVDAG↔sim cache-locality work).
 /// `parse` maps the `HASH_THING_SIM_QOS` env string to a `qos_class_t`
@@ -196,6 +201,10 @@ enum PendingPlayerAction {
 enum PendingSceneSwap {
     LoadLatticeDemo,
     LoadLatticePanoramaDemo,
+    ResetTerrain,
+    LoadGyroid,
+    LoadDemoSpectacle,
+    ResetGolSmoke,
 }
 
 impl PendingSceneSwap {
@@ -203,6 +212,10 @@ impl PendingSceneSwap {
         match self {
             Self::LoadLatticeDemo => "lattice_demo",
             Self::LoadLatticePanoramaDemo => "lattice_panorama",
+            Self::ResetTerrain => "terrain_reset",
+            Self::LoadGyroid => "gyroid",
+            Self::LoadDemoSpectacle => "demo_spectacle",
+            Self::ResetGolSmoke => "gol_smoke_reset",
         }
     }
 }
@@ -270,52 +283,76 @@ struct DemoWaypoint {
     camera: OrbitCameraPose,
 }
 
-fn lattice_demo_waypoint(side: usize, beat: LatticeDemoBeat) -> DemoWaypoint {
-    let side = side as f64;
-    let center = side * 0.5;
+fn lattice_demo_waypoint(
+    side: usize,
+    layout: &sim::DemoLayout,
+    beat: LatticeDemoBeat,
+) -> DemoWaypoint {
+    // ptew: derive player positions from the actual scene anchors so the
+    // spawn is always in carved-AIR cells with scene-provided floor
+    // support. The previous implementation used hardcoded `side * k`
+    // fractions that drifted deep inside lattice pillars whenever scene
+    // geometry evolved.
+    let inv_side = 1.0 / side as f32;
+    let center_xz =
+        |c: [i64; 3]| -> [f64; 3] { [c[0] as f64 + 0.5, c[1] as f64, c[2] as f64 + 0.5] };
+    let to_normalized = |p: [f64; 3]| -> [f32; 3] {
+        [
+            p[0] as f32 * inv_side,
+            p[1] as f32 * inv_side,
+            p[2] as f32 * inv_side,
+        ]
+    };
     match beat {
-        LatticeDemoBeat::Intro => {
-            let offset = side * 0.28;
+        LatticeDemoBeat::Intro => DemoWaypoint {
+            label: "intro",
+            player: PlayerPose {
+                pos: layout.player_pos,
+                yaw: layout.player_yaw,
+                pitch: layout.player_pitch,
+            },
+            camera: OrbitCameraPose {
+                target: to_normalized(layout.player_pos),
+                yaw: -3.0 * std::f32::consts::FRAC_PI_4,
+                pitch: 0.08,
+                dist: 0.34,
+            },
+        },
+        LatticeDemoBeat::Interior => {
+            let pos = center_xz(layout.atrium_center);
             DemoWaypoint {
-                label: "intro",
+                label: "interior",
                 player: PlayerPose {
-                    pos: [center - offset, side * 0.34, center - offset],
-                    yaw: -3.0 * std::f64::consts::FRAC_PI_4,
-                    pitch: -0.08,
+                    pos,
+                    yaw: std::f64::consts::FRAC_PI_2,
+                    pitch: -0.12,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.36, 0.34, 0.36],
-                    yaw: -3.0 * std::f32::consts::FRAC_PI_4,
-                    pitch: 0.08,
-                    dist: 0.34,
+                    target: to_normalized(pos),
+                    yaw: std::f32::consts::FRAC_PI_2,
+                    pitch: 0.10,
+                    dist: 0.22,
                 },
             }
         }
-        LatticeDemoBeat::Interior => DemoWaypoint {
-            label: "interior",
-            player: PlayerPose {
-                pos: [center + side * 0.04, side * 0.46, center + side * 0.10],
-                yaw: std::f64::consts::FRAC_PI_2,
-                pitch: -0.12,
-            },
-            camera: OrbitCameraPose {
-                target: [0.54, 0.46, 0.50],
-                yaw: std::f32::consts::FRAC_PI_2,
-                pitch: 0.10,
-                dist: 0.22,
-            },
-        },
         LatticeDemoBeat::Panorama => {
-            let offset = side * 0.22;
+            let pos = center_xz(layout.reveal_center);
+            // Aim the orbit camera at the midpoint between the player on the
+            // balcony and the panorama volume so the reveal frames both.
+            let panorama_mid: [f64; 3] = [
+                (layout.reveal_center[0] + layout.panorama_center[0]) as f64 * 0.5,
+                (layout.reveal_center[1] + layout.panorama_center[1]) as f64 * 0.5,
+                (layout.reveal_center[2] + layout.panorama_center[2]) as f64 * 0.5,
+            ];
             DemoWaypoint {
                 label: "panorama",
                 player: PlayerPose {
-                    pos: [center + offset, side * 0.58, center + offset],
+                    pos,
                     yaw: std::f64::consts::FRAC_PI_4,
                     pitch: 0.24,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.62, 0.72, 0.62],
+                    target: to_normalized(panorama_mid),
                     yaw: std::f32::consts::FRAC_PI_4,
                     pitch: 0.32,
                     dist: 0.82,
@@ -378,6 +415,11 @@ struct App {
     /// just for the human skimming the title bar (hash-thing-d9af).
     /// Zero sentinel: first frame seeds the filter at its instant value.
     smoothed_fps: f64,
+    /// Throttle for `window.set_title` — at 60 FPS an unthrottled
+    /// title update is unreadable even with EWMA smoothing, and the
+    /// OS sees 60 title rewrites per second. Rewrite at ~4 Hz
+    /// (hash-thing-4ioh). `None` before the first title update.
+    last_title_update: Option<std::time::Instant>,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -486,6 +528,16 @@ fn compute_frame_dts(elapsed: std::time::Duration) -> (f64, f64) {
     (dt_wall, dt_clamped)
 }
 
+/// Title-refresh throttle gate (hash-thing-4ioh). Returns `true` on
+/// the first call (`last` is `None`) and on any call at least
+/// `TITLE_REFRESH_INTERVAL` past the previous refresh.
+fn should_refresh_title(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= TITLE_REFRESH_INTERVAL,
+    }
+}
+
 fn default_legend_visibility(_mode: CameraMode) -> bool {
     // Default-on until proper demo lineup lands (edward 2026-04-21).
     true
@@ -569,6 +621,10 @@ impl App {
             noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
             smoothed_fps: 0.0,
+            // None so the first frame refreshes the title immediately
+            // — without an `Instant` sentinel before the monotonic
+            // epoch, which could underflow on some platforms.
+            last_title_update: None,
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
@@ -1007,8 +1063,19 @@ impl App {
 
     fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
         match swap {
-            PendingSceneSwap::LoadLatticeDemo => self.load_lattice_demo(),
+            PendingSceneSwap::LoadLatticeDemo => {
+                let _ = self.load_lattice_demo();
+            }
             PendingSceneSwap::LoadLatticePanoramaDemo => self.load_lattice_panorama_demo(),
+            PendingSceneSwap::ResetTerrain => self.load_terrain_scene(
+                "Reset terrain",
+                terrain::TerrainParams::for_level(self.volume_size.trailing_zeros()),
+            ),
+            PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
+            PendingSceneSwap::LoadDemoSpectacle => {
+                self.load_demo_spectacle("Reset spectacle gallery")
+            }
+            PendingSceneSwap::ResetGolSmoke => self.reset_gol_smoke_scene(),
         }
     }
 
@@ -1119,8 +1186,17 @@ impl App {
     }
 
     fn load_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
-        self.load_lattice_demo();
-        let waypoint = lattice_demo_waypoint(self.world.side(), beat);
+        // Reseed the scene and use the fresh DemoLayout anchors — direct
+        // return rather than an App-side cache so a stale layout can never
+        // drive a waypoint into unrelated geometry (hash-thing-ptew).
+        let Some(layout) = self.load_lattice_demo() else {
+            // Background sim step in flight — load_lattice_demo already
+            // logged the deferral. Skip the waypoint too; applying a
+            // lattice-shaped pose on top of the previous scene is exactly
+            // the class of bug that ptew is about.
+            return;
+        };
+        let waypoint = lattice_demo_waypoint(self.world.side(), &layout, beat);
         self.apply_player_pose(waypoint.player);
         self.apply_orbit_camera_pose(waypoint.camera);
         self.current_demo_beat = Some(beat);
@@ -1471,13 +1547,37 @@ impl App {
         );
     }
 
-    fn load_lattice_demo(&mut self) {
+    fn reset_gol_smoke_scene(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.set_gol_smoke_rule(self.gol_smoke_rule);
+        self.world.seed_center(12, 0.35);
+        self.gol_smoke_scene = true;
+        self.paused = true;
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
+    }
+
+    fn load_lattice_demo(&mut self) -> Option<sim::DemoLayout> {
         if self.is_stepping() {
             // Without this log the `n` key looks dead during a long sim
             // step — see hash-thing-1a1n. The completion log at the end
             // of this function covers the success path.
             log::info!("load_lattice_demo: deferred — background sim step in flight");
-            return;
+            return None;
         }
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
@@ -1509,6 +1609,7 @@ impl App {
             elapsed.as_secs_f64() * 1000.0,
             layout.reveal_center,
         );
+        Some(layout)
     }
 
     fn load_lattice_panorama_demo(&mut self) {
@@ -1597,6 +1698,11 @@ impl ApplicationHandler for App {
                 &mut self.last_svdag_stats,
             );
             self.sync_cursor_capture();
+            // 4ioh: new window starts with the bootstrap title. Clear
+            // the throttle sentinel so the first real frame refreshes
+            // the title immediately instead of waiting out the 250 ms
+            // interval from a previous window's refresh.
+            self.last_title_update = None;
             // Some macOS / agent launches do not schedule an initial redraw
             // on their own. Arm the first frame explicitly so startup scene
             // generation and the steady redraw loop can begin.
@@ -1750,64 +1856,21 @@ impl ApplicationHandler for App {
                                 self.world.population()
                             );
                         }
-                        winit::keyboard::Key::Character("r") => {
-                            // a9jd: latest scene pick wins. Clear *before* the
-                            // loader so it fires even if the loader drops
-                            // under `is_stepping()`.
-                            self.pending_scene_swap = None;
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
-                        }
-                        winit::keyboard::Key::Character("t") => {
-                            // Plain terrain remains available as an explicit
-                            // toggle, but is no longer the default scene.
-                            self.pending_scene_swap = None;
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
+                        winit::keyboard::Key::Character("r" | "t") => {
+                            // Queue through PendingSceneSwap so a press during
+                            // a background sim step lands at the next step
+                            // boundary instead of being silently dropped by
+                            // load_terrain_scene's is_stepping guard
+                            // (hash-thing-u5ik). `r` and `t` share the same
+                            // terrain reset today; split in the future if the
+                            // keys diverge.
+                            self.request_scene_swap(PendingSceneSwap::ResetTerrain);
                         }
                         winit::keyboard::Key::Character("g") => {
-                            // a9jd: clear the queue unconditionally so a `g`
-                            // during a background step supersedes a queued
-                            // lattice swap, even though the actual load is
-                            // dropped below.
-                            self.pending_scene_swap = None;
-                            if !self.is_stepping() {
-                                // Swap to the single retained GoL smoke seed.
-                                self.world = sim::World::new(self.volume_size.trailing_zeros());
-                                self.world.set_gol_smoke_rule(self.gol_smoke_rule);
-                                self.world.seed_center(12, 0.35);
-                                self.gol_smoke_scene = true;
-                                self.paused = true;
-                                self.perf.clear();
-                                self.mem_stats.reset_peaks();
-                                if let Some(renderer) = &mut self.renderer {
-                                    renderer
-                                        .upload_palette(&self.world.materials.color_palette_rgba());
-                                }
-                                Self::upload_volume(
-                                    &mut self.renderer,
-                                    &mut self.world,
-                                    &mut self.svdag,
-                                    &mut self.last_svdag_stats,
-                                );
-                                self.sync_render_cache();
-                                log::info!(
-                                    "Reset GoL smoke sphere: pop={}",
-                                    self.world.population()
-                                );
-                            }
+                            self.request_scene_swap(PendingSceneSwap::ResetGolSmoke);
                         }
                         winit::keyboard::Key::Character("m") => {
-                            self.pending_scene_swap = None;
-                            self.load_gyroid_demo();
+                            self.request_scene_swap(PendingSceneSwap::LoadGyroid);
                         }
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
@@ -1874,8 +1937,7 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("b") => {
                             // Default demo gallery: deterministic local fire/water set pieces
                             // staged around the beat waypoints.
-                            self.pending_scene_swap = None;
-                            self.load_demo_spectacle("Reset spectacle gallery");
+                            self.request_scene_swap(PendingSceneSwap::LoadDemoSpectacle);
                         }
                         winit::keyboard::Key::Character("c") => {
                             // dlse.2.2: drain perf histograms so the next `P`
@@ -2067,13 +2129,22 @@ impl ApplicationHandler for App {
                 if dt_wall > 0.0 {
                     self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
                 }
-                if let Some(window) = &self.window {
-                    if let Some(renderer) = &self.renderer {
-                        let scale_pct = (renderer.render_scale * 100.0) as u32;
-                        window.set_title(&format!(
-                            "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                            self.smoothed_fps, self.volume_size, scale_pct,
-                        ));
+                // Throttle title refresh to ~4 Hz. EWMA-smoothed
+                // FPS still jitters between integer readings on the
+                // {:.0} boundary (e.g. 59/60 flicker), and 60 title
+                // rewrites per second hands the OS more repaint work
+                // than a human can read anyway (hash-thing-4ioh).
+                let now = std::time::Instant::now();
+                if should_refresh_title(self.last_title_update, now) {
+                    if let Some(window) = &self.window {
+                        if let Some(renderer) = &self.renderer {
+                            let scale_pct = (renderer.render_scale * 100.0) as u32;
+                            window.set_title(&format!(
+                                "hash-thing | {:.0} FPS | {}³ | scale {}%",
+                                self.smoothed_fps, self.volume_size, scale_pct,
+                            ));
+                            self.last_title_update = Some(now);
+                        }
                     }
                 }
 
@@ -2629,6 +2700,29 @@ mod tests {
         assert!((clamped - 0.016).abs() < 1e-12);
     }
 
+    // hash-thing-4ioh: title-refresh throttle fires on the first frame
+    // (`None` seed) and then suppresses rewrites until the interval
+    // elapses. At 60 FPS this collapses ~15 per-frame rewrites into one.
+    #[test]
+    fn should_refresh_title_fires_on_first_frame() {
+        let now = std::time::Instant::now();
+        assert!(should_refresh_title(None, now));
+    }
+
+    #[test]
+    fn should_refresh_title_suppresses_within_interval() {
+        let last = std::time::Instant::now();
+        let soon = last + TITLE_REFRESH_INTERVAL / 2;
+        assert!(!should_refresh_title(Some(last), soon));
+    }
+
+    #[test]
+    fn should_refresh_title_fires_at_interval_boundary() {
+        let last = std::time::Instant::now();
+        let later = last + TITLE_REFRESH_INTERVAL;
+        assert!(should_refresh_title(Some(last), later));
+    }
+
     #[test]
     fn reconcile_modifier_keys_drops_only_cleared_bits() {
         use winit::keyboard::ModifiersState;
@@ -2694,22 +2788,27 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
+        let mut world = sim::World::new(6); // side 64
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
         for beat in [
             LatticeDemoBeat::Intro,
             LatticeDemoBeat::Interior,
             LatticeDemoBeat::Panorama,
         ] {
-            let waypoint = lattice_demo_waypoint(2048, beat);
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
             for axis in [0, 1, 2] {
                 assert!(waypoint.player.pos[axis] > 0.0);
-                assert!(waypoint.player.pos[axis] < 2048.0);
+                assert!(waypoint.player.pos[axis] < side as f64);
             }
         }
     }
 
     #[test]
     fn lattice_panorama_waypoint_faces_inward_and_upward() {
-        let waypoint = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let waypoint = lattice_demo_waypoint(world.side(), &layout, LatticeDemoBeat::Panorama);
         let (_eye, dir) = player::eye_ray(
             &waypoint.player.pos,
             waypoint.player.yaw,
@@ -2722,12 +2821,46 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_are_distinct() {
-        let intro = lattice_demo_waypoint(512, LatticeDemoBeat::Intro);
-        let interior = lattice_demo_waypoint(512, LatticeDemoBeat::Interior);
-        let panorama = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        let intro = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Intro);
+        let interior = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Interior);
+        let panorama = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Panorama);
         assert_ne!(intro.label, interior.label);
         assert_ne!(interior.label, panorama.label);
         assert_ne!(intro.player.pos, panorama.player.pos);
+    }
+
+    /// ptew: player was landing embedded in solid lattice cells because
+    /// the beat waypoints were hardcoded normalized fractions that did
+    /// not track the scene geometry. This test seeds the real scene and
+    /// asserts that every beat's spawn cell is walkable AND grounded, so
+    /// the class of bug cannot regress silently.
+    #[test]
+    fn lattice_demo_waypoints_do_not_collide_with_scene() {
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        for beat in [
+            LatticeDemoBeat::Intro,
+            LatticeDemoBeat::Interior,
+            LatticeDemoBeat::Panorama,
+        ] {
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
+            assert!(
+                !player::player_collides(&world, &waypoint.player.pos),
+                "{:?} waypoint must spawn in AIR: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+            assert!(
+                player::is_grounded(&world, &waypoint.player.pos),
+                "{:?} waypoint must have floor support: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+        }
     }
 
     #[test]

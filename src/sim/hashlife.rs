@@ -42,6 +42,24 @@ use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 
+/// Per-phase micro-timing of one [`World::step_recursive_profiled`] invocation
+/// (hash-thing-jw3k diagnostic harness). All fields are microseconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepProfile {
+    pub total_us: u64,
+    pub step_node_us: u64,
+    pub flatten_us: u64,
+    pub gap_fill_loop_us: u64,
+    pub from_flat_us: u64,
+    pub compact_us: u64,
+}
+
+impl StepProfile {
+    pub fn gap_fill_us(&self) -> u64 {
+        self.flatten_us + self.gap_fill_loop_us + self.from_flat_us
+    }
+}
+
 const LEVEL3_SIDE: usize = 8;
 const LEVEL3_CELL_COUNT: usize = LEVEL3_SIDE * LEVEL3_SIDE * LEVEL3_SIDE;
 const CENTER_LEVEL3_SIDE: usize = 4;
@@ -87,6 +105,62 @@ impl World {
         self.generation += 1;
 
         self.maybe_compact();
+    }
+
+    /// Same work as [`Self::step_recursive`] but returns per-phase timings
+    /// (hash-thing-jw3k). Intended for benchmark/diagnostic callers; production
+    /// sim uses [`Self::step_recursive`].
+    pub fn step_recursive_profiled(&mut self) -> StepProfile {
+        assert!(
+            self.level >= 3,
+            "step_recursive_profiled requires level >= 3, got {}",
+            self.level
+        );
+        let t0 = std::time::Instant::now();
+        self.hashlife_stats = super::world::HashlifeStats::default();
+        let padded_root = self.pad_root();
+        let padded_level = self.level + 1;
+        let period = self.materials.memo_period();
+        let phase = self.generation % period;
+        let t_step = std::time::Instant::now();
+        let result = self.step_node(padded_root, padded_level, phase);
+        let step_node_us = t_step.elapsed().as_micros() as u64;
+        self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
+
+        let (flatten_us, gap_fill_loop_us, from_flat_us) = if self.has_block_rule_cells() {
+            let side = self.side();
+            let t_flat = std::time::Instant::now();
+            let mut grid = self.store.flatten(self.root, side);
+            let flat_us = t_flat.elapsed().as_micros() as u64;
+            let t_gf = std::time::Instant::now();
+            super::world::gravity_gap_fill(&mut grid, side, &self.materials);
+            let gf_us = t_gf.elapsed().as_micros() as u64;
+            let t_ff = std::time::Instant::now();
+            self.root = self.store.from_flat(&grid, side);
+            let ff_us = t_ff.elapsed().as_micros() as u64;
+            (flat_us, gf_us, ff_us)
+        } else {
+            (0, 0, 0)
+        };
+
+        self.generation += 1;
+
+        let t_compact = std::time::Instant::now();
+        self.maybe_compact();
+        let compact_us = t_compact.elapsed().as_micros() as u64;
+
+        StepProfile {
+            total_us: t0.elapsed().as_micros() as u64,
+            step_node_us,
+            flatten_us,
+            gap_fill_loop_us,
+            from_flat_us,
+            compact_us,
+        }
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].

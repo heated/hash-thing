@@ -3054,6 +3054,66 @@ mod tests {
         }
     }
 
+    /// hash-thing-2z3g scout: measure p1/p2 wall-time share on the default
+    /// water scene. Prints cumulative phase1_ns / phase2_ns across N steps
+    /// so a reader can decide whether noop_flags caching (2z3g) is worth
+    /// doing — the gate is "does Phase 1 dominate, and if so is allocation
+    /// a big enough chunk to matter."
+    ///
+    /// Run: `cargo test --profile bench --lib
+    /// hashlife_phase_timing_scout_water_64 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "scout/profiling — prints timing, no assertions"]
+    fn hashlife_phase_timing_scout_water_64() {
+        let mut world = World::new(6);
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        const N_STEPS: u32 = 20;
+        let wall_start = std::time::Instant::now();
+        for _ in 0..N_STEPS {
+            world.step_recursive();
+        }
+        let wall_total_ns = wall_start.elapsed().as_nanos() as u64;
+
+        let stats = &world.hashlife_stats_total;
+        let p1 = stats.phase1_ns;
+        let p2 = stats.phase2_ns;
+        let pct =
+            |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
+        eprintln!("--- hashlife phase timing scout: 64^3 water, {N_STEPS} steps ---");
+        eprintln!("  wall_total:    {:.2} ms", wall_total_ns as f64 / 1e6);
+        eprintln!(
+            "  phase1_total:  {:.2} ms ({:.1}% of wall)",
+            p1 as f64 / 1e6,
+            pct(p1),
+        );
+        eprintln!(
+            "  phase2_total:  {:.2} ms ({:.1}% of wall)",
+            p2 as f64 / 1e6,
+            pct(p2),
+        );
+        eprintln!(
+            "  p1+p2:         {:.2} ms ({:.1}% of wall — remainder is memo lookup/insert, `next` zeroing, dispatch)",
+            (p1 + p2) as f64 / 1e6,
+            pct(p1 + p2),
+        );
+        eprintln!(
+            "  per-step avg:  p1={:.3}ms p2={:.3}ms wall={:.3}ms",
+            p1 as f64 / 1e6 / N_STEPS as f64,
+            p2 as f64 / 1e6 / N_STEPS as f64,
+            wall_total_ns as f64 / 1e6 / N_STEPS as f64,
+        );
+        eprintln!(
+            "  cache_hits={} cache_misses={} (hit_rate={:.3})",
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cache_hits as f64
+                / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+        );
+    }
+
     /// hash-thing-rk4n regression: walks the default water scene past
     /// ground-impact using the brute-force `step()` path which runs
     /// `commit_step` (store-compact every tick). Skipping some sync calls
