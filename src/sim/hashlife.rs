@@ -1447,6 +1447,94 @@ mod tests {
         );
     }
 
+    /// hash-thing-gzio experiment: measure divergence between brute-force
+    /// stepping (per-generation gap-fill, the ship baseline) and the
+    /// candidate replacement — step_node_macro followed by a SINGLE
+    /// gravity_gap_fill at the end of the whole pow2 superstep. The
+    /// hypothesis is that most of the 4497 probe's ~16% divergence is
+    /// per-generation gap-fill that settles back out under one end-of-
+    /// superstep gap-fill, so the post-gap_fill divergence number should
+    /// be much smaller than the pre-gap_fill number.
+    ///
+    /// If this bears out, step_recursive_pow2 could replace its
+    /// per-generation brute-force fallback with step_node_macro +
+    /// one gap_fill — keeping the O(2^n) macro speedup while approximately
+    /// preserving ship-path gap-fill semantics.
+    ///
+    /// Investigation probe, not a ship assertion: it prints divergence
+    /// (pre vs post gap-fill) so future runs can capture the behavior
+    /// without pinning it.
+    #[test]
+    fn investigation_gzio_macro_plus_single_gap_fill_vs_brute() {
+        let level = 4u32;
+        let mut macro_world = World::new(level);
+        let mut brute = World::new(level);
+
+        seed_random_material_cells(&mut macro_world, 0x4497_u64);
+        seed_random_material_cells(&mut brute, 0x4497_u64);
+        assert_eq!(macro_world.flatten(), brute.flatten());
+
+        let steps = macro_world.recursive_pow2_step_count();
+        for _ in 0..steps {
+            brute.step();
+        }
+
+        // Macro path, bypassing the has_block_rule_cells guard.
+        let padded_root = macro_world.pad_root();
+        let padded_level = macro_world.level + 1;
+        let result =
+            macro_world.step_node_macro(padded_root, padded_level, macro_world.generation);
+        macro_world.root = result;
+        macro_world.generation += steps;
+
+        let brute_flat = brute.flatten();
+        let side = macro_world.side();
+
+        // Measure pre-gap-fill divergence — should match the 4497 probe.
+        let pre_flat = macro_world.flatten();
+        let mut pre_diffs = 0usize;
+        for (&m, &b) in pre_flat.iter().zip(brute_flat.iter()) {
+            if m != b {
+                pre_diffs += 1;
+            }
+        }
+
+        // Apply a SINGLE post-macro gravity_gap_fill and re-measure.
+        macro_world.apply_gap_fill_via_flatten_rebuild();
+
+        let post_flat = macro_world.flatten();
+        let mut post_diffs = 0usize;
+        let mut post_water_diffs = 0usize;
+        for (i, (&m, &b)) in post_flat.iter().zip(brute_flat.iter()).enumerate() {
+            if m != b {
+                post_diffs += 1;
+                let water_raw = crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw();
+                if m == water_raw || b == water_raw {
+                    post_water_diffs += 1;
+                }
+                if post_diffs <= 8 {
+                    let z = i / (side * side);
+                    let y = (i / side) % side;
+                    let x = i % side;
+                    eprintln!(
+                        "post-gap-fill divergence at ({x},{y},{z}): \
+                         macro+gf={m:#010x} brute={b:#010x}"
+                    );
+                }
+            }
+        }
+
+        let total = post_flat.len();
+        eprintln!(
+            "gzio probe: level={level} steps={steps} total_cells={total}\n\
+             \tpre_gap_fill_diffs={pre_diffs} ({:.2}%)\n\
+             \tpost_gap_fill_diffs={post_diffs} ({:.2}%) \
+             water_touching={post_water_diffs}",
+            (pre_diffs as f64 / total as f64) * 100.0,
+            (post_diffs as f64 / total as f64) * 100.0,
+        );
+    }
+
     #[test]
     fn pad_root_preserves_center() {
         let mut world = World::new(3);
