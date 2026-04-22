@@ -846,9 +846,12 @@ impl MaterialRegistry {
         &self.cached_block_rule_tick_divisors
     }
 
-    /// Rebuild both tick-divisor caches. Called after every mutation path that
-    /// could change either the per-material divisors or the block-rule table.
-    /// Cost is O(entries + block_rules) — small constants in practice.
+    /// Rebuild the per-registry step caches (tick-divisor flags, block-rule
+    /// tick divisors, and noop flags) after any mutation path that could
+    /// change per-material divisors, the block-rule table, per-material rule
+    /// assignment, or the rule table itself. Cost is O(entries + block_rules)
+    /// — small constants in practice. Name retained for git-blame continuity
+    /// even though it now owns three caches, not two (hash-thing-2z3g).
     ///
     /// Panics if any two materials sharing one BlockRule have different
     /// `tick_divisor`s (iowh invariant). Enforcing here — rather than only in
@@ -970,6 +973,15 @@ impl MaterialRegistry {
     {
         let rule_id = RuleId(self.rules.len());
         self.rules.push(Box::new(rule));
+        // hash-thing-2z3g: rebuild participates in the noop cache
+        // invariant. Without this, a construction path that inserts a
+        // material with a placeholder `rule_id` and only *later* registers
+        // the rule would leave `cached_noop_flags` stuck at `false` (the
+        // permissive out-of-bounds fallback). All shipping constructors
+        // register rules before inserting materials, but the cost of the
+        // rebuild here is O(entries + block_rules) — cheap — and it makes
+        // the invariant local to each mutator.
+        self.rebuild_tick_caches();
         rule_id
     }
 
@@ -1653,6 +1665,51 @@ mod tests {
         assert!(!flags[0], "unregistered slot 0 defaults to non-noop");
         assert!(!flags[1], "unregistered slot 1 defaults to non-noop");
         assert!(flags[2], "slot 2 got a NoopRule");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_insert_overwrite() {
+        // hash-thing-2z3g follow-up: insert() is both a grow mutator and an
+        // overwrite mutator. Overwriting an existing slot with a different
+        // rule_id must also invalidate the noop cache for that slot.
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        let non_noop_id = registry.register_rule(FireRule {
+            fuel_materials: vec![],
+            quencher_material: 0,
+        });
+        registry.insert(0, entry_with(noop_id, [0.0; 4]));
+        assert!(registry.noop_flags()[0], "pre-overwrite: noop rule");
+        registry.insert(0, entry_with(non_noop_id, [1.0; 4]));
+        assert!(!registry.noop_flags()[0], "post-overwrite: non-noop rule");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_register_rule() {
+        // hash-thing-2z3g critical-review follow-up: register_rule must also
+        // rebuild the cache. Construct the exact "insert-with-placeholder,
+        // register-rule-later" sequence that motivated the invariant — and
+        // verify the noop flag flips from the permissive-fallback `false` to
+        // `true` once the rule backing the id is actually registered.
+        let mut registry = MaterialRegistry::new();
+        // Insert first with a rule_id that doesn't exist yet (validate()
+        // would flag this at construction-end; pre-validate state is legal).
+        registry.insert(
+            0,
+            MaterialEntry {
+                rule_id: RuleId(0),
+                ..entry_with(RuleId(0), [0.0; 4])
+            },
+        );
+        assert!(
+            !registry.noop_flags()[0],
+            "pre-register: permissive out-of-bounds fallback returns false"
+        );
+        registry.register_rule(NoopRule);
+        assert!(
+            registry.noop_flags()[0],
+            "post-register: rule_id now resolves, cache reflects is_noop"
+        );
     }
 
     #[test]
