@@ -795,6 +795,11 @@ mod tests {
         let m = |v: f64| v * CELLS_PER_METER;
         let dt = 1.0 / 60.0;
         let start = [m(4.0), m(1.0), m(4.0)];
+        // Precondition: start must actually be on the ground. Without this
+        // the test would silently pass if a future fixture drift floated the
+        // player above the floor — `jumped.grounded == false` would then be
+        // "already in the air", not "left the ground via the jump".
+        assert!(is_grounded(&world, &start), "start pos must be grounded");
 
         let jumped = step_grounded_movement(
             &world,
