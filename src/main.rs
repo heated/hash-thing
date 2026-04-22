@@ -1830,8 +1830,16 @@ impl ApplicationHandler for App {
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
                         winit::keyboard::Key::Character("s")
-                            if self.camera_mode == CameraMode::Orbit && !self.is_stepping() =>
+                            if self.camera_mode != CameraMode::Orbit =>
                         {
+                            log::debug!("s ignored: single-step only in Orbit mode (current=FPS)");
+                        }
+                        winit::keyboard::Key::Character("s") if self.is_stepping() => {
+                            log::debug!(
+                                "s ignored: single-step denied while background step is in flight"
+                            );
+                        }
+                        winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
@@ -1930,7 +1938,9 @@ impl ApplicationHandler for App {
                                         sim::GameOfLife3D::new(4, 7, 6, 8),
                                         "Pyroclastic",
                                     ),
-                                    _ => {}
+                                    _ => log::debug!(
+                                        "digit {digit} ignored in Orbit mode: rule selection uses 1-4 only"
+                                    ),
                                 }
                             }
                         }
@@ -1992,10 +2002,15 @@ impl ApplicationHandler for App {
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
                         }
+                        winit::keyboard::Key::Character("p") if self.is_stepping() => {
+                            log::debug!(
+                                "p ignored: perf dump denied while background step is in flight"
+                            );
+                        }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
                         // cadence.
-                        winit::keyboard::Key::Character("p") if !self.is_stepping() => {
+                        winit::keyboard::Key::Character("p") => {
                             let nodes = self.world.store.stats();
                             self.mem_stats.update(nodes);
                             let (svdag_nodes, svdag_bytes, svdag_root_level) =
