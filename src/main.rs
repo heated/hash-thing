@@ -269,52 +269,76 @@ struct DemoWaypoint {
     camera: OrbitCameraPose,
 }
 
-fn lattice_demo_waypoint(side: usize, beat: LatticeDemoBeat) -> DemoWaypoint {
-    let side = side as f64;
-    let center = side * 0.5;
+fn lattice_demo_waypoint(
+    side: usize,
+    layout: &sim::DemoLayout,
+    beat: LatticeDemoBeat,
+) -> DemoWaypoint {
+    // ptew: derive player positions from the actual scene anchors so the
+    // spawn is always in carved-AIR cells with scene-provided floor
+    // support. The previous implementation used hardcoded `side * k`
+    // fractions that drifted deep inside lattice pillars whenever scene
+    // geometry evolved.
+    let inv_side = 1.0 / side as f32;
+    let center_xz =
+        |c: [i64; 3]| -> [f64; 3] { [c[0] as f64 + 0.5, c[1] as f64, c[2] as f64 + 0.5] };
+    let to_normalized = |p: [f64; 3]| -> [f32; 3] {
+        [
+            p[0] as f32 * inv_side,
+            p[1] as f32 * inv_side,
+            p[2] as f32 * inv_side,
+        ]
+    };
     match beat {
-        LatticeDemoBeat::Intro => {
-            let offset = side * 0.28;
+        LatticeDemoBeat::Intro => DemoWaypoint {
+            label: "intro",
+            player: PlayerPose {
+                pos: layout.player_pos,
+                yaw: layout.player_yaw,
+                pitch: layout.player_pitch,
+            },
+            camera: OrbitCameraPose {
+                target: to_normalized(layout.player_pos),
+                yaw: -3.0 * std::f32::consts::FRAC_PI_4,
+                pitch: 0.08,
+                dist: 0.34,
+            },
+        },
+        LatticeDemoBeat::Interior => {
+            let pos = center_xz(layout.atrium_center);
             DemoWaypoint {
-                label: "intro",
+                label: "interior",
                 player: PlayerPose {
-                    pos: [center - offset, side * 0.34, center - offset],
-                    yaw: -3.0 * std::f64::consts::FRAC_PI_4,
-                    pitch: -0.08,
+                    pos,
+                    yaw: std::f64::consts::FRAC_PI_2,
+                    pitch: -0.12,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.36, 0.34, 0.36],
-                    yaw: -3.0 * std::f32::consts::FRAC_PI_4,
-                    pitch: 0.08,
-                    dist: 0.34,
+                    target: to_normalized(pos),
+                    yaw: std::f32::consts::FRAC_PI_2,
+                    pitch: 0.10,
+                    dist: 0.22,
                 },
             }
         }
-        LatticeDemoBeat::Interior => DemoWaypoint {
-            label: "interior",
-            player: PlayerPose {
-                pos: [center + side * 0.04, side * 0.46, center + side * 0.10],
-                yaw: std::f64::consts::FRAC_PI_2,
-                pitch: -0.12,
-            },
-            camera: OrbitCameraPose {
-                target: [0.54, 0.46, 0.50],
-                yaw: std::f32::consts::FRAC_PI_2,
-                pitch: 0.10,
-                dist: 0.22,
-            },
-        },
         LatticeDemoBeat::Panorama => {
-            let offset = side * 0.22;
+            let pos = center_xz(layout.reveal_center);
+            // Aim the orbit camera at the midpoint between the player on the
+            // balcony and the panorama volume so the reveal frames both.
+            let panorama_mid: [f64; 3] = [
+                (layout.reveal_center[0] + layout.panorama_center[0]) as f64 * 0.5,
+                (layout.reveal_center[1] + layout.panorama_center[1]) as f64 * 0.5,
+                (layout.reveal_center[2] + layout.panorama_center[2]) as f64 * 0.5,
+            ];
             DemoWaypoint {
                 label: "panorama",
                 player: PlayerPose {
-                    pos: [center + offset, side * 0.58, center + offset],
+                    pos,
                     yaw: std::f64::consts::FRAC_PI_4,
                     pitch: 0.24,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.62, 0.72, 0.62],
+                    target: to_normalized(panorama_mid),
                     yaw: std::f32::consts::FRAC_PI_4,
                     pitch: 0.32,
                     dist: 0.82,
@@ -657,8 +681,7 @@ impl App {
     }
 
     fn sync_cursor_capture(&mut self) {
-        let should_capture =
-            should_capture_cursor(self.camera_mode, self.focused, self.occluded);
+        let should_capture = should_capture_cursor(self.camera_mode, self.focused, self.occluded);
         if should_capture == self.cursor_captured {
             return;
         }
@@ -991,7 +1014,9 @@ impl App {
 
     fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
         match swap {
-            PendingSceneSwap::LoadLatticeDemo => self.load_lattice_demo(),
+            PendingSceneSwap::LoadLatticeDemo => {
+                let _ = self.load_lattice_demo();
+            }
             PendingSceneSwap::LoadLatticePanoramaDemo => self.load_lattice_panorama_demo(),
         }
     }
@@ -1103,8 +1128,17 @@ impl App {
     }
 
     fn load_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
-        self.load_lattice_demo();
-        let waypoint = lattice_demo_waypoint(self.world.side(), beat);
+        // Reseed the scene and use the fresh DemoLayout anchors — direct
+        // return rather than an App-side cache so a stale layout can never
+        // drive a waypoint into unrelated geometry (hash-thing-ptew).
+        let Some(layout) = self.load_lattice_demo() else {
+            // Background sim step in flight — load_lattice_demo already
+            // logged the deferral. Skip the waypoint too; applying a
+            // lattice-shaped pose on top of the previous scene is exactly
+            // the class of bug that ptew is about.
+            return;
+        };
+        let waypoint = lattice_demo_waypoint(self.world.side(), &layout, beat);
         self.apply_player_pose(waypoint.player);
         self.apply_orbit_camera_pose(waypoint.camera);
         self.current_demo_beat = Some(beat);
@@ -1455,15 +1489,13 @@ impl App {
         );
     }
 
-    fn load_lattice_demo(&mut self) {
+    fn load_lattice_demo(&mut self) -> Option<sim::DemoLayout> {
         if self.is_stepping() {
             // Without this log the `n` key looks dead during a long sim
             // step — see hash-thing-1a1n. The completion log at the end
             // of this function covers the success path.
-            log::info!(
-                "load_lattice_demo: deferred — background sim step in flight"
-            );
-            return;
+            log::info!("load_lattice_demo: deferred — background sim step in flight");
+            return None;
         }
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
@@ -1495,6 +1527,7 @@ impl App {
             elapsed.as_secs_f64() * 1000.0,
             layout.reveal_center,
         );
+        Some(layout)
     }
 
     fn load_lattice_panorama_demo(&mut self) {
@@ -2596,8 +2629,14 @@ mod tests {
     #[test]
     fn compute_frame_dts_preserves_wall_for_slow_frames() {
         let (wall, clamped) = compute_frame_dts(Duration::from_millis(200));
-        assert!((wall - 0.2).abs() < 1e-12, "wall dt must not clamp; got {wall}");
-        assert!((clamped - 0.1).abs() < 1e-12, "clamped dt must cap at 0.1; got {clamped}");
+        assert!(
+            (wall - 0.2).abs() < 1e-12,
+            "wall dt must not clamp; got {wall}"
+        );
+        assert!(
+            (clamped - 0.1).abs() < 1e-12,
+            "clamped dt must cap at 0.1; got {clamped}"
+        );
     }
 
     #[test]
@@ -2674,22 +2713,27 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
+        let mut world = sim::World::new(6); // side 64
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
         for beat in [
             LatticeDemoBeat::Intro,
             LatticeDemoBeat::Interior,
             LatticeDemoBeat::Panorama,
         ] {
-            let waypoint = lattice_demo_waypoint(2048, beat);
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
             for axis in [0, 1, 2] {
                 assert!(waypoint.player.pos[axis] > 0.0);
-                assert!(waypoint.player.pos[axis] < 2048.0);
+                assert!(waypoint.player.pos[axis] < side as f64);
             }
         }
     }
 
     #[test]
     fn lattice_panorama_waypoint_faces_inward_and_upward() {
-        let waypoint = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let waypoint = lattice_demo_waypoint(world.side(), &layout, LatticeDemoBeat::Panorama);
         let (_eye, dir) = player::eye_ray(
             &waypoint.player.pos,
             waypoint.player.yaw,
@@ -2702,12 +2746,46 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_are_distinct() {
-        let intro = lattice_demo_waypoint(512, LatticeDemoBeat::Intro);
-        let interior = lattice_demo_waypoint(512, LatticeDemoBeat::Interior);
-        let panorama = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        let intro = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Intro);
+        let interior = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Interior);
+        let panorama = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Panorama);
         assert_ne!(intro.label, interior.label);
         assert_ne!(interior.label, panorama.label);
         assert_ne!(intro.player.pos, panorama.player.pos);
+    }
+
+    /// ptew: player was landing embedded in solid lattice cells because
+    /// the beat waypoints were hardcoded normalized fractions that did
+    /// not track the scene geometry. This test seeds the real scene and
+    /// asserts that every beat's spawn cell is walkable AND grounded, so
+    /// the class of bug cannot regress silently.
+    #[test]
+    fn lattice_demo_waypoints_do_not_collide_with_scene() {
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        for beat in [
+            LatticeDemoBeat::Intro,
+            LatticeDemoBeat::Interior,
+            LatticeDemoBeat::Panorama,
+        ] {
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
+            assert!(
+                !player::player_collides(&world, &waypoint.player.pos),
+                "{:?} waypoint must spawn in AIR: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+            assert!(
+                player::is_grounded(&world, &waypoint.player.pos),
+                "{:?} waypoint must have floor support: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+        }
     }
 
     #[test]
@@ -2833,11 +2911,9 @@ mod tests {
     fn orbit_legend_marks_lattice_jumps_as_debug() {
         let lines = App::legend_lines(CameraMode::Orbit);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("DEV intro/interior/reveal"))
-        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("DEV intro/interior/reveal")));
         // a9jd: `[`, `]`, `U`/`I`/`O` remain DEV beat-cycle jumps, but `V`
         // is the user-facing panorama reveal — not a DEV-only key.
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
@@ -3005,8 +3081,7 @@ mod tests {
         for mode in [CameraMode::FirstPerson, CameraMode::Orbit] {
             for focused in [false, true] {
                 for occluded in [false, true] {
-                    let expected =
-                        mode == CameraMode::FirstPerson && focused && !occluded;
+                    let expected = mode == CameraMode::FirstPerson && focused && !occluded;
                     assert_eq!(
                         should_capture_cursor(mode, focused, occluded),
                         expected,
@@ -3125,7 +3200,10 @@ mod tests {
         }
         let (yaw, _pitch) = player_look(&mut app);
         assert!(yaw >= -pi, "yaw {yaw} below -π after accumulation");
-        assert!(yaw < pi, "yaw {yaw} not strictly below +π after accumulation");
+        assert!(
+            yaw < pi,
+            "yaw {yaw} not strictly below +π after accumulation"
+        );
     }
 
     #[test]
@@ -3234,7 +3312,10 @@ mod tests {
         // Post-flip: MouseMotion must now be dropped.
         app.handle_mouse_motion(999.0, 999.0);
         let (yaw, pitch) = player_look(&mut app);
-        assert!((yaw - yaw_cap).abs() < 1e-12, "MouseMotion dropped after flip");
+        assert!(
+            (yaw - yaw_cap).abs() < 1e-12,
+            "MouseMotion dropped after flip"
+        );
         assert!((pitch - pitch_cap).abs() < 1e-12);
 
         // Post-flip: CursorMoved must apply again. Re-seed so the first
@@ -3332,8 +3413,7 @@ mod tests {
         let mut app = App::new(64);
         app.enter_occluded_state();
         // Pretend the app sat paused for two seconds.
-        app.last_frame = std::time::Instant::now()
-            - std::time::Duration::from_secs(2);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
         app.leave_occluded_state();
 
