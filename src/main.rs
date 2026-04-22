@@ -1343,6 +1343,12 @@ impl App {
 
     fn load_lattice_demo(&mut self) {
         if self.is_stepping() {
+            // Without this log the `n` key looks dead during a long sim
+            // step — see hash-thing-1a1n. The completion log at the end
+            // of this function covers the success path.
+            log::info!(
+                "load_lattice_demo: deferred — background sim step in flight"
+            );
             return;
         }
         let start = std::time::Instant::now();
@@ -1653,35 +1659,28 @@ impl ApplicationHandler for App {
                         winit::keyboard::Key::Character("n") => {
                             self.load_lattice_demo();
                         }
-                        winit::keyboard::Key::Character("[")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.cycle_lattice_demo_beat(-1);
-                        }
-                        winit::keyboard::Key::Character("]")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.cycle_lattice_demo_beat(1);
-                        }
-                        winit::keyboard::Key::Character("u")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Intro);
-                        }
-                        winit::keyboard::Key::Character("i")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Interior);
-                        }
-                        winit::keyboard::Key::Character("o")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
-                        }
-                        winit::keyboard::Key::Character("v")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.load_lattice_panorama_demo();
+                        winit::keyboard::Key::Character(k @ ("[" | "]" | "u" | "i" | "o" | "v")) => {
+                            // Lattice-demo debug jumps are orbit-only:
+                            // teleporting the camera between scripted
+                            // beats is useful when previewing the demo,
+                            // less so while the player is walking around
+                            // in FPS mode. Log the silent branch so the
+                            // key doesn't feel dead (hash-thing-1a1n).
+                            if self.lattice_debug_jumps_enabled() {
+                                match k {
+                                    "[" => self.cycle_lattice_demo_beat(-1),
+                                    "]" => self.cycle_lattice_demo_beat(1),
+                                    "u" => self.select_lattice_demo_beat(LatticeDemoBeat::Intro),
+                                    "i" => self.select_lattice_demo_beat(LatticeDemoBeat::Interior),
+                                    "o" => self.select_lattice_demo_beat(LatticeDemoBeat::Panorama),
+                                    "v" => self.load_lattice_panorama_demo(),
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                log::info!(
+                                    "{k}: lattice debug jump — orbit mode only (Tab to switch camera)"
+                                );
+                            }
                         }
                         winit::keyboard::Key::Character(
                             n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
