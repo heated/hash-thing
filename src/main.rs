@@ -910,6 +910,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.exit_lattice_demo_mode();
         log::info!(
             "Initial scene: terrain pop={} nodes={} gen={}µs",
             self.world.population(),
@@ -1478,6 +1479,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.exit_lattice_demo_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -1560,6 +1562,17 @@ impl App {
         }
     }
 
+    /// Zero the lattice-demo beat/cut state. Called from every non-lattice
+    /// scene loader so an in-flight V cut (short_demo_cut = Some(_)) does not
+    /// advance after the user explicitly swapped scenes via B/G/M/terrain —
+    /// otherwise `update_lattice_short_demo_cut` would next frame call
+    /// `load_lattice_demo_beat` and yank the user back into the lattice scene
+    /// (hash-thing-0p0s).
+    fn exit_lattice_demo_mode(&mut self) {
+        self.current_demo_beat = None;
+        self.short_demo_cut = None;
+    }
+
     #[allow(dead_code)]
     fn load_burning_room_demo(&mut self, label: &str) {
         if self.is_stepping() {
@@ -1582,7 +1595,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
-        self.current_demo_beat = None;
+        self.exit_lattice_demo_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -1624,7 +1637,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
-        self.current_demo_beat = None;
+        self.exit_lattice_demo_mode();
         log::info!(
             "Gyroid megastructure: pop={} gen={:.1}ms collapses={} classifies={}",
             self.world.population(),
@@ -1654,6 +1667,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.exit_lattice_demo_mode();
         log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
     }
 
@@ -1737,8 +1751,7 @@ impl App {
             self.noise_ns_per_sample,
         );
         self.sync_render_cache();
-        self.current_demo_beat = None;
-        self.short_demo_cut = None;
+        self.exit_lattice_demo_mode();
     }
 }
 
