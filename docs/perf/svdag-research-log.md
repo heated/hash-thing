@@ -71,13 +71,13 @@ The existing literature treats performance and content separately: the engine pr
 
 ### 1.4 Margolus-in-hashlife (open theory question)
 
-`hash-thing-4497` asks: can macro-pow2 hashlife composes with 2×2×2 Margolus block rules? The phase shift between recursion levels is not obviously compatible with Gosper's step-doubling. We do not know of prior art that has answered this. It is a genuine open theory question, not a debugging task.
+`hash-thing-4497` asks: can macro-pow2 hashlife compose with 2×2×2 Margolus block rules? The phase shift between recursion levels is not obviously compatible with Gosper's step-doubling. We do not know of prior art that has answered this. It is a genuine open theory question, not a debugging task.
 
 ---
 
 ## 2. Ongoing threads
 
-Live research questions. Each has a one-liner, current status, "last moved" date, and the beads that feed it. New entries come in via experiment-log (§3); promotions out go to §4.
+Live research questions. Each thread carries: Question, Why it matters, Status (with "last moved" date), feeding beads, and paper sections it feeds into. New entries come in via experiment-log (§3); promotions out go to §4.
 
 ### 2.1 GPU spatial memo
 
