@@ -55,7 +55,7 @@ We sit at an intersection that the published literature does not cover well. The
 
 Hashlife (Gosper 1984) is CPU-only in the literature. The recursive memoized macro-step is the whole technique, and every published implementation we can find runs it on a single thread. Published GPU cellular-automata work (Lefebvre et al. and successors) does Life-class rules at per-cell parallelism with no pow2-step compression: they get the SIMD win but not the macro-step win.
 
-Our CPU `step_recursive_pow2` + nascent GPU memo exploration (`hash-thing-abwm`) sit in the unclaimed gap. If the spike succeeds, it is novel ground. If it fails for a principled reason (GPU hash-table throughput bounds macro-step dispatch to below CPU throughput at our scales), *that refutation is also novel ground* — we would be the first to publish it.
+Our CPU `step_recursive_pow2` + nascent GPU memo exploration (`hash-thing-abwm`) sit in the unclaimed gap. If the spike succeeds, it is novel ground. If it fails for a principled reason (GPU hash-table throughput bounds macro-step dispatch to below CPU throughput at our scales), *that refutation is also novel ground* — nobody has written it down.
 
 ### 1.2 No SVDAG with per-tick mutation in the literature
 
@@ -109,7 +109,7 @@ Live research questions. Each has a one-liner, current status, "last moved" date
 
 **Why it matters.** Budget-gating decisions (how much churn admits 60 fps, what scene shape stays in L2) depend on the memo model. Characterizing the curve is what lets us make "this scene is too expensive, change the design" an honest call.
 
-**Status (2026-04-23).** Partially characterized: `hash-thing-slc1 / heyw / 4hkq / e092 / cz0r` measured scaling on several scenes. Data exists; this thread is close to graduating — needs one pass to consolidate into a model-shaped entry. Good candidate for the first dated §3 entry.
+**Status (2026-04-23).** Partially characterized: `hash-thing-slc1 / heyw / 4hkq / e092 / cz0r` measured scaling on several scenes. Data exists; consolidation pass not yet run. Good candidate for the first dated §3 entry.
 
 **Feeds from.** `hash-thing-slc1`, `hash-thing-heyw`, `hash-thing-4hkq`, `hash-thing-e092`, `hash-thing-cz0r`.
 
@@ -121,7 +121,7 @@ Live research questions. Each has a one-liner, current status, "last moved" date
 
 **Why it matters.** The SPEC.md 2026-04-20 principle is a claim, not a result. We have the intuition (dedup rate, reachable-DAG size), the infrastructure (bench harness, material knobs), and the motive (4096³ with streaming needs *some* optimum to aim for). We do not yet have a paired A/B measurement that pins it down.
 
-**Status (2026-04-23).** No experiments yet. Needs someone to construct the A/B pair (e.g., uniform-random-grid vs. structurally-repetitive scene, same voxel count, same rule mix) and measure render_gpu + upload_cpu + step over a fixed sim horizon. Most leveraged first §3 entry if a seat wants a meaty log contribution.
+**Status (2026-04-23).** No experiments yet. Needs someone to construct the A/B pair (e.g., uniform-random-grid vs. structurally-repetitive scene, same voxel count, same rule mix) and measure render_gpu + upload_cpu + step over a fixed sim horizon. Highest-leverage first §3 entry — this is the claim the paper has not yet numerically defended.
 
 **Feeds from.** SPEC.md §Core goals (2026-04-20 principle).
 
