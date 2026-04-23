@@ -214,7 +214,16 @@ pub struct World {
     pub level: u32, // root level — grid is 2^level per side
     pub generation: u64,
     pub simulation_seed: u64,
-    pub materials: MaterialRegistry,
+    /// Crate-private — external mutation is structurally blocked
+    /// (hash-thing-6iiz). Any mutation (whole-registry replacement,
+    /// `set_tick_divisor`, `assign_block_rule`, `register_block_rule`, etc.)
+    /// MUST route through [`Self::mutate_materials`] or a safe mutator built
+    /// on top of it. Bare `world.materials.X(...)` from within the crate
+    /// bypasses cache invalidation: cached `block_rule_present` goes stale,
+    /// the 4497 brute-force fallback in `step_recursive_pow2` is skipped
+    /// against a block-rule-present registry, and macro-cached results are
+    /// wrong. Intra-crate reads via direct field access are fine.
+    pub(crate) materials: MaterialRegistry,
     /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
     /// `ensure_region` generates terrain (heightmap)
     /// for newly-created sibling octants instead of leaving them empty.
@@ -482,36 +491,68 @@ impl World {
         }
     }
 
-    /// Invalidate caches whose keys depend on the active CA rule.
-    pub fn invalidate_rule_caches(&mut self) {
+    /// Read-only accessor for the embedded material registry (hash-thing-6iiz).
+    /// Mutation must route through [`Self::mutate_materials`] to keep
+    /// material-dependent caches in sync.
+    pub fn materials(&self) -> &MaterialRegistry {
+        &self.materials
+    }
+
+    /// Invalidate every cache whose contents depend on the material registry.
+    /// Covers the four hashlife caches keyed by NodeId (whose step function
+    /// depends on the active CA + block rules) AND the `block_rule_present`
+    /// flag (whose answer changes when block rules are added / removed /
+    /// re-assigned). Called by every mutation path via
+    /// [`Self::mutate_materials`] (hash-thing-6iiz).
+    ///
+    /// Renamed from the previous `invalidate_rule_caches` — that name was
+    /// misleading because it forgot `block_rule_present`, which was the root
+    /// cause of the dxi4.2 audit finding.
+    pub fn invalidate_material_caches(&mut self) {
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        self.block_rule_present = None;
+    }
+
+    /// Mutate the embedded material registry and invalidate every
+    /// material-dependent cache atomically (hash-thing-6iiz).
+    ///
+    /// All material mutation paths in the crate MUST go through this method.
+    /// Direct mutation via a `&mut MaterialRegistry` borrow bypasses
+    /// `block_rule_present` invalidation and corrupts the `step_recursive_pow2`
+    /// macro path (see the 4497 fallback in `src/sim/hashlife.rs`).
+    ///
+    /// Accepts both in-place edits (`|m| m.assign_block_rule(...)`) and
+    /// whole-registry replacement (`|m| *m = MaterialRegistry::new(...)`).
+    pub fn mutate_materials<R>(&mut self, f: impl FnOnce(&mut MaterialRegistry) -> R) -> R {
+        let r = f(&mut self.materials);
+        self.invalidate_material_caches();
+        r
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
     ///
-    /// This also invalidates rule-dependent caches because the CA dispatch
-    /// table changes even though the octree content does not.
+    /// Routes through `mutate_materials` to keep material-dependent caches
+    /// in sync — the CA dispatch table changes even though the octree content
+    /// does not.
     pub fn set_gol_smoke_rule(&mut self, rule: GameOfLife3D) {
-        self.materials = MaterialRegistry::gol_smoke_with_rule(rule);
-        self.invalidate_rule_caches();
+        self.mutate_materials(|m| *m = MaterialRegistry::gol_smoke_with_rule(rule));
     }
 
-    /// Set the tick_divisor for a material and invalidate memo caches. The
-    /// hashlife cache key is `(NodeId, generation % memo_period())`, so
-    /// changing a divisor changes `memo_period()` and makes existing entries
-    /// unsound. Crate-private because production bakes divisors into the
-    /// registrar; this exists for tests and the future tuning bead (iowh).
+    /// Set the tick_divisor for a material. The hashlife cache key is
+    /// `(NodeId, generation % memo_period())`, so changing a divisor changes
+    /// `memo_period()` and makes existing entries unsound. Crate-private
+    /// because production bakes divisors into the registrar; this exists for
+    /// tests and the future tuning bead (iowh).
     #[allow(dead_code)]
     pub(crate) fn set_material_tick_divisor(
         &mut self,
         material_id: crate::terrain::materials::MaterialId,
         divisor: u16,
     ) {
-        self.materials.set_tick_divisor(material_id, divisor);
-        self.invalidate_rule_caches();
+        self.mutate_materials(|m| m.set_tick_divisor(material_id, divisor));
     }
 
     /// Convert world coordinate to local on a specific axis index (0=x, 1=y, 2=z).
@@ -2541,7 +2582,7 @@ mod tests {
 
     fn gol_world(rule: GameOfLife3D) -> World {
         let mut world = empty_world();
-        world.materials = MaterialRegistry::gol_smoke_with_rule(rule);
+        world.set_gol_smoke_rule(rule);
         world
     }
 
@@ -3727,15 +3768,13 @@ mod tests {
     #[test]
     fn fan_pushes_steam_without_resetting_age_in_recursive_runtime_path() {
         let mut world = empty_world();
-        let identity = world
-            .materials
-            .register_block_rule(crate::sim::margolus::IdentityBlockRule);
-        world
-            .materials
-            .assign_block_rule(STEAM_MATERIAL_ID, identity);
-        for material_id in FAN_ARMED_STEAM_MATERIAL_IDS {
-            world.materials.assign_block_rule(material_id, identity);
-        }
+        world.mutate_materials(|m| {
+            let identity = m.register_block_rule(crate::sim::margolus::IdentityBlockRule);
+            m.assign_block_rule(STEAM_MATERIAL_ID, identity);
+            for material_id in FAN_ARMED_STEAM_MATERIAL_IDS {
+                m.assign_block_rule(material_id, identity);
+            }
+        });
         world.set(wc(1), wc(1), wc(2), FAN);
         world.set(wc(2), wc(1), wc(2), Cell::pack(STEAM_MATERIAL_ID, 14).raw());
 
@@ -3752,15 +3791,13 @@ mod tests {
     #[test]
     fn fan_pushes_firework_without_resetting_fuse_in_recursive_runtime_path() {
         let mut world = empty_world();
-        let identity = world
-            .materials
-            .register_block_rule(crate::sim::margolus::IdentityBlockRule);
-        world
-            .materials
-            .assign_block_rule(FIREWORK_MATERIAL_ID, identity);
-        for material_id in FAN_ARMED_FIREWORK_MATERIAL_IDS {
-            world.materials.assign_block_rule(material_id, identity);
-        }
+        world.mutate_materials(|m| {
+            let identity = m.register_block_rule(crate::sim::margolus::IdentityBlockRule);
+            m.assign_block_rule(FIREWORK_MATERIAL_ID, identity);
+            for material_id in FAN_ARMED_FIREWORK_MATERIAL_IDS {
+                m.assign_block_rule(material_id, identity);
+            }
+        });
         world.set(wc(1), wc(1), wc(2), FAN);
         world.set(
             wc(2),
@@ -3861,25 +3898,25 @@ mod tests {
     /// consistent schedule.
     fn gravity_world(materials_with_gravity: &[u16]) -> World {
         let mut world = World::new(3); // 8x8x8
-        for &mat_id in materials_with_gravity {
-            world.set_material_tick_divisor(mat_id, 1);
-        }
-        let gravity_id = world
-            .materials
-            .register_block_rule(GravityBlockRule::new(simple_density));
-        for &mat_id in materials_with_gravity {
-            world.materials.assign_block_rule(mat_id, gravity_id);
-        }
+        world.mutate_materials(|m| {
+            for &mat_id in materials_with_gravity {
+                m.set_tick_divisor(mat_id, 1);
+            }
+            let gravity_id = m.register_block_rule(GravityBlockRule::new(simple_density));
+            for &mat_id in materials_with_gravity {
+                m.assign_block_rule(mat_id, gravity_id);
+            }
+        });
         world
     }
 
     #[test]
     fn identity_block_rule_leaves_world_unchanged() {
         let mut world = World::new(3);
-        let identity_id = world.materials.register_block_rule(IdentityBlockRule);
-        world
-            .materials
-            .assign_block_rule(STONE_MATERIAL_ID, identity_id);
+        world.mutate_materials(|m| {
+            let identity_id = m.register_block_rule(IdentityBlockRule);
+            m.assign_block_rule(STONE_MATERIAL_ID, identity_id);
+        });
 
         // Place some stone cells.
         world.set(wc(2), wc(4), wc(2), STONE);
@@ -5636,5 +5673,88 @@ mod tests {
         let mut col = vec![sand, 0];
         assert!(!gravity_gap_fill_column(&mut col, &mat));
         assert_eq!(col, vec![sand, 0]);
+    }
+
+    // -----------------------------------------------------------------
+    // hash-thing-6iiz: mutate_materials cache-invalidation invariants
+    // -----------------------------------------------------------------
+
+    /// Force all five material-dependent caches into a populated state and
+    /// seed `block_rule_present` so the invariant tests can observe clearing.
+    fn prime_material_caches(world: &mut World) {
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world.hashlife_inert_cache.insert(NodeId::EMPTY, None);
+        world.hashlife_all_inert_cache.insert(NodeId::EMPTY, true);
+        world.block_rule_present = Some(false);
+    }
+
+    fn assert_material_caches_cleared(world: &World) {
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "hashlife_cache not cleared"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "hashlife_macro_cache not cleared"
+        );
+        assert!(
+            world.hashlife_inert_cache.is_empty(),
+            "hashlife_inert_cache not cleared"
+        );
+        assert!(
+            world.hashlife_all_inert_cache.is_empty(),
+            "hashlife_all_inert_cache not cleared"
+        );
+        assert_eq!(
+            world.block_rule_present, None,
+            "block_rule_present not cleared — dxi4.2 invariant regression"
+        );
+    }
+
+    /// `mutate_materials` must clear `block_rule_present` so the
+    /// `step_recursive_pow2` 4497 brute-force fallback stays correct after a
+    /// block-rule assignment (hash-thing-6iiz / dxi4.2).
+    #[test]
+    fn mutate_materials_invalidates_block_rule_present() {
+        let mut world = empty_world();
+        prime_material_caches(&mut world);
+
+        world.mutate_materials(|m| {
+            let identity = m.register_block_rule(crate::sim::margolus::IdentityBlockRule);
+            m.assign_block_rule(crate::terrain::materials::STONE_MATERIAL_ID, identity);
+        });
+
+        assert_material_caches_cleared(&world);
+    }
+
+    /// `set_gol_smoke_rule` routes through `mutate_materials`; it must invalidate
+    /// all material-dependent caches, including `block_rule_present` (widened
+    /// semantics from the `invalidate_rule_caches` → `invalidate_material_caches`
+    /// rename).
+    #[test]
+    fn set_gol_smoke_rule_invalidates_all_material_caches() {
+        let mut world = empty_world();
+        prime_material_caches(&mut world);
+
+        world.set_gol_smoke_rule(GameOfLife3D::rule445());
+
+        assert_material_caches_cleared(&world);
+    }
+
+    /// `set_material_tick_divisor` routes through `mutate_materials`; same
+    /// coverage as the smoke-rule test.
+    #[test]
+    fn set_material_tick_divisor_invalidates_all_material_caches() {
+        let mut world = empty_world();
+        prime_material_caches(&mut world);
+
+        world.set_material_tick_divisor(crate::terrain::materials::WATER_MATERIAL_ID, 1);
+
+        assert_material_caches_cleared(&world);
     }
 }
