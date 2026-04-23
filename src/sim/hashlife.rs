@@ -1788,8 +1788,8 @@ mod tests {
         // rvsh: terrain_defaults now ships water at divisor=2, so `fast`
         // must explicitly reset to 1 to keep this test a d=1 vs d=2 contrast
         // independent of the registry's default pick.
-        fast.materials.set_tick_divisor(WATER_MATERIAL_ID, 1);
-        slow.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+        fast.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 1));
+        slow.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 2));
 
         let water = Cell::pack(WATER_MATERIAL_ID, 0).raw();
         // Water near the top of the world with clear air below.
@@ -1848,7 +1848,7 @@ mod tests {
         use crate::terrain::materials::FIRE_MATERIAL_ID;
         let mut fast = World::new(3); // 8³, divisor=1 (default)
         let mut slow = World::new(3); // 8³, divisor=2 for fire
-        slow.materials.set_tick_divisor(FIRE_MATERIAL_ID, 2);
+        slow.mutate_materials(|m| m.set_tick_divisor(FIRE_MATERIAL_ID, 2));
 
         let fire = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
 
@@ -1895,7 +1895,7 @@ mod tests {
     fn tick_divisor_two_preserves_water_mass_conservation() {
         use crate::terrain::materials::WATER_MATERIAL_ID;
         let mut world = World::new(5); // 32³
-        world.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+        world.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 2));
         for y in 8..24 {
             world.set(
                 wc(16),
@@ -1932,7 +1932,7 @@ mod tests {
 
         let seed_world = || {
             let mut w = World::new(LEVEL);
-            w.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+            w.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 2));
             for y in WATER_COL_Y_RANGE {
                 w.set(
                     wc(WATER_COL_X),
