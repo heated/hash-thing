@@ -792,10 +792,9 @@ impl App {
     /// `suppress_next_fps_sample = true` so the next FPS sample is
     /// skipped, not blended. The two operations are one contract; this
     /// helper is the only site that implements it — do not inline it.
-    /// (Cold-start scene-load has the same shape at
-    /// `WindowEvent::RedrawRequested` / `startup_scene_pending`;
-    /// routing that through this helper is hash-thing-6e4a's
-    /// territory, currently blocked on breakdown review.)
+    /// All four call sites (focus-gain, unocclude, scene swap, and the
+    /// cold-start-post-surface redraw block) share this contract
+    /// (hash-thing-v79j, hash-thing-6e4a).
     fn mark_resume_edge(&mut self) {
         self.last_frame = std::time::Instant::now();
         self.suppress_next_fps_sample = true;
@@ -3055,6 +3054,11 @@ mod tests {
         app.suppress_next_fps_sample = false;
 
         app.reset_scene_perf_state();
+        // reset_scene_perf_state's internal mark_resume_edge set
+        // last_frame = now. Sleep so dt_wall below is a realistic
+        // small frame-gap rather than ~zero; the suppress flag masks
+        // the actual magnitude, but this keeps the test faithful to
+        // the real redraw-block shape.
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         let dt_wall = app.last_frame.elapsed().as_secs_f64();
