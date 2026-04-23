@@ -6,6 +6,8 @@
 
 **Companion:** `docs/perf/svdag-perf-spec.md` — short re-derived intuition. The spec is regenerated from this paper, not edited in isolation. If the spec disagrees with the paper, the paper wins.
 
+**Research-agenda counterpart:** `docs/perf/svdag-research-log.md` — dated experiments, hypotheses, open frontiers. This paper carries the settled model; the research log carries the things we are still exploring. Findings graduate from the log into this paper when they survive a re-run and can be re-derived in paper style.
+
 ---
 
 ## 0. How to read this document
