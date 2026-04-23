@@ -197,7 +197,7 @@ pub struct MaterialEntry {
 
 pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
-    rules: Vec<Box<dyn CaRule + Send>>,
+    rules: Vec<CaRule>,
     block_rules: Vec<Box<dyn BlockRule + Send>>,
     // Caches rebuilt after any mutation touching entries / block_rules (hash-thing-5yxk).
     // The sim step hot path reads these every tick; recomputing per step would
@@ -215,7 +215,7 @@ impl Clone for MaterialRegistry {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
-            rules: self.rules.iter().map(|r| r.clone_box()).collect(),
+            rules: self.rules.clone(),
             block_rules: self.block_rules.iter().map(|r| r.clone_box()).collect(),
             cached_tick_divisor_flags: self.cached_tick_divisor_flags.clone(),
             cached_block_rule_tick_divisors: self.cached_block_rule_tick_divisors.clone(),
@@ -788,9 +788,9 @@ impl MaterialRegistry {
             .and_then(Option::as_ref)
     }
 
-    pub fn rule_for_cell(&self, cell: Cell) -> Option<&dyn CaRule> {
+    pub fn rule_for_cell(&self, cell: Cell) -> Option<&CaRule> {
         let entry = self.entry(cell.material())?;
-        Some(self.rules[entry.rule_id.0].as_ref())
+        Some(&self.rules[entry.rule_id.0])
     }
 
     pub fn block_rule_for_cell(&self, cell: Cell) -> Option<&dyn BlockRule> {
@@ -967,12 +967,9 @@ impl MaterialRegistry {
         palette
     }
 
-    fn register_rule<R>(&mut self, rule: R) -> RuleId
-    where
-        R: CaRule + Send + 'static,
-    {
+    fn register_rule(&mut self, rule: impl Into<CaRule>) -> RuleId {
         let rule_id = RuleId(self.rules.len());
-        self.rules.push(Box::new(rule));
+        self.rules.push(rule.into());
         // hash-thing-2z3g: rebuild participates in the noop cache
         // invariant. Without this, a construction path that inserts a
         // material with a placeholder `rule_id` and only *later* registers

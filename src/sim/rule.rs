@@ -9,13 +9,63 @@ const FACE_NEIGHBOR_INDICES: [usize; 6] = [4, 10, 12, 13, 15, 21];
 ///
 /// Rules are pure local transforms: they inspect only the center cell and its
 /// neighbors and return the next cell state for that center.
-pub trait CaRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell;
+///
+/// # Dispatch (hash-thing-vvun)
+///
+/// This is an enum, not a trait — replacing the former `Box<dyn CaRule + Send>`
+/// vtable dispatch with a tagged match. Per jw3k.2 scout, dispatch removal
+/// targets ~5-25% phase1 reduction at the 64³ water scout. Each payload keeps
+/// its current struct and an inherent `step_cell` method; the enum `step_cell`
+/// just dispatches to the right arm. `From<X> for CaRule` impls preserve the
+/// readable call-site shape `registry.register_rule(AirRule { ... })`.
+#[derive(Debug, Clone)]
+pub enum CaRule {
+    Air(AirRule),
+    Fan(FanRule),
+    FanDriven(Box<FanDrivenRule>),
+    Noop(NoopRule),
+    Fire(FireRule),
+    Water(WaterRule),
+    Lava(LavaRule),
+    Ice(IceRule),
+    Flammable(FlammableRule),
+    Vine(VineRule),
+    AirVineGrowth(AirVineGrowthRule),
+    Acid(AcidRule),
+    Dissolvable(DissolvableRule),
+    Steam(SteamRule),
+    Firework(FireworkRule),
+    GameOfLife3D(GameOfLife3D),
+}
+
+impl CaRule {
+    #[inline]
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+        match self {
+            CaRule::Air(r) => r.step_cell(center, neighbors),
+            CaRule::Fan(_) => center,
+            CaRule::FanDriven(r) => r.step_cell(center, neighbors),
+            CaRule::Noop(_) => center,
+            CaRule::Fire(r) => r.step_cell(center, neighbors),
+            CaRule::Water(r) => r.step_cell(center, neighbors),
+            CaRule::Lava(r) => r.step_cell(center, neighbors),
+            CaRule::Ice(r) => r.step_cell(center, neighbors),
+            CaRule::Flammable(r) => r.step_cell(center, neighbors),
+            CaRule::Vine(r) => r.step_cell(center, neighbors),
+            CaRule::AirVineGrowth(r) => r.step_cell(center, neighbors),
+            CaRule::Acid(r) => r.step_cell(center, neighbors),
+            CaRule::Dissolvable(r) => r.step_cell(center, neighbors),
+            CaRule::Steam(r) => r.step_cell(center, neighbors),
+            CaRule::Firework(r) => r.step_cell(center, neighbors),
+            CaRule::GameOfLife3D(r) => r.step_cell(center, neighbors),
+        }
+    }
 
     /// True if this rule always returns the center cell unchanged (identity).
     /// Used in the base-case inner loop to skip neighbor collection.
-    fn is_noop(&self) -> bool {
-        false
+    #[inline]
+    pub fn is_noop(&self) -> bool {
+        matches!(self, CaRule::Noop(_) | CaRule::Fan(_))
     }
 
     /// True if this rule is identity when all neighbors are the same material
@@ -24,15 +74,22 @@ pub trait CaRule {
     /// because internal cells never have cross-material neighbors. Boundary
     /// interactions are handled by the 27-intermediate overlap in the parent.
     ///
-    /// Default: delegates to `is_noop()`. Override for conditionally-noop rules
-    /// like DissolvableRule (identity unless acid is adjacent).
-    fn is_self_inert(&self) -> bool {
-        self.is_noop()
+    /// Every override on a former trait impl must appear here explicitly —
+    /// the catch-all uses `is_noop()` (the former trait default). Missing an
+    /// override silently regresses the hashlife inert-subtree short-circuit in
+    /// `MaterialRegistry::cell_is_inert_fixed_point` (dropping self-inert for
+    /// AirVineGrowthRule / FanDrivenRule kills the fast path for fan-static
+    /// and uniform-air-with-vine subtrees).
+    #[inline]
+    pub fn is_self_inert(&self) -> bool {
+        match self {
+            CaRule::Air(_) => true,
+            CaRule::AirVineGrowth(_) => true,
+            CaRule::Dissolvable(_) => true,
+            CaRule::FanDriven(r) => r.base.is_self_inert(),
+            other => other.is_noop(),
+        }
     }
-
-    /// Clone into a boxed trait object. Enables Clone for MaterialRegistry
-    /// (and transitively World) for snapshots, undo, and testing.
-    fn clone_box(&self) -> Box<dyn CaRule + Send>;
 }
 
 /// A block-based CA rule operating on 2x2x2 cell blocks.
@@ -216,8 +273,8 @@ pub struct AirRule {
     pub vine_growth: Option<AirVineGrowthRule>,
 }
 
-impl CaRule for AirRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl AirRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(center.is_empty(), "AirRule should only dispatch for AIR");
         for dir in FanDirection::ALL {
             let (dx, dy, dz) = dir.delta();
@@ -239,13 +296,11 @@ impl CaRule for AirRule {
             .map(|rule| rule.step_cell(center, neighbors))
             .unwrap_or(Cell::EMPTY)
     }
+}
 
-    fn is_self_inert(&self) -> bool {
-        true
-    }
-
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(self.clone())
+impl From<AirRule> for CaRule {
+    fn from(r: AirRule) -> CaRule {
+        CaRule::Air(r)
     }
 }
 
@@ -254,17 +309,16 @@ impl CaRule for AirRule {
 #[derive(Clone, Copy, Debug)]
 pub struct FanRule;
 
-impl CaRule for FanRule {
-    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+impl FanRule {
+    #[inline]
+    pub fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
         center
     }
+}
 
-    fn is_noop(&self) -> bool {
-        true
-    }
-
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(*self)
+impl From<FanRule> for CaRule {
+    fn from(r: FanRule) -> CaRule {
+        CaRule::Fan(r)
     }
 }
 
@@ -273,8 +327,9 @@ impl CaRule for FanRule {
 /// Most materials use the high metadata band for the transient "armed" state.
 /// Age-bearing particles can instead route that state through dedicated
 /// carry-material IDs so their payload metadata stays intact.
+#[derive(Clone)]
 pub struct FanDrivenRule {
-    base: Box<dyn CaRule + Send>,
+    pub(crate) base: Box<CaRule>,
     fan_material: u16,
     transport: FanTransport,
 }
@@ -288,27 +343,21 @@ impl fmt::Debug for FanDrivenRule {
 }
 
 impl FanDrivenRule {
-    pub fn new<R>(base: R, fan_material: u16) -> Self
-    where
-        R: CaRule + Send + 'static,
-    {
+    pub fn new(base: impl Into<CaRule>, fan_material: u16) -> Self {
         Self {
-            base: Box::new(base),
+            base: Box::new(base.into()),
             fan_material,
             transport: FanTransport::MetadataBand,
         }
     }
 
-    pub fn new_with_material_transport<R>(
-        base: R,
+    pub fn new_with_material_transport(
+        base: impl Into<CaRule>,
         fan_material: u16,
         carried_material: FanCarriedMaterial,
-    ) -> Self
-    where
-        R: CaRule + Send + 'static,
-    {
+    ) -> Self {
         Self {
-            base: Box::new(base),
+            base: Box::new(base.into()),
             fan_material,
             transport: FanTransport::MaterialChannel(carried_material),
         }
@@ -343,8 +392,8 @@ impl FanDrivenRule {
     }
 }
 
-impl CaRule for FanDrivenRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl FanDrivenRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         let center_base = self.decode_center(center);
         let base_next = self.base.step_cell(center_base, neighbors);
         if base_next.is_empty() || base_next.material() != center_base.material() {
@@ -365,35 +414,28 @@ impl CaRule for FanDrivenRule {
 
         base_next
     }
+}
 
-    fn is_self_inert(&self) -> bool {
-        self.base.is_self_inert()
-    }
-
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(Self {
-            base: self.base.clone_box(),
-            fan_material: self.fan_material,
-            transport: self.transport,
-        })
+impl From<FanDrivenRule> for CaRule {
+    fn from(r: FanDrivenRule) -> CaRule {
+        CaRule::FanDriven(Box::new(r))
     }
 }
 
 /// Identity rule for static materials. Returns the center cell unchanged.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct NoopRule;
 
-impl CaRule for NoopRule {
-    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+impl NoopRule {
+    #[inline]
+    pub fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
         center
     }
+}
 
-    fn is_noop(&self) -> bool {
-        true
-    }
-
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(NoopRule)
+impl From<NoopRule> for CaRule {
+    fn from(r: NoopRule) -> CaRule {
+        CaRule::Noop(r)
     }
 }
 
@@ -404,8 +446,8 @@ pub struct FireRule {
     pub quencher_material: u16,
 }
 
-impl CaRule for FireRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl FireRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(!center.is_empty(), "FireRule should not dispatch for AIR");
         if neighbors
             .iter()
@@ -421,21 +463,23 @@ impl CaRule for FireRule {
             Cell::EMPTY
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(self.clone())
+impl From<FireRule> for CaRule {
+    fn from(r: FireRule) -> CaRule {
+        CaRule::Fire(r)
     }
 }
 
 /// Water solidifies into a configured product when the reactive material is adjacent.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WaterRule {
     pub reactive_material: u16,
     pub reaction_product: Cell,
 }
 
-impl CaRule for WaterRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl WaterRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(!center.is_empty(), "WaterRule should not dispatch for AIR");
         if neighbors
             .iter()
@@ -446,12 +490,11 @@ impl CaRule for WaterRule {
             center
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(WaterRule {
-            reactive_material: self.reactive_material,
-            reaction_product: self.reaction_product,
-        })
+impl From<WaterRule> for CaRule {
+    fn from(r: WaterRule) -> CaRule {
+        CaRule::Water(r)
     }
 }
 
@@ -462,14 +505,14 @@ impl CaRule for WaterRule {
 /// is expected to catch fire via the terrain's FireRule on the next tick.
 /// The CaRule only transforms the center cell — neighbor ignition is a
 /// side-effect of the fire rule's fuel check seeing lava-heated grass.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LavaRule {
     pub water_material: u16,
     pub solidify_product: Cell,
 }
 
-impl CaRule for LavaRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl LavaRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(!center.is_empty(), "LavaRule should not dispatch for AIR");
         if neighbors
             .iter()
@@ -480,12 +523,11 @@ impl CaRule for LavaRule {
             center
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(LavaRule {
-            water_material: self.water_material,
-            solidify_product: self.solidify_product,
-        })
+impl From<LavaRule> for CaRule {
+    fn from(r: LavaRule) -> CaRule {
+        CaRule::Lava(r)
     }
 }
 
@@ -496,8 +538,8 @@ pub struct IceRule {
     pub melt_product: Cell,
 }
 
-impl CaRule for IceRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl IceRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(!center.is_empty(), "IceRule should not dispatch for AIR");
         if neighbors
             .iter()
@@ -508,21 +550,23 @@ impl CaRule for IceRule {
             center
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(self.clone())
+impl From<IceRule> for CaRule {
+    fn from(r: IceRule) -> CaRule {
+        CaRule::Ice(r)
     }
 }
 
 /// Flammable material catches fire from adjacent fire.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FlammableRule {
     pub fire_material: u16,
     pub fire_product: Cell,
 }
 
-impl CaRule for FlammableRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl FlammableRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(
             !center.is_empty(),
             "FlammableRule should not dispatch for AIR"
@@ -533,12 +577,11 @@ impl CaRule for FlammableRule {
             center
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(FlammableRule {
-            fire_material: self.fire_material,
-            fire_product: self.fire_product,
-        })
+impl From<FlammableRule> for CaRule {
+    fn from(r: FlammableRule) -> CaRule {
+        CaRule::Flammable(r)
     }
 }
 
@@ -550,8 +593,8 @@ pub struct VineRule {
     pub max_age: u16,
 }
 
-impl CaRule for VineRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl VineRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(!center.is_empty(), "VineRule should not dispatch for AIR");
         if neighbors.iter().any(|n| n.material() == self.acid_material) {
             Cell::EMPTY
@@ -564,9 +607,11 @@ impl CaRule for VineRule {
             )
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(self.clone())
+impl From<VineRule> for CaRule {
+    fn from(r: VineRule) -> CaRule {
+        CaRule::Vine(r)
     }
 }
 
@@ -578,8 +623,8 @@ pub struct AirVineGrowthRule {
     pub spread_age: u16,
 }
 
-impl CaRule for AirVineGrowthRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl AirVineGrowthRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(
             center.is_empty(),
             "AirVineGrowthRule should dispatch only for AIR"
@@ -597,13 +642,11 @@ impl CaRule for AirVineGrowthRule {
             center
         }
     }
+}
 
-    fn is_self_inert(&self) -> bool {
-        true
-    }
-
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(self.clone())
+impl From<AirVineGrowthRule> for CaRule {
+    fn from(r: AirVineGrowthRule) -> CaRule {
+        CaRule::AirVineGrowth(r)
     }
 }
 
@@ -614,8 +657,8 @@ pub struct AcidRule {
     pub dissolvable_materials: Vec<u16>,
 }
 
-impl CaRule for AcidRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl AcidRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(!center.is_empty(), "AcidRule should not dispatch for AIR");
         if neighbors
             .iter()
@@ -626,20 +669,22 @@ impl CaRule for AcidRule {
             center
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(self.clone())
+impl From<AcidRule> for CaRule {
+    fn from(r: AcidRule) -> CaRule {
+        CaRule::Acid(r)
     }
 }
 
 /// Material dissolves when adjacent to acid.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DissolvableRule {
     pub acid_material: u16,
 }
 
-impl CaRule for DissolvableRule {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl DissolvableRule {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(
             !center.is_empty(),
             "DissolvableRule should not dispatch for AIR"
@@ -650,27 +695,23 @@ impl CaRule for DissolvableRule {
             center
         }
     }
+}
 
-    fn is_self_inert(&self) -> bool {
-        true
-    }
-
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(DissolvableRule {
-            acid_material: self.acid_material,
-        })
+impl From<DissolvableRule> for CaRule {
+    fn from(r: DissolvableRule) -> CaRule {
+        CaRule::Dissolvable(r)
     }
 }
 
 /// Steam ages via metadata and condenses to water after a threshold.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SteamRule {
     pub condense_product: Cell,
     pub max_age: u16,
 }
 
-impl CaRule for SteamRule {
-    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+impl SteamRule {
+    pub fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(!center.is_empty(), "SteamRule should not dispatch for AIR");
         let age = center.metadata();
         if age >= self.max_age {
@@ -679,25 +720,24 @@ impl CaRule for SteamRule {
             Cell::pack(center.material(), age + 1)
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(SteamRule {
-            condense_product: self.condense_product,
-            max_age: self.max_age,
-        })
+impl From<SteamRule> for CaRule {
+    fn from(r: SteamRule) -> CaRule {
+        CaRule::Steam(r)
     }
 }
 
 /// Firework rises (via negative density in block rule) and explodes into fire
 /// after reaching a metadata age threshold.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FireworkRule {
     pub explode_product: Cell,
     pub fuse_length: u16,
 }
 
-impl CaRule for FireworkRule {
-    fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
+impl FireworkRule {
+    pub fn step_cell(&self, center: Cell, _neighbors: &[Cell; 26]) -> Cell {
         debug_assert!(
             !center.is_empty(),
             "FireworkRule should not dispatch for AIR"
@@ -709,12 +749,11 @@ impl CaRule for FireworkRule {
             Cell::pack(center.material(), age + 1)
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(FireworkRule {
-            explode_product: self.explode_product,
-            fuse_length: self.fuse_length,
-        })
+impl From<FireworkRule> for CaRule {
+    fn from(r: FireworkRule) -> CaRule {
+        CaRule::Firework(r)
     }
 }
 
@@ -768,8 +807,8 @@ impl fmt::Display for GameOfLife3D {
     }
 }
 
-impl CaRule for GameOfLife3D {
-    fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
+impl GameOfLife3D {
+    pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         let alive_count: u8 = neighbors
             .iter()
             .map(|neighbor| if neighbor.is_empty() { 0u8 } else { 1u8 })
@@ -786,9 +825,11 @@ impl CaRule for GameOfLife3D {
             Cell::EMPTY
         }
     }
+}
 
-    fn clone_box(&self) -> Box<dyn CaRule + Send> {
-        Box::new(*self)
+impl From<GameOfLife3D> for CaRule {
+    fn from(r: GameOfLife3D) -> CaRule {
+        CaRule::GameOfLife3D(r)
     }
 }
 
@@ -797,6 +838,99 @@ mod tests {
     //! Unit coverage for `GameOfLife3D` and the first registry-backed rules.
 
     use super::*;
+
+    /// Guards against a silent perf regression: if a future variant bloats the
+    /// enum above the cache-friendly budget, force the author to either box the
+    /// variant or consciously raise this cap. The 96-byte ceiling is picked per
+    /// the vvun plan (~72-byte estimate for the largest inline variant
+    /// `AirRule`, with headroom for alignment). See
+    /// `.ship-notes/plan-flint-hash-thing-vvun-enum-dispatch-carule.md`.
+    #[test]
+    fn carule_enum_size_budget() {
+        let bytes = std::mem::size_of::<CaRule>();
+        eprintln!("size_of::<CaRule>() = {bytes}");
+        assert!(
+            bytes <= 96,
+            "CaRule grew to {bytes} bytes — box the largest variant (likely AirRule) \
+             or raise the ceiling with measurement evidence."
+        );
+    }
+
+    /// Pins the `is_self_inert` truth table. The centralised match in
+    /// `CaRule::is_self_inert` uses a wildcard fall-through to `is_noop()` —
+    /// without this test, a future variant that needs to be self-inert could
+    /// silently regress `MaterialRegistry::cell_is_inert_fixed_point()` and
+    /// lose hashlife's inert-subtree fast path. Update the expected arms here
+    /// whenever an enum variant is added.
+    #[test]
+    fn carule_is_self_inert_truth_table() {
+        let air: CaRule = AirRule {
+            fan_material: 0,
+            carried_materials: Vec::new(),
+            vine_growth: None,
+        }
+        .into();
+        assert!(air.is_self_inert(), "AirRule must be self-inert");
+
+        let avg: CaRule = AirVineGrowthRule {
+            vine_material: 1,
+            support_materials: Vec::new(),
+            spread_age: 0,
+        }
+        .into();
+        assert!(avg.is_self_inert(), "AirVineGrowthRule must be self-inert");
+
+        let dissolvable: CaRule = DissolvableRule { acid_material: 1 }.into();
+        assert!(
+            dissolvable.is_self_inert(),
+            "DissolvableRule must be self-inert"
+        );
+
+        // FanDriven delegates to its base.
+        let fan_over_air: CaRule = FanDrivenRule::new(
+            AirRule {
+                fan_material: 0,
+                carried_materials: Vec::new(),
+                vine_growth: None,
+            },
+            1,
+        )
+        .into();
+        assert!(
+            fan_over_air.is_self_inert(),
+            "FanDriven(Air) must inherit self-inert from its base"
+        );
+        let fan_over_water: CaRule = FanDrivenRule::new(
+            WaterRule {
+                reactive_material: 1,
+                reaction_product: Cell::EMPTY,
+            },
+            1,
+        )
+        .into();
+        assert!(
+            !fan_over_water.is_self_inert(),
+            "FanDriven(Water) must not be self-inert (water is reactive)"
+        );
+
+        // Reactive rules are never self-inert.
+        let water: CaRule = WaterRule {
+            reactive_material: 1,
+            reaction_product: Cell::EMPTY,
+        }
+        .into();
+        assert!(!water.is_self_inert(), "WaterRule must not be self-inert");
+
+        // Noop/Fan wildcard arms fall through to is_noop(). This line
+        // pins the current behaviour so any future change is forced to
+        // update both arms deliberately (not silently).
+        let noop: CaRule = NoopRule.into();
+        assert_eq!(
+            noop.is_self_inert(),
+            noop.is_noop(),
+            "NoopRule wildcard arm must keep delegating to is_noop()"
+        );
+    }
 
     fn mat(material: u16) -> Cell {
         Cell::pack(material, 0)

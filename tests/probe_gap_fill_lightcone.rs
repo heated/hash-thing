@@ -108,16 +108,18 @@ fn print_summary(summary: &RunSummary) {
     let mut chains = summary.all_chains.clone();
     chains.sort_unstable();
     let total_swaps: u64 = summary.per_tick_swaps.iter().sum();
-    let ticks_with_swap = summary
-        .per_tick_swaps
-        .iter()
-        .filter(|&&s| s > 0)
-        .count();
+    let ticks_with_swap = summary.per_tick_swaps.iter().filter(|&&s| s > 0).count();
 
-    eprintln!("=== {} (side={}³, ticks={}) ===", summary.label, summary.side, summary.ticks);
+    eprintln!(
+        "=== {} (side={}³, ticks={}) ===",
+        summary.label, summary.side, summary.ticks
+    );
     eprintln!("  wall: {} ms", summary.wall_ms);
     eprintln!("  total swaps: {}", total_swaps);
-    eprintln!("  ticks with any swap: {} / {}", ticks_with_swap, summary.ticks);
+    eprintln!(
+        "  ticks with any swap: {} / {}",
+        ticks_with_swap, summary.ticks
+    );
     eprintln!(
         "  per-tick max chain:   p50={:>3}  p90={:>3}  p99={:>3}  max={:>3}",
         percentile(&maxes, 0.50),
@@ -150,7 +152,7 @@ fn sample(label: &str, world: &mut World, ticks: usize) -> RunSummary {
 
     let t0 = Instant::now();
     for _ in 0..ticks {
-        let materials = world.materials.clone();
+        let materials = world.materials().clone();
         let mut pre = world.step_returning_pre_gap_fill();
         let profile = gap_fill_probe(&mut pre, side, &materials);
         per_tick_max.push(profile.max_chain);
@@ -318,7 +320,7 @@ fn probe_matches_real_gap_fill_on_random_water() {
     }
     let mut scratch = world.flatten();
     let before: u64 = scratch.iter().filter(|&&c| c != 0).count() as u64;
-    let _ = gap_fill_probe(&mut scratch, side as usize, &world.materials);
+    let _ = gap_fill_probe(&mut scratch, side as usize, world.materials());
     let after: u64 = scratch.iter().filter(|&&c| c != 0).count() as u64;
     assert_eq!(before, after, "gap_fill_probe must conserve cell count");
 }
