@@ -901,7 +901,7 @@ impl App {
         self.paused = false;
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -918,7 +918,7 @@ impl App {
         );
         log::debug!(
             "Material registry palette slots={}",
-            self.world.materials.color_palette_rgba().len()
+            self.world.materials().color_palette_rgba().len()
         );
     }
 
@@ -1447,11 +1447,11 @@ impl App {
         if self.is_stepping() {
             return;
         }
-        self.world.invalidate_rule_caches();
+        self.world.invalidate_material_caches();
         if self.gol_smoke_scene {
             self.world.set_gol_smoke_rule(self.gol_smoke_rule);
             if let Some(renderer) = &mut self.renderer {
-                renderer.upload_palette(&self.world.materials.color_palette_rgba());
+                renderer.upload_palette(&self.world.materials().color_palette_rgba());
             }
         }
         log::info!("Rule: {label}");
@@ -1469,7 +1469,7 @@ impl App {
         self.paused = true;
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1573,7 +1573,7 @@ impl App {
         self.paused = true;
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1615,7 +1615,7 @@ impl App {
         self.paused = false; // Let materials interact immediately.
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1645,7 +1645,7 @@ impl App {
         self.paused = true;
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1677,7 +1677,7 @@ impl App {
         self.paused = false; // Let materials interact immediately.
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1764,7 +1764,7 @@ impl ApplicationHandler for App {
 
             let mut renderer =
                 pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
             // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
             // `surface.get_current_texture()` + `present()`; pairs with the
             // acquire harness to measure whether the ~25 ms surface_acquire
@@ -2598,7 +2598,7 @@ impl ApplicationHandler for App {
                                     renderer.hotbar_selected_slot =
                                         ps.held_material.saturating_sub(1) as u32;
                                     if !stepping {
-                                        let palette = self.world.materials.color_palette_rgba();
+                                        let palette = self.world.materials().color_palette_rgba();
                                         let mat = ps.held_material as usize;
                                         if mat < palette.len() {
                                             renderer.hud_material_color = palette[mat];
