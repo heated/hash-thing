@@ -774,17 +774,20 @@ impl World {
             return;
         }
 
+        let movable: [bool; 8] = std::array::from_fn(|i| {
+            let c = block[i];
+            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
+        });
+
         let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block);
+        let result = rule.step_block(&block, &movable);
 
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
                     let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let original = block[i];
-                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if has_rule || original.is_empty() {
+                    if movable[i] {
                         grid[idx] = result[i].raw();
                     }
                 }
@@ -821,17 +824,20 @@ impl World {
             None => return,
         };
 
+        let movable: [bool; 8] = std::array::from_fn(|i| {
+            let c = block[i];
+            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
+        });
+
         let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block);
+        let result = rule.step_block(&block, &movable);
 
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
                     let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let original = block[i];
-                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if has_rule || original.is_empty() {
+                    if movable[i] {
                         grid[idx] = result[i].raw();
                     }
                 }
@@ -1026,7 +1032,7 @@ mod tests {
     use super::*;
     use crate::sim::rule::ALIVE;
     use crate::sim::{GameOfLife3D, WorldCoord};
-    use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
+    use crate::terrain::materials::{DIRT_MATERIAL_ID, SAND_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
 
     fn wc(coord: u64) -> WorldCoord {
         WorldCoord(coord as i64)
@@ -2062,4 +2068,182 @@ mod tests {
         assert_eq!(grid[idx(0, 1, 0)], SAND, "y=1 received sand from y=2");
         assert_eq!(grid[idx(0, 2, 0)], 0, "y=2 became air");
     }
+
+    /// hash-thing-9yv2 regression test: stone above sand must not delete the sand.
+    ///
+    /// Before the fix, `apply_block_in_grid` would dispatch GravityBlockRule on a
+    /// block containing sand (rule-cell) + stone (no rule). The rule swapped on
+    /// density (stone 5.0 > sand 1.5), and the write-back filter only wrote
+    /// positions whose ORIGINAL cell had a rule — so stone's new position
+    /// (previously sand) got the stone value (sand deleted), and sand's new
+    /// position (previously stone) was skipped (stone stayed). Net: sand
+    /// vanished, stone duplicated. After 9yv2, BlockRule honors a `movable`
+    /// mask and refuses to swap an anchored cell, so the block is unchanged.
+    #[test]
+    fn repro_9yv2_inert_swap_deletes_rule_cell() {
+        use crate::terrain::materials::{SAND, STONE};
+        // Level-3 world = 8³. Place stone on top of sand so gravity rule swaps
+        // them in a single 2×2×2 block.
+        let mut world = World::new(3);
+        // Block (bx=0, by=0, bz=0) covers y=0 and y=1. Stone at y=1, sand at y=0.
+        world.set(wc(0), wc(0), wc(0), SAND);
+        world.set(wc(0), wc(1), wc(0), STONE);
+
+        let pre_sand = count_material(&world, 8, SAND_MATERIAL_ID);
+        let pre_stone = count_material(
+            &world,
+            8,
+            crate::terrain::materials::STONE_MATERIAL_ID,
+        );
+        assert_eq!(pre_sand, 1);
+        assert_eq!(pre_stone, 1);
+
+        world.step_recursive();
+
+        let post_sand = count_material(&world, 8, SAND_MATERIAL_ID);
+        let post_stone = count_material(
+            &world,
+            8,
+            crate::terrain::materials::STONE_MATERIAL_ID,
+        );
+
+        eprintln!("pre: sand={pre_sand} stone={pre_stone}");
+        eprintln!("post: sand={post_sand} stone={post_stone}");
+
+        assert_eq!(post_sand, 1, "sand cell was deleted");
+        assert_eq!(post_stone, 1, "phantom stone appeared");
+    }
+
+    /// hash-thing-9yv2 Phase 1: per-gen sandwich accounting.
+    ///
+    /// Seeds the same 64³ `water_and_sand` scene the v3b2 repro harness uses,
+    /// then at each generation splits `step_recursive` into two measured halves:
+    ///
+    /// 1. `step_margolus_only` — recursive memoised Margolus/block-rule descent.
+    /// 2. `apply_gap_fill_column_path` — per-column gravity settle.
+    ///
+    /// Records water + sand counts `W_pre / W_mid / W_post` and prints the
+    /// per-phase deltas. This tells us which sub-phase owns each cell lost.
+    ///
+    /// Invariant scope: the `seed_water_and_sand` scene has no fire / lava /
+    /// acid, so water and sand have no reactive partners — their counts must
+    /// be monotonic-non-decreasing. Any negative delta is the defect.
+    #[test]
+    #[ignore]
+    fn repro_9yv2_phase_mass_accounting_64() {
+        use crate::terrain::TerrainParams;
+
+        let level = 6u32;
+        let side = 1i64 << level;
+        let mut world = World::new(level);
+        let params = TerrainParams::for_level(level);
+        world
+            .seed_terrain(&params)
+            .expect("level-derived terrain params must validate");
+        world.seed_water_and_sand();
+
+        let w0 = count_material(&world, side, WATER_MATERIAL_ID);
+        let s0 = count_material(&world, side, SAND_MATERIAL_ID);
+        eprintln!("=== 9yv2 phase mass accounting: 64³ water_and_sand ===");
+        eprintln!("initial: water={w0} sand={s0}");
+        eprintln!("gen | water (pre→mid→post, Δmarg,Δgf) | sand (pre→mid→post, Δmarg,Δgf)");
+
+        for gen in 0..80u32 {
+            let w_pre = count_material(&world, side, WATER_MATERIAL_ID);
+            let s_pre = count_material(&world, side, SAND_MATERIAL_ID);
+
+            world.step_margolus_only();
+
+            let w_mid = count_material(&world, side, WATER_MATERIAL_ID);
+            let s_mid = count_material(&world, side, SAND_MATERIAL_ID);
+
+            if world.has_block_rule_cells() {
+                world.apply_gap_fill_column_path();
+            }
+
+            let w_post = count_material(&world, side, WATER_MATERIAL_ID);
+            let s_post = count_material(&world, side, SAND_MATERIAL_ID);
+
+            world.finalize_step_after_external_gap_fill();
+
+            let dw_m = w_mid as isize - w_pre as isize;
+            let dw_g = w_post as isize - w_mid as isize;
+            let ds_m = s_mid as isize - s_pre as isize;
+            let ds_g = s_post as isize - s_mid as isize;
+
+            if dw_m != 0 || dw_g != 0 || ds_m != 0 || ds_g != 0 {
+                eprintln!(
+                    "gen {gen:>2}: W {w_pre}→{w_mid}→{w_post} ({dw_m:+},{dw_g:+}) | \
+                     S {s_pre}→{s_mid}→{s_post} ({ds_m:+},{ds_g:+})",
+                );
+            }
+        }
+
+        let w_end = count_material(&world, side, WATER_MATERIAL_ID);
+        let s_end = count_material(&world, side, SAND_MATERIAL_ID);
+        eprintln!("end: water={w_end} (Δ={}) sand={s_end} (Δ={})", w_end as isize - w0 as isize, s_end as isize - s0 as isize);
+    }
+
+    /// hash-thing-9yv2 path comparison: brute `step()` vs hashlife `step_recursive()`
+    /// on the same pool-over-terrain scene. If brute preserves water mass and
+    /// hashlife doesn't, the defect is in hashlife recursion (step_node /
+    /// recursive_case), not in block-rule write-back.
+    #[test]
+    #[ignore]
+    fn repro_9yv2_brute_vs_recursive_water_mass() {
+        use crate::terrain::TerrainParams;
+        use crate::terrain::materials::WATER;
+
+        let level = 6u32;
+        let side = 1i64 << level;
+
+        let make_world = || -> World {
+            let mut w = World::new(level);
+            let params = TerrainParams::for_level(level);
+            w.seed_terrain(&params).expect("terrain");
+            let side_u = side as u64;
+            let center = side_u / 2;
+            let water_y = center + center / 4;
+            let pool_radius = side_u / 6;
+            let pool_depth = (side_u / 32).max(2);
+            let lo_x = center.saturating_sub(pool_radius);
+            let hi_x = (center + pool_radius).min(side_u);
+            let lo_z = center.saturating_sub(pool_radius);
+            let hi_z = (center + pool_radius).min(side_u);
+            for z in lo_z..hi_z {
+                for x in lo_x..hi_x {
+                    for dy in 0..pool_depth {
+                        let y = water_y + dy;
+                        if y < side_u {
+                            w.set(wc(x), wc(y), wc(z), WATER);
+                        }
+                    }
+                }
+            }
+            w
+        };
+
+        let mut brute = make_world();
+        let mut recur = make_world();
+
+        let w0 = count_material(&brute, side, WATER_MATERIAL_ID);
+        eprintln!("=== 9yv2 brute-vs-recursive: initial water={w0} ===");
+        for gen in 0..80u32 {
+            brute.step();
+            recur.step_recursive();
+            let wb = count_material(&brute, side, WATER_MATERIAL_ID);
+            let wr = count_material(&recur, side, WATER_MATERIAL_ID);
+            if wb != wr {
+                eprintln!("gen {gen:>2}: brute={wb} recur={wr} (diff={})", wb as isize - wr as isize);
+            }
+        }
+        let wb = count_material(&brute, side, WATER_MATERIAL_ID);
+        let wr = count_material(&recur, side, WATER_MATERIAL_ID);
+        eprintln!(
+            "end: brute={wb} (Δ={}) recur={wr} (Δ={})",
+            wb as isize - w0 as isize,
+            wr as isize - w0 as isize,
+        );
+    }
+
 }

@@ -13,7 +13,7 @@ use crate::sim::rule::{block_index, BlockRule};
 pub struct IdentityBlockRule;
 
 impl BlockRule for IdentityBlockRule {
-    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
+    fn step_block(&self, block: &[Cell; 8], _movable: &[bool; 8]) -> [Cell; 8] {
         *block
     }
 
@@ -54,14 +54,19 @@ impl BlockRule for FluidBlockRule {
         })
     }
 
-    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
+    fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8] {
         let mut out = *block;
 
-        // Phase 1: gravity — same as GravityBlockRule
+        // Phase 1: gravity. Only swap if both cells are movable — swapping a
+        // fluid cell with a denser anchored cell (e.g. stone above water on a
+        // cliff face) would delete the fluid at the write-back layer.
         for dz in 0..2 {
             for dx in 0..2 {
                 let bot = block_index(dx, 0, dz);
                 let top = block_index(dx, 1, dz);
+                if !(movable[bot] && movable[top]) {
+                    continue;
+                }
                 if (self.density_fn)(out[top]) > (self.density_fn)(out[bot]) {
                     out.swap(bot, top);
                 }
@@ -162,17 +167,25 @@ impl BlockRule for GravityBlockRule {
         })
     }
 
-    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8] {
+    fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8] {
         let mut out = *block;
         // There are 4 vertical columns in a 2x2x2 block.
         // Each column has y=0 (bottom) and y=1 (top).
+        //
+        // Swap only when BOTH cells are movable (opted into this rule or empty).
+        // Swapping a sand cell with an anchored neighbor (e.g. grass below it)
+        // would be interpreted by the write-back layer as "sand deleted,
+        // neighbor duplicated" — the localized mass-loss mechanism fixed in
+        // hash-thing-9yv2.
         for dz in 0..2 {
             for dx in 0..2 {
                 let bot = block_index(dx, 0, dz);
                 let top = block_index(dx, 1, dz);
+                if !(movable[bot] && movable[top]) {
+                    continue;
+                }
                 let density_bot = (self.density_fn)(out[bot]);
                 let density_top = (self.density_fn)(out[top]);
-                // If the top cell is heavier than the bottom, swap them down.
                 if density_top > density_bot {
                     out.swap(bot, top);
                 }
@@ -224,7 +237,7 @@ mod tests {
             mat(4),
         ];
         let rule = IdentityBlockRule;
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(block, out);
     }
 
@@ -241,7 +254,7 @@ mod tests {
             mat(8),
         ];
         let rule = IdentityBlockRule;
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_mass_conserved(&block, &out);
     }
 
@@ -265,7 +278,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = Cell::EMPTY; // bottom
         block[block_index(0, 1, 0)] = mat(5); // top — heavier, should fall
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(out[block_index(0, 0, 0)], mat(5), "heavy cell should fall");
         assert_eq!(out[block_index(0, 1, 0)], Cell::EMPTY, "air should rise");
     }
@@ -276,7 +289,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(5); // bottom — heavier
         block[block_index(0, 1, 0)] = mat(1); // top — lighter
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(out[block_index(0, 0, 0)], mat(5), "bottom stays");
         assert_eq!(out[block_index(0, 1, 0)], mat(1), "top stays");
     }
@@ -287,7 +300,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(3);
         block[block_index(0, 1, 0)] = mat(3);
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(out[block_index(0, 0, 0)], mat(3));
         assert_eq!(out[block_index(0, 1, 0)], mat(3));
     }
@@ -305,7 +318,7 @@ mod tests {
             mat(2),
             mat(4),
         ];
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_mass_conserved(&block, &out);
     }
 
@@ -320,7 +333,7 @@ mod tests {
                 block[block_index(dx, 1, dz)] = mat(5); // heavy top
             }
         }
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         for dz in 0..2 {
             for dx in 0..2 {
                 assert_eq!(
@@ -344,7 +357,7 @@ mod tests {
         let mut block = [Cell::EMPTY; 8];
         // heavy cell with metadata
         block[block_index(0, 1, 0)] = Cell::pack(5, 42);
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(
             out[block_index(0, 0, 0)],
             Cell::pack(5, 42),
@@ -371,7 +384,7 @@ mod tests {
                                                       // Block lateral escape routes so we isolate the gravity phase.
         block[block_index(1, 0, 0)] = mat(SOLID_MAT);
         block[block_index(0, 0, 1)] = mat(SOLID_MAT);
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(
             out[block_index(0, 0, 0)],
             mat(FLUID_MAT),
@@ -387,7 +400,7 @@ mod tests {
         // axis — but fluid must move to one of the lateral neighbors.
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(FLUID_MAT);
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         // After gravity (no change — fluid already at bottom), lateral phase
         // should swap fluid with air along whichever axis content_hash picks.
         assert!(
@@ -408,7 +421,7 @@ mod tests {
         block[block_index(0, 0, 0)] = mat(FLUID_MAT);
         block[block_index(1, 0, 0)] = mat(SOLID_MAT);
         block[block_index(0, 0, 1)] = mat(SOLID_MAT);
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         // Fluid can't spread into solid, so it stays at (0,0,0).
         assert_eq!(
             out[block_index(0, 0, 0)],
@@ -431,7 +444,7 @@ mod tests {
             mat(0),
             mat(SOLID_MAT),
         ];
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         assert_mass_conserved(&block, &out);
     }
 
@@ -442,7 +455,7 @@ mod tests {
         // Gravity should pull it to (0,0,0), then lateral should spread it.
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 1, 0)] = mat(FLUID_MAT);
-        let out = rule.step_block(&block);
+        let out = rule.step_block(&block, &[true; 8]);
         // After gravity: fluid at (0,0,0). After lateral: fluid spreads.
         // The fluid must not be at the top anymore.
         assert_eq!(

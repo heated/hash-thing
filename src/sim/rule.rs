@@ -50,8 +50,14 @@ pub trait CaRule {
 /// Cell ordering within the block follows octant convention:
 ///   `block_index(dx, dy, dz) = dx + dy*2 + dz*4`
 /// matching `octant_index` in `src/octree/node.rs`.
+///
+/// `movable[i]` is true iff `block[i]` is opted into this rule (or is empty —
+/// empty cells are always valid swap destinations). Rules MUST NOT produce a
+/// permutation that moves an immovable cell: swapping rule-cells with
+/// non-rule-cells would delete the rule-cell at the write-back layer, since
+/// only rule/empty positions are written back.
 pub trait BlockRule {
-    fn step_block(&self, block: &[Cell; 8]) -> [Cell; 8];
+    fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8];
 
     /// Clone into a boxed trait object.
     fn clone_box(&self) -> Box<dyn BlockRule + Send>;
