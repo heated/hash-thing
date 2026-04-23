@@ -1,12 +1,18 @@
-// Workspace crate re-exports — external API unchanged.
+// Workspace crate re-exports.
 pub use ht_octree as octree;
 pub use ht_octree::rng;
 pub use ht_render as render;
 
 pub mod perf;
 pub mod player;
+pub mod scale;
 pub mod sim;
 pub mod terrain;
+
+pub use scale::{
+    CELLS_PER_METER, CELLS_PER_METER_INT, DEFAULT_VOLUME_SIZE, DEFAULT_WORLD_METERS, GROWTH_MARGIN,
+    GROWTH_MARGIN_METERS,
+};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

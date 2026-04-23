@@ -1,10 +1,12 @@
 //! Hashlife step benchmarks at multiple world scales (m1f.1).
 //!
-//! Run with: `cargo test --release -p hash-thing --test bench_hashlife -- --ignored --nocapture`
+//! Run with: `cargo test --profile bench -p hash-thing --test bench_hashlife -- --ignored --nocapture`
 //!
 //! These are `#[ignore]` tests, not criterion benchmarks, to avoid adding
-//! dependencies. The `--release` flag is critical — debug builds are 10-50x
-//! slower and not representative of real performance.
+//! dependencies. `--profile bench` is the intended perf profile per repo
+//! policy — it inherits release opts but drops LTO for fast iteration and
+//! stays representative for relative latency comparisons (debug builds are
+//! 10-50x slower and not representative).
 //!
 //! Confidence note: this file is observational only. It prints timings and
 //! cache stats for manual comparison; it does not enforce a machine-checked
@@ -328,7 +330,8 @@ fn bench_water_scene_profiled(label: &str, level: u32, generations: usize) {
         .expect("level-derived terrain params must validate");
     world.seed_water_and_sand();
 
-    let mut agg = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64); // step_node, flatten, gf_loop, from_flat, compact, total
+    // step_node, column_walk, splice, compact, total, dirty_columns
+    let mut agg = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut max_total = 0u64;
     let mut compact_count = 0u64;
     let mut rows = Vec::with_capacity(generations);
@@ -336,11 +339,11 @@ fn bench_water_scene_profiled(label: &str, level: u32, generations: usize) {
     for gen in 0..generations {
         let profile = world.step_recursive_profiled();
         agg.0 += profile.step_node_us;
-        agg.1 += profile.flatten_us;
-        agg.2 += profile.gap_fill_loop_us;
-        agg.3 += profile.from_flat_us;
-        agg.4 += profile.compact_us;
-        agg.5 += profile.total_us;
+        agg.1 += profile.column_walk_us;
+        agg.2 += profile.splice_us;
+        agg.3 += profile.compact_us;
+        agg.4 += profile.total_us;
+        agg.5 += profile.dirty_columns as u64;
         max_total = max_total.max(profile.total_us);
         if profile.compact_us > 1000 {
             compact_count += 1;
@@ -355,56 +358,49 @@ fn bench_water_scene_profiled(label: &str, level: u32, generations: usize) {
             || profile.compact_us > 1000;
         if want_print {
             eprintln!(
-                "  gen {gen}: total={}µs step_node={}µs flatten={}µs gf_loop={}µs from_flat={}µs compact={}µs",
+                "  gen {gen}: total={}µs step_node={}µs column_walk={}µs splice={}µs dirty={} compact={}µs",
                 profile.total_us,
                 profile.step_node_us,
-                profile.flatten_us,
-                profile.gap_fill_loop_us,
-                profile.from_flat_us,
+                profile.column_walk_us,
+                profile.splice_us,
+                profile.dirty_columns,
                 profile.compact_us,
             );
         }
     }
 
     let gens = generations as u64;
-    let mean_total_ms = agg.5 as f64 / gens as f64 / 1000.0;
-    let pct = |v: u64| -> f64 { v as f64 * 100.0 / agg.5 as f64 };
+    let mean_total_ms = agg.4 as f64 / gens as f64 / 1000.0;
+    let pct = |v: u64| -> f64 { v as f64 * 100.0 / agg.4 as f64 };
     eprintln!();
     eprintln!(
         "  PHASE MEANS over {generations} gens (total={mean_total_ms:.1}ms/gen, max={}ms):",
         max_total / 1000
     );
     eprintln!(
-        "    step_node:  {:>7.1}ms/gen  ({:>5.1}%)",
+        "    step_node:    {:>7.1}ms/gen  ({:>5.1}%)",
         agg.0 as f64 / gens as f64 / 1000.0,
         pct(agg.0)
     );
     eprintln!(
-        "    flatten:    {:>7.1}ms/gen  ({:>5.1}%)",
+        "    column_walk:  {:>7.1}ms/gen  ({:>5.1}%)",
         agg.1 as f64 / gens as f64 / 1000.0,
         pct(agg.1)
     );
     eprintln!(
-        "    gf_loop:    {:>7.1}ms/gen  ({:>5.1}%)",
+        "    splice:       {:>7.1}ms/gen  ({:>5.1}%)   (subset of column_walk)",
         agg.2 as f64 / gens as f64 / 1000.0,
         pct(agg.2)
     );
     eprintln!(
-        "    from_flat:  {:>7.1}ms/gen  ({:>5.1}%)",
+        "    compact:      {:>7.1}ms/gen  ({:>5.1}%)   [{} compactions]",
         agg.3 as f64 / gens as f64 / 1000.0,
-        pct(agg.3)
-    );
-    eprintln!(
-        "    compact:    {:>7.1}ms/gen  ({:>5.1}%)   [{} compactions]",
-        agg.4 as f64 / gens as f64 / 1000.0,
-        pct(agg.4),
+        pct(agg.3),
         compact_count,
     );
-    let gap_fill_total = agg.1 + agg.2 + agg.3;
     eprintln!(
-        "    gap_fill (combined): {:>7.1}ms/gen  ({:>5.1}%)",
-        gap_fill_total as f64 / gens as f64 / 1000.0,
-        pct(gap_fill_total),
+        "    dirty cols:   {:>7.1}/gen   (mean count of columns that triggered splice)",
+        agg.5 as f64 / gens as f64,
     );
     eprintln!();
 }

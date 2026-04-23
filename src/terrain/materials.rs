@@ -101,6 +101,33 @@ pub const FAN: CellState = Cell::pack(FAN_MATERIAL_ID, 0).raw();
 pub const FIREWORK: CellState = Cell::pack(FIREWORK_MATERIAL_ID, 0).raw();
 pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
 
+/// Pack a CLONE cell whose metadata slot carries the source material id.
+///
+/// The "spawn material X" payload is stashed in the Cell's 6-bit metadata
+/// field (`Cell::MAX_METADATA = 63`) rather than a side-table, so this
+/// path caps source materials at 63 even though `Cell::MAX_MATERIAL` is
+/// 1023. Current live materials all fit, but the cap is latent: adding a
+/// material id > 63 would silently route through `Cell::pack`'s generic
+/// "metadata overflows 6 bits" assert at two call sites
+/// (`World::place_clone_source`, main's clone-block placement). Readback
+/// lives in `World::spawn_clones` via `cell.metadata()`, which is
+/// implicitly bounded the same way — a widener (side-table keyed by CLONE
+/// position) would need to update the readback and the
+/// `progression_waterfall_stays_visually_contiguous` test's `metadata()`
+/// assertion (src/sim/world.rs:3400) that checks the source id round-trip.
+/// Tracked by hash-thing-457f.
+#[inline]
+pub fn pack_clone_source(source_material: MaterialId) -> CellState {
+    assert!(
+        source_material <= Cell::MAX_METADATA,
+        "clone source_material {} exceeds 6-bit cap (MAX_METADATA = {}); \
+         widen encoding via side-table (hash-thing-457f)",
+        source_material,
+        Cell::MAX_METADATA,
+    );
+    Cell::pack(CLONE_MATERIAL_ID, source_material).raw()
+}
+
 /// Density lookup for block rules (gravity, fluid). Maps material ID → density.
 ///
 /// Values here must match `MaterialPhysicalProperties::density` in `terrain_defaults()`.
@@ -177,6 +204,11 @@ pub struct MaterialRegistry {
     // allocate two Vec<u16> per step, which shows up in jw3k-class profiles.
     cached_tick_divisor_flags: Vec<u16>,
     cached_block_rule_tick_divisors: Vec<u16>,
+    // hash-thing-2z3g: per-material noop flag, rebuilt under the same
+    // invalidation set as the tick caches. Reads from the sim step inner
+    // dispatch; without caching, the old `noop_flags()` allocated a
+    // Vec<bool> on every call.
+    cached_noop_flags: Vec<bool>,
 }
 
 impl Clone for MaterialRegistry {
@@ -187,6 +219,7 @@ impl Clone for MaterialRegistry {
             block_rules: self.block_rules.iter().map(|r| r.clone_box()).collect(),
             cached_tick_divisor_flags: self.cached_tick_divisor_flags.clone(),
             cached_block_rule_tick_divisors: self.cached_block_rule_tick_divisors.clone(),
+            cached_noop_flags: self.cached_noop_flags.clone(),
         }
     }
 }
@@ -208,6 +241,7 @@ impl MaterialRegistry {
             block_rules: Vec::new(),
             cached_tick_divisor_flags: Vec::new(),
             cached_block_rule_tick_divisors: Vec::new(),
+            cached_noop_flags: Vec::new(),
         }
     }
 
@@ -782,16 +816,14 @@ impl MaterialRegistry {
     /// Precomputed per-material-ID noop flag for hot-loop CaRule skipping.
     /// `result[material_id] == true` iff the material's CaRule is noop (identity).
     /// Avoids vtable dispatch per cell in the base-case inner loop.
-    pub fn noop_flags(&self) -> Vec<bool> {
-        self.entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .as_ref()
-                    .map(|e| self.rules[e.rule_id.0].is_noop())
-                    .unwrap_or(false)
-            })
-            .collect()
+    ///
+    /// Slice into the cache refreshed by any mutation path that could change
+    /// per-material rule assignment (`insert`, `assign_rule`) or material slot
+    /// presence (`insert`). Rules themselves are append-only after
+    /// registration, so their `is_noop` result is fixed once inserted
+    /// (hash-thing-2z3g).
+    pub fn noop_flags(&self) -> &[bool] {
+        &self.cached_noop_flags
     }
 
     /// Per-material tick_divisor, indexed by material id. Unregistered slots
@@ -814,24 +846,66 @@ impl MaterialRegistry {
         &self.cached_block_rule_tick_divisors
     }
 
-    /// Rebuild both tick-divisor caches. Called after every mutation path that
-    /// could change either the per-material divisors or the block-rule table.
-    /// Cost is O(entries + block_rules) — small constants in practice.
+    /// Rebuild the per-registry step caches (tick-divisor flags, block-rule
+    /// tick divisors, and noop flags) after any mutation path that could
+    /// change per-material divisors, the block-rule table, per-material rule
+    /// assignment, or the rule table itself. Cost is O(entries + block_rules)
+    /// — small constants in practice. Name retained for git-blame continuity
+    /// even though it now owns three caches, not two (hash-thing-2z3g).
+    ///
+    /// Panics if any two materials sharing one BlockRule have different
+    /// `tick_divisor`s (iowh invariant). Enforcing here — rather than only in
+    /// [`Self::validate_shared_block_rule_divisors`] called at end-of-
+    /// construction — catches mismatch at the mutator boundary, so any
+    /// future construction path that forgets the trailing validate call still
+    /// fails loudly instead of silently picking last-wins (hash-thing-lw75.1.1).
     fn rebuild_tick_caches(&mut self) {
         self.cached_tick_divisor_flags = self
             .entries
             .iter()
             .map(|entry| entry.as_ref().map(|e| e.tick_divisor.max(1)).unwrap_or(1))
             .collect();
-        let mut per_rule = vec![0u16; self.block_rules.len()];
-        for entry in self.entries.iter().filter_map(|e| e.as_ref()) {
-            if let Some(BlockRuleId(id)) = entry.block_rule_id {
-                per_rule[id] = entry.tick_divisor.max(1);
+        let mut per_rule: Vec<Option<(u16, MaterialId)>> = vec![None; self.block_rules.len()];
+        for (material_id, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            let Some(BlockRuleId(id)) = entry.block_rule_id else {
+                continue;
+            };
+            let d = entry.tick_divisor.max(1);
+            match per_rule[id] {
+                None => per_rule[id] = Some((d, material_id as MaterialId)),
+                Some((first_d, first_mat)) if first_d != d => {
+                    panic!(
+                        "shared BlockRule {} has mixed tick_divisors: material {} = {}, \
+                         material {} = {}. Materials that share a BlockRule must share a \
+                         tick_divisor (iowh invariant).",
+                        id, first_mat, first_d, material_id, d
+                    );
+                }
+                Some(_) => {}
             }
         }
         self.cached_block_rule_tick_divisors = per_rule
             .into_iter()
-            .map(|d| if d == 0 { 1 } else { d })
+            .map(|slot| slot.map(|(d, _)| d).unwrap_or(1))
+            .collect();
+        // hash-thing-2z3g: noop_flags share the same invalidation set as
+        // the tick caches (insert / assign_block_rule / set_tick_divisor /
+        // register_block_rule) plus `assign_rule`, which also calls this.
+        //
+        // An out-of-bounds `rule_id` is treated as non-noop rather than
+        // panicking here — that keeps rebuild_tick_caches compatible with
+        // the "insert corrupt entry, catch it later via `validate()`"
+        // pattern that `validate_catches_invalid_rule_id` exercises.
+        self.cached_noop_flags = self
+            .entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .and_then(|e| self.rules.get(e.rule_id.0).map(|r| r.is_noop()))
+                    .unwrap_or(false)
+            })
             .collect();
     }
 
@@ -899,6 +973,15 @@ impl MaterialRegistry {
     {
         let rule_id = RuleId(self.rules.len());
         self.rules.push(Box::new(rule));
+        // hash-thing-2z3g: rebuild participates in the noop cache
+        // invariant. Without this, a construction path that inserts a
+        // material with a placeholder `rule_id` and only *later* registers
+        // the rule would leave `cached_noop_flags` stuck at `false` (the
+        // permissive out-of-bounds fallback). All shipping constructors
+        // register rules before inserting materials, but the cost of the
+        // rebuild here is O(entries + block_rules) — cheap — and it makes
+        // the invariant local to each mutator.
+        self.rebuild_tick_caches();
         rule_id
     }
 
@@ -941,7 +1024,6 @@ impl MaterialRegistry {
             .as_mut()
             .unwrap_or_else(|| panic!("material {material_id} must exist to set tick_divisor"))
             .tick_divisor = divisor;
-        self.validate_shared_block_rule_divisors();
         self.rebuild_tick_caches();
     }
 
@@ -964,6 +1046,10 @@ impl MaterialRegistry {
             .as_mut()
             .expect("material must exist before assigning a rule")
             .rule_id = rule_id;
+        // hash-thing-2z3g: rule_id drives the noop cache. Today all
+        // `assign_rule` callers run before stepping, but the rebuild is
+        // cheap (O(entries + block_rules)) and keeps the invariant local.
+        self.rebuild_tick_caches();
     }
 
     /// Validate the registry for internal consistency. Returns a list of
@@ -1536,6 +1622,97 @@ mod tests {
     }
 
     #[test]
+    fn noop_flags_returns_per_material_values() {
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        let non_noop_id = registry.register_rule(FireRule {
+            fuel_materials: vec![],
+            quencher_material: 0,
+        });
+        registry.insert(0, entry_with(noop_id, [0.0; 4]));
+        registry.insert(1, entry_with(non_noop_id, [1.0; 4]));
+        let flags = registry.noop_flags();
+        assert!(flags[0], "NoopRule must report as noop");
+        assert!(!flags[1], "FireRule must not report as noop");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_assign_rule() {
+        // hash-thing-2z3g: assign_rule swaps a material's rule_id, which can
+        // flip its noop flag. The cache must reflect the post-assign state.
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        let non_noop_id = registry.register_rule(FireRule {
+            fuel_materials: vec![],
+            quencher_material: 0,
+        });
+        registry.insert(0, entry_with(non_noop_id, [0.0; 4]));
+        assert!(!registry.noop_flags()[0], "pre-assign: non-noop rule");
+        registry.assign_rule(0, noop_id);
+        assert!(registry.noop_flags()[0], "post-assign: noop rule");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_insert() {
+        // hash-thing-2z3g: insert on a new slot grows the cache so the caller
+        // can index by the new material id without a panic or stale false.
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        assert!(registry.noop_flags().is_empty());
+        registry.insert(2, entry_with(noop_id, [0.0; 4]));
+        let flags = registry.noop_flags();
+        assert_eq!(flags.len(), 3, "slots 0..=2 all present after insert(2)");
+        assert!(!flags[0], "unregistered slot 0 defaults to non-noop");
+        assert!(!flags[1], "unregistered slot 1 defaults to non-noop");
+        assert!(flags[2], "slot 2 got a NoopRule");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_insert_overwrite() {
+        // hash-thing-2z3g follow-up: insert() is both a grow mutator and an
+        // overwrite mutator. Overwriting an existing slot with a different
+        // rule_id must also invalidate the noop cache for that slot.
+        let mut registry = MaterialRegistry::new();
+        let noop_id = registry.register_rule(NoopRule);
+        let non_noop_id = registry.register_rule(FireRule {
+            fuel_materials: vec![],
+            quencher_material: 0,
+        });
+        registry.insert(0, entry_with(noop_id, [0.0; 4]));
+        assert!(registry.noop_flags()[0], "pre-overwrite: noop rule");
+        registry.insert(0, entry_with(non_noop_id, [1.0; 4]));
+        assert!(!registry.noop_flags()[0], "post-overwrite: non-noop rule");
+    }
+
+    #[test]
+    fn noop_flags_cache_refreshes_on_register_rule() {
+        // hash-thing-2z3g critical-review follow-up: register_rule must also
+        // rebuild the cache. Construct the exact "insert-with-placeholder,
+        // register-rule-later" sequence that motivated the invariant — and
+        // verify the noop flag flips from the permissive-fallback `false` to
+        // `true` once the rule backing the id is actually registered.
+        let mut registry = MaterialRegistry::new();
+        // Insert first with a rule_id that doesn't exist yet (validate()
+        // would flag this at construction-end; pre-validate state is legal).
+        registry.insert(
+            0,
+            MaterialEntry {
+                rule_id: RuleId(0),
+                ..entry_with(RuleId(0), [0.0; 4])
+            },
+        );
+        assert!(
+            !registry.noop_flags()[0],
+            "pre-register: permissive out-of-bounds fallback returns false"
+        );
+        registry.register_rule(NoopRule);
+        assert!(
+            registry.noop_flags()[0],
+            "post-register: rule_id now resolves, cache reflects is_noop"
+        );
+    }
+
+    #[test]
     fn tick_divisor_flags_treats_zero_as_one() {
         // Defensive: zero divisor should clamp to 1 (a 0-divisor would divide
         // by zero in the dispatcher). The struct field is u16; we verify the
@@ -1607,6 +1784,100 @@ mod tests {
         registry.validate_shared_block_rule_divisors();
     }
 
+    /// hash-thing-lw75.1.1: the shared-BlockRule invariant must fire at the
+    /// mutator boundary, not only from a trailing `validate_shared_block_rule_divisors`
+    /// call. Omits the explicit validate — if `rebuild_tick_caches` doesn't
+    /// catch the mismatch, the test fails. Guards against a future
+    /// construction path that forgets the trailing validate call.
+    #[test]
+    #[should_panic(expected = "mixed tick_divisors")]
+    fn insert_rejects_mixed_divisors_on_shared_block_rule_without_explicit_validate() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        // Second insert must panic from inside rebuild_tick_caches — no
+        // trailing validate_shared_block_rule_divisors() call.
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 6,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+    }
+
+    /// hash-thing-lw75.1.1: parallel coverage for the `assign_block_rule`
+    /// mutator path. Two materials with mismatched `tick_divisor`s sharing one
+    /// `BlockRule` via post-insert assignment must panic from rebuild, without
+    /// any explicit validate call.
+    #[test]
+    #[should_panic(expected = "mixed tick_divisors")]
+    fn assign_block_rule_rejects_mixed_divisors_without_explicit_validate() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: None,
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 6,
+                block_rule_id: None,
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+        registry.assign_block_rule(0, block_rule_id);
+        // Second assign must panic from inside rebuild_tick_caches.
+        registry.assign_block_rule(1, block_rule_id);
+    }
+
+    /// hash-thing-lw75.1.1: parallel coverage for the `set_tick_divisor`
+    /// mutator path. Two materials initially share a BlockRule with a
+    /// consistent divisor (4); diverging one via `set_tick_divisor` must
+    /// panic from rebuild — the explicit validate call that used to live
+    /// inside `set_tick_divisor` was removed in this change, so rebuild is
+    /// the sole enforcer.
+    #[test]
+    #[should_panic(expected = "mixed tick_divisors")]
+    fn set_tick_divisor_rejects_mixed_divisors_on_shared_block_rule() {
+        let mut registry = MaterialRegistry::new();
+        let rule_id = registry.register_rule(NoopRule);
+        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        registry.insert(
+            0,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [0.0; 4])
+            },
+        );
+        registry.insert(
+            1,
+            MaterialEntry {
+                tick_divisor: 4,
+                block_rule_id: Some(block_rule_id),
+                ..entry_with(rule_id, [1.0; 4])
+            },
+        );
+        // Diverging one sharer must panic from inside rebuild_tick_caches.
+        registry.set_tick_divisor(1, 6);
+    }
+
     /// T4 (iowh review): `set_tick_divisor(0)` panics rather than silently
     /// clamping. Protects the dispatcher's `is_multiple_of` gate and the
     /// author's expectation that `>= 1` means "fires at least every N ticks".
@@ -1662,7 +1933,8 @@ mod tests {
     fn block_rule_tick_divisors_cache_tracks_post_insert_reassignment() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
-        let first_block_rule = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let first_block_rule =
+            registry.register_block_rule(GravityBlockRule::new(material_density));
         registry.insert(
             0,
             MaterialEntry {
@@ -1688,5 +1960,23 @@ mod tests {
             divisors[first_block_rule.0], 1,
             "old slot reverts to 1 when no entry references it"
         );
+    }
+
+    #[test]
+    fn pack_clone_source_accepts_at_cap() {
+        // Boundary: MAX_METADATA itself must pack without panic.
+        let state = pack_clone_source(Cell::MAX_METADATA);
+        let cell = Cell::from_raw(state);
+        assert_eq!(cell.material(), CLONE_MATERIAL_ID);
+        assert_eq!(cell.metadata(), Cell::MAX_METADATA);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds 6-bit cap")]
+    fn pack_clone_source_rejects_material_over_cap() {
+        // Guards the call-site-local message (not the encoding cap itself,
+        // which `Cell::pack` still enforces one layer deeper). Widening the
+        // encoding per hash-thing-457f would update both messages together.
+        let _ = pack_clone_source(Cell::MAX_METADATA + 1);
     }
 }

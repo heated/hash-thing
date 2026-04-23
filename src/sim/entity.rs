@@ -15,6 +15,7 @@
 use super::mutation::{MutationQueue, WorldMutation};
 use super::world::{World, WorldCoord};
 use crate::octree::{Cell, CellState};
+use crate::scale::CELLS_PER_METER;
 use crate::terrain::materials::{
     FIRE_MATERIAL_ID, LAVA, LAVA_MATERIAL_ID, WATER, WATER_MATERIAL_ID,
 };
@@ -88,8 +89,8 @@ impl EmitterState {
             period: 5,
             burst_count: 2,
             particle_ttl: 18,
-            speed: 0.85,
-            spread: 0.10,
+            speed: 0.85 * CELLS_PER_METER,
+            spread: 0.10 * CELLS_PER_METER,
             age: 0,
         }
     }
@@ -100,8 +101,8 @@ impl EmitterState {
             period: 7,
             burst_count: 3,
             particle_ttl: 24,
-            speed: 0.75,
-            spread: 0.16,
+            speed: 0.75 * CELLS_PER_METER,
+            spread: 0.16 * CELLS_PER_METER,
             age: 0,
         }
     }
@@ -112,8 +113,11 @@ impl EmitterState {
             period: 4,
             burst_count: 3,
             particle_ttl: 14,
+            // Angular rate (radians/tick-ish); multiplied by the cell-scaled
+            // orbit offset in emitter_particle, so leaving it unscaled keeps
+            // tangential velocity linear (not quadratic) in CELLS_PER_METER.
             speed: 0.22,
-            spread: 0.08,
+            spread: 0.08 * CELLS_PER_METER,
             age: 0,
         }
     }
@@ -135,8 +139,8 @@ impl CritterState {
             material,
             age: 0,
             hop_period: 18,
-            hop_speed: 0.16,
-            hop_height: 0.26,
+            hop_speed: 0.16 * CELLS_PER_METER,
+            hop_height: 0.26 * CELLS_PER_METER,
         }
     }
 }
@@ -307,7 +311,7 @@ fn update_particle(
         *vel = [0.0; 3];
     }
 
-    vel[1] -= 0.05;
+    vel[1] -= 0.05 * CELLS_PER_METER;
 }
 
 fn update_emitter(
@@ -340,7 +344,7 @@ fn emitter_particle(
             pos,
             [
                 jitter_x * state.spread,
-                state.speed + noise(seed + 4.1) * 0.12,
+                state.speed + noise(seed + 4.1) * 0.12 * CELLS_PER_METER,
                 jitter_z * state.spread,
             ],
             ParticleState {
@@ -353,7 +357,7 @@ fn emitter_particle(
             pos,
             [
                 jitter_x * state.spread,
-                state.speed + noise(seed + 5.7) * 0.18,
+                state.speed + noise(seed + 5.7) * 0.18 * CELLS_PER_METER,
                 jitter_z * state.spread,
             ],
             ParticleState {
@@ -367,14 +371,14 @@ fn emitter_particle(
             },
         ),
         EmitterKind::Whirlpool => {
-            let radius = 0.75 + noise(seed + 8.4) * 0.2;
+            let radius = (0.75 + noise(seed + 8.4) * 0.2) * CELLS_PER_METER;
             let orbit_x = angle.cos() * radius;
             let orbit_z = angle.sin() * radius;
             (
                 [pos[0] + orbit_x, pos[1], pos[2] + orbit_z],
                 [
                     -orbit_z * state.speed + jitter_x * state.spread,
-                    -0.03,
+                    -0.03 * CELLS_PER_METER,
                     orbit_x * state.speed + jitter_z * state.spread,
                 ],
                 ParticleState {
@@ -394,7 +398,7 @@ fn update_critter(
     state: &mut CritterState,
     world: &World,
 ) {
-    let grounded = !cell_at(world, [pos[0], pos[1] - 0.75, pos[2]]).is_empty();
+    let grounded = !cell_at(world, [pos[0], pos[1] - 0.75 * CELLS_PER_METER, pos[2]]).is_empty();
 
     if grounded && vel[1] <= 0.0 && state.age.is_multiple_of(state.hop_period) {
         let heading = critter_heading(id, state.age);
@@ -407,12 +411,12 @@ fn update_critter(
     if !cell_at(world, next).is_empty() {
         vel[0] *= -0.45;
         vel[2] *= -0.45;
-        vel[1] = vel[1].max(0.12);
+        vel[1] = vel[1].max(0.12 * CELLS_PER_METER);
     } else {
         *pos = next;
     }
 
-    vel[1] -= 0.04;
+    vel[1] -= 0.04 * CELLS_PER_METER;
     vel[0] *= 0.94;
     vel[2] *= 0.94;
     state.age = state.age.wrapping_add(1);
@@ -448,9 +452,12 @@ mod tests {
     fn floor_world(level: u32) -> World {
         let mut world = World::new(level);
         let side = world.side() as i64;
+        let thickness = CELLS_PER_METER as i64;
         for x in 0..side {
-            for z in 0..side {
-                world.set(WorldCoord(x), WorldCoord(0), WorldCoord(z), STONE);
+            for y in 0..thickness {
+                for z in 0..side {
+                    world.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), STONE);
+                }
             }
         }
         world
@@ -672,11 +679,59 @@ mod tests {
         }
     }
 
+    /// Regression: `EmitterState::whirlpool().speed` stays an angular rate
+    /// (scale-invariant), never `0.22 * CELLS_PER_METER`.
+    ///
+    /// The orbit offset in `emitter_particle` is already cell-scaled
+    /// (`radius = (0.75 + ...) * CELLS_PER_METER`). Pre-69cq the speed was
+    /// also scaled, so the tangential velocity `orbit * speed` picked up
+    /// `CELLS_PER_METER²` — the k² bug. The fix is to leave `speed` alone;
+    /// this test pins that invariant and also checks that the computed
+    /// tangential magnitude matches `radius * speed` (i.e. linear in k,
+    /// not quadratic).
+    #[test]
+    fn whirlpool_speed_is_scale_invariant_angular_rate() {
+        assert_eq!(EmitterState::whirlpool().speed, 0.22);
+
+        // Run the emitter with zero spread so jitter drops out, isolating
+        // the tangential component for the k² check.
+        let mut state = EmitterState::whirlpool();
+        state.spread = 0.0;
+        let pos = [0.0, 0.0, 0.0];
+        let (spawn, vel, _) = emitter_particle(EntityId(0), pos, &state, 0);
+
+        let orbit_x = spawn[0] - pos[0];
+        let orbit_z = spawn[2] - pos[2];
+        let radius = (orbit_x * orbit_x + orbit_z * orbit_z).sqrt();
+        let tangential_mag = (vel[0] * vel[0] + vel[2] * vel[2]).sqrt();
+
+        // Radius is cell-scaled in [0.75, 0.95] * CELLS_PER_METER; tangential
+        // magnitude must therefore stay in `[0.75, 0.95] * k * 0.22` (linear
+        // in k). The band is expressed against the *literal* 0.22, not
+        // `state.speed` — if `speed` were reverted to `0.22 * CELLS_PER_METER`,
+        // `tangential_mag` would balloon to roughly `0.85 * k² * 0.22` and
+        // blow past the upper bound for any k > 1.
+        let k = CELLS_PER_METER;
+        assert!(
+            radius >= 0.75 * k - 1e-9 && radius <= 0.95 * k + 1e-9,
+            "radius {radius} outside [0.75*k, 0.95*k] for k={k}",
+        );
+        let low = 0.75 * k * 0.22;
+        let high = 0.95 * k * 0.22;
+        assert!(
+            tangential_mag >= low - 1e-9 && tangential_mag <= high + 1e-9,
+            "tangential_mag {tangential_mag} outside linear-in-k band [{low}, {high}]; \
+             did `speed` get rescaled to `0.22 * CELLS_PER_METER`?",
+        );
+    }
+
     #[test]
     fn critter_hops_from_ground() {
         let mut store = EntityStore::new();
+        let s = CELLS_PER_METER;
+        let start_y = s;
         store.add(
-            [4.0, 1.0, 4.0],
+            [2.0 * s, start_y, 2.0 * s],
             [0.0; 3],
             EntityKind::Critter(CritterState::new(VINE_MATERIAL_ID)),
         );
@@ -685,6 +740,6 @@ mod tests {
         store.update(&world, &mut queue);
         let critter = store.iter().next().unwrap();
         assert!(matches!(critter.kind, EntityKind::Critter(_)));
-        assert!(critter.pos[1] > 1.0);
+        assert!(critter.pos[1] > start_y);
     }
 }

@@ -9,8 +9,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE, FIREWORK, GRASS, LAVA,
-    OIL, SAND, STONE, VINE, WATER,
+    pack_clone_source, BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE,
+    FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -1801,8 +1801,13 @@ impl World {
         }
     }
 
+    /// Place a CLONE cell that spawns `source_material` downstream.
+    ///
+    /// Routes through `pack_clone_source` to centralize the 6-bit cap +
+    /// panic message (hash-thing-457f). The sister site at
+    /// `main.rs::place_clone_block` uses the same helper.
     fn place_clone_source(&mut self, pos: [i64; 3], source_material: u16) {
-        let state = Cell::pack(CLONE_MATERIAL_ID, source_material).raw();
+        let state = pack_clone_source(source_material);
         self.set(
             WorldCoord(pos[0]),
             WorldCoord(pos[1]),
@@ -1867,6 +1872,31 @@ impl World {
         );
         self.fill_box(entry_passage, AIR);
         self.fill_floor(entry_passage, DIRT);
+        // Bridge the stone slab between corridor.max[2] and atrium.min[2].
+        // At every level atrium.min[2] (lo[2]+cell_size) sits strictly past
+        // corridor.max[2] (corridor_z+tunnel_half_w), so without this carve
+        // the walk_route's corridor_turn → atrium_entry segment is blocked.
+        // The gap is small at level ≤ 6 and grows with cell_size at higher
+        // levels, which is what stranded the level-8 traversability test in
+        // hash-thing-69cq until dyqr. The carve lands before the `atrium`
+        // fill_box below, so any overlap at atrium.min[2] is overwritten by
+        // the atrium's own AIR/STONE pass.
+        let corridor_turn_x = corridor.max[0] - 2;
+        let tunnel_half_w = (corridor.max[2] - corridor.min[2]) / 2;
+        let atrium_entry_passage = Box3::new(
+            [
+                corridor_turn_x - tunnel_half_w,
+                corridor.min[1],
+                corridor.max[2],
+            ],
+            [
+                corridor_turn_x + tunnel_half_w,
+                corridor.max[1],
+                atrium.min[2],
+            ],
+        );
+        self.fill_box(atrium_entry_passage, AIR);
+        self.fill_floor(atrium_entry_passage, DIRT);
         self.fill_box(tease_a, AIR);
         self.fill_box(tease_b, AIR);
         self.fill_box(atrium, AIR);
@@ -1893,7 +1923,7 @@ impl World {
         );
 
         let corridor_mid = [corridor.center()[0], corridor.min[1], corridor.center()[2]];
-        let corridor_turn = [corridor.max[0] - 2, corridor.min[1], corridor.center()[2]];
+        let corridor_turn = [corridor_turn_x, corridor.min[1], corridor.center()[2]];
         let atrium_entry = [corridor_turn[0], atrium.min[1], atrium.min[2] + 1];
         let atrium_center = [atrium.center()[0], atrium.min[1], atrium.center()[2]];
         let reveal_center = [balcony.center()[0], balcony.min[1], balcony.center()[2]];
@@ -2307,10 +2337,11 @@ impl World {
         // so memory tracks live-scene size, not cumulative history.
         // See hash-thing-88d.
         //
-        // Brute-force compaction remaps all NodeIds without updating
-        // hashlife_cache, so clear it to prevent stale cross-path hits.
-        // Keep the remap so Svdag can update its persistent NodeId cache
-        // (hash-thing-5bb.11: O(changed) instead of O(reachable)).
+        // Brute-force compaction remaps every live NodeId into a fresh
+        // store namespace, so clear all four hashlife caches to prevent
+        // stale cross-path hits. Keep the remap so Svdag can update its
+        // persistent NodeId cache (hash-thing-5bb.11: O(changed) instead
+        // of O(reachable)).
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
@@ -2319,6 +2350,7 @@ impl World {
             None => remap,
         });
         self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
     }
@@ -2402,6 +2434,39 @@ pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &
             }
         }
     }
+}
+
+/// 1D column variant of [`gravity_gap_fill`] (hash-thing-jw3k.1).
+///
+/// Operates on a single `(x, z)` column (length = `side`), mutating in place.
+/// Returns `true` when any swap fired so callers can skip the splice step
+/// for unchanged columns.
+///
+/// In-place mutation is load-bearing: the 3D loop evaluates `y = 1..side-1`
+/// in order and later iterations read values that earlier iterations wrote.
+/// A fresh-read variant (read whole column, write to an out-buffer) would
+/// diverge on cascade patterns like `[B, A, B, B]` — see Rev 2 plan tests.
+pub fn gravity_gap_fill_column(column: &mut [CellState], materials: &MaterialRegistry) -> bool {
+    let side = column.len();
+    if side < 3 {
+        return false;
+    }
+    let mut changed = false;
+    for y in 1..side - 1 {
+        let below = Cell::from_raw(column[y - 1]);
+        let cur = Cell::from_raw(column[y]);
+        let above = Cell::from_raw(column[y + 1]);
+        if cur.is_empty()
+            && !above.is_empty()
+            && materials.block_rule_id_for_cell(above).is_some()
+            && !below.is_empty()
+            && materials.block_rule_id_for_cell(below).is_some()
+        {
+            column.swap(y, y + 1);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Get the 26 Moore neighbors of a cell. Out-of-bounds neighbors are
@@ -3121,8 +3186,7 @@ mod tests {
         let stats = &world.hashlife_stats_total;
         let p1 = stats.phase1_ns;
         let p2 = stats.phase2_ns;
-        let pct =
-            |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
+        let pct = |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
         eprintln!("--- hashlife phase timing scout: 64^3 water, {N_STEPS} steps ---");
         eprintln!("  wall_total:    {:.2} ms", wall_total_ns as f64 / 1e6);
         eprintln!(
@@ -3150,8 +3214,7 @@ mod tests {
             "  cache_hits={} cache_misses={} (hit_rate={:.3})",
             stats.cache_hits,
             stats.cache_misses,
-            stats.cache_hits as f64
-                / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+            stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
         );
     }
 
@@ -3236,7 +3299,9 @@ mod tests {
 
     #[test]
     fn lattice_progression_demo_spawn_and_waypoints_are_open() {
-        let mut w = World::new(6); // side 64
+        // Level 8 (256³) — at 4 cells/m, level 6 rooms are only 4 cells (1 m)
+        // tall and cannot fit the 1.6 m player. Level 8 gives ~15-cell rooms.
+        let mut w = World::new(8);
         let layout = w.seed_lattice_progression_demo();
 
         assert!(
@@ -3260,14 +3325,16 @@ mod tests {
 
     #[test]
     fn lattice_progression_demo_route_is_player_traversable_end_to_end() {
-        let mut w = World::new(6);
-        let layout = w.seed_lattice_progression_demo();
-        let route = std::iter::once(walk_cell(layout.player_pos))
-            .chain(layout.walk_route)
-            .collect::<Vec<_>>();
+        for level in [7u32, 8] {
+            let mut w = World::new(level);
+            let layout = w.seed_lattice_progression_demo();
+            let route = std::iter::once(walk_cell(layout.player_pos))
+                .chain(layout.walk_route)
+                .collect::<Vec<_>>();
 
-        for segment in route.windows(2) {
-            assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            for segment in route.windows(2) {
+                assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            }
         }
     }
 
@@ -3785,8 +3852,18 @@ mod tests {
     }
 
     /// Wire a gravity block rule onto specific materials and return the world.
+    ///
+    /// Materials sharing a BlockRule must share a `tick_divisor` (iowh
+    /// invariant, enforced at rebuild time per hash-thing-lw75.1.1). WATER
+    /// ships with `tick_divisor = 2`; every other terrain material defaults
+    /// to 1. Normalize all wired materials to `tick_divisor = 1` before
+    /// assigning, so the gravity tests exercise single-step drops under one
+    /// consistent schedule.
     fn gravity_world(materials_with_gravity: &[u16]) -> World {
         let mut world = World::new(3); // 8x8x8
+        for &mat_id in materials_with_gravity {
+            world.set_material_tick_divisor(mat_id, 1);
+        }
         let gravity_id = world
             .materials
             .register_block_rule(GravityBlockRule::new(simple_density));
@@ -4486,6 +4563,30 @@ mod tests {
         assert!(world.queue.is_empty());
         assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
         assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    /// commit_step rebuilds the NodeStore via `compacted_with_remap`, so every
+    /// NodeId key in every hashlife cache is invalidated. The macro cache was
+    /// historically omitted from the clear-list, leaving stale `(NodeId, u64)`
+    /// keys pointing at a dead namespace — which `maybe_compact` would then
+    /// treat as extra roots and feed back into compaction (hash-thing-w1bs).
+    #[test]
+    fn commit_step_clears_hashlife_macro_cache() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive_pow2();
+        assert!(
+            !world.hashlife_macro_cache.is_empty(),
+            "precondition: step_recursive_pow2 must populate the macro cache"
+        );
+
+        world.step();
+
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "commit_step must clear the macro cache; stale NodeId keys would \
+             alias into the freshly-compacted store"
+        );
     }
 
     #[test]
@@ -5428,5 +5529,112 @@ mod tests {
             (post_push_rate - 1.0).abs() < 1e-9,
             "after eviction window is all-hit → rate = 1.0, got {post_push_rate}",
         );
+    }
+
+    // ---- 1D gravity_gap_fill_column tests (hash-thing-jw3k.1) ----
+
+    /// Build a test material registry where `STONE` is a block-rule material
+    /// and air (0) is empty. Matches what the default sim registry gives us.
+    fn gap_fill_materials() -> MaterialRegistry {
+        MaterialRegistry::terrain_defaults()
+    }
+
+    /// SAND has the gravity block_rule in terrain_defaults; STONE is inert.
+    /// Tests below use SAND for the "block_rule" role.
+    fn sand_cell() -> CellState {
+        SAND
+    }
+
+    #[test]
+    fn gap_fill_column_empty_no_op() {
+        let mat = gap_fill_materials();
+        let mut col: Vec<CellState> = vec![0; 8];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert!(col.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn gap_fill_column_solid_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col: Vec<CellState> = vec![sand; 8];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert!(col.iter().all(|&c| c == sand));
+    }
+
+    #[test]
+    fn gap_fill_column_block_air_block_triple_swaps() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        // y=1 sees below=sand, above=sand → swap cell[1] with cell[2].
+        assert_eq!(col, vec![sand, sand, 0]);
+    }
+
+    #[test]
+    fn gap_fill_column_block_air_air_block_no_swap() {
+        // Rev 2 fix: both above AND below must be block_rule; two adjacent
+        // airs in the middle fail the predicate on both y=1 and y=2.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, 0, sand];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, 0, 0, sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_cascade_babab() {
+        // [B,A,B,A,B]: y=1 swaps (above=B, below=B) → [B,B,A,A,B].
+        // y=2 above=A → skip. y=3 below=A → skip. Single-pass semantics.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand, 0, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, sand, 0, 0, sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_in_place_vs_fresh_read_divergence() {
+        // [B,A,B,B] under in-place semantics:
+        //   y=1: above=B, below=B → swap 1↔2 → [B,B,A,B]
+        //   y=2: cur=A (freshly swapped), above=B, below=B → swap 2↔3 → [B,B,B,A]
+        // A fresh-read variant would end at [B,B,A,B] (y=2 reads original B at idx 2).
+        // This test pins that gravity_gap_fill_column mutates in place.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(
+            col,
+            vec![sand, sand, sand, 0],
+            "in-place semantics: y=2 must see the fresh value written at y=1",
+        );
+    }
+
+    #[test]
+    fn gap_fill_column_boundary_y0_and_y_max_untouched() {
+        let mat = gap_fill_materials();
+        // Air at y=0 and y=side-1 never participates (y ranges 1..side-1).
+        let mut col: Vec<CellState> = vec![0, 0, 0];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+    }
+
+    #[test]
+    fn gap_fill_column_side_1_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_side_2_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, 0]);
     }
 }

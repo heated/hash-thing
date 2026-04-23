@@ -760,6 +760,24 @@ fn bench_raycast_4096_app_spawn() {
     bench_raycast("4096³ app-spawn", 12, 10, BenchCamera::app_spawn(4096));
 }
 
+/// 8192³ (level 13) characterization bench. `DEFAULT_VOLUME_SIZE` was
+/// bumped to 8192 in hash-thing-69cq; this pair confirms launch
+/// feasibility + measures frame time on integrated Metal GPUs
+/// (hash-thing-wirw). Frame count kept low (5) because each frame is
+/// expected to exceed the per-frame cap at 4096³ and the harness caps
+/// total wall time at ~30s per scale.
+#[test]
+#[ignore]
+fn bench_raycast_8192() {
+    bench_raycast("8192³", 13, 5, BenchCamera::empty_corner());
+}
+
+#[test]
+#[ignore]
+fn bench_raycast_8192_app_spawn() {
+    bench_raycast("8192³ app-spawn", 13, 5, BenchCamera::app_spawn(8192));
+}
+
 /// Combined benchmark: SVDAG build + CA step + rebuild + raycast.
 /// Simulates real gameplay: step the CA, rebuild SVDAG, render.
 #[test]
