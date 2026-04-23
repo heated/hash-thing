@@ -437,17 +437,32 @@ impl NodeStore {
     ///
     /// Mirrors `flatten_column_into`'s topology walk; rebuilds interior nodes
     /// along the column path and reuses hash-cons for off-path subtrees.
-    /// Intermediate `Leaf(state)` nodes are expanded into 8 uniform children
-    /// before descending (same pattern as `set_cell_at`), then canonicalized
-    /// back to compressed `Leaf(s)` form on the way up when the resulting
-    /// subtree is uniform.
+    /// Intermediate `Leaf(state)` nodes are expanded into 8 child `Leaf(state)`
+    /// slots before descending (same pattern as `set_cell_at`). On ascent,
+    /// canonicalization back to compressed `Leaf(s)` form fires **only when
+    /// the input at that level was itself a `Leaf(s)`** that got expanded on
+    /// descent — never opportunistically on a pre-existing `Interior` whose
+    /// children happen to be uniform.
+    ///
+    /// The "only when input was a `Leaf(s)`" clause is load-bearing, not
+    /// incidental. Heterogeneous trees in this codebase can carry
+    /// non-canonical uniform `Interior` nodes (siblings that were never
+    /// expanded from a `Leaf`). Opportunistically canonicalizing any
+    /// uniform-`Interior` on ascent would silently rewrite those siblings
+    /// into `Leaf`, breaking identity-splice `NodeId` equality and
+    /// regressing the structural-sharing drift that fix
+    /// `hash-thing-gtua` resolved — see the `(gtua)` references on the
+    /// expand / ascent sites inside `splice_column_rec`. Any refactor
+    /// tempted to "simplify" the ascent into an unconditional
+    /// canonicalize-when-uniform MUST preserve the same identity invariant
+    /// as the regression test `splice_column_identity_through_raw_leaf_no_node_growth`.
     ///
     /// **Identity guarantee**: if the column is identical to the one
     /// already present, the returned root NodeId equals the input root via
     /// hash-cons, including when a raw `Leaf(state)` sits along the column
-    /// path — the expand-then-canonicalize round-trip preserves identity.
-    /// See tests `splice_column_identity_returns_same_nodeid` and
-    /// `splice_column_identity_through_raw_leaf_child_preserves_nodeid`.
+    /// path — the expand-then-narrowly-canonicalize round-trip preserves
+    /// identity. See tests `splice_column_identity_returns_same_nodeid`
+    /// and `splice_column_identity_through_raw_leaf_child_preserves_nodeid`.
     pub fn splice_column(
         &mut self,
         root: NodeId,
@@ -487,7 +502,7 @@ impl NodeStore {
         // itself a compressed uniform-s subtree at the level below. Keeping
         // the compressed form on untouched siblings is what lets the
         // rebuild canonicalize back to Leaf(s) and round-trip to the input
-        // NodeId on identity splice. (jw3k.3)
+        // NodeId on identity splice. (gtua)
         let (children, was_leaf_state) = match *self.get(node) {
             Node::Leaf(s) => {
                 let child = self.leaf(s);
@@ -517,7 +532,7 @@ impl NodeStore {
         // preserves NodeId identity for heterogeneous trees: if we
         // opportunistically collapsed `Interior(L, [leaf(s); 8])` to Leaf(s)
         // on ascent, an identity splice through uniform(L, s) would return
-        // a different NodeId than the input. (jw3k.3)
+        // a different NodeId than the input. (gtua)
         if let Some(s) = was_leaf_state {
             let target = self.leaf(s);
             if new_children.iter().all(|&c| c == target) {
