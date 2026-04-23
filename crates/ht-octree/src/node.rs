@@ -403,10 +403,57 @@ mod tests {
 
     #[test]
     fn from_raw_roundtrip() {
-        // Only valid raws: 0 (empty) and anything where material > 0
-        // (i.e. raw > MAX_METADATA). Raws in 1..=63 are forbidden.
-        for raw in [0u16, 0x0040, 0x0041, 0x1234, 0xFFFF] {
-            assert_eq!(Cell::from_raw(raw).raw(), raw);
+        // Exhaustive over u16. Any future bit-layout shuffle that preserves
+        // a handful of sample values but corrupts the rest will surface here
+        // instead of in production hash-consing.
+        for raw in 0u16..=u16::MAX {
+            if raw != 0 && raw <= Cell::MAX_METADATA {
+                // Forbidden range: material=0 with nonzero metadata. Checked
+                // by `from_raw_rejects_*` below; skip so the sweep stays fast.
+                continue;
+            }
+            let cell = Cell::from_raw(raw);
+            assert_eq!(cell.raw(), raw, "raw round-trip diverged at {raw:#06x}");
+            let material = raw >> Cell::METADATA_BITS;
+            let metadata = raw & Cell::MAX_METADATA;
+            assert_eq!(
+                cell.material(),
+                material,
+                "material decode wrong at {raw:#06x}"
+            );
+            assert_eq!(
+                cell.metadata(),
+                metadata,
+                "metadata decode wrong at {raw:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_roundtrip_exhaustive() {
+        // Companion sweep via the (material, metadata) product space — covers
+        // every legal pack input, so a future pack/unpack split that drifts
+        // from the raw layout surfaces here even if `from_raw` is unchanged.
+        for material in 0u16..=Cell::MAX_MATERIAL {
+            let max_meta = if material == 0 { 0 } else { Cell::MAX_METADATA };
+            for metadata in 0u16..=max_meta {
+                let cell = Cell::pack(material, metadata);
+                assert_eq!(
+                    cell.material(),
+                    material,
+                    "material drift at ({material}, {metadata})"
+                );
+                assert_eq!(
+                    cell.metadata(),
+                    metadata,
+                    "metadata drift at ({material}, {metadata})"
+                );
+                assert_eq!(
+                    Cell::from_raw(cell.raw()).raw(),
+                    cell.raw(),
+                    "raw round-trip drift at ({material}, {metadata})",
+                );
+            }
         }
     }
 
