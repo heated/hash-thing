@@ -1051,6 +1051,47 @@ impl World {
         self.commit_step(&next, side);
     }
 
+    /// Probe variant of [`World::step`]: runs phases 1 (CaRule) and 2
+    /// (BlockRule) into a scratch buffer and returns a clone of that
+    /// buffer *before* phase 3 (`gravity_gap_fill`) runs on it, then
+    /// completes the step normally so the world advances identically
+    /// to `step()`. Used by `tests/probe_gap_fill_lightcone.rs`
+    /// (hash-thing-7nj6) to measure the gap_fill light cone on the
+    /// exact input distribution that the real step path sees.
+    pub fn step_returning_pre_gap_fill(&mut self) -> Vec<CellState> {
+        let side = self.side();
+        let grid = self.flatten();
+        let mut next = vec![0 as CellState; side * side * side];
+        let divisor_by_material = self.materials.tick_divisor_flags();
+        let generation = self.generation;
+
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let idx = x + y * side + z * side * side;
+                    let raw = grid[idx];
+                    let center = Cell::from_raw(raw);
+                    let mat = center.material() as usize;
+                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                    if divisor > 1 && !generation.is_multiple_of(divisor) {
+                        next[idx] = raw;
+                        continue;
+                    }
+                    let neighbors = get_neighbors(&grid, side, x, y, z);
+                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
+                        panic!("missing CaRule for material {}", center.material())
+                    });
+                    next[idx] = rule.step_cell(center, &neighbors).raw();
+                }
+            }
+        }
+        self.step_blocks(&mut next, side);
+        let pre_gap_fill = next.clone();
+        gravity_gap_fill(&mut next, side, &self.materials);
+        self.commit_step(&next, side);
+        pre_gap_fill
+    }
+
     /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
     ///
     /// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
