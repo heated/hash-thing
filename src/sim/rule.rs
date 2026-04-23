@@ -850,6 +850,82 @@ mod tests {
         );
     }
 
+    /// Pins the `is_self_inert` truth table. The centralised match in
+    /// `CaRule::is_self_inert` uses a wildcard fall-through to `is_noop()` —
+    /// without this test, a future variant that needs to be self-inert could
+    /// silently regress `MaterialRegistry::cell_is_inert_fixed_point()` and
+    /// lose hashlife's inert-subtree fast path. Update the expected arms here
+    /// whenever an enum variant is added.
+    #[test]
+    fn carule_is_self_inert_truth_table() {
+        let air: CaRule = AirRule {
+            fan_material: 0,
+            carried_materials: Vec::new(),
+            vine_growth: None,
+        }
+        .into();
+        assert!(air.is_self_inert(), "AirRule must be self-inert");
+
+        let avg: CaRule = AirVineGrowthRule {
+            vine_material: 1,
+            support_materials: Vec::new(),
+            spread_age: 0,
+        }
+        .into();
+        assert!(avg.is_self_inert(), "AirVineGrowthRule must be self-inert");
+
+        let dissolvable: CaRule = DissolvableRule { acid_material: 1 }.into();
+        assert!(
+            dissolvable.is_self_inert(),
+            "DissolvableRule must be self-inert"
+        );
+
+        // FanDriven delegates to its base.
+        let fan_over_air: CaRule = FanDrivenRule::new(
+            AirRule {
+                fan_material: 0,
+                carried_materials: Vec::new(),
+                vine_growth: None,
+            },
+            1,
+        )
+        .into();
+        assert!(
+            fan_over_air.is_self_inert(),
+            "FanDriven(Air) must inherit self-inert from its base"
+        );
+        let fan_over_water: CaRule = FanDrivenRule::new(
+            WaterRule {
+                reactive_material: 1,
+                reaction_product: Cell::EMPTY,
+            },
+            1,
+        )
+        .into();
+        assert!(
+            !fan_over_water.is_self_inert(),
+            "FanDriven(Water) must not be self-inert (water is reactive)"
+        );
+
+        // Reactive rules are never self-inert.
+        let water: CaRule = WaterRule {
+            reactive_material: 1,
+            reaction_product: Cell::EMPTY,
+        }
+        .into();
+        assert!(!water.is_self_inert(), "WaterRule must not be self-inert");
+
+        // Noop/Fan wildcard arms fall through to is_noop(). This line
+        // pins the current behaviour so any future change is forced to
+        // update both arms deliberately (not silently).
+        let noop: CaRule = NoopRule.into();
+        assert_eq!(
+            noop.is_self_inert(),
+            noop.is_noop(),
+            "NoopRule wildcard arm must keep delegating to is_noop()"
+        );
+    }
+
     fn mat(material: u16) -> Cell {
         Cell::pack(material, 0)
     }
