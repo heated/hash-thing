@@ -2228,21 +2228,13 @@ impl ApplicationHandler for App {
                     self.startup_scene_pending = false;
                     self.load_initial_scene();
                     // load_initial_scene runs terrain gen + SVDAG upload —
-                    // hundreds of ms at 256³. Reset so the first real frame's
-                    // dt measures the frame, not the cold-start work
-                    // (hash-thing-q07n; same pattern as xysz for resume edges).
-                    //
-                    // Post-hash-thing-v79j: `load_initial_scene` calls
-                    // `reset_scene_perf_state` (src/main.rs:902), which now
-                    // routes through `mark_resume_edge` — so the suppress
-                    // flag is already set when execution reaches here. The
-                    // assignment below refreshes `last_frame` a second time
-                    // to skip over the terrain-gen + upload window that ran
-                    // between `mark_resume_edge` at the top of the scene
-                    // loader and this point. 6e4a's remaining scope is
-                    // tidying this to a direct `mark_resume_edge` call for
-                    // symmetry with the other resume edges.
-                    self.last_frame = std::time::Instant::now();
+                    // hundreds of ms at 256³. Re-arm the resume edge AFTER
+                    // the upload window so `dt_wall` below measures the
+                    // first real frame, not the cold-start work. Symmetric
+                    // with focus / unocclude / scene-swap resume edges —
+                    // all four share the same pairing contract (last_frame
+                    // + suppress). See hash-thing-v79j / hash-thing-6e4a.
+                    self.mark_resume_edge();
                 }
 
                 // Frame delta time. `dt` is clamped to 0.1s for xa7
@@ -3045,6 +3037,44 @@ mod tests {
         assert!(
             app.suppress_next_fps_sample,
             "scene reset must flag the next FPS sample as bogus via mark_resume_edge"
+        );
+    }
+
+    #[test]
+    fn cold_start_reset_scene_perf_state_is_sufficient_to_suppress_spike() {
+        // hash-thing-6e4a: startup-call-site contract test. The cold-start
+        // redraw block calls load_initial_scene (which calls
+        // reset_scene_perf_state) then mark_resume_edge. This test
+        // deliberately does NOT call mark_resume_edge explicitly — it pins
+        // that reset_scene_perf_state ALONE is sufficient to suppress the
+        // first post-reset FPS sample, so a future refactor that strips
+        // mark_resume_edge out of reset_scene_perf_state would fail here.
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.smoothed_fps = 0.0;
+        app.suppress_next_fps_sample = false;
+
+        app.reset_scene_perf_state();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let dt_wall = app.last_frame.elapsed().as_secs_f64();
+        app.apply_fps_sample(dt_wall);
+        assert_eq!(
+            app.smoothed_fps, 0.0,
+            "cold-start first sample must be suppressed by reset_scene_perf_state alone; got {}",
+            app.smoothed_fps,
+        );
+
+        app.apply_fps_sample(1.0 / 60.0);
+        assert!(
+            (app.smoothed_fps - 60.0).abs() < 1e-9,
+            "second sample must seed via zero-sentinel at the instant value; got {}",
+            app.smoothed_fps,
+        );
+        assert!(
+            app.smoothed_fps < 1000.0,
+            "smoothed_fps must not spike into thousands; got {}",
+            app.smoothed_fps,
         );
     }
 
