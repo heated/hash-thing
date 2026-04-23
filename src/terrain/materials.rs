@@ -985,6 +985,12 @@ impl MaterialRegistry {
         rule_id
     }
 
+    /// Register a block rule and return its id.
+    ///
+    /// On a registry embedded in a [`crate::sim::world::World`], calling this
+    /// directly on `world.materials` bypasses [`crate::sim::world::World::mutate_materials`]
+    /// and leaves `block_rule_present` stale (hash-thing-6iiz / dxi4.2 audit).
+    /// Route via `world.mutate_materials(|m| m.register_block_rule(...))` instead.
     pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
     where
         R: BlockRule + Send + 'static,
@@ -995,6 +1001,12 @@ impl MaterialRegistry {
         id
     }
 
+    /// Bind `material_id` to the given block rule.
+    ///
+    /// On a registry embedded in a [`crate::sim::world::World`], calling this
+    /// directly on `world.materials` bypasses [`crate::sim::world::World::mutate_materials`]
+    /// and leaves `block_rule_present` stale (hash-thing-6iiz / dxi4.2 audit).
+    /// Route via `world.mutate_materials(|m| m.assign_block_rule(...))` instead.
     pub fn assign_block_rule(&mut self, material_id: MaterialId, block_rule_id: BlockRuleId) {
         self.entries[material_id as usize]
             .as_mut()
@@ -1007,13 +1019,15 @@ impl MaterialRegistry {
 
     /// Set the tick divisor for an existing material.
     ///
-    /// Panics if `divisor == 0`. Must be called **before stepping**: this does
-    /// not invalidate the hashlife memo caches, so stale cache entries indexed
-    /// under a prior `memo_period()` would return incorrect results on the
-    /// next step. Prefer [`crate::sim::world::World::set_material_tick_divisor`]
-    /// which clears the caches. Crate-private because the shipping path bakes
-    /// divisors into registrar constructors; this exists for tests and for the
-    /// future tuning bead.
+    /// Panics if `divisor == 0`. On a registry embedded in a
+    /// [`crate::sim::world::World`], calling this directly on `world.materials`
+    /// bypasses [`crate::sim::world::World::mutate_materials`] and leaves the
+    /// four hashlife caches + `block_rule_present` stale (hash-thing-6iiz /
+    /// dxi4.2 audit). Prefer
+    /// [`crate::sim::world::World::set_material_tick_divisor`] or route via
+    /// `world.mutate_materials(|m| m.set_tick_divisor(...))`. Crate-private
+    /// because the shipping path bakes divisors into registrar constructors;
+    /// this exists for tests and the future tuning bead.
     #[allow(dead_code)]
     pub(crate) fn set_tick_divisor(&mut self, material_id: MaterialId, divisor: u16) {
         assert!(
