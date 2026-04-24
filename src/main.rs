@@ -188,13 +188,21 @@ enum PendingPlayerAction {
 /// actions are FIFO lightweight edits against the next live world, while
 /// scene swaps replace the world/entities/render state wholesale. Last
 /// write wins: pressing another scene-selection key (`g`, `m`, `r`, `t`,
-/// `b`, or another `n`/`v`) clears the queue *at key-press time*, even
-/// when the new loader early-returns under `is_stepping()`. That way a
-/// stale queued swap can't land after the user has already picked
-/// something else. If both a player action and a scene swap are queued
-/// when the step finishes, the scene swap wins and the player action is
-/// dropped — the action was queued against a world we're about to
-/// discard, so replaying it would just do wasted upload work.
+/// `b`, another `n`/`v`, or a lattice debug jump `[`/`]`/`u`/`i`/`o`)
+/// clears the queue *at key-press time*, even when the new loader
+/// early-returns under `is_stepping()`. That way a stale queued swap
+/// can't land after the user has already picked something else. If both
+/// a player action and a scene swap are queued when the step finishes,
+/// the scene swap wins and the player action is dropped — the action
+/// was queued against a world we're about to discard, so replaying it
+/// would just do wasted upload work.
+///
+/// `SelectLatticeBeat` carries a pre-resolved target beat (computed at
+/// press-time from `current_demo_beat` for `[`/`]`). Resolving at press
+/// time keeps the cycle-direction intent stable across overwrites
+/// (hash-thing-5a5a plan review), so pressing `]` then another
+/// scene-swap key doesn't silently re-resolve the target against an
+/// unintended `current_demo_beat`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingSceneSwap {
     LoadLatticeDemo,
@@ -203,6 +211,7 @@ enum PendingSceneSwap {
     LoadGyroid,
     LoadDemoSpectacle,
     ResetGolSmoke,
+    SelectLatticeBeat(LatticeDemoBeat),
 }
 
 impl PendingSceneSwap {
@@ -214,6 +223,9 @@ impl PendingSceneSwap {
             Self::LoadGyroid => "gyroid",
             Self::LoadDemoSpectacle => "demo_spectacle",
             Self::ResetGolSmoke => "gol_smoke_reset",
+            Self::SelectLatticeBeat(LatticeDemoBeat::Intro) => "lattice_beat_intro",
+            Self::SelectLatticeBeat(LatticeDemoBeat::Interior) => "lattice_beat_interior",
+            Self::SelectLatticeBeat(LatticeDemoBeat::Panorama) => "lattice_beat_panorama",
         }
     }
 }
@@ -1148,6 +1160,7 @@ impl App {
                 self.load_demo_spectacle("Reset spectacle gallery")
             }
             PendingSceneSwap::ResetGolSmoke => self.reset_gol_smoke_scene(),
+            PendingSceneSwap::SelectLatticeBeat(beat) => self.load_lattice_demo_beat(beat),
         }
     }
 
@@ -1298,22 +1311,6 @@ impl App {
         self.apply_orbit_camera_pose(waypoint.camera);
         self.current_demo_beat = Some(beat);
         log::info!("Lattice debug jump: {} ({})", waypoint.label, beat.label());
-    }
-
-    fn cycle_lattice_demo_beat(&mut self, step: i32) {
-        self.short_demo_cut = None;
-        let current = self.current_demo_beat.unwrap_or(LatticeDemoBeat::Intro);
-        let next = if step >= 0 {
-            current.next()
-        } else {
-            current.previous()
-        };
-        self.load_lattice_demo_beat(next);
-    }
-
-    fn select_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
-        self.short_demo_cut = None;
-        self.load_lattice_demo_beat(beat);
     }
 
     fn start_lattice_short_demo_cut(&mut self) {
@@ -2012,14 +2009,34 @@ impl ApplicationHandler for App {
                             // in FPS mode. Log the silent branch so the
                             // key doesn't feel dead (hash-thing-1a1n).
                             if self.lattice_debug_jumps_enabled() {
-                                match k {
-                                    "[" => self.cycle_lattice_demo_beat(-1),
-                                    "]" => self.cycle_lattice_demo_beat(1),
-                                    "u" => self.select_lattice_demo_beat(LatticeDemoBeat::Intro),
-                                    "i" => self.select_lattice_demo_beat(LatticeDemoBeat::Interior),
-                                    "o" => self.select_lattice_demo_beat(LatticeDemoBeat::Panorama),
+                                // Route through PendingSceneSwap so a press
+                                // during a background sim step gets queued
+                                // instead of silently dropped (hash-thing-5a5a).
+                                // Resolve the target beat here, at press
+                                // time, so the cycle-direction intent
+                                // stays pinned even if a later key
+                                // overwrites the queue.
+                                //
+                                // Clear `short_demo_cut` synchronously —
+                                // `update_lattice_short_demo_cut` runs
+                                // every frame during stepping, so
+                                // deferring the clear to dispatch would
+                                // let the cut timer keep advancing
+                                // against a now-cancelled cut.
+                                self.short_demo_cut = None;
+                                let current =
+                                    self.current_demo_beat.unwrap_or(LatticeDemoBeat::Intro);
+                                let target = match k {
+                                    "[" => current.previous(),
+                                    "]" => current.next(),
+                                    "u" => LatticeDemoBeat::Intro,
+                                    "i" => LatticeDemoBeat::Interior,
+                                    "o" => LatticeDemoBeat::Panorama,
                                     _ => unreachable!(),
-                                }
+                                };
+                                self.request_scene_swap(PendingSceneSwap::SelectLatticeBeat(
+                                    target,
+                                ));
                             } else {
                                 // debug!, not info!: winit delivers key-repeat
                                 // events and the default filter is `info`, so
@@ -3012,6 +3029,38 @@ mod tests {
         assert_eq!(LatticeDemoBeat::Intro.label(), "intro");
         assert_eq!(LatticeDemoBeat::Interior.label(), "interior");
         assert_eq!(LatticeDemoBeat::Panorama.label(), "panorama");
+    }
+
+    #[test]
+    fn pending_scene_swap_select_lattice_beat_labels_are_stable() {
+        // hash-thing-5a5a: the queued log line uses `label()` to
+        // distinguish which beat was requested, so every variant must
+        // map to a distinct static string.
+        assert_eq!(
+            PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Intro).label(),
+            "lattice_beat_intro",
+        );
+        assert_eq!(
+            PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Interior).label(),
+            "lattice_beat_interior",
+        );
+        assert_eq!(
+            PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Panorama).label(),
+            "lattice_beat_panorama",
+        );
+    }
+
+    #[test]
+    fn dispatch_scene_swap_select_lattice_beat_sets_current_beat() {
+        // hash-thing-5a5a: the drain path must actually load the
+        // requested beat, not just decode the variant. Bypass the
+        // queue by calling dispatch directly on a non-stepping App so
+        // the dispatch arm's body is exercised end-to-end.
+        let mut app = App::new(64);
+        app.dispatch_scene_swap(PendingSceneSwap::SelectLatticeBeat(
+            LatticeDemoBeat::Interior,
+        ));
+        assert_eq!(app.current_demo_beat, Some(LatticeDemoBeat::Interior));
     }
 
     #[test]
