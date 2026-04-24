@@ -3896,4 +3896,144 @@ mod tests {
     fn prime_cursor_preserving_look(app: &mut App, start_x: f64, start_y: f64) {
         app.last_mouse = Some((start_x, start_y));
     }
+
+    // hash-thing-t3zn: warp-landing audit. Each warp key must drop the
+    // player into playable space — inside world bounds, AABB clear of
+    // solid cells, with floor support, and facing a finite direction.
+    // Failures here are real bugs; file a follow-up fix bead before
+    // adjusting the assertion.
+    fn assert_player_in_playable_space(app: &App, label: &str) {
+        let pid = app
+            .player_id
+            .unwrap_or_else(|| panic!("{label}: warp must leave player_id set"));
+        let player = app
+            .entities
+            .iter()
+            .find(|e| e.id == pid)
+            .unwrap_or_else(|| panic!("{label}: player entity missing after warp"));
+        let pos = player.pos;
+        let origin = app.world.origin;
+        let side = app.world.side() as i64;
+        for axis in 0..3 {
+            let lo = origin[axis] as f64;
+            let hi = (origin[axis] + side) as f64;
+            assert!(
+                pos[axis] >= lo && pos[axis] < hi,
+                "{label}: pos[{axis}]={} outside world bounds [{}, {})",
+                pos[axis],
+                lo,
+                hi,
+            );
+        }
+        assert!(
+            !player::player_collides(&app.world, &pos),
+            "{label}: player AABB at {pos:?} overlaps a solid cell",
+        );
+        assert!(
+            player::is_grounded(&app.world, &pos),
+            "{label}: player at {pos:?} has no floor support",
+        );
+        if let sim::EntityKind::Player(state) = &player.kind {
+            assert!(
+                state.yaw.is_finite() && state.pitch.is_finite(),
+                "{label}: degenerate facing yaw={} pitch={}",
+                state.yaw,
+                state.pitch,
+            );
+        } else {
+            panic!("{label}: player_id points at a non-Player entity");
+        }
+    }
+
+    /// Audit `n` (LoadLatticeDemo): seeded lattice spawn must be in playable
+    /// space.
+    #[test]
+    fn warp_n_load_lattice_demo_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_lattice_demo()
+            .expect("load_lattice_demo must succeed when no step is in flight");
+        assert_player_in_playable_space(&app, "n / load_lattice_demo");
+    }
+
+    /// Audit `v` (LoadLatticePanoramaDemo): the user-facing panorama-cut
+    /// entry point starts at the Intro beat, so its landing pose must be
+    /// playable.
+    #[test]
+    fn warp_v_load_lattice_panorama_demo_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_lattice_panorama_demo();
+        assert_player_in_playable_space(&app, "v / load_lattice_panorama_demo");
+    }
+
+    /// Audit `[`, `]`, `u`, `i`, `o`: every lattice-demo beat reachable from
+    /// the keyboard must land in playable space at the App level. The
+    /// per-beat waypoint correctness is already covered cell-by-cell in
+    /// `lattice_demo_waypoints_do_not_collide_with_scene`; this test
+    /// exercises the full keypress→swap→pose path on a representative
+    /// beat (Interior — the only one not implicitly retested by `v`/`n`)
+    /// to keep the suite under the soft 60s budget.
+    #[test]
+    fn warp_lattice_debug_jumps_land_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_lattice_demo_beat(LatticeDemoBeat::Interior);
+        assert_player_in_playable_space(&app, "i / load_lattice_demo_beat(Interior)");
+    }
+
+    /// Audit `b` (LoadDemoSpectacle): the spectacle gallery places the
+    /// player at world_center + 2 cells up. Verify that pose is in playable
+    /// space across the seeded spectacle geometry.
+    ///
+    /// Currently FAILS — spectacle has no floor support at world_center, so
+    /// the player drops at [128, 136, 128] with no ground beneath them. See
+    /// hash-thing-t3zn.2 for the fix bead; un-#[ignore] when it lands.
+    #[test]
+    #[ignore = "hash-thing-t3zn.2: spectacle leaves player floating, fix pending"]
+    fn warp_b_load_demo_spectacle_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_demo_spectacle("warp-audit");
+        assert_player_in_playable_space(&app, "b / load_demo_spectacle");
+    }
+
+    /// Audit `0` (recenter_player): recenter from inside a seeded scene
+    /// must not drop the player AABB into a solid cell.
+    ///
+    /// Currently FAILS — recenter blindly teleports to world_center + 2
+    /// cells up, which lands inside the lattice room geometry. See
+    /// hash-thing-t3zn.1 for the fix bead; un-#[ignore] when it lands.
+    /// Grounded support is intentionally not asserted here — a separate
+    /// bead would be needed if recenter is meant to seek floor support.
+    #[test]
+    #[ignore = "hash-thing-t3zn.1: recenter_player teleports into solid cells, fix pending"]
+    fn warp_0_recenter_player_into_lattice_demo_lands_in_playable_space() {
+        let mut app = App::new(256);
+        // Seed a real scene so the player exists and the world has solid
+        // cells around the spawn — exercises the realistic "press 0 mid-demo"
+        // path rather than recentering into an empty world.
+        app.load_lattice_demo()
+            .expect("scene seed must succeed so player_id is set");
+        assert!(app.recenter_player(), "recenter must succeed once a player exists");
+
+        let pid = app.player_id.expect("player should exist after recenter");
+        let player = app
+            .entities
+            .iter()
+            .find(|e| e.id == pid)
+            .expect("player entity should exist");
+        let pos = player.pos;
+        let origin = app.world.origin;
+        let side = app.world.side() as i64;
+        for axis in 0..3 {
+            let lo = origin[axis] as f64;
+            let hi = (origin[axis] + side) as f64;
+            assert!(
+                pos[axis] >= lo && pos[axis] < hi,
+                "0 / recenter_player: pos[{axis}]={} outside world bounds [{lo}, {hi})",
+                pos[axis],
+            );
+        }
+        assert!(
+            !player::player_collides(&app.world, &pos),
+            "0 / recenter_player: player AABB at {pos:?} overlaps a solid cell",
+        );
+    }
 }
