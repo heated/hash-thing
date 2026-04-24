@@ -940,19 +940,21 @@ impl App {
 
         // hash-thing-t3zn.1: blind teleport to `center + 2 cells up` lands
         // inside terrain when the world center is buried. Scan upward at
-        // (cx, cz) for the first AABB-clear, grounded pose; fall back to the
-        // blind pose only when the column has no playable surface (e.g. an
-        // empty world or solid all the way up).
+        // (cx, cz) for the first AABB-clear, grounded pose; on no match the
+        // `unwrap_or(blind_pos)` below falls back to the blind pose (covers
+        // the empty world — `is_grounded` is false everywhere, so the loop
+        // exits without setting `grounded_pos` — and the all-solid column).
         //
-        // Ceiling bound is AABB-aware: `player::player_collides` reads
-        // out-of-region cells as 0, so a candidate near the world top could
-        // look "clear" while the player's head pokes outside the realized
-        // region. Stop once the AABB top would exceed `origin + side`.
+        // Ceiling bound is AABB-aware and mirrors `player::player_collides`:
+        // that helper iterates cells up to `floor(pos[1] + PLAYER_HEIGHT)`
+        // inclusive and reads out-of-region cells as 0, so a naive scan
+        // could declare clearance while the player's head cell sits outside
+        // the realized region. Stop the scan as soon as the topmost AABB
+        // cell `floor(search_y + PLAYER_HEIGHT)` would land at `world_top`.
         let world_top = (self.world.origin[1] + self.world.side() as i64) as f64;
-        let player_height_ceil = player::PLAYER_HEIGHT.ceil();
         let mut search_y = blind_pos[1].floor();
         let mut grounded_pos: Option<[f64; 3]> = None;
-        while search_y + player_height_ceil < world_top {
+        while (search_y + player::PLAYER_HEIGHT).floor() < world_top {
             let cand = [blind_pos[0], search_y, blind_pos[2]];
             if !player::player_collides(&self.world, &cand)
                 && player::is_grounded(&self.world, &cand)
@@ -4076,11 +4078,13 @@ mod tests {
         let cx = center[0].floor() as i64;
         let cz = center[2].floor() as i64;
         let blind_y = (center[1] + 2.0 * CELLS_PER_METER).floor() as i64;
-        // Fill a stone column from y=0 up to and INCLUDING the blind
-        // candidate's AABB (the player AABB reads 4 cells horizontally and
-        // ~7 vertically around `pos`). Cap the column at `blind_y + 4` so
-        // the surface support sits just above the blind pose's footprint;
-        // the climb should land ~5 cells above blind_y.
+        // Fill a stone column from y=0 through the bottom half of the blind
+        // candidate's AABB. The blind AABB occupies cells [blind_y,
+        // blind_y+6] inclusive (PLAYER_HEIGHT=6.4); the column tops at
+        // cell `blind_y+3` (`0..column_top` excludes `column_top`). The
+        // first clear+grounded scan candidate is `search_y = column_top`:
+        // its AABB starts at `column_top`, support cell `column_top-1` is
+        // the topmost stone, and the cells above are clear.
         let column_top = blind_y + 4;
         for y in 0..column_top {
             for x in (cx - 2)..=(cx + 2) {
@@ -4109,9 +4113,9 @@ mod tests {
             player::is_grounded(&app.world, &pos),
             "recenter must land on the surface above the column; pos={pos:?}",
         );
-        assert!(
-            pos[1] > blind_y as f64,
-            "recenter climbed too low — should be above the stone surface: \
+        assert_eq!(
+            pos[1], column_top as f64,
+            "recenter must land exactly on the surface above the stone column: \
              pos.y={} blind_y={} column_top={}",
             pos[1],
             blind_y,
