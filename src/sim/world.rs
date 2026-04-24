@@ -1208,8 +1208,13 @@ impl World {
             }
         }
 
+        let movable: [bool; 8] = std::array::from_fn(|i| {
+            let c = block[i];
+            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
+        });
+
         let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block);
+        let result = rule.step_block(&block, &movable);
 
         // Mass conservation assertion: output must be a permutation of input.
         debug_assert!(
@@ -1223,9 +1228,19 @@ impl World {
             "block rule violated mass conservation at ({bx}, {by}, {bz})"
         );
 
-        // Write back, but anchor cells that didn't opt into this block rule.
-        // A cell with block_rule_id == None is immovable — it stays in its
-        // original position even if the rule tried to swap it elsewhere.
+        // Contract assertion: immovable cells must be left in place by the
+        // rule. Without this, a buggy rule that swaps an immovable cell into
+        // a movable slot would silently delete the immovable cell's value
+        // (the write-back filter only writes movable positions). Assert
+        // here so the failure is loud, not a slow water leak.
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell at ({bx}, {by}, {bz})"
+        );
+
+        // Write back. The rule is contracted to leave immovable cells fixed,
+        // so writing the rule output is safe. The `movable` filter is a
+        // belt-and-suspenders guard against a rule that violates the contract.
         // OOB positions are silently skipped (absorbing boundary).
         for dz in 0..2 {
             for dy in 0..2 {
@@ -1237,14 +1252,10 @@ impl World {
                         continue;
                     }
                     let i = block_index(dx, dy, dz);
-                    let original = block[i];
-                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = x + y * side + z * side * side;
-                    if has_rule || original.is_empty() {
-                        // Opted-in cells and empty cells can be moved by the rule.
+                    if movable[i] {
                         grid[idx] = result[i].raw();
                     }
-                    // else: non-participating cell stays put (anchored).
                 }
             }
         }
