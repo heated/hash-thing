@@ -3405,8 +3405,12 @@ mod tests {
     /// arms.** Future dispatch experiments here should look at
     /// stratified iteration (vvun's "alternative lever") or PGO,
     /// not blanket inlining.
+    ///
+    /// Numbers are wall-time over 20 cold-start steps, not warm-frame
+    /// only — both A and B see the same warm-up so the relative delta
+    /// is preserved, but a per-tick steady-state number would be lower.
     #[test]
-    #[ignore = "scout/profiling — prints timing, no assertions"]
+    #[ignore = "scout/profiling — prints timing; only seed-coverage asserts"]
     fn hashlife_phase_timing_scout_heterogeneous_64() {
         let mut world = World::new(6);
         seed_heterogeneous_palette_64(&mut world);
@@ -3427,19 +3431,23 @@ mod tests {
         }
         // Map material id → expected floor.
         let air_count = counts[0];
+        let fire_count = counts[4];
         let water_count = counts[5];
         let lava_count = counts[7];
         let ice_count = counts[8];
         let oil_count = counts[10];
         let steam_count = counts[12];
+        let vine_count = counts[15];
         let firework_count = counts[17];
         assert!(air_count > 100_000, "AirRule coverage too low: {air_count}");
+        assert!(fire_count > 16, "FireRule coverage too low: {fire_count}");
         assert!(
             water_count > 1000,
             "WaterRule coverage too low: {water_count}"
         );
         assert!(lava_count > 1000, "LavaRule coverage too low: {lava_count}");
         assert!(ice_count > 100, "IceRule coverage too low: {ice_count}");
+        // OilRule dispatches via the FlammableRule arm in this codebase.
         assert!(
             oil_count > 100,
             "FlammableRule coverage too low: {oil_count}"
@@ -3448,6 +3456,7 @@ mod tests {
             steam_count > 100,
             "SteamRule coverage too low: {steam_count}"
         );
+        assert!(vine_count > 8, "VineRule coverage too low: {vine_count}");
         assert!(
             firework_count > 100,
             "FireworkRule coverage too low: {firework_count}"
@@ -3494,7 +3503,7 @@ mod tests {
             stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
         );
         eprintln!(
-            "  t=0 coverage: air={air_count} water={water_count} lava={lava_count} ice={ice_count} oil={oil_count} steam={steam_count} firework={firework_count}",
+            "  t=0 coverage: air={air_count} fire={fire_count} water={water_count} lava={lava_count} ice={ice_count} oil={oil_count} steam={steam_count} vine={vine_count} firework={firework_count}",
         );
     }
 
