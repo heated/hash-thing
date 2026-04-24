@@ -2570,8 +2570,8 @@ mod tests {
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
         MaterialRegistry, FAN, FAN_ARMED_FIREWORK_MATERIAL_IDS, FAN_ARMED_STEAM_MATERIAL_IDS, FIRE,
-        FIREWORK, FIREWORK_MATERIAL_ID, GRASS, LAVA, OIL, SAND, STEAM_MATERIAL_ID, STONE, VINE,
-        WATER,
+        FIREWORK, FIREWORK_MATERIAL_ID, GRASS, ICE, LAVA, OIL, SAND, STEAM, STEAM_MATERIAL_ID,
+        STONE, VINE, WATER,
     };
     use std::collections::{HashSet, VecDeque};
 
@@ -3256,6 +3256,245 @@ mod tests {
             stats.cache_hits,
             stats.cache_misses,
             stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+        );
+    }
+
+    /// hash-thing-9t4u: place a deterministic heterogeneous material mix on
+    /// a level-6 (64³) world so the CaRule dispatch fires across many arms
+    /// per step. No terrain seeding — direct `set_local` writes onto a
+    /// STONE substrate so the bench isolates the dispatch axis from terrain
+    /// generation noise.
+    ///
+    /// Layout (slabs separated geometrically so reactions stay slow boundary
+    /// effects rather than instant collapse):
+    /// - STONE substrate: y in [0, 16).
+    /// - WATER slab: y in [22, 26), x in [0, 32), z in [0, 32).
+    /// - LAVA slab: y in [22, 26), x in [32, 64), z in [32, 64).
+    ///   (No shared face with WATER.)
+    /// - ICE slab: y in [28, 30), x in [0, 32), z in [32, 64).
+    /// - OIL slab: y in [28, 30), x in [32, 64), z in [0, 32).
+    /// - FIRE pillars: 8 isolated 1×4×1 columns at fixed (x,z), y in [30, 34).
+    /// - STEAM slab: y in [38, 40), x in [0, 32), z in [0, 32).
+    /// - FIREWORK slab: y in [38, 40), x in [32, 64), z in [32, 64).
+    /// - VINE pillars: 4 isolated 1×3×1 columns at corners on top of stone.
+    /// - SAND corner block: 4×2×4 at (0, 16, 0).
+    fn seed_heterogeneous_palette_64(world: &mut World) {
+        // STONE substrate.
+        for z in 0..64u64 {
+            for x in 0..64u64 {
+                for y in 0..16u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), STONE);
+                }
+            }
+        }
+        // SAND corner block.
+        for z in 0..4u64 {
+            for x in 0..4u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(16 + dy), LocalCoord(z), SAND);
+                }
+            }
+        }
+        // VINE pillars (on the stone surface y=16,17,18).
+        for &(px, pz) in &[(16u64, 16u64), (48, 16), (16, 48), (48, 48)] {
+            for dy in 0..3u64 {
+                world.set_local(LocalCoord(px), LocalCoord(16 + dy), LocalCoord(pz), VINE);
+            }
+        }
+        // WATER slab (NW quadrant).
+        for z in 0..32u64 {
+            for x in 0..32u64 {
+                for dy in 0..4u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(22 + dy), LocalCoord(z), WATER);
+                }
+            }
+        }
+        // LAVA slab (SE quadrant — no shared face with WATER).
+        for z in 32..64u64 {
+            for x in 32..64u64 {
+                for dy in 0..4u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(22 + dy), LocalCoord(z), LAVA);
+                }
+            }
+        }
+        // ICE slab (NE quadrant, higher).
+        for z in 32..64u64 {
+            for x in 0..32u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(28 + dy), LocalCoord(z), ICE);
+                }
+            }
+        }
+        // OIL slab (SW quadrant, higher).
+        for z in 0..32u64 {
+            for x in 32..64u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(28 + dy), LocalCoord(z), OIL);
+                }
+            }
+        }
+        // FIRE pillars (8 columns at fixed (x,z) so dispatch sees FireRule).
+        for &(px, pz) in &[
+            (8u64, 8u64),
+            (24, 8),
+            (40, 8),
+            (56, 8),
+            (8, 56),
+            (24, 56),
+            (40, 56),
+            (56, 56),
+        ] {
+            for dy in 0..4u64 {
+                world.set_local(LocalCoord(px), LocalCoord(30 + dy), LocalCoord(pz), FIRE);
+            }
+        }
+        // STEAM slab (NW quadrant, top).
+        for z in 0..32u64 {
+            for x in 0..32u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(38 + dy), LocalCoord(z), STEAM);
+                }
+            }
+        }
+        // FIREWORK slab (SE quadrant, top).
+        for z in 32..64u64 {
+            for x in 32..64u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(38 + dy), LocalCoord(z), FIREWORK);
+                }
+            }
+        }
+    }
+
+    /// hash-thing-9t4u scout: heterogeneous-scene phase timing.
+    ///
+    /// Sibling to `hashlife_phase_timing_scout_water_64`. The water scout
+    /// is dominated by AirRule + WaterRule dispatch — in a homogeneous
+    /// scene the indirect-branch predictor hits ~100%, so dispatch cost
+    /// becomes invisible. This scout seeds many materials at once so
+    /// every CaRule arm gets exercised per tick, defeating prediction
+    /// and exposing whatever dispatch cost remains after the vvun
+    /// trait→enum refactor.
+    ///
+    /// Use this scout to compare `#[inline]` candidates on hot rule
+    /// step_cell bodies. The vvun.2 acceptance bar is ≥10% phase1
+    /// reduction on this scene with no >2% regression on the water
+    /// scout. If neither moves, the lever doesn't help in this dispatch
+    /// shape — document the negative result inline and on the bd.
+    ///
+    /// Run: `cargo test --profile bench --lib
+    /// hashlife_phase_timing_scout_heterogeneous_64 -- --ignored --nocapture`
+    /// Repeat 3× and report min/median/max spread.
+    ///
+    /// # 9t4u finding (2026-04-24): `#[inline]` regresses by ~13.5%
+    ///
+    /// Tested adding `#[inline]` to seven hot rule `step_cell` bodies
+    /// (Air, Water, Lava, Ice, Flammable, Steam, Firework). 5 baseline
+    /// runs vs 5 inlined runs on this scene:
+    ///
+    /// | variant   | phase1 min | phase1 median | phase1 max | spread |
+    /// | --------- | ---------- | ------------- | ---------- | ------ |
+    /// | baseline  | 144.29 ms  | **145.71 ms** | 147.56 ms  | 1.023  |
+    /// | inlined   | 163.89 ms  | **165.31 ms** | 168.24 ms  | 1.027  |
+    ///
+    /// Median delta: **+13.5% regression** under `#[inline]`. Likely
+    /// cause: dispatch-site match at `rule.rs` is already `#[inline]`,
+    /// so leaf inlining duplicates the bodies into the dispatch site
+    /// and inflates i-cache pressure — Claude plan-review's flagged
+    /// failure mode. **Do not retry naive leaf `#[inline]` on these
+    /// arms.** Future dispatch experiments here should look at
+    /// stratified iteration (vvun's "alternative lever") or PGO,
+    /// not blanket inlining.
+    #[test]
+    #[ignore = "scout/profiling — prints timing, no assertions"]
+    fn hashlife_phase_timing_scout_heterogeneous_64() {
+        let mut world = World::new(6);
+        seed_heterogeneous_palette_64(&mut world);
+
+        // Per-arm dispatch coverage guard (hash-thing-9t4u):
+        // confirms each major rule has a non-trivial input population.
+        let mut counts = [0u64; 32];
+        for z in 0..64u64 {
+            for y in 0..64u64 {
+                for x in 0..64u64 {
+                    let raw = world.get(wc(x), wc(y), wc(z));
+                    let m = Cell::from_raw(raw).material() as usize;
+                    if m < counts.len() {
+                        counts[m] += 1;
+                    }
+                }
+            }
+        }
+        // Map material id → expected floor.
+        let air_count = counts[0];
+        let water_count = counts[5];
+        let lava_count = counts[7];
+        let ice_count = counts[8];
+        let oil_count = counts[10];
+        let steam_count = counts[12];
+        let firework_count = counts[17];
+        assert!(air_count > 100_000, "AirRule coverage too low: {air_count}");
+        assert!(
+            water_count > 1000,
+            "WaterRule coverage too low: {water_count}"
+        );
+        assert!(lava_count > 1000, "LavaRule coverage too low: {lava_count}");
+        assert!(ice_count > 100, "IceRule coverage too low: {ice_count}");
+        assert!(
+            oil_count > 100,
+            "FlammableRule coverage too low: {oil_count}"
+        );
+        assert!(
+            steam_count > 100,
+            "SteamRule coverage too low: {steam_count}"
+        );
+        assert!(
+            firework_count > 100,
+            "FireworkRule coverage too low: {firework_count}"
+        );
+
+        const N_STEPS: u32 = 20;
+        let wall_start = std::time::Instant::now();
+        for _ in 0..N_STEPS {
+            world.step_recursive();
+        }
+        let wall_total_ns = wall_start.elapsed().as_nanos() as u64;
+
+        let stats = &world.hashlife_stats_total;
+        let p1 = stats.phase1_ns;
+        let p2 = stats.phase2_ns;
+        let pct = |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
+        eprintln!("--- hashlife phase timing scout: 64^3 heterogeneous, {N_STEPS} steps ---");
+        eprintln!("  wall_total:    {:.2} ms", wall_total_ns as f64 / 1e6);
+        eprintln!(
+            "  phase1_total:  {:.2} ms ({:.1}% of wall)",
+            p1 as f64 / 1e6,
+            pct(p1),
+        );
+        eprintln!(
+            "  phase2_total:  {:.2} ms ({:.1}% of wall)",
+            p2 as f64 / 1e6,
+            pct(p2),
+        );
+        eprintln!(
+            "  p1+p2:         {:.2} ms ({:.1}% of wall — remainder is memo lookup/insert, `next` zeroing, dispatch)",
+            (p1 + p2) as f64 / 1e6,
+            pct(p1 + p2),
+        );
+        eprintln!(
+            "  per-step avg:  p1={:.3}ms p2={:.3}ms wall={:.3}ms",
+            p1 as f64 / 1e6 / N_STEPS as f64,
+            p2 as f64 / 1e6 / N_STEPS as f64,
+            wall_total_ns as f64 / 1e6 / N_STEPS as f64,
+        );
+        eprintln!(
+            "  cache_hits={} cache_misses={} (hit_rate={:.3})",
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+        );
+        eprintln!(
+            "  t=0 coverage: air={air_count} water={water_count} lava={lava_count} ice={ice_count} oil={oil_count} steam={steam_count} firework={firework_count}",
         );
     }
 
