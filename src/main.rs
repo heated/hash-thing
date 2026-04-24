@@ -203,6 +203,7 @@ enum PendingSceneSwap {
     LoadGyroid,
     LoadDemoSpectacle,
     ResetGolSmoke,
+    SelectRule(sim::GameOfLife3D, &'static str),
 }
 
 impl PendingSceneSwap {
@@ -214,6 +215,7 @@ impl PendingSceneSwap {
             Self::LoadGyroid => "gyroid",
             Self::LoadDemoSpectacle => "demo_spectacle",
             Self::ResetGolSmoke => "gol_smoke_reset",
+            Self::SelectRule(_, _) => "select_rule",
         }
     }
 }
@@ -1148,7 +1150,19 @@ impl App {
                 self.load_demo_spectacle("Reset spectacle gallery")
             }
             PendingSceneSwap::ResetGolSmoke => self.reset_gol_smoke_scene(),
+            PendingSceneSwap::SelectRule(rule, label) => self.apply_selected_rule(rule, label),
         }
+    }
+
+    fn apply_selected_rule(&mut self, rule: sim::GameOfLife3D, label: &'static str) {
+        self.world.invalidate_material_caches();
+        if self.gol_smoke_scene {
+            self.world.set_gol_smoke_rule(rule);
+            if let Some(renderer) = &mut self.renderer {
+                renderer.upload_palette(&self.world.materials().color_palette_rgba());
+            }
+        }
+        log::info!("Rule: {label}");
     }
 
     fn run_pending_scene_swap(&mut self) {
@@ -1442,19 +1456,9 @@ impl App {
         }
     }
 
-    fn select_rule(&mut self, rule: sim::GameOfLife3D, label: &str) {
+    fn select_rule(&mut self, rule: sim::GameOfLife3D, label: &'static str) {
         self.gol_smoke_rule = rule;
-        if self.is_stepping() {
-            return;
-        }
-        self.world.invalidate_material_caches();
-        if self.gol_smoke_scene {
-            self.world.set_gol_smoke_rule(self.gol_smoke_rule);
-            if let Some(renderer) = &mut self.renderer {
-                renderer.upload_palette(&self.world.materials().color_palette_rgba());
-            }
-        }
-        log::info!("Rule: {label}");
+        self.request_scene_swap(PendingSceneSwap::SelectRule(rule, label));
     }
 
     fn load_demo_spectacle(&mut self, label: &str) {
@@ -3012,6 +3016,26 @@ mod tests {
         assert_eq!(LatticeDemoBeat::Intro.label(), "intro");
         assert_eq!(LatticeDemoBeat::Interior.label(), "interior");
         assert_eq!(LatticeDemoBeat::Panorama.label(), "panorama");
+    }
+
+    #[test]
+    fn pending_scene_swap_select_rule_label_is_stable() {
+        // hash-thing-9t8m: routing select_rule through PendingSceneSwap means
+        // the queued-line in request_scene_swap reads "Scene swap queued during
+        // step: select_rule". Pin that label so the log surface doesn't drift.
+        let swap = PendingSceneSwap::SelectRule(sim::GameOfLife3D::rule445(), "445");
+        assert_eq!(swap.label(), "select_rule");
+    }
+
+    #[test]
+    fn pending_scene_swap_select_rule_round_trips_payload() {
+        // The variant must compare equal when the rule and label match, so the
+        // queue can dedupe / replace earlier queued swaps cleanly.
+        let a = PendingSceneSwap::SelectRule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba");
+        let b = PendingSceneSwap::SelectRule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba");
+        let c = PendingSceneSwap::SelectRule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
