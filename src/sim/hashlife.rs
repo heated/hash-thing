@@ -782,6 +782,11 @@ impl World {
         let rule = self.materials.block_rule(rule_id);
         let result = rule.step_block(&block, &movable);
 
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell"
+        );
+
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
@@ -831,6 +836,11 @@ impl World {
 
         let rule = self.materials.block_rule(rule_id);
         let result = rule.step_block(&block, &movable);
+
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell"
+        );
 
         for dz in 0..2 {
             for dy in 0..2 {

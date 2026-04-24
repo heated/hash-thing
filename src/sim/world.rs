@@ -1228,6 +1228,16 @@ impl World {
             "block rule violated mass conservation at ({bx}, {by}, {bz})"
         );
 
+        // Contract assertion: immovable cells must be left in place by the
+        // rule. Without this, a buggy rule that swaps an immovable cell into
+        // a movable slot would silently delete the immovable cell's value
+        // (the write-back filter only writes movable positions). Assert
+        // here so the failure is loud, not a slow water leak.
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell at ({bx}, {by}, {bz})"
+        );
+
         // Write back. The rule is contracted to leave immovable cells fixed,
         // so writing the rule output is safe. The `movable` filter is a
         // belt-and-suspenders guard against a rule that violates the contract.
