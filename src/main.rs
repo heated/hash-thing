@@ -3981,13 +3981,9 @@ mod tests {
 
     /// Audit `b` (LoadDemoSpectacle): the spectacle gallery places the
     /// player at world_center + 2 cells up. Verify that pose is in playable
-    /// space across the seeded spectacle geometry.
-    ///
-    /// Currently FAILS — spectacle has no floor support at world_center, so
-    /// the player drops at [128, 136, 128] with no ground beneath them. See
-    /// hash-thing-t3zn.2 for the fix bead; un-#[ignore] when it lands.
+    /// space across the seeded spectacle geometry — `seed_demo_spectacle`
+    /// includes a viewing pad at world_center per hash-thing-t3zn.2.
     #[test]
-    #[ignore = "hash-thing-t3zn.2: spectacle leaves player floating, fix pending"]
     fn warp_b_load_demo_spectacle_lands_in_playable_space() {
         let mut app = App::new(256);
         app.load_demo_spectacle("warp-audit");

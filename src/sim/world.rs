@@ -4,6 +4,7 @@ use std::fmt;
 use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
+use crate::scale::CELLS_PER_METER_INT;
 use crate::terrain::field::gyroid::GyroidField;
 use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
@@ -1501,6 +1502,25 @@ impl World {
                 _ => unreachable!("demo spectacle defines exactly four waypoints"),
             }
         }
+
+        // hash-thing-t3zn.2: viewing platform under the player spawn.
+        // `App::reset_scene_entities` places the player at world_center
+        // + 2 cells up; this 5x5 stone pad sits one cell beneath them so
+        // `is_grounded` finds support. Coords use the function's existing
+        // local-as-WorldCoord convention (origin=0 assumed) — see follow-
+        // up bead for the latent shifted-origin issue this shares with
+        // the rest of `seed_demo_spectacle`.
+        let center_cell = (self.side() as i64) / 2;
+        let platform_y = center_cell + 2 * CELLS_PER_METER_INT as i64 - 1;
+        let pad_half: i64 = 2;
+        self.fill_box(
+            Box3::new(
+                [center_cell - pad_half, platform_y, center_cell - pad_half],
+                [center_cell + pad_half, platform_y, center_cell + pad_half],
+            ),
+            STONE,
+        );
+
         self.block_rule_present = None;
     }
 
@@ -3027,6 +3047,51 @@ mod tests {
                 "waypoint {} should have local fire/water spectacle",
                 waypoint.label
             );
+        }
+    }
+
+    /// hash-thing-t3zn.2: locks in the pad-vs-waypoint invariant. The
+    /// viewing pad sits at world center (`side/2 + 7` voxels above the
+    /// world-center cell) — far above every waypoint's `cy + radius`
+    /// vertical extent. If a future tweak moves a waypoint up into the
+    /// pad's footprint, this test fires before the pad silently overwrites
+    /// waypoint geometry or the pad gets buried under set-piece cells.
+    #[test]
+    fn demo_spectacle_pad_does_not_overlap_any_waypoint() {
+        let mut world = World::new(6);
+        world.seed_demo_spectacle();
+
+        let center_cell = (world.side() as i64) / 2;
+        let platform_y = center_cell + 2 * CELLS_PER_METER_INT as i64 - 1;
+        let pad_half: i64 = 2;
+
+        for waypoint in world.demo_waypoints() {
+            let r = waypoint.radius;
+            let dy = (platform_y - waypoint.center[1]).abs();
+            let dx = ((center_cell + pad_half) - (waypoint.center[0] - r))
+                .min((waypoint.center[0] + r) - (center_cell - pad_half));
+            let dz = ((center_cell + pad_half) - (waypoint.center[2] - r))
+                .min((waypoint.center[2] + r) - (center_cell - pad_half));
+            let overlaps = dx >= 0 && dy <= r && dz >= 0;
+            assert!(
+                !overlaps,
+                "pad cell at y={platform_y} overlaps waypoint {} bbox \
+                 (center={:?}, radius={r}); pad would silently overwrite \
+                 set-piece cells",
+                waypoint.label, waypoint.center,
+            );
+        }
+
+        // And the pad itself is actually stone where it ought to be.
+        for x in (center_cell - pad_half)..=(center_cell + pad_half) {
+            for z in (center_cell - pad_half)..=(center_cell + pad_half) {
+                assert_eq!(
+                    world.get(WorldCoord(x), WorldCoord(platform_y), WorldCoord(z)),
+                    STONE,
+                    "pad cell ({x},{platform_y},{z}) lost STONE — was \
+                     overwritten by a later seed step",
+                );
+            }
         }
     }
 
