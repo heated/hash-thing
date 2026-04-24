@@ -364,6 +364,184 @@ impl NodeStore {
         self.interior(level, children)
     }
 
+    // ---- Column primitives (hash-thing-jw3k.1) ----
+
+    /// Flatten a single (x, z) column (all y cells) into the caller-provided
+    /// buffer. `out.len()` must equal `1 << root.level()`.
+    ///
+    /// Walks only the 2 y-children at each level (octants `(ox, 0, oz)` and
+    /// `(ox, 1, oz)`), honors the `population == 0` early-out, and handles
+    /// intermediate `Leaf(state)` nodes by filling the corresponding y-range
+    /// with the uniform state.
+    ///
+    /// Cost per column is `2 * side - 1` node visits — flat and predictable.
+    /// Intended for sim hot paths that need per-column state without
+    /// materializing the whole 3D grid; cross-crate visibility is required
+    /// because the caller lives in the `hash-thing` crate's sim module.
+    pub fn flatten_column_into(&self, root: NodeId, x: u64, z: u64, out: &mut [CellState]) {
+        let level = self.get(root).level();
+        let side = 1u64 << level;
+        assert!(
+            x < side && z < side,
+            "flatten_column_into: ({x}, {z}) out of bounds for side {side}",
+        );
+        assert_eq!(
+            out.len() as u64,
+            side,
+            "flatten_column_into: buffer len {} != side {}",
+            out.len(),
+            side,
+        );
+        self.flatten_column_rec(root, level, x, z, out);
+    }
+
+    fn flatten_column_rec(
+        &self,
+        node: NodeId,
+        level: u32,
+        x: u64,
+        z: u64,
+        out: &mut [CellState],
+    ) {
+        debug_assert_eq!(out.len() as u64, 1u64 << level);
+        match self.get(node) {
+            Node::Leaf(s) => {
+                out.fill(*s);
+            }
+            Node::Interior {
+                children,
+                population,
+                ..
+            } => {
+                if *population == 0 {
+                    out.fill(0);
+                    return;
+                }
+                let children = *children;
+                let half = 1u64 << (level - 1);
+                let ox = if x >= half { 1u32 } else { 0 };
+                let oz = if z >= half { 1u32 } else { 0 };
+                let lx = if ox == 1 { x - half } else { x };
+                let lz = if oz == 1 { z - half } else { z };
+                let idx_lo = octant_index(ox, 0, oz);
+                let idx_hi = octant_index(ox, 1, oz);
+                let (lo, hi) = out.split_at_mut(half as usize);
+                self.flatten_column_rec(children[idx_lo], level - 1, lx, lz, lo);
+                self.flatten_column_rec(children[idx_hi], level - 1, lx, lz, hi);
+            }
+        }
+    }
+
+    /// Splice a column's cells into the tree along (x, z), returning a new
+    /// root. `column.len()` must equal `1 << root.level()`.
+    ///
+    /// Mirrors `flatten_column_into`'s topology walk; rebuilds interior nodes
+    /// along the column path and reuses hash-cons for off-path subtrees.
+    /// Intermediate `Leaf(state)` nodes are expanded into 8 child `Leaf(state)`
+    /// slots before descending (same pattern as `set_cell_at`). On ascent,
+    /// canonicalization back to compressed `Leaf(s)` form fires **only when
+    /// the input at that level was itself a `Leaf(s)`** that got expanded on
+    /// descent — never opportunistically on a pre-existing `Interior` whose
+    /// children happen to be uniform.
+    ///
+    /// The "only when input was a `Leaf(s)`" clause is load-bearing, not
+    /// incidental. Heterogeneous trees in this codebase can carry
+    /// non-canonical uniform `Interior` nodes (siblings that were never
+    /// expanded from a `Leaf`). Opportunistically canonicalizing any
+    /// uniform-`Interior` on ascent would silently rewrite those siblings
+    /// into `Leaf`, breaking identity-splice `NodeId` equality and
+    /// regressing the structural-sharing drift that fix
+    /// `hash-thing-gtua` resolved — see the `(gtua)` references on the
+    /// expand / ascent sites inside `splice_column_rec`. Any refactor
+    /// tempted to "simplify" the ascent into an unconditional
+    /// canonicalize-when-uniform MUST preserve the same identity invariant
+    /// as the regression test `splice_column_identity_through_raw_leaf_no_node_growth`.
+    ///
+    /// **Identity guarantee**: if the column is identical to the one
+    /// already present, the returned root NodeId equals the input root via
+    /// hash-cons, including when a raw `Leaf(state)` sits along the column
+    /// path — the expand-then-narrowly-canonicalize round-trip preserves
+    /// identity. See tests `splice_column_identity_returns_same_nodeid`
+    /// and `splice_column_identity_through_raw_leaf_child_preserves_nodeid`.
+    pub fn splice_column(
+        &mut self,
+        root: NodeId,
+        x: u64,
+        z: u64,
+        column: &[CellState],
+    ) -> NodeId {
+        let level = self.get(root).level();
+        let side = 1u64 << level;
+        assert!(
+            x < side && z < side,
+            "splice_column: ({x}, {z}) out of bounds for side {side}",
+        );
+        assert_eq!(
+            column.len() as u64,
+            side,
+            "splice_column: column len {} != side {}",
+            column.len(),
+            side,
+        );
+        self.splice_column_rec(root, level, x, z, column)
+    }
+
+    fn splice_column_rec(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        x: u64,
+        z: u64,
+        column: &[CellState],
+    ) -> NodeId {
+        debug_assert_eq!(column.len() as u64, 1u64 << level);
+        if level == 0 {
+            return self.leaf(column[0]);
+        }
+        // Expand intermediate Leaf(s) to [Leaf(s); 8] — each child is
+        // itself a compressed uniform-s subtree at the level below. Keeping
+        // the compressed form on untouched siblings is what lets the
+        // rebuild canonicalize back to Leaf(s) and round-trip to the input
+        // NodeId on identity splice. (gtua)
+        let (children, was_leaf_state) = match *self.get(node) {
+            Node::Leaf(s) => {
+                let child = self.leaf(s);
+                ([child; 8], Some(s))
+            }
+            Node::Interior { children, .. } => (children, None),
+        };
+        let half = 1u64 << (level - 1);
+        let ox = if x >= half { 1u32 } else { 0 };
+        let oz = if z >= half { 1u32 } else { 0 };
+        let lx = if ox == 1 { x - half } else { x };
+        let lz = if oz == 1 { z - half } else { z };
+        let idx_lo = octant_index(ox, 0, oz);
+        let idx_hi = octant_index(ox, 1, oz);
+        let (lo, hi) = column.split_at(half as usize);
+        let new_lo = self.splice_column_rec(children[idx_lo], level - 1, lx, lz, lo);
+        let new_hi = self.splice_column_rec(children[idx_hi], level - 1, lx, lz, hi);
+        let mut new_children = children;
+        new_children[idx_lo] = new_lo;
+        new_children[idx_hi] = new_hi;
+        // Canonicalize back to Leaf form *only* when the input was itself a
+        // Leaf(s) expanded above: the untouched siblings are guaranteed to
+        // be leaf(s), and if the recursions also returned leaf(s), the
+        // whole subtree is uniform s and collapses to Leaf(s). Skipping
+        // canonicalization on the Interior input case (no opportunistic
+        // canonicalization of pre-existing non-canonical uniform interiors)
+        // preserves NodeId identity for heterogeneous trees: if we
+        // opportunistically collapsed `Interior(L, [leaf(s); 8])` to Leaf(s)
+        // on ascent, an identity splice through uniform(L, s) would return
+        // a different NodeId than the input. (gtua)
+        if let Some(s) = was_leaf_state {
+            let target = self.leaf(s);
+            if new_children.iter().all(|&c| c == target) {
+                return target;
+            }
+        }
+        self.interior(level, new_children)
+    }
+
     // ---- Extraction primitives (hash-thing-6gf.6) ----
 
     /// Extract the 26 Moore neighbors of a cell, wrapping toroidally.
@@ -1833,5 +2011,384 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Column primitive tests (hash-thing-jw3k.1) ----
+
+    /// Build a deterministic heterogeneous grid: cell(x,y,z) = mat(x*7 + y*13 + z*19 + 1).
+    /// Avoids raw 1..=63 (would alias empty) by the `+1` shift + `mat()` high-bit encoding.
+    fn fill_heterogeneous(store: &mut NodeStore, side: usize) -> (NodeId, Vec<CellState>) {
+        let mut grid = vec![0 as CellState; side * side * side];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let m = ((x * 7 + y * 13 + z * 19) as u16 & 0x3FF).max(1);
+                    grid[x + y * side + z * side * side] = mat(m);
+                }
+            }
+        }
+        let root = store.from_flat(&grid, side);
+        (root, grid)
+    }
+
+    #[test]
+    fn flatten_column_matches_full_flatten_at_every_xz() {
+        let mut store = NodeStore::new();
+        let side = 16;
+        let (root, grid) = fill_heterogeneous(&mut store, side);
+        let mut col = vec![0 as CellState; side];
+        for z in 0..side as u64 {
+            for x in 0..side as u64 {
+                store.flatten_column_into(root, x, z, &mut col);
+                for y in 0..side {
+                    let expected = grid[x as usize + y * side + z as usize * side * side];
+                    assert_eq!(col[y], expected, "cell ({x},{y},{z})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flatten_column_uniform_stone_returns_all_stone() {
+        let mut store = NodeStore::new();
+        let stone = mat(STONE_ID);
+        let root = store.uniform(4, stone); // 16³
+        let mut col = vec![0 as CellState; 16];
+        store.flatten_column_into(root, 7, 3, &mut col);
+        assert!(col.iter().all(|&c| c == stone));
+    }
+
+    const STONE_ID: u16 = 0x100;
+
+    #[test]
+    fn flatten_column_through_uniform_subtree_leaf() {
+        // Build a world where one quadrant is a uniform-stone subtree and the
+        // others are heterogeneous. This forces `flatten_column_rec` to hit a
+        // `Leaf(stone)` at an intermediate level for the stone octant.
+        let mut store = NodeStore::new();
+        let side = 8usize;
+        let stone = mat(STONE_ID);
+        // Top-level: 2 of 8 children are uniform stone, rest empty leaves.
+        let stone_sub = store.uniform(2, stone); // 4³ subtree of stone
+        let empty_sub = store.uniform(2, 0);
+        let mut children = [empty_sub; 8];
+        children[0] = stone_sub; // (ox=0, oy=0, oz=0)
+        children[2] = stone_sub; // (ox=0, oy=1, oz=0)
+        let root = store.interior(3, children); // 8³ world
+
+        // Column at (x=1, z=1): lies within children[0] for y<4 and children[2] for y>=4.
+        let mut col = vec![0 as CellState; side];
+        store.flatten_column_into(root, 1, 1, &mut col);
+        assert!(col.iter().all(|&c| c == stone), "expected all stone, got {col:?}");
+    }
+
+    #[test]
+    fn flatten_column_all_air_returns_all_zero() {
+        let mut store = NodeStore::new();
+        let root = store.empty(4);
+        let mut col = vec![99 as CellState; 16];
+        store.flatten_column_into(root, 5, 5, &mut col);
+        assert!(col.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn flatten_column_boundary_corners() {
+        let mut store = NodeStore::new();
+        let side = 8;
+        let (root, grid) = fill_heterogeneous(&mut store, side);
+        let mut col = vec![0 as CellState; side];
+        for (x, z) in [(0u64, 0u64), (7, 0), (0, 7), (7, 7)] {
+            store.flatten_column_into(root, x, z, &mut col);
+            for y in 0..side {
+                let expected = grid[x as usize + y * side + z as usize * side * side];
+                assert_eq!(col[y], expected, "corner ({x},{y},{z})");
+            }
+        }
+    }
+
+    #[test]
+    fn flatten_column_side_1() {
+        let mut store = NodeStore::new();
+        let stone = mat(STONE_ID);
+        let root = store.leaf(stone);
+        let mut col = vec![0 as CellState; 1];
+        store.flatten_column_into(root, 0, 0, &mut col);
+        assert_eq!(col, vec![stone]);
+    }
+
+    #[test]
+    fn flatten_column_side_2() {
+        let mut store = NodeStore::new();
+        let mut grid = vec![0 as CellState; 8];
+        // Side=2 world, populate y=0 with mat(2), y=1 with mat(3) at (x=0,z=0).
+        grid[0 + 0 * 2 + 0 * 4] = mat(2);
+        grid[0 + 1 * 2 + 0 * 4] = mat(3);
+        let root = store.from_flat(&grid, 2);
+        let mut col = vec![0 as CellState; 2];
+        store.flatten_column_into(root, 0, 0, &mut col);
+        assert_eq!(col, vec![mat(2), mat(3)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn flatten_column_out_of_bounds_x() {
+        let mut store = NodeStore::new();
+        let root = store.empty(3);
+        let mut col = vec![0 as CellState; 8];
+        store.flatten_column_into(root, 8, 0, &mut col);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn flatten_column_out_of_bounds_z() {
+        let mut store = NodeStore::new();
+        let root = store.empty(3);
+        let mut col = vec![0 as CellState; 8];
+        store.flatten_column_into(root, 0, 8, &mut col);
+    }
+
+    #[test]
+    #[should_panic(expected = "buffer len")]
+    fn flatten_column_buffer_len_mismatch() {
+        let mut store = NodeStore::new();
+        let root = store.empty(3);
+        let mut col = vec![0 as CellState; 4]; // wrong — should be 8
+        store.flatten_column_into(root, 0, 0, &mut col);
+    }
+
+    #[test]
+    fn splice_column_identity_returns_same_nodeid() {
+        let mut store = NodeStore::new();
+        let side = 16;
+        let (root, _) = fill_heterogeneous(&mut store, side);
+        let mut col = vec![0 as CellState; side];
+        store.flatten_column_into(root, 3, 5, &mut col);
+        let new_root = store.splice_column(root, 3, 5, &col);
+        assert_eq!(
+            new_root, root,
+            "splicing identical column must yield the same root via hash-cons",
+        );
+    }
+
+    #[test]
+    fn splice_column_no_new_nodes_for_identity() {
+        let mut store = NodeStore::new();
+        let side = 16;
+        let (root, _) = fill_heterogeneous(&mut store, side);
+        let before = store.node_count();
+        let mut col = vec![0 as CellState; side];
+        store.flatten_column_into(root, 5, 5, &mut col);
+        let _ = store.splice_column(root, 5, 5, &col);
+        assert_eq!(
+            store.node_count(),
+            before,
+            "identity splice must not allocate new nodes",
+        );
+    }
+
+    #[test]
+    fn splice_column_changed_cell_round_trips_via_flatten() {
+        let mut store = NodeStore::new();
+        let side = 8;
+        let (root, mut grid) = fill_heterogeneous(&mut store, side);
+        let mut col = vec![0 as CellState; side];
+        store.flatten_column_into(root, 2, 3, &mut col);
+        col[4] = mat(0x200);
+        grid[2 + 4 * side + 3 * side * side] = mat(0x200);
+        let new_root = store.splice_column(root, 2, 3, &col);
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let expected = grid[x + y * side + z * side * side];
+                    let got = store.get_cell(new_root, x as u64, y as u64, z as u64);
+                    assert_eq!(got, expected, "cell ({x},{y},{z})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn splice_column_into_uniform_subtree_expands_leaf() {
+        let mut store = NodeStore::new();
+        let side = 8usize;
+        let stone = mat(STONE_ID);
+        // Build a world: children[0] is a uniform-stone level-2 Leaf subtree.
+        let stone_sub = store.uniform(2, stone);
+        let empty_sub = store.uniform(2, 0);
+        let mut children = [empty_sub; 8];
+        children[0] = stone_sub;
+        let root = store.interior(3, children);
+
+        // Column at (x=1, z=1) passes through children[0] for y<4 and
+        // children[2] (empty) for y>=4. The column should read as 4 stone
+        // cells followed by 4 air cells.
+        let mut col = vec![0 as CellState; side];
+        store.flatten_column_into(root, 1, 1, &mut col);
+        for (y, expected) in col.iter().enumerate() {
+            let want = if y < 4 { stone } else { 0 };
+            assert_eq!(*expected, want, "pre-splice cell y={y}");
+        }
+
+        // Mutate one cell inside the uniform subtree — forces splice_column
+        // to expand the intermediate Leaf(stone) into 8 uniform children.
+        col[2] = mat(0x300);
+        let new_root = store.splice_column(root, 1, 1, &col);
+
+        // Verify: other cells in that uniform subtree are still stone.
+        for y in 0..4 {
+            let got = store.get_cell(new_root, 1, y as u64, 1);
+            let want = if y == 2 { mat(0x300) } else { stone };
+            assert_eq!(got, want, "post-splice (1,{y},1)");
+        }
+        // Other columns in the stone subtree untouched.
+        assert_eq!(store.get_cell(new_root, 0, 2, 0), stone);
+        assert_eq!(store.get_cell(new_root, 3, 2, 3), stone);
+    }
+
+    /// jw3k.3 canonicalization: identity splice through an intermediate
+    /// raw `Leaf(s)` child preserves the original root NodeId. The Leaf is
+    /// expanded on descent and canonicalized back to `Leaf(s)` on ascent,
+    /// so hash-cons resolves the final interior to the same id as input.
+    #[test]
+    fn splice_column_identity_through_raw_leaf_child_preserves_nodeid() {
+        let mut store = NodeStore::new();
+        let stone = mat(0x301);
+        // Level-2 interior (side=4). children[0] is raw Leaf(stone) — a
+        // compressed level-1 uniform-stone subtree (distinct from
+        // uniform(1, stone) which is interior(1, [leaf(stone); 8])).
+        let leaf_stone = store.leaf(stone);
+        let empty_l1 = store.empty(1);
+        let mut children = [empty_l1; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(2, children);
+
+        let mut col = vec![0 as CellState; 4];
+        store.flatten_column_into(root, 0, 0, &mut col);
+        assert_eq!(col, vec![stone, stone, 0, 0], "column read correctly");
+
+        let new_root = store.splice_column(root, 0, 0, &col);
+
+        for y in 0..4u64 {
+            let expected = if y < 2 { stone } else { 0 };
+            assert_eq!(
+                store.get_cell(new_root, 0, y, 0),
+                expected,
+                "grid preserved at (0,{y},0)",
+            );
+        }
+        assert_eq!(
+            new_root, root,
+            "canonicalization restores original NodeId on identity splice",
+        );
+    }
+
+    /// jw3k.3 combined stress: mixed heterogeneous tree where children[0]
+    /// is a raw Leaf(stone) and other children are a heterogeneous fill.
+    /// Identity splice over multiple (x, z) columns (some through the raw
+    /// Leaf, some through Interior siblings) must leave node_count stable.
+    #[test]
+    fn splice_column_identity_mixed_tree_no_node_growth() {
+        let mut store = NodeStore::new();
+        let side = 4;
+        let stone = mat(0x301);
+        // Level-2 tree. children[0] is raw Leaf(stone); children[1..7] get
+        // a heterogeneous fill (varied cells in each level-1 subtree).
+        let leaf_stone = store.leaf(stone);
+        let (hetero_sub_seed, _) = fill_heterogeneous(&mut store, 2);
+        let hetero_sub = hetero_sub_seed;
+        let mut children = [hetero_sub; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(2, children);
+
+        let before = store.node_count();
+        // Repeat identity splice over every (x, z) column — mix of
+        // raw-Leaf path (x<2, z<2) and Interior paths (others). None
+        // should allocate new nodes.
+        for _ in 0..8 {
+            for z in 0..side as u64 {
+                for x in 0..side as u64 {
+                    let mut col = vec![0 as CellState; side];
+                    store.flatten_column_into(root, x, z, &mut col);
+                    let new_root = store.splice_column(root, x, z, &col);
+                    assert_eq!(
+                        new_root, root,
+                        "identity splice at ({x},{z}) must preserve NodeId",
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            store.node_count(),
+            before,
+            "mixed-tree identity splices must not grow node count",
+        );
+    }
+
+    /// jw3k.3: identity splice through a raw Leaf child must not grow the
+    /// node count. Regression guard on the canonicalization in
+    /// splice_column_rec.
+    #[test]
+    fn splice_column_identity_through_raw_leaf_no_node_growth() {
+        let mut store = NodeStore::new();
+        let stone = mat(0x301);
+        let leaf_stone = store.leaf(stone);
+        let empty_l1 = store.empty(1);
+        let mut children = [empty_l1; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(2, children);
+
+        let mut col = vec![0 as CellState; 4];
+        store.flatten_column_into(root, 0, 0, &mut col);
+        let before = store.node_count();
+        // Many identity splices through the raw-Leaf column must not
+        // allocate new nodes — each expand+canonicalize round-trip
+        // resolves to the pre-existing Leaf(s) id.
+        for _ in 0..32 {
+            let _ = store.splice_column(root, 0, 0, &col);
+        }
+        assert_eq!(
+            store.node_count(),
+            before,
+            "identity splice through raw Leaf must not grow node count",
+        );
+    }
+
+    #[test]
+    fn splice_column_side_1() {
+        let mut store = NodeStore::new();
+        let root = store.leaf(mat(0x10));
+        let new_root = store.splice_column(root, 0, 0, &[mat(0x20)]);
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), mat(0x20));
+    }
+
+    #[test]
+    fn splice_column_side_2() {
+        let mut store = NodeStore::new();
+        let grid = vec![0 as CellState; 8];
+        let root = store.from_flat(&grid, 2);
+        let new_root = store.splice_column(root, 1, 0, &[mat(0x11), mat(0x22)]);
+        assert_eq!(store.get_cell(new_root, 1, 0, 0), mat(0x11));
+        assert_eq!(store.get_cell(new_root, 1, 1, 0), mat(0x22));
+        // Other cells remain empty.
+        assert_eq!(store.get_cell(new_root, 0, 0, 0), 0);
+        assert_eq!(store.get_cell(new_root, 0, 1, 1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn splice_column_out_of_bounds_x() {
+        let mut store = NodeStore::new();
+        let root = store.empty(3);
+        let col = vec![0 as CellState; 8];
+        let _ = store.splice_column(root, 8, 0, &col);
+    }
+
+    #[test]
+    #[should_panic(expected = "column len")]
+    fn splice_column_length_mismatch() {
+        let mut store = NodeStore::new();
+        let root = store.empty(3);
+        let col = vec![0 as CellState; 4]; // wrong — should be 8
+        let _ = store.splice_column(root, 0, 0, &col);
     }
 }

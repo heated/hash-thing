@@ -1,10 +1,12 @@
 //! Hashlife step benchmarks at multiple world scales (m1f.1).
 //!
-//! Run with: `cargo test --release -p hash-thing --test bench_hashlife -- --ignored --nocapture`
+//! Run with: `cargo test --profile bench -p hash-thing --test bench_hashlife -- --ignored --nocapture`
 //!
 //! These are `#[ignore]` tests, not criterion benchmarks, to avoid adding
-//! dependencies. The `--release` flag is critical — debug builds are 10-50x
-//! slower and not representative of real performance.
+//! dependencies. `--profile bench` is the intended perf profile per repo
+//! policy — it inherits release opts but drops LTO for fast iteration and
+//! stays representative for relative latency comparisons (debug builds are
+//! 10-50x slower and not representative).
 //!
 //! Confidence note: this file is observational only. It prints timings and
 //! cache stats for manual comparison; it does not enforce a machine-checked
@@ -194,6 +196,225 @@ fn bench_edit_propagation(label: &str, level: u32, edits: usize) {
         edit_stats.cache_hits, edit_stats.cache_misses, edit_stats.empty_skips,
     );
     eprintln!();
+}
+
+/// Water-scene bench (hash-thing-jw3k): seed terrain + water_and_sand, step
+/// long enough to reach the "water has impacted ground, actively propagating"
+/// regime where the production app shows 440ms/gen at 256^3. Run at 128^3 by
+/// default to stay in the soft-max-command-seconds budget; the dynamics regime
+/// is the same, only the cell count differs.
+fn bench_water_scene(label: &str, level: u32, generations: usize) {
+    let side = 1u64 << level;
+    eprintln!("--- {label} (level={level}, side={side}³, water+sand) ---");
+
+    let t0 = Instant::now();
+    let mut world = World::new(level);
+    let params = TerrainParams::for_level(level);
+    world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
+    world.seed_water_and_sand();
+    let seed_ms = t0.elapsed().as_millis();
+    eprintln!(
+        "  seed: {seed_ms}ms, initial pop: {}",
+        world.population(),
+    );
+
+    let mut times_us = Vec::with_capacity(generations);
+    let mut populations = Vec::with_capacity(generations);
+    for gen in 0..generations {
+        let t = Instant::now();
+        world.step_recursive();
+        let us = t.elapsed().as_micros();
+        times_us.push(us);
+        populations.push(world.population());
+
+        let s = world.hashlife_stats;
+        let total_lookups = s.cache_hits + s.cache_misses;
+        let hit_rate = if total_lookups > 0 {
+            s.cache_hits as f64 / total_lookups as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        let want_print = gen < 3
+            || gen == generations - 1
+            || gen == generations / 4
+            || gen == generations / 2
+            || gen == generations * 3 / 4;
+        if want_print {
+            eprintln!(
+                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
+                us as f64 / 1000.0,
+                world.population(),
+                s.cache_hits,
+                s.cache_misses,
+                s.empty_skips,
+                s.fixed_point_skips,
+                hit_rate,
+            );
+            let level_misses: Vec<(usize, u64)> = s
+                .misses_by_level
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(i, &c)| (i + 3, c))
+                .collect();
+            if !level_misses.is_empty() {
+                let parts: Vec<String> = level_misses
+                    .iter()
+                    .map(|(lvl, cnt)| format!("L{lvl}={cnt}"))
+                    .collect();
+                eprintln!("    misses by level: {}", parts.join(", "));
+            }
+        }
+    }
+
+    if generations > 0 {
+        let total_us: u128 = times_us.iter().sum();
+        let mean_us = total_us / generations as u128;
+        let mut sorted = times_us.clone();
+        sorted.sort();
+        let median_us = sorted[generations / 2];
+        let p95_us = sorted[(generations as f64 * 0.95) as usize];
+        let max_us = *sorted.last().unwrap();
+        let mean_pop = populations.iter().sum::<u64>() / generations as u64;
+        let max_pop = *populations.iter().max().unwrap();
+        eprintln!(
+            "  summary: {generations} gens, mean={:.1}ms, median={:.1}ms, p95={:.1}ms, max={:.1}ms, total={:.1}s",
+            mean_us as f64 / 1000.0,
+            median_us as f64 / 1000.0,
+            p95_us as f64 / 1000.0,
+            max_us as f64 / 1000.0,
+            total_us as f64 / 1_000_000.0,
+        );
+        eprintln!(
+            "  pop: mean={mean_pop}, max={max_pop}, ratio_to_volume={:.2}",
+            max_pop as f64 / (side as f64).powi(3),
+        );
+        let ns_per_cell_at_max = (max_us as f64 * 1000.0) / max_pop as f64;
+        eprintln!("  ns-per-active-cell at max pop: {ns_per_cell_at_max:.1}");
+    }
+    eprintln!();
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_128() {
+    bench_water_scene("128³ water+sand", 7, 200);
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_256() {
+    bench_water_scene("256³ water+sand", 8, 200);
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_256_short() {
+    bench_water_scene("256³ water+sand (short)", 8, 60);
+}
+
+/// Phase-level breakdown of step_recursive on the water scene. Identifies
+/// where the 440ms/gen budget goes: memoized step_node descent vs. post-step
+/// gravity gap-fill (flatten + fill + from_flat) vs. compaction.
+fn bench_water_scene_profiled(label: &str, level: u32, generations: usize) {
+    let side = 1u64 << level;
+    eprintln!("--- {label} PROFILED (level={level}, side={side}³, water+sand) ---");
+
+    let mut world = World::new(level);
+    let params = TerrainParams::for_level(level);
+    world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
+    world.seed_water_and_sand();
+
+    // step_node, column_walk, splice, compact, total, dirty_columns
+    let mut agg = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut max_total = 0u64;
+    let mut compact_count = 0u64;
+    let mut rows = Vec::with_capacity(generations);
+
+    for gen in 0..generations {
+        let profile = world.step_recursive_profiled();
+        agg.0 += profile.step_node_us;
+        agg.1 += profile.column_walk_us;
+        agg.2 += profile.splice_us;
+        agg.3 += profile.compact_us;
+        agg.4 += profile.total_us;
+        agg.5 += profile.dirty_columns as u64;
+        max_total = max_total.max(profile.total_us);
+        if profile.compact_us > 1000 {
+            compact_count += 1;
+        }
+        rows.push(profile);
+
+        let want_print = gen < 3
+            || gen == generations - 1
+            || gen == generations / 4
+            || gen == generations / 2
+            || gen == generations * 3 / 4
+            || profile.compact_us > 1000;
+        if want_print {
+            eprintln!(
+                "  gen {gen}: total={}µs step_node={}µs column_walk={}µs splice={}µs dirty={} compact={}µs",
+                profile.total_us,
+                profile.step_node_us,
+                profile.column_walk_us,
+                profile.splice_us,
+                profile.dirty_columns,
+                profile.compact_us,
+            );
+        }
+    }
+
+    let gens = generations as u64;
+    let mean_total_ms = agg.4 as f64 / gens as f64 / 1000.0;
+    let pct = |v: u64| -> f64 { v as f64 * 100.0 / agg.4 as f64 };
+    eprintln!();
+    eprintln!(
+        "  PHASE MEANS over {generations} gens (total={mean_total_ms:.1}ms/gen, max={}ms):",
+        max_total / 1000
+    );
+    eprintln!(
+        "    step_node:    {:>7.1}ms/gen  ({:>5.1}%)",
+        agg.0 as f64 / gens as f64 / 1000.0,
+        pct(agg.0)
+    );
+    eprintln!(
+        "    column_walk:  {:>7.1}ms/gen  ({:>5.1}%)",
+        agg.1 as f64 / gens as f64 / 1000.0,
+        pct(agg.1)
+    );
+    eprintln!(
+        "    splice:       {:>7.1}ms/gen  ({:>5.1}%)   (subset of column_walk)",
+        agg.2 as f64 / gens as f64 / 1000.0,
+        pct(agg.2)
+    );
+    eprintln!(
+        "    compact:      {:>7.1}ms/gen  ({:>5.1}%)   [{} compactions]",
+        agg.3 as f64 / gens as f64 / 1000.0,
+        pct(agg.3),
+        compact_count,
+    );
+    eprintln!(
+        "    dirty cols:   {:>7.1}/gen   (mean count of columns that triggered splice)",
+        agg.5 as f64 / gens as f64,
+    );
+    eprintln!();
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_128_profiled() {
+    bench_water_scene_profiled("128³ water+sand", 7, 200);
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_256_profiled() {
+    bench_water_scene_profiled("256³ water+sand", 8, 40);
 }
 
 #[test]

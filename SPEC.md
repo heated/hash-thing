@@ -315,6 +315,30 @@ Possible encoding (illustrative, not final):
 
 Open questions: whether the breakable/unbreakable distinction belongs in the cell ID or in a material property table. Whether "structural" should be a bit flag or a range. Whether indirection (cell points to extension table) is worth the hashlife-memo complexity.
 
+### World scale
+
+**One cell ≠ one meter.** Cells are a sub-meter spatial unit; `CELLS_PER_METER`
+(declared in src/scale.rs, currently `4.0`) converts player-facing physical
+quantities (m/s, gravity, bounding box, interact range) to cells. At the
+current setting each cell is 0.25 m along a world axis, so the default
+`DEFAULT_VOLUME_SIZE = 8192` world is 2048 m on a side, with 8192³ ≈ 5.5 × 10¹¹
+cells worth of addressable resolution. The DAG never pays for unique cells,
+only for unique sub-tree structure, so the cell count is set aggressively.
+
+**The knob is designed to move.** Bumping `CELLS_PER_METER` (and
+`DEFAULT_VOLUME_SIZE` in lockstep so the world-in-meters stays fixed) shrinks
+cells further — move away from Minecraft-scale blocks toward
+particle/sand-grain resolution. Terrain generator parameters are expressed in
+scaled cells via `TerrainParams::for_level` and follow along automatically;
+demo waypoints are fractions of the world side; rendering normalizes to
+`[0,1]` so neither needs per-bump retuning. See hash-thing-69cq for the first
+bump (1.0 → 4.0 cells/m, 2048³ → 8192³).
+
+**Addressability headroom.** `WorldCoord` is `i64`, so per-axis coordinates
+can represent cell positions far past any plausible scale-knob bump: at
+`CELLS_PER_METER_INT = 16` a 2048-meter world spans 32,768 cells per axis,
+comfortably inside `i64::MAX`.
+
 ### Simulation model
 
 **Hybrid Path D: reaction-phase (pure CA) + movement-phase (Margolus blocks).** Both phases operate directly on the octree via recursive Hashlife stepping; the flatten-to-grid path is a temporary testing scaffold only.
@@ -381,7 +405,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 6. Consider SSVDAG / transform-aware compression once baseline is stable.
 7. Consider LOD streaming (Aokana-style) when scaling to 4096³+.
 
-**Performance ownership:** the crew owns the SVDAG performance story top-down — any seat may pick up sub-beads. Mayor surfaces decisions and re-derives the spec from the paper. See `docs/perf/svdag-perf-paper.md` (long form, living) and `docs/perf/svdag-perf-spec.md` (re-derived intuition). Reference hardware: M1 MacBook Air 8 GB. Bead: `hash-thing-stue`.
+**Performance ownership:** the crew owns the SVDAG performance story top-down — any seat may pick up sub-beads. Mayor surfaces decisions and re-derives the spec from the paper. See `docs/perf/svdag-perf-paper.md` (long form, living) and `docs/perf/svdag-perf-spec.md` (re-derived intuition). For open research frontiers, dated experiments, and threads that have not yet graduated to the settled model, see `docs/perf/svdag-research-log.md`. Reference hardware: M1 MacBook Air 8 GB. Bead: `hash-thing-stue`.
 
 ### Distribution
 

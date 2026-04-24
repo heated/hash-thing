@@ -42,6 +42,37 @@ use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 
+/// Per-phase micro-timing of one [`World::step_recursive_profiled`] invocation
+/// (hash-thing-jw3k diagnostic harness). All `_us` fields are microseconds.
+///
+/// hash-thing-jw3k.1 split: `flatten_us + gap_fill_loop_us + from_flat_us`
+/// (full-world flatten/fill/rebuild round-trip) was replaced by
+/// `column_walk_us + splice_us + dirty_columns` (per-column walk + targeted
+/// splice for columns that changed). The total phase name is still "gap_fill";
+/// see [`Self::gap_fill_us`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepProfile {
+    pub total_us: u64,
+    pub step_node_us: u64,
+    /// Time spent walking all columns (flatten per column + 1D gap_fill).
+    pub column_walk_us: u64,
+    /// Time spent in [`NodeStore::splice_column`] for columns that changed.
+    /// Subset of `column_walk_us` — reported separately so callers can tell
+    /// whether rebuild cost or walk cost dominates.
+    pub splice_us: u64,
+    /// Count of columns where `gravity_gap_fill_column` reported a change
+    /// (i.e. triggered a splice). Lets the bench verify the ~10% dirty
+    /// assumption against real scene dynamics.
+    pub dirty_columns: u32,
+    pub compact_us: u64,
+}
+
+impl StepProfile {
+    pub fn gap_fill_us(&self) -> u64 {
+        self.column_walk_us
+    }
+}
+
 const LEVEL3_SIDE: usize = 8;
 const LEVEL3_CELL_COUNT: usize = LEVEL3_SIDE * LEVEL3_SIDE * LEVEL3_SIDE;
 const CENTER_LEVEL3_SIDE: usize = 4;
@@ -74,19 +105,135 @@ impl World {
             .push(step_stats.cache_hits, step_stats.cache_misses);
 
         // Post-step gravity gap-fill: prevents Margolus rarefaction.
-        // Applied on the flattened grid (same as brute-force path) because
-        // gap-fill is a non-local vertical operation that doesn't decompose
-        // into hashlife's recursive structure.
         if self.has_block_rule_cells() {
-            let side = self.side();
-            let mut grid = self.store.flatten(self.root, side);
-            super::world::gravity_gap_fill(&mut grid, side, &self.materials);
-            self.root = self.store.from_flat(&grid, side);
+            self.apply_gap_fill_column_path();
         }
 
         self.generation += 1;
 
         self.maybe_compact();
+    }
+
+    /// Per-column gap-fill path (hash-thing-jw3k.1). Walks each `(x, z)`
+    /// column through the octree, runs the 1D gap-fill on the extracted
+    /// cells, and splices back only when the column changed. Preserves
+    /// hash-cons sharing for the majority of columns that don't change.
+    ///
+    /// Caller is responsible for gating on `has_block_rule_cells()`.
+    pub fn apply_gap_fill_column_path(&mut self) {
+        let side = self.side();
+        let mut column: Vec<CellState> = vec![0; side];
+        for z in 0..side as u64 {
+            for x in 0..side as u64 {
+                self.store.flatten_column_into(self.root, x, z, &mut column);
+                if super::world::gravity_gap_fill_column(&mut column, &self.materials) {
+                    self.root = self.store.splice_column(self.root, x, z, &column);
+                }
+            }
+        }
+    }
+
+    /// Old full-world gap-fill path, preserved for the cross-check regression
+    /// test (`step_recursive_column_gap_fill_matches_flatten_rebuild_per_step`).
+    /// Flattens the whole world, runs the 3D `gravity_gap_fill`, rebuilds
+    /// from the flat buffer. Scoped for deletion in a follow-up bead once the
+    /// column path has been running without drift in CI for multiple gens.
+    #[cfg(test)]
+    pub fn apply_gap_fill_via_flatten_rebuild(&mut self) {
+        let side = self.side();
+        let mut grid = self.store.flatten(self.root, side);
+        super::world::gravity_gap_fill(&mut grid, side, &self.materials);
+        self.root = self.store.from_flat(&grid, side);
+    }
+
+    /// Test-only: run only the Margolus/hashlife portion of `step_recursive`,
+    /// stopping before the post-step gap-fill. Used by the cross-check
+    /// regression test to sandwich the column path and the flatten-rebuild
+    /// path around a common pre-gap-fill root.
+    #[cfg(test)]
+    pub fn step_margolus_only(&mut self) {
+        assert!(self.level >= 3);
+        self.hashlife_stats = super::world::HashlifeStats::default();
+        let padded_root = self.pad_root();
+        let padded_level = self.level + 1;
+        let period = self.materials.memo_period();
+        let phase = self.generation % period;
+        let result = self.step_node(padded_root, padded_level, phase);
+        self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
+    }
+
+    /// Test-only: finish a step that was started via `step_margolus_only`
+    /// and gap-filled externally. Advances generation and runs `maybe_compact`.
+    #[cfg(test)]
+    pub fn finalize_step_after_external_gap_fill(&mut self) {
+        self.generation += 1;
+        self.maybe_compact();
+    }
+
+    /// Same work as [`Self::step_recursive`] but returns per-phase timings
+    /// (hash-thing-jw3k). Intended for benchmark/diagnostic callers; production
+    /// sim uses [`Self::step_recursive`].
+    pub fn step_recursive_profiled(&mut self) -> StepProfile {
+        assert!(
+            self.level >= 3,
+            "step_recursive_profiled requires level >= 3, got {}",
+            self.level
+        );
+        let t0 = std::time::Instant::now();
+        self.hashlife_stats = super::world::HashlifeStats::default();
+        let padded_root = self.pad_root();
+        let padded_level = self.level + 1;
+        let period = self.materials.memo_period();
+        let phase = self.generation % period;
+        let t_step = std::time::Instant::now();
+        let result = self.step_node(padded_root, padded_level, phase);
+        let step_node_us = t_step.elapsed().as_micros() as u64;
+        self.root = result;
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats.cache_hits, step_stats.cache_misses);
+
+        let (column_walk_us, splice_us, dirty_columns) = if self.has_block_rule_cells() {
+            let side = self.side();
+            let mut column: Vec<CellState> = vec![0; side];
+            let mut splice_us: u64 = 0;
+            let mut dirty: u32 = 0;
+            let t_walk = std::time::Instant::now();
+            for z in 0..side as u64 {
+                for x in 0..side as u64 {
+                    self.store.flatten_column_into(self.root, x, z, &mut column);
+                    if super::world::gravity_gap_fill_column(&mut column, &self.materials) {
+                        let t_sp = std::time::Instant::now();
+                        self.root = self.store.splice_column(self.root, x, z, &column);
+                        splice_us += t_sp.elapsed().as_micros() as u64;
+                        dirty += 1;
+                    }
+                }
+            }
+            (t_walk.elapsed().as_micros() as u64, splice_us, dirty)
+        } else {
+            (0, 0, 0)
+        };
+
+        self.generation += 1;
+
+        let t_compact = std::time::Instant::now();
+        self.maybe_compact();
+        let compact_us = t_compact.elapsed().as_micros() as u64;
+
+        StepProfile {
+            total_us: t0.elapsed().as_micros() as u64,
+            step_node_us,
+            column_walk_us,
+            splice_us,
+            dirty_columns,
+            compact_us,
+        }
     }
 
     /// Number of generations advanced by [`Self::step_recursive_pow2`].
@@ -374,7 +521,9 @@ impl World {
         // Stack-allocated grid avoids heap allocation per base case (~16K calls).
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, self.generation);
+        let (next, p1_ns, p2_ns) = self.step_grid_once(&grid, self.generation);
+        self.hashlife_stats.phase1_ns += p1_ns;
+        self.hashlife_stats.phase2_ns += p2_ns;
         self.center_level3_grid_to_node(&next)
     }
 
@@ -426,8 +575,10 @@ impl World {
     fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let next = self.step_grid_once(&grid, generation);
-        let next = self.step_grid_once(&next, generation + 1);
+        let (next, p1_ns_a, p2_ns_a) = self.step_grid_once(&grid, generation);
+        let (next, p1_ns_b, p2_ns_b) = self.step_grid_once(&next, generation + 1);
+        self.hashlife_stats.phase1_ns += p1_ns_a + p1_ns_b;
+        self.hashlife_stats.phase2_ns += p2_ns_a + p2_ns_b;
         self.center_level3_grid_to_node(&next)
     }
 
@@ -435,13 +586,21 @@ impl World {
         &self,
         grid: &[CellState],
         generation: u64,
-    ) -> [CellState; LEVEL3_CELL_COUNT] {
+    ) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
         let side = LEVEL3_SIDE;
         // Phase 1: CaRule on interior cells (1..side-1 on each axis).
         // The outermost ring cannot be evolved correctly because its neighbors
         // would wrap outside the padded region. Callers only extract the center
         // that remains valid after the requested number of steps.
         let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+        // Phase 1 timer covers both the per-call setup (noop_flags,
+        // tick_divisor_flags) AND the cell loop. Both caches are now slice
+        // reads into MaterialRegistry (tick_divisor_flags by hash-thing-5yxk,
+        // noop_flags by hash-thing-2z3g). Attributing setup to p1 keeps
+        // p1+p2 close to the full step_grid_once wall time — if a future
+        // investigator sees p1+p2 ≪ observed step time, the missing cost is
+        // memo lookup/insert or `next`-array zeroing, not hidden setup.
+        let phase1_start = std::time::Instant::now();
         // Precompute per-material noop flag to avoid vtable dispatch per cell.
         // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
         // entirely (next is zero-initialized). For GoL, air participates in birth
@@ -481,6 +640,8 @@ impl World {
             }
         }
 
+        let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
+
         // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
         // Node-local alignment (9ww): partition is determined by grid-local
         // coordinates, not world-space origin. With per-rule tick_divisors
@@ -488,6 +649,10 @@ impl World {
         // derived from its slowed-down tick schedule — this preserves Margolus
         // mass-conservation alternation for slowed rules. Default d=1 reduces
         // to `generation % 2`, identical to pre-iowh behavior.
+        //
+        // Phase 2 timer covers the block_rule_tick_divisors cache read and
+        // the per-block loop, symmetric with Phase 1 covering its setup.
+        let phase2_start = std::time::Instant::now();
         let block_rule_divisors = self.materials.block_rule_tick_divisors();
 
         // Fast path: when all divisors are 1 (period 2), every rule uses the
@@ -529,7 +694,7 @@ impl World {
                                 bz,
                                 pass_offset,
                                 generation,
-                                &block_rule_divisors,
+                                block_rule_divisors,
                             );
                             bx += 2;
                         }
@@ -539,8 +704,9 @@ impl World {
                 }
             }
         }
+        let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
 
-        next
+        (next, phase1_ns, phase2_ns)
     }
 
     fn center_level3_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
@@ -608,17 +774,25 @@ impl World {
             return;
         }
 
+        let movable: [bool; 8] = std::array::from_fn(|i| {
+            let c = block[i];
+            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
+        });
+
         let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block);
+        let result = rule.step_block(&block, &movable);
+
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell"
+        );
 
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
                     let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let original = block[i];
-                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if has_rule || original.is_empty() {
+                    if movable[i] {
                         grid[idx] = result[i].raw();
                     }
                 }
@@ -655,17 +829,25 @@ impl World {
             None => return,
         };
 
+        let movable: [bool; 8] = std::array::from_fn(|i| {
+            let c = block[i];
+            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
+        });
+
         let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block);
+        let result = rule.step_block(&block, &movable);
+
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell"
+        );
 
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
                     let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let original = block[i];
-                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if has_rule || original.is_empty() {
+                    if movable[i] {
                         grid[idx] = result[i].raw();
                     }
                 }
@@ -860,7 +1042,7 @@ mod tests {
     use super::*;
     use crate::sim::rule::ALIVE;
     use crate::sim::{GameOfLife3D, WorldCoord};
-    use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
+    use crate::terrain::materials::{DIRT_MATERIAL_ID, SAND_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
 
     fn wc(coord: u64) -> WorldCoord {
         WorldCoord(coord as i64)
@@ -1281,6 +1463,94 @@ mod tests {
         );
     }
 
+    /// hash-thing-gzio experiment: measure divergence between brute-force
+    /// stepping (per-generation gap-fill, the ship baseline) and the
+    /// candidate replacement — step_node_macro followed by a SINGLE
+    /// gravity_gap_fill at the end of the whole pow2 superstep. The
+    /// hypothesis is that most of the 4497 probe's ~16% divergence is
+    /// per-generation gap-fill that settles back out under one end-of-
+    /// superstep gap-fill, so the post-gap_fill divergence number should
+    /// be much smaller than the pre-gap_fill number.
+    ///
+    /// If this bears out, step_recursive_pow2 could replace its
+    /// per-generation brute-force fallback with step_node_macro +
+    /// one gap_fill — keeping the O(2^n) macro speedup while approximately
+    /// preserving ship-path gap-fill semantics.
+    ///
+    /// Investigation probe, not a ship assertion: it prints divergence
+    /// (pre vs post gap-fill) so future runs can capture the behavior
+    /// without pinning it.
+    #[test]
+    fn investigation_gzio_macro_plus_single_gap_fill_vs_brute() {
+        let level = 4u32;
+        let mut macro_world = World::new(level);
+        let mut brute = World::new(level);
+
+        seed_random_material_cells(&mut macro_world, 0x4497_u64);
+        seed_random_material_cells(&mut brute, 0x4497_u64);
+        assert_eq!(macro_world.flatten(), brute.flatten());
+
+        let steps = macro_world.recursive_pow2_step_count();
+        for _ in 0..steps {
+            brute.step();
+        }
+
+        // Macro path, bypassing the has_block_rule_cells guard.
+        let padded_root = macro_world.pad_root();
+        let padded_level = macro_world.level + 1;
+        let result =
+            macro_world.step_node_macro(padded_root, padded_level, macro_world.generation);
+        macro_world.root = result;
+        macro_world.generation += steps;
+
+        let brute_flat = brute.flatten();
+        let side = macro_world.side();
+
+        // Measure pre-gap-fill divergence — should match the 4497 probe.
+        let pre_flat = macro_world.flatten();
+        let mut pre_diffs = 0usize;
+        for (&m, &b) in pre_flat.iter().zip(brute_flat.iter()) {
+            if m != b {
+                pre_diffs += 1;
+            }
+        }
+
+        // Apply a SINGLE post-macro gravity_gap_fill and re-measure.
+        macro_world.apply_gap_fill_via_flatten_rebuild();
+
+        let post_flat = macro_world.flatten();
+        let mut post_diffs = 0usize;
+        let mut post_water_diffs = 0usize;
+        for (i, (&m, &b)) in post_flat.iter().zip(brute_flat.iter()).enumerate() {
+            if m != b {
+                post_diffs += 1;
+                let water_raw = crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw();
+                if m == water_raw || b == water_raw {
+                    post_water_diffs += 1;
+                }
+                if post_diffs <= 8 {
+                    let z = i / (side * side);
+                    let y = (i / side) % side;
+                    let x = i % side;
+                    eprintln!(
+                        "post-gap-fill divergence at ({x},{y},{z}): \
+                         macro+gf={m:#010x} brute={b:#010x}"
+                    );
+                }
+            }
+        }
+
+        let total = post_flat.len();
+        eprintln!(
+            "gzio probe: level={level} steps={steps} total_cells={total}\n\
+             \tpre_gap_fill_diffs={pre_diffs} ({:.2}%)\n\
+             \tpost_gap_fill_diffs={post_diffs} ({:.2}%) \
+             water_touching={post_water_diffs}",
+            (pre_diffs as f64 / total as f64) * 100.0,
+            (post_diffs as f64 / total as f64) * 100.0,
+        );
+    }
+
     #[test]
     fn pad_root_preserves_center() {
         let mut world = World::new(3);
@@ -1531,7 +1801,11 @@ mod tests {
     fn tick_divisor_two_halves_water_block_rule_firing_cadence() {
         let mut fast = World::new(4); // 16³, every tick
         let mut slow = World::new(4); // 16³, every other tick
-        slow.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+        // rvsh: terrain_defaults now ships water at divisor=2, so `fast`
+        // must explicitly reset to 1 to keep this test a d=1 vs d=2 contrast
+        // independent of the registry's default pick.
+        fast.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 1));
+        slow.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 2));
 
         let water = Cell::pack(WATER_MATERIAL_ID, 0).raw();
         // Water near the top of the world with clear air below.
@@ -1590,7 +1864,7 @@ mod tests {
         use crate::terrain::materials::FIRE_MATERIAL_ID;
         let mut fast = World::new(3); // 8³, divisor=1 (default)
         let mut slow = World::new(3); // 8³, divisor=2 for fire
-        slow.materials.set_tick_divisor(FIRE_MATERIAL_ID, 2);
+        slow.mutate_materials(|m| m.set_tick_divisor(FIRE_MATERIAL_ID, 2));
 
         let fire = Cell::pack(FIRE_MATERIAL_ID, 0).raw();
 
@@ -1637,7 +1911,7 @@ mod tests {
     fn tick_divisor_two_preserves_water_mass_conservation() {
         use crate::terrain::materials::WATER_MATERIAL_ID;
         let mut world = World::new(5); // 32³
-        world.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+        world.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 2));
         for y in 8..24 {
             world.set(
                 wc(16),
@@ -1674,7 +1948,7 @@ mod tests {
 
         let seed_world = || {
             let mut w = World::new(LEVEL);
-            w.materials.set_tick_divisor(WATER_MATERIAL_ID, 2);
+            w.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 2));
             for y in WATER_COL_Y_RANGE {
                 w.set(
                     wc(WATER_COL_X),
@@ -1716,4 +1990,270 @@ mod tests {
             "cached step must match fresh step at generation {STEPS} + 1"
         );
     }
+
+    // ---- hash-thing-jw3k.1 cross-check: column-path == flatten-rebuild ----
+
+    /// Same-store hash-cons regression for the new column-local gap-fill path.
+    /// For each generation we snapshot the pre-gap-fill root, run the column
+    /// path, capture its root, reset to the snapshot, run the legacy
+    /// flatten/gap_fill/from_flat path on the same store, and assert the two
+    /// resulting roots are identical NodeIds. Same-store canonicality means
+    /// NodeId equality is sufficient — two hash-consed DAGs that encode the
+    /// same grid must land on the same id in the same store.
+    #[test]
+    fn step_recursive_column_gap_fill_matches_flatten_rebuild_per_step() {
+        use crate::terrain::TerrainParams;
+
+        let mut world = World::new(7);
+        let params = TerrainParams::for_level(7);
+        world.seed_terrain(&params).unwrap();
+        world.seed_water_and_sand();
+
+        const GENS: u32 = 16;
+        for gen in 0..GENS {
+            world.step_margolus_only();
+            let pre_root = world.root;
+
+            world.apply_gap_fill_column_path();
+            let root_via_column = world.root;
+
+            world.root = pre_root;
+            world.apply_gap_fill_via_flatten_rebuild();
+            let root_via_flatten = world.root;
+
+            assert_eq!(
+                root_via_column, root_via_flatten,
+                "gen {gen}: column-path root must match flatten-rebuild root \
+                 (same-store hash-cons NodeId equality)",
+            );
+
+            world.root = root_via_column;
+            world.finalize_step_after_external_gap_fill();
+        }
+    }
+
+    // ---- hash-thing-jw3k.1 targeted column-path tests ----
+
+    #[test]
+    fn column_path_all_air_level3_no_change() {
+        let mut world = World::new(3);
+        let pre = world.root;
+        world.apply_gap_fill_column_path();
+        assert_eq!(world.root, pre, "all-air world must not change");
+    }
+
+    #[test]
+    fn column_path_all_sand_level3_no_change() {
+        let mut world = World::new(3);
+        let side = world.side() as u64;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    world.set(wc(x), wc(y), wc(z), crate::terrain::materials::SAND);
+                }
+            }
+        }
+        let pre = world.root;
+        world.apply_gap_fill_column_path();
+        assert_eq!(world.root, pre, "all-sand world has no gaps to fill");
+    }
+
+    /// Triple pattern at a boundary (0,0,0)-(0,2,0) → gap_fill_column swaps.
+    /// Confirms column walking reaches boundary (x,z) coordinates correctly.
+    #[test]
+    fn column_path_boundary_corner_triple_swaps() {
+        use crate::terrain::materials::SAND;
+        let mut world = World::new(3);
+        // sand at y=0 and y=2, air at y=1, all at (x=0,z=0)
+        world.set(wc(0), wc(0), wc(0), SAND);
+        world.set(wc(0), wc(2), wc(0), SAND);
+
+        world.apply_gap_fill_column_path();
+
+        // After gap_fill: sand at y=0 and y=1, air at y=2
+        let side = world.side();
+        let grid = world.store.flatten(world.root, side);
+        let idx = |x: usize, y: usize, z: usize| x + y * side + z * side * side;
+        assert_eq!(grid[idx(0, 0, 0)], SAND, "y=0 unchanged");
+        assert_eq!(grid[idx(0, 1, 0)], SAND, "y=1 received sand from y=2");
+        assert_eq!(grid[idx(0, 2, 0)], 0, "y=2 became air");
+    }
+
+    /// hash-thing-9yv2 regression test: stone above sand must not delete the sand.
+    ///
+    /// Before the fix, `apply_block_in_grid` would dispatch GravityBlockRule on a
+    /// block containing sand (rule-cell) + stone (no rule). The rule swapped on
+    /// density (stone 5.0 > sand 1.5), and the write-back filter only wrote
+    /// positions whose ORIGINAL cell had a rule — so stone's new position
+    /// (previously sand) got the stone value (sand deleted), and sand's new
+    /// position (previously stone) was skipped (stone stayed). Net: sand
+    /// vanished, stone duplicated. After 9yv2, BlockRule honors a `movable`
+    /// mask and refuses to swap an anchored cell, so the block is unchanged.
+    #[test]
+    fn repro_9yv2_inert_swap_deletes_rule_cell() {
+        use crate::terrain::materials::{SAND, STONE};
+        // Level-3 world = 8³. Place stone on top of sand so gravity rule swaps
+        // them in a single 2×2×2 block.
+        let mut world = World::new(3);
+        // Block (bx=0, by=0, bz=0) covers y=0 and y=1. Stone at y=1, sand at y=0.
+        world.set(wc(0), wc(0), wc(0), SAND);
+        world.set(wc(0), wc(1), wc(0), STONE);
+
+        let pre_sand = count_material(&world, 8, SAND_MATERIAL_ID);
+        let pre_stone = count_material(
+            &world,
+            8,
+            crate::terrain::materials::STONE_MATERIAL_ID,
+        );
+        assert_eq!(pre_sand, 1);
+        assert_eq!(pre_stone, 1);
+
+        world.step_recursive();
+
+        let post_sand = count_material(&world, 8, SAND_MATERIAL_ID);
+        let post_stone = count_material(
+            &world,
+            8,
+            crate::terrain::materials::STONE_MATERIAL_ID,
+        );
+
+        eprintln!("pre: sand={pre_sand} stone={pre_stone}");
+        eprintln!("post: sand={post_sand} stone={post_stone}");
+
+        assert_eq!(post_sand, 1, "sand cell was deleted");
+        assert_eq!(post_stone, 1, "phantom stone appeared");
+    }
+
+    /// hash-thing-9yv2 Phase 1: per-gen sandwich accounting.
+    ///
+    /// Seeds the same 64³ `water_and_sand` scene the v3b2 repro harness uses,
+    /// then at each generation splits `step_recursive` into two measured halves:
+    ///
+    /// 1. `step_margolus_only` — recursive memoised Margolus/block-rule descent.
+    /// 2. `apply_gap_fill_column_path` — per-column gravity settle.
+    ///
+    /// Records water + sand counts `W_pre / W_mid / W_post` and prints the
+    /// per-phase deltas. This tells us which sub-phase owns each cell lost.
+    ///
+    /// Invariant scope: the `seed_water_and_sand` scene has no fire / lava /
+    /// acid, so water and sand have no reactive partners — their counts must
+    /// be monotonic-non-decreasing. Any negative delta is the defect.
+    #[test]
+    #[ignore]
+    fn repro_9yv2_phase_mass_accounting_64() {
+        use crate::terrain::TerrainParams;
+
+        let level = 6u32;
+        let side = 1i64 << level;
+        let mut world = World::new(level);
+        let params = TerrainParams::for_level(level);
+        world
+            .seed_terrain(&params)
+            .expect("level-derived terrain params must validate");
+        world.seed_water_and_sand();
+
+        let w0 = count_material(&world, side, WATER_MATERIAL_ID);
+        let s0 = count_material(&world, side, SAND_MATERIAL_ID);
+        eprintln!("=== 9yv2 phase mass accounting: 64³ water_and_sand ===");
+        eprintln!("initial: water={w0} sand={s0}");
+        eprintln!("gen | water (pre→mid→post, Δmarg,Δgf) | sand (pre→mid→post, Δmarg,Δgf)");
+
+        for gen in 0..80u32 {
+            let w_pre = count_material(&world, side, WATER_MATERIAL_ID);
+            let s_pre = count_material(&world, side, SAND_MATERIAL_ID);
+
+            world.step_margolus_only();
+
+            let w_mid = count_material(&world, side, WATER_MATERIAL_ID);
+            let s_mid = count_material(&world, side, SAND_MATERIAL_ID);
+
+            if world.has_block_rule_cells() {
+                world.apply_gap_fill_column_path();
+            }
+
+            let w_post = count_material(&world, side, WATER_MATERIAL_ID);
+            let s_post = count_material(&world, side, SAND_MATERIAL_ID);
+
+            world.finalize_step_after_external_gap_fill();
+
+            let dw_m = w_mid as isize - w_pre as isize;
+            let dw_g = w_post as isize - w_mid as isize;
+            let ds_m = s_mid as isize - s_pre as isize;
+            let ds_g = s_post as isize - s_mid as isize;
+
+            if dw_m != 0 || dw_g != 0 || ds_m != 0 || ds_g != 0 {
+                eprintln!(
+                    "gen {gen:>2}: W {w_pre}→{w_mid}→{w_post} ({dw_m:+},{dw_g:+}) | \
+                     S {s_pre}→{s_mid}→{s_post} ({ds_m:+},{ds_g:+})",
+                );
+            }
+        }
+
+        let w_end = count_material(&world, side, WATER_MATERIAL_ID);
+        let s_end = count_material(&world, side, SAND_MATERIAL_ID);
+        eprintln!("end: water={w_end} (Δ={}) sand={s_end} (Δ={})", w_end as isize - w0 as isize, s_end as isize - s0 as isize);
+    }
+
+    /// hash-thing-9yv2 path comparison: brute `step()` vs hashlife `step_recursive()`
+    /// on the same pool-over-terrain scene. If brute preserves water mass and
+    /// hashlife doesn't, the defect is in hashlife recursion (step_node /
+    /// recursive_case), not in block-rule write-back.
+    #[test]
+    #[ignore]
+    fn repro_9yv2_brute_vs_recursive_water_mass() {
+        use crate::terrain::TerrainParams;
+        use crate::terrain::materials::WATER;
+
+        let level = 6u32;
+        let side = 1i64 << level;
+
+        let make_world = || -> World {
+            let mut w = World::new(level);
+            let params = TerrainParams::for_level(level);
+            w.seed_terrain(&params).expect("terrain");
+            let side_u = side as u64;
+            let center = side_u / 2;
+            let water_y = center + center / 4;
+            let pool_radius = side_u / 6;
+            let pool_depth = (side_u / 32).max(2);
+            let lo_x = center.saturating_sub(pool_radius);
+            let hi_x = (center + pool_radius).min(side_u);
+            let lo_z = center.saturating_sub(pool_radius);
+            let hi_z = (center + pool_radius).min(side_u);
+            for z in lo_z..hi_z {
+                for x in lo_x..hi_x {
+                    for dy in 0..pool_depth {
+                        let y = water_y + dy;
+                        if y < side_u {
+                            w.set(wc(x), wc(y), wc(z), WATER);
+                        }
+                    }
+                }
+            }
+            w
+        };
+
+        let mut brute = make_world();
+        let mut recur = make_world();
+
+        let w0 = count_material(&brute, side, WATER_MATERIAL_ID);
+        eprintln!("=== 9yv2 brute-vs-recursive: initial water={w0} ===");
+        for gen in 0..80u32 {
+            brute.step();
+            recur.step_recursive();
+            let wb = count_material(&brute, side, WATER_MATERIAL_ID);
+            let wr = count_material(&recur, side, WATER_MATERIAL_ID);
+            if wb != wr {
+                eprintln!("gen {gen:>2}: brute={wb} recur={wr} (diff={})", wb as isize - wr as isize);
+            }
+        }
+        let wb = count_material(&brute, side, WATER_MATERIAL_ID);
+        let wr = count_material(&recur, side, WATER_MATERIAL_ID);
+        eprintln!(
+            "end: brute={wb} (Δ={}) recur={wr} (Δ={})",
+            wb as isize - w0 as isize,
+            wr as isize - w0 as isize,
+        );
+    }
+
 }

@@ -220,20 +220,20 @@ Launch two Agent tool calls in a single message with the launch template, substi
 
 **Codex agents** (5x) — use Bash with `run_in_background: true`:
 
-**Important:** Use `env -u CLAUDECODE` to strip the environment variable that blocks nested sessions.
+**Important:** Use `env -u CLAUDECODE` to strip the environment variable that blocks nested sessions. Always redirect stdin to `/dev/null` — codex waits on stdin for EOF before running and hangs indefinitely if bash leaves stdin open (pc95).
 
 Each agent reads its prompt from the **workspace-local** staging dir (not the absolute INPUT_DIR path). Log files also go to `/tmp/` to avoid tee failures:
 
 ```bash
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex-execution.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard-execution.log
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex-execution.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard-execution.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial.log
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex-dependencies.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial-dependencies.log
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex-dependencies.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial-dependencies.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
+env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
 ```
 
 ---
@@ -243,7 +243,7 @@ env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-c
 Each agent reads its prompt from the file written in Phase 3:
 
 ```bash
-gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
+gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
 ```
 
 ---
@@ -288,7 +288,7 @@ Expected files: `standard-claude.md`, `standard-codex.md`, `standard-codex-execu
 Launch **two Agent tool calls** in a single message — one for standard, one for adversarial. The evolutionary lens is not synthesized: Codex's evolutionary pass is the only source and is surfaced as-is.
 
 **Synthesis-Standard Agent:**
-> Read the following three reviews and synthesize them into a single cohesive document:
+> Read the following four reviews and synthesize them into a single cohesive document:
 > - `{PACK_DIR}/standard-claude.md`
 > - `{PACK_DIR}/standard-codex.md`
 > - `{PACK_DIR}/standard-codex-execution.md`
@@ -299,7 +299,7 @@ Launch **two Agent tool calls** in a single message — one for standard, one fo
 > 2. Where do they diverge? (the disagreement itself is signal)
 > 3. What unique insights did only one pass surface?
 > 4. Consolidated questions for the plan author (deduplicated, numbered)
-> 5. Overall readiness verdict synthesized across all three
+> 5. Overall readiness verdict synthesized across all four passes
 >
 > Write your synthesis to: `{PACK_DIR}/synthesis-standard.md`
 > Format as a clean, numbered-list-heavy document. Start with an executive summary.

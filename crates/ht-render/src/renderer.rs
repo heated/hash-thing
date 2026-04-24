@@ -476,6 +476,73 @@ pub struct Renderer {
     start_time: Instant,
 }
 
+/// Which branch `resolved_render_scale` took. Log-side uses this to
+/// emit an explicit line so the user understands where the effective
+/// scale came from (hash-thing-zytn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderScaleSource {
+    /// `HASH_THING_RENDER_SCALE` was set and valid.
+    EnvOverride,
+    /// Env var absent — used the auto-pick.
+    AutoPicked,
+    /// Env var was set but failed parsing or fell outside `0.25..=1.0`.
+    EnvInvalidFallback,
+}
+
+/// Target rendered-pixel budget for a given world side length
+/// (`volume_size`). Grounded in o98b's scene-matrix measurement
+/// (docs/perf/svdag-perf-paper.md §3.12): `surface_acquire_cpu` is
+/// roughly linear in the number of rays (render-target pixels), so
+/// picking a pixel budget per volume is the right first-principles
+/// lever. Bigger worlds get a smaller budget to compensate for SVDAG
+/// memory pressure; smaller worlds can afford native-ish resolution.
+///
+/// The 1024³ row is the **calibration anchor**: o98b measured 1024³
+/// at 50 % scale on a 2940×1782 (≈5.24 M px) display as the
+/// acceptable sweet spot (37 ms acquire, ~25 FPS). `sqrt(1_300_000 /
+/// 5_240_000) ≈ 0.498`, so 1024³ at the anchor display picks ~0.5.
+/// Every other row extrapolates from that anchor.
+fn target_pixels_for_volume(volume_size: u32) -> u32 {
+    match volume_size {
+        0..=128 => 2_500_000,
+        129..=256 => 2_000_000,
+        257..=512 => 1_500_000,
+        513..=1024 => 1_300_000,
+        1025..=2048 => 1_000_000,
+        _ => 800_000,
+    }
+}
+
+/// Pick a render scale such that `physical_pixels * scale^2 ≈
+/// target_pixels_for_volume(volume_size)`. Clamped to the valid
+/// 0.25..=1.0 range (hash-thing-zytn).
+fn auto_render_scale(physical_pixels: u64, volume_size: u32) -> f32 {
+    let target = target_pixels_for_volume(volume_size) as f64;
+    let physical = physical_pixels.max(1) as f64;
+    let raw = (target / physical).sqrt() as f32;
+    raw.clamp(0.25, 1.0)
+}
+
+/// Resolve the effective render scale + which branch fired. Env-var
+/// override wins if it is present AND valid (parses as f32 AND lies
+/// in `0.25..=1.0`). Otherwise the auto-pick applies. Invalid env
+/// values still fall back to auto-pick but are reported distinctly
+/// so the log line can flag the typo (hash-thing-zytn).
+fn resolved_render_scale(
+    env: Option<&str>,
+    physical_pixels: u64,
+    volume_size: u32,
+) -> (f32, RenderScaleSource) {
+    let auto = auto_render_scale(physical_pixels, volume_size);
+    match env {
+        None => (auto, RenderScaleSource::AutoPicked),
+        Some(raw) => match raw.parse::<f32>() {
+            Ok(s) if (0.25..=1.0).contains(&s) => (s, RenderScaleSource::EnvOverride),
+            _ => (auto, RenderScaleSource::EnvInvalidFallback),
+        },
+    }
+}
+
 impl Renderer {
     pub async fn new(window: Arc<Window>, volume_size: u32) -> Self {
         let size = window.inner_size();
@@ -573,9 +640,36 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        // Default render_scale = 0.5: render at half physical resolution
-        // for 4x fewer pixels. Trade sharpness for framerate.
-        let render_scale: f32 = 0.5;
+        // render_scale picker (hash-thing-zytn). Env-var override still
+        // wins (HASH_THING_RENDER_SCALE, dlse.3 diagnostic knob);
+        // otherwise the picker targets a rendered-pixel budget keyed
+        // off volume_size and the current physical framebuffer size.
+        // Anchor: 1024³ on a ~5.24 M physical display picks ~0.5,
+        // matching o98b's measured sweet spot (§3.12).
+        let env_raw = std::env::var("HASH_THING_RENDER_SCALE").ok();
+        let physical_pixels: u64 = (size.width as u64) * (size.height as u64);
+        let (render_scale, scale_source) =
+            resolved_render_scale(env_raw.as_deref(), physical_pixels, volume_size);
+        match scale_source {
+            RenderScaleSource::EnvOverride => log::info!(
+                "render_scale={:.3} (HASH_THING_RENDER_SCALE override; auto-pick would have been {:.3})",
+                render_scale,
+                auto_render_scale(physical_pixels, volume_size),
+            ),
+            RenderScaleSource::AutoPicked => log::info!(
+                "render_scale={:.3} (auto: volume_size={}, physical={}x{}, target={} px) — override with HASH_THING_RENDER_SCALE or use = / - keys at runtime",
+                render_scale,
+                volume_size,
+                size.width,
+                size.height,
+                target_pixels_for_volume(volume_size),
+            ),
+            RenderScaleSource::EnvInvalidFallback => log::info!(
+                "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.25..=1.0); auto-picked {:.3} instead",
+                env_raw.as_deref().unwrap_or(""),
+                render_scale,
+            ),
+        }
         // dlse.2.2 exp#4: env-var gated so latency=3 (and other values)
         // can be A/B tested without a default change. Invalid values
         // fall back silently to DEFAULT_FRAME_LATENCY; the init log
@@ -1258,7 +1352,7 @@ impl Renderer {
             camera_target: [0.5, 0.5, 0.5],
             debug_mode: 0,
             lod_bias: 1.0,
-            render_scale: 0.5,
+            render_scale,
             gpu_timing,
             gpu_timing_render_pass,
             last_gpu_frame_time: None,
@@ -1956,8 +2050,8 @@ impl Renderer {
                 .gpu_timing
                 .as_ref()
                 .is_some_and(|gt| gt.uses_in_encoder() && gt.is_idle());
-        let captured_compute_this_frame =
-            !resolve_disabled && (compute_timestamp_writes.is_some() || compute_in_encoder_capturing);
+        let captured_compute_this_frame = !resolve_disabled
+            && (compute_timestamp_writes.is_some() || compute_in_encoder_capturing);
 
         // --- Render-pass timing setup (dlse.2.4). Independent state
         // machine — may capture on a frame the compute pass doesn't, or
@@ -2204,8 +2298,113 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ticks_to_duration, FrameOutcome, GpuTiming, RendererLifecycleSnapshot};
+    use super::{
+        auto_render_scale, resolved_render_scale, target_pixels_for_volume, ticks_to_duration,
+        FrameOutcome, GpuTiming, RenderScaleSource, RendererLifecycleSnapshot,
+    };
     use std::time::Duration;
+
+    // --- hash-thing-zytn: render-scale auto-picker ---
+
+    // Anchor: 1024³ on the measured M2 MBA external display (2940×1782
+    // ≈ 5.24 M physical px) should land near 0.5, matching o98b's
+    // measured sweet spot. sqrt(1_300_000 / 5_236_680) ≈ 0.498.
+    #[test]
+    fn auto_render_scale_at_1024_anchor_is_near_half() {
+        let s = auto_render_scale(2940 * 1782, 1024);
+        assert!((s - 0.498).abs() < 0.01, "expected ~0.498, got {s}");
+    }
+
+    #[test]
+    fn auto_render_scale_clamps_to_unit_on_tiny_display() {
+        // Small volume + small display → clamp to native.
+        let s = auto_render_scale(640 * 480, 64);
+        assert_eq!(s, 1.0);
+    }
+
+    #[test]
+    fn auto_render_scale_clamps_to_quarter_on_huge_display() {
+        // Massive volume on an 8K+ display → clamp to floor.
+        let s = auto_render_scale(7680 * 4320, 8192);
+        assert_eq!(s, 0.25);
+    }
+
+    #[test]
+    fn auto_render_scale_is_monotonic_in_physical_pixels() {
+        // Bigger display, same volume, must not pick a larger scale.
+        let small = auto_render_scale(1920 * 1080, 1024);
+        let medium = auto_render_scale(2940 * 1782, 1024);
+        let large = auto_render_scale(3840 * 2160, 1024);
+        assert!(small >= medium, "{small} >= {medium}");
+        assert!(medium >= large, "{medium} >= {large}");
+    }
+
+    #[test]
+    fn auto_render_scale_decreases_with_volume_size() {
+        // Bigger world, same display, must not pick a larger scale.
+        // At fixed 5.24 M physical, target decreases with volume_size,
+        // so scale must decrease monotonically.
+        let physical = 2940u64 * 1782u64;
+        let s128 = auto_render_scale(physical, 128);
+        let s1024 = auto_render_scale(physical, 1024);
+        let s4096 = auto_render_scale(physical, 4096);
+        assert!(s128 >= s1024, "{s128} >= {s1024}");
+        assert!(s1024 >= s4096, "{s1024} >= {s4096}");
+    }
+
+    #[test]
+    fn target_pixels_buckets_are_monotonic() {
+        // Larger worlds get smaller budgets. The `match` uses `..=`
+        // ranges, so any u32 maps to a bucket — test the edges.
+        let vs = [
+            0u32, 128, 129, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 99_999,
+        ];
+        let budgets: Vec<u32> = vs.iter().map(|v| target_pixels_for_volume(*v)).collect();
+        for w in budgets.windows(2) {
+            assert!(w[0] >= w[1], "not monotonic: {budgets:?}");
+        }
+    }
+
+    #[test]
+    fn resolved_render_scale_env_valid_wins() {
+        let (s, src) = resolved_render_scale(Some("0.75"), 2940 * 1782, 1024);
+        assert_eq!(src, RenderScaleSource::EnvOverride);
+        assert!((s - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolved_render_scale_env_absent_uses_auto() {
+        let (s, src) = resolved_render_scale(None, 2940 * 1782, 1024);
+        assert_eq!(src, RenderScaleSource::AutoPicked);
+        assert!((s - 0.498).abs() < 0.01);
+    }
+
+    #[test]
+    fn resolved_render_scale_env_out_of_range_falls_back() {
+        // Above clamp → fallback. Below clamp → fallback.
+        // Non-parseable → fallback.
+        for bad in ["1.5", "0.1", "nonsense", ""] {
+            let (s, src) = resolved_render_scale(Some(bad), 2940 * 1782, 1024);
+            assert_eq!(
+                src,
+                RenderScaleSource::EnvInvalidFallback,
+                "case {bad:?} should have fallen back"
+            );
+            assert!((s - 0.498).abs() < 0.01, "case {bad:?} auto value drifted");
+        }
+    }
+
+    #[test]
+    fn resolved_render_scale_env_boundary_values_accepted() {
+        // 0.25 and 1.0 are both inside the inclusive range.
+        let (s_lo, src_lo) = resolved_render_scale(Some("0.25"), 2940 * 1782, 1024);
+        assert_eq!(src_lo, RenderScaleSource::EnvOverride);
+        assert!((s_lo - 0.25).abs() < 1e-6);
+
+        let (s_hi, src_hi) = resolved_render_scale(Some("1.0"), 2940 * 1782, 1024);
+        assert_eq!(src_hi, RenderScaleSource::EnvOverride);
+        assert!((s_hi - 1.0).abs() < 1e-6);
+    }
 
     /// Try to build a headless wgpu device with TIMESTAMP_QUERY. Returns
     /// `None` on CI / machines without a supported adapter so the tests

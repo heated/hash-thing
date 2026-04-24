@@ -1,6 +1,7 @@
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
+use hash_thing::scale::{CELLS_PER_METER, DEFAULT_VOLUME_SIZE, GROWTH_MARGIN};
 use hash_thing::sim;
 use hash_thing::terrain;
 
@@ -19,13 +20,16 @@ use winit::{
 
 use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_SPRINT};
 
-const DEFAULT_VOLUME_SIZE: u32 = 2048;
-
 /// Wall-clock cadence for the consolidated perf log line. Decoupled from
 /// `world.generation` so the log keeps ticking even when the sim is paused
 /// or stepping slowly — see hash-thing-q63.
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
+
+/// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
+/// the threshold at which a human reads a changing number without
+/// jitter (hash-thing-4ioh).
+const TITLE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Thin wrapper over macOS `pthread_set_qos_class_self_np` used as the
 /// xhi6 diagnostic knob (proxy 2 for SVDAG↔sim cache-locality work).
@@ -178,6 +182,42 @@ enum PendingPlayerAction {
     PlaceClone,
 }
 
+/// Scene-swap request queued while a background sim step is in flight.
+///
+/// Keeps `pending_scene_swap` separate from `pending_player_action`: player
+/// actions are FIFO lightweight edits against the next live world, while
+/// scene swaps replace the world/entities/render state wholesale. Last
+/// write wins: pressing another scene-selection key (`g`, `m`, `r`, `t`,
+/// `b`, or another `n`/`v`) clears the queue *at key-press time*, even
+/// when the new loader early-returns under `is_stepping()`. That way a
+/// stale queued swap can't land after the user has already picked
+/// something else. If both a player action and a scene swap are queued
+/// when the step finishes, the scene swap wins and the player action is
+/// dropped — the action was queued against a world we're about to
+/// discard, so replaying it would just do wasted upload work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingSceneSwap {
+    LoadLatticeDemo,
+    LoadLatticePanoramaDemo,
+    ResetTerrain,
+    LoadGyroid,
+    LoadDemoSpectacle,
+    ResetGolSmoke,
+}
+
+impl PendingSceneSwap {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LoadLatticeDemo => "lattice_demo",
+            Self::LoadLatticePanoramaDemo => "lattice_panorama",
+            Self::ResetTerrain => "terrain_reset",
+            Self::LoadGyroid => "gyroid",
+            Self::LoadDemoSpectacle => "demo_spectacle",
+            Self::ResetGolSmoke => "gol_smoke_reset",
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LatticeDemoBeat {
@@ -219,17 +259,39 @@ struct LatticeShortDemoCut {
     started_at: std::time::Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeatAdvance {
+    /// Advance to a different beat this frame.
+    Set(LatticeDemoBeat),
+    /// Cut has finished; clear `short_demo_cut`.
+    End,
+    /// Stay on the current beat.
+    Hold,
+}
+
 impl LatticeShortDemoCut {
-    fn beat_for_elapsed(elapsed: std::time::Duration) -> Option<LatticeDemoBeat> {
+    const INTERIOR_AT: f32 = 2.0;
+    const PANORAMA_AT: f32 = 4.5;
+    const END_AT: f32 = 8.0;
+
+    /// Decide the next beat given the current beat and wall-clock elapsed.
+    /// Advances at most one step per call so a long frame (OS pause,
+    /// long sim step, heavy SVDAG upload) cannot jump Intro → Panorama
+    /// and skip Interior entirely (hash-thing-x1lg). After a stall, the
+    /// next redraw walks forward one step; the frame after that walks the
+    /// remaining step, so each beat is displayed for at least one frame.
+    fn advance(current: Option<LatticeDemoBeat>, elapsed: std::time::Duration) -> BeatAdvance {
         let secs = elapsed.as_secs_f32();
-        if secs < 2.0 {
-            Some(LatticeDemoBeat::Intro)
-        } else if secs < 4.5 {
-            Some(LatticeDemoBeat::Interior)
-        } else if secs < 8.0 {
-            Some(LatticeDemoBeat::Panorama)
-        } else {
-            None
+        match current {
+            None => BeatAdvance::Set(LatticeDemoBeat::Intro),
+            Some(LatticeDemoBeat::Intro) if secs >= Self::INTERIOR_AT => {
+                BeatAdvance::Set(LatticeDemoBeat::Interior)
+            }
+            Some(LatticeDemoBeat::Interior) if secs >= Self::PANORAMA_AT => {
+                BeatAdvance::Set(LatticeDemoBeat::Panorama)
+            }
+            Some(LatticeDemoBeat::Panorama) if secs >= Self::END_AT => BeatAdvance::End,
+            _ => BeatAdvance::Hold,
         }
     }
 }
@@ -241,52 +303,76 @@ struct DemoWaypoint {
     camera: OrbitCameraPose,
 }
 
-fn lattice_demo_waypoint(side: usize, beat: LatticeDemoBeat) -> DemoWaypoint {
-    let side = side as f64;
-    let center = side * 0.5;
+fn lattice_demo_waypoint(
+    side: usize,
+    layout: &sim::DemoLayout,
+    beat: LatticeDemoBeat,
+) -> DemoWaypoint {
+    // ptew: derive player positions from the actual scene anchors so the
+    // spawn is always in carved-AIR cells with scene-provided floor
+    // support. The previous implementation used hardcoded `side * k`
+    // fractions that drifted deep inside lattice pillars whenever scene
+    // geometry evolved.
+    let inv_side = 1.0 / side as f32;
+    let center_xz =
+        |c: [i64; 3]| -> [f64; 3] { [c[0] as f64 + 0.5, c[1] as f64, c[2] as f64 + 0.5] };
+    let to_normalized = |p: [f64; 3]| -> [f32; 3] {
+        [
+            p[0] as f32 * inv_side,
+            p[1] as f32 * inv_side,
+            p[2] as f32 * inv_side,
+        ]
+    };
     match beat {
-        LatticeDemoBeat::Intro => {
-            let offset = side * 0.28;
+        LatticeDemoBeat::Intro => DemoWaypoint {
+            label: "intro",
+            player: PlayerPose {
+                pos: layout.player_pos,
+                yaw: layout.player_yaw,
+                pitch: layout.player_pitch,
+            },
+            camera: OrbitCameraPose {
+                target: to_normalized(layout.player_pos),
+                yaw: -3.0 * std::f32::consts::FRAC_PI_4,
+                pitch: 0.08,
+                dist: 0.34,
+            },
+        },
+        LatticeDemoBeat::Interior => {
+            let pos = center_xz(layout.atrium_center);
             DemoWaypoint {
-                label: "intro",
+                label: "interior",
                 player: PlayerPose {
-                    pos: [center - offset, side * 0.34, center - offset],
-                    yaw: -3.0 * std::f64::consts::FRAC_PI_4,
-                    pitch: -0.08,
+                    pos,
+                    yaw: std::f64::consts::FRAC_PI_2,
+                    pitch: -0.12,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.36, 0.34, 0.36],
-                    yaw: -3.0 * std::f32::consts::FRAC_PI_4,
-                    pitch: 0.08,
-                    dist: 0.34,
+                    target: to_normalized(pos),
+                    yaw: std::f32::consts::FRAC_PI_2,
+                    pitch: 0.10,
+                    dist: 0.22,
                 },
             }
         }
-        LatticeDemoBeat::Interior => DemoWaypoint {
-            label: "interior",
-            player: PlayerPose {
-                pos: [center + side * 0.04, side * 0.46, center + side * 0.10],
-                yaw: std::f64::consts::FRAC_PI_2,
-                pitch: -0.12,
-            },
-            camera: OrbitCameraPose {
-                target: [0.54, 0.46, 0.50],
-                yaw: std::f32::consts::FRAC_PI_2,
-                pitch: 0.10,
-                dist: 0.22,
-            },
-        },
         LatticeDemoBeat::Panorama => {
-            let offset = side * 0.22;
+            let pos = center_xz(layout.reveal_center);
+            // Aim the orbit camera at the midpoint between the player on the
+            // balcony and the panorama volume so the reveal frames both.
+            let panorama_mid: [f64; 3] = [
+                (layout.reveal_center[0] + layout.panorama_center[0]) as f64 * 0.5,
+                (layout.reveal_center[1] + layout.panorama_center[1]) as f64 * 0.5,
+                (layout.reveal_center[2] + layout.panorama_center[2]) as f64 * 0.5,
+            ];
             DemoWaypoint {
                 label: "panorama",
                 player: PlayerPose {
-                    pos: [center + offset, side * 0.58, center + offset],
+                    pos,
                     yaw: std::f64::consts::FRAC_PI_4,
                     pitch: 0.24,
                 },
                 camera: OrbitCameraPose {
-                    target: [0.62, 0.72, 0.62],
+                    target: to_normalized(panorama_mid),
                     yaw: std::f32::consts::FRAC_PI_4,
                     pitch: 0.32,
                     dist: 0.82,
@@ -344,6 +430,25 @@ struct App {
     /// Last frame timestamp for delta-time computation. Player movement
     /// is multiplied by dt so speed is frame-rate-independent (xa7).
     last_frame: std::time::Instant,
+    /// EWMA-smoothed FPS for the window title. Instantaneous `1/dt`
+    /// jumps ±5 between frames at 20-30 FPS; the smoothed readout is
+    /// just for the human skimming the title bar (hash-thing-d9af).
+    /// Zero sentinel: first frame seeds the filter at its instant value.
+    smoothed_fps: f64,
+    /// Set by reset sites that `last_frame = Instant::now()` outside the
+    /// redraw hot path (focus-gain, unocclude). The next RedrawRequested
+    /// sees a `dt_wall` that measures the event-dispatch-to-redraw gap
+    /// (microseconds), not a real frame; blending `1/dt_wall` into the
+    /// EWMA would spike the displayed FPS to millions and decay it over
+    /// many seconds. Consumed (cleared) on the first redraw after the
+    /// reset so subsequent frames measure normally (hash-thing-dxjb;
+    /// same class as hash-thing-6e4a, cold-startup path).
+    suppress_next_fps_sample: bool,
+    /// Throttle for `window.set_title` — at 60 FPS an unthrottled
+    /// title update is unreadable even with EWMA smoothing, and the
+    /// OS sees 60 title rewrites per second. Rewrite at ~4 Hz
+    /// (hash-thing-4ioh). `None` before the first title update.
+    last_title_update: Option<std::time::Instant>,
     /// Entity store: particles, projectiles, etc. Updated after each
     /// sim step. Entities push mutations onto `world.queue`; those are
     /// applied at the start of the next tick.
@@ -378,6 +483,10 @@ struct App {
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
+    /// Defer a scene-swap requested while stepping; drained after step
+    /// completion in the same slot as `pending_player_action`. Last-write
+    /// wins; any unrelated scene-change key clears it. (hash-thing-a9jd)
+    pending_scene_swap: Option<PendingSceneSwap>,
     /// Latest modifier key state, tracked via ModifiersChanged. Feeds
     /// `reconcile_modifier_keys` to clear stuck physical-key entries
     /// when a modifier change arrives without a matching Released event.
@@ -409,6 +518,17 @@ struct App {
     /// leaves the thread at its inherited QoS. Set via
     /// `HASH_THING_SIM_QOS={interactive|initiated|default|utility|background}`.
     sim_qos: Option<u32>,
+    /// Read-only voxel-grid view kept on the main thread so player collision
+    /// can run every frame even while a background sim step owns the mutable
+    /// [`sim::World`] (hash-thing-0s9v). Refreshed at step start, step
+    /// completion, and after [`sim::World::ensure_region`] grows the world.
+    collision_snapshot: Option<sim::CollisionSnapshot>,
+    /// Cached fullscreen state for auto-clearing perf histograms on
+    /// windowed↔fullscreen transitions (hash-thing-0zrc). Queried each
+    /// `Resized` against `window.fullscreen().is_some()`; a mismatch
+    /// means the OS just toggled fullscreen, which matters for dlse.2.2
+    /// A/B perf comparisons.
+    was_fullscreen: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -421,13 +541,48 @@ fn should_warn_about_slow_dev_step(
         && step_elapsed >= std::time::Duration::from_millis(DEV_PROFILE_STEP_WARN_MS)
 }
 
+/// EWMA smoother for the window-title FPS readout (hash-thing-d9af).
+/// `prev <= 0.0` is the first-frame sentinel — seed the filter at the
+/// instant value so the title doesn't crawl up from zero.
+fn smooth_fps(prev: f64, instant: f64, alpha: f64) -> f64 {
+    if prev <= 0.0 {
+        instant
+    } else {
+        alpha * instant + (1.0 - alpha) * prev
+    }
+}
+
+/// Split the per-frame elapsed time into `(dt_wall, dt_clamped)`.
+///
+/// The clamped value keeps xa7 player movement bounded under a hiccup
+/// (pos += vel * dt); the wall value feeds the d9af EWMA title readout
+/// so real sub-10-FPS frames aren't capped at "10 FPS" (hash-thing-dvzl).
+fn compute_frame_dts(elapsed: std::time::Duration) -> (f64, f64) {
+    let dt_wall = elapsed.as_secs_f64();
+    let dt_clamped = dt_wall.min(0.1);
+    (dt_wall, dt_clamped)
+}
+
+/// Title-refresh throttle gate (hash-thing-4ioh). Returns `true` on
+/// the first call (`last` is `None`) and on any call at least
+/// `TITLE_REFRESH_INTERVAL` past the previous refresh.
+fn should_refresh_title(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= TITLE_REFRESH_INTERVAL,
+    }
+}
+
 fn default_legend_visibility(_mode: CameraMode) -> bool {
     // Default-on until proper demo lineup lands (edward 2026-04-21).
     true
 }
 
-fn should_capture_cursor(camera_mode: CameraMode, focused: bool) -> bool {
-    focused && camera_mode == CameraMode::FirstPerson
+fn should_capture_cursor(camera_mode: CameraMode, focused: bool, occluded: bool) -> bool {
+    // Occlusion (e.g. macOS Mission Control) can revoke the OS-level grab
+    // without a Focused(false) event — hash-thing-w0o9. Treat it as
+    // defocus-equivalent so cursor_captured cannot outlive the real grab.
+    focused && !occluded && camera_mode == CameraMode::FirstPerson
 }
 
 /// Drop any modifier KeyCodes from `keys` whose combined bit is *not* set in
@@ -500,6 +655,12 @@ impl App {
             occluded: false,
             noise_ns_per_sample: 0.0,
             last_frame: std::time::Instant::now(),
+            smoothed_fps: 0.0,
+            suppress_next_fps_sample: false,
+            // None so the first frame refreshes the title immediately
+            // — without an `Instant` sentinel before the monotonic
+            // epoch, which could underflow on some platforms.
+            last_title_update: None,
             entities: sim::EntityStore::new(),
             volume_size,
             step_handle: None,
@@ -515,6 +676,7 @@ impl App {
             startup_scene_pending: true,
             cursor_captured: false,
             pending_player_action: None,
+            pending_scene_swap: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
             memo_hud_visible: std::env::var("HASH_THING_MEMO_HUD").ok().as_deref() == Some("1"),
@@ -524,12 +686,16 @@ impl App {
                 .ok()
                 .as_deref()
                 .and_then(thread_qos::parse),
+            collision_snapshot: None,
+            was_fullscreen: false,
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
         }
         if let Some(qos) = app.sim_qos {
-            log::info!("HASH_THING_SIM_QOS active: sim thread will request QoS 0x{qos:02x} (xhi6 diagnostic)");
+            log::info!(
+                "HASH_THING_SIM_QOS active: sim thread will request QoS 0x{qos:02x} (xhi6 diagnostic)"
+            );
         }
 
         // Seed the cached memo summary so the very first periodic log line
@@ -546,7 +712,9 @@ impl App {
             player_pos[1],
             player_pos[2]
         );
-        log::info!("Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit");
+        log::info!(
+            "Controls: WASD=move, mouse=look, LMB=break, RMB=place, scroll/1-9=material, F5=pause, Tab=orbit"
+        );
 
         app
     }
@@ -583,24 +751,74 @@ impl App {
     }
 
     fn sync_cursor_capture(&mut self) {
-        let should_capture = should_capture_cursor(self.camera_mode, self.focused);
+        let should_capture = should_capture_cursor(self.camera_mode, self.focused, self.occluded);
         if should_capture == self.cursor_captured {
             return;
         }
         self.apply_cursor_capture(should_capture);
     }
 
+    // Two entry points latch `self.occluded = true`: the winit
+    // `WindowEvent::Occluded(true)` event and the `FrameOutcome::Occluded`
+    // belt-and-suspenders path in `RedrawRequested`. Both must clear the
+    // same transient input state and sync cursor capture or `cursor_captured`
+    // drifts from the OS-level grab (hash-thing-w0o9). Extract a helper so
+    // the two paths cannot diverge.
+    fn enter_occluded_state(&mut self) {
+        self.occluded = true;
+        self.keys_held.clear();
+        self.jump_was_held = false;
+        self.last_mouse = None;
+        self.sync_cursor_capture();
+    }
+
+    fn leave_occluded_state(&mut self) {
+        self.occluded = false;
+        self.last_mouse = None;
+        self.mark_resume_edge();
+        self.sync_cursor_capture();
+    }
+
+    /// Post-pause resume edge (focus-gain, unocclude). The redraw loop
+    /// stops advancing while paused, so the next RedrawRequested would
+    /// see `last_frame.elapsed()` clamped to 100 ms — that's a full 100
+    /// ms player-movement step on a single frame (hash-thing-xysz) and
+    /// a huge dt that decays the EWMA FPS downward for seconds. Reset
+    /// `last_frame` to "now" so the next frame measures only the real
+    /// gap. BUT the very next RedrawRequested fires microseconds after
+    /// this reset, so `dt_wall` becomes the event-dispatch-to-redraw gap
+    /// — tiny — and blending `1/dt_wall` into the EWMA would spike the
+    /// readout into the millions (hash-thing-dxjb). Pair the reset with
+    /// `suppress_next_fps_sample = true` so the next FPS sample is
+    /// skipped, not blended. The two operations are one contract; this
+    /// helper is the only site that implements it — do not inline it.
+    /// All four call sites (focus-gain, unocclude, scene swap, and the
+    /// cold-start-post-surface redraw block) share this contract
+    /// (hash-thing-v79j, hash-thing-6e4a).
+    fn mark_resume_edge(&mut self) {
+        self.last_frame = std::time::Instant::now();
+        self.suppress_next_fps_sample = true;
+    }
+
     /// Apply a raw pixel-delta mouse look to the player. Scales by
-    /// `LOOK_SENSITIVITY` and clamps pitch to ±1.4. Shared between the
-    /// `CursorMoved` (uncaptured) and `DeviceEvent::MouseMotion` (captured)
-    /// paths so the two stay in parity by construction (hash-thing-a6t2).
+    /// `LOOK_SENSITIVITY`, wraps yaw to `[-π, π)`, and clamps pitch to
+    /// ±1.4. Shared between the `CursorMoved` (uncaptured) and
+    /// `DeviceEvent::MouseMotion` (captured) paths so the two stay in
+    /// parity by construction (hash-thing-a6t2). Wrapping keeps the f32
+    /// downcast for rendering precise over arbitrarily long sessions
+    /// (hash-thing-u0uf, follow-up to hash-thing-w1yq).
     fn apply_fps_look(&mut self, dx: f64, dy: f64) {
         let Some(pid) = self.player_id else { return };
         let Some(player) = self.entities.get_mut(pid) else {
             return;
         };
         if let sim::EntityKind::Player(ref mut ps) = player.kind {
-            ps.yaw += dx * LOOK_SENSITIVITY;
+            let yaw = ps.yaw + dx * LOOK_SENSITIVITY;
+            // Centered wrap (around 0, matching reset_player_pose's
+            // "straight ahead = 0" convention). rem_euclid would land in
+            // [0, τ) instead; [-π, π) keeps sign symmetry with pose code.
+            let tau = std::f64::consts::TAU;
+            ps.yaw = yaw - tau * ((yaw + std::f64::consts::PI) / tau).floor();
             ps.pitch = (ps.pitch + dy * LOOK_SENSITIVITY).clamp(-1.4, 1.4);
         }
     }
@@ -637,11 +855,36 @@ impl App {
     /// Handle a captured-cursor `DeviceEvent::MouseMotion` delta. No-op
     /// unless the player is in first-person mode with the cursor grabbed
     /// (hash-thing-w1yq). Extracted for testability (hash-thing-a6t2).
+    ///
+    /// Deltas are intentionally **device-agnostic**: `DeviceId` is not
+    /// inspected, so an external mouse and a trackpad driven in the same
+    /// frame sum into a single FPS-look delta. A 3D game has no concept
+    /// of "which device owns the camera," and winit already delivers one
+    /// `MouseMotion` per device per frame, so summing is the natural
+    /// behavior (hash-thing-i7gt, follow-up to hash-thing-a6t2).
     fn handle_mouse_motion(&mut self, dx: f64, dy: f64) {
         if self.camera_mode != CameraMode::FirstPerson || !self.cursor_captured {
             return;
         }
         self.apply_fps_look(dx, dy);
+    }
+
+    /// Blend `1 / dt_wall` into the EWMA-smoothed FPS readout, or skip
+    /// when a reset site has flagged this frame as bogus (hash-thing-dxjb).
+    /// A bogus frame is one where `last_frame` was reset outside the
+    /// redraw hot path (focus-gain, unocclude) so `dt_wall` is the event-
+    /// dispatch-to-redraw gap (microseconds), not a real frame. `dt==0`
+    /// (back-to-back redraws within one timer tick) is also skipped to
+    /// avoid blending a 0-FPS sample that would silently decay the
+    /// readout by 5%.
+    fn apply_fps_sample(&mut self, dt_wall: f64) {
+        if self.suppress_next_fps_sample {
+            self.suppress_next_fps_sample = false;
+            return;
+        }
+        if dt_wall > 0.0 {
+            self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
+        }
     }
 
     fn load_initial_scene(&mut self) {
@@ -655,10 +898,9 @@ impl App {
         self.reset_scene_entities();
         self.spawn_demo_entities();
         self.paused = false;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -667,6 +909,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.exit_lattice_demo_mode();
         log::info!(
             "Initial scene: terrain pop={} nodes={} gen={}µs",
             self.world.population(),
@@ -675,7 +918,7 @@ impl App {
         );
         log::debug!(
             "Material registry palette slots={}",
-            self.world.materials.color_palette_rgba().len()
+            self.world.materials().color_palette_rgba().len()
         );
     }
 
@@ -696,7 +939,7 @@ impl App {
         let Some(player) = self.entities.get_mut(pid) else {
             return false;
         };
-        player.pos = [center[0], center[1] + 2.0, center[2]];
+        player.pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         true
     }
 
@@ -714,7 +957,7 @@ impl App {
                 held_material: 1,
             });
         let center = self.world_center();
-        let pos = [center[0], center[1] + 2.0, center[2]];
+        let pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
         self.entities = sim::EntityStore::new();
         self.player_id = Some(self.entities.add(
             pos,
@@ -726,25 +969,41 @@ impl App {
 
     fn spawn_demo_entities(&mut self) {
         let center = self.world_center();
-        let mid_y = center[1] + 1.0;
+        let mid_y = center[1] + 1.0 * CELLS_PER_METER;
         self.entities.add(
-            [center[0] - 10.0, mid_y, center[2] - 4.0],
+            [
+                center[0] - 10.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 4.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::geyser()),
         );
         self.entities.add(
-            [center[0] + 10.0, mid_y + 2.0, center[2] + 6.0],
+            [
+                center[0] + 10.0 * CELLS_PER_METER,
+                mid_y + 2.0 * CELLS_PER_METER,
+                center[2] + 6.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::volcano()),
         );
         self.entities.add(
-            [center[0] + 2.0, mid_y, center[2] - 12.0],
+            [
+                center[0] + 2.0 * CELLS_PER_METER,
+                mid_y,
+                center[2] - 12.0 * CELLS_PER_METER,
+            ],
             [0.0; 3],
             sim::EntityKind::Emitter(sim::EmitterState::whirlpool()),
         );
         for offset in [-8.0, 0.0, 8.0] {
             self.entities.add(
-                [center[0] + offset, mid_y, center[2] + 12.0],
+                [
+                    center[0] + offset * CELLS_PER_METER,
+                    mid_y,
+                    center[2] + 12.0 * CELLS_PER_METER,
+                ],
                 [0.0; 3],
                 sim::EntityKind::Critter(sim::CritterState::new(
                     hash_thing::terrain::materials::VINE_MATERIAL_ID,
@@ -811,6 +1070,20 @@ impl App {
             return;
         }
         self.step_start = std::time::Instant::now();
+        // Refresh the main-thread collision snapshot BEFORE moving the world
+        // to the step thread. Player collision during the step reads from
+        // this snapshot, not the placeholder we're about to swap in
+        // (hash-thing-0s9v). Timed so we can validate the clone-cost
+        // estimate against live sweeps.
+        //
+        // Ordering invariant: the snapshot MUST be set before `step_handle`
+        // becomes `Some(...)`. `is_stepping()` ⟺ `step_handle.is_some()`, and
+        // grounded movement unwraps `collision_snapshot` via `expect` when
+        // stepping; inverting these lines would expose that expect.
+        {
+            let _t = self.perf.start("collision_snapshot_refresh");
+            self.collision_snapshot = Some(self.world.collision_snapshot());
+        }
         // Move world to the background thread only after the frame has
         // consumed the live snapshot for movement, interaction, and render.
         let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
@@ -848,6 +1121,44 @@ impl App {
         }
     }
 
+    /// Queue a scene swap when the sim step is on the background thread, or
+    /// run it immediately otherwise (hash-thing-a9jd). The logs name both
+    /// sides so repro sessions can tell "queued vs dropped" apart.
+    fn request_scene_swap(&mut self, swap: PendingSceneSwap) {
+        if self.is_stepping() {
+            log::info!("Scene swap queued during step: {}", swap.label());
+            self.pending_scene_swap = Some(swap);
+        } else {
+            self.dispatch_scene_swap(swap);
+        }
+    }
+
+    fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
+        match swap {
+            PendingSceneSwap::LoadLatticeDemo => {
+                let _ = self.load_lattice_demo();
+            }
+            PendingSceneSwap::LoadLatticePanoramaDemo => self.load_lattice_panorama_demo(),
+            PendingSceneSwap::ResetTerrain => self.load_terrain_scene(
+                "Reset terrain",
+                terrain::TerrainParams::for_level(self.volume_size.trailing_zeros()),
+            ),
+            PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
+            PendingSceneSwap::LoadDemoSpectacle => {
+                self.load_demo_spectacle("Reset spectacle gallery")
+            }
+            PendingSceneSwap::ResetGolSmoke => self.reset_gol_smoke_scene(),
+        }
+    }
+
+    fn run_pending_scene_swap(&mut self) {
+        let Some(swap) = self.pending_scene_swap.take() else {
+            return;
+        };
+        log::info!("Scene swap executing after step: {}", swap.label());
+        self.dispatch_scene_swap(swap);
+    }
+
     /// Legend text lines for the current camera mode.
     fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
         match mode {
@@ -867,6 +1178,8 @@ impl App {
                 "  T  Terrain    B  Spectacle",
                 "  R  Reset      G  GoL bloom",
                 "  M  Gyroid     N  Lattice walk",
+                "  V  Panorama reveal",
+                "  [/] U/I/O  DEV jumps (Tab for orbit)",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
@@ -888,7 +1201,7 @@ impl App {
                 "  M  Gyroid     N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
-                "  V  DEV tweet reveal",
+                "  V  Panorama reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
                 "  F5 Pause      F1  Signal legend",
@@ -906,6 +1219,26 @@ impl App {
     fn sync_render_cache(&mut self) {
         self.render_origin = self.world.origin;
         self.render_inv_size = 1.0 / self.world.side() as f32;
+    }
+
+    /// Drop any perf / FPS state carried over from a prior scene. Called
+    /// from every scene loader so a scene swap can't leave the window-title
+    /// FPS EWMA, perf histograms, and memory peak-marks anchored to the
+    /// previous scene's regime (hash-thing-6nsh).
+    ///
+    /// Route the `last_frame` + `suppress_next_fps_sample` reset through
+    /// `mark_resume_edge` (hash-thing-v79j). The scene loaders that call
+    /// this helper then run terrain gen + SVDAG upload — hundreds of ms at
+    /// 256³ — before the next redraw. Without the resume edge, the first
+    /// post-swap `dt_wall` captures that upload time, and with
+    /// `smoothed_fps == 0.0` the `smooth_fps` zero-sentinel seeds the EWMA
+    /// at ~3 FPS (`1 / 0.33s`). Same shape as hash-thing-dxjb (focus edge)
+    /// and hash-thing-6e4a (cold-start).
+    fn reset_scene_perf_state(&mut self) {
+        self.perf.clear();
+        self.mem_stats.reset_peaks();
+        self.smoothed_fps = 0.0;
+        self.mark_resume_edge();
     }
 
     /// Get the player's eye position and look direction.
@@ -942,11 +1275,25 @@ impl App {
             renderer.camera_pitch = pose.pitch;
             renderer.camera_dist = pose.dist;
         }
+        // Scene swaps and lattice beats can flip into Orbit from captured
+        // FPS (hash-thing-c4sm). Without this sync, `cursor_captured` stays
+        // true while `should_capture_cursor` is false, so the cursor is
+        // grabbed but no input path drives the orbit.
+        self.sync_cursor_capture();
     }
 
     fn load_lattice_demo_beat(&mut self, beat: LatticeDemoBeat) {
-        self.load_lattice_demo();
-        let waypoint = lattice_demo_waypoint(self.world.side(), beat);
+        // Reseed the scene and use the fresh DemoLayout anchors — direct
+        // return rather than an App-side cache so a stale layout can never
+        // drive a waypoint into unrelated geometry (hash-thing-ptew).
+        let Some(layout) = self.load_lattice_demo() else {
+            // Background sim step in flight — load_lattice_demo already
+            // logged the deferral. Skip the waypoint too; applying a
+            // lattice-shaped pose on top of the previous scene is exactly
+            // the class of bug that ptew is about.
+            return;
+        };
+        let waypoint = lattice_demo_waypoint(self.world.side(), &layout, beat);
         self.apply_player_pose(waypoint.player);
         self.apply_orbit_camera_pose(waypoint.camera);
         self.current_demo_beat = Some(beat);
@@ -981,13 +1328,10 @@ impl App {
         let Some(cut) = self.short_demo_cut else {
             return;
         };
-        match LatticeShortDemoCut::beat_for_elapsed(cut.started_at.elapsed()) {
-            Some(beat) => {
-                if self.current_demo_beat != Some(beat) {
-                    self.load_lattice_demo_beat(beat);
-                }
-            }
-            None => self.short_demo_cut = None,
+        match LatticeShortDemoCut::advance(self.current_demo_beat, cut.started_at.elapsed()) {
+            BeatAdvance::Set(beat) => self.load_lattice_demo_beat(beat),
+            BeatAdvance::End => self.short_demo_cut = None,
+            BeatAdvance::Hold => {}
         }
     }
 
@@ -1103,11 +1447,11 @@ impl App {
         if self.is_stepping() {
             return;
         }
-        self.world.invalidate_rule_caches();
+        self.world.invalidate_material_caches();
         if self.gol_smoke_scene {
             self.world.set_gol_smoke_rule(self.gol_smoke_rule);
             if let Some(renderer) = &mut self.renderer {
-                renderer.upload_palette(&self.world.materials.color_palette_rgba());
+                renderer.upload_palette(&self.world.materials().color_palette_rgba());
             }
         }
         log::info!("Rule: {label}");
@@ -1123,10 +1467,9 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = true;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1135,6 +1478,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
+        self.exit_lattice_demo_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -1194,12 +1538,8 @@ impl App {
             if prev == hit {
                 return;
             }
-            // Encode the source material in clone block metadata.
-            let state = hash_thing::octree::Cell::pack(
-                hash_thing::terrain::materials::CLONE_MATERIAL_ID,
-                held_material,
-            )
-            .raw();
+            // Pack held material as the clone source (see pack_clone_source).
+            let state = hash_thing::terrain::materials::pack_clone_source(held_material);
             let pos = [prev[0], prev[1], prev[2]];
             self.world.set(
                 sim::WorldCoord(pos[0]),
@@ -1221,6 +1561,17 @@ impl App {
         }
     }
 
+    /// Zero the lattice-demo beat/cut state. Called from every non-lattice
+    /// scene loader so an in-flight V cut (short_demo_cut = Some(_)) does not
+    /// advance after the user explicitly swapped scenes via B/G/M/terrain —
+    /// otherwise `update_lattice_short_demo_cut` would next frame call
+    /// `load_lattice_demo_beat` and yank the user back into the lattice scene
+    /// (hash-thing-0p0s).
+    fn exit_lattice_demo_mode(&mut self) {
+        self.current_demo_beat = None;
+        self.short_demo_cut = None;
+    }
+
     #[allow(dead_code)]
     fn load_burning_room_demo(&mut self, label: &str) {
         if self.is_stepping() {
@@ -1232,10 +1583,9 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = true;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1244,7 +1594,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
-        self.current_demo_beat = None;
+        self.exit_lattice_demo_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -1275,10 +1625,9 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = false; // Let materials interact immediately.
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1287,7 +1636,7 @@ impl App {
             &mut self.last_svdag_stats,
         );
         self.sync_render_cache();
-        self.current_demo_beat = None;
+        self.exit_lattice_demo_mode();
         log::info!(
             "Gyroid megastructure: pop={} gen={:.1}ms collapses={} classifies={}",
             self.world.population(),
@@ -1297,9 +1646,37 @@ impl App {
         );
     }
 
-    fn load_lattice_demo(&mut self) {
+    fn reset_gol_smoke_scene(&mut self) {
         if self.is_stepping() {
             return;
+        }
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.set_gol_smoke_rule(self.gol_smoke_rule);
+        self.world.seed_center(12, 0.35);
+        self.gol_smoke_scene = true;
+        self.paused = true;
+        self.reset_scene_perf_state();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
+        }
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+        );
+        self.sync_render_cache();
+        self.exit_lattice_demo_mode();
+        log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
+    }
+
+    fn load_lattice_demo(&mut self) -> Option<sim::DemoLayout> {
+        if self.is_stepping() {
+            // Without this log the `n` key looks dead during a long sim
+            // step — see hash-thing-1a1n. The completion log at the end
+            // of this function covers the success path.
+            log::info!("load_lattice_demo: deferred — background sim step in flight");
+            return None;
         }
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
@@ -1311,10 +1688,9 @@ impl App {
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
         self.paused = false; // Let materials interact immediately.
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
         Self::upload_volume(
             &mut self.renderer,
@@ -1331,6 +1707,7 @@ impl App {
             elapsed.as_secs_f64() * 1000.0,
             layout.reveal_center,
         );
+        Some(layout)
     }
 
     fn load_lattice_panorama_demo(&mut self) {
@@ -1353,8 +1730,7 @@ impl App {
         self.noise_ns_per_sample = terrain::probe_sample_ns(&params.to_heightmap(), 10_000);
         self.gol_smoke_scene = false;
         self.paused = true;
-        self.perf.clear();
-        self.mem_stats.reset_peaks();
+        self.reset_scene_perf_state();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
@@ -1374,8 +1750,7 @@ impl App {
             self.noise_ns_per_sample,
         );
         self.sync_render_cache();
-        self.current_demo_beat = None;
-        self.short_demo_cut = None;
+        self.exit_lattice_demo_mode();
     }
 }
 
@@ -1401,7 +1776,7 @@ impl ApplicationHandler for App {
 
             let mut renderer =
                 pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
-            renderer.upload_palette(&self.world.materials.color_palette_rgba());
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
             // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
             // `surface.get_current_texture()` + `present()`; pairs with the
             // acquire harness to measure whether the ~25 ms surface_acquire
@@ -1419,6 +1794,11 @@ impl ApplicationHandler for App {
                 &mut self.last_svdag_stats,
             );
             self.sync_cursor_capture();
+            // 4ioh: new window starts with the bootstrap title. Clear
+            // the throttle sentinel so the first real frame refreshes
+            // the title immediately instead of waiting out the 250 ms
+            // interval from a previous window's refresh.
+            self.last_title_update = None;
             // Some macOS / agent launches do not schedule an initial redraw
             // on their own. Arm the first frame explicitly so startup scene
             // generation and the steady redraw loop can begin.
@@ -1439,15 +1819,47 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
+                // hash-thing-0zrc: detect OS-initiated windowed<->fullscreen
+                // transitions by diffing cached state against the current
+                // `window.fullscreen()`. winit 0.30 has no dedicated
+                // `FullscreenChanged` event; on macOS/Windows the toggle
+                // surfaces as `Resized`, so this is the idiomatic hook.
+                // Pre-transition samples belong to a different regime
+                // (different render-target size, GPU bottleneck mix), so
+                // dropping them gives dlse.2.2 A/B comparisons a clean slate.
+                //
+                // Scope: strictly windowed<->fullscreen. Same-mode regime
+                // changes — monitor swap while fullscreen, DPI change,
+                // windowed drag — are intentionally out of scope and left
+                // to scene-reset paths or follow-up beads. We call the
+                // narrow `self.perf.clear()` (not `reset_scene_perf_state`)
+                // because the bead is scoped to perf histograms; FPS EWMA
+                // and mem peaks are left alone on purpose.
+                if let Some(window) = self.window.as_ref() {
+                    let now_fullscreen = window.fullscreen().is_some();
+                    if now_fullscreen != self.was_fullscreen {
+                        log::info!(
+                            "fullscreen transition {}→{}: clearing perf histograms (hash-thing-0zrc)",
+                            self.was_fullscreen,
+                            now_fullscreen,
+                        );
+                        self.perf.clear();
+                        self.was_fullscreen = now_fullscreen;
+                    }
+                }
             }
 
             // Pause the redraw treadmill while the window is hidden
             // (minimized, behind another window, screen locked). On un-occlude,
             // re-arm the loop with a single `request_redraw`. See
-            // hash-thing-8jp.
+            // hash-thing-8jp. Also treat occlusion as a capture-blocking
+            // signal — macOS Mission Control / Spaces can revoke the cursor
+            // grab here without a Focused(false) event (hash-thing-w0o9).
             WindowEvent::Occluded(occluded) => {
-                self.occluded = occluded;
-                if !occluded {
+                if occluded {
+                    self.enter_occluded_state();
+                } else {
+                    self.leave_occluded_state();
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1458,6 +1870,7 @@ impl ApplicationHandler for App {
                 self.focused = focused;
                 if focused {
                     self.last_mouse = None;
+                    self.mark_resume_edge();
                     self.sync_cursor_capture();
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -1538,8 +1951,16 @@ impl ApplicationHandler for App {
                             log::info!("Camera mode: {:?}", self.camera_mode);
                         }
                         winit::keyboard::Key::Character("s")
-                            if self.camera_mode == CameraMode::Orbit && !self.is_stepping() =>
+                            if self.camera_mode != CameraMode::Orbit =>
                         {
+                            log::debug!("s ignored: single-step only in Orbit mode (current=FPS)");
+                        }
+                        winit::keyboard::Key::Character("s") if self.is_stepping() => {
+                            log::debug!(
+                                "s ignored: single-step denied while background step is in flight"
+                            );
+                        }
+                        winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
@@ -1564,80 +1985,60 @@ impl ApplicationHandler for App {
                                 self.world.population()
                             );
                         }
-                        winit::keyboard::Key::Character("r") => {
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
+                        winit::keyboard::Key::Character("r" | "t") => {
+                            // Queue through PendingSceneSwap so a press during
+                            // a background sim step lands at the next step
+                            // boundary instead of being silently dropped by
+                            // load_terrain_scene's is_stepping guard
+                            // (hash-thing-u5ik). `r` and `t` share the same
+                            // terrain reset today; split in the future if the
+                            // keys diverge.
+                            self.request_scene_swap(PendingSceneSwap::ResetTerrain);
                         }
-                        winit::keyboard::Key::Character("t") => {
-                            // Plain terrain remains available as an explicit
-                            // toggle, but is no longer the default scene.
-                            self.load_terrain_scene(
-                                "Reset terrain",
-                                terrain::TerrainParams::for_level(
-                                    self.volume_size.trailing_zeros(),
-                                ),
-                            );
-                        }
-                        winit::keyboard::Key::Character("g") if !self.is_stepping() => {
-                            // Swap to the single retained GoL smoke seed.
-                            self.world = sim::World::new(self.volume_size.trailing_zeros());
-                            self.world.set_gol_smoke_rule(self.gol_smoke_rule);
-                            self.world.seed_center(12, 0.35);
-                            self.gol_smoke_scene = true;
-                            self.paused = true;
-                            self.perf.clear();
-                            self.mem_stats.reset_peaks();
-                            if let Some(renderer) = &mut self.renderer {
-                                renderer.upload_palette(&self.world.materials.color_palette_rgba());
-                            }
-                            Self::upload_volume(
-                                &mut self.renderer,
-                                &mut self.world,
-                                &mut self.svdag,
-                                &mut self.last_svdag_stats,
-                            );
-                            self.sync_render_cache();
-                            log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
+                        winit::keyboard::Key::Character("g") => {
+                            self.request_scene_swap(PendingSceneSwap::ResetGolSmoke);
                         }
                         winit::keyboard::Key::Character("m") => {
-                            self.load_gyroid_demo();
+                            self.request_scene_swap(PendingSceneSwap::LoadGyroid);
                         }
                         winit::keyboard::Key::Character("n") => {
-                            self.load_lattice_demo();
+                            self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
                         }
-                        winit::keyboard::Key::Character("[")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.cycle_lattice_demo_beat(-1);
+                        winit::keyboard::Key::Character(k @ ("[" | "]" | "u" | "i" | "o")) => {
+                            // Lattice-demo debug jumps are orbit-only:
+                            // teleporting the camera between scripted
+                            // beats is useful when previewing the demo,
+                            // less so while the player is walking around
+                            // in FPS mode. Log the silent branch so the
+                            // key doesn't feel dead (hash-thing-1a1n).
+                            if self.lattice_debug_jumps_enabled() {
+                                match k {
+                                    "[" => self.cycle_lattice_demo_beat(-1),
+                                    "]" => self.cycle_lattice_demo_beat(1),
+                                    "u" => self.select_lattice_demo_beat(LatticeDemoBeat::Intro),
+                                    "i" => self.select_lattice_demo_beat(LatticeDemoBeat::Interior),
+                                    "o" => self.select_lattice_demo_beat(LatticeDemoBeat::Panorama),
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                // debug!, not info!: winit delivers key-repeat
+                                // events and the default filter is `info`, so
+                                // holding `[` would spam the console at
+                                // ~30 lines/sec. Discoverability now lives in
+                                // the FPS legend line; the log is a fallback
+                                // for RUST_LOG=debug sessions (hash-thing-ibe0).
+                                log::debug!(
+                                    "{k}: lattice debug jump — orbit mode only (Tab to switch camera)"
+                                );
+                            }
                         }
-                        winit::keyboard::Key::Character("]")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.cycle_lattice_demo_beat(1);
-                        }
-                        winit::keyboard::Key::Character("u")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Intro);
-                        }
-                        winit::keyboard::Key::Character("i")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Interior);
-                        }
-                        winit::keyboard::Key::Character("o")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.select_lattice_demo_beat(LatticeDemoBeat::Panorama);
-                        }
-                        winit::keyboard::Key::Character("v")
-                            if self.lattice_debug_jumps_enabled() =>
-                        {
-                            self.load_lattice_panorama_demo();
+                        winit::keyboard::Key::Character("v") => {
+                            // a9jd: the short-demo cut is the user-facing
+                            // demo entry (not an orbit-only debug jump),
+                            // so no camera-mode gate. `[`, `]`, `u`/`i`/`o`
+                            // keep their debug gates — those are genuine
+                            // beat-cycle jumps.
+                            self.request_scene_swap(PendingSceneSwap::LoadLatticePanoramaDemo);
                         }
                         winit::keyboard::Key::Character(
                             n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
@@ -1658,14 +2059,16 @@ impl ApplicationHandler for App {
                                         sim::GameOfLife3D::new(4, 7, 6, 8),
                                         "Pyroclastic",
                                     ),
-                                    _ => {}
+                                    _ => log::debug!(
+                                        "digit {digit} ignored in Orbit mode: rule selection uses 1-4 only"
+                                    ),
                                 }
                             }
                         }
                         winit::keyboard::Key::Character("b") => {
                             // Default demo gallery: deterministic local fire/water set pieces
                             // staged around the beat waypoints.
-                            self.load_demo_spectacle("Reset spectacle gallery");
+                            self.request_scene_swap(PendingSceneSwap::LoadDemoSpectacle);
                         }
                         winit::keyboard::Key::Character("c") => {
                             // dlse.2.2: drain perf histograms so the next `P`
@@ -1720,10 +2123,15 @@ impl ApplicationHandler for App {
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
                         }
+                        winit::keyboard::Key::Character("p") if self.is_stepping() => {
+                            log::debug!(
+                                "p ignored: perf dump denied while background step is in flight"
+                            );
+                        }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
                         // cadence.
-                        winit::keyboard::Key::Character("p") if !self.is_stepping() => {
+                        winit::keyboard::Key::Character("p") => {
                             let nodes = self.world.store.stats();
                             self.mem_stats.update(nodes);
                             let (svdag_nodes, svdag_bytes, svdag_root_level) =
@@ -1831,22 +2239,42 @@ impl ApplicationHandler for App {
                 if self.startup_scene_pending {
                     self.startup_scene_pending = false;
                     self.load_initial_scene();
+                    // load_initial_scene runs terrain gen + SVDAG upload —
+                    // hundreds of ms at 256³. Re-arm the resume edge AFTER
+                    // the upload window so `dt_wall` below measures the
+                    // first real frame, not the cold-start work. Symmetric
+                    // with focus / unocclude / scene-swap resume edges —
+                    // all four share the same pairing contract (last_frame
+                    // + suppress). See hash-thing-v79j / hash-thing-6e4a.
+                    self.mark_resume_edge();
                 }
 
-                // Frame delta time for frame-rate-independent movement (xa7).
-                let dt = self.last_frame.elapsed().as_secs_f64().min(0.1);
+                // Frame delta time. `dt` is clamped to 0.1s for xa7
+                // player movement (a 500ms hiccup must not teleport the
+                // player). `dt_wall` is the unclamped wall-clock value for
+                // the EWMA title readout — without it, sub-10-FPS frames
+                // all report "10 FPS" because 1.0 / 0.1 = 10 (dvzl).
+                let (dt_wall, dt) = compute_frame_dts(self.last_frame.elapsed());
                 self.last_frame = std::time::Instant::now();
                 self.update_lattice_short_demo_cut();
 
-                // Update window title with FPS + resolution.
-                if let Some(window) = &self.window {
-                    let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
-                    if let Some(renderer) = &self.renderer {
-                        let scale_pct = (renderer.render_scale * 100.0) as u32;
-                        window.set_title(&format!(
-                            "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                            fps, self.volume_size, scale_pct,
-                        ));
+                self.apply_fps_sample(dt_wall);
+                // Throttle title refresh to ~4 Hz. EWMA-smoothed
+                // FPS still jitters between integer readings on the
+                // {:.0} boundary (e.g. 59/60 flicker), and 60 title
+                // rewrites per second hands the OS more repaint work
+                // than a human can read anyway (hash-thing-4ioh).
+                let now = std::time::Instant::now();
+                if should_refresh_title(self.last_title_update, now) {
+                    if let Some(window) = &self.window {
+                        if let Some(renderer) = &self.renderer {
+                            let scale_pct = (renderer.render_scale * 100.0) as u32;
+                            window.set_title(&format!(
+                                "hash-thing | {:.0} FPS | {}³ | scale {}%",
+                                self.smoothed_fps, self.volume_size, scale_pct,
+                            ));
+                            self.last_title_update = Some(now);
+                        }
                     }
                 }
 
@@ -1874,6 +2302,16 @@ impl ApplicationHandler for App {
                         match handle.join().expect("step thread aborted") {
                             Ok(world) => {
                                 self.world = world;
+                                // Refresh the collision snapshot from the
+                                // just-returned world so the next frame's
+                                // player physics reads post-step geometry
+                                // (hash-thing-0s9v). Same clone-cost surface
+                                // as the step-start refresh; timed under the
+                                // same metric so sweeps see both samples.
+                                {
+                                    let _t = self.perf.start("collision_snapshot_refresh");
+                                    self.collision_snapshot = Some(self.world.collision_snapshot());
+                                }
                                 // Refresh cached memo-health summary while the
                                 // real world is in hand (hash-thing-stue.6):
                                 // the (stepping) log branch below cannot read
@@ -1910,6 +2348,16 @@ impl ApplicationHandler for App {
                 }
 
                 if !self.is_stepping() {
+                    // a9jd: drain a queued scene swap FIRST. If one is set, the
+                    // pending player action was queued against the world
+                    // that's about to be discarded, so running it first would
+                    // do a full SVDAG rebuild/upload that the scene swap
+                    // immediately throws away. Dropping the player action in
+                    // that case matches "latest intent wins."
+                    if self.pending_scene_swap.is_some() {
+                        self.pending_player_action = None;
+                    }
+                    self.run_pending_scene_swap();
                     self.run_pending_player_action();
                 }
 
@@ -2024,34 +2472,34 @@ impl ApplicationHandler for App {
 
                         let stepping = self.is_stepping();
                         let mut camera_grounded = false;
+                        // 0s9v: grounded physics every frame. During
+                        // background steps, collide against a snapshot of
+                        // the step-entry world instead of the placeholder.
+                        let grid: &dyn player::VoxelGrid = if stepping {
+                            self.collision_snapshot
+                                .as_ref()
+                                .expect("collision snapshot refreshed at step start")
+                        } else {
+                            &self.world
+                        };
                         if let Some(p) = self.entities.get_mut(pid) {
-                            if stepping {
-                                // Free-fly: no collision while world is on
-                                // the background thread (x5w).
-                                p.pos[0] += delta[0];
-                                p.pos[1] += delta[1];
-                                p.pos[2] += delta[2];
-                            } else {
-                                let step = player::step_grounded_movement(
-                                    &self.world,
-                                    &p.pos,
-                                    p.vel[1],
-                                    player::GroundedMoveInput {
-                                        yaw,
-                                        move_input: [fwd, right],
-                                        speed,
-                                        dt,
-                                        jump_requested,
-                                    },
-                                );
-                                p.pos = step.pos;
-                                p.vel[1] = step.vertical_velocity;
-                            }
+                            let step = player::step_grounded_movement(
+                                grid,
+                                &p.pos,
+                                p.vel[1],
+                                player::GroundedMoveInput {
+                                    yaw,
+                                    move_input: [fwd, right],
+                                    speed,
+                                    dt,
+                                    jump_requested,
+                                },
+                            );
+                            p.pos = step.pos;
+                            p.vel[1] = step.vertical_velocity;
                         }
-                        if !stepping {
-                            if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
-                                camera_grounded = player::is_grounded(&self.world, &p.pos);
-                            }
+                        if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
+                            camera_grounded = player::is_grounded(grid, &p.pos);
                         }
                         let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
                         // hash-thing-m1f.4 / 37r: grow the world when the
@@ -2059,7 +2507,6 @@ impl ApplicationHandler for App {
                         // Skipped during background step — world is placeholder.
                         if !self.is_stepping() {
                             if let Some(p) = self.entities.get_mut(pid) {
-                                const GROWTH_MARGIN: f64 = 8.0;
                                 let origin = self.world.origin;
                                 let side = self.world.side() as f64;
                                 let pos = p.pos;
@@ -2085,6 +2532,18 @@ impl ApplicationHandler for App {
                                     ];
                                     let old_level = self.world.level;
                                     self.world.ensure_region(min, max);
+                                    // 0s9v: ensure_region may grow the
+                                    // world; refresh the collision snapshot
+                                    // so the next background step starts
+                                    // from the grown state. Timed under the
+                                    // same metric as the other two refresh
+                                    // sites so sweeps observe the full
+                                    // clone-cost distribution.
+                                    {
+                                        let _t = self.perf.start("collision_snapshot_refresh");
+                                        self.collision_snapshot =
+                                            Some(self.world.collision_snapshot());
+                                    }
                                     if self.world.level != old_level {
                                         log::info!(
                                             "World grew: level {} → {} (side {}, origin {:?})",
@@ -2143,7 +2602,7 @@ impl ApplicationHandler for App {
                                     renderer.hotbar_selected_slot =
                                         ps.held_material.saturating_sub(1) as u32;
                                     if !stepping {
-                                        let palette = self.world.materials.color_palette_rgba();
+                                        let palette = self.world.materials().color_palette_rgba();
                                         let mat = ps.held_material as usize;
                                         if mat < palette.len() {
                                             renderer.hud_material_color = palette[mat];
@@ -2203,9 +2662,10 @@ impl ApplicationHandler for App {
                 // before winit fires `WindowEvent::Occluded(true)` (some
                 // platforms are lazy about that event), latch the flag here
                 // so the next RedrawRequested short-circuits at the top of
-                // the arm.
+                // the arm. Route through the same helper as the winit event
+                // so cursor capture releases on this path too (w0o9).
                 if matches!(outcome, Some(render::FrameOutcome::Occluded)) {
-                    self.occluded = true;
+                    self.enter_occluded_state();
                     return;
                 }
 
@@ -2264,7 +2724,7 @@ fn main() {
     log::info!("  N: lattice walk-through demo");
     log::info!("  [/] DEV previous/next lattice jump (orbit mode)");
     log::info!("  U/I/O: DEV intro/interior/reveal lattice jumps (orbit mode)");
-    log::info!("  V: DEV panoramic lattice reveal jump (orbit mode)");
+    log::info!("  V: Panoramic lattice reveal (timed demo cut)");
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
@@ -2310,6 +2770,87 @@ mod tests {
     use super::*;
     use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
     use std::time::Duration;
+
+    #[test]
+    fn smooth_fps_seeds_from_zero_prev_returns_instant() {
+        assert_eq!(smooth_fps(0.0, 60.0, 0.05), 60.0);
+        // Negative prev (shouldn't occur in practice) hits the same
+        // sentinel branch rather than producing a nonsense blend.
+        assert_eq!(smooth_fps(-1.0, 20.0, 0.1), 20.0);
+    }
+
+    #[test]
+    fn smooth_fps_weights_new_sample_by_alpha() {
+        // 0.1 * 20 + 0.9 * 100 = 92.0. Round-trip through f64 to avoid
+        // flaky equality; the arithmetic is exact for these values.
+        assert!((smooth_fps(100.0, 20.0, 0.1) - 92.0).abs() < 1e-12);
+        // alpha=0 pins to prev (filter is frozen).
+        assert_eq!(smooth_fps(42.0, 1.0, 0.0), 42.0);
+        // alpha=1 snaps to the instant sample (no smoothing).
+        assert_eq!(smooth_fps(42.0, 1.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn smooth_fps_converges_to_steady_instant() {
+        // Drive the filter with a constant 60 FPS from a distant start
+        // and assert it settles within a plausible window. At alpha=0.05
+        // the 99% settle is log(0.01) / log(0.95) ≈ 90 samples, so 200
+        // iterations is plenty of headroom.
+        let mut s = 10.0;
+        for _ in 0..200 {
+            s = smooth_fps(s, 60.0, 0.05);
+        }
+        assert!((s - 60.0).abs() < 0.1, "expected ~60, got {s}");
+    }
+
+    // hash-thing-dvzl: the EWMA title readout must not get the 100ms
+    // clamp, or frames slower than 10 FPS all round-trip to exactly "10".
+    // xa7 movement still uses the clamped value.
+
+    #[test]
+    fn compute_frame_dts_preserves_wall_for_slow_frames() {
+        let (wall, clamped) = compute_frame_dts(Duration::from_millis(200));
+        assert!(
+            (wall - 0.2).abs() < 1e-12,
+            "wall dt must not clamp; got {wall}"
+        );
+        assert!(
+            (clamped - 0.1).abs() < 1e-12,
+            "clamped dt must cap at 0.1; got {clamped}"
+        );
+    }
+
+    #[test]
+    fn compute_frame_dts_matches_below_clamp() {
+        // At typical frame times the two values coincide — the clamp only
+        // bites above 100ms.
+        let (wall, clamped) = compute_frame_dts(Duration::from_millis(16));
+        assert!((wall - 0.016).abs() < 1e-12);
+        assert!((clamped - 0.016).abs() < 1e-12);
+    }
+
+    // hash-thing-4ioh: title-refresh throttle fires on the first frame
+    // (`None` seed) and then suppresses rewrites until the interval
+    // elapses. At 60 FPS this collapses ~15 per-frame rewrites into one.
+    #[test]
+    fn should_refresh_title_fires_on_first_frame() {
+        let now = std::time::Instant::now();
+        assert!(should_refresh_title(None, now));
+    }
+
+    #[test]
+    fn should_refresh_title_suppresses_within_interval() {
+        let last = std::time::Instant::now();
+        let soon = last + TITLE_REFRESH_INTERVAL / 2;
+        assert!(!should_refresh_title(Some(last), soon));
+    }
+
+    #[test]
+    fn should_refresh_title_fires_at_interval_boundary() {
+        let last = std::time::Instant::now();
+        let later = last + TITLE_REFRESH_INTERVAL;
+        assert!(should_refresh_title(Some(last), later));
+    }
 
     #[test]
     fn reconcile_modifier_keys_drops_only_cleared_bits() {
@@ -2376,22 +2917,27 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_stay_inside_world() {
+        let mut world = sim::World::new(6); // side 64
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
         for beat in [
             LatticeDemoBeat::Intro,
             LatticeDemoBeat::Interior,
             LatticeDemoBeat::Panorama,
         ] {
-            let waypoint = lattice_demo_waypoint(2048, beat);
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
             for axis in [0, 1, 2] {
                 assert!(waypoint.player.pos[axis] > 0.0);
-                assert!(waypoint.player.pos[axis] < 2048.0);
+                assert!(waypoint.player.pos[axis] < side as f64);
             }
         }
     }
 
     #[test]
     fn lattice_panorama_waypoint_faces_inward_and_upward() {
-        let waypoint = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let waypoint = lattice_demo_waypoint(world.side(), &layout, LatticeDemoBeat::Panorama);
         let (_eye, dir) = player::eye_ray(
             &waypoint.player.pos,
             waypoint.player.yaw,
@@ -2404,12 +2950,49 @@ mod tests {
 
     #[test]
     fn lattice_demo_waypoints_are_distinct() {
-        let intro = lattice_demo_waypoint(512, LatticeDemoBeat::Intro);
-        let interior = lattice_demo_waypoint(512, LatticeDemoBeat::Interior);
-        let panorama = lattice_demo_waypoint(512, LatticeDemoBeat::Panorama);
+        let mut world = sim::World::new(6);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        let intro = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Intro);
+        let interior = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Interior);
+        let panorama = lattice_demo_waypoint(side, &layout, LatticeDemoBeat::Panorama);
         assert_ne!(intro.label, interior.label);
         assert_ne!(interior.label, panorama.label);
         assert_ne!(intro.player.pos, panorama.player.pos);
+    }
+
+    /// ptew: player was landing embedded in solid lattice cells because
+    /// the beat waypoints were hardcoded normalized fractions that did
+    /// not track the scene geometry. This test seeds the real scene and
+    /// asserts that every beat's spawn cell is walkable AND grounded, so
+    /// the class of bug cannot regress silently.
+    #[test]
+    fn lattice_demo_waypoints_do_not_collide_with_scene() {
+        // Level 8: 69cq (CELLS_PER_METER=4) requires lattice rooms to fit
+        // a 6.4-cell-tall player; the other lattice spawn tests moved to
+        // level 8 for the same reason.
+        let mut world = sim::World::new(8);
+        let layout = world.seed_lattice_progression_demo();
+        let side = world.side();
+        for beat in [
+            LatticeDemoBeat::Intro,
+            LatticeDemoBeat::Interior,
+            LatticeDemoBeat::Panorama,
+        ] {
+            let waypoint = lattice_demo_waypoint(side, &layout, beat);
+            assert!(
+                !player::player_collides(&world, &waypoint.player.pos),
+                "{:?} waypoint must spawn in AIR: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+            assert!(
+                player::is_grounded(&world, &waypoint.player.pos),
+                "{:?} waypoint must have floor support: pos={:?}",
+                beat,
+                waypoint.player.pos,
+            );
+        }
     }
 
     #[test]
@@ -2432,24 +3015,171 @@ mod tests {
     }
 
     #[test]
+    fn reset_scene_perf_state_zeroes_smoothed_fps() {
+        // hash-thing-6nsh: scene loaders previously cleared perf rings and
+        // mem_stats peaks but left smoothed_fps anchored to the previous
+        // scene, so the window-title FPS EWMA lied for many refreshes
+        // after a scene with a very different render cost.
+        let mut app = App::new(64);
+        app.smoothed_fps = 240.0;
+
+        app.reset_scene_perf_state();
+
+        assert_eq!(app.smoothed_fps, 0.0);
+    }
+
+    #[test]
+    fn reset_scene_perf_state_routes_through_mark_resume_edge() {
+        // hash-thing-v79j: scene loaders call reset_scene_perf_state then
+        // spend hundreds of ms on terrain gen + SVDAG upload before the
+        // next redraw. Without the mark_resume_edge pairing, the first
+        // post-swap dt_wall captures that upload time and seeds the EWMA
+        // at ~3 FPS via the smooth_fps zero-sentinel branch.
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.suppress_next_fps_sample = false;
+
+        app.reset_scene_perf_state();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "scene reset must refresh last_frame via mark_resume_edge; elapsed was {:?}",
+            app.last_frame.elapsed()
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "scene reset must flag the next FPS sample as bogus via mark_resume_edge"
+        );
+    }
+
+    #[test]
+    fn cold_start_reset_scene_perf_state_is_sufficient_to_suppress_spike() {
+        // hash-thing-6e4a: startup-call-site contract test. The cold-start
+        // redraw block calls load_initial_scene (which calls
+        // reset_scene_perf_state) then mark_resume_edge. This test
+        // deliberately does NOT call mark_resume_edge explicitly — it pins
+        // that reset_scene_perf_state ALONE is sufficient to suppress the
+        // first post-reset FPS sample, so a future refactor that strips
+        // mark_resume_edge out of reset_scene_perf_state would fail here.
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.smoothed_fps = 0.0;
+        app.suppress_next_fps_sample = false;
+
+        app.reset_scene_perf_state();
+        // reset_scene_perf_state's internal mark_resume_edge set
+        // last_frame = now. Sleep so dt_wall below is a realistic
+        // small frame-gap rather than ~zero; the suppress flag masks
+        // the actual magnitude, but this keeps the test faithful to
+        // the real redraw-block shape.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let dt_wall = app.last_frame.elapsed().as_secs_f64();
+        app.apply_fps_sample(dt_wall);
+        assert_eq!(
+            app.smoothed_fps, 0.0,
+            "cold-start first sample must be suppressed by reset_scene_perf_state alone; got {}",
+            app.smoothed_fps,
+        );
+
+        app.apply_fps_sample(1.0 / 60.0);
+        assert!(
+            (app.smoothed_fps - 60.0).abs() < 1e-9,
+            "second sample must seed via zero-sentinel at the instant value; got {}",
+            app.smoothed_fps,
+        );
+        assert!(
+            app.smoothed_fps < 1000.0,
+            "smoothed_fps must not spike into thousands; got {}",
+            app.smoothed_fps,
+        );
+    }
+
+    #[test]
     fn lattice_short_demo_cut_advances_in_story_order() {
         use std::time::Duration;
 
+        // None → Intro regardless of elapsed (initial entry).
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(0.0)),
-            Some(LatticeDemoBeat::Intro)
+            LatticeShortDemoCut::advance(None, Duration::from_secs_f32(0.0)),
+            BeatAdvance::Set(LatticeDemoBeat::Intro)
+        );
+        // Hold Intro until the 2s boundary.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(1.5)
+            ),
+            BeatAdvance::Hold
+        );
+        // Boundary is inclusive (>=): elapsed == INTERIOR_AT must advance.
+        // Pins the semantics so a future refactor to strict `>` would flip
+        // this test.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(LatticeShortDemoCut::INTERIOR_AT)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
         );
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(2.1)),
-            Some(LatticeDemoBeat::Interior)
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(2.1)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
         );
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(5.0)),
-            Some(LatticeDemoBeat::Panorama)
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Interior),
+                Duration::from_secs_f32(5.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Panorama)
         );
         assert_eq!(
-            LatticeShortDemoCut::beat_for_elapsed(Duration::from_secs_f32(8.1)),
-            None
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Panorama),
+                Duration::from_secs_f32(8.1)
+            ),
+            BeatAdvance::End
+        );
+    }
+
+    #[test]
+    fn lattice_short_demo_cut_does_not_skip_interior_on_long_frame() {
+        // hash-thing-x1lg: a long frame (OS pause, long sim step, SVDAG
+        // upload) that jumps wall-clock from ~0s to >4.5s must not
+        // transition Intro → Panorama in one step. Interior must be
+        // displayed for at least one frame, preserving story order.
+        use std::time::Duration;
+
+        // Elapsed past the Panorama threshold but currently on Intro:
+        // should advance to Interior (one step), not skip to Panorama.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(5.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
+        );
+        // Same elapsed again the next frame, now on Interior: advances
+        // to Panorama on the very next frame.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Interior),
+                Duration::from_secs_f32(5.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Panorama)
+        );
+        // Elapsed past the End threshold but still on Intro: one step
+        // to Interior, not straight to End. Protects the cut from being
+        // torn down before the user sees any middle beat.
+        assert_eq!(
+            LatticeShortDemoCut::advance(
+                Some(LatticeDemoBeat::Intro),
+                Duration::from_secs_f32(10.0)
+            ),
+            BeatAdvance::Set(LatticeDemoBeat::Interior)
         );
     }
 
@@ -2505,17 +3235,29 @@ mod tests {
     }
 
     #[test]
-    fn first_person_legend_hides_lattice_debug_jumps() {
+    fn first_person_legend_notes_lattice_debug_jumps() {
         let lines = App::legend_lines(CameraMode::FirstPerson);
         assert!(lines.iter().any(|line| line.contains("Space       Leap")));
         assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
         assert!(!lines.iter().any(|line| line.contains("Fly down")));
-        assert!(!lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(!lines
+        // ibe0: FPS legend should mention the orbit-only DEV jumps so users
+        // pressing `[/]UIO` in FPS mode know where to look, without copying
+        // the full orbit-mode entry wording.
+        let dev_jump_line = lines
             .iter()
-            .any(|line| line.contains("DEV intro/interior/reveal")));
-        assert!(!lines.iter().any(|line| line.contains("DEV tweet reveal")));
+            .find(|line| line.contains("[/]") && line.contains("U/I/O"))
+            .expect("FPS legend should list the orbit-only DEV jump keys");
+        assert!(
+            dev_jump_line.contains("DEV"),
+            "DEV jump legend line should label the keys as DEV: {dev_jump_line}"
+        );
+        assert!(
+            dev_jump_line.contains("Tab") || dev_jump_line.contains("orbit"),
+            "DEV jump legend line should point users at Tab/orbit: {dev_jump_line}"
+        );
+        // a9jd: V is user-facing in every camera mode now (not a DEV jump).
+        assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
 
@@ -2526,7 +3268,9 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("DEV intro/interior/reveal")));
-        assert!(lines.iter().any(|line| line.contains("DEV tweet reveal")));
+        // a9jd: `[`, `]`, `U`/`I`/`O` remain DEV beat-cycle jumps, but `V`
+        // is the user-facing panorama reveal — not a DEV-only key.
+        assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
     }
 
@@ -2576,44 +3320,57 @@ mod tests {
             .find(|entity| entity.id == pid)
             .expect("player entity should still exist");
         let center = app.world_center();
-        assert_eq!(player.pos, [center[0], center[1] + 2.0, center[2]]);
+        assert_eq!(
+            player.pos,
+            [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]]
+        );
     }
 
     #[test]
     fn background_step_starts_after_live_world_player_update() {
-        let mut app = App::new(8);
+        // 69cq scale: volume_size bumped 8→32 so the 8 m physical world
+        // fits after CELLS_PER_METER=4. Fixtures are sized in meters and
+        // scaled through CELLS_PER_METER so the physical layout matches
+        // the pre-scale intent (3 m × 3 m × 1 m floor slab; 1 m × 2 m ×
+        // 1 m column 1 m north of the player).
+        let mut app = App::new(32);
         app.paused = false;
         app.keys_held.insert(KeyCode::KeyW);
         let stone = hash_thing::octree::Cell::pack(1, 0).raw();
-        for x in 3..=5 {
-            for z in 3..=5 {
-                app.world.set(
-                    sim::WorldCoord(x),
-                    sim::WorldCoord(0),
-                    sim::WorldCoord(z),
-                    stone,
-                );
+        let s = CELLS_PER_METER as i64;
+        let m = |v: f64| v * CELLS_PER_METER;
+        for x in 3 * s..6 * s {
+            for y in 0..s {
+                for z in 3 * s..6 * s {
+                    app.world.set(
+                        sim::WorldCoord(x),
+                        sim::WorldCoord(y),
+                        sim::WorldCoord(z),
+                        stone,
+                    );
+                }
             }
         }
-        app.world.set(
-            sim::WorldCoord(4),
-            sim::WorldCoord(1),
-            sim::WorldCoord(3),
-            stone,
-        );
-        app.world.set(
-            sim::WorldCoord(4),
-            sim::WorldCoord(2),
-            sim::WorldCoord(3),
-            stone,
-        );
-        app.reset_player_pose([4.5, 1.0, 4.5], 0.0, 0.0);
+        for x in 4 * s..5 * s {
+            for y in s..3 * s {
+                for z in 3 * s..4 * s {
+                    app.world.set(
+                        sim::WorldCoord(x),
+                        sim::WorldCoord(y),
+                        sim::WorldCoord(z),
+                        stone,
+                    );
+                }
+            }
+        }
+        let spawn = [m(4.5), m(1.0), m(4.5)];
+        app.reset_player_pose(spawn, 0.0, 0.0);
 
         let pid = app.player_id.expect("player should exist");
         let speed = PLAYER_SPEED;
         let step = player::step_grounded_movement(
             &app.world,
-            &[4.5, 1.0, 4.5],
+            &spawn,
             0.0,
             player::GroundedMoveInput {
                 yaw: 0.0,
@@ -2635,7 +3392,7 @@ mod tests {
             .unwrap_or(0.0);
         let delta = player::compute_move_delta(yaw, [1.0, 0.0, 0.0], speed, 0.1);
         assert!(
-            4.5 + delta[2] < expected_z,
+            spawn[2] + delta[2] < expected_z,
             "free-fly would move farther through the wall than grounded movement"
         );
 
@@ -2684,11 +3441,22 @@ mod tests {
     }
 
     #[test]
-    fn cursor_capture_requires_first_person_and_focus() {
-        assert!(should_capture_cursor(CameraMode::FirstPerson, true));
-        assert!(!should_capture_cursor(CameraMode::FirstPerson, false));
-        assert!(!should_capture_cursor(CameraMode::Orbit, true));
-        assert!(!should_capture_cursor(CameraMode::Orbit, false));
+    fn cursor_capture_requires_first_person_focused_and_unoccluded() {
+        // Only (FirstPerson, focused, !occluded) should grab. Occluded is the
+        // hash-thing-w0o9 axis: macOS Mission Control revokes the OS-level
+        // grab via Occluded(true) without firing Focused(false).
+        for mode in [CameraMode::FirstPerson, CameraMode::Orbit] {
+            for focused in [false, true] {
+                for occluded in [false, true] {
+                    let expected = mode == CameraMode::FirstPerson && focused && !occluded;
+                    assert_eq!(
+                        should_capture_cursor(mode, focused, occluded),
+                        expected,
+                        "mode={mode:?} focused={focused} occluded={occluded}"
+                    );
+                }
+            }
+        }
     }
 
     /// Read the player's `(yaw, pitch)` off the entity store, for tests
@@ -2766,6 +3534,46 @@ mod tests {
     }
 
     #[test]
+    fn apply_fps_look_wraps_yaw_past_pi() {
+        // hash-thing-u0uf invariant: apply_fps_look must keep accumulated
+        // yaw in [-π, π) so the f32 downcast for rendering stays precise.
+        let mut app = App::new(64);
+        let pi = std::f64::consts::PI;
+        app.reset_player_pose([0.0, 0.0, 0.0], pi - 0.01, 0.0);
+
+        // 10 px * LOOK_SENSITIVITY(0.003) = 0.03 rad → crosses +π by 0.02.
+        app.apply_fps_look(10.0, 0.0);
+        let (yaw, _pitch) = player_look(&mut app);
+        assert!(yaw >= -pi, "yaw {yaw} below -π after wrap");
+        assert!(yaw < pi, "yaw {yaw} not strictly below +π after wrap");
+        let expected = -pi + 0.02;
+        assert!(
+            (yaw - expected).abs() < 1e-10,
+            "yaw {yaw} did not wrap to {expected}"
+        );
+    }
+
+    #[test]
+    fn apply_fps_look_bounds_yaw_across_many_rotations() {
+        // hash-thing-u0uf: even under an absurd event storm the wrap
+        // invariant must hold — this is the regression guard for "someone
+        // removed the wrap and nothing else noticed."
+        let mut app = App::new(64);
+        let pi = std::f64::consts::PI;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        for _ in 0..100 {
+            app.apply_fps_look(10_000.0, 0.0);
+        }
+        let (yaw, _pitch) = player_look(&mut app);
+        assert!(yaw >= -pi, "yaw {yaw} below -π after accumulation");
+        assert!(
+            yaw < pi,
+            "yaw {yaw} not strictly below +π after accumulation"
+        );
+    }
+
+    #[test]
     fn apply_fps_look_clamps_pitch() {
         let mut app = App::new(64);
         app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 1.3);
@@ -2780,5 +3588,452 @@ mod tests {
         app.apply_fps_look(0.0, -1000.0);
         let (_yaw, pitch) = player_look(&mut app);
         assert!((pitch - -1.4).abs() < 1e-12, "pitch should clamp at -1.4");
+    }
+
+    // hash-thing-9r62 regression: drive the cursor_captured flag through the
+    // real apply_cursor_capture entry point rather than direct field writes,
+    // so the state machine + event-routing contract are both covered (not
+    // just the gating logic).
+
+    #[test]
+    fn apply_cursor_capture_without_window_forces_uncaptured() {
+        // App::new leaves window = None (winit attaches it in resumed()).
+        // The entry point's no-window fallback must force cursor_captured =
+        // false no matter which direction is requested — otherwise the flag
+        // can report "captured" while there is no actual OS-level grab,
+        // which is the state w1yq debugged.
+        let mut app = App::new(64);
+        assert!(app.window.is_none(), "App::new must not attach a window");
+
+        app.apply_cursor_capture(true);
+        assert!(
+            !app.cursor_captured,
+            "no-window apply_cursor_capture(true) must not claim capture"
+        );
+
+        app.apply_cursor_capture(false);
+        assert!(
+            !app.cursor_captured,
+            "no-window apply_cursor_capture(false) must stay uncaptured"
+        );
+    }
+
+    #[test]
+    fn apply_cursor_capture_release_routes_events_uncaptured() {
+        // Going through apply_cursor_capture(false) from a captured state
+        // must leave the event routing in the uncaptured regime: CursorMoved
+        // drives look, DeviceEvent::MouseMotion is a noop.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        // Setup pretends we were captured; the *entry point under test* is
+        // the release call that follows.
+        app.cursor_captured = true;
+
+        app.apply_cursor_capture(false);
+        assert!(!app.cursor_captured);
+
+        // MouseMotion must be dropped in uncaptured FP.
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0, "MouseMotion must not apply after release");
+        assert_eq!(pitch, 0.0);
+
+        // CursorMoved must now apply (after the seeding call).
+        prime_cursor(&mut app, 100.0, 100.0);
+        app.handle_cursor_moved(110.0, 95.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch - (-5.0) * LOOK_SENSITIVITY).abs() < 1e-12);
+    }
+
+    #[test]
+    fn apply_cursor_capture_flip_drops_in_flight_captured_events() {
+        // Cross-stream ordering hazard (F1 from the w1yq triple-tier synth):
+        // MouseMotion events in flight across a capture → release flip must
+        // stop applying as soon as the flag flips. CursorMoved events must
+        // begin applying again after the flip (post-seed).
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        // Pre-flip: we believed we had capture. MouseMotion applies here.
+        app.cursor_captured = true;
+        app.handle_mouse_motion(10.0, 6.0);
+        let (yaw_cap, pitch_cap) = player_look(&mut app);
+        assert!((yaw_cap - 10.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+        assert!((pitch_cap - 6.0 * LOOK_SENSITIVITY).abs() < 1e-12);
+
+        // Same-frame CursorMoved while still captured is a noop.
+        prime_cursor_preserving_look(&mut app, 500.0, 500.0);
+        app.handle_cursor_moved(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - yaw_cap).abs() < 1e-12);
+        assert!((pitch - pitch_cap).abs() < 1e-12);
+
+        // Release via the real entry point.
+        app.apply_cursor_capture(false);
+        assert!(!app.cursor_captured);
+
+        // Post-flip: MouseMotion must now be dropped.
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!(
+            (yaw - yaw_cap).abs() < 1e-12,
+            "MouseMotion dropped after flip"
+        );
+        assert!((pitch - pitch_cap).abs() < 1e-12);
+
+        // Post-flip: CursorMoved must apply again. Re-seed so the first
+        // real delta is predictable — otherwise an untouched last_mouse
+        // from pre-flip would produce a huge one-shot delta.
+        prime_cursor_preserving_look(&mut app, 200.0, 200.0);
+        app.handle_cursor_moved(220.0, 180.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert!((yaw - (yaw_cap + 20.0 * LOOK_SENSITIVITY)).abs() < 1e-12);
+        assert!((pitch - (pitch_cap + (-20.0) * LOOK_SENSITIVITY)).abs() < 1e-12);
+    }
+
+    // hash-thing-w0o9: occlusion (macOS Mission Control / Spaces) must
+    // release cursor capture even when Focused(false) never fires. Drive
+    // through `enter_occluded_state` so the winit-event path and the
+    // `FrameOutcome::Occluded` latch path are both covered (Codex blocker).
+
+    #[test]
+    fn enter_occluded_state_releases_cursor_capture() {
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.occluded = false;
+        // Simulate a successful grab from before the occlusion event.
+        app.cursor_captured = true;
+
+        app.enter_occluded_state();
+
+        assert!(app.occluded, "enter_occluded_state must latch occluded");
+        assert!(
+            !app.cursor_captured,
+            "occlusion must flip cursor_captured even while focused"
+        );
+        assert!(
+            app.keys_held.is_empty(),
+            "transient key state must clear on occlusion"
+        );
+        assert!(!app.jump_was_held);
+        assert!(app.last_mouse.is_none());
+    }
+
+    #[test]
+    fn mouse_motion_after_occlusion_is_noop() {
+        // End-to-end proof: once occlusion has flipped capture off, ghost
+        // DeviceEvent::MouseMotion deltas delivered during the Space swap
+        // must not reach the player pose.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.occluded = false;
+        app.cursor_captured = true;
+        app.reset_player_pose([0.0, 0.0, 0.0], 0.0, 0.0);
+
+        app.enter_occluded_state();
+
+        app.handle_mouse_motion(999.0, 999.0);
+        let (yaw, pitch) = player_look(&mut app);
+        assert_eq!(yaw, 0.0);
+        assert_eq!(pitch, 0.0);
+    }
+
+    #[test]
+    fn leave_occluded_state_restores_should_capture() {
+        // Recovery path (Gemini nit): after occlude → un-occlude while
+        // still focused in FirstPerson, the capture predicate must want
+        // to re-grab. We can't verify the actual OS grab without a window,
+        // but the predicate is what sync_cursor_capture consults.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.enter_occluded_state();
+        assert!(!should_capture_cursor(
+            app.camera_mode,
+            app.focused,
+            app.occluded,
+        ));
+
+        app.leave_occluded_state();
+
+        assert!(!app.occluded);
+        assert!(app.last_mouse.is_none());
+        assert!(should_capture_cursor(
+            app.camera_mode,
+            app.focused,
+            app.occluded,
+        ));
+    }
+
+    #[test]
+    fn apply_orbit_camera_pose_clears_cursor_captured_from_fps() {
+        // hash-thing-c4sm: scene swaps (V panorama) and lattice beats that
+        // terminate in Orbit previously left `cursor_captured = true` if the
+        // player was in captured FPS, because `apply_orbit_camera_pose`
+        // didn't sync cursor state. Symptom: grabbed cursor with no input
+        // path driving the orbit until the next focus/occlusion transition.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.cursor_captured = true;
+        let pose = OrbitCameraPose {
+            target: [0.0, 0.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            dist: 1.0,
+        };
+
+        app.apply_orbit_camera_pose(pose);
+
+        assert_eq!(app.camera_mode, CameraMode::Orbit);
+        assert!(
+            !app.cursor_captured,
+            "apply_orbit_camera_pose must sync cursor capture; orbit mode never captures",
+        );
+    }
+
+    // hash-thing-xysz + hash-thing-dxjb: the redraw handler early-returns
+    // while paused so `last_frame` stops advancing. Resuming without a
+    // reset clamps the first dt to the 100ms guard (xysz); resetting
+    // without suppressing the next FPS sample blends a microsecond
+    // dt_wall into the EWMA (dxjb). `mark_resume_edge` does both as one
+    // step; `leave_occluded_state_routes_through_mark_resume_edge` (below)
+    // verifies the unocclude path calls it.
+
+    // hash-thing-dxjb: the focus/unocclude resets happen outside the
+    // redraw hot path. The next RedrawRequested sees a near-zero dt —
+    // blending 1/dt_wall into the EWMA would spike the displayed FPS
+    // into the millions and take many seconds to decay. The paired
+    // `suppress_next_fps_sample` flag defuses that. Both resume edges
+    // route through `mark_resume_edge`, so the invariant (reset +
+    // suppress in lockstep) cannot drift by construction.
+
+    #[test]
+    fn mark_resume_edge_resets_last_frame_and_flags_suppress() {
+        let mut app = App::new(64);
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.suppress_next_fps_sample = false;
+
+        app.mark_resume_edge();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "mark_resume_edge must reset last_frame; elapsed was {:?}",
+            app.last_frame.elapsed()
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "mark_resume_edge must flag the next FPS sample as bogus"
+        );
+    }
+
+    #[test]
+    fn leave_occluded_state_routes_through_mark_resume_edge() {
+        let mut app = App::new(64);
+        app.enter_occluded_state();
+        app.suppress_next_fps_sample = false;
+        app.last_frame = std::time::Instant::now() - std::time::Duration::from_secs(2);
+
+        app.leave_occluded_state();
+
+        assert!(
+            app.last_frame.elapsed() < std::time::Duration::from_millis(50),
+            "unocclude must reset last_frame via mark_resume_edge"
+        );
+        assert!(
+            app.suppress_next_fps_sample,
+            "unocclude must flag suppression via mark_resume_edge"
+        );
+    }
+
+    #[test]
+    fn apply_fps_sample_consumes_suppress_flag_without_blending() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 120.0;
+        app.suppress_next_fps_sample = true;
+
+        // A microsecond dt would normally push smoothed_fps past 50000
+        // in a single 0.05-alpha blend — verify we skip entirely.
+        app.apply_fps_sample(1e-6);
+
+        assert_eq!(
+            app.smoothed_fps, 120.0,
+            "suppress flag must skip the EWMA update on the flagged frame"
+        );
+        assert!(
+            !app.suppress_next_fps_sample,
+            "flag must be consumed after the suppressed frame"
+        );
+    }
+
+    #[test]
+    fn apply_fps_sample_blends_after_suppress_consumed() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 60.0;
+        app.suppress_next_fps_sample = true;
+
+        // First call: bogus frame, skipped.
+        app.apply_fps_sample(1e-6);
+        // Second call: real 60 FPS frame, should blend (identity here).
+        app.apply_fps_sample(1.0 / 60.0);
+
+        assert!(
+            (app.smoothed_fps - 60.0).abs() < 1e-9,
+            "subsequent real frames must blend normally; got {}",
+            app.smoothed_fps
+        );
+    }
+
+    /// Seed `last_mouse` without resetting player yaw/pitch. Used when a
+    /// test builds up yaw/pitch in stages and does not want the anchor
+    /// reset to clear the player pose.
+    fn prime_cursor_preserving_look(app: &mut App, start_x: f64, start_y: f64) {
+        app.last_mouse = Some((start_x, start_y));
+    }
+
+    // hash-thing-t3zn: warp-landing audit. Each warp key must drop the
+    // player into playable space — inside world bounds, AABB clear of
+    // solid cells, with floor support, and facing a finite direction.
+    // Failures here are real bugs; file a follow-up fix bead before
+    // adjusting the assertion.
+    fn assert_player_in_playable_space(app: &App, label: &str) {
+        let pid = app
+            .player_id
+            .unwrap_or_else(|| panic!("{label}: warp must leave player_id set"));
+        let player = app
+            .entities
+            .iter()
+            .find(|e| e.id == pid)
+            .unwrap_or_else(|| panic!("{label}: player entity missing after warp"));
+        let pos = player.pos;
+        let origin = app.world.origin;
+        let side = app.world.side() as i64;
+        for axis in 0..3 {
+            let lo = origin[axis] as f64;
+            let hi = (origin[axis] + side) as f64;
+            assert!(
+                pos[axis] >= lo && pos[axis] < hi,
+                "{label}: pos[{axis}]={} outside world bounds [{}, {})",
+                pos[axis],
+                lo,
+                hi,
+            );
+        }
+        assert!(
+            !player::player_collides(&app.world, &pos),
+            "{label}: player AABB at {pos:?} overlaps a solid cell",
+        );
+        assert!(
+            player::is_grounded(&app.world, &pos),
+            "{label}: player at {pos:?} has no floor support",
+        );
+        if let sim::EntityKind::Player(state) = &player.kind {
+            assert!(
+                state.yaw.is_finite() && state.pitch.is_finite(),
+                "{label}: degenerate facing yaw={} pitch={}",
+                state.yaw,
+                state.pitch,
+            );
+        } else {
+            panic!("{label}: player_id points at a non-Player entity");
+        }
+    }
+
+    /// Audit `n` (LoadLatticeDemo): seeded lattice spawn must be in playable
+    /// space.
+    #[test]
+    fn warp_n_load_lattice_demo_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_lattice_demo()
+            .expect("load_lattice_demo must succeed when no step is in flight");
+        assert_player_in_playable_space(&app, "n / load_lattice_demo");
+    }
+
+    /// Audit `v` (LoadLatticePanoramaDemo): the user-facing panorama-cut
+    /// entry point starts at the Intro beat, so its landing pose must be
+    /// playable.
+    #[test]
+    fn warp_v_load_lattice_panorama_demo_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_lattice_panorama_demo();
+        assert_player_in_playable_space(&app, "v / load_lattice_panorama_demo");
+    }
+
+    /// Audit `[`, `]`, `u`, `i`, `o`: every lattice-demo beat reachable from
+    /// the keyboard must land in playable space at the App level. The
+    /// per-beat waypoint correctness is already covered cell-by-cell in
+    /// `lattice_demo_waypoints_do_not_collide_with_scene`; this test
+    /// exercises the full keypress→swap→pose path on a representative
+    /// beat (Interior — the only one not implicitly retested by `v`/`n`)
+    /// to keep the suite under the soft 60s budget.
+    #[test]
+    fn warp_lattice_debug_jumps_land_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_lattice_demo_beat(LatticeDemoBeat::Interior);
+        assert_player_in_playable_space(&app, "i / load_lattice_demo_beat(Interior)");
+    }
+
+    /// Audit `b` (LoadDemoSpectacle): the spectacle gallery places the
+    /// player at world_center + 2 cells up. Verify that pose is in playable
+    /// space across the seeded spectacle geometry.
+    ///
+    /// Currently FAILS — spectacle has no floor support at world_center, so
+    /// the player drops at [128, 136, 128] with no ground beneath them. See
+    /// hash-thing-t3zn.2 for the fix bead; un-#[ignore] when it lands.
+    #[test]
+    #[ignore = "hash-thing-t3zn.2: spectacle leaves player floating, fix pending"]
+    fn warp_b_load_demo_spectacle_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_demo_spectacle("warp-audit");
+        assert_player_in_playable_space(&app, "b / load_demo_spectacle");
+    }
+
+    /// Audit `0` (recenter_player): recenter from inside a seeded scene
+    /// must not drop the player AABB into a solid cell.
+    ///
+    /// Currently FAILS — recenter blindly teleports to world_center + 2
+    /// cells up, which lands inside the lattice room geometry. See
+    /// hash-thing-t3zn.1 for the fix bead; un-#[ignore] when it lands.
+    /// Grounded support is intentionally not asserted here — a separate
+    /// bead would be needed if recenter is meant to seek floor support.
+    #[test]
+    #[ignore = "hash-thing-t3zn.1: recenter_player teleports into solid cells, fix pending"]
+    fn warp_0_recenter_player_into_lattice_demo_lands_in_playable_space() {
+        let mut app = App::new(256);
+        // Seed a real scene so the player exists and the world has solid
+        // cells around the spawn — exercises the realistic "press 0 mid-demo"
+        // path rather than recentering into an empty world.
+        app.load_lattice_demo()
+            .expect("scene seed must succeed so player_id is set");
+        assert!(app.recenter_player(), "recenter must succeed once a player exists");
+
+        let pid = app.player_id.expect("player should exist after recenter");
+        let player = app
+            .entities
+            .iter()
+            .find(|e| e.id == pid)
+            .expect("player entity should exist");
+        let pos = player.pos;
+        let origin = app.world.origin;
+        let side = app.world.side() as i64;
+        for axis in 0..3 {
+            let lo = origin[axis] as f64;
+            let hi = (origin[axis] + side) as f64;
+            assert!(
+                pos[axis] >= lo && pos[axis] < hi,
+                "0 / recenter_player: pos[{axis}]={} outside world bounds [{lo}, {hi})",
+                pos[axis],
+            );
+        }
+        assert!(
+            !player::player_collides(&app.world, &pos),
+            "0 / recenter_player: player AABB at {pos:?} overlaps a solid cell",
+        );
     }
 }

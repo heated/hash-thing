@@ -314,18 +314,18 @@ cp notes/.tmp/ship-{BRANCH_ID}/review-standard.md notes/.tmp/ship-{BRANCH_ID}/re
 2. **Claude Critical** — Agent tool:
    > Read notes/.tmp/ship-{BRANCH_ID}/review-critical.md and follow the instructions. READ-ONLY. Write to `$NOTES_DIR/CR-{BRANCH_ID}-Claude-Critical-{TIMESTAMP}.md`
 
-3. **Codex Standard** — Bash (`run_in_background: true`):
+3. **Codex Standard** — Bash (`run_in_background: true`). Always redirect stdin to `/dev/null` — codex waits on stdin for EOF before running and hangs indefinitely if bash leaves stdin open (pc95):
    ```bash
    env -u CLAUDECODE codex exec --full-auto --skip-git-repo-check \
      "Read notes/.tmp/ship-{BRANCH_ID}/review-standard.md and follow the instructions. Write to $NOTES_DIR/CR-{BRANCH_ID}-Codex-Standard-{TIMESTAMP}.md" \
-     2>&1 | tee notes/.tmp/ship-{BRANCH_ID}/codex.log
+     < /dev/null 2>&1 | tee notes/.tmp/ship-{BRANCH_ID}/codex.log
    ```
 
 4. **Gemini Standard** — Bash (`run_in_background: true`):
    ```bash
    gemini -m gemini-3-pro-preview --yolo \
      "Read notes/.tmp/ship-{BRANCH_ID}/review-standard-gemini.md and follow the instructions. Write to $NOTES_DIR/CR-{BRANCH_ID}-Gemini-Standard-{TIMESTAMP}.md" \
-     2>&1 | tee notes/.tmp/ship-{BRANCH_ID}/gemini.log
+     < /dev/null 2>&1 | tee notes/.tmp/ship-{BRANCH_ID}/gemini.log
    ```
 
 **Collect:** Wait for all 4 (don't block on Gemini if it fails). If an output file is missing but the log has review content (>500 bytes), copy the log as the output file (Codex/Gemini sometimes write to stdout). Verify output >500 bytes. Consolidate and deduplicate into metadata file.

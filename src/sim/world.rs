@@ -9,8 +9,8 @@ use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
-    BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE, FIREWORK, GRASS, LAVA,
-    OIL, SAND, STONE, VINE, WATER,
+    pack_clone_source, BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE,
+    FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -72,6 +72,44 @@ pub struct WorldCoord(pub i64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct LocalCoord(pub u64);
+
+/// Read-only voxel-grid view for queries that must outlive a mutable borrow
+/// of the full [`World`].
+///
+/// Holds only the data needed to answer [`get`](Self::get) — a clone of the
+/// octree store plus the three metadata fields. No caches, no pending
+/// mutations. The main thread refreshes this snapshot each time a sim step
+/// finishes (and once more when the next step kicks off) so player collision
+/// during a background step sees a stable world instead of falling through
+/// `World::placeholder` or switching to free-fly physics (hash-thing-0s9v).
+///
+/// Staleness: during an in-flight step the snapshot reflects the world state
+/// as it entered that step, for the entire duration of the step. Expected
+/// drift is negligible at sim tick rates; long steps (100s of ms at 4096³)
+/// may briefly let the player clip through a cell that was just cleared or
+/// stand inside a cell that just became solid, self-correcting on step
+/// completion.
+#[derive(Clone)]
+pub struct CollisionSnapshot {
+    store: NodeStore,
+    root: NodeId,
+    level: u32,
+    origin: [i64; 3],
+}
+
+impl CollisionSnapshot {
+    pub fn get(&self, x: WorldCoord, y: WorldCoord, z: WorldCoord) -> CellState {
+        let lx = x.0 - self.origin[0];
+        let ly = y.0 - self.origin[1];
+        let lz = z.0 - self.origin[2];
+        let side = 1i64 << self.level;
+        if lx < 0 || ly < 0 || lz < 0 || lx >= side || ly >= side || lz >= side {
+            return 0;
+        }
+        self.store
+            .get_cell(self.root, lx as u64, ly as u64, lz as u64)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DemoLayout {
@@ -176,7 +214,16 @@ pub struct World {
     pub level: u32, // root level — grid is 2^level per side
     pub generation: u64,
     pub simulation_seed: u64,
-    pub materials: MaterialRegistry,
+    /// Crate-private — external mutation is structurally blocked
+    /// (hash-thing-6iiz). Any mutation (whole-registry replacement,
+    /// `set_tick_divisor`, `assign_block_rule`, `register_block_rule`, etc.)
+    /// MUST route through [`Self::mutate_materials`] or a safe mutator built
+    /// on top of it. Bare `world.materials.X(...)` from within the crate
+    /// bypasses cache invalidation: cached `block_rule_present` goes stale,
+    /// the 4497 brute-force fallback in `step_recursive_pow2` is skipped
+    /// against a block-rule-present registry, and macro-cached results are
+    /// wrong. Intra-crate reads via direct field access are fine.
+    pub(crate) materials: MaterialRegistry,
     /// Retained terrain params for lazy expansion (3fq.4). When `Some`,
     /// `ensure_region` generates terrain (heightmap)
     /// for newly-created sibling octants instead of leaving them empty.
@@ -252,6 +299,13 @@ pub struct HashlifeStats {
     pub fixed_point_skips: u64,
     /// Per-level cache miss counts (index = level - 3, since base case is level 3).
     pub misses_by_level: [u64; 32],
+    /// Cumulative nanoseconds spent in `step_grid_once` Phase 1 (per-cell
+    /// CaRule) across all memo-miss base cases in one step (hash-thing-71mp).
+    pub phase1_ns: u64,
+    /// Cumulative nanoseconds spent in `step_grid_once` Phase 2 (per-block
+    /// BlockRule / Margolus) across all memo-miss base cases in one step
+    /// (hash-thing-71mp).
+    pub phase2_ns: u64,
 }
 
 impl HashlifeStats {
@@ -262,6 +316,8 @@ impl HashlifeStats {
         self.cache_misses += step.cache_misses;
         self.empty_skips += step.empty_skips;
         self.fixed_point_skips += step.fixed_point_skips;
+        self.phase1_ns += step.phase1_ns;
+        self.phase2_ns += step.phase2_ns;
         for (dst, src) in self
             .misses_by_level
             .iter_mut()
@@ -435,36 +491,68 @@ impl World {
         }
     }
 
-    /// Invalidate caches whose keys depend on the active CA rule.
-    pub fn invalidate_rule_caches(&mut self) {
+    /// Read-only accessor for the embedded material registry (hash-thing-6iiz).
+    /// Mutation must route through [`Self::mutate_materials`] to keep
+    /// material-dependent caches in sync.
+    pub fn materials(&self) -> &MaterialRegistry {
+        &self.materials
+    }
+
+    /// Invalidate every cache whose contents depend on the material registry.
+    /// Covers the four hashlife caches keyed by NodeId (whose step function
+    /// depends on the active CA + block rules) AND the `block_rule_present`
+    /// flag (whose answer changes when block rules are added / removed /
+    /// re-assigned). Called by every mutation path via
+    /// [`Self::mutate_materials`] (hash-thing-6iiz).
+    ///
+    /// Renamed from the previous `invalidate_rule_caches` — that name was
+    /// misleading because it forgot `block_rule_present`, which was the root
+    /// cause of the dxi4.2 audit finding.
+    pub fn invalidate_material_caches(&mut self) {
         self.hashlife_cache.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        self.block_rule_present = None;
+    }
+
+    /// Mutate the embedded material registry and invalidate every
+    /// material-dependent cache atomically (hash-thing-6iiz).
+    ///
+    /// All material mutation paths in the crate MUST go through this method.
+    /// Direct mutation via a `&mut MaterialRegistry` borrow bypasses
+    /// `block_rule_present` invalidation and corrupts the `step_recursive_pow2`
+    /// macro path (see the 4497 fallback in `src/sim/hashlife.rs`).
+    ///
+    /// Accepts both in-place edits (`|m| m.assign_block_rule(...)`) and
+    /// whole-registry replacement (`|m| *m = MaterialRegistry::new(...)`).
+    pub fn mutate_materials<R>(&mut self, f: impl FnOnce(&mut MaterialRegistry) -> R) -> R {
+        let r = f(&mut self.materials);
+        self.invalidate_material_caches();
+        r
     }
 
     /// Reconfigure the legacy GoL smoke material dispatch to use `rule`.
     ///
-    /// This also invalidates rule-dependent caches because the CA dispatch
-    /// table changes even though the octree content does not.
+    /// Routes through `mutate_materials` to keep material-dependent caches
+    /// in sync — the CA dispatch table changes even though the octree content
+    /// does not.
     pub fn set_gol_smoke_rule(&mut self, rule: GameOfLife3D) {
-        self.materials = MaterialRegistry::gol_smoke_with_rule(rule);
-        self.invalidate_rule_caches();
+        self.mutate_materials(|m| *m = MaterialRegistry::gol_smoke_with_rule(rule));
     }
 
-    /// Set the tick_divisor for a material and invalidate memo caches. The
-    /// hashlife cache key is `(NodeId, generation % memo_period())`, so
-    /// changing a divisor changes `memo_period()` and makes existing entries
-    /// unsound. Crate-private because production bakes divisors into the
-    /// registrar; this exists for tests and the future tuning bead (iowh).
+    /// Set the tick_divisor for a material. The hashlife cache key is
+    /// `(NodeId, generation % memo_period())`, so changing a divisor changes
+    /// `memo_period()` and makes existing entries unsound. Crate-private
+    /// because production bakes divisors into the registrar; this exists for
+    /// tests and the future tuning bead (iowh).
     #[allow(dead_code)]
     pub(crate) fn set_material_tick_divisor(
         &mut self,
         material_id: crate::terrain::materials::MaterialId,
         divisor: u16,
     ) {
-        self.materials.set_tick_divisor(material_id, divisor);
-        self.invalidate_rule_caches();
+        self.mutate_materials(|m| m.set_tick_divisor(material_id, divisor));
     }
 
     /// Convert world coordinate to local on a specific axis index (0=x, 1=y, 2=z).
@@ -647,6 +735,19 @@ impl World {
         self.ensure_region(min, max);
         self.queue
             .push(WorldMutation::FillRegion { min, max, state });
+    }
+
+    /// Extract a read-only [`CollisionSnapshot`] view of the current voxel
+    /// grid. Clones the octree store and copies the three metadata fields;
+    /// does not copy any step caches. Used by the main thread to retain a
+    /// usable voxel grid across a background sim step (hash-thing-0s9v).
+    pub fn collision_snapshot(&self) -> CollisionSnapshot {
+        CollisionSnapshot {
+            store: self.store.clone(),
+            root: self.root,
+            level: self.level,
+            origin: self.origin,
+        }
     }
 
     /// Get a cell.
@@ -950,6 +1051,47 @@ impl World {
         self.commit_step(&next, side);
     }
 
+    /// Probe variant of [`World::step`]: runs phases 1 (CaRule) and 2
+    /// (BlockRule) into a scratch buffer and returns a clone of that
+    /// buffer *before* phase 3 (`gravity_gap_fill`) runs on it, then
+    /// completes the step normally so the world advances identically
+    /// to `step()`. Used by `tests/probe_gap_fill_lightcone.rs`
+    /// (hash-thing-7nj6) to measure the gap_fill light cone on the
+    /// exact input distribution that the real step path sees.
+    pub fn step_returning_pre_gap_fill(&mut self) -> Vec<CellState> {
+        let side = self.side();
+        let grid = self.flatten();
+        let mut next = vec![0 as CellState; side * side * side];
+        let divisor_by_material = self.materials.tick_divisor_flags();
+        let generation = self.generation;
+
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let idx = x + y * side + z * side * side;
+                    let raw = grid[idx];
+                    let center = Cell::from_raw(raw);
+                    let mat = center.material() as usize;
+                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                    if divisor > 1 && !generation.is_multiple_of(divisor) {
+                        next[idx] = raw;
+                        continue;
+                    }
+                    let neighbors = get_neighbors(&grid, side, x, y, z);
+                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
+                        panic!("missing CaRule for material {}", center.material())
+                    });
+                    next[idx] = rule.step_cell(center, &neighbors).raw();
+                }
+            }
+        }
+        self.step_blocks(&mut next, side);
+        let pre_gap_fill = next.clone();
+        gravity_gap_fill(&mut next, side, &self.materials);
+        self.commit_step(&next, side);
+        pre_gap_fill
+    }
+
     /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
     ///
     /// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
@@ -997,7 +1139,7 @@ impl World {
                             bx,
                             by,
                             bz,
-                            Some(&block_rule_divisors),
+                            Some(block_rule_divisors),
                             pass_offset,
                         );
                         bx += 2;
@@ -1066,8 +1208,13 @@ impl World {
             }
         }
 
+        let movable: [bool; 8] = std::array::from_fn(|i| {
+            let c = block[i];
+            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
+        });
+
         let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block);
+        let result = rule.step_block(&block, &movable);
 
         // Mass conservation assertion: output must be a permutation of input.
         debug_assert!(
@@ -1081,9 +1228,19 @@ impl World {
             "block rule violated mass conservation at ({bx}, {by}, {bz})"
         );
 
-        // Write back, but anchor cells that didn't opt into this block rule.
-        // A cell with block_rule_id == None is immovable — it stays in its
-        // original position even if the rule tried to swap it elsewhere.
+        // Contract assertion: immovable cells must be left in place by the
+        // rule. Without this, a buggy rule that swaps an immovable cell into
+        // a movable slot would silently delete the immovable cell's value
+        // (the write-back filter only writes movable positions). Assert
+        // here so the failure is loud, not a slow water leak.
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell at ({bx}, {by}, {bz})"
+        );
+
+        // Write back. The rule is contracted to leave immovable cells fixed,
+        // so writing the rule output is safe. The `movable` filter is a
+        // belt-and-suspenders guard against a rule that violates the contract.
         // OOB positions are silently skipped (absorbing boundary).
         for dz in 0..2 {
             for dy in 0..2 {
@@ -1095,14 +1252,10 @@ impl World {
                         continue;
                     }
                     let i = block_index(dx, dy, dz);
-                    let original = block[i];
-                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = x + y * side + z * side * side;
-                    if has_rule || original.is_empty() {
-                        // Opted-in cells and empty cells can be moved by the rule.
+                    if movable[i] {
                         grid[idx] = result[i].raw();
                     }
-                    // else: non-participating cell stays put (anchored).
                 }
             }
         }
@@ -1700,8 +1853,13 @@ impl World {
         }
     }
 
+    /// Place a CLONE cell that spawns `source_material` downstream.
+    ///
+    /// Routes through `pack_clone_source` to centralize the 6-bit cap +
+    /// panic message (hash-thing-457f). The sister site at
+    /// `main.rs::place_clone_block` uses the same helper.
     fn place_clone_source(&mut self, pos: [i64; 3], source_material: u16) {
-        let state = Cell::pack(CLONE_MATERIAL_ID, source_material).raw();
+        let state = pack_clone_source(source_material);
         self.set(
             WorldCoord(pos[0]),
             WorldCoord(pos[1]),
@@ -1766,6 +1924,31 @@ impl World {
         );
         self.fill_box(entry_passage, AIR);
         self.fill_floor(entry_passage, DIRT);
+        // Bridge the stone slab between corridor.max[2] and atrium.min[2].
+        // At every level atrium.min[2] (lo[2]+cell_size) sits strictly past
+        // corridor.max[2] (corridor_z+tunnel_half_w), so without this carve
+        // the walk_route's corridor_turn → atrium_entry segment is blocked.
+        // The gap is small at level ≤ 6 and grows with cell_size at higher
+        // levels, which is what stranded the level-8 traversability test in
+        // hash-thing-69cq until dyqr. The carve lands before the `atrium`
+        // fill_box below, so any overlap at atrium.min[2] is overwritten by
+        // the atrium's own AIR/STONE pass.
+        let corridor_turn_x = corridor.max[0] - 2;
+        let tunnel_half_w = (corridor.max[2] - corridor.min[2]) / 2;
+        let atrium_entry_passage = Box3::new(
+            [
+                corridor_turn_x - tunnel_half_w,
+                corridor.min[1],
+                corridor.max[2],
+            ],
+            [
+                corridor_turn_x + tunnel_half_w,
+                corridor.max[1],
+                atrium.min[2],
+            ],
+        );
+        self.fill_box(atrium_entry_passage, AIR);
+        self.fill_floor(atrium_entry_passage, DIRT);
         self.fill_box(tease_a, AIR);
         self.fill_box(tease_b, AIR);
         self.fill_box(atrium, AIR);
@@ -1792,7 +1975,7 @@ impl World {
         );
 
         let corridor_mid = [corridor.center()[0], corridor.min[1], corridor.center()[2]];
-        let corridor_turn = [corridor.max[0] - 2, corridor.min[1], corridor.center()[2]];
+        let corridor_turn = [corridor_turn_x, corridor.min[1], corridor.center()[2]];
         let atrium_entry = [corridor_turn[0], atrium.min[1], atrium.min[2] + 1];
         let atrium_center = [atrium.center()[0], atrium.min[1], atrium.center()[2]];
         let reveal_center = [balcony.center()[0], balcony.min[1], balcony.center()[2]];
@@ -1983,22 +2166,54 @@ impl World {
         self.store.population(self.root)
     }
 
+    /// Bytes-per-entry estimate for `hashlife_macro_cache` (hash-thing-z7uu).
+    /// Key is `(NodeId, u64)` → u32 + u64 with u64 alignment pads the key
+    /// tuple to 16 bytes; value is `NodeId` (u32) padded to 8 under the
+    /// outer tuple's 8-byte alignment. Total stored bytes = 24. Add 8 bytes
+    /// for the hashbrown SwissTable control byte plus load-factor slack
+    /// (~0.875) — gives ~32 bytes/entry, matching the perf paper §4.7.3
+    /// projection. Compile-time constant so the arithmetic stays auditable.
+    pub const MACRO_CACHE_BYTES_PER_ENTRY: usize =
+        std::mem::size_of::<((NodeId, u64), NodeId)>() + 8;
+
+    /// Live count of entries in `hashlife_macro_cache`. Exposed so
+    /// observers (perf HUD, bench harnesses) don't have to reach into a
+    /// `pub(crate)` field.
+    pub fn macro_cache_entries(&self) -> usize {
+        self.hashlife_macro_cache.len()
+    }
+
+    /// Approximate byte footprint of `hashlife_macro_cache` (entries ×
+    /// `MACRO_CACHE_BYTES_PER_ENTRY`). Closes the perf paper §5 band that
+    /// had a 9 MB floor / 105 MB ceiling projection at 4096³ with no
+    /// runtime measurement behind it.
+    pub fn macro_cache_bytes_est(&self) -> usize {
+        self.macro_cache_entries() * Self::MACRO_CACHE_BYTES_PER_ENTRY
+    }
+
     /// Compact one-line summary of spatial-memo health for the periodic log
-    /// (hash-thing-stue.6, extended by hash-thing-o2es). Uses the lifetime
-    /// accumulator `hashlife_stats_total` for hit rate — so the rate
-    /// converges toward steady state rather than fluctuating with the most
-    /// recent step. Table sizes are live `.len()`, which is the right
-    /// signal for "is this table about to blow memory."
+    /// (hash-thing-stue.6, extended by hash-thing-o2es, hash-thing-z7uu).
+    /// Uses the lifetime accumulator `hashlife_stats_total` for hit rate —
+    /// so the rate converges toward steady state rather than fluctuating
+    /// with the most recent step. Table sizes are live `.len()`, which is
+    /// the right signal for "is this table about to blow memory."
     ///
     /// Format: `memo_hit=<fraction> memo_churn=<signed-fraction>
-    /// memo_tbl=<int> memo_mac=<int>`.
+    /// memo_tbl=<int> memo_mac=<int> memo_mac_bytes=<int>
+    /// p1=<ms>ms p2=<ms>ms`.
     ///
     /// `memo_churn` is `window_hit_rate − lifetime_hit_rate` over the last
     /// `MemoWindow::CAPACITY` steps. Positive = recent steps cache better
     /// than the running average (e.g. cache warmup). Negative = recent
     /// regression. `+0.000` before any step has run (both rates are 0).
-    /// `memo_mac` stays at 0 on single-step sessions (only
-    /// `step_recursive_pow2` populates the macro cache).
+    /// `memo_mac` / `memo_mac_bytes` stay at 0 on single-step sessions
+    /// (only `step_recursive_pow2` populates the macro cache).
+    ///
+    /// `p1` / `p2` are the last step's per-phase wall times inside
+    /// `step_grid_once` (Phase 1 = per-cell CaRule, Phase 2 = per-block
+    /// BlockRule / Margolus). Reported per-step (not lifetime) so the
+    /// number reflects current sim cost rather than an ever-growing sum
+    /// (hash-thing-71mp).
     pub fn memo_summary(&self) -> String {
         let stats = &self.hashlife_stats_total;
         let total = stats.cache_hits + stats.cache_misses;
@@ -2008,12 +2223,18 @@ impl World {
             stats.cache_hits as f64 / total as f64
         };
         let churn = self.memo_window.hit_rate() - hit_rate;
+        let last_step = &self.hashlife_stats;
+        let p1_ms = last_step.phase1_ns as f64 / 1_000_000.0;
+        let p2_ms = last_step.phase2_ns as f64 / 1_000_000.0;
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={}",
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} p1={:.2}ms p2={:.2}ms",
             hit_rate,
             churn,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
+            self.macro_cache_bytes_est(),
+            p1_ms,
+            p2_ms,
         )
     }
 
@@ -2168,10 +2389,11 @@ impl World {
         // so memory tracks live-scene size, not cumulative history.
         // See hash-thing-88d.
         //
-        // Brute-force compaction remaps all NodeIds without updating
-        // hashlife_cache, so clear it to prevent stale cross-path hits.
-        // Keep the remap so Svdag can update its persistent NodeId cache
-        // (hash-thing-5bb.11: O(changed) instead of O(reachable)).
+        // Brute-force compaction remaps every live NodeId into a fresh
+        // store namespace, so clear all four hashlife caches to prevent
+        // stale cross-path hits. Keep the remap so Svdag can update its
+        // persistent NodeId cache (hash-thing-5bb.11: O(changed) instead
+        // of O(reachable)).
         let (new_store, new_root, remap) = self.store.compacted_with_remap(self.root);
         self.store = new_store;
         self.root = new_root;
@@ -2180,6 +2402,7 @@ impl World {
             None => remap,
         });
         self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
     }
@@ -2265,6 +2488,39 @@ pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &
     }
 }
 
+/// 1D column variant of [`gravity_gap_fill`] (hash-thing-jw3k.1).
+///
+/// Operates on a single `(x, z)` column (length = `side`), mutating in place.
+/// Returns `true` when any swap fired so callers can skip the splice step
+/// for unchanged columns.
+///
+/// In-place mutation is load-bearing: the 3D loop evaluates `y = 1..side-1`
+/// in order and later iterations read values that earlier iterations wrote.
+/// A fresh-read variant (read whole column, write to an out-buffer) would
+/// diverge on cascade patterns like `[B, A, B, B]` — see Rev 2 plan tests.
+pub fn gravity_gap_fill_column(column: &mut [CellState], materials: &MaterialRegistry) -> bool {
+    let side = column.len();
+    if side < 3 {
+        return false;
+    }
+    let mut changed = false;
+    for y in 1..side - 1 {
+        let below = Cell::from_raw(column[y - 1]);
+        let cur = Cell::from_raw(column[y]);
+        let above = Cell::from_raw(column[y + 1]);
+        if cur.is_empty()
+            && !above.is_empty()
+            && materials.block_rule_id_for_cell(above).is_some()
+            && !below.is_empty()
+            && materials.block_rule_id_for_cell(below).is_some()
+        {
+            column.swap(y, y + 1);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Get the 26 Moore neighbors of a cell. Out-of-bounds neighbors are
 /// `Cell::EMPTY` (absorbing boundary), matching hashlife's infinite-world
 /// semantics.
@@ -2337,7 +2593,7 @@ mod tests {
 
     fn gol_world(rule: GameOfLife3D) -> World {
         let mut world = empty_world();
-        world.materials = MaterialRegistry::gol_smoke_with_rule(rule);
+        world.set_gol_smoke_rule(rule);
         world
     }
 
@@ -2956,6 +3212,64 @@ mod tests {
         }
     }
 
+    /// hash-thing-2z3g scout: measure p1/p2 wall-time share on the default
+    /// water scene. Prints cumulative phase1_ns / phase2_ns across N steps
+    /// so a reader can decide whether noop_flags caching (2z3g) is worth
+    /// doing — the gate is "does Phase 1 dominate, and if so is allocation
+    /// a big enough chunk to matter."
+    ///
+    /// Run: `cargo test --profile bench --lib
+    /// hashlife_phase_timing_scout_water_64 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "scout/profiling — prints timing, no assertions"]
+    fn hashlife_phase_timing_scout_water_64() {
+        let mut world = World::new(6);
+        let params = TerrainParams::for_level(6);
+        let _ = world.seed_terrain(&params);
+        world.seed_water_and_sand();
+
+        const N_STEPS: u32 = 20;
+        let wall_start = std::time::Instant::now();
+        for _ in 0..N_STEPS {
+            world.step_recursive();
+        }
+        let wall_total_ns = wall_start.elapsed().as_nanos() as u64;
+
+        let stats = &world.hashlife_stats_total;
+        let p1 = stats.phase1_ns;
+        let p2 = stats.phase2_ns;
+        let pct = |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
+        eprintln!("--- hashlife phase timing scout: 64^3 water, {N_STEPS} steps ---");
+        eprintln!("  wall_total:    {:.2} ms", wall_total_ns as f64 / 1e6);
+        eprintln!(
+            "  phase1_total:  {:.2} ms ({:.1}% of wall)",
+            p1 as f64 / 1e6,
+            pct(p1),
+        );
+        eprintln!(
+            "  phase2_total:  {:.2} ms ({:.1}% of wall)",
+            p2 as f64 / 1e6,
+            pct(p2),
+        );
+        eprintln!(
+            "  p1+p2:         {:.2} ms ({:.1}% of wall — remainder is memo lookup/insert, `next` zeroing, dispatch)",
+            (p1 + p2) as f64 / 1e6,
+            pct(p1 + p2),
+        );
+        eprintln!(
+            "  per-step avg:  p1={:.3}ms p2={:.3}ms wall={:.3}ms",
+            p1 as f64 / 1e6 / N_STEPS as f64,
+            p2 as f64 / 1e6 / N_STEPS as f64,
+            wall_total_ns as f64 / 1e6 / N_STEPS as f64,
+        );
+        eprintln!(
+            "  cache_hits={} cache_misses={} (hit_rate={:.3})",
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+        );
+    }
+
     /// hash-thing-rk4n regression: walks the default water scene past
     /// ground-impact using the brute-force `step()` path which runs
     /// `commit_step` (store-compact every tick). Skipping some sync calls
@@ -3037,7 +3351,9 @@ mod tests {
 
     #[test]
     fn lattice_progression_demo_spawn_and_waypoints_are_open() {
-        let mut w = World::new(6); // side 64
+        // Level 8 (256³) — at 4 cells/m, level 6 rooms are only 4 cells (1 m)
+        // tall and cannot fit the 1.6 m player. Level 8 gives ~15-cell rooms.
+        let mut w = World::new(8);
         let layout = w.seed_lattice_progression_demo();
 
         assert!(
@@ -3061,14 +3377,16 @@ mod tests {
 
     #[test]
     fn lattice_progression_demo_route_is_player_traversable_end_to_end() {
-        let mut w = World::new(6);
-        let layout = w.seed_lattice_progression_demo();
-        let route = std::iter::once(walk_cell(layout.player_pos))
-            .chain(layout.walk_route)
-            .collect::<Vec<_>>();
+        for level in [7u32, 8] {
+            let mut w = World::new(level);
+            let layout = w.seed_lattice_progression_demo();
+            let route = std::iter::once(walk_cell(layout.player_pos))
+                .chain(layout.walk_route)
+                .collect::<Vec<_>>();
 
-        for segment in route.windows(2) {
-            assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            for segment in route.windows(2) {
+                assert_walk_segment_is_traversable(&w, segment[0], segment[1]);
+            }
         }
     }
 
@@ -3461,15 +3779,13 @@ mod tests {
     #[test]
     fn fan_pushes_steam_without_resetting_age_in_recursive_runtime_path() {
         let mut world = empty_world();
-        let identity = world
-            .materials
-            .register_block_rule(crate::sim::margolus::IdentityBlockRule);
-        world
-            .materials
-            .assign_block_rule(STEAM_MATERIAL_ID, identity);
-        for material_id in FAN_ARMED_STEAM_MATERIAL_IDS {
-            world.materials.assign_block_rule(material_id, identity);
-        }
+        world.mutate_materials(|m| {
+            let identity = m.register_block_rule(crate::sim::margolus::IdentityBlockRule);
+            m.assign_block_rule(STEAM_MATERIAL_ID, identity);
+            for material_id in FAN_ARMED_STEAM_MATERIAL_IDS {
+                m.assign_block_rule(material_id, identity);
+            }
+        });
         world.set(wc(1), wc(1), wc(2), FAN);
         world.set(wc(2), wc(1), wc(2), Cell::pack(STEAM_MATERIAL_ID, 14).raw());
 
@@ -3486,15 +3802,13 @@ mod tests {
     #[test]
     fn fan_pushes_firework_without_resetting_fuse_in_recursive_runtime_path() {
         let mut world = empty_world();
-        let identity = world
-            .materials
-            .register_block_rule(crate::sim::margolus::IdentityBlockRule);
-        world
-            .materials
-            .assign_block_rule(FIREWORK_MATERIAL_ID, identity);
-        for material_id in FAN_ARMED_FIREWORK_MATERIAL_IDS {
-            world.materials.assign_block_rule(material_id, identity);
-        }
+        world.mutate_materials(|m| {
+            let identity = m.register_block_rule(crate::sim::margolus::IdentityBlockRule);
+            m.assign_block_rule(FIREWORK_MATERIAL_ID, identity);
+            for material_id in FAN_ARMED_FIREWORK_MATERIAL_IDS {
+                m.assign_block_rule(material_id, identity);
+            }
+        });
         world.set(wc(1), wc(1), wc(2), FAN);
         world.set(
             wc(2),
@@ -3586,24 +3900,34 @@ mod tests {
     }
 
     /// Wire a gravity block rule onto specific materials and return the world.
+    ///
+    /// Materials sharing a BlockRule must share a `tick_divisor` (iowh
+    /// invariant, enforced at rebuild time per hash-thing-lw75.1.1). WATER
+    /// ships with `tick_divisor = 2`; every other terrain material defaults
+    /// to 1. Normalize all wired materials to `tick_divisor = 1` before
+    /// assigning, so the gravity tests exercise single-step drops under one
+    /// consistent schedule.
     fn gravity_world(materials_with_gravity: &[u16]) -> World {
         let mut world = World::new(3); // 8x8x8
-        let gravity_id = world
-            .materials
-            .register_block_rule(GravityBlockRule::new(simple_density));
-        for &mat_id in materials_with_gravity {
-            world.materials.assign_block_rule(mat_id, gravity_id);
-        }
+        world.mutate_materials(|m| {
+            for &mat_id in materials_with_gravity {
+                m.set_tick_divisor(mat_id, 1);
+            }
+            let gravity_id = m.register_block_rule(GravityBlockRule::new(simple_density));
+            for &mat_id in materials_with_gravity {
+                m.assign_block_rule(mat_id, gravity_id);
+            }
+        });
         world
     }
 
     #[test]
     fn identity_block_rule_leaves_world_unchanged() {
         let mut world = World::new(3);
-        let identity_id = world.materials.register_block_rule(IdentityBlockRule);
-        world
-            .materials
-            .assign_block_rule(STONE_MATERIAL_ID, identity_id);
+        world.mutate_materials(|m| {
+            let identity_id = m.register_block_rule(IdentityBlockRule);
+            m.assign_block_rule(STONE_MATERIAL_ID, identity_id);
+        });
 
         // Place some stone cells.
         world.set(wc(2), wc(4), wc(2), STONE);
@@ -4287,6 +4611,30 @@ mod tests {
         assert!(world.queue.is_empty());
         assert_eq!(world.get(wc(1), wc(2), wc(3)), STONE);
         assert_eq!(world.get(wc(4), wc(5), wc(6)), STONE);
+    }
+
+    /// commit_step rebuilds the NodeStore via `compacted_with_remap`, so every
+    /// NodeId key in every hashlife cache is invalidated. The macro cache was
+    /// historically omitted from the clear-list, leaving stale `(NodeId, u64)`
+    /// keys pointing at a dead namespace — which `maybe_compact` would then
+    /// treat as extra roots and feed back into compaction (hash-thing-w1bs).
+    #[test]
+    fn commit_step_clears_hashlife_macro_cache() {
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive_pow2();
+        assert!(
+            !world.hashlife_macro_cache.is_empty(),
+            "precondition: step_recursive_pow2 must populate the macro cache"
+        );
+
+        world.step();
+
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "commit_step must clear the macro cache; stale NodeId keys would \
+             alias into the freshly-compacted store"
+        );
     }
 
     #[test]
@@ -5010,12 +5358,49 @@ mod tests {
         assert!(summary.contains("memo_hit="));
         assert!(summary.contains("memo_tbl="));
         assert!(summary.contains("memo_mac="));
+        assert!(summary.contains("memo_mac_bytes="));
+        // hash-thing-71mp: guard the phase-timing output contract so the
+        // fields can't silently disappear under a future refactor.
+        assert!(summary.contains("p1="));
+        assert!(summary.contains("p2="));
+    }
+
+    /// hash-thing-z7uu: `macro_cache_bytes_est()` must equal
+    /// `macro_cache_entries() * MACRO_CACHE_BYTES_PER_ENTRY`. Guards the
+    /// arithmetic from drifting if the struct is refactored (e.g. someone
+    /// swaps in a different map type with different overhead).
+    #[test]
+    fn macro_cache_bytes_est_equals_entries_times_per_entry() {
+        // Fresh world: no steps, macro cache empty.
+        let world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        assert_eq!(world.macro_cache_entries(), 0);
+        assert_eq!(world.macro_cache_bytes_est(), 0);
+
+        // Drive a pow2 step to seed the macro cache.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive_pow2();
+
+        let entries = world.macro_cache_entries();
+        assert_eq!(
+            world.macro_cache_bytes_est(),
+            entries * World::MACRO_CACHE_BYTES_PER_ENTRY,
+        );
+        const _: () = assert!(
+            World::MACRO_CACHE_BYTES_PER_ENTRY >= 24,
+            "per-entry estimate must cover at least key+value payload bytes",
+        );
     }
 
     /// HUD overlay (hash-thing-nhwo) splits `memo_summary` on whitespace
     /// so each field lands on its own line. Guards against future schema
     /// changes that would introduce an intra-field space (e.g.
-    /// `memo_tbl=1 234`) which would silently break the HUD layout.
+    /// `memo_tbl=1 234`) which would silently break the HUD layout, and
+    /// against per-field widths that overflow the compact HUD panel.
+    ///
+    /// Prefix allow-list covers `memo_` (cache fields) and `p1` / `p2`
+    /// (per-step phase timings from hash-thing-71mp, which are part of
+    /// the same HUD block but semantically not memo state).
     #[test]
     fn memo_summary_splits_cleanly_for_hud_overlay() {
         let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
@@ -5032,8 +5417,8 @@ mod tests {
         );
         for line in &lines {
             assert!(
-                line.starts_with("memo_"),
-                "every field must start with memo_ to keep the HUD layout sane, got {line:?}",
+                line.starts_with("memo_") || line.starts_with("p1=") || line.starts_with("p2="),
+                "field must use an approved HUD prefix (memo_ / p1 / p2), got {line:?}",
             );
             assert!(
                 line.len() <= 25,
@@ -5067,6 +5452,33 @@ mod tests {
             second_misses < first_misses + second_misses,
             "per-step stats must reset between calls (second={second_misses}, sum={})",
             first_misses + second_misses,
+        );
+    }
+
+    #[test]
+    fn step_grid_once_phase_timings_accumulated_on_memo_miss() {
+        // hash-thing-71mp: HashlifeStats.phase1_ns and .phase2_ns must be
+        // non-zero after a real (memo-missing) step. On a fresh one-cell
+        // world, step_recursive drops into step_base_case at least once
+        // for the L3 node containing the seed — that's enough to tick
+        // both phase timers past zero. Exact values are platform-dependent
+        // (Instant::now resolution varies), so we only assert > 0.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+
+        let stats = &world.hashlife_stats;
+        assert!(
+            stats.cache_misses > 0,
+            "test precondition: seeded step should have at least one memo miss",
+        );
+        assert!(
+            stats.phase1_ns > 0,
+            "phase1_ns should accumulate across step_grid_once calls, got 0",
+        );
+        assert!(
+            stats.phase2_ns > 0,
+            "phase2_ns should accumulate across step_grid_once calls, got 0",
         );
     }
 
@@ -5165,5 +5577,195 @@ mod tests {
             (post_push_rate - 1.0).abs() < 1e-9,
             "after eviction window is all-hit → rate = 1.0, got {post_push_rate}",
         );
+    }
+
+    // ---- 1D gravity_gap_fill_column tests (hash-thing-jw3k.1) ----
+
+    /// Build a test material registry where `STONE` is a block-rule material
+    /// and air (0) is empty. Matches what the default sim registry gives us.
+    fn gap_fill_materials() -> MaterialRegistry {
+        MaterialRegistry::terrain_defaults()
+    }
+
+    /// SAND has the gravity block_rule in terrain_defaults; STONE is inert.
+    /// Tests below use SAND for the "block_rule" role.
+    fn sand_cell() -> CellState {
+        SAND
+    }
+
+    #[test]
+    fn gap_fill_column_empty_no_op() {
+        let mat = gap_fill_materials();
+        let mut col: Vec<CellState> = vec![0; 8];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert!(col.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn gap_fill_column_solid_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col: Vec<CellState> = vec![sand; 8];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert!(col.iter().all(|&c| c == sand));
+    }
+
+    #[test]
+    fn gap_fill_column_block_air_block_triple_swaps() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        // y=1 sees below=sand, above=sand → swap cell[1] with cell[2].
+        assert_eq!(col, vec![sand, sand, 0]);
+    }
+
+    #[test]
+    fn gap_fill_column_block_air_air_block_no_swap() {
+        // Rev 2 fix: both above AND below must be block_rule; two adjacent
+        // airs in the middle fail the predicate on both y=1 and y=2.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, 0, sand];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, 0, 0, sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_cascade_babab() {
+        // [B,A,B,A,B]: y=1 swaps (above=B, below=B) → [B,B,A,A,B].
+        // y=2 above=A → skip. y=3 below=A → skip. Single-pass semantics.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand, 0, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, sand, 0, 0, sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_in_place_vs_fresh_read_divergence() {
+        // [B,A,B,B] under in-place semantics:
+        //   y=1: above=B, below=B → swap 1↔2 → [B,B,A,B]
+        //   y=2: cur=A (freshly swapped), above=B, below=B → swap 2↔3 → [B,B,B,A]
+        // A fresh-read variant would end at [B,B,A,B] (y=2 reads original B at idx 2).
+        // This test pins that gravity_gap_fill_column mutates in place.
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0, sand, sand];
+        assert!(gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(
+            col,
+            vec![sand, sand, sand, 0],
+            "in-place semantics: y=2 must see the fresh value written at y=1",
+        );
+    }
+
+    #[test]
+    fn gap_fill_column_boundary_y0_and_y_max_untouched() {
+        let mat = gap_fill_materials();
+        // Air at y=0 and y=side-1 never participates (y ranges 1..side-1).
+        let mut col: Vec<CellState> = vec![0, 0, 0];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+    }
+
+    #[test]
+    fn gap_fill_column_side_1_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand]);
+    }
+
+    #[test]
+    fn gap_fill_column_side_2_no_op() {
+        let mat = gap_fill_materials();
+        let sand = sand_cell();
+        let mut col = vec![sand, 0];
+        assert!(!gravity_gap_fill_column(&mut col, &mat));
+        assert_eq!(col, vec![sand, 0]);
+    }
+
+    // -----------------------------------------------------------------
+    // hash-thing-6iiz: mutate_materials cache-invalidation invariants
+    // -----------------------------------------------------------------
+
+    /// Force all five material-dependent caches into a populated state and
+    /// seed `block_rule_present` so the invariant tests can observe clearing.
+    fn prime_material_caches(world: &mut World) {
+        world
+            .hashlife_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world
+            .hashlife_macro_cache
+            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        world.hashlife_inert_cache.insert(NodeId::EMPTY, None);
+        world.hashlife_all_inert_cache.insert(NodeId::EMPTY, true);
+        world.block_rule_present = Some(false);
+    }
+
+    fn assert_material_caches_cleared(world: &World) {
+        assert!(
+            world.hashlife_cache.is_empty(),
+            "hashlife_cache not cleared"
+        );
+        assert!(
+            world.hashlife_macro_cache.is_empty(),
+            "hashlife_macro_cache not cleared"
+        );
+        assert!(
+            world.hashlife_inert_cache.is_empty(),
+            "hashlife_inert_cache not cleared"
+        );
+        assert!(
+            world.hashlife_all_inert_cache.is_empty(),
+            "hashlife_all_inert_cache not cleared"
+        );
+        assert_eq!(
+            world.block_rule_present, None,
+            "block_rule_present not cleared — dxi4.2 invariant regression"
+        );
+    }
+
+    /// `mutate_materials` must clear `block_rule_present` so the
+    /// `step_recursive_pow2` 4497 brute-force fallback stays correct after a
+    /// block-rule assignment (hash-thing-6iiz / dxi4.2).
+    #[test]
+    fn mutate_materials_invalidates_block_rule_present() {
+        let mut world = empty_world();
+        prime_material_caches(&mut world);
+
+        world.mutate_materials(|m| {
+            let identity = m.register_block_rule(crate::sim::margolus::IdentityBlockRule);
+            m.assign_block_rule(crate::terrain::materials::STONE_MATERIAL_ID, identity);
+        });
+
+        assert_material_caches_cleared(&world);
+    }
+
+    /// `set_gol_smoke_rule` routes through `mutate_materials`; it must invalidate
+    /// all material-dependent caches, including `block_rule_present` (widened
+    /// semantics from the `invalidate_rule_caches` → `invalidate_material_caches`
+    /// rename).
+    #[test]
+    fn set_gol_smoke_rule_invalidates_all_material_caches() {
+        let mut world = empty_world();
+        prime_material_caches(&mut world);
+
+        world.set_gol_smoke_rule(GameOfLife3D::rule445());
+
+        assert_material_caches_cleared(&world);
+    }
+
+    /// `set_material_tick_divisor` routes through `mutate_materials`; same
+    /// coverage as the smoke-rule test.
+    #[test]
+    fn set_material_tick_divisor_invalidates_all_material_caches() {
+        let mut world = empty_world();
+        prime_material_caches(&mut world);
+
+        world.set_material_tick_divisor(crate::terrain::materials::WATER_MATERIAL_ID, 1);
+
+        assert_material_caches_cleared(&world);
     }
 }
