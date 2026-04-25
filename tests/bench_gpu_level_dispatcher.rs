@@ -673,6 +673,18 @@ fn build_subcube_block(
     block
 }
 
+// CPU level-4 step.
+//
+// **Oracle independence note (per code review):** this function is *structurally
+// similar* to `cs_step_recursive_l4` — it uses the same 27-intermediate /
+// 8-subcube decomposition and the same `(sk + cz) * 9 + (sj + cy) * 3 + (si + cx)`
+// linearization as the WGSL kernel and as `build_subcube_block`. A bug in the
+// shared algorithm would pass the GPU == CPU corpus check on both sides. The
+// **third-party** oracle in this chain is `src/sim/hashlife.rs::step_recursive_case`
+// (line ~859), which uses the same indexing (line 905: `centered[(ox + dx) +
+// (oy + dy) * 3 + (oz + dz) * 9]`); the algorithm is therefore validated against
+// production hashlife by inspection plus a hard `live_count == 109` assertion
+// on the `random_seed_42` fixture in `gpu_level_4_matches_cpu_on_corpus`.
 fn cpu_level_4_step(input: &[u32; L4_CELLS]) -> [u32; L3_CELLS] {
     // Phase 1: 27 intermediate base cases.
     let mut intermediate_results = [[0u32; L2_CELLS]; NUM_INTERMEDIATES];
@@ -720,10 +732,15 @@ fn cpu_level_4_step(input: &[u32; L4_CELLS]) -> [u32; L3_CELLS] {
 //
 // Cross-dispatch fence: dispatch 1 (cs_base_case on 27*N intermediates)
 // writes to `intermediate_results`. Dispatch 2 reads the same buffer.
-// The visibility relies on the queue.submit boundary between dispatches —
-// see the discussion in `tests/bench_gpu_hash_table.rs::cs_insert` and the
-// kernel-internal ordering rule in this file's module docstring. DO NOT
-// fuse these into a single submit without explicit synchronization.
+// The visibility relies on the queue.submit boundary between dispatches.
+// WebGPU spec: storage writes are visible across `queue.submit` boundaries
+// (regardless of atomic vs non-atomic — abwm.2's cs_insert comment was
+// specifically about atomics within a single dispatch, but the host-side
+// submit boundary is a stronger guarantee that applies to plain storage
+// writes too). WGSL has no in-shader release-store; the host-side submit
+// boundary is sufficient. DO NOT fuse these into a single submit without
+// explicit synchronization. See the kernel-internal ordering rule in this
+// file's module docstring.
 //
 // NodeId-pre-allocation shortcut: result slots are pre-assigned by CPU,
 // so direct buffer indexing replaces hash-table memo lookups for the
@@ -1109,6 +1126,16 @@ fn gpu_level_4_matches_cpu_on_corpus() {
         }
         let live_count = cpu.iter().filter(|&&c| c == 1).count();
         eprintln!("fixture {label}: {live_count} live cells in 8³ result");
+        // Hard checksum on the random fixture: independent of the CPU oracle's
+        // structural code (which mirrors the GPU's), this number is the
+        // committed regression tripwire — if it changes, either the rule, the
+        // stencil, or the seeded fixture changed.
+        if *label == "random_seed_42" {
+            assert_eq!(
+                live_count, 109,
+                "random_seed_42: expected 109 live cells in inner 8³ (committed regression tripwire); got {live_count}"
+            );
+        }
     }
 }
 
@@ -1133,6 +1160,11 @@ struct TimedRun {
     dispatch_1_gpu: Option<std::time::Duration>,
     dispatch_2_gpu: Option<std::time::Duration>,
     wall_total: std::time::Duration,
+    // Per code-review feedback: decompose the wall total into measured
+    // components so the §8.7 "spike-scale artifact" decomposition is data,
+    // not estimate.
+    cpu_prep: std::time::Duration,
+    readback: std::time::Duration,
 }
 
 fn run_level_4_step_gpu_timed(
@@ -1142,6 +1174,7 @@ fn run_level_4_step_gpu_timed(
     let num_worlds = worlds.len() as u32;
     assert!(num_worlds > 0, "need at least one world");
     let wall_start = Instant::now();
+    let cpu_prep_start = Instant::now();
 
     // Build all (num_worlds * 27) intermediate inputs CPU-side.
     let mut flat_inputs: Vec<u32> = Vec::with_capacity(worlds.len() * NUM_INTERMEDIATES * L3_CELLS);
@@ -1164,6 +1197,7 @@ fn run_level_4_step_gpu_timed(
     );
     let final_output_buf =
         make_output_buffer(ctx, "timed_final_outputs", num_worlds * L3_CELLS as u32);
+    let cpu_prep = cpu_prep_start.elapsed();
 
     let base_params_buf = ctx
         .device
@@ -1308,6 +1342,7 @@ fn run_level_4_step_gpu_timed(
     ctx.queue.submit(std::iter::once(enc2.finish()));
 
     // ---- Readback (output cells + timestamps) ----
+    let readback_start = Instant::now();
     let flat = read_buffer_u32(ctx, &final_output_buf, num_worlds * L3_CELLS as u32);
     let mut out: Vec<[u32; L3_CELLS]> = Vec::with_capacity(worlds.len());
     for chunk in flat.chunks(L3_CELLS) {
@@ -1315,6 +1350,7 @@ fn run_level_4_step_gpu_timed(
         arr.copy_from_slice(chunk);
         out.push(arr);
     }
+    let readback = readback_start.elapsed();
 
     let read_ts = |readback: &wgpu::Buffer| -> Option<std::time::Duration> {
         let slice = readback.slice(..);
@@ -1347,6 +1383,8 @@ fn run_level_4_step_gpu_timed(
             dispatch_1_gpu,
             dispatch_2_gpu,
             wall_total: wall_start.elapsed(),
+            cpu_prep,
+            readback,
         },
     )
 }
@@ -1385,10 +1423,22 @@ fn gpu_level_4_throughput() {
         runs.push(t);
     }
 
-    // Compute median (sort by wall_total, take middle).
-    let mut sorted = runs.clone();
-    sorted.sort_by_key(|r| r.wall_total);
-    let median = sorted[N_ITERS / 2];
+    // Per-column medians — independent for d1, d2, wall. (Sorting by wall and
+    // taking that run's d1/d2 was misleading: wall is dominated by CPU prep +
+    // readback in this harness, so the wall-median run is not guaranteed to be
+    // the d1- or d2-median run.)
+    fn median_dur(values: &[std::time::Duration]) -> std::time::Duration {
+        let mut v = values.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    }
+    let median_wall = median_dur(&runs.iter().map(|r| r.wall_total).collect::<Vec<_>>());
+    let median_cpu_prep = median_dur(&runs.iter().map(|r| r.cpu_prep).collect::<Vec<_>>());
+    let median_readback = median_dur(&runs.iter().map(|r| r.readback).collect::<Vec<_>>());
+    let d1_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_1_gpu).collect();
+    let d2_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_2_gpu).collect();
+    let median_d1 = (!d1_samples.is_empty()).then(|| median_dur(&d1_samples));
+    let median_d2 = (!d2_samples.is_empty()).then(|| median_dur(&d2_samples));
 
     let fmt_dur = |d: std::time::Duration| {
         let ns = d.as_nanos();
@@ -1398,38 +1448,38 @@ fn gpu_level_4_throughput() {
             format!("{:.3} ms", ns as f64 / 1e6)
         }
     };
-    eprintln!("median (of {N_ITERS} runs, N={N_WORLDS} worlds, fresh buffers each iter):");
+    eprintln!(
+        "per-column medians (of {N_ITERS} runs, N={N_WORLDS} worlds, fresh buffers each iter):"
+    );
     eprintln!(
         "  dispatch 1 (27*N base case, {} threads): {}",
         N_WORLDS * NUM_INTERMEDIATES * L2_CELLS,
-        median
-            .dispatch_1_gpu
-            .map(fmt_dur)
-            .unwrap_or_else(|| "n/a".into())
+        median_d1.map(fmt_dur).unwrap_or_else(|| "n/a".into())
     );
     eprintln!(
         "  dispatch 2 (level-4 recursive, {} threads): {}",
         N_WORLDS,
-        median
-            .dispatch_2_gpu
-            .map(fmt_dur)
-            .unwrap_or_else(|| "n/a".into())
+        median_d2.map(fmt_dur).unwrap_or_else(|| "n/a".into())
     );
     eprintln!(
         "  wall total (incl. CPU prep + readback): {}",
-        fmt_dur(median.wall_total)
+        fmt_dur(median_wall)
+    );
+    // Measured wall-time decomposition (replaces the §8.7 hand-decomposition).
+    eprintln!(
+        "  decomposition (median): cpu_prep = {}, readback = {}, residual = {}",
+        fmt_dur(median_cpu_prep),
+        fmt_dur(median_readback),
+        fmt_dur(median_wall.saturating_sub(median_cpu_prep + median_readback)),
     );
 
     // Plan adjustment 5 — verdict criteria:
     //   GO: per-dispatch ≤ 1 ms AND total step ≤ 5 ms
     //   NO-GO: per-dispatch > 5 ms (we can't fix in 2h)
     //   CAVEAT: 1–5 ms per-dispatch — file follow-up beads per issue
-    let d1 = median.dispatch_1_gpu;
-    let d2 = median.dispatch_2_gpu;
-    if let (Some(d1), Some(d2)) = (d1, d2) {
+    if let (Some(d1), Some(d2)) = (median_d1, median_d2) {
         let max_dispatch = d1.max(d2);
-        let verdict = if max_dispatch.as_micros() <= 1_000 && median.wall_total.as_micros() <= 5_000
-        {
+        let verdict = if max_dispatch.as_micros() <= 1_000 && median_wall.as_micros() <= 5_000 {
             "GO"
         } else if max_dispatch.as_micros() > 5_000 {
             "NO-GO"
@@ -1448,8 +1498,8 @@ fn gpu_level_4_throughput() {
         );
         eprintln!(
             "  wall total = {} {} 5 ms",
-            fmt_dur(median.wall_total),
-            if median.wall_total.as_micros() <= 5_000 {
+            fmt_dur(median_wall),
+            if median_wall.as_micros() <= 5_000 {
                 "≤"
             } else {
                 ">"
@@ -1463,13 +1513,15 @@ fn gpu_level_4_throughput() {
     eprintln!("--- per-iter detail ---");
     for (i, r) in runs.iter().enumerate() {
         eprintln!(
-            "  iter {i}: d1={} d2={} wall={}",
+            "  iter {i}: d1={} d2={} cpu_prep={} readback={} wall={}",
             r.dispatch_1_gpu
                 .map(fmt_dur)
                 .unwrap_or_else(|| "n/a".into()),
             r.dispatch_2_gpu
                 .map(fmt_dur)
                 .unwrap_or_else(|| "n/a".into()),
+            fmt_dur(r.cpu_prep),
+            fmt_dur(r.readback),
             fmt_dur(r.wall_total),
         );
     }
