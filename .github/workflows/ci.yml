@@ -109,8 +109,11 @@ jobs:
         run: cargo fmt --check
 
       # Gating: clippy backlog is clear (hash-thing-00f closed).
+      # --workspace catches sub-crate lib tests (ht-octree, ht-render);
+      # without it CI missed a clippy::erasing_op error landed via qy4g.1
+      # (see hash-thing-qm61, hash-thing-5dee).
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --workspace --locked -- -D warnings
 
       # Build release binary for artifact upload (xb7.4).
       - name: Build release binary
