@@ -218,4 +218,49 @@ mod tests {
         }
         assert!(found, "expected at least one lit pixel");
     }
+
+    /// Visual-check helper for hash-thing-bujj. Writes a PPM (P6) of the
+    /// legend lines composited over a dark slate background so a reviewer
+    /// can eyeball the typeface. Path is taken from `BUJJ_DUMP_PPM`; if
+    /// the env var is unset, the test no-ops. `#[ignore]` so it never
+    /// runs on plain `cargo test`.
+    ///
+    /// Usage:
+    ///   BUJJ_DUMP_PPM=/tmp/legend.ppm \
+    ///     cargo test -p ht-render --lib font::tests::dump_legend_ppm \
+    ///       -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_legend_ppm() {
+        let Ok(path) = std::env::var("BUJJ_DUMP_PPM") else {
+            return;
+        };
+        let lines: &[&str] = &[
+            "  Tab: orbit / first-person",
+            "  WASD: move    Mouse: look",
+            "  Space: jump   Ctrl: sprint",
+            "  LMB break  RMB place",
+            "  F1: legend   F5: pause",
+            "  R: reset terrain",
+            "  Aé é Hello, World! 0123",
+        ];
+        let (rgba, w, h) = render_text_rgba(lines, 2);
+        let bg = (24u8, 28u8, 36u8);
+        let mut body = Vec::with_capacity((w * h * 3) as usize);
+        for i in 0..(w * h) as usize {
+            let a = rgba[i * 4 + 3] as u32;
+            let mix = |fg: u8, b: u8| -> u8 {
+                ((fg as u32 * a + b as u32 * (255 - a)) / 255) as u8
+            };
+            body.push(mix(rgba[i * 4], bg.0));
+            body.push(mix(rgba[i * 4 + 1], bg.1));
+            body.push(mix(rgba[i * 4 + 2], bg.2));
+        }
+        let header = format!("P6\n{w} {h}\n255\n");
+        let mut out = Vec::with_capacity(header.len() + body.len());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&body);
+        std::fs::write(&path, &out).expect("write ppm");
+        eprintln!("wrote {path} ({w}×{h})");
+    }
 }
