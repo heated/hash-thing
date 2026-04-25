@@ -119,7 +119,7 @@ These are terrain/world presets — each would be a different terrain stack + ma
 >
 > **Entity ideas to explore:** Physics creatures (water elemental, sand worm), automata-native entities (behavior IS CA rules), environmental entities (geysers, volcanos, whirlpools), critters (small scatter creatures that make world feel alive).
 >
-> **Roguelike:** Deferred. Get sandbox + metroidvania + destructible environment solid first. Rain World 2 as possible inspiration when the time comes. Don't build roguelike mechanics yet.
+> **Roguelike:** Deferred. Get sandbox + metroidvania + destructible environment solid first. Risk of Rain 2 as possible inspiration when the time comes. Don't build roguelike mechanics yet.
 >
 > **Metroidvania progression (concrete):**
 > - Start: walk only, navigate terrain puzzles
@@ -231,7 +231,7 @@ These are the operational specifications. If one of these ever disagrees with th
 - 30-sec and 5-min demo experiences building to a wow moment
 
 **Requires human gate:**
-- Roguelike layer specifics — deferred until sandbox + metroidvania are solid (Rain World 2 as reference when ready)
+- Roguelike layer specifics — deferred until sandbox + metroidvania are solid (Risk of Rain 2 as reference when ready)
 - Voxel scale decision (player-sized vs much smaller) — awaiting perf data from m1f
 - Specific entity creature designs beyond the explored categories (physics creatures, environmental, critters)
 - Anything that makes it look/feel like a specific existing game (Minecraft clone, Terraria clone, etc.)
@@ -239,7 +239,7 @@ These are the operational specifications. If one of these ever disagrees with th
 
 ### Current game direction (crew reference — no gate needed to build toward this)
 
-**Identity:** Player-as-physical-presence in a living world. Sandbox + metroidvania + destructible environment first. Roguelike layered on later (Rain World 2 as reference). No crafting.
+**Identity:** Player-as-physical-presence in a living world. Sandbox + metroidvania + destructible environment first. Roguelike layered on later (Risk of Rain 2 as reference). No crafting.
 
 **Interaction model:** Entities/machines, not block construction. Clone blocks (material sources). Mobile physics creatures. Environmental entities (geysers, volcanos). Player places things that DO things. Hotbar + inventory, no crafting. Movement progression: walk → break → create → swim → fly (Superman-style).
 
