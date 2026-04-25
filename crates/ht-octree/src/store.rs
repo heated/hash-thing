@@ -2111,8 +2111,9 @@ mod tests {
         let mut store = NodeStore::new();
         let mut grid = vec![0 as CellState; 8];
         // Side=2 world, populate y=0 with mat(2), y=1 with mat(3) at (x=0,z=0).
-        grid[0 + 0 * 2 + 0 * 4] = mat(2);
-        grid[0 + 1 * 2 + 0 * 4] = mat(3);
+        let idx = |x: usize, y: usize, z: usize| x + y * 2 + z * 4;
+        grid[idx(0, 0, 0)] = mat(2);
+        grid[idx(0, 1, 0)] = mat(3);
         let root = store.from_flat(&grid, 2);
         let mut col = vec![0 as CellState; 2];
         store.flatten_column_into(root, 0, 0, &mut col);
