@@ -80,9 +80,7 @@ fn measure(label: &str, level: u32) {
     let entries = world.macro_cache_entries();
     let bytes = world.macro_cache_bytes_est();
     let mb = bytes as f64 / (1024.0 * 1024.0);
-    eprintln!(
-        "  after 1x pow2 step: entries={entries}, bytes_est={bytes} ({mb:.3} MB)",
-    );
+    eprintln!("  after 1x pow2 step: entries={entries}, bytes_est={bytes} ({mb:.3} MB)",);
     eprintln!("  {}", world.memo_summary());
 
     // Sanity: the macro stepper on a live GoL world must actually fill the

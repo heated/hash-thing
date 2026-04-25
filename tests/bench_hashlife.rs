@@ -215,10 +215,7 @@ fn bench_water_scene(label: &str, level: u32, generations: usize) {
         .expect("level-derived terrain params must validate");
     world.seed_water_and_sand();
     let seed_ms = t0.elapsed().as_millis();
-    eprintln!(
-        "  seed: {seed_ms}ms, initial pop: {}",
-        world.population(),
-    );
+    eprintln!("  seed: {seed_ms}ms, initial pop: {}", world.population(),);
 
     let mut times_us = Vec::with_capacity(generations);
     let mut populations = Vec::with_capacity(generations);

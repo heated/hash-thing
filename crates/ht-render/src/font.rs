@@ -249,9 +249,8 @@ mod tests {
         let mut body = Vec::with_capacity((w * h * 3) as usize);
         for i in 0..(w * h) as usize {
             let a = rgba[i * 4 + 3] as u32;
-            let mix = |fg: u8, b: u8| -> u8 {
-                ((fg as u32 * a + b as u32 * (255 - a)) / 255) as u8
-            };
+            let mix =
+                |fg: u8, b: u8| -> u8 { ((fg as u32 * a + b as u32 * (255 - a)) / 255) as u8 };
             body.push(mix(rgba[i * 4], bg.0));
             body.push(mix(rgba[i * 4 + 1], bg.1));
             body.push(mix(rgba[i * 4 + 2], bg.2));

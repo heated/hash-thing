@@ -395,14 +395,7 @@ impl NodeStore {
         self.flatten_column_rec(root, level, x, z, out);
     }
 
-    fn flatten_column_rec(
-        &self,
-        node: NodeId,
-        level: u32,
-        x: u64,
-        z: u64,
-        out: &mut [CellState],
-    ) {
+    fn flatten_column_rec(&self, node: NodeId, level: u32, x: u64, z: u64, out: &mut [CellState]) {
         debug_assert_eq!(out.len() as u64, 1u64 << level);
         match self.get(node) {
             Node::Leaf(s) => {
@@ -463,13 +456,7 @@ impl NodeStore {
     /// path — the expand-then-narrowly-canonicalize round-trip preserves
     /// identity. See tests `splice_column_identity_returns_same_nodeid`
     /// and `splice_column_identity_through_raw_leaf_child_preserves_nodeid`.
-    pub fn splice_column(
-        &mut self,
-        root: NodeId,
-        x: u64,
-        z: u64,
-        column: &[CellState],
-    ) -> NodeId {
+    pub fn splice_column(&mut self, root: NodeId, x: u64, z: u64, column: &[CellState]) -> NodeId {
         let level = self.get(root).level();
         let side = 1u64 << level;
         assert!(
@@ -2079,7 +2066,10 @@ mod tests {
         // Column at (x=1, z=1): lies within children[0] for y<4 and children[2] for y>=4.
         let mut col = vec![0 as CellState; side];
         store.flatten_column_into(root, 1, 1, &mut col);
-        assert!(col.iter().all(|&c| c == stone), "expected all stone, got {col:?}");
+        assert!(
+            col.iter().all(|&c| c == stone),
+            "expected all stone, got {col:?}"
+        );
     }
 
     #[test]

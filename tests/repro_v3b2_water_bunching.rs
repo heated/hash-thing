@@ -18,16 +18,16 @@ fn ascii_cell(state: u16) -> char {
     // material lives in the upper 10 bits (METADATA_BITS = 6)
     let m = (state >> 6) as u32;
     match m {
-        0 => '.',  // air
-        1 => '#',  // stone
-        2 => 'd',  // dirt
-        3 => 'g',  // grass
-        4 => 'f',  // fire
-        5 => '~',  // water
-        6 => 's',  // sand
-        7 => 'L',  // lava
-        8 => 'i',  // ice
-        9 => 'a',  // acid
+        0 => '.', // air
+        1 => '#', // stone
+        2 => 'd', // dirt
+        3 => 'g', // grass
+        4 => 'f', // fire
+        5 => '~', // water
+        6 => 's', // sand
+        7 => 'L', // lava
+        8 => 'i', // ice
+        9 => 'a', // acid
         _ => char::from_digit(m % 36, 36).unwrap_or('?'),
     }
 }

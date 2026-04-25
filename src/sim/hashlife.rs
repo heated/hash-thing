@@ -1466,8 +1466,7 @@ mod tests {
         // branch of step_recursive_pow2 exactly.
         let padded_root = macro_world.pad_root();
         let padded_level = macro_world.level + 1;
-        let result =
-            macro_world.step_node_macro(padded_root, padded_level, macro_world.generation);
+        let result = macro_world.step_node_macro(padded_root, padded_level, macro_world.generation);
         macro_world.root = result;
         macro_world.generation += steps;
 
@@ -1481,8 +1480,7 @@ mod tests {
         for (i, (&m, &b)) in macro_flat.iter().zip(brute_flat.iter()).enumerate() {
             if m != b {
                 diff_count += 1;
-                let water_raw =
-                    crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw();
+                let water_raw = crate::octree::Cell::pack(WATER_MATERIAL_ID, 0).raw();
                 if m == water_raw || b == water_raw {
                     diff_with_water_present += 1;
                 }
@@ -1490,9 +1488,7 @@ mod tests {
                     let z = i / (side * side);
                     let y = (i / side) % side;
                     let x = i % side;
-                    eprintln!(
-                        "divergence at ({x},{y},{z}): macro={m:#010x} brute={b:#010x}"
-                    );
+                    eprintln!("divergence at ({x},{y},{z}): macro={m:#010x} brute={b:#010x}");
                 }
             }
         }
@@ -1539,8 +1535,7 @@ mod tests {
         // Macro path, bypassing the has_block_rule_cells guard.
         let padded_root = macro_world.pad_root();
         let padded_level = macro_world.level + 1;
-        let result =
-            macro_world.step_node_macro(padded_root, padded_level, macro_world.generation);
+        let result = macro_world.step_node_macro(padded_root, padded_level, macro_world.generation);
         macro_world.root = result;
         macro_world.generation += steps;
 
@@ -1842,9 +1837,9 @@ mod tests {
     fn tick_divisor_two_halves_water_block_rule_firing_cadence() {
         let mut fast = World::new(4); // 16³, every tick
         let mut slow = World::new(4); // 16³, every other tick
-        // rvsh: terrain_defaults now ships water at divisor=2, so `fast`
-        // must explicitly reset to 1 to keep this test a d=1 vs d=2 contrast
-        // independent of the registry's default pick.
+                                      // rvsh: terrain_defaults now ships water at divisor=2, so `fast`
+                                      // must explicitly reset to 1 to keep this test a d=1 vs d=2 contrast
+                                      // independent of the registry's default pick.
         fast.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 1));
         slow.mutate_materials(|m| m.set_tick_divisor(WATER_MATERIAL_ID, 2));
 
@@ -2141,22 +2136,14 @@ mod tests {
         world.set(wc(0), wc(1), wc(0), STONE);
 
         let pre_sand = count_material(&world, 8, SAND_MATERIAL_ID);
-        let pre_stone = count_material(
-            &world,
-            8,
-            crate::terrain::materials::STONE_MATERIAL_ID,
-        );
+        let pre_stone = count_material(&world, 8, crate::terrain::materials::STONE_MATERIAL_ID);
         assert_eq!(pre_sand, 1);
         assert_eq!(pre_stone, 1);
 
         world.step_recursive();
 
         let post_sand = count_material(&world, 8, SAND_MATERIAL_ID);
-        let post_stone = count_material(
-            &world,
-            8,
-            crate::terrain::materials::STONE_MATERIAL_ID,
-        );
+        let post_stone = count_material(&world, 8, crate::terrain::materials::STONE_MATERIAL_ID);
 
         eprintln!("pre: sand={pre_sand} stone={pre_stone}");
         eprintln!("post: sand={post_sand} stone={post_stone}");
@@ -2232,7 +2219,11 @@ mod tests {
 
         let w_end = count_material(&world, side, WATER_MATERIAL_ID);
         let s_end = count_material(&world, side, SAND_MATERIAL_ID);
-        eprintln!("end: water={w_end} (Δ={}) sand={s_end} (Δ={})", w_end as isize - w0 as isize, s_end as isize - s0 as isize);
+        eprintln!(
+            "end: water={w_end} (Δ={}) sand={s_end} (Δ={})",
+            w_end as isize - w0 as isize,
+            s_end as isize - s0 as isize
+        );
     }
 
     /// hash-thing-9yv2 path comparison: brute `step()` vs hashlife `step_recursive()`
@@ -2242,8 +2233,8 @@ mod tests {
     #[test]
     #[ignore]
     fn repro_9yv2_brute_vs_recursive_water_mass() {
-        use crate::terrain::TerrainParams;
         use crate::terrain::materials::WATER;
+        use crate::terrain::TerrainParams;
 
         let level = 6u32;
         let side = 1i64 << level;
@@ -2285,7 +2276,10 @@ mod tests {
             let wb = count_material(&brute, side, WATER_MATERIAL_ID);
             let wr = count_material(&recur, side, WATER_MATERIAL_ID);
             if wb != wr {
-                eprintln!("gen {gen:>2}: brute={wb} recur={wr} (diff={})", wb as isize - wr as isize);
+                eprintln!(
+                    "gen {gen:>2}: brute={wb} recur={wr} (diff={})",
+                    wb as isize - wr as isize
+                );
             }
         }
         let wb = count_material(&brute, side, WATER_MATERIAL_ID);

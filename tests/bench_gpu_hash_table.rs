@@ -171,13 +171,11 @@ impl GpuCtx {
             flags: Default::default(),
             memory_budget_thresholds: Default::default(),
         });
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
         .ok()?;
 
         let af = adapter.features();
@@ -189,14 +187,13 @@ impl GpuCtx {
             required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         }
 
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("bench_gpu_hash_table"),
-                required_features,
-                required_limits: wgpu::Limits::default(),
-                ..Default::default()
-            }))
-            .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("bench_gpu_hash_table"),
+            required_features,
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .ok()?;
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("hash_bgl"),
@@ -250,7 +247,12 @@ impl GpuCtx {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            (Some(qs), Some(resolve), Some(readback), queue.get_timestamp_period())
+            (
+                Some(qs),
+                Some(resolve),
+                Some(readback),
+                queue.get_timestamp_period(),
+            )
         } else {
             (None, None, None, 0.0)
         };
@@ -411,7 +413,12 @@ impl Table {
 
     fn reset(&self, ctx: &GpuCtx) {
         self.write_params(ctx, 0);
-        let bg = self.bind_group(ctx, &dummy_input(ctx), &dummy_input(ctx), &dummy_output(ctx));
+        let bg = self.bind_group(
+            ctx,
+            &dummy_input(ctx),
+            &dummy_input(ctx),
+            &dummy_output(ctx),
+        );
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
@@ -469,27 +476,30 @@ impl Table {
 }
 
 fn dummy_input(ctx: &GpuCtx) -> wgpu::Buffer {
-    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("dummy_input"),
-        contents: bytemuck::cast_slice(&[0u32; 4]),
-        usage: wgpu::BufferUsages::STORAGE,
-    })
+    ctx.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dummy_input"),
+            contents: bytemuck::cast_slice(&[0u32; 4]),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
 }
 
 fn dummy_output(ctx: &GpuCtx) -> wgpu::Buffer {
-    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("dummy_output"),
-        contents: bytemuck::cast_slice(&[0u32; 4]),
-        usage: wgpu::BufferUsages::STORAGE,
-    })
+    ctx.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dummy_output"),
+            contents: bytemuck::cast_slice(&[0u32; 4]),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
 }
 
 fn make_input_buffer(ctx: &GpuCtx, label: &str, data: &[u32]) -> wgpu::Buffer {
-    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::cast_slice(data),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-    })
+    ctx.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        })
 }
 
 fn make_output_buffer(ctx: &GpuCtx, label: &str, n: u32) -> wgpu::Buffer {
@@ -831,12 +841,7 @@ fn mean(samples: &[Duration]) -> Duration {
     total / samples.len() as u32
 }
 
-fn run_sweep_row(
-    ctx: &GpuCtx,
-    n: u32,
-    m_threads: u32,
-    load_factor: f32,
-) -> Row {
+fn run_sweep_row(ctx: &GpuCtx, n: u32, m_threads: u32, load_factor: f32) -> Row {
     let capacity = ((n as f64 / load_factor as f64).ceil() as u32)
         .max(WORKGROUP_SIZE)
         .next_power_of_two();
@@ -888,8 +893,7 @@ fn run_sweep_row(
             None
         };
         let bg_miss = table.bind_group(ctx, &miss_keys_buf, &values_buf, &results_buf);
-        let (w_miss, g_miss) =
-            run_phase(ctx, &ctx.pipeline_lookup, &bg_miss, threads_to_dispatch);
+        let (w_miss, g_miss) = run_phase(ctx, &ctx.pipeline_lookup, &bg_miss, threads_to_dispatch);
         let miss_mp = if pass >= warm_runs {
             Some(table.read_max_probes(ctx))
         } else {
@@ -925,9 +929,21 @@ fn run_sweep_row(
     let hit_mean = mean(&hit_samples);
     let miss_mean = mean(&miss_samples);
     let ins_p95 = p95(&mut insert_samples.clone());
-    let g_ins_mean = if gpu_insert.is_empty() { None } else { Some(mean(&gpu_insert)) };
-    let g_hit_mean = if gpu_hit.is_empty() { None } else { Some(mean(&gpu_hit)) };
-    let g_miss_mean = if gpu_miss.is_empty() { None } else { Some(mean(&gpu_miss)) };
+    let g_ins_mean = if gpu_insert.is_empty() {
+        None
+    } else {
+        Some(mean(&gpu_insert))
+    };
+    let g_hit_mean = if gpu_hit.is_empty() {
+        None
+    } else {
+        Some(mean(&gpu_hit))
+    };
+    let g_miss_mean = if gpu_miss.is_empty() {
+        None
+    } else {
+        Some(mean(&gpu_miss))
+    };
 
     let keys_dispatched = threads_to_dispatch as f64;
     let to_ms = |d: Duration| d.as_secs_f64() * 1_000.0;
@@ -989,8 +1005,14 @@ fn sweep_gpu_hash_throughput() {
     let ms: [u32; 4] = [256, 1024, 4096, 16_384];
     let lfs: [f32; 3] = [0.5, 0.75, 0.9];
 
-    let opt_ms = |v: Option<f64>| v.map(|x| format!("{:>10.3}", x)).unwrap_or_else(|| "       n/a".into());
-    let opt_mk = |v: Option<f64>| v.map(|x| format!("{:>12.1}", x)).unwrap_or_else(|| "         n/a".into());
+    let opt_ms = |v: Option<f64>| {
+        v.map(|x| format!("{:>10.3}", x))
+            .unwrap_or_else(|| "       n/a".into())
+    };
+    let opt_mk = |v: Option<f64>| {
+        v.map(|x| format!("{:>12.1}", x))
+            .unwrap_or_else(|| "         n/a".into())
+    };
 
     for &n in &ns {
         for &m in &ms {
