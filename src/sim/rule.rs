@@ -771,7 +771,7 @@ impl From<FireworkRule> for CaRule {
 /// public scaffold.
 ///
 /// [`rule445`]: GameOfLife3D::rule445
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GameOfLife3D {
     /// survive_min..=survive_max: cell stays alive if neighbor count is in this range
     pub survive_min: u8,
