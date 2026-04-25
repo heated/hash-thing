@@ -223,6 +223,8 @@ struct GpuCtx {
     queue: wgpu::Queue,
     pipeline_base_case: wgpu::ComputePipeline,
     bgl_base_case: wgpu::BindGroupLayout,
+    pipeline_recursive_l4: wgpu::ComputePipeline,
+    bgl_recursive_l4: wgpu::BindGroupLayout,
 }
 
 impl GpuCtx {
@@ -270,11 +272,36 @@ impl GpuCtx {
             cache: None,
         });
 
+        let bgl_recursive_l4 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("recursive_l4_bgl"),
+            entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
+        });
+        let shader_r = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("recursive_l4_shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_RECURSIVE_L4.into()),
+        });
+        let pl_r = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("recursive_l4_pl"),
+            bind_group_layouts: &[Some(&bgl_recursive_l4)],
+            immediate_size: 0,
+        });
+        let pipeline_recursive_l4 =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("cs_step_recursive_l4"),
+                layout: Some(&pl_r),
+                module: &shader_r,
+                entry_point: Some("cs_step_recursive_l4"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         Some(Self {
             device,
             queue,
             pipeline_base_case,
             bgl_base_case,
+            pipeline_recursive_l4,
+            bgl_recursive_l4,
         })
     }
 }
@@ -552,4 +579,518 @@ fn gpu_base_case_throughput() {
         dt,
         ((n * L2_CELLS) as f64) / dt.as_secs_f64() / 1e6,
     );
+}
+
+// ===========================================================================
+// Level-4 (16³) recursive step.
+//
+// Hashlife recursion at level 4: input is a 16³ world, output is the inner 8³
+// region advanced by 2 generations. Mirrors `src/sim/hashlife.rs::
+// step_recursive_case` (line ~859) but specialized to one recursive level
+// above the base case (no further recursion below the level-3 base).
+//
+// Algorithm:
+//   1. Form 27 intermediate level-3 nodes (each 8³) by sampling overlapping
+//      8³ blocks at offsets (i*4, j*4, k*4) for i,j,k ∈ {0,1,2}. The 27
+//      intermediates tile 16³ with 8-cell-wide blocks at 4-cell stride.
+//   2. Step each intermediate (1-generation 8³→4³ base case) — 27 level-2
+//      results in a 12³ post-gen-1 region [2,14)³ of the 16³ space.
+//   3. Form 8 sub-cube level-3 nodes (each 8³) at corners of the 12³ region.
+//      Sub-cube (si,sj,sk) ∈ {0,1}³ is composed of 8 of the 27 level-2
+//      results: sub-cube oct (sx,sy,sz) sub_cell (cx,cy,cz) reads from
+//      intermediate (si+cx, sj+cy, sk+cz). Each sub-cube reads from at most
+//      8 intermediates.
+//   4. Step each sub-cube (1-generation 8³→4³ base case) — 8 level-2 results.
+//   5. Tile the 8 level-2 results into a single 8³ output: sub-cube oct
+//      (sx,sy,sz)'s 4³ result lands at output offset (sx*4, sy*4, sz*4).
+//
+// Net effect: 2 generations on 16³ → 8³ output (lose 4 cells per side).
+// ===========================================================================
+
+const L4_SIDE: usize = 16;
+const L4_CELLS: usize = L4_SIDE * L4_SIDE * L4_SIDE;
+const NUM_INTERMEDIATES: usize = 27;
+
+fn build_intermediate(input: &[u32; L4_CELLS], i: usize, j: usize, k: usize) -> [u32; L3_CELLS] {
+    let mut block = [0u32; L3_CELLS];
+    for bz in 0..L3_SIDE {
+        for by in 0..L3_SIDE {
+            for bx in 0..L3_SIDE {
+                let gx = i * L2_SIDE + bx;
+                let gy = j * L2_SIDE + by;
+                let gz = k * L2_SIDE + bz;
+                block[bz * L3_SIDE * L3_SIDE + by * L3_SIDE + bx] =
+                    input[gz * L4_SIDE * L4_SIDE + gy * L4_SIDE + gx];
+            }
+        }
+    }
+    block
+}
+
+fn build_subcube_block(
+    intermediate_results: &[[u32; L2_CELLS]; NUM_INTERMEDIATES],
+    si: usize,
+    sj: usize,
+    sk: usize,
+) -> [u32; L3_CELLS] {
+    let mut block = [0u32; L3_CELLS];
+    for cz in 0..2 {
+        for cy in 0..2 {
+            for cx in 0..2 {
+                let im_idx = (sk + cz) * 9 + (sj + cy) * 3 + (si + cx);
+                let im = &intermediate_results[im_idx];
+                for fz in 0..L2_SIDE {
+                    for fy in 0..L2_SIDE {
+                        for fx in 0..L2_SIDE {
+                            let bx = cx * L2_SIDE + fx;
+                            let by = cy * L2_SIDE + fy;
+                            let bz = cz * L2_SIDE + fz;
+                            block[bz * L3_SIDE * L3_SIDE + by * L3_SIDE + bx] =
+                                im[fz * L2_SIDE * L2_SIDE + fy * L2_SIDE + fx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    block
+}
+
+fn cpu_level_4_step(input: &[u32; L4_CELLS]) -> [u32; L3_CELLS] {
+    // Phase 1: 27 intermediate base cases.
+    let mut intermediate_results = [[0u32; L2_CELLS]; NUM_INTERMEDIATES];
+    for k in 0..3 {
+        for j in 0..3 {
+            for i in 0..3 {
+                let im = build_intermediate(input, i, j, k);
+                intermediate_results[k * 9 + j * 3 + i] = cpu_base_case(&im);
+            }
+        }
+    }
+    // Phase 2: 8 sub-cube base cases, tiled into the final 8³ output.
+    let mut output = [0u32; L3_CELLS];
+    for sk in 0..2 {
+        for sj in 0..2 {
+            for si in 0..2 {
+                let sub_block = build_subcube_block(&intermediate_results, si, sj, sk);
+                let sub_result = cpu_base_case(&sub_block);
+                for fz in 0..L2_SIDE {
+                    for fy in 0..L2_SIDE {
+                        for fx in 0..L2_SIDE {
+                            let ox = si * L2_SIDE + fx;
+                            let oy = sj * L2_SIDE + fy;
+                            let oz = sk * L2_SIDE + fz;
+                            output[oz * L3_SIDE * L3_SIDE + oy * L3_SIDE + ox] =
+                                sub_result[fz * L2_SIDE * L2_SIDE + fy * L2_SIDE + fx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
+// ---------------------------------------------------------------------------
+// GPU recursive-case kernel (dispatch 2 of the breadth-first dispatcher).
+//
+// Per plan: one thread per (level-4 input × parity). Each thread serially
+// runs the 8 sub-cube assemblies and base-case applications. This is the
+// architecture under test — the spike validates the dispatcher *shape*
+// (per-level breadth-first kernel, results feeding next level via storage
+// buffers across a queue.submit fence), NOT throughput at level 4 with one
+// thread per world. Throughput driver in commit 3 stacks N=64 worlds.
+//
+// Cross-dispatch fence: dispatch 1 (cs_base_case on 27*N intermediates)
+// writes to `intermediate_results`. Dispatch 2 reads the same buffer.
+// The visibility relies on the queue.submit boundary between dispatches —
+// see the discussion in `tests/bench_gpu_hash_table.rs::cs_insert` and the
+// kernel-internal ordering rule in this file's module docstring. DO NOT
+// fuse these into a single submit without explicit synchronization.
+//
+// NodeId-pre-allocation shortcut: result slots are pre-assigned by CPU,
+// so direct buffer indexing replaces hash-table memo lookups for the
+// architectural test. The same cross-dispatch fence semantics apply
+// (storage write in dispatch 1 → storage read in dispatch 2).
+// ---------------------------------------------------------------------------
+
+const SHADER_RECURSIVE_L4: &str = r#"
+struct RecursiveParams {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> rparams: RecursiveParams;
+// intermediate_results layout: [world][intermediate_idx ∈ 0..27][cell_idx ∈ 0..64]
+// = world * 27 * 64 + intermediate_idx * 64 + cell_idx
+@group(0) @binding(1) var<storage, read> intermediate_results: array<u32>;
+// final_outputs layout: [world][cell_idx ∈ 0..512]
+@group(0) @binding(2) var<storage, read_write> final_outputs: array<u32>;
+
+const L3_SIDE: u32 = 8u;
+const L2_SIDE: u32 = 4u;
+const L2_CELLS: u32 = 64u;
+const NUM_INTERMEDIATES: u32 = 27u;
+const FINAL_CELLS: u32 = 512u;
+const BAYS_BIRTH_MASK: u32 = 0xE0u;   // bits 5,6,7
+const BAYS_SURVIVE_MASK: u32 = 0x60u; // bits 5,6
+
+fn read_intermediate(world: u32, intermediate_idx: u32, cell_idx: u32) -> u32 {
+    let off = world * NUM_INTERMEDIATES * L2_CELLS + intermediate_idx * L2_CELLS + cell_idx;
+    return intermediate_results[off];
+}
+
+// Per-thread scratch for one sub-cube's 8³ assembly. WGSL `var<private>` is
+// per-shader-invocation: each thread gets its own copy.
+var<private> scratch: array<u32, 512>;
+
+@compute @workgroup_size(1)
+fn cs_step_recursive_l4(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let world = gid.x;
+    if (world >= rparams.num_worlds) { return; }
+
+    for (var sk: u32 = 0u; sk < 2u; sk = sk + 1u) {
+        for (var sj: u32 = 0u; sj < 2u; sj = sj + 1u) {
+            for (var si: u32 = 0u; si < 2u; si = si + 1u) {
+                // Step A: assemble 8³ scratch from 8 4³ intermediate chunks.
+                // sub-cube (si,sj,sk) sub_cell (cx,cy,cz) ← intermediate (si+cx, sj+cy, sk+cz).
+                for (var cz: u32 = 0u; cz < 2u; cz = cz + 1u) {
+                    for (var cy: u32 = 0u; cy < 2u; cy = cy + 1u) {
+                        for (var cx: u32 = 0u; cx < 2u; cx = cx + 1u) {
+                            let im_idx = (sk + cz) * 9u + (sj + cy) * 3u + (si + cx);
+                            for (var fz: u32 = 0u; fz < L2_SIDE; fz = fz + 1u) {
+                                for (var fy: u32 = 0u; fy < L2_SIDE; fy = fy + 1u) {
+                                    for (var fx: u32 = 0u; fx < L2_SIDE; fx = fx + 1u) {
+                                        let scr_x = cx * L2_SIDE + fx;
+                                        let scr_y = cy * L2_SIDE + fy;
+                                        let scr_z = cz * L2_SIDE + fz;
+                                        let im_cell = fz * L2_SIDE * L2_SIDE + fy * L2_SIDE + fx;
+                                        scratch[scr_z * L3_SIDE * L3_SIDE + scr_y * L3_SIDE + scr_x] =
+                                            read_intermediate(world, im_idx, im_cell);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Step B: apply Bays-5766 base case to scratch → 4³ result;
+                // tile into final output at sub-cube offset.
+                for (var oz: u32 = 0u; oz < L2_SIDE; oz = oz + 1u) {
+                    for (var oy: u32 = 0u; oy < L2_SIDE; oy = oy + 1u) {
+                        for (var ox: u32 = 0u; ox < L2_SIDE; ox = ox + 1u) {
+                            let ix = ox + 2u;
+                            let iy = oy + 2u;
+                            let iz = oz + 2u;
+                            let cur = scratch[iz * L3_SIDE * L3_SIDE + iy * L3_SIDE + ix];
+                            var alive: u32 = 0u;
+                            for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+                                for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                                    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                                        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                                        let nx = u32(i32(ix) + dx);
+                                        let ny = u32(i32(iy) + dy);
+                                        let nz = u32(i32(iz) + dz);
+                                        alive = alive + scratch[nz * L3_SIDE * L3_SIDE + ny * L3_SIDE + nx];
+                                    }
+                                }
+                            }
+                            var next: u32 = 0u;
+                            if (cur == 1u) {
+                                next = (BAYS_SURVIVE_MASK >> alive) & 1u;
+                            } else {
+                                next = (BAYS_BIRTH_MASK >> alive) & 1u;
+                            }
+                            let fox = si * L2_SIDE + ox;
+                            let foy = sj * L2_SIDE + oy;
+                            let foz = sk * L2_SIDE + oz;
+                            let out_off = world * FINAL_CELLS + foz * L3_SIDE * L3_SIDE + foy * L3_SIDE + fox;
+                            final_outputs[out_off] = next;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RecursiveParams {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// ---------------------------------------------------------------------------
+// GPU level-4 dispatcher driver.
+//
+// Two dispatches across separate `queue.submit` calls:
+//   Dispatch 1: cs_base_case on (num_worlds * 27) level-3 intermediates →
+//   intermediate_results buffer (length num_worlds * 27 * 64).
+//   Dispatch 2: cs_step_recursive_l4 → final_outputs buffer
+//   (length num_worlds * 512).
+//
+// Per plan adjustment 11, dispatches use SEPARATE queue.submit calls, not
+// just separate compute passes within one encoder, so dispatch 2's reads
+// see dispatch 1's writes via the cross-dispatch fence.
+// ---------------------------------------------------------------------------
+
+fn run_level_4_step_gpu(ctx: &GpuCtx, worlds: &[[u32; L4_CELLS]]) -> Vec<[u32; L3_CELLS]> {
+    let num_worlds = worlds.len() as u32;
+    assert!(num_worlds > 0, "need at least one world");
+
+    // Build all (num_worlds * 27) intermediate inputs CPU-side.
+    let mut flat_inputs: Vec<u32> = Vec::with_capacity(worlds.len() * NUM_INTERMEDIATES * L3_CELLS);
+    for input in worlds {
+        for k in 0..3 {
+            for j in 0..3 {
+                for i in 0..3 {
+                    let im = build_intermediate(input, i, j, k);
+                    flat_inputs.extend_from_slice(&im);
+                }
+            }
+        }
+    }
+    let num_intermediate_inputs = num_worlds * NUM_INTERMEDIATES as u32;
+    let intermediate_input_buf =
+        make_input_buffer(ctx, "dispatcher_intermediate_inputs", &flat_inputs);
+    let intermediate_results_buf = make_output_buffer(
+        ctx,
+        "dispatcher_intermediate_results",
+        num_intermediate_inputs * L2_CELLS as u32,
+    );
+    let final_output_buf = make_output_buffer(
+        ctx,
+        "dispatcher_final_outputs",
+        num_worlds * L3_CELLS as u32,
+    );
+
+    let base_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dispatcher_base_params"),
+            contents: bytemuck::bytes_of(&BaseCaseParams {
+                num_inputs: num_intermediate_inputs,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_base = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dispatcher_bg_base"),
+        layout: &ctx.bgl_base_case,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: base_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: intermediate_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    // ---- Dispatch 1: 27 base-case calls per world ----
+    let mut enc1 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dispatcher_enc_dispatch1"),
+        });
+    {
+        let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("dispatcher_pass1_base_case"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_base_case);
+        cpass.set_bind_group(0, &bg_base, &[]);
+        let total_threads = num_intermediate_inputs * L2_CELLS as u32;
+        let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+        cpass.dispatch_workgroups(groups, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc1.finish()));
+    // (Cross-dispatch fence: queue.submit boundary commits the storage writes.)
+
+    // ---- Dispatch 2: recursive level-4 kernel ----
+    let rec_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dispatcher_rec_params"),
+            contents: bytemuck::bytes_of(&RecursiveParams {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_rec = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dispatcher_bg_rec"),
+        layout: &ctx.bgl_recursive_l4,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: rec_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: final_output_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc2 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dispatcher_enc_dispatch2"),
+        });
+    {
+        let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("dispatcher_pass2_recursive"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_recursive_l4);
+        cpass.set_bind_group(0, &bg_rec, &[]);
+        cpass.dispatch_workgroups(num_worlds, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc2.finish()));
+
+    // ---- Readback ----
+    let flat = read_buffer_u32(ctx, &final_output_buf, num_worlds * L3_CELLS as u32);
+    let mut out: Vec<[u32; L3_CELLS]> = Vec::with_capacity(worlds.len());
+    for chunk in flat.chunks(L3_CELLS) {
+        let mut arr = [0u32; L3_CELLS];
+        arr.copy_from_slice(chunk);
+        out.push(arr);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Level-4 fixtures (per plan adjustment 12).
+// ---------------------------------------------------------------------------
+
+fn fixture_l4_empty() -> [u32; L4_CELLS] {
+    [0u32; L4_CELLS]
+}
+
+fn fixture_l4_full() -> [u32; L4_CELLS] {
+    [1u32; L4_CELLS]
+}
+
+fn fixture_l4_single_live_center() -> [u32; L4_CELLS] {
+    let mut g = [0u32; L4_CELLS];
+    let i = 8 * L4_SIDE * L4_SIDE + 8 * L4_SIDE + 8;
+    g[i] = 1;
+    g
+}
+
+/// 3×3×3 live block at corner (0,0,0). The block touches the world boundary;
+/// stencils for cells near (0,0,0) read past the level-4 edge — but those
+/// reads are inside the inner 8³ output region only when the live pattern
+/// is within 4 cells of the inner boundary. This fixture exercises the
+/// zero-padded boundary handling where the level-4 step's outer ring of
+/// cells contributes to the inner result via stencil, but the level-4
+/// boundary itself is implicitly zero-padded by the intermediate
+/// construction (cells outside the 16³ region are not read; intermediates
+/// whose blocks would extend past the boundary stay within [0,16)).
+fn fixture_l4_boundary_touching() -> [u32; L4_CELLS] {
+    let mut g = [0u32; L4_CELLS];
+    for z in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                g[z * L4_SIDE * L4_SIDE + y * L4_SIDE + x] = 1;
+            }
+        }
+    }
+    g
+}
+
+fn fixture_l4_seeded_random(seed: u64, density: f32) -> [u32; L4_CELLS] {
+    let mut state: u64 = seed;
+    let mut g = [0u32; L4_CELLS];
+    for cell in g.iter_mut() {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let r = (z as f64) / (u64::MAX as f64);
+        *cell = if (r as f32) < density { 1 } else { 0 };
+    }
+    g
+}
+
+fn level_4_corpus() -> Vec<(&'static str, [u32; L4_CELLS])> {
+    vec![
+        ("empty", fixture_l4_empty()),
+        ("full", fixture_l4_full()),
+        ("single_live_center", fixture_l4_single_live_center()),
+        ("boundary_touching", fixture_l4_boundary_touching()),
+        ("random_seed_42", fixture_l4_seeded_random(42, 0.30)),
+    ]
+}
+
+#[test]
+fn cpu_level_4_empty_stays_empty() {
+    let inp = fixture_l4_empty();
+    let out = cpu_level_4_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "empty L4 → empty L3");
+}
+
+#[test]
+fn cpu_level_4_full_dies() {
+    // Dense regions in Bays-5766 collapse: inner cells have 26 alive
+    // neighbors, and survive mask is {5,6} only.
+    let inp = fixture_l4_full();
+    let out = cpu_level_4_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "full L4 → empty L3");
+}
+
+#[test]
+fn cpu_level_4_single_live_dies() {
+    // Single live cell with 0 neighbors → dies. Surrounding dead cells
+    // have 1 alive neighbor → don't satisfy B{5,6,7} → stay dead.
+    let inp = fixture_l4_single_live_center();
+    let out = cpu_level_4_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "single-live L4 → empty L3");
+}
+
+#[test]
+#[ignore]
+fn gpu_level_4_matches_cpu_on_corpus() {
+    let ctx = match GpuCtx::new() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no GPU adapter");
+            return;
+        }
+    };
+    let corpus = level_4_corpus();
+    let worlds: Vec<[u32; L4_CELLS]> = corpus.iter().map(|(_, w)| *w).collect();
+    let cpu_results: Vec<[u32; L3_CELLS]> = worlds.iter().map(cpu_level_4_step).collect();
+    let gpu_results = run_level_4_step_gpu(&ctx, &worlds);
+    assert_eq!(gpu_results.len(), worlds.len(), "result count");
+    for (idx, (label, _)) in corpus.iter().enumerate() {
+        let cpu = &cpu_results[idx];
+        let gpu = &gpu_results[idx];
+        for (cell_idx, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert_eq!(g, c, "fixture {label} cell {cell_idx}: GPU={g} CPU={c}");
+        }
+        let live_count = cpu.iter().filter(|&&c| c == 1).count();
+        eprintln!("fixture {label}: {live_count} live cells in 8³ result");
+    }
 }
