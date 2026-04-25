@@ -274,7 +274,7 @@ jobs:
       # installs for per-push compile checks. --no-install-recommends
       # mirrors ci.yml exactly so release builds don't diverge from what
       # CI is validating on every push.
-      - name: Linux system deps (winit / wgpu)
+      - name: Linux system deps (winit / wgpu / AppImage)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -284,7 +284,8 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxcursor-dev libxi-dev libxrandr-dev \
             libudev-dev \
-            libgl1-mesa-dev libegl1-mesa-dev
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libfuse2
 
       - name: Cache cargo (release)
         uses: Swatinem/rust-cache@5cb072d7354962be830356aa6b146f7612846014 # v2.7.5
@@ -320,6 +321,74 @@ jobs:
           # Same idempotent publish as the windows-exe sibling. The create
           # path wins for whichever platform job finishes first; the other
           # falls back to upload --clobber.
+          if ! gh release create "$TAG" "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes; then
+            echo "release $TAG already exists — uploading asset with --clobber"
+            gh release upload "$TAG" "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          fi
+
+      # AppImage wrapping (hash-thing-679, follow-up to xb7.3). Mirrors
+      # ci.yml's AppImage build but pins linuxdeploy by SHA256 — release
+      # artifacts must be reproducible across re-runs of the same tag, so
+      # the `continuous` rolling channel needs an explicit hash gate. Refresh
+      # LINUXDEPLOY_SHA256 (and re-run) when an upstream linuxdeploy update
+      # is wanted; the current value was captured 2026-04-25 (mtime
+      # 2026-04-12).
+      - name: Build AppImage
+        shell: bash
+        env:
+          LINUXDEPLOY_URL: https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          LINUXDEPLOY_SHA256: f10e520f5948ed04ad31b160cca3f79476e1a52bb0f8c184981ce66cdcfa116a
+        run: |
+          set -euo pipefail
+          curl -fsSL -o linuxdeploy-x86_64.AppImage "$LINUXDEPLOY_URL"
+          echo "${LINUXDEPLOY_SHA256}  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable target/release/hash-thing \
+            --desktop-file packaging/linux/hash-thing.desktop \
+            --icon-file packaging/linux/hash-thing.svg \
+            --output appimage
+
+      # linuxdeploy derives the output filename from the .desktop Name= field
+      # (Hash-Thing-x86_64.AppImage), so rename to the platform-qualified
+      # asset name that matches the bare-binary convention before publish.
+      - name: Stage AppImage release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          # linuxdeploy emits the file in the workdir; capture the first match.
+          src=$(find . -maxdepth 1 -name 'Hash-Thing-*x86_64.AppImage' -print -quit)
+          if [ -z "$src" ] || [ ! -f "$src" ]; then
+            echo "::error::expected linuxdeploy to produce a Hash-Thing-*x86_64.AppImage"
+            find . -maxdepth 1 -name '*.AppImage' -ls || true
+            exit 1
+          fi
+          mv "$src" hash-thing-linux-x86_64.AppImage
+
+      - name: Publish Linux AppImage to GitHub release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          artifact="hash-thing-linux-x86_64.AppImage"
+          if [ ! -f "$artifact" ]; then
+            echo "::error::expected $artifact but the Build AppImage step did not produce it"
+            exit 1
+          fi
+
+          # Same idempotent publish pattern as the bare-binary sibling. By
+          # this point the bare-binary publish above has already run, so the
+          # release exists — the create path falls through to upload.
           if ! gh release create "$TAG" "$artifact" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" \
