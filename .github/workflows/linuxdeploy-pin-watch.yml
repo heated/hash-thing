@@ -1,0 +1,71 @@
+name: linuxdeploy SHA pin watch
+
+# Early-warning for hash-thing-kfpp: release.yml pins linuxdeploy by SHA256
+# against its `continuous` rolling channel, so the pinned hash will
+# eventually go stale upstream. Without this watcher, the first signal of
+# drift would be a release-tag run failing on `sha256sum -c -` — i.e. on
+# tag day, the worst possible time.
+#
+# This job re-runs that exact verify step on a weekly cadence and on any
+# push that touches release.yml. The pinned SHA is parsed from release.yml
+# so there is one source of truth.
+
+on:
+  schedule:
+    # Weekly on Mondays. Off the hour to avoid scheduler pileups.
+    - cron: '23 8 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/linuxdeploy-pin-watch.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linuxdeploy-pin-watch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-pin:
+    name: Re-verify pinned SHA against upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Parse pinned SHA from release.yml
+        id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="${GITHUB_WORKSPACE}/.github/workflows/release.yml"
+          url=$(grep -E '^\s*LINUXDEPLOY_URL:' "$release" | head -n1 | awk '{print $2}')
+          sha=$(grep -E '^\s*LINUXDEPLOY_SHA256:' "$release" | head -n1 | awk '{print $2}')
+          if [[ -z "$url" || -z "$sha" ]]; then
+            echo "::error::could not parse LINUXDEPLOY_URL/LINUXDEPLOY_SHA256 from release.yml"
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Download upstream linuxdeploy and verify
+        shell: bash
+        env:
+          LINUXDEPLOY_URL: ${{ steps.parse.outputs.url }}
+          LINUXDEPLOY_SHA256: ${{ steps.parse.outputs.sha }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o linuxdeploy-x86_64.AppImage "$LINUXDEPLOY_URL"
+          actual=$(sha256sum linuxdeploy-x86_64.AppImage | awk '{print $1}')
+          if [[ "$actual" != "$LINUXDEPLOY_SHA256" ]]; then
+            echo "::error::linuxdeploy continuous SHA drifted"
+            echo "  pinned (release.yml): $LINUXDEPLOY_SHA256"
+            echo "  upstream (continuous): $actual"
+            echo "Update LINUXDEPLOY_SHA256 in .github/workflows/release.yml after"
+            echo "vetting the new build, or wait for an upstream-tagged release."
+            exit 1
+          fi
+          echo "linuxdeploy continuous matches pinned SHA: $actual"
