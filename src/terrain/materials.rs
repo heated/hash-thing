@@ -216,6 +216,11 @@ pub struct MaterialRegistry {
     // dispatch; without caching, the old `noop_flags()` allocated a
     // Vec<bool> on every call.
     cached_noop_flags: Vec<bool>,
+    // hash-thing-qy4g.1: cached "any material has a LocalRule assigned"
+    // flag. Read on every base-case `step_grid_once` call to gate Phase 3,
+    // so an O(N) scan would re-introduce the same per-step cost the other
+    // caches were added to remove. Rebuilt by `rebuild_tick_caches`.
+    cached_has_local_rules: bool,
 }
 
 impl Clone for MaterialRegistry {
@@ -228,6 +233,7 @@ impl Clone for MaterialRegistry {
             cached_tick_divisor_flags: self.cached_tick_divisor_flags.clone(),
             cached_block_rule_tick_divisors: self.cached_block_rule_tick_divisors.clone(),
             cached_noop_flags: self.cached_noop_flags.clone(),
+            cached_has_local_rules: self.cached_has_local_rules,
         }
     }
 }
@@ -251,6 +257,7 @@ impl MaterialRegistry {
             cached_tick_divisor_flags: Vec::new(),
             cached_block_rule_tick_divisors: Vec::new(),
             cached_noop_flags: Vec::new(),
+            cached_has_local_rules: false,
         }
     }
 
@@ -844,14 +851,13 @@ impl MaterialRegistry {
         self.entry(cell.material())?.local_rule_id
     }
 
-    /// True if any registered material has a LocalRule assigned. O(materials).
-    /// Used by `step_grid_once` to gate the Phase 3 snapshot+apply loop —
-    /// returns false on the shipping (no-LocalRule) path so the loop is
-    /// strictly zero-cost there (hash-thing-qy4g.1).
+    /// True if any registered material has a LocalRule assigned. O(1) — reads
+    /// `cached_has_local_rules`, refreshed by `rebuild_tick_caches` on every
+    /// mutation path. Used by `step_grid_once` to gate the Phase 3 snapshot+
+    /// apply loop, so the shipping (no-LocalRule) path stays a single bool
+    /// load (hash-thing-qy4g.1).
     pub fn has_local_rules(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.as_ref().is_some_and(|e| e.local_rule_id.is_some()))
+        self.cached_has_local_rules
     }
 
     /// True if this cell has no block rule, no non-self-inert local rule, and
@@ -967,6 +973,14 @@ impl MaterialRegistry {
                     .unwrap_or(false)
             })
             .collect();
+        // hash-thing-qy4g.1: keep the Phase 3 gate a single bool load on the
+        // shipping path. Same invalidation set as the tick caches: any
+        // mutation that could change `local_rule_id` on an entry routes
+        // through `rebuild_tick_caches` via `mutate_materials`.
+        self.cached_has_local_rules = self
+            .entries
+            .iter()
+            .any(|entry| entry.as_ref().is_some_and(|e| e.local_rule_id.is_some()));
     }
 
     /// Panic if any two materials sharing one BlockRule have different
@@ -1085,6 +1099,11 @@ impl MaterialRegistry {
     pub fn register_local_rule(&mut self, rule: impl Into<LocalRule>) -> LocalRuleId {
         let id = LocalRuleId(self.local_rules.len());
         self.local_rules.push(rule.into());
+        // Registration alone doesn't flip `cached_has_local_rules` (no entry
+        // references this id yet), but rebuild keeps the cache in lockstep
+        // with the other tick caches and matches `register_block_rule`'s
+        // pattern (hash-thing-qy4g.1).
+        self.rebuild_tick_caches();
         id
     }
 
@@ -1103,6 +1122,9 @@ impl MaterialRegistry {
                 panic!("material {material_id} must exist before assigning a local rule")
             })
             .local_rule_id = Some(local_rule_id);
+        // Refresh `cached_has_local_rules` — the Phase 3 gate in
+        // `step_grid_once` reads it on every base-case call (hash-thing-qy4g.1).
+        self.rebuild_tick_caches();
     }
 
     /// Set the tick divisor for an existing material.

@@ -709,13 +709,27 @@ impl World {
         // Phase 3: LocalRule (hash-thing-qy4g.1). Read-old/write-new with a
         // stack snapshot of post-Phase-2 state. Cells whose material has no
         // LocalRule fall through and `next[idx]` retains its post-Phase-2
-        // value. Y bounds match Phase 1 (1..side-1); the level-3 base case
-        // extracts only the center 4³ (Y ∈ [2,5]) from `next`, so above/below
-        // reads land within Phase 1's processed range and the boundary rows
-        // we may write are discarded by extraction.
+        // value. Y bounds match Phase 1 (1..side-1); boundary writes at y=1
+        // and y=side-2 (computed from snapshot rows that were not processed
+        // by this call's Phase 1) are either overwritten by the next
+        // step's Phase 1 in `step_base_case_macro`'s chained second call
+        // or discarded by the level-3 center extraction at Y ∈ [2,5].
         //
-        // Gated on `has_local_rules()` so the no-LocalRule shipping path is
-        // strictly zero-cost (no snapshot copy, no inner loop).
+        // Boundary budget caveat: Phase 3 adds 1 cell of y-axis propagation
+        // per generation on top of CaRule's 1 + BlockRule's 1, totaling 3 in
+        // y vs 2 in x/z. The level-3 base case has only 4 boundary cells
+        // per side over its 2-generation chain, so a non-`is_self_inert`
+        // LocalRule can over-shoot the y budget by up to 2 cells. This is
+        // harmless for qy4g.1 (the only LocalRule defined is
+        // `IdentityLocalRule`, which is `is_self_inert == true`, and no
+        // material is wired to use it — `has_local_rules() == false` keeps
+        // Phase 3 out of the call graph). The follow-up bead that lands the
+        // first non-trivial LocalRule must either expand the base case
+        // padding or restructure the chain.
+        //
+        // Gated on the cached `has_local_rules` flag so the no-LocalRule
+        // shipping path is a single bool load (no scan, no snapshot copy,
+        // no inner loop).
         if self.materials.has_local_rules() {
             let snapshot = next;
             for z in 1..side - 1 {
@@ -2301,8 +2315,12 @@ mod tests {
     /// every material in the registry must not perturb step output. This
     /// is the read-old/write-new contract test: if Phase 3 wrote into the
     /// snapshot or read from `next` mid-loop, results would drift from
-    /// the no-LocalRule baseline. N >= 4 generations exercise the macro
-    /// path (`step_recursive_pow2`) on top of the base case.
+    /// the no-LocalRule baseline. Driven by `step_recursive` (which routes
+    /// through `step_node` → `step_base_case_macro` for level-3 worlds),
+    /// covering the recursive path that exercises Phase 3.
+    /// `step_recursive_pow2` macro-path coverage is deferred to the bead
+    /// that lands the first non-trivial LocalRule (where boundary budget
+    /// also becomes load-bearing — see the Phase 3 inline comment).
     #[test]
     fn identity_local_rule_does_not_perturb_step_output() {
         use crate::sim::rule::IdentityLocalRule;
