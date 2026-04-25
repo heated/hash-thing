@@ -2600,9 +2600,10 @@ mod tests {
     use crate::render::Svdag;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
-        MaterialRegistry, FAN, FAN_ARMED_FIREWORK_MATERIAL_IDS, FAN_ARMED_STEAM_MATERIAL_IDS, FIRE,
-        FIREWORK, FIREWORK_MATERIAL_ID, GRASS, ICE, LAVA, OIL, SAND, STEAM, STEAM_MATERIAL_ID,
-        STONE, VINE, WATER,
+        MaterialRegistry, AIR_MATERIAL_ID, FAN, FAN_ARMED_FIREWORK_MATERIAL_IDS,
+        FAN_ARMED_STEAM_MATERIAL_IDS, FIRE, FIREWORK, FIREWORK_MATERIAL_ID, FIRE_MATERIAL_ID,
+        GRASS, ICE, ICE_MATERIAL_ID, LAVA, LAVA_MATERIAL_ID, OIL, OIL_MATERIAL_ID, SAND, STEAM,
+        STEAM_MATERIAL_ID, STONE, VINE, VINE_MATERIAL_ID, WATER, WATER_MATERIAL_ID,
     };
     use std::collections::{HashSet, VecDeque};
 
@@ -3506,15 +3507,15 @@ mod tests {
             }
         }
         // Map material id → expected floor.
-        let air_count = counts[0];
-        let fire_count = counts[4];
-        let water_count = counts[5];
-        let lava_count = counts[7];
-        let ice_count = counts[8];
-        let oil_count = counts[10];
-        let steam_count = counts[12];
-        let vine_count = counts[15];
-        let firework_count = counts[17];
+        let air_count = counts[AIR_MATERIAL_ID as usize];
+        let fire_count = counts[FIRE_MATERIAL_ID as usize];
+        let water_count = counts[WATER_MATERIAL_ID as usize];
+        let lava_count = counts[LAVA_MATERIAL_ID as usize];
+        let ice_count = counts[ICE_MATERIAL_ID as usize];
+        let oil_count = counts[OIL_MATERIAL_ID as usize];
+        let steam_count = counts[STEAM_MATERIAL_ID as usize];
+        let vine_count = counts[VINE_MATERIAL_ID as usize];
+        let firework_count = counts[FIREWORK_MATERIAL_ID as usize];
         assert!(air_count > 100_000, "AirRule coverage too low: {air_count}");
         assert!(fire_count > 16, "FireRule coverage too low: {fire_count}");
         assert!(
@@ -4196,7 +4197,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::sim::margolus::{GravityBlockRule, IdentityBlockRule};
-    use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE_MATERIAL_ID, WATER_MATERIAL_ID};
+    use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE_MATERIAL_ID};
 
     fn simple_density(cell: Cell) -> f32 {
         if cell.is_empty() {

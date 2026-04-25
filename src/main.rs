@@ -936,10 +936,40 @@ impl App {
             return false;
         };
         let center = self.world_center();
+        let blind_pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
+
+        // hash-thing-t3zn.1: blind teleport to `center + 2 cells up` lands
+        // inside terrain when the world center is buried. Scan upward at
+        // (cx, cz) for the first AABB-clear, grounded pose; on no match the
+        // `unwrap_or(blind_pos)` below falls back to the blind pose (covers
+        // the empty world — `is_grounded` is false everywhere, so the loop
+        // exits without setting `grounded_pos` — and the all-solid column).
+        //
+        // Ceiling bound is AABB-aware and mirrors `player::player_collides`:
+        // that helper iterates cells up to `floor(pos[1] + PLAYER_HEIGHT)`
+        // inclusive and reads out-of-region cells as 0, so a naive scan
+        // could declare clearance while the player's head cell sits outside
+        // the realized region. Stop the scan as soon as the topmost AABB
+        // cell `floor(search_y + PLAYER_HEIGHT)` would land at `world_top`.
+        let world_top = (self.world.origin[1] + self.world.side() as i64) as f64;
+        let mut search_y = blind_pos[1].floor();
+        let mut grounded_pos: Option<[f64; 3]> = None;
+        while (search_y + player::PLAYER_HEIGHT).floor() < world_top {
+            let cand = [blind_pos[0], search_y, blind_pos[2]];
+            if !player::player_collides(&self.world, &cand)
+                && player::is_grounded(&self.world, &cand)
+            {
+                grounded_pos = Some(cand);
+                break;
+            }
+            search_y += 1.0;
+        }
+        let pos = grounded_pos.unwrap_or(blind_pos);
+
         let Some(player) = self.entities.get_mut(pid) else {
             return false;
         };
-        player.pos = [center[0], center[1] + 2.0 * CELLS_PER_METER, center[2]];
+        player.pos = pos;
         true
     }
 
@@ -3991,15 +4021,9 @@ mod tests {
     }
 
     /// Audit `0` (recenter_player): recenter from inside a seeded scene
-    /// must not drop the player AABB into a solid cell.
-    ///
-    /// Currently FAILS — recenter blindly teleports to world_center + 2
-    /// cells up, which lands inside the lattice room geometry. See
-    /// hash-thing-t3zn.1 for the fix bead; un-#[ignore] when it lands.
-    /// Grounded support is intentionally not asserted here — a separate
-    /// bead would be needed if recenter is meant to seek floor support.
+    /// must not drop the player AABB into a solid cell, and must land on a
+    /// surface with floor support (per the t3zn.1 acceptance line).
     #[test]
-    #[ignore = "hash-thing-t3zn.1: recenter_player teleports into solid cells, fix pending"]
     fn warp_0_recenter_player_into_lattice_demo_lands_in_playable_space() {
         let mut app = App::new(256);
         // Seed a real scene so the player exists and the world has solid
@@ -4030,6 +4054,68 @@ mod tests {
         assert!(
             !player::player_collides(&app.world, &pos),
             "0 / recenter_player: player AABB at {pos:?} overlaps a solid cell",
+        );
+        assert!(
+            player::is_grounded(&app.world, &pos),
+            "0 / recenter_player: player at {pos:?} has no floor support",
+        );
+    }
+
+    /// hash-thing-t3zn.1: positive scan-path test. Blind candidate is
+    /// inside a solid column; a grounded surface exists higher in the same
+    /// column. Recenter must climb to that surface, not fall back.
+    /// Side=64 so the AABB-aware ceiling has enough headroom above the
+    /// stone column for the climb to land (player AABB ≈ 7 cells tall).
+    #[test]
+    fn recenter_player_climbs_buried_column() {
+        let mut app = App::new(64);
+        let stone = hash_thing::octree::Cell::pack(1, 0).raw();
+        let center = app.world_center();
+        let cx = center[0].floor() as i64;
+        let cz = center[2].floor() as i64;
+        let blind_y = (center[1] + 2.0 * CELLS_PER_METER).floor() as i64;
+        // Fill a stone column from y=0 through the bottom half of the blind
+        // candidate's AABB. The blind AABB occupies cells [blind_y,
+        // blind_y+6] inclusive (PLAYER_HEIGHT=6.4); the column tops at
+        // cell `blind_y+3` (`0..column_top` excludes `column_top`). The
+        // first clear+grounded scan candidate is `search_y = column_top`:
+        // its AABB starts at `column_top`, support cell `column_top-1` is
+        // the topmost stone, and the cells above are clear.
+        let column_top = blind_y + 4;
+        for y in 0..column_top {
+            for x in (cx - 2)..=(cx + 2) {
+                for z in (cz - 2)..=(cz + 2) {
+                    app.world.set(
+                        sim::WorldCoord(x),
+                        sim::WorldCoord(y),
+                        sim::WorldCoord(z),
+                        stone,
+                    );
+                }
+            }
+        }
+        // Spawn a player so recenter has a target entity.
+        app.reset_scene_entities();
+        assert!(app.recenter_player(), "recenter must succeed");
+
+        let pid = app.player_id.expect("player exists");
+        let player = app.entities.iter().find(|e| e.id == pid).expect("player");
+        let pos = player.pos;
+        assert!(
+            !player::player_collides(&app.world, &pos),
+            "recenter must climb out of the solid column; pos={pos:?}",
+        );
+        assert!(
+            player::is_grounded(&app.world, &pos),
+            "recenter must land on the surface above the column; pos={pos:?}",
+        );
+        assert_eq!(
+            pos[1], column_top as f64,
+            "recenter must land exactly on the surface above the stone column: \
+             pos.y={} blind_y={} column_top={}",
+            pos[1],
+            blind_y,
+            column_top,
         );
     }
 }
