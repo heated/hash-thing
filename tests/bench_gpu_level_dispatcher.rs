@@ -225,6 +225,8 @@ struct GpuCtx {
     bgl_base_case: wgpu::BindGroupLayout,
     pipeline_recursive_l4: wgpu::ComputePipeline,
     bgl_recursive_l4: wgpu::BindGroupLayout,
+    timestamp_supported: bool,
+    timestamp_period_ns: f32,
 }
 
 impl GpuCtx {
@@ -242,13 +244,26 @@ impl GpuCtx {
             force_fallback_adapter: false,
         }))
         .ok()?;
+        let af = adapter.features();
+        let timestamp_supported = af.contains(wgpu::Features::TIMESTAMP_QUERY)
+            && af.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let mut required_features = wgpu::Features::empty();
+        if timestamp_supported {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+            required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("bench_gpu_level_dispatcher"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             ..Default::default()
         }))
         .ok()?;
+        let timestamp_period_ns = if timestamp_supported {
+            queue.get_timestamp_period()
+        } else {
+            0.0
+        };
 
         let bgl_base_case = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("base_case_bgl"),
@@ -302,6 +317,8 @@ impl GpuCtx {
             bgl_base_case,
             pipeline_recursive_l4,
             bgl_recursive_l4,
+            timestamp_supported,
+            timestamp_period_ns,
         })
     }
 }
@@ -1092,5 +1109,368 @@ fn gpu_level_4_matches_cpu_on_corpus() {
         }
         let live_count = cpu.iter().filter(|&&c| c == 1).count();
         eprintln!("fixture {label}: {live_count} live cells in 8³ result");
+    }
+}
+
+// ===========================================================================
+// Throughput driver (commit 3 — perf measurement for §8.7 paper appendix).
+//
+// Per plan adjustment 6: N-worlds × 1 iter (N = 64), NOT 1-world × 100 iters.
+// At level-4 root with one world, dispatch 2 runs a single thread — measures
+// nothing useful. Stack 64 random worlds into one buffer so dispatch 2 has
+// 64 active threads.
+//
+// Per plan adjustment 7: each iteration starts from freshly cleared buffers
+// + freshly uploaded inputs (no step chaining — avoids 3D Life's tendency
+// to converge to sparse states which would trivialize subsequent iters).
+//
+// Per plan adjustment 9: in-encoder timestamps PER DISPATCH so we can
+// distinguish "primitive is fast, scaling open" from "primitive itself slow."
+// ===========================================================================
+
+#[derive(Default, Debug, Clone, Copy)]
+struct TimedRun {
+    dispatch_1_gpu: Option<std::time::Duration>,
+    dispatch_2_gpu: Option<std::time::Duration>,
+    wall_total: std::time::Duration,
+}
+
+fn run_level_4_step_gpu_timed(
+    ctx: &GpuCtx,
+    worlds: &[[u32; L4_CELLS]],
+) -> (Vec<[u32; L3_CELLS]>, TimedRun) {
+    let num_worlds = worlds.len() as u32;
+    assert!(num_worlds > 0, "need at least one world");
+    let wall_start = Instant::now();
+
+    // Build all (num_worlds * 27) intermediate inputs CPU-side.
+    let mut flat_inputs: Vec<u32> = Vec::with_capacity(worlds.len() * NUM_INTERMEDIATES * L3_CELLS);
+    for input in worlds {
+        for k in 0..3 {
+            for j in 0..3 {
+                for i in 0..3 {
+                    let im = build_intermediate(input, i, j, k);
+                    flat_inputs.extend_from_slice(&im);
+                }
+            }
+        }
+    }
+    let num_intermediate_inputs = num_worlds * NUM_INTERMEDIATES as u32;
+    let intermediate_input_buf = make_input_buffer(ctx, "timed_intermediate_inputs", &flat_inputs);
+    let intermediate_results_buf = make_output_buffer(
+        ctx,
+        "timed_intermediate_results",
+        num_intermediate_inputs * L2_CELLS as u32,
+    );
+    let final_output_buf =
+        make_output_buffer(ctx, "timed_final_outputs", num_worlds * L3_CELLS as u32);
+
+    let base_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("timed_base_params"),
+            contents: bytemuck::bytes_of(&BaseCaseParams {
+                num_inputs: num_intermediate_inputs,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_base = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("timed_bg_base"),
+        layout: &ctx.bgl_base_case,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: base_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: intermediate_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    // Per-dispatch timestamp infra. Two QuerySets (one per dispatch), each with
+    // 2 slots (start, end). Resolve+copy in the same encoder so the data is
+    // available after the corresponding queue.submit.
+    let make_ts_set = |label: &str| -> Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer)> {
+        if !ctx.timestamp_supported {
+            return None;
+        }
+        let qs = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some(label),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts_resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts_readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some((qs, resolve, readback))
+    };
+    let ts1 = make_ts_set("timed_ts_dispatch1");
+    let ts2 = make_ts_set("timed_ts_dispatch2");
+
+    // ---- Dispatch 1 ----
+    let mut enc1 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("timed_enc1"),
+        });
+    if let Some((qs, _, _)) = &ts1 {
+        enc1.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("timed_pass1"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_base_case);
+        cpass.set_bind_group(0, &bg_base, &[]);
+        let total_threads = num_intermediate_inputs * L2_CELLS as u32;
+        let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+        cpass.dispatch_workgroups(groups, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts1 {
+        enc1.write_timestamp(qs, 1);
+        enc1.resolve_query_set(qs, 0..2, resolve, 0);
+        enc1.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc1.finish()));
+
+    // ---- Dispatch 2 ----
+    let rec_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("timed_rec_params"),
+            contents: bytemuck::bytes_of(&RecursiveParams {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_rec = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("timed_bg_rec"),
+        layout: &ctx.bgl_recursive_l4,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: rec_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: final_output_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc2 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("timed_enc2"),
+        });
+    if let Some((qs, _, _)) = &ts2 {
+        enc2.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("timed_pass2"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_recursive_l4);
+        cpass.set_bind_group(0, &bg_rec, &[]);
+        cpass.dispatch_workgroups(num_worlds, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts2 {
+        enc2.write_timestamp(qs, 1);
+        enc2.resolve_query_set(qs, 0..2, resolve, 0);
+        enc2.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc2.finish()));
+
+    // ---- Readback (output cells + timestamps) ----
+    let flat = read_buffer_u32(ctx, &final_output_buf, num_worlds * L3_CELLS as u32);
+    let mut out: Vec<[u32; L3_CELLS]> = Vec::with_capacity(worlds.len());
+    for chunk in flat.chunks(L3_CELLS) {
+        let mut arr = [0u32; L3_CELLS];
+        arr.copy_from_slice(chunk);
+        out.push(arr);
+    }
+
+    let read_ts = |readback: &wgpu::Buffer| -> Option<std::time::Duration> {
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        rx.recv().ok()?.ok()?;
+        let ticks = {
+            let data = slice.get_mapped_range();
+            let ts: &[u64] = bytemuck::cast_slice(&data);
+            if ts.len() >= 2 && ts[1] > ts[0] {
+                Some(ts[1] - ts[0])
+            } else {
+                None
+            }
+        };
+        readback.unmap();
+        ticks.map(|t| {
+            std::time::Duration::from_nanos((t as f64 * ctx.timestamp_period_ns as f64) as u64)
+        })
+    };
+    let dispatch_1_gpu = ts1.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+    let dispatch_2_gpu = ts2.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+
+    (
+        out,
+        TimedRun {
+            dispatch_1_gpu,
+            dispatch_2_gpu,
+            wall_total: wall_start.elapsed(),
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn gpu_level_4_throughput() {
+    let ctx = match GpuCtx::new() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no GPU adapter");
+            return;
+        }
+    };
+    eprintln!(
+        "GPU dispatcher throughput (timestamp_supported={}, period_ns={})",
+        ctx.timestamp_supported, ctx.timestamp_period_ns
+    );
+
+    const N_WORLDS: usize = 64;
+    const N_ITERS: usize = 10;
+
+    // Build N=64 random worlds (mixed seeds to defeat content-address aliasing).
+    let worlds: Vec<[u32; L4_CELLS]> = (0..N_WORLDS)
+        .map(|i| fixture_l4_seeded_random(0x42u64.wrapping_add(i as u64), 0.30))
+        .collect();
+
+    // Warm-up (compile shaders, allocate first set of buffers).
+    let (_warm_out, _warm_t) = run_level_4_step_gpu_timed(&ctx, &worlds);
+
+    // Measure: each iter starts from freshly cleared buffers (driver creates
+    // new buffers per call). No step chaining — per plan adjustment 7.
+    let mut runs: Vec<TimedRun> = Vec::with_capacity(N_ITERS);
+    for _ in 0..N_ITERS {
+        let (_out, t) = run_level_4_step_gpu_timed(&ctx, &worlds);
+        runs.push(t);
+    }
+
+    // Compute median (sort by wall_total, take middle).
+    let mut sorted = runs.clone();
+    sorted.sort_by_key(|r| r.wall_total);
+    let median = sorted[N_ITERS / 2];
+
+    let fmt_dur = |d: std::time::Duration| {
+        let ns = d.as_nanos();
+        if ns < 10_000 {
+            format!("{ns} ns")
+        } else {
+            format!("{:.3} ms", ns as f64 / 1e6)
+        }
+    };
+    eprintln!("median (of {N_ITERS} runs, N={N_WORLDS} worlds, fresh buffers each iter):");
+    eprintln!(
+        "  dispatch 1 (27*N base case, {} threads): {}",
+        N_WORLDS * NUM_INTERMEDIATES * L2_CELLS,
+        median
+            .dispatch_1_gpu
+            .map(fmt_dur)
+            .unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  dispatch 2 (level-4 recursive, {} threads): {}",
+        N_WORLDS,
+        median
+            .dispatch_2_gpu
+            .map(fmt_dur)
+            .unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  wall total (incl. CPU prep + readback): {}",
+        fmt_dur(median.wall_total)
+    );
+
+    // Plan adjustment 5 — verdict criteria:
+    //   GO: per-dispatch ≤ 1 ms AND total step ≤ 5 ms
+    //   NO-GO: per-dispatch > 5 ms (we can't fix in 2h)
+    //   CAVEAT: 1–5 ms per-dispatch — file follow-up beads per issue
+    let d1 = median.dispatch_1_gpu;
+    let d2 = median.dispatch_2_gpu;
+    if let (Some(d1), Some(d2)) = (d1, d2) {
+        let max_dispatch = d1.max(d2);
+        let verdict = if max_dispatch.as_micros() <= 1_000 && median.wall_total.as_micros() <= 5_000
+        {
+            "GO"
+        } else if max_dispatch.as_micros() > 5_000 {
+            "NO-GO"
+        } else {
+            "CAVEAT"
+        };
+        eprintln!("verdict (per plan adjustment 5): {verdict}");
+        eprintln!(
+            "  max(dispatch_1, dispatch_2) = {} {} 1 ms",
+            fmt_dur(max_dispatch),
+            if max_dispatch.as_micros() <= 1_000 {
+                "≤"
+            } else {
+                ">"
+            }
+        );
+        eprintln!(
+            "  wall total = {} {} 5 ms",
+            fmt_dur(median.wall_total),
+            if median.wall_total.as_micros() <= 5_000 {
+                "≤"
+            } else {
+                ">"
+            }
+        );
+    } else {
+        eprintln!("verdict: timestamps unavailable; cannot decide GO/NO-GO from this run");
+    }
+
+    // Also dump all individual runs so noise can be inspected manually.
+    eprintln!("--- per-iter detail ---");
+    for (i, r) in runs.iter().enumerate() {
+        eprintln!(
+            "  iter {i}: d1={} d2={} wall={}",
+            r.dispatch_1_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            r.dispatch_2_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            fmt_dur(r.wall_total),
+        );
     }
 }

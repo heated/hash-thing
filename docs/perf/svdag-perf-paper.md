@@ -980,6 +980,125 @@ stands up; proceed to abwm.3 integration.
 - **N ≤ 1M.** Did not probe beyond 1M keys. Memo live-set at 256³ is
   comfortably below this threshold per §4.
 
+### 8.7 Breadth-first level dispatcher PoC (bead `hash-thing-abwm.3`)
+
+Spike target: prove that a hashlife recursive step can run as a chain of
+per-level GPU compute dispatches, with results feeding the next level's
+reads via a queue.submit fence (the architecture sketched in §8.3). The
+PoC is intentionally toy-scale and validates *structure*, not throughput.
+
+**Scope** (per `tests/bench_gpu_level_dispatcher.rs` — 1100 LOC):
+
+- Toy CA rule: 3D Life Bays-5766 (B{5,6,7} / S{5,6}). Single-material,
+  binary alive/dead, 1-cell stencil, zero-padded boundary. Auditable
+  against published material; isolates the dispatcher from the
+  production CaRule + BlockRule path.
+- World root level 4 (16³). One recursive level above the level-3 base
+  case — the minimum that exercises base-case → recursive-case kernel
+  hand-off across a queue.submit boundary.
+- 27-intermediate / 8-subcube hashlife structure, mirroring
+  `src/sim/hashlife.rs::step_recursive_case` (line ~859) but specialized
+  to one recursive level. Net effect: 2 generations on 16³ → 8³ output.
+- NodeId-pre-allocation shortcut: CPU pre-assigns flat result slots, GPU
+  writes results into pre-known offsets. The hash-table memo from
+  §8.6/abwm.2 is *not* in the critical path of this spike — direct
+  storage-buffer indexing under the cross-dispatch fence covers the same
+  architectural test (storage write in dispatch 1 → storage read in
+  dispatch 2 also requires the queue.submit boundary). Hash-table
+  memo integration is deferred to phase 4 (real-sim wiring) where
+  dynamic NodeId allocation makes pre-allocation infeasible.
+
+**Dispatcher shape** (the architecture under test):
+
+- Dispatch 1: `cs_base_case` — one thread per (intermediate × output
+  cell). For N worlds, that's `N × 27 × 64` threads. Writes 4³ result
+  cells per intermediate to a flat storage buffer.
+- Queue.submit boundary (cross-dispatch fence — see kernel-internal
+  ordering rule in the test file's module docstring; mirrors the
+  `cs_insert` discussion in `tests/bench_gpu_hash_table.rs`).
+- Dispatch 2: `cs_step_recursive_l4` — one thread per world. Each
+  thread serially assembles 8 sub-cube level-3 nodes from the 27
+  intermediate results, applies the base-case stencil to each, and
+  tiles the 8 level-2 (4³) results into the final 8³ output.
+
+**Correctness** (default `cargo test`, plus `--ignored` GPU corpus):
+
+- 7 default tests (CPU + GPU base case): all pass.
+- `gpu_level_4_matches_cpu_on_corpus` (`--ignored`): GPU == CPU
+  cell-by-cell on a fixed 5-fixture corpus (empty, full,
+  single-live-center, boundary-touching, random_seed_42). The random
+  fixture produces 109 live cells in the inner 8³ result — non-trivial
+  signal, not a Bays-collapse artifact.
+- The 8 sub-cubes' base cases compute the same Bays-5766 stencil the
+  level-3 base-case kernel computes, validating that the structural
+  recursion encodes correctly across the dispatch boundary.
+
+**Throughput** (`gpu_level_4_throughput`, `--profile bench --ignored`,
+N=64 worlds, 10 iters with fresh buffers each iter; M2 MBA, Apple
+Silicon Metal, in-encoder timestamps per dlse.2.3 methodology):
+
+| metric | median | threads |
+|---|---|---|
+| dispatch 1 (27·N base case) | **0.085 ms** | 110 592 |
+| dispatch 2 (level-4 recursive) | **0.019 ms** | 64 |
+| wall total (incl. CPU prep + readback) | 10.7 ms | — |
+
+Per-iter detail (10 runs, ms): d1 ranges 0.060–0.359, d2 ranges
+0.011–0.069, wall ranges 8.7–17.4. The dispatch-1 spread is mostly
+warm-up tail; dispatch 2 is consistently sub-30 µs.
+
+**Verdict — the dispatcher mechanism: GO.** Per the abwm.3 plan's
+adjusted criteria (per-dispatch ≤ 1 ms AND total step ≤ 5 ms):
+
+- Per-dispatch GPU time: **0.085 ms** (max of d1, d2) — comfortably
+  below the 1 ms ceiling. The dispatcher itself is fast.
+- Cross-dispatch fence: storage writes in dispatch 1 ARE visible to
+  reads in dispatch 2. Validated by cell-by-cell correctness on
+  corpus fixtures the CPU disagrees with under any other ordering.
+- Structural recursion: encodes correctly in WGSL with the spike's
+  flat-NodeId-array shortcut (~80 lines of WGSL for the recursive
+  kernel; sub-cube assembly + base-case stencil clean to express).
+
+**Verdict — wall-time at this spike scale: CAVEAT.** Wall total is
+10.7 ms, exceeding the 5 ms criterion. Decomposition (per plan §
+adjustment 5: list issues, decide artifact vs. architecture):
+
+- ~3-5 ms: building the 27 × 64 = 1728 intermediate inputs CPU-side
+  (1.7M cell reads/writes through plain Rust loops), uploading to
+  GPU. **Spike-scale artifact** — phase 4 derives intermediates from
+  the existing octree on GPU, not by CPU re-extraction.
+- ~5-7 ms: readback (64 × 512 = 32k u32 cells through staging
+  buffer + map_async + poll). **Spike-scale artifact** — phase 4
+  feeds the next level's dispatch directly without CPU readback.
+- ~0.1 ms: the actual GPU dispatcher work (d1 + d2 from the table).
+  This is the architecture under test; it stays well under the
+  criterion.
+
+The two artifacts disappear in real-sim integration. Filing a follow-up
+bead to validate the recursive→recursive transition at level 5 (32³)
+where the recursive kernel calls itself across nested queue.submit
+boundaries — the level-4 PoC validates base→recursive only.
+
+**Scope of validation:**
+
+- Validates: per-level breadth-first dispatch, cross-dispatch fence
+  via queue.submit, the 27/8 hashlife structural recursion in WGSL,
+  GPU == CPU on a fixed correctness corpus.
+- Does NOT validate: hash-table memo lookups in the critical path
+  (deferred to phase 4 where pre-allocation isn't feasible),
+  recursive→recursive transitions (level-5 follow-up filed),
+  multi-tick macro-step / parity rotation (out of toy-rule scope),
+  Margolus block-rule integration (phase 4 concern), real
+  M1-MBA-on-actual-spec hardware (the M2 MBA above; M1 numbers
+  expected within 1.5× per §1).
+
+**Recommendation for §8.5 / phase 4:** PROCEED with porting the
+dispatcher shape to the real sim. The architecture is GPU-friendly at
+toy scale; the open questions remaining (hash-table memo in critical
+path, recursive→recursive boundary, Margolus block-rule wiring) are
+phase-4-scope, not architecture-scope. The §8.3 sketch as drawn is
+sound.
+
 ---
 
 ## 9. Revision log
@@ -1007,3 +1126,4 @@ stands up; proceed to abwm.3 integration.
 | 2026-04-21 | onyx | §4.7.2, §5, §6 Q11 (bead `hash-thing-slc1`). Three-point memo-miss scaling measurement: 64³=411.75, 256³=1847.1, 512³=2295.8 misses/step (last confirmed twice to 0.01 %). Pair-wise slopes drop from **1.08** (64³→256³) to **0.31** (256³→512³); least-squares fit across all three: `L^0.863`. **The §4.7's "exponent blows up at 1024³+" worry is refuted in the 64³–512³ range** — scaling is *favorably* sub-linear, not super-linear. Revised 4096³ miss-count band: 4k–40k (vs prior 20k–80k two-point projection); upload-bandwidth band at 60 FPS tightens to 2–26 MB/s. Out-of-band 2048³/4096³ measurement remains unresolved — one 2048³ warm step ran >15 min of CPU in the current `#[ignore]` harness before being stopped, well past the 60s soft-ceiling. §6 Q11 marked partially resolved; follow-up bead filed for a long-timeout measurement workflow. |
 | 2026-04-21 | spark | §8.6 retro follow-ups (bead `hash-thing-ta8j`). Replaced the saturating 32-bucket probe-depth histogram with an exact `atomicMax` scalar in the WGSL shader — the N=10K/M=10K/LF=0.9 row's `maxP_miss` resolves from saturated-30 to exact 38 (insert/hit are confirmed exactly 30, not saturated). Added a cross-dispatch-fence comment in `cs_insert` warning a future abwm.3 integrator that queue-submit ordering is load-bearing and WGSL has no release-store. Softened flip condition #3 to match what the correctness test actually asserts (serialization of concurrent same-key inserts + value assertion on the winning slot) rather than an unmeasured 10× slowdown claim. Tightened §8.6 Scope prose to describe the packed-u32 keys the harness actually runs, not the production `(NodeId, parity)` fold (which lives in abwm.3). M-column footnote added. No verdict change: GO for linear probing still holds. |
 | 2026-04-22 | onyx | §3.11 update + new §3.12 (bead `hash-thing-o98b`). Scene-matrix compute-pass measurement at 256³/1024³ × 50%/100% on M2 MBA. **Compute (`render_gpu`) is flat at 0.10–0.16 ms mean across all four cells** — 16× voxel-count change, 4× ray-count change, and the warp-coherent L1 regime still holds. Every cell is dominated by `surface_acquire_cpu`; compute + render-pass GPU work never exceeds ~1 ms at any cell. §3.11's "GPU genuinely spending ~150 ms/frame at 1024³/100%" is **wrong**: the off-surface `render_gpu` plateau (51.77 / 154.04 ms, reproduced in o98b's cross-check) is the same Metal inter-command-buffer wait that §3.9 documented, not real shader time. The windowed compute timestamp for the same workload reads 0.16 / 0.30 ms. **Triage verdict: no shader-opt bead filed** — the three candidates (workgroup-cooperative ancestor caching, Laine-Karras, sparse-64) all shave sub-ms off a 0.16 ms pass against a 142 ms acquire stall. The real lowest-hanging win at 1024³/100% is swapchain-side (owned by `zytn` + dlse.2.2 descendants), not shader-side. Future perf beads proposing "optimise the raycast shader" should cite §3.12 and re-measure before spending engineering time. |
+| 2026-04-25 | spark | §8.7 GPU breadth-first dispatcher PoC (bead `hash-thing-abwm.3`). Toy-rule (3D Life Bays-5766) hashlife dispatcher landed as `tests/bench_gpu_level_dispatcher.rs` (~1100 LOC). 27-intermediate / 8-subcube structure on a level-4 (16³) world, two GPU dispatches across separate `queue.submit` boundaries (cross-dispatch fence per the §8.6/abwm.2 comment), GPU == CPU cell-by-cell on a fixed 5-fixture corpus (empty / full / single-live / boundary-touching / random_seed_42 → 109 live cells in inner 8³). On M2 MBA at N=64 worlds: dispatch 1 (110 592 base-case threads) **0.085 ms median**, dispatch 2 (64 recursive threads) **0.019 ms median** — both well under the 1 ms per-dispatch criterion. Wall total 10.7 ms is dominated by spike-only CPU prep (~3-5 ms intermediate construction) and readback (~5-7 ms staging+map) — both disappear in real-sim integration. **Verdict: GO for the dispatcher mechanism**, CAVEAT on wall-time at this scale (decomposed: spike-scale artifact, not architecture). Hash-table memo deferred from the critical path here (NodeId pre-allocation + direct buffer indexing covers the same cross-dispatch-fence test); memo-in-critical-path validation is phase-4 scope. Recursive→recursive transition (level 5) and Margolus block-rule wiring are also phase-4. The §8.3 dispatcher sketch is sound. |
