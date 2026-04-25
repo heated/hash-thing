@@ -1448,7 +1448,23 @@ impl World {
     /// spectacle around each waypoint. The exact route/controls stay external;
     /// this just makes the content reproducible for whichever beat loader
     /// consumes it.
+    ///
+    /// Coordinate convention: every cell write here passes raw local indices
+    /// straight into `fill_box` / `set` as `WorldCoord`. That is only
+    /// correct when `self.origin == [0, 0, 0]`; under any other origin the
+    /// `local_from_world` subtraction would shift the entire spectacle by
+    /// `-origin`. Today the only caller (`App::load_demo_spectacle`) always
+    /// builds a fresh `World::new(level)` first, so the assumption holds.
+    /// The assert below locks it in — if a future caller (multiplayer,
+    /// streaming, 4096+ epics) ever seeds spectacle into a shifted world,
+    /// fail loudly here instead of silently mis-placing geometry. See
+    /// hash-thing-zksj.
     pub fn seed_demo_spectacle(&mut self) {
+        assert_eq!(
+            self.origin,
+            [0, 0, 0],
+            "seed_demo_spectacle assumes origin=[0,0,0]; helpers pass local coords as WorldCoord and would silently shift by -origin otherwise (hash-thing-zksj)"
+        );
         let waypoints = self.demo_waypoints();
         let first = waypoints
             .first()
