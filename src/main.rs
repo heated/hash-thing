@@ -218,6 +218,22 @@ impl PendingSceneSwap {
             Self::SelectRule(_, _) => "select_rule",
         }
     }
+
+    /// True if dispatching this swap replaces `world`, making any
+    /// concurrently-queued player action stale (it was queued against the
+    /// world we're about to throw out — see a9jd / drain comment). False
+    /// when the swap only re-keys auxiliary state on the existing world.
+    fn discards_world(self) -> bool {
+        match self {
+            Self::LoadLatticeDemo
+            | Self::LoadLatticePanoramaDemo
+            | Self::ResetTerrain
+            | Self::LoadGyroid
+            | Self::LoadDemoSpectacle
+            | Self::ResetGolSmoke => true,
+            Self::SelectRule(_, _) => false,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1155,7 +1171,10 @@ impl App {
     }
 
     fn apply_selected_rule(&mut self, rule: sim::GameOfLife3D, label: &'static str) {
-        self.world.invalidate_material_caches();
+        // set_gol_smoke_rule routes through mutate_materials, which already
+        // invalidates the material-dependent hashlife caches (sim/world.rs:529).
+        // The !gol_smoke_scene branch doesn't change the registry, so it has
+        // no caches to invalidate either.
         if self.gol_smoke_scene {
             self.world.set_gol_smoke_rule(rule);
             if let Some(renderer) = &mut self.renderer {
@@ -2352,13 +2371,18 @@ impl ApplicationHandler for App {
                 }
 
                 if !self.is_stepping() {
-                    // a9jd: drain a queued scene swap FIRST. If one is set, the
-                    // pending player action was queued against the world
-                    // that's about to be discarded, so running it first would
-                    // do a full SVDAG rebuild/upload that the scene swap
-                    // immediately throws away. Dropping the player action in
-                    // that case matches "latest intent wins."
-                    if self.pending_scene_swap.is_some() {
+                    // a9jd: drain a queued scene swap FIRST. If one is set and
+                    // it replaces `world`, the pending player action was
+                    // queued against the world that's about to be discarded,
+                    // so running it first would do a full SVDAG rebuild/upload
+                    // that the scene swap immediately throws out. Dropping the
+                    // player action in that case matches "latest intent wins."
+                    // Swaps that don't discard the world (SelectRule, 9t8m)
+                    // preserve the queued action.
+                    if self
+                        .pending_scene_swap
+                        .is_some_and(PendingSceneSwap::discards_world)
+                    {
                         self.pending_player_action = None;
                     }
                     self.run_pending_scene_swap();
@@ -3036,6 +3060,21 @@ mod tests {
         let c = PendingSceneSwap::SelectRule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn pending_scene_swap_discards_world_classification() {
+        // hash-thing-9t8m post-review: SelectRule must NOT discard a queued
+        // player action — it only re-keys the material registry on the
+        // existing post-step world. Every other variant replaces `world` and
+        // therefore invalidates any concurrently-queued player action.
+        assert!(!PendingSceneSwap::SelectRule(sim::GameOfLife3D::rule445(), "445").discards_world());
+        assert!(PendingSceneSwap::LoadLatticeDemo.discards_world());
+        assert!(PendingSceneSwap::LoadLatticePanoramaDemo.discards_world());
+        assert!(PendingSceneSwap::ResetTerrain.discards_world());
+        assert!(PendingSceneSwap::LoadGyroid.discards_world());
+        assert!(PendingSceneSwap::LoadDemoSpectacle.discards_world());
+        assert!(PendingSceneSwap::ResetGolSmoke.discards_world());
     }
 
     #[test]
