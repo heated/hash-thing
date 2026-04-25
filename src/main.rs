@@ -1952,6 +1952,7 @@ impl ApplicationHandler for App {
             // signal — macOS Mission Control / Spaces can revoke the cursor
             // grab here without a Focused(false) event (hash-thing-w0o9).
             WindowEvent::Occluded(occluded) => {
+                log::info!("WindowEvent::Occluded({occluded})");
                 if occluded {
                     self.enter_occluded_state();
                 } else {
