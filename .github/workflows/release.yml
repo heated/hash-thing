@@ -9,9 +9,10 @@ name: Release
 # - Linux bare binary
 # - macOS notarized .app zip
 #
-# Linux AppImage publishing remains follow-up xb7.3; ci.yml already builds
-# an AppImage as a workflow artifact, but release.yml still only publishes
-# the bare Linux binary.
+# Linux AppImage publishing landed in hash-thing-679 — the linux-bin job
+# now builds and publishes both the bare binary and an AppImage wrapped
+# from the same release binary. ci.yml continues to build the AppImage
+# as a per-push workflow artifact for early breakage detection.
 #
 # Inherits the SHA-pinning + warning-gating patterns established by
 # hash-thing-xb7.1 in .github/workflows/ci.yml.
@@ -343,6 +344,11 @@ jobs:
         env:
           LINUXDEPLOY_URL: https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           LINUXDEPLOY_SHA256: f10e520f5948ed04ad31b160cca3f79476e1a52bb0f8c184981ce66cdcfa116a
+          # linuxdeploy reads $OUTPUT and uses it as the produced filename
+          # when --output appimage is set. Setting it here means we get the
+          # platform-qualified release-asset name out of the build directly,
+          # without a separate rename step.
+          OUTPUT: hash-thing-linux-x86_64.AppImage
         run: |
           set -euo pipefail
           curl -fsSL -o linuxdeploy-x86_64.AppImage "$LINUXDEPLOY_URL"
@@ -354,22 +360,6 @@ jobs:
             --desktop-file packaging/linux/hash-thing.desktop \
             --icon-file packaging/linux/hash-thing.svg \
             --output appimage
-
-      # linuxdeploy derives the output filename from the .desktop Name= field
-      # (Hash-Thing-x86_64.AppImage), so rename to the platform-qualified
-      # asset name that matches the bare-binary convention before publish.
-      - name: Stage AppImage release asset
-        shell: bash
-        run: |
-          set -euo pipefail
-          # linuxdeploy emits the file in the workdir; capture the first match.
-          src=$(find . -maxdepth 1 -name 'Hash-Thing-*x86_64.AppImage' -print -quit)
-          if [ -z "$src" ] || [ ! -f "$src" ]; then
-            echo "::error::expected linuxdeploy to produce a Hash-Thing-*x86_64.AppImage"
-            find . -maxdepth 1 -name '*.AppImage' -ls || true
-            exit 1
-          fi
-          mv "$src" hash-thing-linux-x86_64.AppImage
 
       - name: Publish Linux AppImage to GitHub release
         if: github.event_name == 'push'
