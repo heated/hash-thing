@@ -4,6 +4,7 @@ use std::fmt;
 use super::mutation::{MutationQueue, WorldMutation};
 use super::rule::{block_index, GameOfLife3D, ALIVE};
 use crate::octree::{Cell, CellState, NodeId, NodeStore, CELLS_PER_BLOCK};
+use crate::scale::CELLS_PER_METER_INT;
 use crate::terrain::field::gyroid::GyroidField;
 use crate::terrain::field::heightmap::PrecomputedHeightmapField;
 use crate::terrain::field::lattice::LatticeField;
@@ -1208,8 +1209,13 @@ impl World {
             }
         }
 
+        let movable: [bool; 8] = std::array::from_fn(|i| {
+            let c = block[i];
+            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
+        });
+
         let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block);
+        let result = rule.step_block(&block, &movable);
 
         // Mass conservation assertion: output must be a permutation of input.
         debug_assert!(
@@ -1223,9 +1229,19 @@ impl World {
             "block rule violated mass conservation at ({bx}, {by}, {bz})"
         );
 
-        // Write back, but anchor cells that didn't opt into this block rule.
-        // A cell with block_rule_id == None is immovable — it stays in its
-        // original position even if the rule tried to swap it elsewhere.
+        // Contract assertion: immovable cells must be left in place by the
+        // rule. Without this, a buggy rule that swaps an immovable cell into
+        // a movable slot would silently delete the immovable cell's value
+        // (the write-back filter only writes movable positions). Assert
+        // here so the failure is loud, not a slow water leak.
+        debug_assert!(
+            (0..8).all(|i| movable[i] || result[i] == block[i]),
+            "block rule moved an immovable cell at ({bx}, {by}, {bz})"
+        );
+
+        // Write back. The rule is contracted to leave immovable cells fixed,
+        // so writing the rule output is safe. The `movable` filter is a
+        // belt-and-suspenders guard against a rule that violates the contract.
         // OOB positions are silently skipped (absorbing boundary).
         for dz in 0..2 {
             for dy in 0..2 {
@@ -1237,14 +1253,10 @@ impl World {
                         continue;
                     }
                     let i = block_index(dx, dy, dz);
-                    let original = block[i];
-                    let has_rule = self.materials.block_rule_id_for_cell(original).is_some();
                     let idx = x + y * side + z * side * side;
-                    if has_rule || original.is_empty() {
-                        // Opted-in cells and empty cells can be moved by the rule.
+                    if movable[i] {
                         grid[idx] = result[i].raw();
                     }
-                    // else: non-participating cell stays put (anchored).
                 }
             }
         }
@@ -1436,7 +1448,23 @@ impl World {
     /// spectacle around each waypoint. The exact route/controls stay external;
     /// this just makes the content reproducible for whichever beat loader
     /// consumes it.
+    ///
+    /// Coordinate convention: every cell write here passes raw local indices
+    /// straight into `fill_box` / `set` as `WorldCoord`. That is only
+    /// correct when `self.origin == [0, 0, 0]`; under any other origin the
+    /// `local_from_world` subtraction would shift the entire spectacle by
+    /// `-origin`. Today the only caller (`App::load_demo_spectacle`) always
+    /// builds a fresh `World::new(level)` first, so the assumption holds.
+    /// The assert below locks it in — if a future caller (multiplayer,
+    /// streaming, 4096+ epics) ever seeds spectacle into a shifted world,
+    /// fail loudly here instead of silently mis-placing geometry. See
+    /// hash-thing-zksj.
     pub fn seed_demo_spectacle(&mut self) {
+        assert_eq!(
+            self.origin,
+            [0, 0, 0],
+            "seed_demo_spectacle assumes origin=[0,0,0]; helpers pass local coords as WorldCoord and would silently shift by -origin otherwise (hash-thing-zksj)"
+        );
         let waypoints = self.demo_waypoints();
         let first = waypoints
             .first()
@@ -1490,6 +1518,25 @@ impl World {
                 _ => unreachable!("demo spectacle defines exactly four waypoints"),
             }
         }
+
+        // hash-thing-t3zn.2: viewing platform under the player spawn.
+        // `App::reset_scene_entities` places the player at world_center
+        // + 2 cells up; this 5x5 stone pad sits one cell beneath them so
+        // `is_grounded` finds support. Coords use the function's existing
+        // local-as-WorldCoord convention (origin=0 assumed) — see follow-
+        // up bead for the latent shifted-origin issue this shares with
+        // the rest of `seed_demo_spectacle`.
+        let center_cell = (self.side() as i64) / 2;
+        let platform_y = center_cell + 2 * CELLS_PER_METER_INT as i64 - 1;
+        let pad_half: i64 = 2;
+        self.fill_box(
+            Box3::new(
+                [center_cell - pad_half, platform_y, center_cell - pad_half],
+                [center_cell + pad_half, platform_y, center_cell + pad_half],
+            ),
+            STONE,
+        );
+
         self.block_rule_present = None;
     }
 
@@ -2569,9 +2616,10 @@ mod tests {
     use crate::render::Svdag;
     use crate::sim::rule::{GameOfLife3D, ALIVE};
     use crate::terrain::materials::{
-        MaterialRegistry, FAN, FAN_ARMED_FIREWORK_MATERIAL_IDS, FAN_ARMED_STEAM_MATERIAL_IDS, FIRE,
-        FIREWORK, FIREWORK_MATERIAL_ID, GRASS, LAVA, OIL, SAND, STEAM_MATERIAL_ID, STONE, VINE,
-        WATER,
+        MaterialRegistry, AIR_MATERIAL_ID, FAN, FAN_ARMED_FIREWORK_MATERIAL_IDS,
+        FAN_ARMED_STEAM_MATERIAL_IDS, FIRE, FIREWORK, FIREWORK_MATERIAL_ID, FIRE_MATERIAL_ID,
+        GRASS, ICE, ICE_MATERIAL_ID, LAVA, LAVA_MATERIAL_ID, OIL, OIL_MATERIAL_ID, SAND, STEAM,
+        STEAM_MATERIAL_ID, STONE, VINE, VINE_MATERIAL_ID, WATER, WATER_MATERIAL_ID,
     };
     use std::collections::{HashSet, VecDeque};
 
@@ -3019,6 +3067,51 @@ mod tests {
         }
     }
 
+    /// hash-thing-t3zn.2: locks in the pad-vs-waypoint invariant. The
+    /// viewing pad sits at world center (`side/2 + 7` voxels above the
+    /// world-center cell) — far above every waypoint's `cy + radius`
+    /// vertical extent. If a future tweak moves a waypoint up into the
+    /// pad's footprint, this test fires before the pad silently overwrites
+    /// waypoint geometry or the pad gets buried under set-piece cells.
+    #[test]
+    fn demo_spectacle_pad_does_not_overlap_any_waypoint() {
+        let mut world = World::new(6);
+        world.seed_demo_spectacle();
+
+        let center_cell = (world.side() as i64) / 2;
+        let platform_y = center_cell + 2 * CELLS_PER_METER_INT as i64 - 1;
+        let pad_half: i64 = 2;
+
+        for waypoint in world.demo_waypoints() {
+            let r = waypoint.radius;
+            let dy = (platform_y - waypoint.center[1]).abs();
+            let dx = ((center_cell + pad_half) - (waypoint.center[0] - r))
+                .min((waypoint.center[0] + r) - (center_cell - pad_half));
+            let dz = ((center_cell + pad_half) - (waypoint.center[2] - r))
+                .min((waypoint.center[2] + r) - (center_cell - pad_half));
+            let overlaps = dx >= 0 && dy <= r && dz >= 0;
+            assert!(
+                !overlaps,
+                "pad cell at y={platform_y} overlaps waypoint {} bbox \
+                 (center={:?}, radius={r}); pad would silently overwrite \
+                 set-piece cells",
+                waypoint.label, waypoint.center,
+            );
+        }
+
+        // And the pad itself is actually stone where it ought to be.
+        for x in (center_cell - pad_half)..=(center_cell + pad_half) {
+            for z in (center_cell - pad_half)..=(center_cell + pad_half) {
+                assert_eq!(
+                    world.get(WorldCoord(x), WorldCoord(platform_y), WorldCoord(z)),
+                    STONE,
+                    "pad cell ({x},{platform_y},{z}) lost STONE — was \
+                     overwritten by a later seed step",
+                );
+            }
+        }
+    }
+
     #[test]
     fn demo_spectacles_seed_active_materials_near_every_anchor() {
         let mut world = World::new(6);
@@ -3256,6 +3349,254 @@ mod tests {
             stats.cache_hits,
             stats.cache_misses,
             stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+        );
+    }
+
+    /// hash-thing-9t4u: place a deterministic heterogeneous material mix on
+    /// a level-6 (64³) world so the CaRule dispatch fires across many arms
+    /// per step. No terrain seeding — direct `set_local` writes onto a
+    /// STONE substrate so the bench isolates the dispatch axis from terrain
+    /// generation noise.
+    ///
+    /// Layout (slabs separated geometrically so reactions stay slow boundary
+    /// effects rather than instant collapse):
+    /// - STONE substrate: y in [0, 16).
+    /// - WATER slab: y in [22, 26), x in [0, 32), z in [0, 32).
+    /// - LAVA slab: y in [22, 26), x in [32, 64), z in [32, 64).
+    ///   (No shared face with WATER.)
+    /// - ICE slab: y in [28, 30), x in [0, 32), z in [32, 64).
+    /// - OIL slab: y in [28, 30), x in [32, 64), z in [0, 32).
+    /// - FIRE pillars: 8 isolated 1×4×1 columns at fixed (x,z), y in [30, 34).
+    /// - STEAM slab: y in [38, 40), x in [0, 32), z in [0, 32).
+    /// - FIREWORK slab: y in [38, 40), x in [32, 64), z in [32, 64).
+    /// - VINE pillars: 4 isolated 1×3×1 columns at corners on top of stone.
+    /// - SAND corner block: 4×2×4 at (0, 16, 0).
+    fn seed_heterogeneous_palette_64(world: &mut World) {
+        // STONE substrate.
+        for z in 0..64u64 {
+            for x in 0..64u64 {
+                for y in 0..16u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(y), LocalCoord(z), STONE);
+                }
+            }
+        }
+        // SAND corner block.
+        for z in 0..4u64 {
+            for x in 0..4u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(16 + dy), LocalCoord(z), SAND);
+                }
+            }
+        }
+        // VINE pillars (on the stone surface y=16,17,18).
+        for &(px, pz) in &[(16u64, 16u64), (48, 16), (16, 48), (48, 48)] {
+            for dy in 0..3u64 {
+                world.set_local(LocalCoord(px), LocalCoord(16 + dy), LocalCoord(pz), VINE);
+            }
+        }
+        // WATER slab (NW quadrant).
+        for z in 0..32u64 {
+            for x in 0..32u64 {
+                for dy in 0..4u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(22 + dy), LocalCoord(z), WATER);
+                }
+            }
+        }
+        // LAVA slab (SE quadrant — no shared face with WATER).
+        for z in 32..64u64 {
+            for x in 32..64u64 {
+                for dy in 0..4u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(22 + dy), LocalCoord(z), LAVA);
+                }
+            }
+        }
+        // ICE slab (NE quadrant, higher).
+        for z in 32..64u64 {
+            for x in 0..32u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(28 + dy), LocalCoord(z), ICE);
+                }
+            }
+        }
+        // OIL slab (SW quadrant, higher).
+        for z in 0..32u64 {
+            for x in 32..64u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(28 + dy), LocalCoord(z), OIL);
+                }
+            }
+        }
+        // FIRE pillars (8 columns at fixed (x,z) so dispatch sees FireRule).
+        for &(px, pz) in &[
+            (8u64, 8u64),
+            (24, 8),
+            (40, 8),
+            (56, 8),
+            (8, 56),
+            (24, 56),
+            (40, 56),
+            (56, 56),
+        ] {
+            for dy in 0..4u64 {
+                world.set_local(LocalCoord(px), LocalCoord(30 + dy), LocalCoord(pz), FIRE);
+            }
+        }
+        // STEAM slab (NW quadrant, top).
+        for z in 0..32u64 {
+            for x in 0..32u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(38 + dy), LocalCoord(z), STEAM);
+                }
+            }
+        }
+        // FIREWORK slab (SE quadrant, top).
+        for z in 32..64u64 {
+            for x in 32..64u64 {
+                for dy in 0..2u64 {
+                    world.set_local(LocalCoord(x), LocalCoord(38 + dy), LocalCoord(z), FIREWORK);
+                }
+            }
+        }
+    }
+
+    /// hash-thing-9t4u scout: heterogeneous-scene phase timing.
+    ///
+    /// Sibling to `hashlife_phase_timing_scout_water_64`. The water scout
+    /// is dominated by AirRule + WaterRule dispatch — in a homogeneous
+    /// scene the indirect-branch predictor hits ~100%, so dispatch cost
+    /// becomes invisible. This scout seeds many materials at once so
+    /// every CaRule arm gets exercised per tick, defeating prediction
+    /// and exposing whatever dispatch cost remains after the vvun
+    /// trait→enum refactor.
+    ///
+    /// Use this scout to compare `#[inline]` candidates on hot rule
+    /// step_cell bodies. The vvun.2 acceptance bar is ≥10% phase1
+    /// reduction on this scene with no >2% regression on the water
+    /// scout. If neither moves, the lever doesn't help in this dispatch
+    /// shape — document the negative result inline and on the bd.
+    ///
+    /// Run: `cargo test --profile bench --lib
+    /// hashlife_phase_timing_scout_heterogeneous_64 -- --ignored --nocapture`
+    /// Repeat 3× and report min/median/max spread.
+    ///
+    /// # 9t4u finding (2026-04-24): `#[inline]` regresses by ~13.5%
+    ///
+    /// Tested adding `#[inline]` to seven hot rule `step_cell` bodies
+    /// (Air, Water, Lava, Ice, Flammable, Steam, Firework). 5 baseline
+    /// runs vs 5 inlined runs on this scene:
+    ///
+    /// | variant   | phase1 min | phase1 median | phase1 max | spread |
+    /// | --------- | ---------- | ------------- | ---------- | ------ |
+    /// | baseline  | 144.29 ms  | **145.71 ms** | 147.56 ms  | 1.023  |
+    /// | inlined   | 163.89 ms  | **165.31 ms** | 168.24 ms  | 1.027  |
+    ///
+    /// Median delta: **+13.5% regression** under `#[inline]`. Likely
+    /// cause: dispatch-site match at `rule.rs` is already `#[inline]`,
+    /// so leaf inlining duplicates the bodies into the dispatch site
+    /// and inflates i-cache pressure — Claude plan-review's flagged
+    /// failure mode. **Do not retry naive leaf `#[inline]` on these
+    /// arms.** Future dispatch experiments here should look at
+    /// stratified iteration (vvun's "alternative lever") or PGO,
+    /// not blanket inlining.
+    ///
+    /// Numbers are wall-time over 20 cold-start steps, not warm-frame
+    /// only — both A and B see the same warm-up so the relative delta
+    /// is preserved, but a per-tick steady-state number would be lower.
+    #[test]
+    #[ignore = "scout/profiling — prints timing; only seed-coverage asserts"]
+    fn hashlife_phase_timing_scout_heterogeneous_64() {
+        let mut world = World::new(6);
+        seed_heterogeneous_palette_64(&mut world);
+
+        // Per-arm dispatch coverage guard (hash-thing-9t4u):
+        // confirms each major rule has a non-trivial input population.
+        let mut counts = [0u64; 32];
+        for z in 0..64u64 {
+            for y in 0..64u64 {
+                for x in 0..64u64 {
+                    let raw = world.get(wc(x), wc(y), wc(z));
+                    let m = Cell::from_raw(raw).material() as usize;
+                    if m < counts.len() {
+                        counts[m] += 1;
+                    }
+                }
+            }
+        }
+        // Map material id → expected floor.
+        let air_count = counts[AIR_MATERIAL_ID as usize];
+        let fire_count = counts[FIRE_MATERIAL_ID as usize];
+        let water_count = counts[WATER_MATERIAL_ID as usize];
+        let lava_count = counts[LAVA_MATERIAL_ID as usize];
+        let ice_count = counts[ICE_MATERIAL_ID as usize];
+        let oil_count = counts[OIL_MATERIAL_ID as usize];
+        let steam_count = counts[STEAM_MATERIAL_ID as usize];
+        let vine_count = counts[VINE_MATERIAL_ID as usize];
+        let firework_count = counts[FIREWORK_MATERIAL_ID as usize];
+        assert!(air_count > 100_000, "AirRule coverage too low: {air_count}");
+        assert!(fire_count > 16, "FireRule coverage too low: {fire_count}");
+        assert!(
+            water_count > 1000,
+            "WaterRule coverage too low: {water_count}"
+        );
+        assert!(lava_count > 1000, "LavaRule coverage too low: {lava_count}");
+        assert!(ice_count > 100, "IceRule coverage too low: {ice_count}");
+        // OilRule dispatches via the FlammableRule arm in this codebase.
+        assert!(
+            oil_count > 100,
+            "FlammableRule coverage too low: {oil_count}"
+        );
+        assert!(
+            steam_count > 100,
+            "SteamRule coverage too low: {steam_count}"
+        );
+        assert!(vine_count > 8, "VineRule coverage too low: {vine_count}");
+        assert!(
+            firework_count > 100,
+            "FireworkRule coverage too low: {firework_count}"
+        );
+
+        const N_STEPS: u32 = 20;
+        let wall_start = std::time::Instant::now();
+        for _ in 0..N_STEPS {
+            world.step_recursive();
+        }
+        let wall_total_ns = wall_start.elapsed().as_nanos() as u64;
+
+        let stats = &world.hashlife_stats_total;
+        let p1 = stats.phase1_ns;
+        let p2 = stats.phase2_ns;
+        let pct = |n: u64| -> f64 { (n as f64) / (wall_total_ns as f64) * 100.0 };
+        eprintln!("--- hashlife phase timing scout: 64^3 heterogeneous, {N_STEPS} steps ---");
+        eprintln!("  wall_total:    {:.2} ms", wall_total_ns as f64 / 1e6);
+        eprintln!(
+            "  phase1_total:  {:.2} ms ({:.1}% of wall)",
+            p1 as f64 / 1e6,
+            pct(p1),
+        );
+        eprintln!(
+            "  phase2_total:  {:.2} ms ({:.1}% of wall)",
+            p2 as f64 / 1e6,
+            pct(p2),
+        );
+        eprintln!(
+            "  p1+p2:         {:.2} ms ({:.1}% of wall — remainder is memo lookup/insert, `next` zeroing, dispatch)",
+            (p1 + p2) as f64 / 1e6,
+            pct(p1 + p2),
+        );
+        eprintln!(
+            "  per-step avg:  p1={:.3}ms p2={:.3}ms wall={:.3}ms",
+            p1 as f64 / 1e6 / N_STEPS as f64,
+            p2 as f64 / 1e6 / N_STEPS as f64,
+            wall_total_ns as f64 / 1e6 / N_STEPS as f64,
+        );
+        eprintln!(
+            "  cache_hits={} cache_misses={} (hit_rate={:.3})",
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64,
+        );
+        eprintln!(
+            "  t=0 coverage: air={air_count} fire={fire_count} water={water_count} lava={lava_count} ice={ice_count} oil={oil_count} steam={steam_count} vine={vine_count} firework={firework_count}",
         );
     }
 
@@ -3872,7 +4213,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::sim::margolus::{GravityBlockRule, IdentityBlockRule};
-    use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE_MATERIAL_ID, WATER_MATERIAL_ID};
+    use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE_MATERIAL_ID};
 
     fn simple_density(cell: Cell) -> f32 {
         if cell.is_empty() {
