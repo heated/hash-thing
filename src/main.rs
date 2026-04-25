@@ -308,6 +308,27 @@ impl LatticeShortDemoCut {
     }
 }
 
+/// Map a `[`/`]`/`u`/`i`/`o` lattice-debug key to its target beat
+/// (hash-thing-5a5a). `[` and `]` resolve relative to `current` with
+/// `unwrap_or(Intro)`; `u`/`i`/`o` map to their literal beat. Pulled
+/// out of the key handler so press-time resolution is unit-testable
+/// without stubbing the background-step machinery.
+///
+/// Caller must already have gated on `lattice_debug_jumps_enabled`
+/// and restricted `key` to one of the five recognized characters; any
+/// other value trips `unreachable!()`.
+fn resolve_lattice_beat_target(current: Option<LatticeDemoBeat>, key: &str) -> LatticeDemoBeat {
+    let anchor = current.unwrap_or(LatticeDemoBeat::Intro);
+    match key {
+        "[" => anchor.previous(),
+        "]" => anchor.next(),
+        "u" => LatticeDemoBeat::Intro,
+        "i" => LatticeDemoBeat::Interior,
+        "o" => LatticeDemoBeat::Panorama,
+        _ => unreachable!("resolve_lattice_beat_target: unexpected key {key:?}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DemoWaypoint {
     label: &'static str,
@@ -1313,6 +1334,30 @@ impl App {
         log::info!("Lattice debug jump: {} ({})", waypoint.label, beat.label());
     }
 
+    /// Resolve a `[`/`]`/`u`/`i`/`o` press into a queued
+    /// `SelectLatticeBeat` request (hash-thing-5a5a).
+    ///
+    /// Routes through `PendingSceneSwap` so a press during a background
+    /// sim step gets queued instead of silently dropped. Resolves the
+    /// target beat against `current_demo_beat` *at press time* so the
+    /// cycle-direction intent stays pinned even if a later key
+    /// overwrites the queue; dispatch then runs against the pinned
+    /// target regardless of intermediate state.
+    ///
+    /// Clears `short_demo_cut` synchronously — `update_lattice_short_demo_cut`
+    /// runs every frame during stepping, so deferring the clear to
+    /// dispatch would let the cut timer keep advancing against a
+    /// now-cancelled cut.
+    ///
+    /// Caller is expected to have already gated on
+    /// `lattice_debug_jumps_enabled()`. Only the five debug-jump keys
+    /// are accepted; any other input hits `unreachable!()`.
+    fn request_lattice_beat_jump(&mut self, key: &str) {
+        self.short_demo_cut = None;
+        let target = resolve_lattice_beat_target(self.current_demo_beat, key);
+        self.request_scene_swap(PendingSceneSwap::SelectLatticeBeat(target));
+    }
+
     fn start_lattice_short_demo_cut(&mut self) {
         self.short_demo_cut = Some(LatticeShortDemoCut {
             started_at: std::time::Instant::now(),
@@ -2009,34 +2054,7 @@ impl ApplicationHandler for App {
                             // in FPS mode. Log the silent branch so the
                             // key doesn't feel dead (hash-thing-1a1n).
                             if self.lattice_debug_jumps_enabled() {
-                                // Route through PendingSceneSwap so a press
-                                // during a background sim step gets queued
-                                // instead of silently dropped (hash-thing-5a5a).
-                                // Resolve the target beat here, at press
-                                // time, so the cycle-direction intent
-                                // stays pinned even if a later key
-                                // overwrites the queue.
-                                //
-                                // Clear `short_demo_cut` synchronously —
-                                // `update_lattice_short_demo_cut` runs
-                                // every frame during stepping, so
-                                // deferring the clear to dispatch would
-                                // let the cut timer keep advancing
-                                // against a now-cancelled cut.
-                                self.short_demo_cut = None;
-                                let current =
-                                    self.current_demo_beat.unwrap_or(LatticeDemoBeat::Intro);
-                                let target = match k {
-                                    "[" => current.previous(),
-                                    "]" => current.next(),
-                                    "u" => LatticeDemoBeat::Intro,
-                                    "i" => LatticeDemoBeat::Interior,
-                                    "o" => LatticeDemoBeat::Panorama,
-                                    _ => unreachable!(),
-                                };
-                                self.request_scene_swap(PendingSceneSwap::SelectLatticeBeat(
-                                    target,
-                                ));
+                                self.request_lattice_beat_jump(k);
                             } else {
                                 // debug!, not info!: winit delivers key-repeat
                                 // events and the default filter is `info`, so
@@ -3061,6 +3079,65 @@ mod tests {
             LatticeDemoBeat::Interior,
         ));
         assert_eq!(app.current_demo_beat, Some(LatticeDemoBeat::Interior));
+    }
+
+    #[test]
+    fn resolve_lattice_beat_target_snapshots_cycle_direction() {
+        // hash-thing-5a5a: `[`/`]` must resolve against the current
+        // beat at press time. `]` advances with wraparound, `[`
+        // retreats with wraparound, and `u`/`i`/`o` map to the literal
+        // beat regardless of current state.
+        use LatticeDemoBeat::*;
+
+        assert_eq!(resolve_lattice_beat_target(Some(Interior), "]"), Panorama);
+        assert_eq!(resolve_lattice_beat_target(Some(Interior), "["), Intro);
+        assert_eq!(resolve_lattice_beat_target(Some(Panorama), "]"), Intro);
+        assert_eq!(resolve_lattice_beat_target(Some(Intro), "["), Panorama);
+
+        // `current_demo_beat == None` → `unwrap_or(Intro)`: `[` wraps
+        // to Panorama, `]` advances to Interior. Pins the pre-existing
+        // fresh-scene behavior.
+        assert_eq!(resolve_lattice_beat_target(None, "["), Panorama);
+        assert_eq!(resolve_lattice_beat_target(None, "]"), Interior);
+
+        // Literal mappings are independent of current.
+        for current in [None, Some(Intro), Some(Interior), Some(Panorama)] {
+            assert_eq!(resolve_lattice_beat_target(current, "u"), Intro);
+            assert_eq!(resolve_lattice_beat_target(current, "i"), Interior);
+            assert_eq!(resolve_lattice_beat_target(current, "o"), Panorama);
+        }
+    }
+
+    #[test]
+    fn request_lattice_beat_jump_clears_short_demo_cut_synchronously() {
+        // hash-thing-5a5a: `update_lattice_short_demo_cut` runs every
+        // frame regardless of stepping. Deferring the clear to
+        // dispatch would let the cut timer keep advancing against a
+        // now-cancelled cut, so the clear must happen at press time.
+        //
+        // On a non-stepping App `request_lattice_beat_jump` dispatches
+        // immediately, which re-seeds the lattice demo and then lands
+        // the requested beat — so `current_demo_beat` holds the
+        // resolved target and `short_demo_cut` is cleared along the
+        // way. Both signals together prove the clear happens before
+        // the dispatch hands off to `load_lattice_demo_beat`.
+        let mut app = App::new(32);
+        app.short_demo_cut = Some(LatticeShortDemoCut {
+            started_at: std::time::Instant::now(),
+        });
+        app.current_demo_beat = Some(LatticeDemoBeat::Intro);
+
+        app.request_lattice_beat_jump("]");
+
+        assert!(
+            app.short_demo_cut.is_none(),
+            "short_demo_cut must be cleared when a beat jump is requested",
+        );
+        assert_eq!(
+            app.current_demo_beat,
+            Some(LatticeDemoBeat::Interior),
+            "press-time resolution must hand the snapshotted target to dispatch",
+        );
     }
 
     #[test]
