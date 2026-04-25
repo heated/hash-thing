@@ -1,323 +1,266 @@
-//! Minimal 5×7 bitmap font for HUD text rendering.
+//! HUD / legend text rasterization.
 //!
-//! Each glyph covers ASCII 32–126 (95 printable characters).
-//! Stored as `[u8; 7]` — 7 rows, 5 bits per row (MSB = left pixel).
+//! Renders short ASCII / Unicode lines (legend overlay, memo HUD) to an
+//! RGBA8 buffer the renderer uploads as a 2D texture. Backed by an embedded
+//! Inter Regular TTF rasterized at runtime via `ab_glyph`. Replaces the
+//! prior 5×7 hand-rolled bitmap font (hash-thing-bujj).
 //!
-//! Renders text lines into an RGBA texture on the CPU.
+//! Output convention:
+//! - Glyph color: warm off-white `(245, 233, 214)`, **unmodulated** by
+//!   coverage. The alpha channel carries the rasterizer's coverage value
+//!   (0..=255). Background pixels stay fully transparent.
+//! - This produces correct anti-aliasing against the legend panel under
+//!   `Rgba8UnormSrgb` blending: alpha is gamma-blended by the hardware,
+//!   color stays at its sRGB-encoded target.
+//!
+//! Sizing is driven by the caller's `scale` argument. The font is
+//! rasterized directly at the final size — there is no nearest-neighbor
+//! upscale pass.
 
-/// 5×7 bitmap font data for ASCII 32–126.
-/// Index 0 = space (ASCII 32), index 94 = tilde (ASCII 126).
-#[rustfmt::skip]
-const FONT_5X7: [[u8; 7]; 95] = [
-    // 32 ' ' (space)
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-    // 33 '!'
-    [0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x00],
-    // 34 '"'
-    [0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00],
-    // 35 '#'
-    [0x0A, 0x1F, 0x0A, 0x0A, 0x1F, 0x0A, 0x00],
-    // 36 '$'
-    [0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04],
-    // 37 '%'
-    [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03],
-    // 38 '&'
-    [0x08, 0x14, 0x08, 0x15, 0x12, 0x0D, 0x00],
-    // 39 '''
-    [0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00],
-    // 40 '('
-    [0x02, 0x04, 0x04, 0x04, 0x04, 0x02, 0x00],
-    // 41 ')'
-    [0x08, 0x04, 0x04, 0x04, 0x04, 0x08, 0x00],
-    // 42 '*'
-    [0x00, 0x0A, 0x04, 0x1F, 0x04, 0x0A, 0x00],
-    // 43 '+'
-    [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00],
-    // 44 ','
-    [0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x08],
-    // 45 '-'
-    [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
-    // 46 '.'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00],
-    // 47 '/'
-    [0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00],
-    // 48 '0'
-    [0x0E, 0x11, 0x13, 0x15, 0x19, 0x0E, 0x00],
-    // 49 '1'
-    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x0E, 0x00],
-    // 50 '2'
-    [0x0E, 0x11, 0x01, 0x06, 0x08, 0x1F, 0x00],
-    // 51 '3'
-    [0x0E, 0x11, 0x02, 0x01, 0x11, 0x0E, 0x00],
-    // 52 '4'
-    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x00],
-    // 53 '5'
-    [0x1F, 0x10, 0x1E, 0x01, 0x11, 0x0E, 0x00],
-    // 54 '6'
-    [0x06, 0x08, 0x1E, 0x11, 0x11, 0x0E, 0x00],
-    // 55 '7'
-    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x00],
-    // 56 '8'
-    [0x0E, 0x11, 0x0E, 0x11, 0x11, 0x0E, 0x00],
-    // 57 '9'
-    [0x0E, 0x11, 0x11, 0x0F, 0x02, 0x0C, 0x00],
-    // 58 ':'
-    [0x00, 0x04, 0x00, 0x00, 0x04, 0x00, 0x00],
-    // 59 ';'
-    [0x00, 0x04, 0x00, 0x00, 0x04, 0x04, 0x08],
-    // 60 '<'
-    [0x02, 0x04, 0x08, 0x04, 0x02, 0x00, 0x00],
-    // 61 '='
-    [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00],
-    // 62 '>'
-    [0x08, 0x04, 0x02, 0x04, 0x08, 0x00, 0x00],
-    // 63 '?'
-    [0x0E, 0x11, 0x02, 0x04, 0x00, 0x04, 0x00],
-    // 64 '@'
-    [0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0E],
-    // 65 'A'
-    [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00],
-    // 66 'B'
-    [0x1E, 0x11, 0x1E, 0x11, 0x11, 0x1E, 0x00],
-    // 67 'C'
-    [0x0E, 0x11, 0x10, 0x10, 0x11, 0x0E, 0x00],
-    // 68 'D'
-    [0x1C, 0x12, 0x11, 0x11, 0x12, 0x1C, 0x00],
-    // 69 'E'
-    [0x1F, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00],
-    // 70 'F'
-    [0x1F, 0x10, 0x1E, 0x10, 0x10, 0x10, 0x00],
-    // 71 'G'
-    [0x0E, 0x11, 0x10, 0x17, 0x11, 0x0E, 0x00],
-    // 72 'H'
-    [0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00],
-    // 73 'I'
-    [0x0E, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00],
-    // 74 'J'
-    [0x01, 0x01, 0x01, 0x01, 0x11, 0x0E, 0x00],
-    // 75 'K'
-    [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
-    // 76 'L'
-    [0x10, 0x10, 0x10, 0x10, 0x10, 0x1F, 0x00],
-    // 77 'M'
-    [0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x00],
-    // 78 'N'
-    [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x00],
-    // 79 'O'
-    [0x0E, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00],
-    // 80 'P'
-    [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x00],
-    // 81 'Q'
-    [0x0E, 0x11, 0x11, 0x15, 0x12, 0x0D, 0x00],
-    // 82 'R'
-    [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x00],
-    // 83 'S'
-    [0x0E, 0x11, 0x08, 0x06, 0x11, 0x0E, 0x00],
-    // 84 'T'
-    [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00],
-    // 85 'U'
-    [0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00],
-    // 86 'V'
-    [0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04, 0x00],
-    // 87 'W'
-    [0x11, 0x11, 0x11, 0x15, 0x1B, 0x11, 0x00],
-    // 88 'X'
-    [0x11, 0x0A, 0x04, 0x04, 0x0A, 0x11, 0x00],
-    // 89 'Y'
-    [0x11, 0x0A, 0x04, 0x04, 0x04, 0x04, 0x00],
-    // 90 'Z'
-    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x1F, 0x00],
-    // 91 '['
-    [0x0E, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x00],
-    // 92 '\'
-    [0x10, 0x08, 0x04, 0x02, 0x01, 0x00, 0x00],
-    // 93 ']'
-    [0x0E, 0x02, 0x02, 0x02, 0x02, 0x0E, 0x00],
-    // 94 '^'
-    [0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00],
-    // 95 '_'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00],
-    // 96 '`'
-    [0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00],
-    // 97 'a'
-    [0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00],
-    // 98 'b'
-    [0x10, 0x10, 0x1E, 0x11, 0x11, 0x1E, 0x00],
-    // 99 'c'
-    [0x00, 0x0E, 0x10, 0x10, 0x10, 0x0E, 0x00],
-    // 100 'd'
-    [0x01, 0x01, 0x0F, 0x11, 0x11, 0x0F, 0x00],
-    // 101 'e'
-    [0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E, 0x00],
-    // 102 'f'
-    [0x06, 0x08, 0x1C, 0x08, 0x08, 0x08, 0x00],
-    // 103 'g'
-    [0x00, 0x0F, 0x11, 0x0F, 0x01, 0x0E, 0x00],
-    // 104 'h'
-    [0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x00],
-    // 105 'i'
-    [0x04, 0x00, 0x04, 0x04, 0x04, 0x04, 0x00],
-    // 106 'j'
-    [0x02, 0x00, 0x02, 0x02, 0x12, 0x0C, 0x00],
-    // 107 'k'
-    [0x10, 0x12, 0x14, 0x18, 0x14, 0x12, 0x00],
-    // 108 'l'
-    [0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00],
-    // 109 'm'
-    [0x00, 0x1A, 0x15, 0x15, 0x11, 0x11, 0x00],
-    // 110 'n'
-    [0x00, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x00],
-    // 111 'o'
-    [0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00],
-    // 112 'p'
-    [0x00, 0x1E, 0x11, 0x1E, 0x10, 0x10, 0x00],
-    // 113 'q'
-    [0x00, 0x0F, 0x11, 0x0F, 0x01, 0x01, 0x00],
-    // 114 'r'
-    [0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x00],
-    // 115 's'
-    [0x00, 0x0E, 0x10, 0x0E, 0x01, 0x1E, 0x00],
-    // 116 't'
-    [0x08, 0x1C, 0x08, 0x08, 0x08, 0x06, 0x00],
-    // 117 'u'
-    [0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x00],
-    // 118 'v'
-    [0x00, 0x11, 0x11, 0x0A, 0x0A, 0x04, 0x00],
-    // 119 'w'
-    [0x00, 0x11, 0x11, 0x15, 0x15, 0x0A, 0x00],
-    // 120 'x'
-    [0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00],
-    // 121 'y'
-    [0x00, 0x11, 0x11, 0x0F, 0x01, 0x0E, 0x00],
-    // 122 'z'
-    [0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F, 0x00],
-    // 123 '{'
-    [0x02, 0x04, 0x08, 0x04, 0x02, 0x00, 0x00],
-    // 124 '|'
-    [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00],
-    // 125 '}'
-    [0x08, 0x04, 0x02, 0x04, 0x08, 0x00, 0x00],
-    // 126 '~'
-    [0x00, 0x00, 0x0D, 0x12, 0x00, 0x00, 0x00],
-];
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use std::sync::LazyLock;
 
-const GLYPH_W: usize = 5;
-const GLYPH_H: usize = 7;
-const CHAR_W: usize = GLYPH_W + 1; // 1px spacing
-const CHAR_H: usize = GLYPH_H + 2; // 2px spacing
+/// Embedded Inter Regular (SIL Open Font License 1.1).
+/// See `assets/fonts/Inter-LICENSE.txt`.
+const INTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+
+static FONT: LazyLock<FontRef<'static>> = LazyLock::new(|| {
+    FontRef::try_from_slice(INTER_REGULAR)
+        .expect("Inter-Regular.ttf is a valid TrueType font (build asset, fail-loud)")
+});
+
+/// Native cap-height target before `scale`. The 5×7 bitmap that this
+/// replaced rendered at ~9 px cap-height post-scale=2; matching that
+/// keeps the legend panel close to its prior on-screen footprint.
+const NATIVE_CAP_HEIGHT_PX: f32 = 9.0;
+
+/// Native padding (per side) before `scale`.
+const NATIVE_PADDING_PX: u32 = 2;
+
+/// Glyph color (sRGB-encoded, unmodulated).
+const GLYPH_R: u8 = 245;
+const GLYPH_G: u8 = 233;
+const GLYPH_B: u8 = 214;
 
 /// Render lines of text into an RGBA pixel buffer.
 ///
 /// Returns `(pixels, width, height)`. Background is transparent so the
 /// shader can supply the panel treatment; glyphs are warm off-white.
-/// `scale` multiplies each pixel (1 = native 6×9 per char).
+/// `scale` multiplies the rasterization size — pass `2` for the legend
+/// panel.
 pub fn render_text_rgba(lines: &[&str], scale: u32) -> (Vec<u8>, u32, u32) {
-    // char-count, not byte-length: a 2- or 4-byte char would over-allocate
-    // tex_w under `line.len()`, and the `chars().enumerate()` render loop
-    // below advances by char — so the two must agree (hash-thing-9q5o).
-    let max_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let pad = 2; // padding in native pixels
-    let tex_w = max_cols * CHAR_W + pad * 2;
-    let tex_h = lines.len() * CHAR_H + pad * 2;
+    let scale = scale.max(1);
+    let pad = NATIVE_PADDING_PX * scale;
 
-    let out_w = (tex_w as u32) * scale;
-    let out_h = (tex_h as u32) * scale;
+    let px_scale = PxScale::from(NATIVE_CAP_HEIGHT_PX * scale as f32);
+    let scaled_font = FONT.as_scaled(px_scale);
+
+    let ascent = scaled_font.ascent();
+    let descent = scaled_font.descent();
+    let line_gap = scaled_font.line_gap();
+    let line_height = ascent - descent;
+    let line_pitch = line_height + line_gap;
+
+    // Width: longest laid-out line. Layout uses char-driven advance so
+    // multi-byte UTF-8 cannot inflate the texture (hash-thing-9q5o).
+    let max_advance = lines
+        .iter()
+        .map(|line| line_advance(line, &scaled_font))
+        .fold(0.0f32, f32::max);
+
+    // Height: lines * pitch − one trailing line_gap, plus ascent above
+    // the first baseline and |descent| below the last.
+    let n_lines = lines.len() as f32;
+    let content_h = if n_lines > 0.0 {
+        n_lines * line_height + (n_lines - 1.0).max(0.0) * line_gap
+    } else {
+        0.0
+    };
+
+    let tex_w = (max_advance.ceil() as u32) + 2 * pad;
+    let tex_h = (content_h.ceil() as u32) + 2 * pad;
+
+    let out_w = tex_w.max(2 * pad).max(1);
+    let out_h = tex_h.max(2 * pad).max(1);
+
     let mut pixels = vec![0u8; (out_w * out_h * 4) as usize];
 
-    // Transparent background: the legend shader paints the panel.
-    for i in 0..(out_w * out_h) as usize {
-        pixels[i * 4] = 0;
-        pixels[i * 4 + 1] = 0;
-        pixels[i * 4 + 2] = 0;
-        pixels[i * 4 + 3] = 0;
+    if lines.is_empty() || lines.iter().all(|l| l.is_empty()) {
+        return (pixels, out_w, out_h);
     }
 
     for (row, line) in lines.iter().enumerate() {
-        for (col, ch) in line.chars().enumerate() {
-            let glyph = glyph_for(ch);
-            for (gy, &row_bits) in glyph.iter().enumerate().take(GLYPH_H) {
-                for gx in 0..GLYPH_W {
-                    if row_bits & (1 << (4 - gx)) != 0 {
-                        let nat_x = pad + col * CHAR_W + gx;
-                        let nat_y = pad + row * CHAR_H + gy;
-                        // Scale up.
-                        for sy in 0..scale {
-                            for sx in 0..scale {
-                                let px = nat_x as u32 * scale + sx;
-                                let py = nat_y as u32 * scale + sy;
-                                if px < out_w && py < out_h {
-                                    let idx = ((py * out_w + px) * 4) as usize;
-                                    pixels[idx] = 245;
-                                    pixels[idx + 1] = 233;
-                                    pixels[idx + 2] = 214;
-                                    pixels[idx + 3] = 255;
-                                }
-                            }
-                        }
+        let baseline_y = pad as f32 + ascent + row as f32 * line_pitch;
+        let mut pen_x = pad as f32;
+
+        for ch in line.chars() {
+            let glyph_id = scaled_font.glyph_id(ch);
+            let glyph =
+                glyph_id.with_scale_and_position(px_scale, ab_glyph::point(pen_x, baseline_y));
+            let advance = scaled_font.h_advance(glyph_id);
+
+            if let Some(outlined) = scaled_font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                let bx = bounds.min.x;
+                let by = bounds.min.y;
+                outlined.draw(|gx, gy, coverage| {
+                    let px = (bx + gx as f32).round() as i32;
+                    let py = (by + gy as f32).round() as i32;
+                    if px < 0 || py < 0 {
+                        return;
                     }
-                }
+                    let px = px as u32;
+                    let py = py as u32;
+                    if px >= out_w || py >= out_h {
+                        return;
+                    }
+                    let idx = ((py * out_w + px) * 4) as usize;
+                    let new_a = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let cur_a = pixels[idx + 3];
+                    if new_a > cur_a {
+                        pixels[idx] = GLYPH_R;
+                        pixels[idx + 1] = GLYPH_G;
+                        pixels[idx + 2] = GLYPH_B;
+                        pixels[idx + 3] = new_a;
+                    }
+                });
             }
+
+            pen_x += advance;
         }
     }
 
     (pixels, out_w, out_h)
 }
 
-fn glyph_for(ch: char) -> [u8; 7] {
-    let code = ch as u32;
-    if (32..=126).contains(&code) {
-        FONT_5X7[(code - 32) as usize]
-    } else {
-        FONT_5X7[0] // space for unknown
-    }
+fn line_advance<F: Font>(line: &str, scaled_font: &ab_glyph::PxScaleFont<&F>) -> f32 {
+    line.chars()
+        .map(|c| scaled_font.h_advance(scaled_font.glyph_id(c)))
+        .sum()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Output texture dimensions match the pixel buffer length.
     #[test]
     fn render_produces_correct_dimensions() {
         let (pixels, w, h) = render_text_rgba(&["Hello", "World!"], 2);
-        // "World!" = 6 chars (longest) → 6*6 + 4 padding = 40 native → 80 scaled
-        // 2 lines → 2*9 + 4 = 22 native → 44 scaled
-        assert_eq!(w, 80);
-        assert_eq!(h, 44);
-        assert_eq!(pixels.len(), (80 * 44 * 4) as usize);
+        assert!(w > 0, "width must be positive");
+        assert!(h > 0, "height must be positive");
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
     }
 
     #[test]
     fn empty_lines_produce_minimal_texture() {
         let (pixels, w, h) = render_text_rgba(&[], 1);
-        assert_eq!(w, 4); // just padding
-        assert_eq!(h, 4);
-        assert_eq!(pixels.len(), (4 * 4 * 4) as usize);
+        // Just padding on both axes.
+        assert!(w >= 2 * NATIVE_PADDING_PX);
+        assert!(h >= 2 * NATIVE_PADDING_PX);
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+        // No lit pixels in an empty render.
+        let lit = (0..(pixels.len() / 4))
+            .filter(|&i| pixels[i * 4 + 3] > 0)
+            .count();
+        assert_eq!(lit, 0);
     }
 
     #[test]
     fn letter_a_has_lit_pixels() {
         let (pixels, w, _h) = render_text_rgba(&["A"], 1);
-        // Check that at least some pixels are opaque glyph pixels (not all background).
         let lit_count = (0..(pixels.len() / 4))
-            .filter(|&i| pixels[i * 4 + 3] == 255)
+            .filter(|&i| pixels[i * 4 + 3] > 0)
             .count();
         assert!(
             lit_count > 0,
-            "Expected some lit glyph pixels for 'A', tex_w={}",
-            w
+            "Expected some lit glyph pixels for 'A', tex_w={w}"
         );
     }
 
-    /// Non-ASCII input must size the texture by char count, not byte length
-    /// (hash-thing-9q5o). "é" is 2 UTF-8 bytes; "Aé" should produce the same
-    /// `tex_w` as a 2-char ASCII string.
+    /// Texture sizing is driven by char count, not UTF-8 byte length
+    /// (hash-thing-9q5o). `"Aéé"` is 3 chars / 5 bytes; `"AAA"` is
+    /// 3 chars / 3 bytes. Both must render at comparable widths — far
+    /// closer to each other than a `byte_len * per_char_advance` sizing
+    /// would produce (which would size `"Aéé"` ≈ 5/3 wider than `"AAA"`).
     #[test]
     fn non_ascii_sizes_by_char_count_not_byte_len() {
-        let (_pa, w_two_ascii, _ha) = render_text_rgba(&["AB"], 1);
-        let (_pm, w_mixed, _hm) = render_text_rgba(&["Aé"], 1);
-        assert_eq!(
-            w_mixed, w_two_ascii,
-            "2-char line should have the same width regardless of UTF-8 byte length"
+        let (_, w_aaa, _) = render_text_rgba(&["AAA"], 1);
+        let (_, w_aee, _) = render_text_rgba(&["Aéé"], 1);
+        // Both renders succeeded with positive widths.
+        assert!(w_aaa > 0 && w_aee > 0);
+        // Character widths vary in proportional fonts, but byte-length
+        // sizing would inflate "Aéé" by ~5/3 = 1.67×. Both widths must
+        // stay within a 1.5× factor of each other.
+        let ratio = w_aaa.max(w_aee) as f32 / w_aaa.min(w_aee) as f32;
+        assert!(
+            ratio < 1.5,
+            "char-driven layout should keep widths within 1.5×; \
+             got w_aaa={w_aaa}, w_aee={w_aee}, ratio={ratio:.3}"
         );
+    }
+
+    /// Glyph fill color is constant; only the alpha channel carries
+    /// coverage. Sample any lit pixel from a rendered 'A' and verify
+    /// its RGB matches the documented constants.
+    #[test]
+    fn lit_pixels_have_constant_glyph_color() {
+        let (pixels, _, _) = render_text_rgba(&["A"], 2);
+        let mut found = false;
+        for i in 0..(pixels.len() / 4) {
+            if pixels[i * 4 + 3] > 0 {
+                assert_eq!(pixels[i * 4], GLYPH_R);
+                assert_eq!(pixels[i * 4 + 1], GLYPH_G);
+                assert_eq!(pixels[i * 4 + 2], GLYPH_B);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected at least one lit pixel");
+    }
+
+    /// Visual-check helper for hash-thing-bujj. Writes a PPM (P6) of the
+    /// legend lines composited over a dark slate background so a reviewer
+    /// can eyeball the typeface. Path is taken from `BUJJ_DUMP_PPM`; if
+    /// the env var is unset, the test no-ops. `#[ignore]` so it never
+    /// runs on plain `cargo test`.
+    ///
+    /// Usage:
+    ///   BUJJ_DUMP_PPM=/tmp/legend.ppm \
+    ///     cargo test -p ht-render --lib font::tests::dump_legend_ppm \
+    ///       -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_legend_ppm() {
+        let Ok(path) = std::env::var("BUJJ_DUMP_PPM") else {
+            return;
+        };
+        let lines: &[&str] = &[
+            "  Tab: orbit / first-person",
+            "  WASD: move    Mouse: look",
+            "  Space: jump   Ctrl: sprint",
+            "  LMB break  RMB place",
+            "  F1: legend   F5: pause",
+            "  R: reset terrain",
+            "  Aé é Hello, World! 0123",
+        ];
+        let (rgba, w, h) = render_text_rgba(lines, 2);
+        let bg = (24u8, 28u8, 36u8);
+        let mut body = Vec::with_capacity((w * h * 3) as usize);
+        for i in 0..(w * h) as usize {
+            let a = rgba[i * 4 + 3] as u32;
+            let mix = |fg: u8, b: u8| -> u8 {
+                ((fg as u32 * a + b as u32 * (255 - a)) / 255) as u8
+            };
+            body.push(mix(rgba[i * 4], bg.0));
+            body.push(mix(rgba[i * 4 + 1], bg.1));
+            body.push(mix(rgba[i * 4 + 2], bg.2));
+        }
+        let header = format!("P6\n{w} {h}\n255\n");
+        let mut out = Vec::with_capacity(header.len() + body.len());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&body);
+        std::fs::write(&path, &out).expect("write ppm");
+        eprintln!("wrote {path} ({w}×{h})");
     }
 }

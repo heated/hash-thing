@@ -10,6 +10,7 @@ winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 rustc-hash = "2"
+ab_glyph = "0.2"
 
 [dev-dependencies]
 pollster = "0.4"
