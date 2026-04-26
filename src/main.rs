@@ -31,6 +31,16 @@ const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 /// jitter (hash-thing-4ioh).
 const TITLE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Bound on consecutive failed FPS cursor-grab attempts before the
+/// per-frame retry tap goes dormant (hash-thing-ezx8). 600 frames
+/// ~= 10 s at 60 Hz: long enough to ride out the slow-startup
+/// activation window lke9 fixed (typically a few frames), short
+/// enough that 5 syscalls/frame * 600 = ~3000 calls is a hard
+/// ceiling on permanently-unsupported platforms (headless, broken
+/// X11). Reset by any successful grab or by an explicit release
+/// (camera-mode toggle, focus loss, occlusion).
+const MAX_CURSOR_GRAB_RETRIES: u32 = 600;
+
 /// Thin wrapper over macOS `pthread_set_qos_class_self_np` used as the
 /// xhi6 diagnostic knob (proxy 2 for SVDAG↔sim cache-locality work).
 /// `parse` maps the `HASH_THING_SIM_QOS` env string to a `qos_class_t`
@@ -532,6 +542,23 @@ struct App {
     startup_scene_pending: bool,
     /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
     cursor_captured: bool,
+    /// Latches "the most recent grab attempt failed" so the per-frame
+    /// retry tap (RedrawRequested) can re-attempt without spamming
+    /// `log::warn!` on every frame for platforms where grab is
+    /// permanently unsupported. Cleared by any successful grab or by
+    /// an explicit release; one warn per failure streak.
+    /// hash-thing-lke9.
+    cursor_capture_grab_warned: bool,
+    /// Counts consecutive failed grab attempts. When it reaches
+    /// `MAX_CURSOR_GRAB_RETRIES`, `sync_cursor_capture` stops calling
+    /// `apply_cursor_capture(true)` so platforms where grab is
+    /// permanently unsupported don't burn syscalls every frame
+    /// indefinitely. Reset on success (`record_grab_outcome(true)`)
+    /// and on release (`apply_cursor_capture(false)`); legitimate
+    /// state transitions (camera-mode, focus, occlusion) all route
+    /// through the release path so they re-arm a fresh attempt.
+    /// hash-thing-ezx8.
+    cursor_capture_grab_failures: u32,
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
@@ -727,6 +754,8 @@ impl App {
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
             cursor_captured: false,
+            cursor_capture_grab_warned: false,
+            cursor_capture_grab_failures: 0,
             pending_player_action: None,
             pending_scene_swap: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -771,40 +800,115 @@ impl App {
         app
     }
 
-    fn apply_cursor_capture(&mut self, capture: bool) {
-        let Some(window) = self.window.as_ref() else {
+    /// Apply a grab attempt's outcome to the cursor-capture state. Pure on
+    /// `App` fields; window-side effects (visibility, set_cursor_grab cleanup)
+    /// stay with the caller. Returns `true` if a fresh `log::warn!` should
+    /// fire for this failure (first failure of a streak), `false` to stay
+    /// silent (steady-state failures, or on success).
+    ///
+    /// Streak contract — hash-thing-lke9:
+    /// - success: clear `cursor_capture_grab_warned`. Next failure can warn.
+    /// - failure: set the flag; suppress repeat warns until success or
+    ///   explicit release clears it.
+    ///
+    /// Also drives the `cursor_capture_grab_failures` counter
+    /// (hash-thing-ezx8): increment on each failure (saturating at
+    /// `u32::MAX`), reset to 0 on success. The counter pairs with the
+    /// `MAX_CURSOR_GRAB_RETRIES` dormant gate in `sync_cursor_capture`.
+    fn record_grab_outcome(&mut self, succeeded: bool) -> bool {
+        if succeeded {
+            self.cursor_captured = true;
+            self.last_mouse = None;
+            self.cursor_capture_grab_warned = false;
+            self.cursor_capture_grab_failures = 0;
+            false
+        } else {
             self.cursor_captured = false;
+            self.cursor_capture_grab_failures = self.cursor_capture_grab_failures.saturating_add(1);
+            let should_warn = !self.cursor_capture_grab_warned;
+            self.cursor_capture_grab_warned = true;
+            should_warn
+        }
+    }
+
+    fn apply_cursor_capture(&mut self, capture: bool) {
+        if !capture {
+            // Release: clear the warn-throttle and the failure counter
+            // (hash-thing-ezx8) so a later recapture-then-fail can warn
+            // once again and the dormant gate is re-armed. Note that
+            // `sync_cursor_capture` also resets the counter on every
+            // release-direction call (even when this branch is
+            // short-circuited by the state-match early return) — that
+            // covers the permanently-failing-platform case where
+            // `cursor_captured` was never true. This branch handles the
+            // reset for the post-successful-grab release path. Then
+            // drop the OS-level grab if we have a window.
+            self.cursor_capture_grab_warned = false;
+            self.cursor_capture_grab_failures = 0;
+            if let Some(window) = self.window.as_ref() {
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
+            self.cursor_captured = false;
+            self.last_mouse = None;
+            return;
+        }
+
+        // Clone the Arc so the window reference doesn't conflict with the
+        // `&mut self` borrow inside `record_grab_outcome`.
+        let Some(window) = self.window.clone() else {
+            // No window: nothing to grab against. Treat as a soft "couldn't
+            // grab" so unit tests can drive the streak lifecycle through
+            // App::new (no window). No `log::warn!` here — there is no OS
+            // error to surface; the flag move is purely state-tracking.
+            let _ = self.record_grab_outcome(false);
             return;
         };
 
-        if capture {
-            let grab = window
-                .set_cursor_grab(CursorGrabMode::Locked)
-                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-            match grab {
-                Ok(()) => {
-                    window.set_cursor_visible(false);
-                    self.cursor_captured = true;
-                    self.last_mouse = None;
-                }
-                Err(err) => {
-                    log::warn!("Failed to grab FPS cursor: {err}");
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
-                    window.set_cursor_visible(true);
-                    self.cursor_captured = false;
-                }
+        let grab = window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        match grab {
+            Ok(()) => {
+                window.set_cursor_visible(false);
+                let _ = self.record_grab_outcome(true);
             }
-        } else {
-            let _ = window.set_cursor_grab(CursorGrabMode::None);
-            window.set_cursor_visible(true);
-            self.cursor_captured = false;
-            self.last_mouse = None;
+            Err(err) => {
+                if self.record_grab_outcome(false) {
+                    log::warn!("Failed to grab FPS cursor: {err}");
+                }
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
         }
     }
 
     fn sync_cursor_capture(&mut self) {
         let should_capture = should_capture_cursor(self.camera_mode, self.focused, self.occluded);
+        // hash-thing-ezx8: any time the predicate says we should NOT
+        // capture, clear the failure budget — even when
+        // `cursor_captured` was already false (the
+        // permanently-failing-platform case where dormancy was reached
+        // via 600 failures with no successful grab in between). On
+        // those platforms `should_capture==cursor_captured==false`
+        // would short-circuit at the state-match early return below,
+        // never reaching `apply_cursor_capture(false)`'s reset path,
+        // and the user would be pinned dormant forever after the first
+        // Tab / focus-loss / occlusion. Reset here covers both the
+        // "stale-true cursor_captured" case (handled additionally by
+        // the release branch in `apply_cursor_capture`) and the
+        // "never-true cursor_captured" case the early return masks.
+        if !should_capture {
+            self.cursor_capture_grab_failures = 0;
+        }
         if should_capture == self.cursor_captured {
+            return;
+        }
+        // Dormant gate: when consecutive grab failures saturate, stop
+        // hammering `set_cursor_grab` from the per-frame retry tap.
+        // Only gates the *capture* direction — release transitions
+        // already reset the counter above and proceed normally.
+        if should_capture && self.cursor_capture_grab_failures >= MAX_CURSOR_GRAB_RETRIES {
             return;
         }
         self.apply_cursor_capture(should_capture);
@@ -929,6 +1033,17 @@ impl App {
     /// (back-to-back redraws within one timer tick) is also skipped to
     /// avoid blending a 0-FPS sample that would silently decay the
     /// readout by 5%.
+    ///
+    /// Also records `dt_wall` as the `frame_total` perf metric so the
+    /// log summary line includes wall-clock per-frame period alongside
+    /// `render_gpu` / `render_cpu` (hash-thing-dbz5). The components
+    /// alone don't sum to the frame budget — winit dispatch, input
+    /// handling, scene-state mutation, and `Queue::write_*` upload land
+    /// outside any `_cpu` / `_gpu` bracket, so a "fast `render_gpu`"
+    /// reading was easy to misread as "60 FPS" when frame_total was
+    /// actually 33-66 ms (15-30 FPS perceived). Shares the suppress
+    /// gate with the EWMA so post-resume bogus dt's don't pollute the
+    /// metric either.
     fn apply_fps_sample(&mut self, dt_wall: f64) {
         if self.suppress_next_fps_sample {
             self.suppress_next_fps_sample = false;
@@ -936,6 +1051,8 @@ impl App {
         }
         if dt_wall > 0.0 {
             self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
+            self.perf
+                .record("frame_total", std::time::Duration::from_secs_f64(dt_wall));
         }
     }
 
@@ -2326,6 +2443,17 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                // hash-thing-lke9: per-frame retry tap. If `resumed()`'s
+                // initial grab attempt lost the OS-activation race (macOS /
+                // agent launches), `cursor_captured` is false even though
+                // `should_capture_cursor()` wants it true. `sync_cursor_capture`
+                // short-circuits in steady state (one bool comparison) and
+                // re-attempts the grab when state mismatches — exactly the
+                // post-startup-failure window. Placed BEFORE the
+                // `startup_scene_pending` block so the retry isn't delayed
+                // behind hundreds of ms of cold-start scene generation.
+                self.sync_cursor_capture();
+
                 if self.startup_scene_pending {
                     self.startup_scene_pending = false;
                     self.load_initial_scene();
@@ -2848,7 +2976,19 @@ fn main() {
     {
         // Make launch behavior explicit instead of depending on bundle/agent defaults.
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
-        event_loop_builder.with_activate_ignoring_other_apps(true);
+        // hash-thing-sgcv: gate the activate-ignoring-other-apps flag
+        // behind the same HASH_THING_FOCUS=1 env var that gates
+        // window.focus_window() at src/main.rs:1985. winit's default
+        // for this flag is `true` (PlatformSpecificEventLoopAttributes
+        // in winit/platform_impl/macos/event_loop.rs), so we MUST set
+        // it explicitly in both branches — omitting the setter would
+        // silently inherit the focus-stealing default and the gate
+        // would be a no-op. Default is to NOT steal focus, so the
+        // agent surface keeps keyboard input.
+        // ActivationPolicy::Regular stays unconditional — it controls
+        // dock/Cmd-Tab presence, not activation.
+        let want_focus = std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
+        event_loop_builder.with_activate_ignoring_other_apps(want_focus);
     }
     let event_loop = event_loop_builder
         .build()
@@ -3814,6 +3954,236 @@ mod tests {
         assert!((pitch - -1.4).abs() < 1e-12, "pitch should clamp at -1.4");
     }
 
+    // hash-thing-lke9: streak-reset coverage for the per-frame retry tap.
+    // record_grab_outcome is the pure, window-less home of the warn-throttle
+    // contract; testing it here proves all three transitions
+    // (success, failure, repeated failure) without needing a real OS grab.
+
+    #[test]
+    fn record_grab_outcome_failure_streak_warns_once_then_throttles() {
+        let mut app = App::new(64);
+        assert!(!app.cursor_capture_grab_warned, "fresh app starts unwarned");
+
+        // First failure of a streak: caller should warn.
+        assert!(app.record_grab_outcome(false));
+        assert!(app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
+
+        // Subsequent failures throttle.
+        assert!(!app.record_grab_outcome(false));
+        assert!(!app.record_grab_outcome(false));
+        assert!(app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
+    }
+
+    #[test]
+    fn record_grab_outcome_success_clears_streak() {
+        // Success path is the primary lke9 acceptance edge: a successful
+        // grab must reset the warn-throttle so a *future* failure streak
+        // can warn once again. Codex plan-review Important #1.
+        let mut app = App::new(64);
+        app.cursor_capture_grab_warned = true;
+
+        assert!(!app.record_grab_outcome(true));
+        assert!(
+            !app.cursor_capture_grab_warned,
+            "success must clear the warn-throttle"
+        );
+        assert!(app.cursor_captured);
+    }
+
+    #[test]
+    fn record_grab_outcome_failure_then_success_then_failure_re_warns() {
+        // Full lifecycle: streak 1 (fail-throttle), success (reset),
+        // streak 2 (fail again, must warn). Pins the "warn-once-per-streak"
+        // contract from both directions.
+        let mut app = App::new(64);
+
+        assert!(app.record_grab_outcome(false));
+        assert!(!app.record_grab_outcome(false));
+
+        assert!(!app.record_grab_outcome(true));
+        assert!(!app.cursor_capture_grab_warned);
+
+        assert!(
+            app.record_grab_outcome(false),
+            "fresh streak after success must warn again"
+        );
+    }
+
+    #[test]
+    fn apply_cursor_capture_release_clears_warned_flag() {
+        // apply_cursor_capture(false) is the second reset path (alongside
+        // record_grab_outcome(true)). Verifies the release branch matches
+        // the streak-reset contract.
+        let mut app = App::new(64);
+        app.cursor_capture_grab_warned = true;
+
+        app.apply_cursor_capture(false);
+
+        assert!(!app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
+    }
+
+    #[test]
+    fn apply_cursor_capture_no_window_sets_warned_flag() {
+        // No-window path is treated as a soft "couldn't grab" so unit tests
+        // can drive the streak lifecycle through App::new. No log fires
+        // (there is no OS error to surface) but the flag moves so callers
+        // observe the throttled state.
+        let mut app = App::new(64);
+        assert!(app.window.is_none());
+
+        app.apply_cursor_capture(true);
+
+        assert!(app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
+    }
+
+    // hash-thing-ezx8: bounded retry counter + dormant-gate coverage.
+    // Pairs with the lke9 warn-throttle tests above. The counter is the
+    // syscall-budget half of the same per-frame retry contract.
+
+    #[test]
+    fn record_grab_outcome_failure_increments_counter() {
+        let mut app = App::new(64);
+        assert_eq!(
+            app.cursor_capture_grab_failures, 0,
+            "fresh app starts at zero failures"
+        );
+
+        for expected in 1..=3 {
+            let _ = app.record_grab_outcome(false);
+            assert_eq!(app.cursor_capture_grab_failures, expected);
+        }
+    }
+
+    #[test]
+    fn record_grab_outcome_success_clears_counter() {
+        // Success is the primary reset path: any successful grab must
+        // re-arm a fresh failure budget.
+        let mut app = App::new(64);
+        app.cursor_capture_grab_failures = 5;
+
+        let _ = app.record_grab_outcome(true);
+
+        assert_eq!(app.cursor_capture_grab_failures, 0);
+        assert!(app.cursor_captured);
+    }
+
+    #[test]
+    fn apply_cursor_capture_release_clears_counter() {
+        // Second reset path: explicit release re-arms the budget alongside
+        // clearing the warn-throttle, so a later recapture-then-fail can
+        // both warn once and burn its full retry budget.
+        let mut app = App::new(64);
+        app.cursor_capture_grab_failures = 5;
+
+        app.apply_cursor_capture(false);
+
+        assert_eq!(app.cursor_capture_grab_failures, 0);
+        assert!(!app.cursor_captured);
+    }
+
+    #[test]
+    fn sync_cursor_capture_dormant_after_max_failures() {
+        // Once the counter saturates, sync_cursor_capture must skip the
+        // apply_cursor_capture(true) call so the per-frame retry tap
+        // stops burning syscalls. Proven by observing the counter does
+        // not increment further when sync_cursor_capture is invoked
+        // with an active capture-direction state mismatch.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.occluded = false;
+        app.cursor_captured = false;
+        app.cursor_capture_grab_failures = MAX_CURSOR_GRAB_RETRIES;
+
+        // Sanity: the predicate inputs make should_capture true and
+        // cursor_captured is false, so without the dormant gate the call
+        // would route through apply_cursor_capture(true) and increment
+        // the counter via the no-window soft-failure path.
+        assert!(should_capture_cursor(
+            app.camera_mode,
+            app.focused,
+            app.occluded
+        ));
+
+        app.sync_cursor_capture();
+
+        assert_eq!(
+            app.cursor_capture_grab_failures, MAX_CURSOR_GRAB_RETRIES,
+            "dormant gate must skip the retry; counter must not advance"
+        );
+        assert!(!app.cursor_captured, "dormant retry must not flip the flag");
+    }
+
+    #[test]
+    fn sync_cursor_capture_release_resets_dormant_counter_when_uncaptured() {
+        // hash-thing-ezx8 critical-review B1 regression: on a
+        // permanently-failing platform dormancy arrives via 600
+        // failures with `cursor_captured` staying false the entire
+        // time. A subsequent `should_capture==false` transition
+        // (Tab to Orbit / focus loss / occlusion) MUST reset the
+        // counter even though `cursor_captured` is already false and
+        // the state-match early return would otherwise short-circuit.
+        // Without this, returning to FPS later finds the gate still
+        // dormant and the retry never re-fires.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::Orbit;
+        app.focused = true;
+        app.occluded = false;
+        app.cursor_captured = false;
+        app.cursor_capture_grab_failures = MAX_CURSOR_GRAB_RETRIES;
+
+        assert!(!should_capture_cursor(
+            app.camera_mode,
+            app.focused,
+            app.occluded
+        ));
+
+        app.sync_cursor_capture();
+
+        assert_eq!(
+            app.cursor_capture_grab_failures, 0,
+            "release-direction sync must reset the counter even when \
+             cursor_captured was already false (no prior successful grab)"
+        );
+        assert!(!app.cursor_captured);
+    }
+
+    #[test]
+    fn sync_cursor_capture_dormant_release_then_recapture_re_arms_budget() {
+        // End-to-end on the permanently-failing-platform recovery
+        // path: dormant -> release sync -> re-capture sync gets a
+        // fresh budget. Without B1's fix the recapture sync would
+        // return early at the dormant gate (counter still saturated)
+        // and the per-frame retry would never re-fire.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.occluded = false;
+        app.cursor_captured = false;
+        app.cursor_capture_grab_failures = MAX_CURSOR_GRAB_RETRIES;
+
+        // Simulate Tab to Orbit: should_capture flips false. Counter resets.
+        app.camera_mode = CameraMode::Orbit;
+        app.sync_cursor_capture();
+        assert_eq!(app.cursor_capture_grab_failures, 0);
+
+        // Simulate Tab back to FPS: should_capture flips true again.
+        // Counter is back at 0 -> dormant gate doesn't fire ->
+        // apply_cursor_capture(true) runs -> no-window soft failure
+        // increments the counter to 1.
+        app.camera_mode = CameraMode::FirstPerson;
+        app.sync_cursor_capture();
+        assert_eq!(
+            app.cursor_capture_grab_failures, 1,
+            "re-capture after release must reach apply_cursor_capture(true) \
+             and burn one retry from the fresh budget"
+        );
+    }
+
     // hash-thing-9r62 regression: drive the cursor_captured flag through the
     // real apply_cursor_capture entry point rather than direct field writes,
     // so the state machine + event-routing contract are both covered (not
@@ -4094,6 +4464,11 @@ mod tests {
             !app.suppress_next_fps_sample,
             "flag must be consumed after the suppressed frame"
         );
+        assert_eq!(
+            app.perf.stats("frame_total").map(|s| s.2).unwrap_or(0),
+            0,
+            "suppressed bogus frame must not pollute the frame_total ring (hash-thing-dbz5)"
+        );
     }
 
     #[test]
@@ -4111,6 +4486,11 @@ mod tests {
             (app.smoothed_fps - 60.0).abs() < 1e-9,
             "subsequent real frames must blend normally; got {}",
             app.smoothed_fps
+        );
+        assert_eq!(
+            app.perf.stats("frame_total").map(|s| s.2).unwrap_or(0),
+            1,
+            "real post-resume frame must record exactly one frame_total sample (hash-thing-dbz5)"
         );
     }
 

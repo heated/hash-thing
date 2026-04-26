@@ -2658,6 +2658,10 @@ mod tests {
 
     /// Helper: verify every cell in the octree matches the SVDAG lookup.
     /// Samples all cells in the side³ cube.
+    ///
+    /// Also calls `assert_svdag_lod_rep_mat_matches_octree`, so every existing
+    /// m1f.5 sync test gains LOD `rep_mat` coverage on top of the per-voxel walk
+    /// (qaca — closes rk4n's rep_mat blind spot).
     fn assert_svdag_matches_octree(
         svdag: &Svdag,
         store: &NodeStore,
@@ -2687,6 +2691,161 @@ mod tests {
             mismatches, 0,
             "{label}: {mismatches} voxel mismatches between octree and SVDAG"
         );
+
+        assert_svdag_lod_rep_mat_matches_octree(svdag, store, root, label);
+    }
+
+    // ---------------------------------------------------------------
+    // qaca: LOD rep_mat consistency check
+    // ---------------------------------------------------------------
+    //
+    // `lookup_voxel` descends to leaves and ignores the LOD `rep_mat` field
+    // packed into `(slot[0] >> 8) & 0xFFFF`. So `assert_svdag_matches_octree`
+    // alone passes silently when interior LOD material fields are stale or
+    // wrong — which is the rep_mat-staleness hypothesis on rk4n.
+    //
+    // This walker descends the SVDAG and the source NodeStore in lockstep and
+    // re-derives the expected rep_mat from population-weighted-largest-child
+    // (the rule baked into `Svdag::visit` at svdag.rs:209-238). Mismatch ->
+    // panic with the offset, octree path, and both values.
+
+    /// Walk every interior node reachable from `svdag.nodes[0]` and validate
+    /// (a) the encoded rep_mat matches what `Svdag::visit` would compute for
+    /// the corresponding NodeStore node, and (b) child slots that should be
+    /// `LEAF_BIT | state` (leaves and empty interior subtrees) are exactly
+    /// that.
+    fn assert_svdag_lod_rep_mat_matches_octree(
+        svdag: &Svdag,
+        store: &NodeStore,
+        root: NodeId,
+        label: &str,
+    ) {
+        let root_offset = svdag.nodes[0] as usize;
+        let mut mismatches: Vec<String> = Vec::new();
+        validate_rep_mat_recursive(svdag, store, root, root_offset, "", &mut mismatches);
+        if !mismatches.is_empty() {
+            for line in mismatches.iter().take(5) {
+                eprintln!("  {line} [{label}]");
+            }
+            panic!(
+                "{label}: {} LOD rep_mat / slot-encoding mismatches",
+                mismatches.len()
+            );
+        }
+    }
+
+    fn validate_rep_mat_recursive(
+        svdag: &Svdag,
+        store: &NodeStore,
+        node_id: NodeId,
+        offset: usize,
+        path: &str,
+        out: &mut Vec<String>,
+    ) {
+        let cmask = svdag.nodes[offset];
+        let encoded_rep = (cmask >> 8) & 0xFFFF;
+        let expected_rep = expected_rep_mat(store, node_id);
+        if encoded_rep != expected_rep {
+            out.push(format!(
+                "rep_mat mismatch at offset={offset} path='{}': encoded={} expected={}",
+                if path.is_empty() { "/" } else { path },
+                encoded_rep,
+                expected_rep,
+            ));
+        }
+
+        let node = store.get(node_id);
+        if let Node::Interior { children, .. } = node {
+            for (i, &child_id) in children.iter().enumerate() {
+                let child_word = svdag.nodes[offset + 1 + i];
+                match store.get(child_id) {
+                    Node::Leaf(state) => {
+                        let expected_word = LEAF_BIT | (*state as u32);
+                        if child_word != expected_word {
+                            out.push(format!(
+                                "leaf child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
+                                offset + 1 + i,
+                                if path.is_empty() { "/" } else { path },
+                                child_word,
+                                expected_word,
+                            ));
+                        }
+                    }
+                    Node::Interior { population, .. } => {
+                        if *population == 0 {
+                            // Empty interior subtree is encoded as
+                            // LEAF_BIT (state=0) — see svdag.rs:240.
+                            if child_word != LEAF_BIT {
+                                out.push(format!(
+                                    "empty-interior child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
+                                    offset + 1 + i,
+                                    if path.is_empty() { "/" } else { path },
+                                    child_word,
+                                    LEAF_BIT,
+                                ));
+                            }
+                        } else {
+                            // Populated interior — child_word is the offset.
+                            if child_word & LEAF_BIT != 0 {
+                                out.push(format!(
+                                    "populated-interior child slot has LEAF_BIT at offset={} (child {i} of '{}'): encoded={:#010x}",
+                                    offset + 1 + i,
+                                    if path.is_empty() { "/" } else { path },
+                                    child_word,
+                                ));
+                                continue;
+                            }
+                            let child_path = if path.is_empty() {
+                                format!("/{i}")
+                            } else {
+                                format!("{path}/{i}")
+                            };
+                            validate_rep_mat_recursive(
+                                svdag,
+                                store,
+                                child_id,
+                                child_word as usize,
+                                &child_path,
+                                out,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mirror `Svdag::visit`'s rep_mat selection rule directly off the
+    /// NodeStore (no SVDAG state read). For interior nodes: scan children in
+    /// octant order; first non-zero leaf seeds rep_mat with population 1;
+    /// each interior child with strictly greater population takes over,
+    /// recursing to read its rep_mat from the NodeStore (not from the
+    /// SVDAG slot, so we don't trust the field we're validating).
+    fn expected_rep_mat(store: &NodeStore, node_id: NodeId) -> u32 {
+        match store.get(node_id) {
+            Node::Leaf(state) => (*state as u32) & 0xFFFF,
+            Node::Interior { children, .. } => {
+                let mut rep_mat: u32 = 0;
+                let mut rep_pop: u64 = 0;
+                for &child_id in children.iter() {
+                    match store.get(child_id) {
+                        Node::Leaf(state) => {
+                            if *state != 0 && (rep_mat == 0 || rep_pop == 0) {
+                                rep_mat = (*state as u32) & 0xFFFF;
+                                rep_pop = 1;
+                            }
+                        }
+                        Node::Interior { population, .. } => {
+                            if *population > 0 && *population > rep_pop {
+                                rep_mat = expected_rep_mat(store, child_id);
+                                rep_pop = *population;
+                            }
+                        }
+                    }
+                }
+                rep_mat
+            }
+        }
     }
 
     #[test]
@@ -2792,5 +2951,199 @@ mod tests {
         }
         let svdag = Svdag::build(&store, root, 3);
         assert_svdag_matches_octree(&svdag, &store, root, 3, "fully filled 8³");
+    }
+
+    // ---- vn5w upload-path regression guards ----------------------------
+    //
+    // These three tests pin invariants that `Renderer::upload_svdag()`
+    // (renderer.rs:1583) silently relies on. They live here, against the
+    // CPU-side `Svdag`, because the upload path is a thin shim over the
+    // CPU-side `nodes` buffer — protecting the CPU contract guards the
+    // GPU side without booting wgpu.
+
+    /// vn5w guard #1: append-only watermark.
+    ///
+    /// `upload_svdag()` rewrites slot 0 (the root header) every frame,
+    /// then appends `nodes[uploaded_len..]`. That is only correct if
+    /// `nodes[1..uploaded_len]` is bitwise unchanged after subsequent
+    /// `update()` calls. A future change that mutates non-tail slots
+    /// (in-place compaction, LOD substitution, slot reuse) would
+    /// silently corrupt the GPU mirror — this test fails first.
+    #[test]
+    fn vn5w_watermark_prefix_unchanged_after_incremental_update() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 16, 16, 16, mat(1));
+        let mut dag = Svdag::build(&store, root, 6);
+        let snapshot = dag.nodes.clone();
+        let watermark = snapshot.len();
+
+        // Edit a distant cell so the new subtree forces fresh slots
+        // beyond `watermark`. The incremental update must not rewrite
+        // any existing slot (slot 0 excepted — it's the root header).
+        root = store.set_cell(root, 48, 48, 48, mat(2));
+        dag.update(&store, root, 6);
+
+        assert!(
+            dag.nodes.len() >= watermark,
+            "watermark must not shrink: {} -> {}",
+            watermark,
+            dag.nodes.len()
+        );
+        assert_eq!(
+            &dag.nodes[1..watermark],
+            &snapshot[1..watermark],
+            "non-root prefix mutated; renderer's append-only upload \
+             would leave the GPU mirror inconsistent"
+        );
+    }
+
+    /// vn5w guard #2: pre/post-compact decode equivalence.
+    ///
+    /// `Svdag::compact()` (svdag.rs:310) full-rebuilds via `Self::build`.
+    /// Downstream code (next-frame upload, `apply_remap`, `id_to_offset`)
+    /// must observe the new buffer at the next decode. This pins the
+    /// observable contract: identical `lookup_voxel` results across the
+    /// rebuild for every probed cell.
+    #[test]
+    fn vn5w_compact_preserves_voxel_decode() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        let probes = [
+            (8u64, 8u64, 8u64, 1u16),
+            (32, 32, 32, 2),
+            (50, 12, 33, 3),
+            (1, 60, 1, 7),
+            (47, 47, 47, 4),
+        ];
+        for &(x, y, z, m) in &probes {
+            root = store.set_cell(root, x, y, z, mat(m));
+        }
+        let mut dag = Svdag::build(&store, root, 6);
+        let pre: Vec<u16> = probes
+            .iter()
+            .map(|&(x, y, z, _)| dag.lookup_voxel(x, y, z))
+            .collect();
+
+        // Generate stale slots: each (set + update + clear + update)
+        // pair leaves the live tree shape unchanged but interns
+        // intermediate slots that are no longer reachable from root.
+        for i in 0..16u64 {
+            root = store.set_cell(root, i, 0, 0, mat(9));
+            dag.update(&store, root, 6);
+            root = store.set_cell(root, i, 0, 0, 0);
+            dag.update(&store, root, 6);
+        }
+        let stale_total = dag.total_slot_count();
+
+        dag.compact(&store, root);
+        let post: Vec<u16> = probes
+            .iter()
+            .map(|&(x, y, z, _)| dag.lookup_voxel(x, y, z))
+            .collect();
+
+        assert_eq!(
+            pre, post,
+            "compact() altered visible voxel decode; pre={pre:?} post={post:?}"
+        );
+        // Compaction should drop slots that no incremental edit would
+        // ever revisit. If the post-compact slot count matches the
+        // stale-laden pre-compact count, compact() didn't actually
+        // rebuild — pin that regression here.
+        assert!(
+            dag.total_slot_count() < stale_total,
+            "compact() left slot count unchanged ({}); rebuild appears to have no-oped",
+            dag.total_slot_count()
+        );
+    }
+
+    /// vn5w guard #3: growth across many incremental updates stays
+    /// decode-consistent. Mirrors the GPU path where capacity overflow
+    /// triggers a reallocate + full re-upload — the CPU buffer's
+    /// `lookup_voxel` is what the GPU shader will see, so any growth
+    /// pattern that breaks this also breaks the renderer.
+    #[test]
+    fn vn5w_growth_then_incremental_decodes_correctly() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(7); // 128³
+        let mut dag = Svdag::build(&store, root, 7);
+        let initial_len = dag.nodes.len();
+
+        // Spread probes across the world so each batch forces unique
+        // subtrees (different octant paths from the root).
+        let probes: Vec<(u64, u64, u64, u16)> = (0..40u64)
+            .map(|i| {
+                (
+                    (i * 13) % 128,
+                    (i * 7) % 128,
+                    (i * 23) % 128,
+                    ((i % 7) + 1) as u16,
+                )
+            })
+            .collect();
+
+        for chunk in probes.chunks(5) {
+            for &(x, y, z, m) in chunk {
+                root = store.set_cell(root, x, y, z, mat(m));
+            }
+            dag.update(&store, root, 7);
+        }
+
+        assert!(
+            dag.nodes.len() > initial_len,
+            "buffer should have grown past initial size: {} -> {}",
+            initial_len,
+            dag.nodes.len()
+        );
+
+        for &(x, y, z, m) in &probes {
+            assert_eq!(
+                dag.lookup_voxel(x, y, z),
+                mat(m),
+                "voxel ({x},{y},{z}) decode mismatch after \
+                 {} incremental growth steps",
+                probes.len() / 5
+            );
+        }
+    }
+
+    // ---- qaca rep_mat-walker adversarial guard -------------------------
+
+    /// Confirm `assert_svdag_lod_rep_mat_matches_octree` actually fires when a
+    /// slot's rep_mat field is corrupted post-build. Without this, the walker
+    /// could silently no-op and we'd close the rep_mat blind spot only on
+    /// paper.
+    #[test]
+    #[should_panic(expected = "LOD rep_mat / slot-encoding mismatches")]
+    fn qaca_walker_catches_corrupted_rep_mat() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(5); // 32³
+                                       // Two materials so the walker's invariant is exercised on a
+                                       // populated interior whose rep_mat is determined by the largest-
+                                       // population child (here: the whole-octant fill of mat(2)).
+        for z in 0..16u64 {
+            for y in 0..16u64 {
+                for x in 0..16u64 {
+                    root = store.set_cell(root, x, y, z, mat(2));
+                }
+            }
+        }
+        root = store.set_cell(root, 31, 31, 31, mat(7));
+        let mut dag = Svdag::build(&store, root, 5);
+
+        // Sanity: the helper passes on the fresh build.
+        assert_svdag_lod_rep_mat_matches_octree(&dag, &store, root, "pre-corrupt");
+
+        // Corrupt the root slot's rep_mat field. Bits 8..23 — flip to a
+        // material id that no child carries. Mask preserves bits 0-7
+        // (occupancy) and bits 24-31 (unused).
+        let root_offset = dag.nodes[0] as usize;
+        let cmask = dag.nodes[root_offset];
+        let occ = cmask & 0xFFu32;
+        let bogus_rep = 0x4242u32;
+        dag.nodes[root_offset] = occ | (bogus_rep << 8);
+
+        // Should panic with the qaca walker's mismatch message.
+        assert_svdag_lod_rep_mat_matches_octree(&dag, &store, root, "post-corrupt");
     }
 }
