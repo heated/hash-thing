@@ -15,7 +15,7 @@ This document defines the **memory/streaming LOD policy** for big-map worlds: wh
 - **Distance → LOD level mapping.** Logarithmic radii anchored to player chunk: full detail within 1 chunk, drop one octree level per doubling of chunk-radius. Tunable; defaults below.
 - **Material-collapse policy.** **FEEL-GATE for edward — flag.** Default proposal: keep current "largest populated child" propagation; alternative is fixed per-material priority (rock > sand > water > air). Doc proposes default; edward picks if they disagree.
 - **Transition handling.** Hard swap on chunk-radius crossing, not crossfade. Crossfade is an optional follow-up if hard swap reads as poppy in playtesting.
-- **GPU buffer impact.** At 4096³ no streaming or LOD policy is required for memory; the LOD layer's value is bounded per-chunk cost for cswp.5's streaming bookkeeping. Memory + cold-gen savings dominate at 8192³+; streaming-plus-LOD becomes mandatory at 16384³+.
+- **GPU buffer impact.** §4.7 of the perf paper says 4096³ is comfortably resident on 8 GB without any streaming or LOD layer. This doc does **not** claim memory savings at 4096³ from the LOD policy; the policy's value is *shape* (bounded per-chunk cost, standardised representation for cswp.5 / cswp.2, a tunable knob), not absolute byte savings. Whether the LOD policy reduces resident memory in absolute terms — and at what scale — is a measurement, filed for the impl bead.
 
 The visual lever is the material-collapse policy. The mechanics (radius curve, transition strategy) ship per the gate-tier rule "internal mechanics, ship without asking."
 
@@ -54,7 +54,7 @@ Memory LOD is a **superset** of render LOD: any subtree the renderer would skip 
 
 Two reasons memory LOD is needed at all:
 
-- **Cold-gen budget.** At 4096³ cold gen is 3.7 s (§3.13). The measured 1024³→4096³ ratio (15.5× time for 64× cells) gives time ∝ cells^0.66 ∝ L^1.98 — so 8192³ projects to ~15 s, 16384³ to ~58 s. Generating full detail for cells the player will never touch is wasted seed time even before memory becomes the bottleneck.
+- **Cold-gen budget (hypothesis, not result).** At 4096³ cold gen is 3.7 s (§3.13). The measured 1024³→4096³ ratio (15.5× time for 64× cells) gives time ∝ cells^0.66 ∝ L^1.98 — so 8192³ *projects* to ~15 s and 16384³ to ~58 s. Generating full detail for cells the player will never touch *should* be wasted seed time, but whether the LOD policy actually shaves cold-gen depends on the impl strategy (skip-at-gen vs build-then-collapse — see §5.4). The cold-gen savings are filed as a hypothesis for the impl bead to validate, not a result.
 - **Long-tail memory growth.** §4.7.5 calls 4096³ resident on 8 GB a strong claim, but only because the dominant consumers are tightly bounded. Above 4096³, multiple consumers grow: macro-cache (unbounded analytically), `offset_by_slot` (~48 B/entry), and `id_to_offset` (~12 B/entry) all scale with reachable nodes, and reachable nodes grow ~`L^1.58`. Memory LOD breaks that scaling by capping reachable-nodes-as-a-function-of-distance.
 
 A useful framing: **render LOD is a runtime ray-traversal decision; memory LOD is a build/streaming decision.** They share the same representative-material substrate, so adding memory LOD is mostly about *deciding when to build coarser nodes* — the SVDAG build path already produces the right shape.
@@ -176,62 +176,52 @@ Reasons:
 
 ---
 
-## 5. GPU buffer impact and budget shrinkage
+## 5. GPU buffer impact (qualitative; numbers are hypotheses for the impl bead)
 
-### 5.1 Without LOD (extrapolation from §4.7)
+This section walks the *shape* of memory savings, not the magnitude. A first attempt to put numbers on this section produced a back-of-envelope where the proposed LOD policy increased reachable-node counts at every documented scale (the dual-reviewer pass on this doc, 2026-04-25, called this out as a contradiction with the rest of the doc). The honest reading is that we do not yet have the inputs to derive a per-chunk-cost curve from first principles. The §4.7 perf-paper numbers describe a *whole-world* DAG; per-chunk reachable-node counts are not measurable from the existing benches and depend on chunk-occupancy statistics that the impl bead must instrument.
 
-Reachable-node count scales as `L^1.58` empirically (256³ → 4096³ measurement). Per-node cost: 36 B (DAG) + 48 B (`offset_by_slot`) + 12 B (`id_to_offset`) ≈ 96 B/node total resident.
+What this section *does* say:
 
-| Scale | Reachable | Total resident (no LOD) |
-|---|---:|---:|
-| 4096³ | 548k | 53 MB |
-| 8192³ | 1.65M | 158 MB |
-| 16384³ | 4.97M | 477 MB |
+### 5.1 The substrate that the LOD policy operates on
 
-Plus macro-cache (9–105 MB at 4096³ band, growing with reachable). Total at 8192³ without LOD: ~277 MB; at 16384³: ~700 MB+. Both within an 8 GB envelope numerically, but unmodeled overheads (NodeStore active region, view-shift churn, wgpu driver state) eat the margin.
+From §4.7 of the perf paper (already measured):
 
-### 5.2 With LOD policy from §2.2
+| Scale | Reachable nodes | DAG resident | Render-side maps | Macro-cache band |
+|---|---:|---:|---:|---:|
+| 4096³ (measured) | 548k | 18.8 MB | ~33 MB steady (~64 MB peak) | 9–105 MB |
+| 8192³ (`L^1.58` projection) | ~1.65M | ~57 MB | ~100 MB steady | unbounded analytically |
+| 16384³ (`L^1.58` projection) | ~5M | ~170 MB | ~300 MB+ | unbounded analytically |
 
-Per the §2.2 mapping, with chunk-side 64 and player at world center:
+§4.7.5 calls 4096³ "comfortably resident on 8 GB M1 MBA." 8192³ was labeled "plausibly mandatory streaming, but this is intuition." 16384³ has not been derived in the paper.
 
-| Band | Chunk count | Compression | Full-equivalent chunks |
-|---|---:|---:|---:|
-| LOD-0 (r ≤ 1) | 27 | 1× | 27 |
-| LOD-1 (1 < r ≤ 4) | 9³−3³ = 702 | 8× | 88 |
-| LOD-2 (4 < r ≤ 16) | 33³−9³ ≈ 35,200 | 64× | 550 |
-| LOD-3 (16 < r ≤ 64) | bounded by world | 512× | depends on scale |
-| LOD-4 (r > 64) | bounded by world | 4096× | depends on scale |
+### 5.2 What the LOD policy changes
 
-The LOD-3 / LOD-4 contribution is world-size-dependent. Worked examples:
+The LOD policy in §2.2 makes **distant chunks contribute fewer leaves to the resident DAG** by collapsing each LOD-k chunk to a (chunk_side / 2^k)³ leaf set. For a chunk-side of 64 and the proposed log₄ curve, distant LOD-3/LOD-4 chunks contribute on the order of 1–10 effective leaves each.
 
-- **4096³ (64 chunks across at chunk=64).** Player at center: max chunk-radius 32. LOD-3 ring is 33 < r ≤ 32 (band is empty — world ends inside the LOD-2 reach). Memory dominated by LOD-0..LOD-2 bands ≈ 665 full-equivalent chunks.
-- **8192³ (128 chunks across).** Max chunk-radius 64. LOD-3 ring: 33 < r ≤ 64 → ~129³ − 33³ ≈ 2.1M chunks × (1/512) = ~4,100 full-equivalent. Total: ~4,700 full-equivalent.
-- **16384³ (256 chunks across).** LOD-3 + LOD-4 bands populate fully. LOD-3 contributes the same ~4,100; LOD-4 ring (r > 64) ≈ 256³ − 129³ ≈ 14.6M chunks × (1/4096) = ~3,560 full-equivalent. Total: ~8,300.
+What this *should* do, in shape:
 
-Per-chunk resident cost depends on chunk content; using `L^1.58` extrapolation as a per-chunk proxy gives roughly 1k reachable nodes for a full LOD-0 64³ chunk. Multiplying:
+- **Bound the per-chunk cost.** Without LOD, a distant fully-instantiated chunk contributes leaves at the chunk's actual content density. With LOD, the contribution is capped at the LOD-band's leaf count regardless of content density. This makes "memory cost as a function of chunks-in-view" a function we can bound, instead of one that depends on what's procedurally generated in those chunks.
+- **Skip seed/build cost for cells the player will never see.** Cold-gen for distant chunks goes through `TerrainParams::for_level` plus the SVDAG build path; a coarser chunk skips the deeper recursion. Whether this translates to a measurable cold-gen drop depends on the impl: if the gen-time path is "build full detail then collapse," there's no win; if the impl skips detail at gen time, the savings can be substantial. **The impl bead must pick a path and measure** before any cold-gen claim is made.
+- **Decouple reachable-node count from world side.** Long-tail scaling without LOD is `L^1.58`. With LOD that holds up to a finite-LOD-radius and then flattens, because chunks beyond that radius contribute a bounded constant. **Where the crossover lands is a measurement, not a derivation** — it depends on chunk size, the LOD curve's exact slope, and the per-chunk dedup rate.
 
-| Scale | LOD policy | No-LOD |
-|---|---:|---:|
-| 4096³ | ~640k reachable | 548k (already measured) |
-| 8192³ | ~4.7M | ~1.65M (projected) |
-| 16384³ | ~8.3M | ~5M (projected) |
+### 5.3 What the doc does *not* claim
 
-**Counter-intuitive result.** At 4096³ the LOD policy *adds* overhead because the proposed bands extend past the world boundary into nothing — the 27-chunk LOD-0 core is not fewer nodes than just-render-it-all when the whole world is small. At 8192³ and 16384³ the math also doesn't show the dramatic savings the §5.1 table suggested would be there.
+A direct reading of the §5.1 table ("4096³ is comfortably resident") is that **no LOD layer is required for memory at 4096³**. The LOD policy's value at and below cswp's 4096³+ target is qualitative:
 
-**Why this is actually fine.** The savings story for memory LOD is not "fewer reachable nodes total" but "**bounded growth**." Without LOD, reachable nodes scale as L^1.58 — the curve keeps climbing as the world grows. With LOD, distant chunks contribute a *bounded constant* per chunk, so total reachable scales linearly with chunks-in-LOD-band, which is L³-bounded but with very small coefficients (1/4096 at LOD-4). The crossover where LOD wins is at 16384³ and beyond, where the L^1.58 curve passes the LOD-flattened curve.
+- It defines the *shape* of streaming-side bookkeeping (cswp.5 needs a per-chunk cost it can budget against; the LOD policy supplies one).
+- It standardises the chunk-content representation so on-disk storage (cswp.2) doesn't have to handle arbitrary per-chunk reachable-node distributions.
+- It adds a knob (`lod_bias`-analog) for playtesting tradeoffs.
 
-This recasts §5.1's framing: **the LOD policy is not primarily a memory-shrinkage tool at 4096³–8192³.** It is a **structural shaping tool** that enforces bounded per-chunk cost and decouples world-side from reachable-node count. The memory win lands at 16384³+ and the cold-gen win lands at 8192³+ (skipping full detail for cells the player won't see).
+The doc explicitly **does not claim** that the LOD policy reduces resident memory at 4096³ or 8192³ versus no-LOD. The §4.7.4 "8192³ streaming threshold" framing in the perf paper stays unchanged — this doc does not re-derive it. Whether streaming is actually mandatory above 8192³ is still labeled intuition; the LOD policy is a separable architectural layer that pays off whenever streaming exists, regardless of where streaming becomes mandatory.
 
-This re-derivation is back-of-envelope. The impl bead should measure chunk-occupancy distributions on a representative seeded scene before locking the bands; the table above uses uniform fill, which overstates the LOD-3 / LOD-4 cost (most distant chunks are largely empty sky or uniform stone, both of which dedup hard).
+### 5.4 Things the impl bead must measure
 
-### 5.3 Streaming threshold (revised)
+The numbers we can't derive from existing benches but the impl bead can land:
 
-§4.7.4 of the perf paper called 8192³ "plausibly mandatory streaming, intuition not derived." With the LOD policy proposed here:
-
-- **8192³ remains feasible without streaming** because (a) total reachable count grows but stays in the few-million-nodes regime (~450 MB worst case at 96 B/node, several × that with overheads), and (b) cold-gen at 8192³ is the binding consumer, not memory. Memory LOD shaves cold-gen by skipping detail in distant chunks even though it doesn't shave the resident DAG much at this scale.
-- **16384³ is where streaming-plus-LOD becomes mandatory.** Cold-gen at this scale is ~58 s (§1.2 projection); without LOD, even gen-time hash-consing (cswp.3) won't bring it under the interactive bar. A streaming layer that loads only the seen chunks becomes necessary, and the LOD policy makes the seen-chunk set's memory bounded.
-
-The proposed LOD layer's value at cswp's 4096³+ target is therefore **bounded growth, not absolute shrinkage**. cswp.5 (chunk eviction) lands its full payoff above 8192³ with this LOD layer in place; below that, the layer's main contribution is keeping the per-chunk cost predictable for the streaming bookkeeping, not slashing the total budget.
+1. **Per-chunk reachable-node count** for the chosen chunk size (64³ / 128³ / 256³) on the seeded-terrain scene. This is the missing input that closes the §5.2 hand-wave into a real budget.
+2. **LOD-coarsening effective compression ratio** for representative chunks: a sand-and-stone chunk at LOD-2 is effectively how many bytes? Hash-cons dedup makes this content-dependent.
+3. **Cold-gen savings under each impl strategy** (skip-at-gen vs build-then-collapse). The doc *recommends* skip-at-gen but cannot prove the savings without measurement.
+4. **The crossover scale** where LOD-policy memory < no-LOD memory. The doc's previous attempt to derive this analytically was wrong; the impl bead lands the measurement instead.
 
 ---
 
@@ -242,7 +232,7 @@ The implementation sub-bead following cswp.6 needs to resolve:
 1. **Chunk size.** 64³, 128³, or 256³? Smaller = finer LOD bands, more bookkeeping; larger = coarser LOD bands, less bookkeeping. Probably want the chunk to be at a power-of-2 octree level for hash-cons reuse, so the candidates are 64³ (level-6 subtree), 128³ (level-7), 256³ (level-8). Recommend starting at 128³ as a middle ground; tune from playtesting.
 2. **Representative-material recompute on incoming transitions.** Do we recompute representative material when a chunk gains a level (becomes finer), or do we keep the parent's representative? Proposal: recompute on every level change, since the parent's rep was computed against children that no longer exist. Cost is O(chunk-leaves), bounded.
 3. **`lod_bias` knob.** Add a single uniform analogous to render-LOD's `u.debug.y` so playtesting can A/B aggressive vs gentle without recompiling. Suggest values 0.5 (more detail kept), 1.0 (default), 2.0 (more aggressive collapse).
-4. **Acceptance bench.** A "fly through 4096³ at velocity X" bench that measures resident memory + frame-time over the trajectory. Acceptance: total resident < 100 MB across the trajectory at 4096³, < 200 MB at 8192³.
+4. **Acceptance bench.** A "fly through 4096³ at velocity X" bench that measures resident memory + frame-time over the trajectory. The impl bead picks the threshold; the doc deliberately does not pin one because the no-LOD 4096³ resident set is already comfortable (§4.7), so the right bar is "LOD doesn't make things *worse*" plus "the per-chunk cost bound is empirically tight," not a fixed MB ceiling. Include macro-cache + render-side maps + DAG bytes in the measurement to match the perf paper's whole-resident accounting.
 5. **Multiplayer interaction.** cswp.6 is single-player. Per-client chunk LOD is fine for camera-anchored streaming; if `hash-thing-3bj` lockstep wants synchronized LODs, we need a separate "what's the canonical chunk LOD set" rule — out of scope here, file when 3bj actually starts.
 
 ---
