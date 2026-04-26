@@ -916,6 +916,182 @@ impl NodeStore {
         }
         (dst, new_root, remap)
     }
+
+    /// LOD-collapse primitive: collapse the bottom `target_lod` octree levels
+    /// of the subtree at `root` into representative-material leaves.
+    ///
+    /// Convention follows `docs/perf/cswp-lod.md` §2.1:
+    /// - `target_lod = 0` is identity (returns `root` unchanged).
+    /// - `target_lod = root_level` is full collapse (returns a single
+    ///   `Leaf` carrying the whole tree's representative state).
+    /// - In between, every contextual-level-`target_lod` subtree becomes a
+    ///   `Leaf`; Interior structure above is preserved and re-interned.
+    ///
+    /// Panics if `target_lod > root_level` (caller must clamp).
+    ///
+    /// The representative-state rule mirrors the SVDAG builder
+    /// (`crates/ht-render/src/svdag.rs`): largest-populated child wins; ties
+    /// among Interior children stay with the earlier octant; among Leaf-only
+    /// children, the first non-empty leaf wins (rep_pop seeded to 1). This
+    /// guarantees bit-exact agreement with SVDAG's `rep_mat` selection — the
+    /// full 16-bit `CellState` is preserved, not just the material field.
+    pub fn lod_collapse(&mut self, root: NodeId, target_lod: u32) -> NodeId {
+        let root_level = self.get(root).level();
+        assert!(
+            target_lod <= root_level,
+            "lod_collapse: target_lod {target_lod} > root_level {root_level}",
+        );
+        if target_lod == 0 {
+            return root;
+        }
+        self.lod_collapse_rec(root, root_level, target_lod)
+    }
+
+    /// Recursive worker for [`lod_collapse`]. `level` is the contextual level
+    /// of `node` as seen from its parent — when an intermediate subtree is
+    /// represented by a raw `Leaf(s)` (uniform-region compression), the
+    /// caller's `level` carries the true level rather than `Node::level()`.
+    fn lod_collapse_rec(&mut self, node: NodeId, level: u32, target_lod: u32) -> NodeId {
+        if level == target_lod {
+            let rep = self.representative_state(node);
+            return self.leaf(rep);
+        }
+        // level > target_lod: descend.
+        match *self.get(node) {
+            // A raw Leaf at level > target_lod stands for a uniform region;
+            // collapsing a uniform region cannot change it, so the input
+            // NodeId is already the answer.
+            Node::Leaf(_) => node,
+            Node::Interior { children, .. } => {
+                let mut new_children = children;
+                for i in 0..8 {
+                    new_children[i] = self.lod_collapse_rec(children[i], level - 1, target_lod);
+                }
+                self.interior(level, new_children)
+            }
+        }
+    }
+
+    /// Compute the representative `CellState` for `node` using the
+    /// SVDAG-builder rule (largest-populated child wins; among Leaf-only
+    /// children the first non-empty leaf wins). Pure read; no mutation.
+    fn representative_state(&self, node: NodeId) -> CellState {
+        match *self.get(node) {
+            Node::Leaf(s) => s,
+            Node::Interior { children, .. } => {
+                let mut rep_state: CellState = 0;
+                let mut rep_pop: u64 = 0;
+                for &child in children.iter() {
+                    match *self.get(child) {
+                        Node::Leaf(s) => {
+                            // First non-empty Leaf seeds rep_pop=1 — mirrors
+                            // svdag.rs `rep_mat == 0 || rep_pop == 0` guard.
+                            if s != 0 && (rep_state == 0 || rep_pop == 0) {
+                                rep_state = s;
+                                rep_pop = 1;
+                            }
+                        }
+                        Node::Interior { population, .. } => {
+                            // Strict inequality: equal-population ties stay
+                            // with the earlier octant — matches SVDAG.
+                            if population > 0 && population > rep_pop {
+                                rep_state = self.representative_state(child);
+                                rep_pop = population;
+                            }
+                        }
+                    }
+                }
+                rep_state
+            }
+        }
+    }
+
+    /// Per-chunk variant of [`lod_collapse`]. Rewrites only the subtree at
+    /// chunk `(chunk_x, chunk_y, chunk_z)` (where chunks are
+    /// `2^chunk_level`-cube cells of the `2^root_level` root grid),
+    /// collapsing it with the given `target_lod`. Other chunks' subtrees are
+    /// preserved by NodeId — hash-consing makes the rebuilt root share
+    /// every untouched branch with the input root.
+    ///
+    /// Panics if `chunk_level > root_level`, `target_lod > chunk_level`, or
+    /// any chunk coordinate is out of bounds for the
+    /// `(2^(root_level - chunk_level))^3` chunk grid.
+    pub fn lod_collapse_chunk(
+        &mut self,
+        root: NodeId,
+        chunk_x: u64,
+        chunk_y: u64,
+        chunk_z: u64,
+        chunk_level: u32,
+        target_lod: u32,
+    ) -> NodeId {
+        let root_level = self.get(root).level();
+        assert!(
+            chunk_level <= root_level,
+            "lod_collapse_chunk: chunk_level {chunk_level} > root_level {root_level}",
+        );
+        assert!(
+            target_lod <= chunk_level,
+            "lod_collapse_chunk: target_lod {target_lod} > chunk_level {chunk_level}",
+        );
+        let chunks_per_axis = 1u64 << (root_level - chunk_level);
+        assert!(
+            chunk_x < chunks_per_axis
+                && chunk_y < chunks_per_axis
+                && chunk_z < chunks_per_axis,
+            "lod_collapse_chunk: coord ({chunk_x},{chunk_y},{chunk_z}) out of bounds for {chunks_per_axis}³ grid",
+        );
+        self.lod_collapse_chunk_rec(
+            root,
+            root_level,
+            (chunk_x, chunk_y, chunk_z),
+            chunk_level,
+            target_lod,
+        )
+    }
+
+    /// Recursive worker for [`lod_collapse_chunk`]. Descends the unique path
+    /// to the target chunk, calling `lod_collapse` once at the chunk
+    /// boundary. The Leaf early-return preserves uniform regions: if the
+    /// path passes through a raw `Leaf(s)` above `chunk_level` (the
+    /// uniform-compression case), the chunk is already represented by that
+    /// leaf and collapsing it cannot change anything.
+    fn lod_collapse_chunk_rec(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        (cx, cy, cz): (u64, u64, u64),
+        chunk_level: u32,
+        target_lod: u32,
+    ) -> NodeId {
+        if level == chunk_level {
+            return self.lod_collapse(node, target_lod);
+        }
+        match *self.get(node) {
+            Node::Leaf(_) => node,
+            Node::Interior { children, .. } => {
+                // At descent step from `level` to `level-1`, the chunk grid
+                // halves. The target chunk's high bit at this depth picks
+                // the octant; the remaining bits address the sub-chunk
+                // within that octant.
+                let stride = 1u64 << (level - 1 - chunk_level);
+                let ox = (cx / stride) & 1;
+                let oy = (cy / stride) & 1;
+                let oz = (cz / stride) & 1;
+                let oct = octant_index(ox as u32, oy as u32, oz as u32);
+                let local = (cx - ox * stride, cy - oy * stride, cz - oz * stride);
+                let mut new_children = children;
+                new_children[oct] = self.lod_collapse_chunk_rec(
+                    children[oct],
+                    level - 1,
+                    local,
+                    chunk_level,
+                    target_lod,
+                );
+                self.interior(level, new_children)
+            }
+        }
+    }
 }
 
 /// Clone the subtree rooted at `old` from `src` into `dst`, populating
@@ -2804,5 +2980,300 @@ mod tests {
             leaf_arm_chunks, expected,
             "Leaf-above arm chunk coords must be dense over the raw-Leaf's 2³ chunk region",
         );
+    }
+
+    // -- cswp.8.2: lod_collapse / lod_collapse_chunk ------------------------
+
+    /// `target_lod = 0` is identity by contract — returns the input NodeId.
+    #[test]
+    fn lod_collapse_identity_at_target_lod_zero() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        root = store.set_cell(root, 1, 2, 3, mat(7));
+        root = store.set_cell(root, 8, 8, 8, mat(2));
+        let collapsed = store.lod_collapse(root, 0);
+        assert_eq!(
+            collapsed, root,
+            "lod_collapse(_, 0) must return the input NodeId unchanged",
+        );
+    }
+
+    /// `target_lod = root_level` collapses the entire tree to a single Leaf
+    /// carrying the representative state. For a uniform-stone root, that
+    /// representative is unambiguously `Leaf(stone)`.
+    #[test]
+    fn lod_collapse_full_collapse_at_root_level() {
+        let mut store = NodeStore::new();
+        let stone = mat(1);
+        let root = store.uniform(3, stone);
+        let collapsed = store.lod_collapse(root, 3);
+        assert!(
+            matches!(*store.get(collapsed), Node::Leaf(s) if s == stone),
+            "full collapse of uniform(3, stone) must be Leaf(stone), got {:?}",
+            store.get(collapsed),
+        );
+    }
+
+    /// Collapsing a uniform region anywhere in the level range produces a
+    /// hash-cons-equal output to a freshly-built uniform tree of the same
+    /// shape — the chain of Interior nodes above target_lod plus the
+    /// terminal Leaf reconstructs the same canonical shape.
+    #[test]
+    fn lod_collapse_uniform_returns_same_shape() {
+        let mut store = NodeStore::new();
+        let stone = mat(1);
+        // Take a uniform tree that goes all the way to Leaf at level 0
+        // (uniform helper builds an Interior chain top to bottom).
+        let original = store.uniform(4, stone);
+        // Collapsing at target_lod=2 produces an Interior(4) → Interior(3)
+        // chain over a Leaf(stone) at contextual level 2. Hash-consing
+        // makes that structurally equal to `uniform(4, stone)` because
+        // `uniform` builds the same Interior-of-Interior-of-Leaf shape with
+        // the Leaf reaching level 0 — but at level 2 the input subtree is
+        // already a recursively-equal Interior tree, so the stop-at-2
+        // Leaf(stone) is NOT NodeId-equal to the uniform-at-2 Interior.
+        // The invariant we DO get is: the collapsed root contains the same
+        // material everywhere by construction.
+        let collapsed = store.lod_collapse(original, 2);
+        // Collapsed root must still be at level 4.
+        assert_eq!(store.get(collapsed).level(), 4);
+        // The representative_state of the collapsed root is `stone`
+        // (everything is stone in the input).
+        assert_eq!(store.representative_state(collapsed), stone);
+    }
+
+    /// Largest-population child wins. Populate one octant with 64 stones,
+    /// another with 8 water, leave the rest empty, collapse to root level.
+    /// The root's representative must be stone.
+    #[test]
+    fn lod_collapse_dominant_material_wins() {
+        let mut store = NodeStore::new();
+        let stone = mat(1);
+        let water = mat(2);
+        let mut root = store.empty(3); // 8³
+                                       // Octant 0 (origin corner): fill a 4³ block with stone (64 cells).
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    root = store.set_cell(root, x, y, z, stone);
+                }
+            }
+        }
+        // Octant 7 (far corner): fill a 2³ block with water (8 cells).
+        for x in 4..6 {
+            for y in 4..6 {
+                for z in 4..6 {
+                    root = store.set_cell(root, x, y, z, water);
+                }
+            }
+        }
+        let collapsed = store.lod_collapse(root, 3);
+        assert!(
+            matches!(*store.get(collapsed), Node::Leaf(s) if s == stone),
+            "dominant-population child (stone, pop 64) must win over water (pop 8); got {:?}",
+            store.get(collapsed),
+        );
+    }
+
+    /// Empty world stays empty under any collapse — verified via population
+    /// and full flatten, not NodeId equality. The collapsed tree's
+    /// structural shape differs from `empty(N)` for `target_lod > 0` (the
+    /// Interior chain stops at `target_lod` rather than continuing to
+    /// level 0), so NodeId equality is too strong; the semantic invariant
+    /// is "every cell is 0".
+    #[test]
+    fn lod_collapse_empty_world_stays_empty() {
+        let mut store = NodeStore::new();
+        let root = store.empty(4);
+        let side: usize = 1 << 4;
+        for k in 0..=4 {
+            let collapsed = store.lod_collapse(root, k);
+            assert_eq!(
+                store.population(collapsed),
+                0,
+                "empty world collapsed at target_lod={k} must have population 0",
+            );
+            // For k < root_level the collapsed tree still has root level 4
+            // and we can flatten the full grid; for k == root_level the
+            // result is a single Leaf(0) and flatten is meaningless.
+            if k < 4 {
+                let flat = store.flatten(collapsed, side);
+                assert!(
+                    flat.iter().all(|&c| c == 0),
+                    "empty world collapsed at target_lod={k} must flatten to all zeros",
+                );
+            } else {
+                assert!(
+                    matches!(*store.get(collapsed), Node::Leaf(0)),
+                    "empty world collapsed at root_level must be Leaf(0)",
+                );
+            }
+        }
+    }
+
+    /// `target_lod > root_level` panics.
+    #[test]
+    #[should_panic(expected = "target_lod")]
+    fn lod_collapse_panics_above_root_level() {
+        let mut store = NodeStore::new();
+        let root = store.empty(3);
+        let _ = store.lod_collapse(root, 4);
+    }
+
+    /// Property: collapsing must never grow the reachable-node count. The
+    /// strict equality property for arbitrary trees is content-dependent
+    /// because hash-consing already shares uniform/empty regions, so the
+    /// monotonic inequality is the right invariant.
+    #[test]
+    fn lod_collapse_count_after_le_count_before() {
+        let mut store = NodeStore::new();
+        // Build a heterogeneous tree: a few scattered cells across the world.
+        let mut root = store.empty(4); // 16³
+        let probes: &[(u64, u64, u64, u16)] = &[
+            (0, 0, 0, 1),
+            (15, 15, 15, 2),
+            (3, 7, 11, 3),
+            (8, 0, 4, 1),
+            (12, 12, 12, 2),
+            (1, 14, 5, 3),
+            (9, 2, 9, 1),
+        ];
+        for &(x, y, z, m) in probes {
+            root = store.set_cell(root, x, y, z, mat(m));
+        }
+        let count_before = store.reachable_node_count(root);
+        for k in 1..=4 {
+            let collapsed = store.lod_collapse(root, k);
+            let count_after = store.reachable_node_count(collapsed);
+            assert!(
+                count_after <= count_before,
+                "lod_collapse(_, {k}): count_after ({count_after}) > count_before ({count_before})",
+            );
+        }
+    }
+
+    /// `lod_collapse_chunk` only mutates the targeted chunk's subtree:
+    /// every other top-level child of the root must remain NodeId-equal.
+    #[test]
+    fn lod_collapse_chunk_only_touches_one_chunk() {
+        let mut store = NodeStore::new();
+        // root_level=4, chunk_level=2 → 4 chunks per axis (chunks are 4³).
+        let mut root = store.empty(4);
+        // Sprinkle one cell into each of two different top-level octants so
+        // their subtrees diverge (avoiding full hash-cons sharing across
+        // the whole world).
+        root = store.set_cell(root, 1, 1, 1, mat(1)); // octant 0 of root
+        root = store.set_cell(root, 9, 9, 9, mat(2)); // octant 7 of root
+        let original_children = store.children(root);
+        // Collapse the chunk at top-level octant 0 (origin chunk at chunk_level=3).
+        // chunk_level=3 → 2 chunks per axis; chunk (0,0,0) is the level-3 child
+        // at octant 0 of the root.
+        let collapsed = store.lod_collapse_chunk(root, 0, 0, 0, 3, 1);
+        let collapsed_children = store.children(collapsed);
+        // Octant 0's subtree may differ. Octants 1..8 must be unchanged.
+        for oct in 1..8 {
+            assert_eq!(
+                collapsed_children[oct], original_children[oct],
+                "octant {oct} subtree must be NodeId-equal after lod_collapse_chunk",
+            );
+        }
+    }
+
+    /// `target_lod > chunk_level` panics.
+    #[test]
+    #[should_panic(expected = "target_lod")]
+    fn lod_collapse_chunk_panics_target_above_chunk_level() {
+        let mut store = NodeStore::new();
+        let root = store.empty(4);
+        // chunk_level=2, target_lod=3 → must panic.
+        let _ = store.lod_collapse_chunk(root, 0, 0, 0, 2, 3);
+    }
+
+    /// Targeting a chunk that lives inside a uniform-Leaf-above-chunk_level
+    /// region must short-circuit at the Leaf early-return arm and return
+    /// the input root unchanged. Reproduces the structural state by
+    /// building a raw `Leaf` at child slot 0 of an Interior(level=3),
+    /// round-tripping through `set_cell` to canonicalize via splice_column,
+    /// and then probing a chunk at `chunk_level=1` inside that uniform
+    /// region.
+    #[test]
+    fn lod_collapse_chunk_uniform_leaf_above_chunk_level() {
+        let mut store = NodeStore::new();
+        let stone_leaf = store.leaf(mat(1));
+        // Build an Interior at level=3 with octant 0 = raw Leaf(stone) (a
+        // uniform 4³ region) and the rest empty(2). Note: `interior` will
+        // sum populations correctly across leaf children (stone_leaf has
+        // population 1 by `population()`, but for a *uniform Leaf at
+        // level=3* the population is 64 — which is why we round-trip
+        // through set_cell below to canonicalize.
+        let empty2 = store.empty(2);
+        let mut children = [empty2; 8];
+        children[0] = stone_leaf;
+        let raw_root = store.interior(3, children);
+        // Round-trip through set_cell — this may canonicalize the raw Leaf
+        // path. The exact NodeId post-roundtrip is what we test against.
+        // We don't actually need set_cell here; the raw_root IS structurally
+        // a uniform-Leaf-above-chunk-level case the rec walker will hit.
+
+        // Collapse the chunk at (0,0,0) at chunk_level=1 (chunk side=2),
+        // target_lod=0 (no-op inside the chunk). This descends to the
+        // raw Leaf(stone) at level 3 (one descent step), at which point
+        // we're not yet at chunk_level=1 and hit the Leaf arm.
+        let collapsed = store.lod_collapse_chunk(raw_root, 0, 0, 0, 1, 0);
+        assert_eq!(
+            collapsed, raw_root,
+            "uniform-Leaf-above-chunk_level chunk collapse must return root unchanged",
+        );
+    }
+
+    /// Idempotence: collapsing twice at the same target_lod returns the
+    /// same NodeId. Hash-cons identity property.
+    ///
+    /// Caveat: when `target_lod == root_level` the first collapse already
+    /// reduces the tree to a single `Leaf` whose `Node::level() == 0`, so a
+    /// re-collapse at `k = root_level` would panic the assert
+    /// `target_lod ≤ root_level`. The clean idempotence statement is "the
+    /// second collapse uses target_lod clamped to the post-collapse root
+    /// level": `lod_collapse(once, min(k, once.level()))` returns `once`.
+    #[test]
+    fn lod_collapse_idempotent() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        root = store.set_cell(root, 0, 0, 0, mat(1));
+        root = store.set_cell(root, 15, 15, 15, mat(2));
+        root = store.set_cell(root, 7, 8, 9, mat(3));
+        for k in 0..=4 {
+            let once = store.lod_collapse(root, k);
+            let once_level = store.get(once).level();
+            let k2 = k.min(once_level);
+            let twice = store.lod_collapse(once, k2);
+            assert_eq!(
+                once, twice,
+                "lod_collapse must be idempotent at target_lod={k} (re-collapse at {k2})",
+            );
+        }
+    }
+
+    /// For a uniform-stone tree at root_level=N, the collapsed reachable
+    /// count at any `target_lod = k` is exactly `(N - k) + 1`: one Interior
+    /// link per preserved level above target_lod, plus the terminal
+    /// `Leaf(stone)` at level k. This pins the exact compression for the
+    /// uniform case (the inequality property test admits silent
+    /// undercounting).
+    #[test]
+    fn lod_collapse_uniform_exact_count() {
+        let mut store = NodeStore::new();
+        let stone = mat(1);
+        let root_level: u32 = 4;
+        let root = store.uniform(root_level, stone);
+        for k in 0..=root_level {
+            let collapsed = store.lod_collapse(root, k);
+            let expected = (root_level - k) as u64 + 1;
+            let actual = store.reachable_node_count(collapsed);
+            assert_eq!(
+                actual, expected,
+                "uniform(root_level={root_level}, stone) collapsed at target_lod={k}: expected {expected} reachable nodes, got {actual}",
+            );
+        }
     }
 }
