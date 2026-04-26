@@ -255,7 +255,7 @@ pub struct World {
     pub memo_window: MemoWindow,
     /// Store size after the last compaction, used to trigger periodic GC.
     pub(crate) store_size_at_last_compact: usize,
-    /// Cache for `inert_uniform_state`: NodeId → Option<CellState>.
+    /// Cache for `inert_uniform_state`: NodeId → `Option<CellState>`.
     /// `Some(state)` = all leaves are the same inert material; `None` = mixed or active.
     pub(crate) hashlife_inert_cache: FxHashMap<NodeId, Option<CellState>>,
     /// Cache for `is_all_inert`: NodeId → bool.
@@ -2493,10 +2493,11 @@ impl World {
 /// Gravity gap-fill: cascading bottom-to-top sweep that fills air gaps
 /// WITHIN gravity-bearing bodies, preventing Margolus rarefaction.
 ///
-/// Only swaps cell[y] (air) with cell[y+1] (gravity-bearing) when cell[y-1]
-/// is also gravity-bearing — i.e., only fills internal gaps, never extends
-/// the falling front. This prevents isolated cells from cascading to the
-/// bottom while still compacting bodies after block-rule gravity creates gaps.
+/// Only swaps `cell[y]` (air) with `cell[y+1]` (gravity-bearing) when
+/// `cell[y-1]` is also gravity-bearing — i.e., only fills internal gaps,
+/// never extends the falling front. This prevents isolated cells from
+/// cascading to the bottom while still compacting bodies after block-rule
+/// gravity creates gaps.
 ///
 /// Mass-conserving: only swaps, never creates or destroys cells.
 pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &MaterialRegistry) {
@@ -2524,7 +2525,7 @@ pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &
     }
 }
 
-/// 1D column variant of [`gravity_gap_fill`] (hash-thing-jw3k.1).
+/// 1D column variant of `gravity_gap_fill` (hash-thing-jw3k.1).
 ///
 /// Operates on a single `(x, z)` column (length = `side`), mutating in place.
 /// Returns `true` when any swap fired so callers can skip the splice step

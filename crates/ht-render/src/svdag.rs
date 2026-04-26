@@ -15,12 +15,12 @@
 //! array across frames** so that unchanged subtrees never need to be re-uploaded.
 //!
 //! Buffer layout (u32 per slot):
-//!   [0]:        root_offset — absolute index of the current root node's slot
-//!   [1..]:      concatenated 9-u32 interior-node slots, append-only
+//!   `[0]`:      root_offset — absolute index of the current root node's slot
+//!   `[1..]`:    concatenated 9-u32 interior-node slots, append-only
 //!
 //! Interior node slot (9 u32s = 36 bytes):
-//!   [0]:        child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
-//!   [1..=8]:    child entries — packed as (is_leaf << 31) | payload_bits
+//!   `[0]`:      child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
+//!   `[1..=8]`:  child entries — packed as (is_leaf << 31) | payload_bits
 //!     - is_leaf: payload is the 16-bit material state in low bits
 //!     - else:    payload is the absolute offset of the child node in this buffer
 //!

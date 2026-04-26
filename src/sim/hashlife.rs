@@ -56,7 +56,7 @@ pub struct StepProfile {
     pub step_node_us: u64,
     /// Time spent walking all columns (flatten per column + 1D gap_fill).
     pub column_walk_us: u64,
-    /// Time spent in [`NodeStore::splice_column`] for columns that changed.
+    /// Time spent in [`crate::octree::NodeStore::splice_column`] for columns that changed.
     /// Subset of `column_walk_us` — reported separately so callers can tell
     /// whether rebuild cost or walk cost dominates.
     pub splice_us: u64,
