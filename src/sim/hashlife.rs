@@ -104,9 +104,10 @@ impl World {
         self.memo_window
             .push(step_stats.cache_hits, step_stats.cache_misses);
 
-        // No post-pass gap-fill: qy4g option G (2026-04-26) — internal
-        // gaps left by Margolus close over 2-4 ticks via the alternating
-        // partition offset.
+        // No post-pass gap-fill: qy4g option G (2026-04-26) — static
+        // internal gaps close in 1-2 ticks via parity-flip; falling
+        // columns checkerboard in flight and compact on landing. See
+        // World::step and SPEC.md for the visible-artifact tradeoff.
         self.generation += 1;
 
         self.maybe_compact();

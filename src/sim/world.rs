@@ -1042,10 +1042,13 @@ impl World {
         }
 
         // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
-        // Internal gaps left by Margolus close at ~1 cell per tick via the
-        // alternating partition offset (linear in gap height; qy4g epic
-        // decision 2026-04-26, option G). No post-pass gap-fill runs in
-        // production.
+        // Static internal gaps close in 1-2 ticks via the alternating
+        // partition offset (qy4g epic decision 2026-04-26, option G).
+        // Gaps within free-falling columns are co-moving with the column
+        // and appear as a sustained checkerboard until the leading edge
+        // compacts against a solid surface — see SPEC.md for the in-flight
+        // visible-artifact tradeoff and fallbacks A/F. No post-pass
+        // gap-fill runs in production.
         self.step_blocks(&mut next, side);
 
         self.commit_step(&next, side);
@@ -5381,12 +5384,21 @@ mod tests {
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 
-    /// qy4g.2 option G regression: a falling water block develops temporary
-    /// every-other-y gaps from the Margolus 2×2×2 partition. Those gaps must
-    /// close as parity flips (~1 cell per tick, linear in gap height). Mass
-    /// must remain conserved throughout. Originally hash-thing-u4w
-    /// "checkerboard density bug" — option G accepts the temporary gaps and
-    /// asserts eventual closure rather than disallowing them.
+    /// qy4g.2 option G regression. Two invariants checked under the new
+    /// no-gap-fill regime:
+    ///
+    /// 1. **Mass conservation every step.** Population is constant under
+    ///    pure CaRule + Margolus BlockRule (option G's strongest guarantee).
+    /// 2. **Post-compaction contiguity.** Once the falling water block
+    ///    compacts against the floor (or another solid), the resulting
+    ///    settled pile is contiguous (no every-other-y holes left behind).
+    ///
+    /// What this test does **NOT** verify: gap closure during free-fall.
+    /// Option G accepts an in-flight every-other-y checkerboard while a
+    /// column is falling — see `World::step` and SPEC.md "Internal-gap
+    /// closure rides parity-flip" for the explicit tradeoff and fallbacks
+    /// A/F. The 32-tick run lets the 6-cell starter block fall ~16 cells
+    /// onto the floor and settle.
     #[test]
     fn water_block_gaps_close_via_parity_flip() {
         let mut world = World::new(5); // 32³
@@ -5400,10 +5412,6 @@ mod tests {
         }
         let pop_before = world.population();
 
-        // Step long enough for the falling block to settle. Spec claim:
-        // ~1 cell per tick closure rate, so a 6-cell column with 1-cell
-        // gaps closes well within 32 ticks. Mass conservation enforced
-        // every step.
         let max_steps = 32;
         for step in 0..max_steps {
             world.step();
@@ -5452,7 +5460,8 @@ mod tests {
             assert_eq!(
                 pair[1] - pair[0],
                 1,
-                "gap between y={} and y={} — parity-flip closure failed within {max_steps} steps",
+                "gap between y={} and y={} — settled pile not contiguous \
+                 after {max_steps} steps",
                 pair[0],
                 pair[1]
             );
