@@ -1774,24 +1774,58 @@ impl App {
             .map(|r| format!("{r:.2}x"))
             .unwrap_or_else(|| "n/a".to_string());
         format!(
-            "lod=ON bias={:.2} hist[0..4]={}/{}/{}/{}/{} grow={}",
+            "lod=ON bias={:.2} hist[0..=4]={}/{}/{}/{}/{} grow={}",
             self.lod_policy.lod_bias, h[0], h[1], h[2], h[3], h[4], growth
         )
     }
 
-    /// Player world-cell position with a sane fallback when no player
-    /// exists yet (e.g. during demo-load before `reset_scene_entities`
-    /// runs). Used by [`Self::upload_volume`] to anchor the cswp.8.3
-    /// chunk-LOD policy.
+    /// Re-run [`Self::upload_volume`] and request a redraw so a chunk-LOD
+    /// hotkey takes effect immediately, even in a paused/static scene
+    /// where no sim-step would otherwise trigger an upload (cswp.8.3
+    /// review fix — Codex-standard "important" finding).
+    fn refresh_view_after_lod_change(&mut self) {
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
+        );
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Player position in **local-cell coords** (`[0, 1 << world.level)` per
+    /// axis), with a sane fallback when no player exists yet (e.g. during
+    /// demo-load before `reset_scene_entities` runs). Used by
+    /// [`Self::upload_volume`] to anchor the cswp.8.3 chunk-LOD policy.
+    ///
+    /// `entity.pos` is world-space (`world.origin + local_offset`); the
+    /// chunk grid is local-cell-space, so `world.origin` is subtracted.
+    /// When `world.origin == [0,0,0]` (the default for non-grown worlds)
+    /// the two coincide and this function is the identity on the entity
+    /// position. Without the subtraction the LOD anchor would jump as the
+    /// world auto-grows negatively (`hash-thing-cswp.8.3` review fix).
     fn player_world_pos(&self) -> [f64; 3] {
+        let origin = self.world.origin;
         if let Some(pid) = self.player_id {
             if let Some(entity) = self.entities.iter().find(|e| e.id == pid) {
-                return entity.pos;
+                return [
+                    entity.pos[0] - origin[0] as f64,
+                    entity.pos[1] - origin[1] as f64,
+                    entity.pos[2] - origin[2] as f64,
+                ];
             }
         }
-        // Center the world; LOD policy is render-only and self-defensive,
-        // so this only matters for the (rare) frame where the policy is
-        // enabled, the player is missing, and a far-chunk view is queried.
+        // Local-cell center: the LOD anchor lives in local-cell space.
         let center = self.world.side() as f64 * 0.5;
         [center, center, center]
     }
@@ -2525,6 +2559,7 @@ impl ApplicationHandler for App {
                                 self.lod_policy.lod_bias,
                                 self.lod_policy.max_lod,
                             );
+                            self.refresh_view_after_lod_change();
                         }
                         // cswp.8.3: chunk-LOD bias step (semicolon = down,
                         // apostrophe = up). Clamped to [0.25, 4.0]; lower
@@ -2534,6 +2569,7 @@ impl ApplicationHandler for App {
                             if next != self.lod_policy.lod_bias {
                                 self.lod_policy.lod_bias = next;
                                 log::info!("Chunk-LOD bias: {:.2}x", self.lod_policy.lod_bias);
+                                self.refresh_view_after_lod_change();
                             }
                         }
                         winit::keyboard::Key::Character("'") => {
@@ -2541,6 +2577,7 @@ impl ApplicationHandler for App {
                             if next != self.lod_policy.lod_bias {
                                 self.lod_policy.lod_bias = next;
                                 log::info!("Chunk-LOD bias: {:.2}x", self.lod_policy.lod_bias);
+                                self.refresh_view_after_lod_change();
                             }
                         }
                         winit::keyboard::Key::Character("=")

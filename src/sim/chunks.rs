@@ -226,7 +226,13 @@ impl ChunkLodPolicy {
     }
 
     /// Recompute path. Invalidates `chunk_lod` against the current world
-    /// dimensions, then walks all chunks in lex order.
+    /// dimensions, then walks all chunks in lex order. Every chunk —
+    /// including LOD 0 — is recorded in the new map so:
+    /// - the next frame sees `current = Some(0)` and can hold transitions
+    ///   1→0 with hysteresis (cswp.8.3 review BLOCKER 2: previously chunks
+    ///   crossing back into the near band lost their hysteresis hold);
+    /// - [`lod_histogram`](Self::lod_histogram) reports an honest hist[0]
+    ///   instead of always zero.
     fn recompute(
         &mut self,
         store: &mut NodeStore,
@@ -235,8 +241,11 @@ impl ChunkLodPolicy {
         player_chunk: ChunkCoord,
     ) -> NodeId {
         let chunks_per_axis: u32 = 1u32 << (world_level - CHUNK_LEVEL);
+        let total_chunks = (chunks_per_axis as usize)
+            .saturating_pow(3)
+            .max(self.chunk_lod.len());
         let mut next_lod: FxHashMap<ChunkCoord, u8> =
-            FxHashMap::with_capacity_and_hasher(self.chunk_lod.len(), Default::default());
+            FxHashMap::with_capacity_and_hasher(total_chunks, Default::default());
         let mut view = world_root;
         for cz in 0..chunks_per_axis {
             for cy in 0..chunks_per_axis {
@@ -246,8 +255,8 @@ impl ChunkLodPolicy {
                     let current = self.chunk_lod.get(&chunk).copied();
                     let lod =
                         target_lod_with_hysteresis(radius, current, self.lod_bias, self.max_lod);
+                    next_lod.insert(chunk, lod);
                     if lod > 0 {
-                        next_lod.insert(chunk, lod);
                         view = store.lod_collapse_chunk(
                             view,
                             cx as u64,
