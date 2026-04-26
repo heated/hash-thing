@@ -2252,49 +2252,78 @@ mod tests {
     // is added to one table but forgotten in the other.
     #[test]
     fn material_density_and_phase_agree_on_known_materials() {
-        // Air: density 0, Gas.
-        assert_eq!(material_density(Cell::EMPTY), 0.0);
-        assert_eq!(material_phase(Cell::EMPTY), Phase::Gas);
-
-        // Sample: every named material id should classify as something
-        // non-default (i.e. not the catch-all Gas-with-density-0). We probe
-        // each registered constant.
-        let registered: &[MaterialId] = &[
-            STONE_MATERIAL_ID,
-            DIRT_MATERIAL_ID,
-            GRASS_MATERIAL_ID,
-            FIRE_MATERIAL_ID,
-            WATER_MATERIAL_ID,
-            SAND_MATERIAL_ID,
-            LAVA_MATERIAL_ID,
-            ICE_MATERIAL_ID,
-            ACID_MATERIAL_ID,
-            OIL_MATERIAL_ID,
-            GUNPOWDER_MATERIAL_ID,
-            STEAM_MATERIAL_ID,
-            GAS_MATERIAL_ID,
-            METAL_MATERIAL_ID,
-            VINE_MATERIAL_ID,
-            FAN_MATERIAL_ID,
-            FIREWORK_MATERIAL_ID,
-            CLONE_MATERIAL_ID,
+        // Pin every reachable material's exact (density, phase) pair so a
+        // drift in either table — a forgotten entry, a Gas getting silently
+        // re-tagged Liquid, a fan-armed material disappearing — fails this
+        // test loudly. Includes the eight reachable FAN_ARMED_* gravity
+        // materials; both `material_density` and `material_phase` classify
+        // them specially, so they must be pinned here too.
+        let cases: &[(MaterialId, f32, Phase)] = &[
+            (AIR_MATERIAL_ID, 0.0, Phase::Gas),
+            (STONE_MATERIAL_ID, 5.0, Phase::Solid),
+            (DIRT_MATERIAL_ID, 2.0, Phase::Solid),
+            (GRASS_MATERIAL_ID, 1.2, Phase::Solid),
+            (FIRE_MATERIAL_ID, 0.05, Phase::Gas),
+            (WATER_MATERIAL_ID, 1.0, Phase::Liquid),
+            (SAND_MATERIAL_ID, 1.5, Phase::Solid),
+            (LAVA_MATERIAL_ID, 3.0, Phase::Liquid),
+            (ICE_MATERIAL_ID, 0.9, Phase::Solid),
+            (ACID_MATERIAL_ID, 1.1, Phase::Liquid),
+            (OIL_MATERIAL_ID, 0.8, Phase::Liquid),
+            (GUNPOWDER_MATERIAL_ID, 1.4, Phase::Solid),
+            (STEAM_MATERIAL_ID, -0.1, Phase::Gas),
+            (GAS_MATERIAL_ID, -0.2, Phase::Gas),
+            (METAL_MATERIAL_ID, 7.0, Phase::Solid),
+            (VINE_MATERIAL_ID, 1.1, Phase::Solid),
+            (FAN_MATERIAL_ID, 1.0, Phase::Solid),
+            (FIREWORK_MATERIAL_ID, -0.3, Phase::Gas),
+            (CLONE_MATERIAL_ID, 10.0, Phase::Solid),
         ];
-        for &id in registered {
-            let cell = Cell::pack(id, 0);
+        for &(id, expected_density, expected_phase) in cases {
+            let cell = if id == AIR_MATERIAL_ID {
+                Cell::EMPTY
+            } else {
+                Cell::pack(id, 0)
+            };
             let d = material_density(cell);
             let p = material_phase(cell);
-            // Solids: density should be > 0 (no negative-density solids today).
-            if p == Phase::Solid {
-                assert!(
-                    d > 0.0,
-                    "material {id} is Solid but density {d} <= 0; \
-                     classification table likely drifted"
-                );
-            }
-            // Liquids: density should be > 0 (lighter than solids in current set).
-            if p == Phase::Liquid {
-                assert!(d > 0.0, "material {id} is Liquid but density {d} <= 0");
-            }
+            assert_eq!(
+                d, expected_density,
+                "material {id}: density {d} ≠ expected {expected_density} (table drift?)"
+            );
+            assert_eq!(
+                p, expected_phase,
+                "material {id}: phase {p:?} ≠ expected {expected_phase:?} (table drift?)"
+            );
+        }
+
+        // Fan-armed steam variants (4 ids): all density -0.1, Gas.
+        for &id in FAN_ARMED_STEAM_MATERIAL_IDS.iter() {
+            let cell = Cell::pack(id, 0);
+            assert_eq!(
+                material_density(cell),
+                -0.1,
+                "FAN_ARMED_STEAM {id}: density drift"
+            );
+            assert_eq!(
+                material_phase(cell),
+                Phase::Gas,
+                "FAN_ARMED_STEAM {id}: phase drift"
+            );
+        }
+        // Fan-armed firework variants (4 ids): all density -0.3, Gas.
+        for &id in FAN_ARMED_FIREWORK_MATERIAL_IDS.iter() {
+            let cell = Cell::pack(id, 0);
+            assert_eq!(
+                material_density(cell),
+                -0.3,
+                "FAN_ARMED_FIREWORK {id}: density drift"
+            );
+            assert_eq!(
+                material_phase(cell),
+                Phase::Gas,
+                "FAN_ARMED_FIREWORK {id}: phase drift"
+            );
         }
     }
 }

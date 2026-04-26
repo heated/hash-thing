@@ -444,6 +444,7 @@ mod tests {
         let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(out[block_index(0, 0, 0)], mat(5));
         assert_eq!(out[block_index(0, 1, 0)], Cell::EMPTY);
+        assert_mass_conserved(&block, &out);
     }
 
     // hash-thing-nagw: gas-on-gas density swaps still happen (heavy gas falls).
@@ -461,6 +462,7 @@ mod tests {
         let out = rule.step_block(&block, &[true; 8]);
         assert_eq!(out[block_index(0, 0, 0)], mat(5), "heavy gas falls");
         assert_eq!(out[block_index(0, 1, 0)], mat(1), "light gas rises");
+        assert_mass_conserved(&block, &out);
     }
 
     // ---------------------------------------------------------------
@@ -560,6 +562,35 @@ mod tests {
             out[block_index(0, 1, 0)],
             Cell::EMPTY,
             "fluid should have fallen from top"
+        );
+        assert_mass_conserved(&block, &out);
+    }
+
+    // hash-thing-nagw defense-in-depth: FluidBlockRule's gravity phase must
+    // also refuse solid-on-solid swaps. No shipped fluid is Solid today, so
+    // this can only be triggered by a future cross-classification — but if
+    // the gate were stripped out, this test fails immediately, pinning the
+    // symmetry the comment promises.
+    #[test]
+    fn fluid_gravity_does_not_swap_solid_on_solid() {
+        let rule = fluid_rule();
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = mat(SOLID_MAT); // light(er) solid bottom (density 7)
+        block[block_index(0, 1, 0)] = mat(SOLID_MAT + 1); // heavier solid top (density 8)
+                                                          // Block lateral neighbors with non-fluid solids so the lateral phase
+                                                          // cannot move anything.
+        block[block_index(1, 0, 0)] = mat(SOLID_MAT);
+        block[block_index(0, 0, 1)] = mat(SOLID_MAT);
+        let out = rule.step_block(&block, &[true; 8]);
+        assert_eq!(
+            out[block_index(0, 0, 0)],
+            mat(SOLID_MAT),
+            "solid bottom must stay even though density(top) > density(bot)"
+        );
+        assert_eq!(
+            out[block_index(0, 1, 0)],
+            mat(SOLID_MAT + 1),
+            "solid top must stay — solid-on-solid lock applies in FluidBlockRule too"
         );
         assert_mass_conserved(&block, &out);
     }
