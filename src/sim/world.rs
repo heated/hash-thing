@@ -1042,55 +1042,13 @@ impl World {
         }
 
         // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
+        // Internal gaps left by Margolus close at ~1 cell per tick via the
+        // alternating partition offset (linear in gap height; qy4g epic
+        // decision 2026-04-26, option G). No post-pass gap-fill runs in
+        // production.
         self.step_blocks(&mut next, side);
 
-        // Phase 3: gravity gap-fill — prevents Margolus rarefaction.
-        // Fills air gaps within gravity-bearing bodies by cascading cells
-        // down, but only at positions with gravity cells on both sides.
-        gravity_gap_fill(&mut next, side, &self.materials);
-
         self.commit_step(&next, side);
-    }
-
-    /// Probe variant of [`World::step`]: runs phases 1 (CaRule) and 2
-    /// (BlockRule) into a scratch buffer and returns a clone of that
-    /// buffer *before* phase 3 (`gravity_gap_fill`) runs on it, then
-    /// completes the step normally so the world advances identically
-    /// to `step()`. Used by `tests/probe_gap_fill_lightcone.rs`
-    /// (hash-thing-7nj6) to measure the gap_fill light cone on the
-    /// exact input distribution that the real step path sees.
-    pub fn step_returning_pre_gap_fill(&mut self) -> Vec<CellState> {
-        let side = self.side();
-        let grid = self.flatten();
-        let mut next = vec![0 as CellState; side * side * side];
-        let divisor_by_material = self.materials.tick_divisor_flags();
-        let generation = self.generation;
-
-        for z in 0..side {
-            for y in 0..side {
-                for x in 0..side {
-                    let idx = x + y * side + z * side * side;
-                    let raw = grid[idx];
-                    let center = Cell::from_raw(raw);
-                    let mat = center.material() as usize;
-                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
-                    if divisor > 1 && !generation.is_multiple_of(divisor) {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    let neighbors = get_neighbors(&grid, side, x, y, z);
-                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
-                        panic!("missing CaRule for material {}", center.material())
-                    });
-                    next[idx] = rule.step_cell(center, &neighbors).raw();
-                }
-            }
-        }
-        self.step_blocks(&mut next, side);
-        let pre_gap_fill = next.clone();
-        gravity_gap_fill(&mut next, side, &self.materials);
-        self.commit_step(&next, side);
-        pre_gap_fill
     }
 
     /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
@@ -2490,15 +2448,13 @@ impl World {
     }
 }
 
-/// Gravity gap-fill: cascading bottom-to-top sweep that fills air gaps
-/// WITHIN gravity-bearing bodies, preventing Margolus rarefaction.
-///
-/// Only swaps cell[y] (air) with cell[y+1] (gravity-bearing) when cell[y-1]
-/// is also gravity-bearing — i.e., only fills internal gaps, never extends
-/// the falling front. This prevents isolated cells from cascading to the
-/// bottom while still compacting bodies after block-rule gravity creates gaps.
+/// Cascading bottom-to-top sweep that fills internal air gaps in
+/// gravity-bearing bodies. Retained as a `#[cfg(test)]` reference for
+/// divergence/regression tests after qy4g option G removed it from the
+/// production step path (2026-04-26).
 ///
 /// Mass-conserving: only swaps, never creates or destroys cells.
+#[cfg(test)]
 pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &MaterialRegistry) {
     for z in 0..side {
         for x in 0..side {
@@ -2524,17 +2480,13 @@ pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &
     }
 }
 
-/// 1D column variant of [`gravity_gap_fill`] (hash-thing-jw3k.1).
-///
-/// Operates on a single `(x, z)` column (length = `side`), mutating in place.
-/// Returns `true` when any swap fired so callers can skip the splice step
-/// for unchanged columns.
-///
-/// In-place mutation is load-bearing: the 3D loop evaluates `y = 1..side-1`
-/// in order and later iterations read values that earlier iterations wrote.
-/// A fresh-read variant (read whole column, write to an out-buffer) would
-/// diverge on cascade patterns like `[B, A, B, B]` — see Rev 2 plan tests.
-pub fn gravity_gap_fill_column(column: &mut [CellState], materials: &MaterialRegistry) -> bool {
+/// 1D column variant of [`gravity_gap_fill`]. Retained as a `#[cfg(test)]`
+/// reference (qy4g option G, 2026-04-26).
+#[cfg(test)]
+pub(crate) fn gravity_gap_fill_column(
+    column: &mut [CellState],
+    materials: &MaterialRegistry,
+) -> bool {
     let side = column.len();
     if side < 3 {
         return false;
@@ -5429,10 +5381,14 @@ mod tests {
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 
-    /// Reproduction test for hash-thing-u4w: checkerboard density bug.
-    /// A solid block of water should not develop every-other-column air gaps.
+    /// qy4g.2 option G regression: a falling water block develops temporary
+    /// every-other-y gaps from the Margolus 2×2×2 partition. Those gaps must
+    /// close as parity flips (~1 cell per tick, linear in gap height). Mass
+    /// must remain conserved throughout. Originally hash-thing-u4w
+    /// "checkerboard density bug" — option G accepts the temporary gaps and
+    /// asserts eventual closure rather than disallowing them.
     #[test]
-    fn water_block_no_checkerboard_gaps() {
+    fn water_block_gaps_close_via_parity_flip() {
         let mut world = World::new(5); // 32³
                                        // Place a 6×6×6 water block in the center, well away from boundaries.
         for z in 10..16 {
@@ -5444,19 +5400,21 @@ mod tests {
         }
         let pop_before = world.population();
 
-        // Step 6 times — enough for the falling front to develop.
-        for step in 0..6 {
+        // Step long enough for the falling block to settle. Spec claim:
+        // ~1 cell per tick closure rate, so a 6-cell column with 1-cell
+        // gaps closes well within 32 ticks. Mass conservation enforced
+        // every step.
+        let max_steps = 32;
+        for step in 0..max_steps {
             world.step();
             let pop_after = world.population();
             assert_eq!(
                 pop_before, pop_after,
-                "population changed at step {} ({} → {})",
-                step, pop_before, pop_after
+                "population changed at step {step} ({pop_before} → {pop_after})",
             );
         }
 
         // Check: for each y-level that contains water, count water cells.
-        // If there's a checkerboard, some y-levels will have ~50% of expected.
         let side = world.side() as u64;
         let grid = world.flatten();
         let mut water_by_y = vec![0u64; side as usize];
@@ -5473,16 +5431,13 @@ mod tests {
             }
         }
 
-        // Print water distribution for diagnosis
-        eprintln!("Water cells per y-level:");
+        eprintln!("Water cells per y-level after {max_steps} steps:");
         for (y, &count) in water_by_y.iter().enumerate() {
             if count > 0 {
                 eprintln!("  y={y}: {count} water cells");
             }
         }
 
-        // Water should occupy CONTIGUOUS y-levels (no alternating gaps).
-        // Count how many y-levels have water and check for gaps.
         let water_levels: Vec<usize> = water_by_y
             .iter()
             .enumerate()
@@ -5493,12 +5448,11 @@ mod tests {
             !water_levels.is_empty(),
             "water should still exist after stepping"
         );
-        // Check for gaps: consecutive water levels should differ by 1.
         for pair in water_levels.windows(2) {
             assert_eq!(
                 pair[1] - pair[0],
                 1,
-                "gap between y={} and y={} — checkerboard rarefaction bug",
+                "gap between y={} and y={} — parity-flip closure failed within {max_steps} steps",
                 pair[0],
                 pair[1]
             );

@@ -104,22 +104,17 @@ impl World {
         self.memo_window
             .push(step_stats.cache_hits, step_stats.cache_misses);
 
-        // Post-step gravity gap-fill: prevents Margolus rarefaction.
-        if self.has_block_rule_cells() {
-            self.apply_gap_fill_column_path();
-        }
-
+        // No post-pass gap-fill: qy4g option G (2026-04-26) — internal
+        // gaps left by Margolus close over 2-4 ticks via the alternating
+        // partition offset.
         self.generation += 1;
 
         self.maybe_compact();
     }
 
-    /// Per-column gap-fill path (hash-thing-jw3k.1). Walks each `(x, z)`
-    /// column through the octree, runs the 1D gap-fill on the extracted
-    /// cells, and splices back only when the column changed. Preserves
-    /// hash-cons sharing for the majority of columns that don't change.
-    ///
-    /// Caller is responsible for gating on `has_block_rule_cells()`.
+    /// Per-column gap-fill path. Retained `#[cfg(test)]` after qy4g option G
+    /// removed gap-fill from the production step path (2026-04-26).
+    #[cfg(test)]
     pub fn apply_gap_fill_column_path(&mut self) {
         let side = self.side();
         let mut column: Vec<CellState> = vec![0; side];
@@ -198,27 +193,9 @@ impl World {
         self.memo_window
             .push(step_stats.cache_hits, step_stats.cache_misses);
 
-        let (column_walk_us, splice_us, dirty_columns) = if self.has_block_rule_cells() {
-            let side = self.side();
-            let mut column: Vec<CellState> = vec![0; side];
-            let mut splice_us: u64 = 0;
-            let mut dirty: u32 = 0;
-            let t_walk = std::time::Instant::now();
-            for z in 0..side as u64 {
-                for x in 0..side as u64 {
-                    self.store.flatten_column_into(self.root, x, z, &mut column);
-                    if super::world::gravity_gap_fill_column(&mut column, &self.materials) {
-                        let t_sp = std::time::Instant::now();
-                        self.root = self.store.splice_column(self.root, x, z, &column);
-                        splice_us += t_sp.elapsed().as_micros() as u64;
-                        dirty += 1;
-                    }
-                }
-            }
-            (t_walk.elapsed().as_micros() as u64, splice_us, dirty)
-        } else {
-            (0, 0, 0)
-        };
+        // qy4g.2 option G: gap-fill post-pass deleted from production. StepProfile
+        // fields preserved as zeros for back-compat with bench_hashlife consumers.
+        let (column_walk_us, splice_us, dirty_columns) = (0u64, 0u64, 0u32);
 
         self.generation += 1;
 
@@ -250,11 +227,13 @@ impl World {
             self.level
         );
         if self.has_block_rule_cells() {
-            // Fallback: `step_node_macro`'s base case runs CaRule+BlockRule only,
-            // omitting the per-generation `gravity_gap_fill` that `World::step()`
-            // applies. See `investigation_4497_macro_vs_brute_with_block_rules`
-            // for the empirical baseline (27% cell divergence, gap-fill signature
-            // at y=0) and hash-thing-gzio for the replacement experiment.
+            // Fallback: brute-step generation-by-generation when block rules are
+            // present. Pre-qy4g.2 this fallback existed to bridge over the missing
+            // gap-fill post-pass in `step_node_macro`. With option G (gap-fill
+            // deleted from production), the gap-fill divergence reason is gone —
+            // but `step_node_macro`'s memoized hop may still need empirical
+            // validation against brute Margolus before we trust it for
+            // block-rule worlds. Tracked in hash-thing-qy4g (epic) follow-up.
             let steps = self.recursive_pow2_step_count();
             for _ in 0..steps {
                 self.step();
