@@ -92,6 +92,18 @@ impl CaRule {
     }
 }
 
+/// Phase classification for block rules. Solid cells do not swap with other
+/// solids in `GravityBlockRule` / `FluidBlockRule` gravity phase, regardless of
+/// density gap — granular stratification is locked (sand stays on gunpowder,
+/// no Brazil-nut sifting). Liquid and Gas pairs continue to swap by density.
+/// See hash-thing-nagw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Solid,
+    Liquid,
+    Gas,
+}
+
 /// A block-based CA rule operating on 2x2x2 cell blocks.
 ///
 /// Block rules are pure functions of block contents — no position, generation,

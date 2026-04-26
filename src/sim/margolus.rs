@@ -5,7 +5,7 @@
 //! All transforms must preserve the multiset of input cells (mass conservation).
 
 use crate::octree::Cell;
-use crate::sim::rule::{block_index, BlockRule};
+use crate::sim::rule::{block_index, BlockRule, Phase};
 
 /// Identity block rule — returns the block unchanged. Useful for testing
 /// the pipeline (flatten → partition → iterate → apply → rebuild) with
@@ -34,13 +34,19 @@ impl BlockRule for IdentityBlockRule {
 /// enabling spatial memoization in hashlife.
 pub struct FluidBlockRule {
     density_fn: fn(Cell) -> f32,
+    phase_fn: fn(Cell) -> Phase,
     fluid_material: u16,
 }
 
 impl FluidBlockRule {
-    pub fn new(density_fn: fn(Cell) -> f32, fluid_material: u16) -> Self {
+    pub fn new(
+        density_fn: fn(Cell) -> f32,
+        phase_fn: fn(Cell) -> Phase,
+        fluid_material: u16,
+    ) -> Self {
         Self {
             density_fn,
+            phase_fn,
             fluid_material,
         }
     }
@@ -50,6 +56,7 @@ impl BlockRule for FluidBlockRule {
     fn clone_box(&self) -> Box<dyn BlockRule + Send> {
         Box::new(FluidBlockRule {
             density_fn: self.density_fn,
+            phase_fn: self.phase_fn,
             fluid_material: self.fluid_material,
         })
     }
@@ -60,6 +67,10 @@ impl BlockRule for FluidBlockRule {
         // Phase 1: gravity. Only swap if both cells are movable — swapping a
         // fluid cell with a denser anchored cell (e.g. stone above water on a
         // cliff face) would delete the fluid at the write-back layer.
+        //
+        // Solid-on-solid lock — no-op for current fluids (water/lava/acid/oil
+        // are all Liquid), here for symmetry with GravityBlockRule and to
+        // defend against future cross-classification (hash-thing-nagw).
         for dz in 0..2 {
             for dx in 0..2 {
                 let bot = block_index(dx, 0, dz);
@@ -67,7 +78,9 @@ impl BlockRule for FluidBlockRule {
                 if !(movable[bot] && movable[top]) {
                     continue;
                 }
-                if (self.density_fn)(out[top]) > (self.density_fn)(out[bot]) {
+                let any_non_solid = (self.phase_fn)(out[top]) != Phase::Solid
+                    || (self.phase_fn)(out[bot]) != Phase::Solid;
+                if any_non_solid && (self.density_fn)(out[top]) > (self.density_fn)(out[bot]) {
                     out.swap(bot, top);
                 }
             }
@@ -152,11 +165,18 @@ pub struct GravityBlockRule {
     /// Returns the density for a given cell. Higher density = falls down.
     /// Air (empty) should return 0.0.
     density_fn: fn(Cell) -> f32,
+    /// Returns the phase classification (Solid / Liquid / Gas) for a given cell.
+    /// Two `Solid` cells never trade places, regardless of density gap
+    /// (hash-thing-nagw). Liquids and gases continue to swap by density.
+    phase_fn: fn(Cell) -> Phase,
 }
 
 impl GravityBlockRule {
-    pub fn new(density_fn: fn(Cell) -> f32) -> Self {
-        Self { density_fn }
+    pub fn new(density_fn: fn(Cell) -> f32, phase_fn: fn(Cell) -> Phase) -> Self {
+        Self {
+            density_fn,
+            phase_fn,
+        }
     }
 }
 
@@ -164,6 +184,7 @@ impl BlockRule for GravityBlockRule {
     fn clone_box(&self) -> Box<dyn BlockRule + Send> {
         Box::new(GravityBlockRule {
             density_fn: self.density_fn,
+            phase_fn: self.phase_fn,
         })
     }
 
@@ -177,11 +198,20 @@ impl BlockRule for GravityBlockRule {
         // would be interpreted by the write-back layer as "sand deleted,
         // neighbor duplicated" — the localized mass-loss mechanism fixed in
         // hash-thing-9yv2.
+        //
+        // Solids never swap with other solids (hash-thing-nagw): granular
+        // stratification is locked. At least one of the two cells must be
+        // Liquid or Gas for the density swap to fire.
         for dz in 0..2 {
             for dx in 0..2 {
                 let bot = block_index(dx, 0, dz);
                 let top = block_index(dx, 1, dz);
                 if !(movable[bot] && movable[top]) {
+                    continue;
+                }
+                let any_non_solid = (self.phase_fn)(out[top]) != Phase::Solid
+                    || (self.phase_fn)(out[bot]) != Phase::Solid;
+                if !any_non_solid {
                     continue;
                 }
                 let density_bot = (self.density_fn)(out[bot]);
@@ -271,9 +301,25 @@ mod tests {
         }
     }
 
+    /// Simple phase classification for unit tests:
+    /// - empty → Gas
+    /// - FLUID_MAT (3) → Liquid
+    /// - everything else → Solid
+    ///
+    /// Mirrors the production `material_phase` shape (hash-thing-nagw).
+    fn simple_phase(cell: Cell) -> Phase {
+        if cell.is_empty() {
+            Phase::Gas
+        } else if cell.material() == FLUID_MAT {
+            Phase::Liquid
+        } else {
+            Phase::Solid
+        }
+    }
+
     #[test]
     fn gravity_swaps_heavy_cell_downward() {
-        let rule = GravityBlockRule::new(simple_density);
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
         // Column at (0,0): bottom=air, top=stone(mat 5)
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = Cell::EMPTY; // bottom
@@ -285,7 +331,7 @@ mod tests {
 
     #[test]
     fn gravity_does_not_swap_when_bottom_is_heavier() {
-        let rule = GravityBlockRule::new(simple_density);
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(5); // bottom — heavier
         block[block_index(0, 1, 0)] = mat(1); // top — lighter
@@ -296,7 +342,7 @@ mod tests {
 
     #[test]
     fn gravity_equal_density_no_swap() {
-        let rule = GravityBlockRule::new(simple_density);
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
         let mut block = [Cell::EMPTY; 8];
         block[block_index(0, 0, 0)] = mat(3);
         block[block_index(0, 1, 0)] = mat(3);
@@ -307,7 +353,7 @@ mod tests {
 
     #[test]
     fn gravity_conserves_mass() {
-        let rule = GravityBlockRule::new(simple_density);
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
         let block = [
             mat(5),
             mat(0),
@@ -324,13 +370,15 @@ mod tests {
 
     #[test]
     fn gravity_all_four_columns_independent() {
-        let rule = GravityBlockRule::new(simple_density);
-        // Set up all 4 columns with heavy-on-top
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
+        // Set up all 4 columns with heavy-solid-on-top, gas-bottom.
+        // (Solid-on-solid no longer swaps under hash-thing-nagw, so we use
+        // solid-on-gas to still demonstrate per-column independence.)
         let mut block = [Cell::EMPTY; 8];
         for dz in 0..2 {
             for dx in 0..2 {
-                block[block_index(dx, 0, dz)] = mat(1); // light bottom
-                block[block_index(dx, 1, dz)] = mat(5); // heavy top
+                block[block_index(dx, 0, dz)] = Cell::EMPTY; // gas bottom
+                block[block_index(dx, 1, dz)] = mat(5); // heavy solid top
             }
         }
         let out = rule.step_block(&block, &[true; 8]);
@@ -339,12 +387,12 @@ mod tests {
                 assert_eq!(
                     out[block_index(dx, 0, dz)],
                     mat(5),
-                    "heavy should fall at ({dx}, 0, {dz})"
+                    "heavy solid should fall at ({dx}, 0, {dz})"
                 );
                 assert_eq!(
                     out[block_index(dx, 1, dz)],
-                    mat(1),
-                    "light should rise at ({dx}, 1, {dz})"
+                    Cell::EMPTY,
+                    "gas should rise at ({dx}, 1, {dz})"
                 );
             }
         }
@@ -353,7 +401,7 @@ mod tests {
 
     #[test]
     fn gravity_preserves_metadata() {
-        let rule = GravityBlockRule::new(simple_density);
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
         let mut block = [Cell::EMPTY; 8];
         // heavy cell with metadata
         block[block_index(0, 1, 0)] = Cell::pack(5, 42);
@@ -365,6 +413,56 @@ mod tests {
         );
     }
 
+    // hash-thing-nagw: solids never sink through other solids, regardless of
+    // density gap. Verifies the new phase-gated predicate.
+    #[test]
+    fn gravity_does_not_swap_solid_on_solid_regardless_of_density_gap() {
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = mat(1); // light solid bottom
+        block[block_index(0, 1, 0)] = mat(7); // much heavier solid top
+        let out = rule.step_block(&block, &[true; 8]);
+        assert_eq!(
+            out[block_index(0, 0, 0)],
+            mat(1),
+            "light solid bottom must stay — no solid-on-solid swap"
+        );
+        assert_eq!(
+            out[block_index(0, 1, 0)],
+            mat(7),
+            "heavy solid top must stay — no solid-on-solid swap"
+        );
+    }
+
+    // hash-thing-nagw: solids still sink through gas (the original gravity behavior).
+    #[test]
+    fn gravity_swaps_solid_on_gas() {
+        let rule = GravityBlockRule::new(simple_density, simple_phase);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::EMPTY; // gas bottom
+        block[block_index(0, 1, 0)] = mat(5); // solid top
+        let out = rule.step_block(&block, &[true; 8]);
+        assert_eq!(out[block_index(0, 0, 0)], mat(5));
+        assert_eq!(out[block_index(0, 1, 0)], Cell::EMPTY);
+    }
+
+    // hash-thing-nagw: gas-on-gas density swaps still happen (heavy gas falls).
+    #[test]
+    fn gravity_swaps_gas_on_gas() {
+        // Use a synthetic phase where two distinct materials are both Gas
+        // but one is denser than the other.
+        fn gas_only_phase(_cell: Cell) -> Phase {
+            Phase::Gas
+        }
+        let rule = GravityBlockRule::new(simple_density, gas_only_phase);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = mat(1); // light gas bottom
+        block[block_index(0, 1, 0)] = mat(5); // heavy gas top
+        let out = rule.step_block(&block, &[true; 8]);
+        assert_eq!(out[block_index(0, 0, 0)], mat(5), "heavy gas falls");
+        assert_eq!(out[block_index(0, 1, 0)], mat(1), "light gas rises");
+    }
+
     // ---------------------------------------------------------------
     // FluidBlockRule
     // ---------------------------------------------------------------
@@ -373,7 +471,7 @@ mod tests {
     const SOLID_MAT: u16 = 7; // "stone" in test context
 
     fn fluid_rule() -> FluidBlockRule {
-        FluidBlockRule::new(simple_density, FLUID_MAT)
+        FluidBlockRule::new(simple_density, simple_phase, FLUID_MAT)
     }
 
     #[test]

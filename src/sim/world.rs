@@ -4213,6 +4213,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::sim::margolus::{GravityBlockRule, IdentityBlockRule};
+    use crate::sim::rule::Phase;
     use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE_MATERIAL_ID};
 
     fn simple_density(cell: Cell) -> f32 {
@@ -4226,6 +4227,21 @@ mod tests {
             4 => 0.05, // fire
             5 => 1.0,  // water
             _ => 1.0,
+        }
+    }
+
+    /// Phase classification matching `simple_density` for these gravity tests
+    /// (hash-thing-nagw). Air → Gas, water (5) → Liquid, fire (4) → Gas,
+    /// everything else → Solid. The block-rule predicate uses this to refuse
+    /// solid-on-solid swaps.
+    fn simple_phase(cell: Cell) -> Phase {
+        if cell.is_empty() {
+            return Phase::Gas;
+        }
+        match cell.material() {
+            4 => Phase::Gas,    // fire
+            5 => Phase::Liquid, // water
+            _ => Phase::Solid,
         }
     }
 
@@ -4243,7 +4259,8 @@ mod tests {
             for &mat_id in materials_with_gravity {
                 m.set_tick_divisor(mat_id, 1);
             }
-            let gravity_id = m.register_block_rule(GravityBlockRule::new(simple_density));
+            let gravity_id =
+                m.register_block_rule(GravityBlockRule::new(simple_density, simple_phase));
             for &mat_id in materials_with_gravity {
                 m.assign_block_rule(mat_id, gravity_id);
             }
@@ -4347,10 +4364,10 @@ mod tests {
         let mut world = World::new(3);
         let gravity_a = world
             .materials
-            .register_block_rule(GravityBlockRule::new(simple_density));
+            .register_block_rule(GravityBlockRule::new(simple_density, simple_phase));
         let gravity_b = world
             .materials
-            .register_block_rule(GravityBlockRule::new(simple_density));
+            .register_block_rule(GravityBlockRule::new(simple_density, simple_phase));
         world
             .materials
             .assign_block_rule(DIRT_MATERIAL_ID, gravity_a);
@@ -4420,6 +4437,37 @@ mod tests {
             a.flatten(),
             b.flatten(),
             "block stepping must be deterministic"
+        );
+    }
+
+    // hash-thing-nagw: production-wiring regression. SAND on top of GUNPOWDER
+    // (both Solid in `material_phase`) must not swap even though SAND density
+    // (1.5) > GUNPOWDER density (1.4). Catches drift if a future material is
+    // added to `material_density` but forgotten in `material_phase`.
+    #[test]
+    fn solid_does_not_sink_through_solid_via_terrain_defaults() {
+        use crate::terrain::materials::{GUNPOWDER_MATERIAL_ID, SAND_MATERIAL_ID};
+        // terrain_defaults wires gravity onto SAND and GUNPOWDER (both
+        // movable solids). Before nagw, SAND would have swapped with
+        // GUNPOWDER below it; now neither moves.
+        let mut world = World::new(3); // 8³, terrain_defaults
+                                       // Place sand at y=3 and gunpowder at y=2 in same block column.
+        let sand = Cell::pack(SAND_MATERIAL_ID, 0).raw();
+        let gunpowder = Cell::pack(GUNPOWDER_MATERIAL_ID, 0).raw();
+        world.set(wc(2), wc(2), wc(2), gunpowder);
+        world.set(wc(2), wc(3), wc(2), sand);
+
+        world.step();
+
+        assert_eq!(
+            world.get(wc(2), wc(2), wc(2)),
+            gunpowder,
+            "gunpowder must not be displaced by sand (solid-on-solid)"
+        );
+        assert_eq!(
+            world.get(wc(2), wc(3), wc(2)),
+            sand,
+            "sand must stay above gunpowder (no solid-on-solid swap)"
         );
     }
 
