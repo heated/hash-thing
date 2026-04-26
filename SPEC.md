@@ -343,11 +343,19 @@ comfortably inside `i64::MAX`.
 
 **Hybrid Path D: reaction-phase (pure CA) + movement-phase (Margolus blocks).** Both phases operate directly on the octree via recursive Hashlife stepping; the flatten-to-grid path is a temporary testing scaffold only.
 
+**Operating model: two phases (CaRule + BlockRule).** A third phase (LocalRule) is wired into the stepper as an extension point but currently runs only `is_self_inert` rules — i.e., it is a no-op in production. See "Phase 3" below for why it exists and the conditions under which it would be activated.
+
 **Phase 1 — Reaction phase (pure CA, 26-neighborhood).**
-Fire spreads, temperature diffuses, signals propagate, chemical reactions fire. Strictly local, no cell movement. Hashlife memoizes this perfectly because every cell independently computes its next state from its neighborhood.
+Fire spreads, temperature diffuses, signals propagate, chemical reactions fire. Strictly local, no cell movement. Hashlife memoizes this perfectly because every cell independently computes its next state from its neighborhood. **Also handles "fix-up after Margolus" logic** (e.g., gap-fill behind falling cells) — CaRule's 26-Moore window includes ±1y, so gap-fill folds in here and arrives one generation after the Margolus move that opened the gap. This produces a 1-frame visible gap behind falling cells, accepted as the trade for staying within the two-phase y-budget (see hash-thing-qy4g epic decision 2026-04-26).
 
 **Phase 2 — Movement phase (Margolus 2×2×2 blocks).**
 Gravity, fluid flow, particle displacement. The world is partitioned into non-overlapping 2×2×2 blocks. A block rule takes 8 cells in, produces 8 cells out — which means it can *permute* cells within the block (swap sand with air below it = gravity). The partition offset alternates each generation (even steps: blocks at (0,0,0); odd steps: blocks at (1,1,1)) so cells can travel across block boundaries over multiple steps. Mass is conserved automatically because you're rearranging, not creating or destroying.
+
+**Phase 3 — Local-context phase (LocalRule, ±1y read). Wired but unused in production.**
+Tightly-scoped per-cell rules that read self + immediate vertical neighbors only (above, below) and run **after** Phase 2. The trait + recursive-stepper integration ship in qy4g.1 as an extension point, but no non-`is_self_inert` LocalRule is registered today; the only impl is `IdentityLocalRule`, which exists to pin the equivalence test. **Activating Phase 3 with a non-trivial rule reopens an architectural problem** (the 8³ level-3 base case is short by 2 y-cells once Phase 3 contributes a 1-cell light cone; fixing it requires threading y-context through every step_node recursion — see hash-thing-mzct for the parked design work). Default route for any new "fix-up after Margolus" rule: fold it into Phase 1 (CaRule) and accept the 1-frame delay. Reach for Phase 3 only if you genuinely need post-Margolus state THIS generation, and unblock mzct first.
+
+**Phase ceiling: 3 phases, with Phase 3 gated.**
+Each phase pays a per-gen light cone slot, a buffer-geometry assumption, a cache-key dimension, and a recursion-threading obligation. Adding a 4th phase requires explicit justification (a bead with a concrete value-vs-tax case) — not a one-liner. Default disposition for any new "I want to read neighbors" rule: fold it into Phase 1 or Phase 2, or run it as a non-recursive pass (see `apply_gap_fill_column_path`). Activating Phase 3 with a non-trivial rule is a one-way door: it requires landing the slab-threading architecture (hash-thing-mzct) first. The 3-phase cap was originally pinned by the hash-thing-mzct postmortem (qy4g.1's addition of Phase 3 over-budgeted the level-3 base case y-light-cone, forcing slab-threading through every recursion level); the two-phase operating decision (qy4g 2026-04-26) defers actually paying that tax.
 
 **Why Margolus:**
 - Pure CA can't swap cells, so gravity is hard without tricks.
