@@ -720,18 +720,18 @@ impl Renderer {
                     );
                     if needs_check && !surface_caps.present_modes.contains(&mode) {
                         log::warn!(
-                            "HASH_THING_PRESENT_MODE={s} → {mode:?} not in surface_caps.present_modes={:?}; falling back to AutoVsync",
+                            "HASH_THING_PRESENT_MODE={s:?} → {mode:?} not in surface_caps.present_modes={:?}; falling back to AutoVsync",
                             surface_caps.present_modes
                         );
                         wgpu::PresentMode::AutoVsync
                     } else {
-                        log::info!("HASH_THING_PRESENT_MODE={s} → effective={mode:?}");
+                        log::info!("HASH_THING_PRESENT_MODE={s:?} → effective={mode:?}");
                         mode
                     }
                 }
                 None => {
                     log::warn!(
-                        "HASH_THING_PRESENT_MODE={s:?} unrecognised (need one of auto-vsync, auto-no-vsync, fifo, fifo-relaxed, immediate, mailbox); falling back to AutoVsync"
+                        "HASH_THING_PRESENT_MODE={s:?} unrecognised (need one of auto, auto-vsync, auto-no-vsync, fifo, fifo-relaxed, immediate, mailbox); falling back to AutoVsync"
                     );
                     wgpu::PresentMode::AutoVsync
                 }
