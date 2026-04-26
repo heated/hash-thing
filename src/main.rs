@@ -532,6 +532,13 @@ struct App {
     startup_scene_pending: bool,
     /// Tracks whether the cursor is currently grabbed/hidden for FPS look.
     cursor_captured: bool,
+    /// Latches "the most recent grab attempt failed" so the per-frame
+    /// retry tap (RedrawRequested) can re-attempt without spamming
+    /// `log::warn!` on every frame for platforms where grab is
+    /// permanently unsupported. Cleared by any successful grab or by
+    /// an explicit release; one warn per failure streak.
+    /// hash-thing-lke9.
+    cursor_capture_grab_warned: bool,
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
@@ -727,6 +734,7 @@ impl App {
             camera_feel: player::FirstPersonCameraFeel::default(),
             startup_scene_pending: true,
             cursor_captured: false,
+            cursor_capture_grab_warned: false,
             pending_player_action: None,
             pending_scene_swap: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -771,34 +779,71 @@ impl App {
         app
     }
 
-    fn apply_cursor_capture(&mut self, capture: bool) {
-        let Some(window) = self.window.as_ref() else {
+    /// Apply a grab attempt's outcome to the cursor-capture state. Pure on
+    /// `App` fields; window-side effects (visibility, set_cursor_grab cleanup)
+    /// stay with the caller. Returns `true` if a fresh `log::warn!` should
+    /// fire for this failure (first failure of a streak), `false` to stay
+    /// silent (steady-state failures, or on success).
+    ///
+    /// Streak contract — hash-thing-lke9:
+    /// - success: clear `cursor_capture_grab_warned`. Next failure can warn.
+    /// - failure: set the flag; suppress repeat warns until success or
+    ///   explicit release clears it.
+    fn record_grab_outcome(&mut self, succeeded: bool) -> bool {
+        if succeeded {
+            self.cursor_captured = true;
+            self.last_mouse = None;
+            self.cursor_capture_grab_warned = false;
+            false
+        } else {
             self.cursor_captured = false;
+            let should_warn = !self.cursor_capture_grab_warned;
+            self.cursor_capture_grab_warned = true;
+            should_warn
+        }
+    }
+
+    fn apply_cursor_capture(&mut self, capture: bool) {
+        if !capture {
+            // Release: clear the warn-throttle so a later recapture-then-fail
+            // can warn once again. Then drop the OS-level grab if we have a
+            // window.
+            self.cursor_capture_grab_warned = false;
+            if let Some(window) = self.window.as_ref() {
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
+            self.cursor_captured = false;
+            self.last_mouse = None;
+            return;
+        }
+
+        // Clone the Arc so the window reference doesn't conflict with the
+        // `&mut self` borrow inside `record_grab_outcome`.
+        let Some(window) = self.window.clone() else {
+            // No window: nothing to grab against. Treat as a soft "couldn't
+            // grab" so unit tests can drive the streak lifecycle through
+            // App::new (no window). No `log::warn!` here — there is no OS
+            // error to surface; the flag move is purely state-tracking.
+            let _ = self.record_grab_outcome(false);
             return;
         };
 
-        if capture {
-            let grab = window
-                .set_cursor_grab(CursorGrabMode::Locked)
-                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-            match grab {
-                Ok(()) => {
-                    window.set_cursor_visible(false);
-                    self.cursor_captured = true;
-                    self.last_mouse = None;
-                }
-                Err(err) => {
-                    log::warn!("Failed to grab FPS cursor: {err}");
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
-                    window.set_cursor_visible(true);
-                    self.cursor_captured = false;
-                }
+        let grab = window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        match grab {
+            Ok(()) => {
+                window.set_cursor_visible(false);
+                let _ = self.record_grab_outcome(true);
             }
-        } else {
-            let _ = window.set_cursor_grab(CursorGrabMode::None);
-            window.set_cursor_visible(true);
-            self.cursor_captured = false;
-            self.last_mouse = None;
+            Err(err) => {
+                if self.record_grab_outcome(false) {
+                    log::warn!("Failed to grab FPS cursor: {err}");
+                }
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
         }
     }
 
@@ -2326,6 +2371,17 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                // hash-thing-lke9: per-frame retry tap. If `resumed()`'s
+                // initial grab attempt lost the OS-activation race (macOS /
+                // agent launches), `cursor_captured` is false even though
+                // `should_capture_cursor()` wants it true. `sync_cursor_capture`
+                // short-circuits in steady state (one bool comparison) and
+                // re-attempts the grab when state mismatches — exactly the
+                // post-startup-failure window. Placed BEFORE the
+                // `startup_scene_pending` block so the retry isn't delayed
+                // behind hundreds of ms of cold-start scene generation.
+                self.sync_cursor_capture();
+
                 if self.startup_scene_pending {
                     self.startup_scene_pending = false;
                     self.load_initial_scene();
@@ -3812,6 +3868,92 @@ mod tests {
         app.apply_fps_look(0.0, -1000.0);
         let (_yaw, pitch) = player_look(&mut app);
         assert!((pitch - -1.4).abs() < 1e-12, "pitch should clamp at -1.4");
+    }
+
+    // hash-thing-lke9: streak-reset coverage for the per-frame retry tap.
+    // record_grab_outcome is the pure, window-less home of the warn-throttle
+    // contract; testing it here proves all three transitions
+    // (success, failure, repeated failure) without needing a real OS grab.
+
+    #[test]
+    fn record_grab_outcome_failure_streak_warns_once_then_throttles() {
+        let mut app = App::new(64);
+        assert!(!app.cursor_capture_grab_warned, "fresh app starts unwarned");
+
+        // First failure of a streak: caller should warn.
+        assert!(app.record_grab_outcome(false));
+        assert!(app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
+
+        // Subsequent failures throttle.
+        assert!(!app.record_grab_outcome(false));
+        assert!(!app.record_grab_outcome(false));
+        assert!(app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
+    }
+
+    #[test]
+    fn record_grab_outcome_success_clears_streak() {
+        // Success path is the primary lke9 acceptance edge: a successful
+        // grab must reset the warn-throttle so a *future* failure streak
+        // can warn once again. Codex plan-review Important #1.
+        let mut app = App::new(64);
+        app.cursor_capture_grab_warned = true;
+
+        assert!(!app.record_grab_outcome(true));
+        assert!(
+            !app.cursor_capture_grab_warned,
+            "success must clear the warn-throttle"
+        );
+        assert!(app.cursor_captured);
+    }
+
+    #[test]
+    fn record_grab_outcome_failure_then_success_then_failure_re_warns() {
+        // Full lifecycle: streak 1 (fail-throttle), success (reset),
+        // streak 2 (fail again, must warn). Pins the "warn-once-per-streak"
+        // contract from both directions.
+        let mut app = App::new(64);
+
+        assert!(app.record_grab_outcome(false));
+        assert!(!app.record_grab_outcome(false));
+
+        assert!(!app.record_grab_outcome(true));
+        assert!(!app.cursor_capture_grab_warned);
+
+        assert!(
+            app.record_grab_outcome(false),
+            "fresh streak after success must warn again"
+        );
+    }
+
+    #[test]
+    fn apply_cursor_capture_release_clears_warned_flag() {
+        // apply_cursor_capture(false) is the second reset path (alongside
+        // record_grab_outcome(true)). Verifies the release branch matches
+        // the streak-reset contract.
+        let mut app = App::new(64);
+        app.cursor_capture_grab_warned = true;
+
+        app.apply_cursor_capture(false);
+
+        assert!(!app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
+    }
+
+    #[test]
+    fn apply_cursor_capture_no_window_sets_warned_flag() {
+        // No-window path is treated as a soft "couldn't grab" so unit tests
+        // can drive the streak lifecycle through App::new. No log fires
+        // (there is no OS error to surface) but the flag moves so callers
+        // observe the throttled state.
+        let mut app = App::new(64);
+        assert!(app.window.is_none());
+
+        app.apply_cursor_capture(true);
+
+        assert!(app.cursor_capture_grab_warned);
+        assert!(!app.cursor_captured);
     }
 
     // hash-thing-9r62 regression: drive the cursor_captured flag through the
