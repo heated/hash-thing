@@ -2976,7 +2976,15 @@ fn main() {
     {
         // Make launch behavior explicit instead of depending on bundle/agent defaults.
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
-        event_loop_builder.with_activate_ignoring_other_apps(true);
+        // hash-thing-sgcv: gate the activate-ignoring-other-apps flag
+        // behind the same HASH_THING_FOCUS=1 env var that gates
+        // window.focus_window() at src/main.rs:1985. Default is to NOT
+        // steal focus, so the agent surface keeps keyboard input.
+        // ActivationPolicy::Regular stays unconditional — it controls
+        // dock/Cmd-Tab presence, not activation.
+        if std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1") {
+            event_loop_builder.with_activate_ignoring_other_apps(true);
+        }
     }
     let event_loop = event_loop_builder
         .build()
