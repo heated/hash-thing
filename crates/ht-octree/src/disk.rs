@@ -183,7 +183,10 @@ pub fn load(r: &mut impl Read) -> Result<(NodeStore, NodeId, u32), DiskError> {
         });
     }
 
-    let expected_size = HEADER_BYTES as u64 + NODE_BYTES as u64 * node_count;
+    let expected_size = (NODE_BYTES as u64)
+        .checked_mul(node_count)
+        .and_then(|n| n.checked_add(HEADER_BYTES as u64))
+        .unwrap_or(u64::MAX);
     let mut store = NodeStore::new();
 
     for at in 0..node_count {
@@ -191,9 +194,13 @@ pub fn load(r: &mut impl Read) -> Result<(NodeStore, NodeId, u32), DiskError> {
         match r.read_exact(&mut buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                let found = (NODE_BYTES as u64)
+                    .checked_mul(at)
+                    .and_then(|n| n.checked_add(HEADER_BYTES as u64))
+                    .unwrap_or(u64::MAX);
                 return Err(DiskError::SizeMismatch {
                     expected: expected_size,
-                    found: HEADER_BYTES as u64 + NODE_BYTES as u64 * at,
+                    found,
                 });
             }
             Err(e) => return Err(DiskError::Io(e)),
@@ -391,12 +398,13 @@ mod tests {
         for i in 0..16 {
             root = store.set_cell(root, i, 0, 0, Cell::pack(1, 0).raw());
         }
-        let (compact, _) = store.compacted(root);
+        let (compact, compact_root) = store.compacted(root);
         let expected = compact.node_count();
 
         let bytes = save_to_vec(&store, root, level);
-        let (loaded, _, _) = load_from_slice(&bytes).unwrap();
+        let (loaded, lroot, _) = load_from_slice(&bytes).unwrap();
         assert_eq!(loaded.node_count(), expected);
+        assert_eq!(lroot.0, compact_root.0);
     }
 
     #[test]
@@ -711,6 +719,22 @@ mod tests {
                 node_count: 1,
             } => {}
             other => panic!("expected InvalidRootId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_validation_duplicate_record() {
+        // Hand-crafted file: NodeId(0) = Leaf(0), NodeId(1) also Leaf(0).
+        // Record 1 dedups to NodeId(0), tripping DuplicateRecord.
+        let mut bytes = minimal_file();
+        let off = record_offset(1);
+        for b in &mut bytes[off..off + NODE_BYTES] {
+            *b = 0;
+        }
+        write_le_u32(&mut bytes, off, u32::MAX); // leaf sentinel
+        match expect_err(load_from_slice(&bytes)) {
+            DiskError::DuplicateRecord { at: 1, dedup_to: 0 } => {}
+            other => panic!("expected DuplicateRecord, got {other:?}"),
         }
     }
 }
