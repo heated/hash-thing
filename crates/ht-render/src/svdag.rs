@@ -1420,8 +1420,14 @@ mod tests {
         };
         for i in 0..8 {
             let child_word = dag.nodes[original_offset + 1 + i];
-            // Skip empty / leaf-encoded children — nothing to descend into.
             if child_word & LEAF_BIT != 0 {
+                // SVDAG inlined this subtree as a single uniform-state leaf
+                // (or empty subtree). The collapsed-side subtree must carry
+                // that same state at every level-1 leaf, otherwise the
+                // bit-exact claim has a hole at uniform / empty regions.
+                // (Closed by claude-critical CR finding 2026-04-26.)
+                let expected = (child_word & 0xFFFF) as u16;
+                assert_collapsed_uniform_state(store, collapsed_children[i], expected);
                 continue;
             }
             let child_off = child_word as usize;
@@ -1433,6 +1439,23 @@ mod tests {
                 child_off,
                 original_level - 1,
             );
+        }
+    }
+
+    /// Assert every `Leaf` reachable under `node` carries `expected` as its
+    /// state. Used by the SVDAG bit-exact agreement test for octants the
+    /// SVDAG inlined as `LEAF_BIT` (uniform / empty subtrees).
+    fn assert_collapsed_uniform_state(store: &NodeStore, node: NodeId, expected: u16) {
+        match *store.get(node) {
+            Node::Leaf(s) => assert_eq!(
+                s, expected,
+                "uniform-region collapsed Leaf state must equal SVDAG inlined state {expected:#06x}",
+            ),
+            Node::Interior { children, .. } => {
+                for c in children.iter() {
+                    assert_collapsed_uniform_state(store, *c, expected);
+                }
+            }
         }
     }
 
