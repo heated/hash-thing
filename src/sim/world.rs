@@ -3779,13 +3779,21 @@ mod tests {
     /// (see `compose_remap`); this test stays as a regression guard.
     ///
     /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
-    /// always-on under the 60s soft-max (~10s observed). With the fix
-    /// reverted, the assertion fires at step 42 with ~254k mismatches.
-    /// Water pool sits at `water_y = center + center/4` with
-    /// `pool_depth = (side/32).max(2)` — at 128^3 the pool bottom is ~16
-    /// cells above the mid-terrain floor, so 60 steps covers impact plus
-    /// tail comfortably.
+    /// always-on under the 60s soft-max in release / `--profile bench`
+    /// (~10s observed); in debug builds the 128³ voxel walk dominates
+    /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
+    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// non-`debug_assertions` profile) to exercise the regression
+    /// guard. With the fix reverted, the assertion fires at step 42
+    /// with ~254k mismatches. Water pool sits at
+    /// `water_y = center + center/4` with `pool_depth = (side/32).max(2)`
+    /// — at 128^3 the pool bottom is ~16 cells above the mid-terrain
+    /// floor, so 60 steps covers impact plus tail comfortably.
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile bench (hash-thing-1imu)"
+    )]
     fn water_and_sand_128_commit_step_skip_sync_corrupts_svdag() {
         let mut world = World::new(7);
         let params = TerrainParams::for_level(7);
@@ -3823,9 +3831,18 @@ mod tests {
     /// this test stays as a regression guard.
     ///
     /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
-    /// always-on under the 60s soft-max (~5s observed). With the fix
-    /// reverted, the assertion fires at step 24 with ~974k mismatches.
+    /// always-on under the 60s soft-max in release / `--profile bench`
+    /// (~5s observed); in debug builds the 128³ voxel walk dominates
+    /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
+    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// non-`debug_assertions` profile) to exercise the regression
+    /// guard. With the fix reverted, the assertion fires at step 24
+    /// with ~974k mismatches.
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile bench (hash-thing-1imu)"
+    )]
     fn water_and_sand_128_step_recursive_with_sync_every_step() {
         let mut world = World::new(7);
         let params = TerrainParams::for_level(7);
