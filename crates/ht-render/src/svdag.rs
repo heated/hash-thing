@@ -2793,4 +2793,158 @@ mod tests {
         let svdag = Svdag::build(&store, root, 3);
         assert_svdag_matches_octree(&svdag, &store, root, 3, "fully filled 8³");
     }
+
+    // ---- vn5w upload-path regression guards ----------------------------
+    //
+    // These three tests pin invariants that `Renderer::upload_svdag()`
+    // (renderer.rs:1583) silently relies on. They live here, against the
+    // CPU-side `Svdag`, because the upload path is a thin shim over the
+    // CPU-side `nodes` buffer — protecting the CPU contract guards the
+    // GPU side without booting wgpu.
+
+    /// vn5w guard #1: append-only watermark.
+    ///
+    /// `upload_svdag()` rewrites slot 0 (the root header) every frame,
+    /// then appends `nodes[uploaded_len..]`. That is only correct if
+    /// `nodes[1..uploaded_len]` is bitwise unchanged after subsequent
+    /// `update()` calls. A future change that mutates non-tail slots
+    /// (in-place compaction, LOD substitution, slot reuse) would
+    /// silently corrupt the GPU mirror — this test fails first.
+    #[test]
+    fn vn5w_watermark_prefix_unchanged_after_incremental_update() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        root = store.set_cell(root, 16, 16, 16, mat(1));
+        let mut dag = Svdag::build(&store, root, 6);
+        let snapshot = dag.nodes.clone();
+        let watermark = snapshot.len();
+
+        // Edit a distant cell so the new subtree forces fresh slots
+        // beyond `watermark`. The incremental update must not rewrite
+        // any existing slot (slot 0 excepted — it's the root header).
+        root = store.set_cell(root, 48, 48, 48, mat(2));
+        dag.update(&store, root, 6);
+
+        assert!(
+            dag.nodes.len() >= watermark,
+            "watermark must not shrink: {} -> {}",
+            watermark,
+            dag.nodes.len()
+        );
+        assert_eq!(
+            &dag.nodes[1..watermark],
+            &snapshot[1..watermark],
+            "non-root prefix mutated; renderer's append-only upload \
+             would leave the GPU mirror inconsistent"
+        );
+    }
+
+    /// vn5w guard #2: pre/post-compact decode equivalence.
+    ///
+    /// `Svdag::compact()` (svdag.rs:310) full-rebuilds via `Self::build`.
+    /// Downstream code (next-frame upload, `apply_remap`, `id_to_offset`)
+    /// must observe the new buffer at the next decode. This pins the
+    /// observable contract: identical `lookup_voxel` results across the
+    /// rebuild for every probed cell.
+    #[test]
+    fn vn5w_compact_preserves_voxel_decode() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(6);
+        let probes = [
+            (8u64, 8u64, 8u64, 1u16),
+            (32, 32, 32, 2),
+            (50, 12, 33, 3),
+            (1, 60, 1, 7),
+            (47, 47, 47, 4),
+        ];
+        for &(x, y, z, m) in &probes {
+            root = store.set_cell(root, x, y, z, mat(m));
+        }
+        let mut dag = Svdag::build(&store, root, 6);
+        let pre: Vec<u16> = probes
+            .iter()
+            .map(|&(x, y, z, _)| dag.lookup_voxel(x, y, z))
+            .collect();
+
+        // Generate stale slots: each (set + update + clear + update)
+        // pair leaves the live tree shape unchanged but interns
+        // intermediate slots that are no longer reachable from root.
+        for i in 0..16u64 {
+            root = store.set_cell(root, i, 0, 0, mat(9));
+            dag.update(&store, root, 6);
+            root = store.set_cell(root, i, 0, 0, 0);
+            dag.update(&store, root, 6);
+        }
+        let stale_total = dag.total_slot_count();
+
+        dag.compact(&store, root);
+        let post: Vec<u16> = probes
+            .iter()
+            .map(|&(x, y, z, _)| dag.lookup_voxel(x, y, z))
+            .collect();
+
+        assert_eq!(
+            pre, post,
+            "compact() altered visible voxel decode; pre={pre:?} post={post:?}"
+        );
+        // Compaction should drop slots that no incremental edit would
+        // ever revisit. If the post-compact slot count matches the
+        // stale-laden pre-compact count, compact() didn't actually
+        // rebuild — pin that regression here.
+        assert!(
+            dag.total_slot_count() < stale_total,
+            "compact() left slot count unchanged ({}); rebuild appears to have no-oped",
+            dag.total_slot_count()
+        );
+    }
+
+    /// vn5w guard #3: growth across many incremental updates stays
+    /// decode-consistent. Mirrors the GPU path where capacity overflow
+    /// triggers a reallocate + full re-upload — the CPU buffer's
+    /// `lookup_voxel` is what the GPU shader will see, so any growth
+    /// pattern that breaks this also breaks the renderer.
+    #[test]
+    fn vn5w_growth_then_incremental_decodes_correctly() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(7); // 128³
+        let mut dag = Svdag::build(&store, root, 7);
+        let initial_len = dag.nodes.len();
+
+        // Spread probes across the world so each batch forces unique
+        // subtrees (different octant paths from the root).
+        let probes: Vec<(u64, u64, u64, u16)> = (0..40u64)
+            .map(|i| {
+                (
+                    (i * 13) % 128,
+                    (i * 7) % 128,
+                    (i * 23) % 128,
+                    ((i % 7) + 1) as u16,
+                )
+            })
+            .collect();
+
+        for chunk in probes.chunks(5) {
+            for &(x, y, z, m) in chunk {
+                root = store.set_cell(root, x, y, z, mat(m));
+            }
+            dag.update(&store, root, 7);
+        }
+
+        assert!(
+            dag.nodes.len() > initial_len,
+            "buffer should have grown past initial size: {} -> {}",
+            initial_len,
+            dag.nodes.len()
+        );
+
+        for &(x, y, z, m) in &probes {
+            assert_eq!(
+                dag.lookup_voxel(x, y, z),
+                mat(m),
+                "voxel ({x},{y},{z}) decode mismatch after \
+                 {} incremental growth steps",
+                probes.len() / 5
+            );
+        }
+    }
 }
