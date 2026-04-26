@@ -1,5 +1,20 @@
 use super::node::{octant_index, Cell, CellState, Node, NodeId};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Output type for the per-chunk reachable-node walker: `Vec` of
+/// `((chunk_x, chunk_y, chunk_z), reachable_count)` in row-major
+/// (cz outer, cy middle, cx inner) order. See
+/// [`NodeStore::reachable_nodes_per_chunk`].
+pub type ChunkReachable = Vec<((u64, u64, u64), u64)>;
+
+/// Walker state for [`NodeStore::reachable_summary`]. Bundles the
+/// arguments threaded through the recursion so the call site stays
+/// within clippy's `too_many_arguments` budget.
+struct ChunkWalk {
+    chunk_level: u32,
+    out: ChunkReachable,
+    global: FxHashSet<NodeId>,
+}
 
 /// Canonical node store — the core of hash-consing.
 ///
@@ -637,6 +652,208 @@ impl NodeStore {
     /// clearer name; use this for capacity checks and diagnostics.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Total unique reachable nodes from `root`, counting each interior /
+    /// leaf NodeId once regardless of how many times it appears.
+    ///
+    /// This is the global reachable-node count used by the cswp memory-LOD
+    /// measurement (`hash-thing-cswp.8.1`); it is the denominator against
+    /// which per-chunk numbers are compared (see
+    /// [`Self::reachable_nodes_per_chunk`]).
+    pub fn reachable_node_count(&self, root: NodeId) -> u64 {
+        let mut visited: FxHashSet<NodeId> = FxHashSet::default();
+        self.collect_reachable(root, &mut visited);
+        visited.len() as u64
+    }
+
+    /// Per-chunk reachable-node distribution.
+    ///
+    /// For a tree with `root_level >= chunk_level > 0`, walks each
+    /// level-`chunk_level` subtree once and counts the unique NodeIds
+    /// reachable from that chunk's root (the chunk root itself, all of its
+    /// interiors, and the leaf at the bottom of every reachable path).
+    ///
+    /// Note: an "empty" chunk does NOT have count == 1, because
+    /// [`Self::empty`] / [`Self::uniform`] build a fresh `Interior` per
+    /// level rather than collapsing to a single canonical empty
+    /// `NodeId`. An empty chunk at `chunk_level == k` therefore reaches
+    /// exactly `k + 1` unique NodeIds (the empty-`Interior` chain at
+    /// levels `k`, `k-1`, ..., `1`, plus the canonical empty leaf
+    /// `NodeId::EMPTY` at level 0). Callers wanting an "empty?" check
+    /// from this output should compare against `k + 1`, or use
+    /// [`Self::population`] on the chunk root directly. A future fast
+    /// path that short-circuits at `Interior { population: 0, .. }` would
+    /// shrink this number to 1, but is intentionally not part of cswp.8.1
+    /// (cswp.8 follow-up).
+    ///
+    /// Returns one entry per chunk in **row-major (cz outer, cy middle,
+    /// cx inner)** order, i.e. index `(cz * chunks_per_axis + cy) *
+    /// chunks_per_axis + cx`, where `chunks_per_axis = 1 << (root_level -
+    /// chunk_level)`.
+    ///
+    /// ## What this measurement is (and is not)
+    ///
+    /// Each chunk's count uses a **chunk-local** visited-set. Hash-cons
+    /// sharing across chunks is not deduplicated — a node referenced by
+    /// `N` chunks is charged once to each, so `sum(per_chunk) >= global`.
+    /// The gap (`sum - global`) is the cross-chunk-shared multiplicity.
+    ///
+    /// Concretely this gives the **chunk-local reachable upper bound with
+    /// all cross-chunk sharing charged in full to every chunk**. It is the
+    /// right input for "what is the standalone cost of shipping/serializing
+    /// this chunk?" It is *not* a "reclaimable bytes if I evict this
+    /// chunk" estimate, since shared nodes survive in the surviving
+    /// chunks. Callers picking chunk size from this output must read the
+    /// `share×` ratio (`sum_per_chunk / global`) alongside per-chunk
+    /// distribution; if sharing is high, an exclusive-count follow-up
+    /// measurement may be needed.
+    ///
+    /// ## Cost
+    ///
+    /// O(reachable per chunk) time per chunk, O(largest chunk visited-set)
+    /// memory at any moment. Empty regions short-circuit at the
+    /// uniform-leaf arm. The walker recursion depth is bounded by
+    /// `root_level - chunk_level` (chunk dispatch) plus `chunk_level`
+    /// (per-chunk reachability), i.e. `root_level` total — well under any
+    /// reasonable Rust stack at the project's max level (12 → 4096³).
+    ///
+    /// ## Panics
+    ///
+    /// - if `chunk_level == 0` (cell-level walks are O(side³); use
+    ///   [`Self::reachable_node_count`] instead).
+    /// - if `chunk_level > root_level` (no chunks fit in the tree).
+    pub fn reachable_nodes_per_chunk(&self, root: NodeId, chunk_level: u32) -> ChunkReachable {
+        let (per_chunk, _global) = self.reachable_summary(root, chunk_level);
+        per_chunk
+    }
+
+    /// Combined per-chunk + global reachable counts in a single tree walk.
+    ///
+    /// Returns `(per_chunk, global)` where `per_chunk` follows the same
+    /// shape and ordering as [`Self::reachable_nodes_per_chunk`] and
+    /// `global` is the unique-reachable-from-`root` count (also returned
+    /// stand-alone by [`Self::reachable_node_count`]).
+    ///
+    /// Prefer this over calling the two methods separately when you need
+    /// both, since each single-method call walks the full DAG.
+    pub fn reachable_summary(&self, root: NodeId, chunk_level: u32) -> (ChunkReachable, u64) {
+        let root_level = self.get(root).level();
+        assert!(
+            chunk_level > 0,
+            "reachable_nodes_per_chunk: chunk_level=0 is O(side^3) cells and not the intended use; \
+             use reachable_node_count for cell-level walks",
+        );
+        assert!(
+            chunk_level <= root_level,
+            "reachable_nodes_per_chunk: chunk_level {chunk_level} exceeds root_level {root_level}",
+        );
+        let chunks_per_axis = 1u64 << (root_level - chunk_level);
+        let total = (chunks_per_axis as usize)
+            .checked_pow(3)
+            .expect("reachable_nodes_per_chunk: chunks_per_axis^3 overflowed usize");
+        let mut state = ChunkWalk {
+            chunk_level,
+            out: Vec::with_capacity(total),
+            global: FxHashSet::default(),
+        };
+        self.walk_chunks_rec(root, root_level, (0, 0, 0), &mut state);
+        debug_assert_eq!(state.out.len(), total);
+        let global = state.global.len() as u64;
+        (state.out, global)
+    }
+
+    /// Walker dispatch above `chunk_level`; emits one entry per chunk in
+    /// row-major (cz outer, cy middle, cx inner) order.
+    fn walk_chunks_rec(
+        &self,
+        node: NodeId,
+        level: u32,
+        (cx, cy, cz): (u64, u64, u64),
+        state: &mut ChunkWalk,
+    ) {
+        if level == state.chunk_level {
+            let mut local: FxHashSet<NodeId> = FxHashSet::default();
+            self.collect_reachable_pair(node, &mut local, &mut state.global);
+            state.out.push(((cx, cy, cz), local.len() as u64));
+            return;
+        }
+        match *self.get(node) {
+            Node::Leaf(_) => {
+                // Uniform region above chunk_level: every nested chunk is
+                // the same leaf. Emit one entry per nested chunk in
+                // row-major order with count = 1 (the leaf itself, which
+                // is also added to the global set on the first emit).
+                state.global.insert(node);
+                let chunks_per_axis_below = 1u64 << (level - state.chunk_level);
+                for dz in 0..chunks_per_axis_below {
+                    for dy in 0..chunks_per_axis_below {
+                        for dx in 0..chunks_per_axis_below {
+                            state.out.push((
+                                (
+                                    cx * chunks_per_axis_below + dx,
+                                    cy * chunks_per_axis_below + dy,
+                                    cz * chunks_per_axis_below + dz,
+                                ),
+                                1,
+                            ));
+                        }
+                    }
+                }
+            }
+            Node::Interior { children, .. } => {
+                state.global.insert(node);
+                let chunks_per_axis_below_child = 1u64 << (level - 1 - state.chunk_level);
+                for (oct, &child) in children.iter().enumerate() {
+                    let (ox, oy, oz) = super::node::octant_coords(oct);
+                    self.walk_chunks_rec(
+                        child,
+                        level - 1,
+                        (
+                            cx + ox as u64 * chunks_per_axis_below_child,
+                            cy + oy as u64 * chunks_per_axis_below_child,
+                            cz + oz as u64 * chunks_per_axis_below_child,
+                        ),
+                        state,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reachability traversal that updates a single visited-set.
+    fn collect_reachable(&self, node: NodeId, visited: &mut FxHashSet<NodeId>) {
+        if !visited.insert(node) {
+            return;
+        }
+        if let Node::Interior { children, .. } = self.get(node) {
+            let children = *children;
+            for c in children {
+                self.collect_reachable(c, visited);
+            }
+        }
+    }
+
+    /// Reachability traversal that updates two visited-sets in lockstep
+    /// (chunk-local + global). Each NodeId is recorded in both sets the
+    /// first time it is seen on this chunk; the local set drives the
+    /// per-chunk count, the global set accumulates across the whole walk.
+    fn collect_reachable_pair(
+        &self,
+        node: NodeId,
+        local: &mut FxHashSet<NodeId>,
+        global: &mut FxHashSet<NodeId>,
+    ) {
+        if !local.insert(node) {
+            return;
+        }
+        global.insert(node);
+        if let Node::Interior { children, .. } = self.get(node) {
+            let children = *children;
+            for c in children {
+                self.collect_reachable_pair(c, local, global);
+            }
+        }
     }
 
     /// Return a fresh `NodeStore` containing only the nodes reachable from
@@ -2381,5 +2598,120 @@ mod tests {
         let root = store.empty(3);
         let col = vec![0 as CellState; 4]; // wrong — should be 8
         let _ = store.splice_column(root, 0, 0, &col);
+    }
+
+    // ---- reachable_nodes_per_chunk + reachable_node_count + reachable_summary
+    //
+    // Measurement-only walker for cswp.8.1 — see store.rs docstrings and
+    // `tests/bench_chunk_reachable.rs` for the bench that consumes this.
+
+    #[test]
+    fn reachable_nodes_per_chunk_empty_world() {
+        // empty(level=4) builds an `Interior` per level (no zero-pop
+        // collapse), so an empty chunk at chunk_level=2 reaches:
+        //   chunk-root Interior(level=2) +
+        //   Interior(level=1)             +
+        //   NodeId::EMPTY (Leaf 0)
+        // = 3 unique NodeIds. chunks_per_axis = 1 << (4-2) = 4, so 4³ = 64
+        // chunks, all count=3, all coordinates distinct.
+        let mut store = NodeStore::new();
+        let root = store.empty(4);
+        let chunks = store.reachable_nodes_per_chunk(root, 2);
+        assert_eq!(chunks.len(), 64);
+        assert!(
+            chunks.iter().all(|&(_, n)| n == 3),
+            "all empty chunks reach k+1 = 3 nodes; got {:?}",
+            chunks.iter().map(|&(_, n)| n).collect::<Vec<_>>(),
+        );
+        let coords: std::collections::HashSet<_> = chunks.iter().map(|&(c, _)| c).collect();
+        assert_eq!(coords.len(), 64);
+    }
+
+    #[test]
+    fn reachable_nodes_per_chunk_identity_at_root_level() {
+        // chunk_level == root_level: a single entry whose count equals the
+        // global reachable count.
+        let mut store = NodeStore::new();
+        let root = store.empty(3);
+        let chunks = store.reachable_nodes_per_chunk(root, 3);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, (0, 0, 0));
+        assert_eq!(chunks[0].1, store.reachable_node_count(root));
+    }
+
+    #[test]
+    fn reachable_nodes_per_chunk_distinct_chunks_distinct_counts() {
+        // 8³ tree (level 3); place a single non-empty cell in chunk (0,0,0)
+        // at chunk_level=1 (chunks_per_axis = 4, chunk_side = 2).
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3);
+        root = store.set_cell(root, 0, 0, 0, mat(7));
+        let chunks = store.reachable_nodes_per_chunk(root, 1);
+        assert_eq!(chunks.len(), 64);
+
+        let zero_count = chunks.iter().find(|&&(c, _)| c == (0, 0, 0)).unwrap().1;
+        // Non-empty chunk (0,0,0): chunk root is Interior(level=1) with one
+        // non-empty Leaf in octant 0 and seven empty Leafs elsewhere — so
+        // reachable = {Interior(level=1, non-empty), populated-Leaf,
+        //              NodeId::EMPTY (the empty Leaf)} = 3 unique nodes.
+        assert!(
+            zero_count >= 3,
+            "non-empty chunk (0,0,0) must reach Interior + populated-Leaf + EMPTY (>= 3); got {zero_count}",
+        );
+
+        let far_count = chunks.iter().find(|&&(c, _)| c == (3, 3, 3)).unwrap().1;
+        // Empty chunk at chunk_level=1: Interior(level=1, empty) + Leaf 0
+        // = 2 unique NodeIds. (See docstring: empty(level) doesn't
+        // collapse zero-pop interiors to a single canonical id.)
+        assert_eq!(
+            far_count, 2,
+            "empty chunk at chunk_level=1 reaches the empty Interior + EMPTY leaf",
+        );
+    }
+
+    #[test]
+    fn reachable_node_count_matches_per_chunk_at_root_level() {
+        // Whatever the global count is, the per-chunk walker at
+        // chunk_level == root_level must agree, because both walks visit
+        // the same DAG with one shared visited-set.
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2);
+        root = store.set_cell(root, 1, 2, 3, mat(0x42));
+        let global = store.reachable_node_count(root);
+        let per_chunk = store.reachable_nodes_per_chunk(root, 2);
+        assert_eq!(per_chunk.len(), 1);
+        assert_eq!(per_chunk[0].1, global);
+    }
+
+    #[test]
+    fn reachable_summary_matches_separate_calls() {
+        // The combined walker must agree with the two single-purpose
+        // walkers on every chunk and on the global denominator.
+        let mut store = NodeStore::new();
+        let mut root = store.empty(3);
+        root = store.set_cell(root, 0, 0, 0, mat(1));
+        root = store.set_cell(root, 7, 7, 7, mat(2));
+
+        let separate_chunks = store.reachable_nodes_per_chunk(root, 1);
+        let separate_global = store.reachable_node_count(root);
+        let (combined_chunks, combined_global) = store.reachable_summary(root, 1);
+
+        assert_eq!(combined_chunks, separate_chunks);
+        assert_eq!(combined_global, separate_global);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_level=0")]
+    fn reachable_nodes_per_chunk_rejects_chunk_level_zero() {
+        let store = NodeStore::new();
+        let _ = store.reachable_nodes_per_chunk(NodeId::EMPTY, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds root_level")]
+    fn reachable_nodes_per_chunk_rejects_chunk_level_above_root() {
+        let mut store = NodeStore::new();
+        let root = store.empty(2);
+        let _ = store.reachable_nodes_per_chunk(root, 3);
     }
 }
