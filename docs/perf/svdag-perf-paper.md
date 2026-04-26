@@ -469,6 +469,30 @@ Run-to-run variance is small at both scales (~5% spread). 4096³ seed completes 
 cargo test --profile bench --test bench_cold_gen_big_map -- --ignored --nocapture
 ```
 
+### 3.14 Gen-time hash-cons is already in (`hash-thing-cswp.3`)
+
+cswp.3 was filed expecting "≥10× faster than cswp.1's baseline" from adding gen-time hash-cons. Reading the gen pipeline (`World::seed_terrain` → `terrain::gen::gen_region`, `src/sim/world.rs:2459` → `src/terrain/gen.rs:89`) shows the path already builds the SVDAG via recursive `Builder::build` with two intern channels: `WorldGen::classify` short-circuits uniform sub-cubes to `store.uniform`, and the recursive case interns the 8-child node via `store.interior`. cswp.1's measurements (§3.13) ARE the hash-cons-on numbers — the 10–50× analytical estimate was anchored to the stale 25 s no-dedup projection (`hash-thing-stue.2`), which the current codepath already beats by ~100×.
+
+Verified on the same M2 16 GB / bench profile via `tests/verify_gen_hash_cons.rs` (3-run identity + dedup-ratio assertion at each scale):
+
+| Scale | Voxels | Reachable nodes | voxel/node ratio | Pop |
+|---|---:|---:|---:|---:|
+| 64³ | 262 144 | 778 | 336× | 126 380 |
+| 1024³ | 1.07×10⁹ | 56 357 | 19 052× | 510 477 921 |
+| 4096³ | 6.87×10¹⁰ | 548 179 | 125 359× | 32 648 197 116 |
+
+Identity check: building the same level twice with `TerrainParams::for_level` produces byte-identical root NodeIds (and matching `nodes_after_gen` / `population`). The gen pipeline is deterministic and the intern is content-addressed.
+
+The voxel-to-node ratio is a *lower bound* on dedup (it counts cells, not subtrees), and it scales superlinearly with side: each additional level of self-similar terrain collapses entire branches into a single canonical NodeId. The 125 000× ratio at 4096³ is what makes the current ~3.7 s cold gen feasible — the alternative is ≥6.87×10¹⁰ leaf-cell allocations.
+
+**Reproduce:**
+```text
+cargo test --profile bench --test verify_gen_hash_cons -- --ignored --nocapture
+```
+(64³ runs unignored as a CI guard.)
+
+**Implication.** cswp.3's stated 10× target was anchored to a no-dedup baseline that does not exist in the codebase. Hunting an additional 10× on top of the 236 ms / 3.7 s in §3.13 is its own work item if/when cold gen becomes a felt user latency — file under cswp follow-ups, not under this verification bead.
+
 ---
 
 ## 4. SVDAG ↔ memo-step interaction
