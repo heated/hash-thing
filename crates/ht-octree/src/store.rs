@@ -712,11 +712,16 @@ impl NodeStore {
     /// ## Cost
     ///
     /// O(reachable per chunk) time per chunk, O(largest chunk visited-set)
-    /// memory at any moment. Empty regions short-circuit at the
-    /// uniform-leaf arm. The walker recursion depth is bounded by
-    /// `root_level - chunk_level` (chunk dispatch) plus `chunk_level`
-    /// (per-chunk reachability), i.e. `root_level` total — well under any
-    /// reasonable Rust stack at the project's max level (12 → 4096³).
+    /// memory at any moment. Uniform regions above chunk_level (an
+    /// Interior child slot pointing at a raw `Leaf(s)` — a structural
+    /// state arising in practice via [`Self::splice_column`]'s
+    /// canonicalize path; trees built only via [`Self::empty`] are full
+    /// Interior chains and don't hit this arm) short-circuit by emitting
+    /// one count=1 entry per nested chunk without descending further.
+    /// The walker recursion depth is bounded by `root_level - chunk_level`
+    /// (chunk dispatch) plus `chunk_level` (per-chunk reachability),
+    /// i.e. `root_level` total — well under any reasonable Rust stack at
+    /// the project's max level (12 → 4096³).
     ///
     /// ## Panics
     ///
@@ -783,7 +788,8 @@ impl NodeStore {
                 // Uniform region above chunk_level: every nested chunk is
                 // the same leaf. Emit one entry per nested chunk in
                 // row-major order with count = 1 (the leaf itself, which
-                // is also added to the global set on the first emit).
+                // is added to the global set on this visit; subsequent
+                // visits are no-ops by FxHashSet semantics).
                 state.global.insert(node);
                 let chunks_per_axis_below = 1u64 << (level - state.chunk_level);
                 for dz in 0..chunks_per_axis_below {
@@ -2713,5 +2719,90 @@ mod tests {
         let mut store = NodeStore::new();
         let root = store.empty(2);
         let _ = store.reachable_nodes_per_chunk(root, 3);
+    }
+
+    /// `NodeId::EMPTY` is `Leaf(0)` at level 0. Walking it with any
+    /// `chunk_level > 0` must trip the `chunk_level > root_level` panic,
+    /// pinning the leaf-root × chunk_level>0 path against off-by-one
+    /// drift in the bound.
+    #[test]
+    #[should_panic(expected = "exceeds root_level")]
+    fn reachable_nodes_per_chunk_rejects_chunk_level_above_leaf_root() {
+        let store = NodeStore::new();
+        let _ = store.reachable_nodes_per_chunk(NodeId::EMPTY, 1);
+    }
+
+    /// Exercises the Leaf-above-chunk arm of `walk_chunks_rec`: a raw
+    /// `Leaf(s)` sitting at a child slot whose contextual level >
+    /// `chunk_level`. This structural state arises in practice via
+    /// `splice_column`'s canonicalize path (see the (gtua) refs); we
+    /// build it directly with `interior(...)` for a focused test, and
+    /// also round-trip through `splice_column` to confirm the live path
+    /// preserves the same NodeId.
+    #[test]
+    fn reachable_nodes_per_chunk_leaf_above_chunk_arm() {
+        let mut store = NodeStore::new();
+        let stone = mat(0x301);
+        // Level-3 tree (side=8). children[0] is a raw Leaf(stone) sitting
+        // at contextual level 2; the other 7 children are empty(2)
+        // Interior subtrees. octant 0 = (0,0,0) so the raw-Leaf region
+        // covers cell coords (0..4, 0..4, 0..4).
+        let leaf_stone = store.leaf(stone);
+        let empty_l2 = store.empty(2);
+        let mut children = [empty_l2; 8];
+        children[0] = leaf_stone;
+        let root = store.interior(3, children);
+
+        // Round-trip through splice_column on a column inside the
+        // raw-Leaf region: the canonicalize path must preserve the
+        // raw-Leaf-at-level-2 structural state (NodeId identity).
+        let mut col = vec![0 as CellState; 8];
+        store.flatten_column_into(root, 0, 0, &mut col);
+        let after = store.splice_column(root, 0, 0, &col);
+        assert_eq!(
+            after, root,
+            "identity splice through raw-Leaf-at-level-2 must preserve NodeId",
+        );
+
+        // Walk at chunk_level=1 (chunk_side=2, 4×4×4 = 64 chunks).
+        let chunks = store.reachable_nodes_per_chunk(root, 1);
+        assert_eq!(
+            chunks.len(),
+            64,
+            "4³ chunks_per_axis at level=3,chunk_level=1"
+        );
+
+        // The raw-Leaf region covers chunks (cx,cy,cz) ∈ {0,1}³ — 8 chunks
+        // emitted via the Leaf-above-chunk arm with count == 1 each.
+        let mut leaf_arm_chunks: Vec<(u64, u64, u64)> = Vec::new();
+        for &((cx, cy, cz), n) in &chunks {
+            if cx < 2 && cy < 2 && cz < 2 {
+                assert_eq!(
+                    n, 1,
+                    "Leaf-above-chunk arm at ({cx},{cy},{cz}) must emit count=1, got {n}",
+                );
+                leaf_arm_chunks.push((cx, cy, cz));
+            } else {
+                // empty(2) descended via the Interior arm: each chunk
+                // sees Interior(level=1) + Leaf(0) = 2 reachable nodes.
+                assert_eq!(
+                    n, 2,
+                    "Interior-descent chunk at ({cx},{cy},{cz}) reaches Interior(1)+Leaf(0)=2, got {n}",
+                );
+            }
+        }
+
+        // The 8 Leaf-above chunk coords must be dense over the 2×2×2 grid
+        // (the region the raw Leaf covers), with no duplicates. Compare
+        // as a sorted vec so the assertion is order-agnostic.
+        leaf_arm_chunks.sort_unstable();
+        let mut expected: Vec<(u64, u64, u64)> = (0..2)
+            .flat_map(|cx| (0..2).flat_map(move |cy| (0..2).map(move |cz| (cx, cy, cz))))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            leaf_arm_chunks, expected,
+            "Leaf-above arm chunk coords must be dense over the raw-Leaf's 2³ chunk region",
+        );
     }
 }
