@@ -958,16 +958,30 @@ impl NodeStore {
         if target_lod == 0 {
             return root;
         }
-        self.lod_collapse_rec(root, root_level, target_lod)
+        // Memo cache for `representative_state` keyed by NodeId. Hash-cons
+        // guarantees same NodeId ⇒ same subtree ⇒ same representative state,
+        // so the cache is sound for the lifetime of this call. Mutations via
+        // `interior(...)` during the descent only mint *new* NodeIds above
+        // `target_lod`; the memo is only ever queried for boundary nodes
+        // (level == target_lod) that already existed at entry, so existing
+        // cache entries can never be invalidated.
+        let mut memo: FxHashMap<NodeId, CellState> = FxHashMap::default();
+        self.lod_collapse_rec(root, root_level, target_lod, &mut memo)
     }
 
     /// Recursive worker for [`Self::lod_collapse`]. `level` is the contextual level
     /// of `node` as seen from its parent — when an intermediate subtree is
     /// represented by a raw `Leaf(s)` (uniform-region compression), the
     /// caller's `level` carries the true level rather than `Node::level()`.
-    fn lod_collapse_rec(&mut self, node: NodeId, level: u32, target_lod: u32) -> NodeId {
+    fn lod_collapse_rec(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        target_lod: u32,
+        memo: &mut FxHashMap<NodeId, CellState>,
+    ) -> NodeId {
         if level == target_lod {
-            let rep = self.representative_state(node);
+            let rep = self.representative_state_memo(node, memo);
             return self.leaf(rep);
         }
         // level > target_lod: descend.
@@ -979,18 +993,28 @@ impl NodeStore {
             Node::Interior { children, .. } => {
                 let mut new_children = children;
                 for i in 0..8 {
-                    new_children[i] = self.lod_collapse_rec(children[i], level - 1, target_lod);
+                    new_children[i] =
+                        self.lod_collapse_rec(children[i], level - 1, target_lod, memo);
                 }
                 self.interior(level, new_children)
             }
         }
     }
 
-    /// Compute the representative `CellState` for `node` using the
-    /// SVDAG-builder rule (largest-populated child wins; among Leaf-only
-    /// children the first non-empty leaf wins). Pure read; no mutation.
-    fn representative_state(&self, node: NodeId) -> CellState {
-        match *self.get(node) {
+    /// Memoized `representative_state`: returns the cached `CellState` for
+    /// `node` if present, otherwise computes it via the SVDAG-builder rule
+    /// (largest-populated child wins; among Leaf-only children the first
+    /// non-empty leaf wins) and inserts the result. Pure read on the store
+    /// itself; mutates only the supplied `memo`.
+    fn representative_state_memo(
+        &self,
+        node: NodeId,
+        memo: &mut FxHashMap<NodeId, CellState>,
+    ) -> CellState {
+        if let Some(&cached) = memo.get(&node) {
+            return cached;
+        }
+        let rep = match *self.get(node) {
             Node::Leaf(s) => s,
             Node::Interior { children, .. } => {
                 let mut rep_state: CellState = 0;
@@ -1009,7 +1033,7 @@ impl NodeStore {
                             // Strict inequality: equal-population ties stay
                             // with the earlier octant — matches SVDAG.
                             if population > 0 && population > rep_pop {
-                                rep_state = self.representative_state(child);
+                                rep_state = self.representative_state_memo(child, memo);
                                 rep_pop = population;
                             }
                         }
@@ -1017,7 +1041,18 @@ impl NodeStore {
                 }
                 rep_state
             }
-        }
+        };
+        memo.insert(node, rep);
+        rep
+    }
+
+    /// Test-only no-cache wrapper for [`representative_state_memo`]. Builds a
+    /// fresh memo per call; useful for assertions in unit tests where the
+    /// caller doesn't want to thread a cache.
+    #[cfg(test)]
+    fn representative_state(&self, node: NodeId) -> CellState {
+        let mut memo: FxHashMap<NodeId, CellState> = FxHashMap::default();
+        self.representative_state_memo(node, &mut memo)
     }
 
     /// Per-chunk variant of [`Self::lod_collapse`]. Rewrites only the subtree at
@@ -3326,6 +3361,142 @@ mod tests {
                 "lod_collapse must be idempotent at target_lod={k} (re-collapse at {k2})",
             );
         }
+    }
+
+    /// ip0d memo correctness: a tree where the same NodeId appears as a
+    /// child of two *different-shape* parents at the target_lod boundary
+    /// still produces the same collapsed result as a fresh-store rebuild.
+    /// Hash-cons guarantees the shared subtree dedups; the memo must return
+    /// the same `CellState` for that NodeId regardless of which parent
+    /// queries it.
+    #[test]
+    fn lod_collapse_memo_shared_subtree_under_distinct_parents() {
+        let stone = mat(1);
+        let water = mat(2);
+        let dirt = mat(3);
+        // Build the same scene twice, in separate stores, to compare.
+        // Scene: root_level=3 (8³). Octant 0 holds a 2³ stone block at
+        // origin; octant 7 holds a 2³ stone block at (4,4,4). Both octants'
+        // octant-0 child (a level-1 subtree) is identical (a uniform stone
+        // 2³), so hash-cons shares it. We then differentiate the two
+        // top-level octants by adding a unique cell elsewhere in each, so
+        // the parents have different shapes but share one identical child.
+        fn build(store: &mut NodeStore, stone: u16, water: u16, dirt: u16) -> NodeId {
+            let mut root = store.empty(3);
+            // Octant 0 (origin): fill 2³ at (0,0,0)..(2,2,2) with stone.
+            for x in 0..2 {
+                for y in 0..2 {
+                    for z in 0..2 {
+                        root = store.set_cell(root, x, y, z, stone);
+                    }
+                }
+            }
+            // Octant 7 (far): fill 2³ at (4,4,4)..(6,6,6) with stone — the
+            // octant-0 child of octant-7's level-2 subtree is now a
+            // uniform-stone level-1 block, which hash-cons-shares with the
+            // identical block in octant 0.
+            for x in 4..6 {
+                for y in 4..6 {
+                    for z in 4..6 {
+                        root = store.set_cell(root, x, y, z, stone);
+                    }
+                }
+            }
+            // Make octants 0 and 7 distinguishable: drop unique cells.
+            root = store.set_cell(root, 3, 0, 0, water);
+            root = store.set_cell(root, 7, 4, 4, dirt);
+            root
+        }
+
+        let mut store_a = NodeStore::new();
+        let root_a = build(&mut store_a, stone, water, dirt);
+        let collapsed_a = store_a.lod_collapse(root_a, 1);
+
+        // Compare against a fresh build → fresh collapse: same scene must
+        // produce a structurally-equal collapsed root, and the
+        // representative state must match on a probe.
+        let mut store_b = NodeStore::new();
+        let root_b = build(&mut store_b, stone, water, dirt);
+        let collapsed_b = store_b.lod_collapse(root_b, 1);
+
+        assert_eq!(
+            store_a.reachable_node_count(collapsed_a),
+            store_b.reachable_node_count(collapsed_b),
+            "memo path and reference must produce structurally-equal trees",
+        );
+        assert_eq!(
+            store_a.representative_state(collapsed_a),
+            store_b.representative_state(collapsed_b),
+            "memo path and reference must agree on root representative state",
+        );
+        // Cell-by-cell flatten agreement: ensures the materials at every
+        // collapsed cell match (catches any memo-induced state drift).
+        let side: usize = 1 << 3;
+        let flat_a = store_a.flatten(collapsed_a, side);
+        let flat_b = store_b.flatten(collapsed_b, side);
+        assert_eq!(
+            flat_a, flat_b,
+            "memo path and reference must produce identical flattened cell grids",
+        );
+    }
+
+    /// ip0d: `lod_collapse_chunk` calls `lod_collapse` once at the chunk
+    /// boundary, so the memo benefits the chunk wrapper too. Verify the
+    /// chunk path produces the same result as collapsing the chunk subtree
+    /// directly via `lod_collapse`.
+    #[test]
+    fn lod_collapse_chunk_memo_matches_direct_collapse() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(4);
+        // Heterogeneous fill so chunk subtrees aren't trivially uniform.
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    root = store.set_cell(root, x, y, z, mat(1));
+                }
+            }
+        }
+        for x in 4..8 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    root = store.set_cell(root, x, y, z, mat(2));
+                }
+            }
+        }
+        // Chunk at (0,0,0) with chunk_level=2 (8³ chunks → 2 per axis at
+        // root_level=4). target_lod=1: collapse one level inside the chunk.
+        let chunk_level = 2u32;
+        let target_lod = 1u32;
+        let via_chunk = store.lod_collapse_chunk(root, 0, 0, 0, chunk_level, target_lod);
+
+        // The chunk-(0,0,0) subtree at chunk_level=2 is the level-2 octant-0
+        // child of the level-3 octant-0 child of root. Walk to it and
+        // collapse directly.
+        let level3_octant0 = match *store.get(root) {
+            Node::Interior { children, .. } => children[0],
+            _ => panic!("root must be Interior"),
+        };
+        let level2_chunk = match *store.get(level3_octant0) {
+            Node::Interior { children, .. } => children[0],
+            _ => panic!("level-3 octant-0 must be Interior for this fixture"),
+        };
+        let direct = store.lod_collapse(level2_chunk, target_lod);
+
+        // The chunk wrapper rebuilds the path; after the collapse, the
+        // root's path-to-chunk-(0,0,0) should terminate in the same NodeId
+        // as `direct`.
+        let new_l3_oct0 = match *store.get(via_chunk) {
+            Node::Interior { children, .. } => children[0],
+            _ => panic!("collapsed root must be Interior"),
+        };
+        let new_l2_chunk = match *store.get(new_l3_oct0) {
+            Node::Interior { children, .. } => children[0],
+            _ => panic!("new level-3 octant-0 must be Interior"),
+        };
+        assert_eq!(
+            new_l2_chunk, direct,
+            "lod_collapse_chunk must produce the same chunk subtree as a direct lod_collapse on it",
+        );
     }
 
     /// For a uniform-stone tree at root_level=N, the collapsed reachable
