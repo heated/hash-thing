@@ -2978,13 +2978,17 @@ fn main() {
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
         // hash-thing-sgcv: gate the activate-ignoring-other-apps flag
         // behind the same HASH_THING_FOCUS=1 env var that gates
-        // window.focus_window() at src/main.rs:1985. Default is to NOT
-        // steal focus, so the agent surface keeps keyboard input.
+        // window.focus_window() at src/main.rs:1985. winit's default
+        // for this flag is `true` (PlatformSpecificEventLoopAttributes
+        // in winit/platform_impl/macos/event_loop.rs), so we MUST set
+        // it explicitly in both branches — omitting the setter would
+        // silently inherit the focus-stealing default and the gate
+        // would be a no-op. Default is to NOT steal focus, so the
+        // agent surface keeps keyboard input.
         // ActivationPolicy::Regular stays unconditional — it controls
         // dock/Cmd-Tab presence, not activation.
-        if std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1") {
-            event_loop_builder.with_activate_ignoring_other_apps(true);
-        }
+        let want_focus = std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
+        event_loop_builder.with_activate_ignoring_other_apps(want_focus);
     }
     let event_loop = event_loop_builder
         .build()
