@@ -15,12 +15,12 @@
 //! array across frames** so that unchanged subtrees never need to be re-uploaded.
 //!
 //! Buffer layout (u32 per slot):
-//!   [0]:        root_offset — absolute index of the current root node's slot
-//!   [1..]:      concatenated 9-u32 interior-node slots, append-only
+//!   `[0]`:      root_offset — absolute index of the current root node's slot
+//!   `[1..]`:    concatenated 9-u32 interior-node slots, append-only
 //!
 //! Interior node slot (9 u32s = 36 bytes):
-//!   [0]:        child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
-//!   [1..=8]:    child entries — packed as (is_leaf << 31) | payload_bits
+//!   `[0]`:      child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
+//!   `[1..=8]`:  child entries — packed as (is_leaf << 31) | payload_bits
 //!     - is_leaf: payload is the 16-bit material state in low bits
 //!     - else:    payload is the absolute offset of the child node in this buffer
 //!
@@ -1243,6 +1243,220 @@ mod tests {
             "representative material should follow the largest populated child, \
              not the first occupied octant"
         );
+    }
+
+    /// cswp.8.2 invariant: `NodeStore::lod_collapse` produces representative
+    /// `CellState`s that bit-exact-match what `Svdag::visit` packs into its
+    /// `rep_mat` field for the same source tree. The SVDAG's `rep_mat` carries
+    /// the full 16-bit `CellState` (not just the material field), so the
+    /// comparison is on the entire packed word — preserves metadata bits
+    /// alongside material.
+    ///
+    /// We assert this at three depths:
+    /// (1) full collapse (`target_lod == root_level`) — collapsed root's
+    ///     leaf state must equal the SVDAG root's `(slot[0] >> 8) & 0xFFFF`.
+    /// (2) collapse-to-children (`target_lod == root_level - 1`) — every
+    ///     collapsed child Leaf's state must equal the SVDAG's per-octant
+    ///     `rep_mat`, which is the leaf state itself for Leaf children, the
+    ///     populated-Interior child's `(child_slot[0] >> 8) & 0xFFFF` for
+    ///     populated-Interior children, and 0 for empty children.
+    /// (3) intermediate collapse (`target_lod = 1`) — for every preserved
+    ///     Interior node along the path, the collapsed sub-leaves must
+    ///     equal the SVDAG's `rep_mat` field at the corresponding offset.
+    /// The existing `assert_svdag_lod_rep_mat_matches_octree` walker covers
+    /// the SVDAG-side recursion; we cross-check the lod_collapse-side here.
+    #[test]
+    fn lod_collapse_matches_svdag_rep_mat_bit_exact() {
+        let mut store = NodeStore::new();
+        let stone = mat(1);
+        let water = mat(5);
+        let dirt = mat(3);
+        // Build a heterogeneous tree at root_level=3 (8³ world).
+        let mut root = store.empty(3);
+        // Octant 0: 4 stone cells in the 0..2 corner.
+        for z in 0..2u64 {
+            for y in 0..2u64 {
+                root = store.set_cell(root, 0, y, z, stone);
+            }
+        }
+        // Octant 1 (+x): a single water cell.
+        root = store.set_cell(root, 4, 0, 0, water);
+        // Octant 7 (+x+y+z): a 3³ block of dirt — biggest single-octant pop.
+        for z in 4..7u64 {
+            for y in 4..7u64 {
+                for x in 4..7u64 {
+                    root = store.set_cell(root, x, y, z, dirt);
+                }
+            }
+        }
+        let dag = Svdag::build(&store, root, 3);
+        let root_off = dag.nodes[0] as usize;
+
+        // (1) Full collapse: root rep matches SVDAG root rep_mat.
+        let collapsed_root = store.lod_collapse(root, 3);
+        let collapsed_state = match *store.get(collapsed_root) {
+            Node::Leaf(s) => s as u32,
+            Node::Interior { .. } => {
+                panic!("full collapse must yield a Leaf, got Interior with id {collapsed_root:?}",)
+            }
+        };
+        let svdag_root_rep = (dag.nodes[root_off] >> 8) & 0xFFFF;
+        assert_eq!(
+            collapsed_state, svdag_root_rep,
+            "(1) full-collapse root state must bit-exact match SVDAG root rep_mat",
+        );
+
+        // (2) Collapse-to-children: each top-level child's Leaf state
+        // matches SVDAG's per-octant rep_mat.
+        let collapsed_lvl2 = store.lod_collapse(root, 2);
+        let collapsed_children = match *store.get(collapsed_lvl2) {
+            Node::Interior { children, .. } => children,
+            Node::Leaf(_) => panic!("collapse at root_level-1 must yield an Interior, got Leaf",),
+        };
+        let original_children = match *store.get(root) {
+            Node::Interior { children, .. } => children,
+            Node::Leaf(_) => panic!("test fixture root must be Interior"),
+        };
+        for i in 0..8 {
+            let collapsed_child_state = match *store.get(collapsed_children[i]) {
+                Node::Leaf(s) => s as u32,
+                Node::Interior { .. } => {
+                    panic!("(2) collapse-to-children: child {i} must be Leaf, got Interior",)
+                }
+            };
+            // Derive the SVDAG-side expected rep for child i.
+            let expected = match store.get(original_children[i]) {
+                Node::Leaf(s) => *s as u32,
+                Node::Interior { population: 0, .. } => 0,
+                Node::Interior { .. } => {
+                    let child_word = dag.nodes[root_off + 1 + i];
+                    assert_eq!(
+                        child_word & LEAF_BIT,
+                        0,
+                        "(2) populated-Interior child {i} must encode an offset, not LEAF_BIT",
+                    );
+                    let child_off = child_word as usize;
+                    (dag.nodes[child_off] >> 8) & 0xFFFF
+                }
+            };
+            assert_eq!(
+                collapsed_child_state, expected,
+                "(2) octant {i}: collapsed child Leaf state must bit-exact match SVDAG child rep_mat",
+            );
+        }
+
+        // (3) Intermediate collapse at target_lod = 1: every level-1 subtree
+        // becomes a Leaf whose state matches the SVDAG-side rep_mat for the
+        // corresponding original level-1 node. Walk both trees in lockstep.
+        let collapsed_lvl1 = store.lod_collapse(root, 1);
+        check_collapse_against_svdag(&store, &dag, root, collapsed_lvl1, root_off, 3);
+    }
+
+    /// Recursive lockstep walker for the cswp.8.2 bit-exact agreement test.
+    /// At every contextual level > target_lod, original and collapsed have
+    /// the same Interior structure (modulo hash-cons). At level == target_lod
+    /// the collapsed is a Leaf whose state equals the SVDAG-side rep_mat
+    /// for the original's NodeId at that offset.
+    fn check_collapse_against_svdag(
+        store: &NodeStore,
+        dag: &Svdag,
+        original: NodeId,
+        collapsed: NodeId,
+        original_offset: usize,
+        original_level: u32,
+    ) {
+        // Below this depth the collapsed result is always a Leaf (target_lod=1
+        // collapses every level-1 subtree). Stop the recursion at level 2 so
+        // both sides are still Interior at the parent.
+        if original_level == 2 {
+            // Collapsed at level 2 is Interior(2, [Leaf(rep_i); 8]).
+            let collapsed_children = match *store.get(collapsed) {
+                Node::Interior { children, .. } => children,
+                Node::Leaf(_) => return, // uniform region — collapse left it as Leaf
+            };
+            let original_children = match *store.get(original) {
+                Node::Interior { children, .. } => children,
+                Node::Leaf(_) => return,
+            };
+            for i in 0..8 {
+                let collapsed_state = match *store.get(collapsed_children[i]) {
+                    Node::Leaf(s) => s as u32,
+                    Node::Interior { .. } => panic!(
+                        "(3) target_lod=1 must produce Leaf at level 1, got Interior at octant {i}",
+                    ),
+                };
+                let expected = match store.get(original_children[i]) {
+                    Node::Leaf(s) => *s as u32,
+                    Node::Interior { population: 0, .. } => 0,
+                    Node::Interior { .. } => {
+                        let child_word = dag.nodes[original_offset + 1 + i];
+                        if child_word & LEAF_BIT != 0 {
+                            // Original child is a populated Interior whose SVDAG
+                            // slot encodes it inline as a degenerate leaf — only
+                            // happens if all-equal-state, in which case the
+                            // inline state is the rep.
+                            child_word & 0xFFFF
+                        } else {
+                            let child_off = child_word as usize;
+                            (dag.nodes[child_off] >> 8) & 0xFFFF
+                        }
+                    }
+                };
+                assert_eq!(
+                    collapsed_state, expected,
+                    "(3) lvl1 octant {i}: collapsed Leaf state must bit-exact match SVDAG rep_mat",
+                );
+            }
+            return;
+        }
+        // Higher levels: both Interior, recurse into each octant.
+        let collapsed_children = match *store.get(collapsed) {
+            Node::Interior { children, .. } => children,
+            Node::Leaf(_) => return,
+        };
+        let original_children = match *store.get(original) {
+            Node::Interior { children, .. } => children,
+            Node::Leaf(_) => return,
+        };
+        for i in 0..8 {
+            let child_word = dag.nodes[original_offset + 1 + i];
+            if child_word & LEAF_BIT != 0 {
+                // SVDAG inlined this subtree as a single uniform-state leaf
+                // (or empty subtree). The collapsed-side subtree must carry
+                // that same state at every level-1 leaf, otherwise the
+                // bit-exact claim has a hole at uniform / empty regions.
+                // (Closed by claude-critical CR finding 2026-04-26.)
+                let expected = (child_word & 0xFFFF) as u16;
+                assert_collapsed_uniform_state(store, collapsed_children[i], expected);
+                continue;
+            }
+            let child_off = child_word as usize;
+            check_collapse_against_svdag(
+                store,
+                dag,
+                original_children[i],
+                collapsed_children[i],
+                child_off,
+                original_level - 1,
+            );
+        }
+    }
+
+    /// Assert every `Leaf` reachable under `node` carries `expected` as its
+    /// state. Used by the SVDAG bit-exact agreement test for octants the
+    /// SVDAG inlined as `LEAF_BIT` (uniform / empty subtrees).
+    fn assert_collapsed_uniform_state(store: &NodeStore, node: NodeId, expected: u16) {
+        match *store.get(node) {
+            Node::Leaf(s) => assert_eq!(
+                s, expected,
+                "uniform-region collapsed Leaf state must equal SVDAG inlined state {expected:#06x}",
+            ),
+            Node::Interior { children, .. } => {
+                for c in children.iter() {
+                    assert_collapsed_uniform_state(store, *c, expected);
+                }
+            }
+        }
     }
 
     /// Regression for hash-thing-nch I4: empty leaf roots (state 0) build
