@@ -886,7 +886,7 @@ impl NodeStore {
         (store, root)
     }
 
-    /// Like [`compacted`], but also returns the old→new NodeId remap table.
+    /// Like [`Self::compacted`], but also returns the old→new NodeId remap table.
     /// Callers that maintain caches keyed on NodeId can remap their keys
     /// instead of invalidating the entire cache.
     pub fn compacted_with_remap(
@@ -948,7 +948,7 @@ impl NodeStore {
     /// new nodes. The `NodeStore` grows monotonically; repeated per-frame
     /// collapses against a long-lived store will accumulate ghost interior
     /// chains. cswp.8.3 should either run against a transient/scratch
-    /// `NodeStore` or compact via [`compact_reachable_from`] periodically.
+    /// `NodeStore` or compact via [`Self::compacted_with_remap_keeping`] periodically.
     pub fn lod_collapse(&mut self, root: NodeId, target_lod: u32) -> NodeId {
         let root_level = self.get(root).level();
         assert!(
@@ -961,7 +961,7 @@ impl NodeStore {
         self.lod_collapse_rec(root, root_level, target_lod)
     }
 
-    /// Recursive worker for [`lod_collapse`]. `level` is the contextual level
+    /// Recursive worker for [`Self::lod_collapse`]. `level` is the contextual level
     /// of `node` as seen from its parent — when an intermediate subtree is
     /// represented by a raw `Leaf(s)` (uniform-region compression), the
     /// caller's `level` carries the true level rather than `Node::level()`.
@@ -1020,7 +1020,7 @@ impl NodeStore {
         }
     }
 
-    /// Per-chunk variant of [`lod_collapse`]. Rewrites only the subtree at
+    /// Per-chunk variant of [`Self::lod_collapse`]. Rewrites only the subtree at
     /// chunk `(chunk_x, chunk_y, chunk_z)` (where chunks are
     /// `2^chunk_level`-cube cells of the `2^root_level` root grid),
     /// collapsing it with the given `target_lod`. Other chunks' subtrees are
@@ -1031,7 +1031,7 @@ impl NodeStore {
     /// any chunk coordinate is out of bounds for the
     /// `(2^(root_level - chunk_level))^3` chunk grid.
     ///
-    /// **Memory:** like [`lod_collapse`], each call interns a fresh
+    /// **Memory:** like [`Self::lod_collapse`], each call interns a fresh
     /// root-to-chunk Interior chain plus the collapsed leaf. Calling this
     /// once per chunk per frame against a long-lived store will accumulate
     /// ghost chains; cswp.8.3 should batch or compact accordingly.
@@ -1069,7 +1069,7 @@ impl NodeStore {
         )
     }
 
-    /// Recursive worker for [`lod_collapse_chunk`]. Descends the unique path
+    /// Recursive worker for [`Self::lod_collapse_chunk`]. Descends the unique path
     /// to the target chunk, calling `lod_collapse` once at the chunk
     /// boundary. The Leaf early-return preserves uniform regions: if the
     /// path passes through a raw `Leaf(s)` above `chunk_level` (the
