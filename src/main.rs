@@ -835,8 +835,14 @@ impl App {
         if !capture {
             // Release: clear the warn-throttle and the failure counter
             // (hash-thing-ezx8) so a later recapture-then-fail can warn
-            // once again and the dormant gate is re-armed. Then drop
-            // the OS-level grab if we have a window.
+            // once again and the dormant gate is re-armed. Note that
+            // `sync_cursor_capture` also resets the counter on every
+            // release-direction call (even when this branch is
+            // short-circuited by the state-match early return) — that
+            // covers the permanently-failing-platform case where
+            // `cursor_captured` was never true. This branch handles the
+            // reset for the post-successful-grab release path. Then
+            // drop the OS-level grab if we have a window.
             self.cursor_capture_grab_warned = false;
             self.cursor_capture_grab_failures = 0;
             if let Some(window) = self.window.as_ref() {
@@ -879,16 +885,29 @@ impl App {
 
     fn sync_cursor_capture(&mut self) {
         let should_capture = should_capture_cursor(self.camera_mode, self.focused, self.occluded);
+        // hash-thing-ezx8: any time the predicate says we should NOT
+        // capture, clear the failure budget — even when
+        // `cursor_captured` was already false (the
+        // permanently-failing-platform case where dormancy was reached
+        // via 600 failures with no successful grab in between). On
+        // those platforms `should_capture==cursor_captured==false`
+        // would short-circuit at the state-match early return below,
+        // never reaching `apply_cursor_capture(false)`'s reset path,
+        // and the user would be pinned dormant forever after the first
+        // Tab / focus-loss / occlusion. Reset here covers both the
+        // "stale-true cursor_captured" case (handled additionally by
+        // the release branch in `apply_cursor_capture`) and the
+        // "never-true cursor_captured" case the early return masks.
+        if !should_capture {
+            self.cursor_capture_grab_failures = 0;
+        }
         if should_capture == self.cursor_captured {
             return;
         }
-        // hash-thing-ezx8 dormant gate: when consecutive grab failures
-        // saturate, stop hammering `set_cursor_grab` from the per-frame
-        // retry tap. Only gates the *capture* direction — releases must
-        // still proceed so explicit transitions (camera-mode toggle,
-        // focus loss, occlusion) reach `apply_cursor_capture(false)`,
-        // which resets the counter and re-arms a fresh attempt next
-        // time `should_capture` flips back to true.
+        // Dormant gate: when consecutive grab failures saturate, stop
+        // hammering `set_cursor_grab` from the per-frame retry tap.
+        // Only gates the *capture* direction — release transitions
+        // already reset the counter above and proceed normally.
         if should_capture && self.cursor_capture_grab_failures >= MAX_CURSOR_GRAB_RETRIES {
             return;
         }
@@ -4075,19 +4094,21 @@ mod tests {
     }
 
     #[test]
-    fn sync_cursor_capture_dormant_release_clears_counter() {
-        // The release direction (should_capture == false) must NOT be
-        // gated by the dormant counter — otherwise an explicit
-        // camera-mode toggle / focus loss / occlusion couldn't reach
-        // apply_cursor_capture(false) to re-arm the budget.
+    fn sync_cursor_capture_release_resets_dormant_counter_when_uncaptured() {
+        // hash-thing-ezx8 critical-review B1 regression: on a
+        // permanently-failing platform dormancy arrives via 600
+        // failures with `cursor_captured` staying false the entire
+        // time. A subsequent `should_capture==false` transition
+        // (Tab to Orbit / focus loss / occlusion) MUST reset the
+        // counter even though `cursor_captured` is already false and
+        // the state-match early return would otherwise short-circuit.
+        // Without this, returning to FPS later finds the gate still
+        // dormant and the retry never re-fires.
         let mut app = App::new(64);
         app.camera_mode = CameraMode::Orbit;
         app.focused = true;
         app.occluded = false;
-        // Pretend a prior FPS session got dormant, then the user
-        // toggled to Orbit (cursor_captured still latched true from the
-        // last successful grab in that session).
-        app.cursor_captured = true;
+        app.cursor_captured = false;
         app.cursor_capture_grab_failures = MAX_CURSOR_GRAB_RETRIES;
 
         assert!(!should_capture_cursor(
@@ -4100,9 +4121,42 @@ mod tests {
 
         assert_eq!(
             app.cursor_capture_grab_failures, 0,
-            "release path must reset the counter even when dormant"
+            "release-direction sync must reset the counter even when \
+             cursor_captured was already false (no prior successful grab)"
         );
         assert!(!app.cursor_captured);
+    }
+
+    #[test]
+    fn sync_cursor_capture_dormant_release_then_recapture_re_arms_budget() {
+        // End-to-end on the permanently-failing-platform recovery
+        // path: dormant -> release sync -> re-capture sync gets a
+        // fresh budget. Without B1's fix the recapture sync would
+        // return early at the dormant gate (counter still saturated)
+        // and the per-frame retry would never re-fire.
+        let mut app = App::new(64);
+        app.camera_mode = CameraMode::FirstPerson;
+        app.focused = true;
+        app.occluded = false;
+        app.cursor_captured = false;
+        app.cursor_capture_grab_failures = MAX_CURSOR_GRAB_RETRIES;
+
+        // Simulate Tab to Orbit: should_capture flips false. Counter resets.
+        app.camera_mode = CameraMode::Orbit;
+        app.sync_cursor_capture();
+        assert_eq!(app.cursor_capture_grab_failures, 0);
+
+        // Simulate Tab back to FPS: should_capture flips true again.
+        // Counter is back at 0 -> dormant gate doesn't fire ->
+        // apply_cursor_capture(true) runs -> no-window soft failure
+        // increments the counter to 1.
+        app.camera_mode = CameraMode::FirstPerson;
+        app.sync_cursor_capture();
+        assert_eq!(
+            app.cursor_capture_grab_failures, 1,
+            "re-capture after release must reach apply_cursor_capture(true) \
+             and burn one retry from the fresh budget"
+        );
     }
 
     // hash-thing-9r62 regression: drive the cursor_captured flag through the
