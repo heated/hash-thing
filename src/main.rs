@@ -1033,6 +1033,17 @@ impl App {
     /// (back-to-back redraws within one timer tick) is also skipped to
     /// avoid blending a 0-FPS sample that would silently decay the
     /// readout by 5%.
+    ///
+    /// Also records `dt_wall` as the `frame_total` perf metric so the
+    /// log summary line includes wall-clock per-frame period alongside
+    /// `render_gpu` / `render_cpu` (hash-thing-dbz5). The components
+    /// alone don't sum to the frame budget — winit dispatch, input
+    /// handling, scene-state mutation, and `Queue::write_*` upload land
+    /// outside any `_cpu` / `_gpu` bracket, so a "fast `render_gpu`"
+    /// reading was easy to misread as "60 FPS" when frame_total was
+    /// actually 33-66 ms (15-30 FPS perceived). Shares the suppress
+    /// gate with the EWMA so post-resume bogus dt's don't pollute the
+    /// metric either.
     fn apply_fps_sample(&mut self, dt_wall: f64) {
         if self.suppress_next_fps_sample {
             self.suppress_next_fps_sample = false;
@@ -1040,6 +1051,8 @@ impl App {
         }
         if dt_wall > 0.0 {
             self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
+            self.perf
+                .record("frame_total", std::time::Duration::from_secs_f64(dt_wall));
         }
     }
 
@@ -4439,6 +4452,11 @@ mod tests {
             !app.suppress_next_fps_sample,
             "flag must be consumed after the suppressed frame"
         );
+        assert_eq!(
+            app.perf.stats("frame_total").map(|s| s.2).unwrap_or(0),
+            0,
+            "suppressed bogus frame must not pollute the frame_total ring (hash-thing-dbz5)"
+        );
     }
 
     #[test]
@@ -4456,6 +4474,11 @@ mod tests {
             (app.smoothed_fps - 60.0).abs() < 1e-9,
             "subsequent real frames must blend normally; got {}",
             app.smoothed_fps
+        );
+        assert_eq!(
+            app.perf.stats("frame_total").map(|s| s.2).unwrap_or(0),
+            1,
+            "real post-resume frame must record exactly one frame_total sample (hash-thing-dbz5)"
         );
     }
 
