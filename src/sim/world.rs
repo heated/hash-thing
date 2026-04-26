@@ -2798,6 +2798,174 @@ mod tests {
             mismatches, 0,
             "{label}: {mismatches} voxel mismatches between world octree and Svdag"
         );
+
+        assert_svdag_lod_rep_mat_matches_world(world, svdag, label);
+    }
+
+    // ---------------------------------------------------------------
+    // eiu9: LOD rep_mat consistency check (mirror of qaca's ht-render walker)
+    // ---------------------------------------------------------------
+    //
+    // The voxel-walk above only inspects leaves; the LOD `rep_mat` field packed
+    // into `(slot[0] >> 8) & 0xFFFF` is unread. Walk the SVDAG and the World's
+    // NodeStore in lockstep so post-compact and cross-epoch SVDAG syncs (the
+    // path that motivated rk4n) gain the same rep_mat-staleness coverage that
+    // qaca added on the ht-render m1f.5 corpus. Mirrored inline because
+    // ht-render's helpers are gated on its own `cfg(test)`.
+
+    fn assert_svdag_lod_rep_mat_matches_world(world: &World, svdag: &Svdag, label: &str) {
+        use crate::octree::Node;
+
+        if svdag.nodes.is_empty() {
+            return;
+        }
+
+        // Empty world: SVDAG holds only the root header (no interior slots).
+        if world.store.get(world.root).is_empty() {
+            return;
+        }
+
+        // Memoize on NodeId — without this, validate's per-node call to
+        // expected_rep_mat re-recurses the subtree at every level, blowing the
+        // 128³ skip-sync test from ~5s to >9 min.
+        fn expected_rep_mat(
+            store: &NodeStore,
+            id: NodeId,
+            cache: &mut FxHashMap<NodeId, u32>,
+        ) -> u32 {
+            if let Some(&hit) = cache.get(&id) {
+                return hit;
+            }
+            let val = match store.get(id) {
+                Node::Leaf(state) => (*state as u32) & 0xFFFF,
+                Node::Interior { children, .. } => {
+                    let children = *children;
+                    let mut rep_mat: u32 = 0;
+                    let mut rep_pop: u64 = 0;
+                    for &child_id in children.iter() {
+                        match store.get(child_id) {
+                            Node::Leaf(state) => {
+                                if *state != 0 && (rep_mat == 0 || rep_pop == 0) {
+                                    rep_mat = (*state as u32) & 0xFFFF;
+                                    rep_pop = 1;
+                                }
+                            }
+                            Node::Interior { population, .. } => {
+                                if *population > 0 && *population > rep_pop {
+                                    let p = *population;
+                                    rep_mat = expected_rep_mat(store, child_id, cache);
+                                    rep_pop = p;
+                                }
+                            }
+                        }
+                    }
+                    rep_mat
+                }
+            };
+            cache.insert(id, val);
+            val
+        }
+
+        fn validate(
+            svdag: &Svdag,
+            store: &NodeStore,
+            id: NodeId,
+            offset: usize,
+            path: &str,
+            out: &mut Vec<String>,
+            cache: &mut FxHashMap<NodeId, u32>,
+        ) {
+            const LEAF_BIT: u32 = 0x8000_0000;
+            let cmask = svdag.nodes[offset];
+            let encoded_rep = (cmask >> 8) & 0xFFFF;
+            let want_rep = expected_rep_mat(store, id, cache);
+            if encoded_rep != want_rep {
+                out.push(format!(
+                    "rep_mat mismatch at offset={offset} path='{}': encoded={} expected={}",
+                    if path.is_empty() { "/" } else { path },
+                    encoded_rep,
+                    want_rep,
+                ));
+            }
+
+            if let Node::Interior { children, .. } = store.get(id) {
+                let children = *children;
+                for (i, &child_id) in children.iter().enumerate() {
+                    let child_word = svdag.nodes[offset + 1 + i];
+                    match store.get(child_id) {
+                        Node::Leaf(state) => {
+                            let want = LEAF_BIT | (*state as u32);
+                            if child_word != want {
+                                out.push(format!(
+                                    "leaf child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
+                                    offset + 1 + i,
+                                    if path.is_empty() { "/" } else { path },
+                                    child_word,
+                                    want,
+                                ));
+                            }
+                        }
+                        Node::Interior { population, .. } => {
+                            if *population == 0 {
+                                if child_word != LEAF_BIT {
+                                    out.push(format!(
+                                        "empty-interior child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
+                                        offset + 1 + i,
+                                        if path.is_empty() { "/" } else { path },
+                                        child_word,
+                                        LEAF_BIT,
+                                    ));
+                                }
+                            } else if child_word & LEAF_BIT != 0 {
+                                out.push(format!(
+                                    "populated-interior child slot has LEAF_BIT at offset={} (child {i} of '{}'): encoded={:#010x}",
+                                    offset + 1 + i,
+                                    if path.is_empty() { "/" } else { path },
+                                    child_word,
+                                ));
+                            } else {
+                                let child_path = if path.is_empty() {
+                                    format!("/{i}")
+                                } else {
+                                    format!("{path}/{i}")
+                                };
+                                validate(
+                                    svdag,
+                                    store,
+                                    child_id,
+                                    child_word as usize,
+                                    &child_path,
+                                    out,
+                                    cache,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let root_offset = svdag.nodes[0] as usize;
+        let mut mismatches: Vec<String> = Vec::new();
+        let mut cache: FxHashMap<NodeId, u32> = FxHashMap::default();
+        validate(
+            svdag,
+            &world.store,
+            world.root,
+            root_offset,
+            "",
+            &mut mismatches,
+            &mut cache,
+        );
+        if !mismatches.is_empty() {
+            for line in mismatches.iter().take(5) {
+                eprintln!("  {line} [{label}]");
+            }
+            panic!(
+                "{label}: {} LOD rep_mat / slot-encoding mismatches between world octree and Svdag",
+                mismatches.len()
+            );
+        }
     }
 
     fn wc(coord: u64) -> WorldCoord {
@@ -6097,5 +6265,40 @@ mod tests {
         world.set_material_tick_divisor(crate::terrain::materials::WATER_MATERIAL_ID, 1);
 
         assert_material_caches_cleared(&world);
+    }
+
+    // ---- eiu9 rep_mat-walker adversarial guard ------------------------
+    //
+    // Mirror of qaca_walker_catches_corrupted_rep_mat in ht-render. Confirms
+    // assert_svdag_lod_rep_mat_matches_world actually fires when a slot's
+    // rep_mat field is corrupted post-build. Without this, the walker could
+    // silently no-op on the world.rs path and we'd close rk4n's blind spot
+    // only on paper.
+    #[test]
+    #[should_panic(expected = "LOD rep_mat / slot-encoding mismatches")]
+    fn eiu9_walker_catches_corrupted_rep_mat() {
+        let mut world = World::new(5); // 32³
+                                       // Solid 16³ water block in one octant gives an interior root with
+                                       // a non-trivial rep_mat the walker can validate.
+        for z in 0..16 {
+            for y in 0..16 {
+                for x in 0..16 {
+                    world.set(wc(x), wc(y), wc(z), WATER);
+                }
+            }
+        }
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "pre-corruption water block");
+
+        // Stomp the root node's rep_mat field to a bogus material id while
+        // preserving the child mask; the walker must catch the mismatch.
+        let root_offset = svdag.nodes[0] as usize;
+        let original = svdag.nodes[root_offset];
+        let bogus_mat: u32 = 0xABCD;
+        svdag.nodes[root_offset] = (original & 0xFF) | (bogus_mat << 8);
+
+        assert_svdag_matches_world(&world, &svdag, "corrupted rep_mat");
     }
 }
