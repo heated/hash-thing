@@ -44,17 +44,20 @@ use std::time::Instant;
 
 /// Number of trajectory samples per `lod_bias`. Each sample is one call to
 /// `policy.update`. Kept small (8) because per-frame cost at 4096³ ranges
-/// 1–35 s pre-cswp.8.3.1 and grows monotonically with sample index (the
-/// policy *adds* scaffold nodes each frame; later frames walk a larger
-/// store). 8 samples × 4 biases × ~30 s mean ≈ 16 min wall-time, within
-/// reach of one bench run; a TRAJ_STEPS of 20 produced ≈ 90 min projected
-/// wall-time and trips the runaway-detection backstop in pilot runs.
+/// 8–80 s pre-cswp.8.3.1 (per `docs/perf/svdag-perf-paper.md` §4.7.5a)
+/// and grows monotonically with sample index (the policy *adds* scaffold
+/// nodes each frame; later frames walk a larger store). 8 samples × 4
+/// biases × ~30 s mean ≈ 16 min per-bench wall; per-bias world reset
+/// (cswp.8.5 trident-review fix) adds ~1 min of cold-gen for honesty.
 const TRAJ_STEPS: usize = 8;
 
-/// Trajectory anchor — chunk (0, 0, 0). Pinning the camera at one corner
-/// keeps the *opposite* corner at the maximum sustainable Chebyshev radius
-/// across the entire walk, so the LOD curve's outermost reachable band is
-/// exercised every frame instead of fading in mid-trajectory.
+/// Trajectory start — chunk (0, 0, 0) cell-center. The bench walks a
+/// straight diagonal from this chunk to `TRAJ_FAR_CHUNK`, so the camera
+/// chunk-coordinate sweeps `[0, TRAJ_FAR_CHUNK]`. The maximum chunk
+/// Chebyshev radius reached anywhere in the trajectory is `TRAJ_FAR_CHUNK`
+/// (camera-at-anchor reaches the opposite corner at distance 31; mid-walk
+/// at chunk ~15.5 the *minimum* furthest chunk is at distance ~16). This
+/// is *not* a fixed-camera bench — it is a diagonal sweep.
 const TRAJ_ANCHOR_CHUNK: u32 = 0;
 
 /// Furthest chunk the camera reaches. 31 = `(1 << (12 - CHUNK_LEVEL)) - 1`,
@@ -191,7 +194,7 @@ fn run_bias(world: &mut World, bias: f32, total_chunks: u32) -> Vec<FrameSample>
     }
 
     let mut dts: Vec<f64> = samples.iter().map(|s| s.dt_ms).collect();
-    dts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    dts.sort_by(|a, b| a.total_cmp(b));
     let dt_min = *dts.first().unwrap();
     let dt_max = *dts.last().unwrap();
     let dt_mean: f64 = dts.iter().sum::<f64>() / dts.len() as f64;
@@ -203,16 +206,49 @@ fn run_bias(world: &mut World, bias: f32, total_chunks: u32) -> Vec<FrameSample>
         .filter_map(|s| s.growth)
         .fold(f32::NEG_INFINITY, f32::max);
     eprintln!("  summary: dt_ms min={dt_min:.2} mean={dt_mean:.2} p95={dt_p95:.2} max={dt_max:.2}");
-    eprintln!("           nodes min={nodes_min} max={nodes_max} growth_max={growth_max:.2}x",);
+    eprintln!(
+        "           nodes min={nodes_min} max={nodes_max} growth_max={:.2}x",
+        if growth_max.is_finite() {
+            growth_max
+        } else {
+            0.0
+        },
+    );
     eprintln!();
 
     samples
 }
 
-/// Fly-through bench at 4096³, all four lod_bias values. Shared world; the
-/// cold-gen amortizes once across biases. Wall-time is dominated by the
-/// per-frame `policy.update` cost — see the docstring's "What this bench
-/// does NOT measure" note.
+/// Build a freshly-seeded 4096³ World. Each bias must run against an
+/// independent store; sharing one across biases contaminates the
+/// `nodes_max` and `growth_max` columns with prior biases' scaffold (per
+/// the cswp.8.5 trident-review BLOCKER finding — "monotonicity coincides
+/// with iteration order, not with the lod_bias curve"). The cold-gen
+/// amortization that motivated sharing the world cost ~3× wall, but the
+/// per-bias gen at 4096³ is ~7–18 s on M2 16 GB and small against the
+/// 14-min total bench wall.
+fn fresh_world(level: u32) -> World {
+    let mut world = World::new(level);
+    assert_eq!(world.level, level, "world level pin");
+    let params = TerrainParams::for_level(level);
+    let _ = world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
+    world
+}
+
+/// Returns the LOD-4 band edge (in cells) for the given `lod_bias` at
+/// `chunk_level=7`. LOD 4 fires when scaled-radius ≥ 64, i.e. raw chunk
+/// radius ≥ `64 * lod_bias`; multiply by chunk side to get the cell-space
+/// extent the policy is comparing against the world half-extent.
+fn lod4_edge_cells(bias: f32) -> f64 {
+    64.0 * bias as f64 * (1u32 << CHUNK_LEVEL) as f64
+}
+
+/// Fly-through bench at 4096³, all four lod_bias values. Each bias runs
+/// against a *fresh* World — see `fresh_world` docstring for why.
+/// Wall-time is dominated by the per-frame `policy.update` cost — see the
+/// crate docstring's "What this bench does NOT measure" note.
 #[test]
 #[ignore]
 fn bench_flythrough_4096() {
@@ -225,18 +261,6 @@ fn bench_flythrough_4096() {
     eprintln!("  biases={LOD_BIASES:?}");
     eprintln!();
 
-    let t_gen = Instant::now();
-    let mut world = World::new(level);
-    assert_eq!(world.level, level, "world level pin");
-    let params = TerrainParams::for_level(level);
-    let _ = world
-        .seed_terrain(&params)
-        .expect("level-derived terrain params must validate");
-    let gen_ms = t_gen.elapsed().as_secs_f64() * 1e3;
-    let nodes_after_gen = world.store.node_count();
-    eprintln!("  cold-gen: {gen_ms:.1} ms, nodes={nodes_after_gen}");
-    eprintln!();
-
     let chunks_per_axis: u32 = 1u32 << (level - CHUNK_LEVEL);
     assert_eq!(
         chunks_per_axis,
@@ -246,31 +270,53 @@ fn bench_flythrough_4096() {
     let total_chunks: u32 = chunks_per_axis.pow(3);
 
     let mid_step = TRAJ_STEPS / 2;
+    let world_extent_cells = (1u64 << level) as f64;
 
     // Per-bias rollup row: (bias, dt_mean, dt_max, nodes_max, growth_max,
     // hist_at_mid_traj).
     let mut rollups: Vec<(f32, f64, f64, usize, f32, [u32; 5])> = Vec::new();
     for &bias in LOD_BIASES.iter() {
+        // Fresh world per bias: avoids the cross-bias scaffold-accumulation
+        // contamination spotted by the cswp.8.5 trident review.
+        let t_gen = Instant::now();
+        let mut world = fresh_world(level);
+        let gen_ms = t_gen.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "  cold-gen for bias={bias:.2}: {gen_ms:.1} ms, nodes={}",
+            world.store.node_count()
+        );
+
         let samples = run_bias(&mut world, bias, total_chunks);
 
-        // Band-coverage invariants per the LOD-4-reachability docstring
-        // note: at biases ≥ 0.5 the LOD-4 band is unreachable. Pin it as a
-        // documented invariant so a future curve change trips loudly.
-        if bias >= 0.5 {
+        // Band-coverage invariants. LOD-4 is reachable iff the chunk radius
+        // can exceed the per-bias band edge. The check is computed per-bias
+        // so a future curve / world-size change trips with the *correct*
+        // numerical edge in the message.
+        let lod4_edge = lod4_edge_cells(bias);
+        if lod4_edge >= world_extent_cells {
             for s in &samples {
                 assert_eq!(
                     s.hist[4], 0,
-                    "bias {bias}: hist[4] must be 0 (LOD-4 band edge ≥ {} cells, > 4096³ extent), got hist={:?}",
-                    32u32 << CHUNK_LEVEL,
+                    "bias {bias}: hist[4] must be 0 (LOD-4 band edge {lod4_edge:.0} cells \
+                     ≥ world extent {world_extent_cells:.0} cells), got hist={:?}",
                     s.hist,
                 );
             }
         } else {
-            // bias 0.25 should reach LOD 4 at the far corner.
-            let any_lod4 = samples.iter().any(|s| s.hist[4] > 0);
+            // The opposite-corner chunk hits LOD 4 throughout the trajectory
+            // (the camera sweep keeps the corner-distance ≥ 16 chunks, so
+            // every sample should report hist[4] > 0 at bias 0.25). Pin
+            // first AND last frame so a future curve change that breaks
+            // mid-trajectory still trips.
             assert!(
-                any_lod4,
-                "bias {bias}: expected LOD-4 collapse at far corner, none observed",
+                samples.first().unwrap().hist[4] > 0,
+                "bias {bias}: first sample must show LOD-4 at far corner, got hist={:?}",
+                samples.first().unwrap().hist,
+            );
+            assert!(
+                samples.last().unwrap().hist[4] > 0,
+                "bias {bias}: last sample must show LOD-4 at near corner, got hist={:?}",
+                samples.last().unwrap().hist,
             );
         }
 
