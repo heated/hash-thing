@@ -12,7 +12,7 @@ use crate::sim::margolus::GravityBlockRule;
 use crate::sim::rule::{
     AcidRule, AirRule, AirVineGrowthRule, BlockRule, CaRule, DissolvableRule, FanCarriedMaterial,
     FanDrivenRule, FanRule, FireRule, FireworkRule, FlammableRule, GameOfLife3D, IceRule, LavaRule,
-    LocalRule, NoopRule, Phase, SteamRule, VineRule, WaterRule,
+    NoopRule, Phase, SteamRule, VineRule, WaterRule,
 };
 
 pub type MaterialId = u16;
@@ -207,9 +207,6 @@ pub struct RuleId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockRuleId(pub usize);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocalRuleId(pub usize);
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaterialVisualProperties {
     pub label: &'static str,
@@ -230,9 +227,6 @@ pub struct MaterialEntry {
     pub physical: MaterialPhysicalProperties,
     pub rule_id: RuleId,
     pub block_rule_id: Option<BlockRuleId>,
-    /// LocalRule (Phase 3) assigned to this material (hash-thing-qy4g.1).
-    /// `None` means Phase 3 leaves cells of this material untouched.
-    pub local_rule_id: Option<LocalRuleId>,
     /// How often this material's rules fire, in whole sim ticks.
     /// Rule (CaRule and BlockRule) applies iff `generation % tick_divisor == 0`.
     /// `1` = every tick (default, current behavior). Must be >= 1.
@@ -245,7 +239,6 @@ pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
     rules: Vec<CaRule>,
     block_rules: Vec<Box<dyn BlockRule + Send>>,
-    local_rules: Vec<LocalRule>,
     // Caches rebuilt after any mutation touching entries / block_rules (hash-thing-5yxk).
     // The sim step hot path reads these every tick; recomputing per step would
     // allocate two Vec<u16> per step, which shows up in jw3k-class profiles.
@@ -256,11 +249,6 @@ pub struct MaterialRegistry {
     // dispatch; without caching, the old `noop_flags()` allocated a
     // Vec<bool> on every call.
     cached_noop_flags: Vec<bool>,
-    // hash-thing-qy4g.1: cached "any material has a LocalRule assigned"
-    // flag. Read on every base-case `step_grid_once` call to gate Phase 3,
-    // so an O(N) scan would re-introduce the same per-step cost the other
-    // caches were added to remove. Rebuilt by `rebuild_tick_caches`.
-    cached_has_local_rules: bool,
 }
 
 impl Clone for MaterialRegistry {
@@ -269,11 +257,9 @@ impl Clone for MaterialRegistry {
             entries: self.entries.clone(),
             rules: self.rules.clone(),
             block_rules: self.block_rules.iter().map(|r| r.clone_box()).collect(),
-            local_rules: self.local_rules.clone(),
             cached_tick_divisor_flags: self.cached_tick_divisor_flags.clone(),
             cached_block_rule_tick_divisors: self.cached_block_rule_tick_divisors.clone(),
             cached_noop_flags: self.cached_noop_flags.clone(),
-            cached_has_local_rules: self.cached_has_local_rules,
         }
     }
 }
@@ -293,11 +279,9 @@ impl MaterialRegistry {
             entries: Vec::with_capacity(INITIAL_MATERIAL_SLOTS),
             rules: Vec::new(),
             block_rules: Vec::new(),
-            local_rules: Vec::new(),
             cached_tick_divisor_flags: Vec::new(),
             cached_block_rule_tick_divisors: Vec::new(),
             cached_noop_flags: Vec::new(),
-            cached_has_local_rules: false,
         }
     }
 
@@ -443,7 +427,6 @@ impl MaterialRegistry {
                 },
                 rule_id: air_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -462,7 +445,6 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -481,7 +463,6 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -500,7 +481,6 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -519,7 +499,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_fire_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -538,7 +517,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_water_rule,
                 block_rule_id: Some(water_fluid_block_rule),
-                local_rule_id: None,
                 // Water falls on every other tick so it reads as liquid.
                 // Expands memo_period from 2 to 4 (see rvsh).
                 tick_divisor: 2,
@@ -559,7 +537,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_static_rule,
                 block_rule_id: Some(gravity_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -578,7 +555,6 @@ impl MaterialRegistry {
                 },
                 rule_id: lava_rule,
                 block_rule_id: Some(lava_fluid_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -600,7 +576,6 @@ impl MaterialRegistry {
                 },
                 rule_id: ice_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -619,7 +594,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_acid_rule,
                 block_rule_id: Some(acid_fluid_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -638,7 +612,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_flammable_rule,
                 block_rule_id: Some(oil_fluid_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -657,7 +630,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_flammable_rule,
                 block_rule_id: Some(gravity_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -676,7 +648,6 @@ impl MaterialRegistry {
                 },
                 rule_id: steam_rule,
                 block_rule_id: Some(gravity_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -695,7 +666,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_flammable_rule,
                 block_rule_id: Some(gravity_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -714,7 +684,6 @@ impl MaterialRegistry {
                 },
                 rule_id: dissolvable_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -733,7 +702,6 @@ impl MaterialRegistry {
                 },
                 rule_id: vine_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -752,7 +720,6 @@ impl MaterialRegistry {
                 },
                 rule_id: fan_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -771,7 +738,6 @@ impl MaterialRegistry {
                 },
                 rule_id: firework_rule,
                 block_rule_id: Some(gravity_block_rule),
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -796,7 +762,6 @@ impl MaterialRegistry {
                     },
                     rule_id: steam_rule,
                     block_rule_id: Some(gravity_block_rule),
-                    local_rule_id: None,
                     tick_divisor: 1,
                 },
             );
@@ -822,7 +787,6 @@ impl MaterialRegistry {
                     },
                     rule_id: firework_rule,
                     block_rule_id: Some(gravity_block_rule),
-                    local_rule_id: None,
                     tick_divisor: 1,
                 },
             );
@@ -842,7 +806,6 @@ impl MaterialRegistry {
                 },
                 rule_id: static_rule,
                 block_rule_id: None,
-                local_rule_id: None,
                 tick_divisor: 1,
             },
         );
@@ -892,40 +855,11 @@ impl MaterialRegistry {
         self.entry(cell.material())?.block_rule_id
     }
 
-    /// LocalRule (Phase 3) for the given cell, if any (hash-thing-qy4g.1).
-    pub fn local_rule_for_cell(&self, cell: Cell) -> Option<&LocalRule> {
-        let entry = self.entry(cell.material())?;
-        let id = entry.local_rule_id?;
-        self.local_rules.get(id.0)
-    }
-
-    pub fn local_rule_id_for_cell(&self, cell: Cell) -> Option<LocalRuleId> {
-        self.entry(cell.material())?.local_rule_id
-    }
-
-    /// True if any registered material has a LocalRule assigned. O(1) — reads
-    /// `cached_has_local_rules`, refreshed by `rebuild_tick_caches` on every
-    /// mutation path. Used by `step_grid_once` to gate the Phase 3 snapshot+
-    /// apply loop, so the shipping (no-LocalRule) path stays a single bool
-    /// load (hash-thing-qy4g.1).
-    pub fn has_local_rules(&self) -> bool {
-        self.cached_has_local_rules
-    }
-
-    /// True if this cell has no block rule, no non-self-inert local rule, and
-    /// its CA rule is self-inert. Such cells never change state — hashlife
-    /// can skip stepping entire subtrees composed of these materials.
-    ///
-    /// LocalRule participates via the same rule-semantic gate as CaRule:
-    /// an `Identity`-style LocalRule reports `is_self_inert == true` and
-    /// preserves the inert-subtree short-circuit; future LocalRules that
-    /// depend on neighbor state report `false` and disable the short-circuit
-    /// for materials that carry them (hash-thing-qy4g.1).
+    /// True if this cell has no block rule and its CA rule is self-inert.
+    /// Such cells never change state — hashlife can skip stepping entire
+    /// subtrees composed of these materials.
     pub fn cell_is_inert_fixed_point(&self, cell: Cell) -> bool {
         self.block_rule_id_for_cell(cell).is_none()
-            && self
-                .local_rule_for_cell(cell)
-                .is_none_or(|rule| rule.is_self_inert())
             && self
                 .rule_for_cell(cell)
                 .is_some_and(|rule| rule.is_self_inert())
@@ -1025,14 +959,6 @@ impl MaterialRegistry {
                     .unwrap_or(false)
             })
             .collect();
-        // hash-thing-qy4g.1: keep the Phase 3 gate a single bool load on the
-        // shipping path. Same invalidation set as the tick caches: any
-        // mutation that could change `local_rule_id` on an entry routes
-        // through `rebuild_tick_caches` via `mutate_materials`.
-        self.cached_has_local_rules = self
-            .entries
-            .iter()
-            .any(|entry| entry.as_ref().is_some_and(|e| e.local_rule_id.is_some()));
     }
 
     /// Panic if any two materials sharing one BlockRule have different
@@ -1137,45 +1063,6 @@ impl MaterialRegistry {
                 panic!("material {material_id} must exist before assigning a block rule")
             })
             .block_rule_id = Some(block_rule_id);
-        self.rebuild_tick_caches();
-    }
-
-    /// Register a LocalRule and return its id (hash-thing-qy4g.1).
-    ///
-    /// On a registry embedded in a [`crate::sim::world::World`], calling this
-    /// directly on `world.materials` bypasses
-    /// [`crate::sim::world::World::mutate_materials`] and leaves the four
-    /// hashlife caches + `block_rule_present` stale (hash-thing-6iiz / dxi4.2
-    /// audit). Route via
-    /// `world.mutate_materials(|m| m.register_local_rule(...))` instead.
-    pub fn register_local_rule(&mut self, rule: impl Into<LocalRule>) -> LocalRuleId {
-        let id = LocalRuleId(self.local_rules.len());
-        self.local_rules.push(rule.into());
-        // Registration alone doesn't flip `cached_has_local_rules` (no entry
-        // references this id yet), but rebuild keeps the cache in lockstep
-        // with the other tick caches and matches `register_block_rule`'s
-        // pattern (hash-thing-qy4g.1).
-        self.rebuild_tick_caches();
-        id
-    }
-
-    /// Bind `material_id` to the given LocalRule (hash-thing-qy4g.1).
-    ///
-    /// On a registry embedded in a [`crate::sim::world::World`], calling this
-    /// directly on `world.materials` bypasses
-    /// [`crate::sim::world::World::mutate_materials`] and leaves the four
-    /// hashlife caches + `block_rule_present` stale (hash-thing-6iiz / dxi4.2
-    /// audit). Route via
-    /// `world.mutate_materials(|m| m.assign_local_rule(...))` instead.
-    pub fn assign_local_rule(&mut self, material_id: MaterialId, local_rule_id: LocalRuleId) {
-        self.entries[material_id as usize]
-            .as_mut()
-            .unwrap_or_else(|| {
-                panic!("material {material_id} must exist before assigning a local rule")
-            })
-            .local_rule_id = Some(local_rule_id);
-        // Refresh `cached_has_local_rules` — the Phase 3 gate in
-        // `step_grid_once` reads it on every base-case call (hash-thing-qy4g.1).
         self.rebuild_tick_caches();
     }
 
@@ -1359,7 +1246,6 @@ mod tests {
             },
             rule_id,
             block_rule_id: None,
-            local_rule_id: None,
             tick_divisor: 1,
         }
     }
@@ -1764,7 +1650,6 @@ mod tests {
         registry.insert(
             1,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 ..entry_with(rule_id, [1.0, 0.0, 0.0, 1.0])
             },
@@ -1775,7 +1660,6 @@ mod tests {
         registry.insert(
             2,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 3,
                 ..entry_with(rule_id, [0.0, 1.0, 0.0, 1.0])
             },
@@ -1791,7 +1675,6 @@ mod tests {
         registry.insert(
             1,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 ..entry_with(rule_id, [1.0; 4])
             },
@@ -1902,7 +1785,6 @@ mod tests {
         registry.insert(
             0,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 0,
                 ..entry_with(rule_id, [0.0; 4])
             },
@@ -1920,7 +1802,6 @@ mod tests {
         registry.insert(
             0,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [0.0; 4])
@@ -1929,7 +1810,6 @@ mod tests {
         registry.insert(
             1,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [1.0; 4])
@@ -1953,7 +1833,6 @@ mod tests {
         registry.insert(
             0,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [0.0; 4])
@@ -1962,7 +1841,6 @@ mod tests {
         registry.insert(
             1,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 6,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [1.0; 4])
@@ -1986,7 +1864,6 @@ mod tests {
         registry.insert(
             0,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [0.0; 4])
@@ -1997,7 +1874,6 @@ mod tests {
         registry.insert(
             1,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 6,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [1.0; 4])
@@ -2019,7 +1895,6 @@ mod tests {
         registry.insert(
             0,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 block_rule_id: None,
                 ..entry_with(rule_id, [0.0; 4])
@@ -2028,7 +1903,6 @@ mod tests {
         registry.insert(
             1,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 6,
                 block_rule_id: None,
                 ..entry_with(rule_id, [1.0; 4])
@@ -2055,7 +1929,6 @@ mod tests {
         registry.insert(
             0,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [0.0; 4])
@@ -2064,7 +1937,6 @@ mod tests {
         registry.insert(
             1,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 4,
                 block_rule_id: Some(block_rule_id),
                 ..entry_with(rule_id, [1.0; 4])
@@ -2101,7 +1973,6 @@ mod tests {
             registry.insert(
                 i as MaterialId,
                 MaterialEntry {
-                    local_rule_id: None,
                     tick_divisor: p,
                     ..entry_with(rule_id, [0.0; 4])
                 },
@@ -2136,7 +2007,6 @@ mod tests {
         registry.insert(
             0,
             MaterialEntry {
-                local_rule_id: None,
                 tick_divisor: 3,
                 block_rule_id: Some(first_block_rule),
                 ..entry_with(rule_id, [0.0; 4])
@@ -2179,70 +2049,12 @@ mod tests {
         let _ = pack_clone_source(Cell::MAX_METADATA + 1);
     }
 
-    // hash-thing-qy4g.1: LocalRule plumbing.
-
     #[test]
-    fn register_local_rule_assigns_sequential_ids() {
-        use crate::sim::rule::IdentityLocalRule;
-        let mut reg = MaterialRegistry::new();
-        let id_a = reg.register_local_rule(IdentityLocalRule);
-        let id_b = reg.register_local_rule(IdentityLocalRule);
-        assert_eq!(id_a.0, 0);
-        assert_eq!(id_b.0, 1);
-    }
-
-    #[test]
-    fn has_local_rules_false_when_registered_but_not_assigned() {
-        use crate::sim::rule::IdentityLocalRule;
-        let mut reg = MaterialRegistry::new();
-        let _ = reg.register_local_rule(IdentityLocalRule);
-        assert!(
-            !reg.has_local_rules(),
-            "registering without assignment must not flip the gate"
-        );
-    }
-
-    #[test]
-    fn assign_local_rule_makes_has_local_rules_true_and_lookup_works() {
-        use crate::sim::rule::{IdentityLocalRule, NoopRule};
-        let mut reg = MaterialRegistry::new();
-        let rule_id = reg.register_rule(NoopRule);
-        let local_id = reg.register_local_rule(IdentityLocalRule);
-        reg.insert(7, entry_with(rule_id, [0.5; 4]));
-        reg.assign_local_rule(7, local_id);
-
-        assert!(reg.has_local_rules());
-        let cell = Cell::pack(7, 0);
-        assert!(reg.local_rule_for_cell(cell).is_some());
-        assert_eq!(reg.local_rule_id_for_cell(cell), Some(local_id));
-    }
-
-    #[test]
-    fn cell_is_inert_fixed_point_preserves_short_circuit_for_self_inert_local_rule() {
-        // qy4g.1 critical invariant: a self-inert LocalRule (Identity) must
-        // NOT disqualify uniform subtrees from the inert fast path. If this
-        // flips to false, qy4g.2's GapFillLocalRule on stone would lose the
-        // hashlife inert-subtree short-circuit even though gap-fill on a
-        // uniform block of stone is a no-op.
-        use crate::sim::rule::{IdentityLocalRule, NoopRule};
-        let mut reg = MaterialRegistry::new();
-        let rule_id = reg.register_rule(NoopRule);
-        let local_id = reg.register_local_rule(IdentityLocalRule);
-        reg.insert(11, entry_with(rule_id, [0.0; 4]));
-        reg.assign_local_rule(11, local_id);
-        assert!(
-            reg.cell_is_inert_fixed_point(Cell::pack(11, 0)),
-            "Identity LocalRule + Noop CaRule + no BlockRule must remain inert"
-        );
-    }
-
-    #[test]
-    fn cell_is_inert_fixed_point_unchanged_when_no_local_rule() {
+    fn cell_is_inert_fixed_point_with_noop_carule_and_no_block_rule() {
         use crate::sim::rule::NoopRule;
         let mut reg = MaterialRegistry::new();
         let rule_id = reg.register_rule(NoopRule);
         reg.insert(13, entry_with(rule_id, [0.0; 4]));
-        // No LocalRule registered or assigned → behavior must match pre-qy4g.1.
         assert!(reg.cell_is_inert_fixed_point(Cell::pack(13, 0)));
     }
 
