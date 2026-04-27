@@ -578,10 +578,26 @@ impl World {
             y.0,
             z.0,
         );
-        self.hashlife_cache.clear();
-        self.hashlife_macro_cache.clear();
-        self.hashlife_inert_cache.clear();
-        self.hashlife_all_inert_cache.clear();
+        // hash-thing-wsq3: do NOT clear hashlife caches on cell edits.
+        // The four caches are keyed by NodeId (hash-thing-cons interned subtrees)
+        // plus, for the recursive cache, schedule_phase = generation %
+        // memo_period(). All four are pure functions of NodeId content +
+        // material registry, so cell edits leave existing entries
+        // semantically valid — `set_cell` produces a fresh root NodeId and
+        // any unchanged subtrees keep their interned ids. Material-registry
+        // mutation is the only thing that invalidates entries; that path
+        // goes through `mutate_materials` -> `invalidate_material_caches`.
+        // Fresh-store epoch boundaries (commit_step / seed_*) handle their
+        // own cache clears separately because they mint a new NodeId
+        // namespace.
+        //
+        // The pre-wsq3 unconditional clear here was inherited from
+        // 53f7414 (2026-04-12) when the cache key still included an
+        // `[origin]` component; it was correctness-paranoia overcorrection
+        // that no longer applies under the current `(NodeId, phase)` shape
+        // and was the dominant production-path slowdown — every entity-
+        // produced SetCell wiped the cache, forcing every step to pay
+        // cold-cache cost (~2-3s/gen at 512^3).
         self.root = self.store.set_cell(self.root, x.0, y.0, z.0, state);
         self.block_rule_present = None; // invalidate cache
     }
@@ -5164,54 +5180,90 @@ mod tests {
         );
     }
 
+    /// hash-thing-wsq3: cell edits must NOT invalidate hashlife cache entries.
+    /// Hash-consed NodeIds plus phase-derived keys make existing entries
+    /// semantically valid across edits — only material-registry mutation
+    /// (`mutate_materials` -> `invalidate_material_caches`) and fresh-store
+    /// epoch boundaries (`commit_step` at line 2378-2405, plus the seed_*
+    /// paths) require a clear. The pre-wsq3 unconditional clear in
+    /// `set_local` was correctness-paranoia leftover from 53f7414's
+    /// `(NodeId, [origin], parity)` cache shape and forced every entity-
+    /// driven SetCell in production to wipe the cache, paying cold-cache
+    /// cost on every step.
     #[test]
-    fn direct_set_clears_hashlife_caches() {
+    fn direct_set_preserves_hashlife_caches() {
         let mut world = World::new(3);
-        world
-            .hashlife_cache
-            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
-        world
-            .hashlife_macro_cache
-            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
-
-        world.set(wc(3), wc(3), wc(3), STONE);
-
+        // Seed a non-empty, non-uniform world so step_recursive actually
+        // descends through step_base_case and populates caches (an empty
+        // world short-circuits at the population==0 guard in step_node).
+        // WATER has a FluidBlockRule, so the leaf is not all-inert and
+        // step_node won't short-circuit before reaching step_base_case.
+        world.set(wc(2), wc(2), wc(2), WATER);
+        world.set(wc(3), wc(2), wc(2), WATER);
+        world.set(wc(4), wc(2), wc(2), WATER);
+        world.step_recursive();
+        let recursive_before = world.hashlife_cache.len();
+        let inert_before = world.hashlife_inert_cache.len();
+        let all_inert_before = world.hashlife_all_inert_cache.len();
         assert!(
-            world.hashlife_cache.is_empty(),
-            "direct edits must drop stale recursive cache entries"
+            recursive_before > 0,
+            "precondition: stepping a seeded small world should populate the recursive cache"
         );
-        assert!(
-            world.hashlife_macro_cache.is_empty(),
-            "direct edits must drop stale macro-step cache entries"
+
+        // Direct edit: should produce a new root NodeId but leave the
+        // pre-edit subtree NodeIds (and their cached step results) intact.
+        world.set(wc(5), wc(5), wc(5), STONE);
+
+        assert_eq!(
+            world.hashlife_cache.len(),
+            recursive_before,
+            "direct edits must preserve recursive cache entries — NodeIds are hash-consed"
+        );
+        assert_eq!(
+            world.hashlife_inert_cache.len(),
+            inert_before,
+            "direct edits must preserve inert-uniform cache entries"
+        );
+        assert_eq!(
+            world.hashlife_all_inert_cache.len(),
+            all_inert_before,
+            "direct edits must preserve all-inert cache entries"
         );
     }
 
+    /// hash-thing-wsq3: paired with `direct_set_preserves_hashlife_caches`.
+    /// Entity-driven mutations (the production hot path) flow through
+    /// `apply_mutations` -> `set` -> `set_local`, which must NOT clear caches.
     #[test]
-    fn apply_mutations_clears_hashlife_caches() {
+    fn apply_mutations_preserves_hashlife_caches() {
         use crate::sim::WorldMutation;
         let mut world = World::new(3);
-        world
-            .hashlife_cache
-            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
-        world
-            .hashlife_macro_cache
-            .insert((NodeId::EMPTY, 0), NodeId::EMPTY);
+        // See `direct_set_preserves_hashlife_caches` — empty worlds
+        // short-circuit before populating the cache.
+        // WATER has a FluidBlockRule, so the leaf is not all-inert and
+        // step_node won't short-circuit before reaching step_base_case.
+        world.set(wc(2), wc(2), wc(2), WATER);
+        world.set(wc(3), wc(2), wc(2), WATER);
+        world.set(wc(4), wc(2), wc(2), WATER);
+        world.step_recursive();
+        let recursive_before = world.hashlife_cache.len();
+        assert!(
+            recursive_before > 0,
+            "precondition: stepping a seeded small world should populate the recursive cache"
+        );
+
         world.queue.push(WorldMutation::SetCell {
-            x: wc(2),
-            y: wc(2),
-            z: wc(2),
+            x: wc(5),
+            y: wc(5),
+            z: wc(5),
             state: STONE,
         });
-
         world.apply_mutations();
 
-        assert!(
-            world.hashlife_cache.is_empty(),
-            "mutation flush must clear stale recursive cache entries"
-        );
-        assert!(
-            world.hashlife_macro_cache.is_empty(),
-            "mutation flush must clear stale macro-step cache entries"
+        assert_eq!(
+            world.hashlife_cache.len(),
+            recursive_before,
+            "mutation flush must preserve recursive cache entries"
         );
     }
 
