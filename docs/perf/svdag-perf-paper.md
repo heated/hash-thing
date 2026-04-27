@@ -745,6 +745,30 @@ Plausible bands at 4096³:
 - **CPU step cost: the binding concern.** Scales directly with active-region misses; macro-cache short-circuits are load-bearing. The bench harness SIGKILLed a single 4096³ hashlife step at the 60-second ignore-mode ceiling — step cost is already ≫ per-frame budget without further optimization. ivms doesn't re-measure step cost; `hash-thing-hashlife-stride` is the adjacent bead that would.
 - Streaming not needed at 4096³ (strong claim). 8192³ *probably* needs streaming, but that call is intuition.
 
+**4.7.5a LOD policy fly-through measurement (`hash-thing-cswp.8.5`, flint 2026-04-27).** First end-to-end measurement of the cswp.8.3 chunk-LOD policy at the 4096³ design target. Bench: `tests/bench_flythrough_4096.rs`, M2 16 GB, profile=bench, base commit `3ad2ada`. Each `lod_bias` runs against a *fresh* world (per-bias `World::new + seed_terrain`, ~6–11 s cold-gen each) so cross-bias `nodes_max` and `growth_max` columns are not contaminated by prior biases' scaffold; trident-review cleanup of the original shared-world run. 8 trajectory samples per bias, sweeping diagonally from chunk (0,0,0) to chunk (31,31,31). **n=1, no warm-up filter** — these are single-run snapshots, not stabilized benchmarks. `hist` index = LOD level (0 = full detail … 4 = max collapse). Run with `cargo test --profile bench --test bench_flythrough_4096 -- --ignored --nocapture` (~11 min wall on M2 16 GB; multiply by ~1.5 for M1-equivalent dt_ms).
+
+| `lod_bias` | dt_ms mean | dt_ms max | nodes_max | growth_max | hist[0..5] @ mid-traj |
+|---:|---:|---:|---:|---:|---|
+| 0.25 | 2,073 | 3,381 | 1,172,383 | 2.14× | [1/0/361/26,134/6,272] |
+| 0.50 | 6,160 | 10,010 | 1,049,565 | 1.91× | [1/26/3,679/29,062/0] |
+| 1.00 | 15,125 | 27,412 | 1,246,153 | 2.27× | [1/361/26,134/6,272/0] |
+| 2.00 | 55,379 | 110,067 | 1,167,061 | 2.13× | [27/3,679/29,062/0/0] |
+
+Three things this table establishes:
+
+- **The cswp.8.3.1 optimization is load-bearing, not a nice-to-have.** Per-frame `policy.update` cost at 4096³ is 2–55 s mean (3–110 s max) with the chained-recompute algorithm — two-to-three orders of magnitude above the 16.7 ms per-frame budget, and growing roughly linearly with bias as more chunks fall into low-collapse LOD bands and require more `lod_collapse_chunk` work each. The single-pass-recursive-descent rewrite (`hash-thing-cswp.8.3.1`) needs to land before the policy can be enabled by default at 4096³.
+- **`lod_bias` shifts the histogram, not the working-set size.** The hist column shows the design-doc curve directly: bias 0.25 puts most chunks in LODs 3–4, bias 2.0 puts most in LODs 1–2. But `nodes_max` is *roughly flat* across biases (1.05M–1.25M, 19% spread), not monotonic in bias. The knob's effect at this scale is on the *time* axis (compute cost: ~30× variation across the bias sweep), not the *memory* axis. Per `docs/perf/cswp-lod.md` §0 this is consistent with the doc's "no absolute byte savings claim at 4096³"; the original (contaminated) bench-shared-world reading suggested otherwise and was wrong.
+- **The 4× growth tripwire holds across the full bias sweep.** `growth_max` is 1.91×–2.27× across all four biases — comfortably under the cswp.8.3 warn-once threshold but tighter than the contaminated-shared-world reading suggested. Each ratio is now the genuine post-trajectory growth from a freshly-seeded baseline; bias=1.00 happens to produce the highest growth (most chunks at LODs 2–3 = most lod_collapse_chunk calls per frame, each interning one new representative-leaf NodeId).
+
+Two things this bench does **not** measure (deferred to follow-ups, not this bead):
+
+- **The bead's per-chunk reachable-node ceiling acceptance bar** (cswp.8.5 description: "per-chunk reachable-node count never exceeds the LOD band's analytical ceiling"). The bench reports global `growth_max`, not per-chunk node counts. Tighter per-chunk-ceiling assertions would need a `reachable_summary`-style sweep at every trajectory sample; deferred to cswp.8.5.1 if a tighter bound is ever needed.
+- **CA-driven macro-cache growth** — no `world.step()` in the trajectory, because a single warm 4096³ step exceeds the 60 s soft-max-command-seconds budget per §4.7.2a. `macro_cache_bytes_est()` reads 0 across the table for that reason. Sim-coupled measurement belongs with cswp.8.3.1's perf-rerun follow-up.
+
+LOD-4 reachability: at chunk_level=7 with a 32-chunk-per-axis world, max Chebyshev radius is 31. Band edges per `src/sim/chunks.rs` `target_lod_for_radius` put the LOD-4 boundary at raw radius {32, 64, 128} for biases {0.5, 1.0, 2.0} — all unreachable by construction. Bias 0.25 is included as a diagnostic so the bench output exercises the LOD-4 collapse path (band edge at raw radius 16, comfortably reachable). This is a curve-vs-world-size property of the design, not a bench limitation; it stops being true at chunk_level=8 in 4096³ or any chunk_level in 8192³+.
+
+Hysteresis disclosure: each bias starts with a fresh `ChunkLodPolicy` (no held LOD state), so frame 0 takes the raw `target_lod_for_radius` value and only frames 1–7 exercise the hysteresis branch. The numbers are "policy as it ships from cold start," not steady-state running cost.
+
 ---
 
 ## 5. Gap report
@@ -1187,6 +1211,191 @@ path, recursive→recursive boundary, Margolus block-rule wiring) are
 phase-4-scope, not architecture-scope. The §8.3 sketch as drawn is
 sound.
 
+### 8.8 Recursive→recursive transition at level 5 (bead `hash-thing-szqv`)
+
+Spike target: close the remaining structural unknown from §8.7. abwm.3
+proved a base-case → recursive transition across one queue.submit fence
+(D1 = base case → D2 = recursive). szqv proves a *recursive →
+recursive* transition across a *second* fence (D2 = L4 recursive → D3
+= L5 recursive that consumes D2's recursive output).
+
+**Scope** (per `tests/bench_gpu_level_dispatcher.rs` + abwm.3 carry-over,
+~2800 LOC after szqv lands):
+
+- Toy rule unchanged from abwm.3 (3D Life Bays-5766, B{5,6,7} / S{5,6}).
+- World root **level 5 (32³)**. Two recursive levels above the level-3
+  base case → exercises both fences.
+- Hashlife semantics: 27 L4 intermediates → cpu_level_4_step → 27 L3
+  results → 8 L4 sub-cubes → cpu_level_4_step → 8 L3 results → tile
+  into 16³ output. Net 4 generations on 32³ → 16³.
+- **Brute-force CPU oracle** added (`cpu_brute_force_l5_step`): naive
+  4-generation Bays-5766 stencil on 32³, no decomposition. Used as a
+  third-party tripwire — `cpu_level_5_step ≡ cpu_brute_force_l5_step`
+  on every fixture under default `cargo test`. Catches shared-algorithm
+  bugs in the 27/8 decomposition that GPU == CPU corpus checks alone
+  would miss (the abwm.3 review's "live-count tripwire is just
+  measure-then-pin" critique, addressed).
+- abwm.3's `cs_step_recursive_l4` kernel and §8.7 numbers stay untouched;
+  szqv adds two new kernels alongside.
+
+**Dispatcher shape** (3 dispatches, 2 cross-dispatch fences):
+
+- **D1**: existing `cs_base_case`. For N L5 worlds, dispatched on
+  `729 × N` L3 base cases (one per (world, L4-intermediate, sub-intermediate)).
+  CPU pre-extracts the 8³ sub-blocks; GPU writes 4³ inner results to a
+  flat storage buffer. No structural change vs abwm.3 — szqv just runs
+  the same kernel on 27× more invocations per world. (Bead body says
+  `27·N`; the corrected count is `27 × 27 × N`. Each L4-intermediate
+  needs 27 L3 base cases; pinning here so future readers don't
+  re-derive it.)
+- **Fence 1: queue.submit boundary.**
+- **D2**: NEW `cs_step_l4_recursive_wg` (`@workgroup_size(64)`). One
+  workgroup per (world, L4-intermediate) → `27 × N` workgroups. Each
+  thread computes 8 cells, one per L4-step phase-B base case, at
+  position `tid`. **No workgroup-shared scratch** — the 8³ phase-B
+  input is implicit (read directly from D1 output per stencil cell).
+  This is the substantive change vs abwm.3's `cs_step_recursive_l4`,
+  which used `var<private> scratch: array<u32, 512>` (2 KB per
+  thread × 64 threads = 128 KB per workgroup, the Gemini-IMPORTANT
+  occupancy concern from abwm.3's review). Direct-from-global reads
+  drop the scratch to zero.
+- **Fence 2: queue.submit boundary.**
+- **D3**: NEW `cs_step_l5_recursive` (`@workgroup_size(64)`). One
+  workgroup per L5 world → N workgroups. Serial outer loop over
+  the 8 L5 sub-cubes; per sub-cube runs phase A (27 L3 base cases →
+  workgroup-shared `phase_a_results: array<u32, 27 × 64>` = **6912 B**,
+  validated at runtime against `device.limits().max_compute_workgroup_storage_size` in `build_l5_pipelines`)
+  followed by phase B (8 L3 base cases → tile to global L5 output).
+  `workgroupBarrier()` sequence: **S0** at sub-cube boundary
+  (allows safe reuse of `phase_a_results` between sub-cubes — also
+  acts as the post-write barrier from the previous iter's phase B,
+  even though phase B writes to global memory disjoint from the
+  shared scratch); **S1** between phase A writes and phase B reads.
+  Phase A's input is the 16³ L5-sub-cube assembled implicitly from 8
+  D2 outputs (read directly from global storage per stencil cell; no
+  shared staging — the 13.5 KB cost would put workgroup memory near
+  the 16 KB default limit with insufficient headroom).
+
+**Correctness** (default `cargo test`, plus `--ignored` GPU corpus):
+
+- 4 default tests (CPU brute-force vs CPU recursive on 5 fixtures):
+  all pass. Bays-5766 collapses dense regions in 1 generation, so
+  `empty / full / single_live_center / boundary_touching` all give
+  0 live cells in the inner 16³ result. `random_seed_42` gives
+  909 live cells — pinned as defense-in-depth tripwire on top of the
+  brute-force structural check.
+- `gpu_level_5_matches_cpu_on_corpus` (`--ignored`): GPU == CPU
+  cell-by-cell on the same 5-fixture corpus. The 909-cell tripwire
+  for `random_seed_42` matches between brute-force, recursive CPU,
+  and GPU — three independent paths agree.
+
+**Throughput** (`gpu_level_5_throughput`, `--profile bench --ignored`,
+N=64 worlds, 10 timed iters with fresh buffers each iter; M2 MBA,
+Apple Silicon Metal, in-encoder timestamps per dlse.2.3 methodology;
+matches abwm.3 §8.7 methodology):
+
+| metric | median (per-column) | threads / workgroups |
+|---|---|---|
+| dispatch 1 (729·N L3 base case) | **0.076 ms** | 2 985 984 threads |
+| dispatch 2 (27·N L4-recursive-wg) | **0.085 ms** | 1 728 wgs × 64 threads |
+| dispatch 3 (N L5-recursive) | **0.076 ms** | 64 wgs × 64 threads |
+| wall total (incl. CPU inputs + buf alloc + readback) | 104.421 ms | — |
+
+Decomposition (medians; per code-review I1 + I2 — splits the prior
+"cpu_prep" timer into the actual CPU loop and the wgpu/Metal buffer
+allocation, and computes residual per-iter before medianizing):
+
+| component | median | per-iter range |
+|---|---|---|
+| cpu_inputs (extracting 27·27·N L3 sub-blocks) | 36.436 ms | 13.662 – 62.292 |
+| buf_alloc (wgpu/Metal create_buffer + mapped upload) | 36.416 ms | 18.338 – 81.351 |
+| readback (staging buffer + map_async + poll, 1 MB) | 28.198 ms | 20.945 – 69.371 |
+| residual (3 submits + GPU dispatches + encoder cost) | 1.741 ms | 0.361 – 30.281 |
+
+Per-iter d3 ranges 0.043–0.136 ms; d1 / d2 / d3 each independently
+below 0.15 ms median. The three GPU dispatches together account for
+~0.24 ms of the wall — at N=64 worlds the dispatcher chain is
+**GPU-bound by ~0.2 % of the wall**. Note that the prior shipped
+revision of this section reported `cpu_prep = 69 ms` because cpu
+work and buffer allocation were lumped together; the actual CPU
+loop is ~36 ms and the other ~36 ms is wgpu/Metal driver overhead.
+Buffer allocation is a per-iter spike-scale artifact (phase 4
+re-uses persistent buffers across ticks).
+
+**Verdict — recursive→recursive transition: GO.** Per the szqv plan
+A8 verdict criteria (per-column d3 ≤ 1 ms, d1/d2 within 2× of abwm.3
+baselines, total wall ≤ 10 ms):
+
+- d3 = 0.076 ms, **~2.1× under the planned ~0.16 ms budget** (8×
+  abwm.3's d2 = 0.020 ms baseline) and ~13× under the 1 ms ceiling.
+  The fused phase-A + phase-B inline at workgroup_size=64 with
+  6.75 KB shared scratch is comfortable, not stressed.
+- d1 = 0.076 ms — **improves on abwm.3's d1 baseline of 0.085 ms**
+  despite running 27× more invocations per world (729·N vs 27·N).
+- d2 = 0.085 ms is incomparable to abwm.3 d2 = 0.019 ms — abwm.3 d2
+  ran one thread per world (workgroup_size=1, 64 threads total);
+  szqv d2 runs 64 threads × 27 workgroups per world (110 592 threads
+  total). The workgroup_size=64 + zero-scratch fix recovers per-cell
+  parallelism with no per-thread private-memory pressure.
+- Cross-dispatch fence visibility for **recursive output**:
+  validated. D3 reads D2 recursive output across queue.submit and
+  produces results identical to a 4-generation single-CPU stencil
+  on 32³. The fence is independent of which kernel produced the
+  data — same guarantee as base→recursive.
+- Workgroup-shared scratch + `workgroupBarrier()` sequence (S0 + S1):
+  validated. No correctness regressions vs the brute-force oracle on
+  any fixture. The Gemini abwm.3 IMPORTANT (occupancy at workgroup
+  scratch level) is addressed: D2 has zero scratch (direct global
+  reads); D3 has 6.75 KB at the workgroup level (vs abwm.3's
+  2 KB-per-thread = 128 KB-per-workgroup with `var<private>`).
+
+**Verdict — wall-time at this spike scale: CAVEAT.** Wall total
+104 ms exceeds the 10 ms criterion; same shape as abwm.3's CAVEAT,
+larger by ~10× because L5 has ~8× the data of L4. Decomposition
+(per code-review I1, splitting the prior "cpu_prep" into the
+actual CPU loop vs wgpu/Metal driver overhead):
+
+- **36 ms cpu_inputs**: extracting 27 × 27 × N = 46 656 L3 sub-blocks
+  CPU-side per iter (~24 M u32 cells through plain Rust loops).
+  **Spike-scale artifact** — phase 4 derives intermediates GPU-side
+  from the existing octree, not by CPU re-extraction.
+- **36 ms buf_alloc**: wgpu/Metal `create_buffer_init` (input upload
+  via mapped-at-creation) + 3× `create_buffer` for the dispatch
+  output buffers. **Spike-scale artifact** — phase 4 keeps persistent
+  device-side buffers across ticks, paying alloc once at startup.
+  Note: this overhead was misattributed to "cpu_prep" in the original
+  shipped §8.8 (code-review I1); the corrected split shows buf_alloc
+  is roughly half of the 70 ms wall-time-pre-readback.
+- **28 ms readback**: 64 × 4096 = 256 K u32 cells through staging
+  buffer + `map_async` + `poll`. **Spike-scale artifact** — phase 4
+  feeds the next dispatch directly without CPU readback.
+- **1.7 ms residual** (per-iter median, **not** median-of-medians —
+  per code-review I2): three command-encoder + `queue.submit`
+  round-trips plus actual GPU dispatcher work (~0.24 ms). The
+  dispatcher itself is well under the criterion; most residual is
+  per-iter setup overhead.
+
+**Scope of validation:**
+
+- Validates: per-level breadth-first dispatch *across two fences*,
+  cross-dispatch visibility for *recursive* output (not just
+  base-case output), workgroup-shared scratch + barrier sequence
+  in WGSL, the 27/8 hashlife structural recursion across two levels,
+  GPU == CPU == brute-force on a fixed 5-fixture corpus.
+- Does NOT validate: hash-table memo in critical path (still
+  pre-allocated; phase-4 question), Margolus block-rule wiring
+  (toy rule still), real M1 hardware (numbers above are M2 MBA;
+  M1 expected within 1.5×), production-scale sub-cube counts (the
+  spike does 8 L5 sub-cubes per workgroup serially; phase 4 with
+  larger root levels would need fan-out via additional dispatches
+  if d3 latency stops scaling sub-linearly).
+
+**Recommendation:** PROCEED with phase 4 (real-sim integration of
+the dispatcher shape). Both fences in the §8.3 sketch are now
+validated. The remaining open phase-4 questions — hash-table memo
+in the critical path, Margolus block-rule, NodeId allocation at
+runtime — are orthogonal to dispatcher correctness.
+
 ---
 
 ## 9. Revision log
@@ -1217,3 +1426,4 @@ sound.
 | 2026-04-25 | cairn | §3.13 + §5 cold-gen baseline at 1024³/4096³ (bead `hash-thing-71t7`, parent `hash-thing-cswp`). New `tests/bench_cold_gen_big_map.rs` (3-run mean, bench profile). M2 16 GB measurements: **1024³ = 236.6 ms mean** (precompute 50.3 / gen_region 186.3), pop=510 M, 56k reachable nodes; **4096³ = 3,664.6 ms mean** (precompute 788.9 / gen_region 2,875.7), pop=32.6 G, 548k reachable nodes (§3.10.3 confirmation, 1×1×1 same numbers within run-to-run variance). 64× cell-count → 15.5× total time → sub-linear in cells; heightmap precompute scales precisely O(side²) (15.7× ≈ 16×). No OOM at either scale on 16 GB. Establishes the baseline against which gen-time hash-cons (cswp.3) will be measured; the prior "25 s single-thread cold-gen at 1024³" framing in cswp's description is already obsolete on the current codepath. |
 | 2026-04-25 | ember | New companion doc `docs/perf/cswp-lod.md` (bead `hash-thing-cswp.6`). Memory/streaming LOD *policy* for 4096³+ worlds — design only, no code, no re-derivation of perf-paper budgets. Distinguishes existing render LOD (already shipped, pixel-projected subtree skip per `svdag_raycast.wgsl:418-426`) from memory LOD (memory-resident granularity); proposes log₄ chunk-radius → LOD-level mapping; documents material-collapse policy options (status-quo "largest populated child" recommended as default per `svdag.rs:228-238`, fixed per-material priority flagged for edward as the second-place candidate); recommends hard-swap transitions over crossfade. The doc deliberately does **not** claim memory savings at 4096³ or revise §4.7.4's 8192³ streaming threshold — first attempt did, dual-reviewer pass (Claude + Codex, 2026-04-25) caught that the §5 derivation produced *more* reachable nodes under LOD than without, contradicting its own conclusion. §5 was rewritten as qualitative (shape, not magnitude); the impl sub-bead lands per-chunk measurements that turn the §5 hand-wave into real numbers. |
 | 2026-04-25 | spark | §8.7 GPU breadth-first dispatcher PoC + post-review tightening (bead `hash-thing-abwm.3`, code review fixes). Toy-rule (3D Life Bays-5766) hashlife dispatcher landed as `tests/bench_gpu_level_dispatcher.rs` (~1100 LOC). 27-intermediate / 8-subcube structure on a level-4 (16³) world, two GPU dispatches across separate `queue.submit` boundaries (cross-dispatch fence per the §8.6/abwm.2 comment), GPU == CPU cell-by-cell on a fixed 5-fixture corpus (empty / full / single-live / boundary-touching / random_seed_42 → 109 live cells in inner 8³). On M2 MBA at N=64 worlds: dispatch 1 (110 592 base-case threads) **0.085 ms median**, dispatch 2 (64 recursive threads) **0.019 ms median** — both well under the 1 ms per-dispatch criterion. Wall total 10.7 ms is dominated by spike-only CPU prep (~3-5 ms intermediate construction) and readback (~5-7 ms staging+map) — both disappear in real-sim integration. **Verdict: GO for the dispatcher mechanism**, CAVEAT on wall-time at this scale (decomposed: spike-scale artifact, not architecture). Hash-table memo deferred from the critical path here (NodeId pre-allocation + direct buffer indexing covers the same cross-dispatch-fence test); memo-in-critical-path validation is phase-4 scope. Recursive→recursive transition (level 5) and Margolus block-rule wiring are also phase-4. The §8.3 dispatcher sketch is sound. |
+| 2026-04-26 | spark | §8.8 GPU recursive→recursive transition at level 5 (bead `hash-thing-szqv`). Extends abwm.3 with three dispatches across two `queue.submit` fences. New `cs_step_l4_recursive_wg` (workgroup_size=64, no scratch — addresses Gemini's abwm.3 IMPORTANT on `var<private>` occupancy by direct-from-global stencil reads); new `cs_step_l5_recursive` (workgroup_size=64, 6.75 KB workgroup-shared `phase_a_results`, runtime-validated against `device.limits().max_compute_workgroup_storage_size`; barrier sequence S0/S1 between phase A and phase B). New `cpu_brute_force_l5_step` third-party oracle (naive 4-gen Bays-5766 stencil on 32³, no decomposition) catches shared-algorithm bugs the live-count tripwire alone can't. Three independent paths agree on `random_seed_42` → 909 live cells in inner 16³: brute-force CPU, recursive CPU, GPU dispatcher. On M2 MBA at N=64 worlds: d1 **0.076 ms**, d2 **0.085 ms**, d3 **0.076 ms** medians — d3 is ~13× under the 1 ms ceiling and ~2.1× under the planned 0.16 ms budget; d1 improves on abwm.3's 0.085 ms baseline despite 27× more invocations per world. **Verdict: GO for the recursive→recursive transition**, CAVEAT on wall-time (104 ms dominated by 36 ms cpu_inputs + 36 ms buf_alloc + 28 ms readback — same spike-scale artifact shape as §8.7, ~10× larger because L5 has ~8× the data of L4; ~0.24 ms is dispatcher GPU time, residual ~1.7 ms). Both fences in the §8.3 sketch are now validated. Phase-4 questions (hash-table memo in critical path, Margolus block-rule, NodeId allocation at runtime) are orthogonal to dispatcher correctness — the architecture under test is sound for level 5. Plan-review tier was dual (Claude proceed-with-adjustments; Codex hung pc95) — adjustments incorporated: D3 workgroup-size locked, barrier sequence pinned, runtime budget validation, brute-force oracle added. Code-review tier was triple (Claude LGTM-WITH-FIXES, Gemini LGTM; Codex hung pc95 — fix-pass commit addressed I1 cpu_prep timer scope split, I2 per-iter residual decomposition, I3 verdict-line split). |

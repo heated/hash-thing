@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -111,6 +111,45 @@ pub struct RendererCpuPhaseTimes {
     pub surface_acquire: Duration,
     pub submit: Duration,
     pub present: Duration,
+    /// hash-thing-dbz5.1: full pipeline length of the prior frame's GPU
+    /// work, measured from `queue.submit()` returning to the
+    /// `on_submitted_work_done` callback firing. `None` on the first
+    /// frame (no prior submission), or when the prior callback hasn't
+    /// fired yet by the time this frame finishes acquire (we don't
+    /// retroactively patch past samples).
+    pub prior_gpu_pipeline: Option<Duration>,
+    /// hash-thing-dbz5.1: was the prior frame's GPU submission still in
+    /// flight (callback not yet fired) at the moment this frame's
+    /// `surface.get_current_texture()` was called? Disambiguates "acquire
+    /// blocked on prior frame" (true) from "acquire blocked on something
+    /// else, e.g. swapchain pacing or compositor" (false). On the first
+    /// frame this is false (no prior submission to wait on).
+    pub prior_gpu_in_flight_at_acquire: bool,
+}
+
+/// hash-thing-dbz5.1: shared state for tracking the prior frame's GPU
+/// submission fence. The render thread bumps `submit_seq` after each
+/// `queue.submit()`; the wgpu polling thread updates `done_seq` and
+/// `last_pipeline` from the `on_submitted_work_done` callback. Sequence
+/// numbers disambiguate "submission in flight" (`done_seq <
+/// submit_seq`) from "submission complete" (`done_seq == submit_seq`).
+/// The callback computes the pipeline duration from a captured
+/// `Instant` so we never have to align stale `submit_at` / `done_at`
+/// pairs across frames.
+#[derive(Default)]
+struct SubmitFenceState {
+    /// Sequence number of the most recent `queue.submit()` call. Starts
+    /// at 0 (never submitted); incremented before each new submit.
+    submit_seq: u64,
+    /// Sequence number of the most recent `on_submitted_work_done`
+    /// callback that fired. `done_seq < submit_seq` means a submission
+    /// is currently in flight on the GPU.
+    done_seq: u64,
+    /// Pipeline duration of the most recently completed submission:
+    /// elapsed time from `queue.submit()` returning to the matching
+    /// `on_submitted_work_done` callback firing. Computed inside the
+    /// callback so it doesn't suffer cross-submit aliasing.
+    last_pipeline: Option<Duration>,
 }
 
 /// GPU-side render pass timing via `wgpu::Features::TIMESTAMP_QUERY`.
@@ -478,6 +517,12 @@ pub struct Renderer {
     /// submit/encode path (persists). Env-var gated at startup; zero-cost
     /// in normal runs.
     off_surface_target: Option<wgpu::Texture>,
+    /// hash-thing-dbz5.1: shared state for tracking when the prior
+    /// frame's GPU work completes. Read at the top of `render()` to
+    /// answer "is the prior submission still in flight?"; updated after
+    /// each `queue.submit()` and from the wgpu polling thread when the
+    /// `on_submitted_work_done` callback fires.
+    submit_fence: Arc<Mutex<SubmitFenceState>>,
     start_time: Instant,
 }
 
@@ -1479,6 +1524,7 @@ impl Renderer {
             last_render_pass_gpu_frame_time: None,
             last_cpu_phase_times: None,
             off_surface_target: None,
+            submit_fence: Arc::new(Mutex::new(SubmitFenceState::default())),
             start_time: Instant::now(),
         }
     }
@@ -2049,6 +2095,20 @@ impl Renderer {
         // `self.off_surface_target` is `Some`, bypass the surface entirely
         // and draw into the throwaway texture. `surface_acquire` records
         // ~0 in that mode.
+        //
+        // hash-thing-dbz5.1: snapshot the prior-frame fence state BEFORE
+        // entering acquire. The acquire call itself may pump wgpu's
+        // poll loop and let the prior submission's callback fire
+        // mid-acquire, so taking the snapshot here pins "in flight at
+        // acquire start" semantics independent of when the callback
+        // ultimately lands. The pipeline duration we report is the
+        // most-recently-completed submission's pipeline at the moment
+        // we entered acquire — typically the prior frame.
+        let (prior_in_flight_at_acquire, prior_gpu_pipeline) = {
+            let s = self.submit_fence.lock().unwrap();
+            let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+            (in_flight, s.last_pipeline)
+        };
         let acquire_start = Instant::now();
         let (surface_texture, view) = if let Some(off) = self.off_surface_target.as_ref() {
             let view = off.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2390,15 +2450,49 @@ impl Renderer {
         let submit_start = Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
         let submit = submit_start.elapsed();
+
+        // hash-thing-dbz5.1: bump the submit sequence and register an
+        // `on_submitted_work_done` callback so the next frame can tell
+        // whether `surface_acquire` is "blocked on prior GPU" (callback
+        // hasn't fired yet at acquire time) vs "blocked on something
+        // else" (callback fired well before acquire). The callback
+        // captures `submit_at` by move and computes the pipeline
+        // duration itself, so cross-submit aliasing is impossible. It
+        // runs from wgpu's polling thread; the Mutex makes the
+        // cross-thread update safe. The `done_seq < this_seq` guard
+        // defends against out-of-order callbacks (shouldn't happen in
+        // practice, but cheap).
+        let submit_at = Instant::now();
+        let this_seq = {
+            let mut s = self.submit_fence.lock().unwrap();
+            s.submit_seq += 1;
+            s.submit_seq
+        };
+        {
+            let arc = Arc::clone(&self.submit_fence);
+            self.queue.on_submitted_work_done(move || {
+                let pipeline = submit_at.elapsed();
+                if let Ok(mut s) = arc.lock() {
+                    if s.done_seq < this_seq {
+                        s.done_seq = this_seq;
+                        s.last_pipeline = Some(pipeline);
+                    }
+                }
+            });
+        }
+
         let present_start = Instant::now();
         if let Some(st) = surface_texture {
             st.present();
         }
         let present = present_start.elapsed();
+
         self.last_cpu_phase_times = Some(RendererCpuPhaseTimes {
             surface_acquire,
             submit,
             present,
+            prior_gpu_pipeline,
+            prior_gpu_in_flight_at_acquire: prior_in_flight_at_acquire,
         });
 
         if captured_compute_this_frame {
@@ -2421,7 +2515,9 @@ mod tests {
     use super::{
         auto_render_scale, parse_present_mode, resolved_render_scale, target_pixels_for_volume,
         ticks_to_duration, FrameOutcome, GpuTiming, RenderScaleSource, RendererLifecycleSnapshot,
+        SubmitFenceState,
     };
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     // --- hash-thing-zytn: render-scale auto-picker ---
@@ -2939,5 +3035,104 @@ mod tests {
         assert!(compute.is_idle(), "compute must return to IDLE after take");
         assert!(render.is_idle(), "render still untouched");
         assert!(render.take_resolved().is_none());
+    }
+
+    // --- hash-thing-dbz5.1: SubmitFenceState semantics ---
+    //
+    // The state machine is small but the semantics are subtle: we have
+    // to distinguish "no submission yet" (frame 0) from "submission
+    // in flight" from "submission complete", and the callback may fire
+    // after the next submit has already incremented `submit_seq`. These
+    // tests pin the predicate the renderer reads at acquire time.
+
+    #[test]
+    fn submit_fence_initial_state_reports_no_inflight() {
+        // First-ever frame: no submit has happened, so there is no
+        // prior submission to wait on. The renderer must NOT report
+        // "in flight" in this case (would mis-attribute the first
+        // frame's surface_acquire to a phantom prior frame).
+        let s = SubmitFenceState::default();
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(!in_flight, "first-frame fence must not report in-flight");
+        assert!(s.last_pipeline.is_none());
+    }
+
+    #[test]
+    fn submit_fence_in_flight_after_submit_before_callback() {
+        let mut s = SubmitFenceState::default();
+        s.submit_seq = 1; // simulate one submit having happened
+        // Callback hasn't fired yet → done_seq still 0.
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(in_flight, "submit registered but no callback yet");
+        assert!(s.last_pipeline.is_none(), "no completed pipeline yet");
+    }
+
+    #[test]
+    fn submit_fence_not_in_flight_after_callback() {
+        let mut s = SubmitFenceState::default();
+        s.submit_seq = 1;
+        s.done_seq = 1;
+        s.last_pipeline = Some(Duration::from_millis(5));
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(
+            !in_flight,
+            "callback fired and matches submit_seq → not in flight"
+        );
+        assert_eq!(s.last_pipeline, Some(Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn submit_fence_callback_only_advances_done_seq() {
+        // Out-of-order callback (older seq fires after newer one
+        // already updated done_seq) must not roll done_seq backward.
+        // The guard `if s.done_seq < this_seq` prevents this in the
+        // real callback; this test mirrors that contract on the state
+        // struct directly.
+        let mut s = SubmitFenceState::default();
+        s.submit_seq = 5;
+        s.done_seq = 4;
+        s.last_pipeline = Some(Duration::from_millis(3));
+
+        // A stale callback for seq=3 arrives. Apply guard manually.
+        let stale_seq = 3u64;
+        let guarded_apply = s.done_seq < stale_seq;
+        if guarded_apply {
+            s.done_seq = stale_seq;
+            s.last_pipeline = Some(Duration::from_millis(99));
+        }
+        assert!(!guarded_apply);
+        assert_eq!(s.done_seq, 4, "stale callback must not roll seq back");
+        assert_eq!(
+            s.last_pipeline,
+            Some(Duration::from_millis(3)),
+            "stale callback must not overwrite pipeline"
+        );
+    }
+
+    #[test]
+    fn submit_fence_callback_runs_from_other_thread() {
+        // Sanity: the Arc<Mutex<...>> is the actual cross-thread channel
+        // the renderer uses (callback fires from wgpu's polling thread).
+        // Spawn a thread, have it touch the state under lock, join,
+        // confirm the render-thread side observes the update.
+        let arc = Arc::new(Mutex::new(SubmitFenceState::default()));
+        {
+            let mut s = arc.lock().unwrap();
+            s.submit_seq = 7;
+        }
+        let arc_cb = Arc::clone(&arc);
+        let handle = std::thread::spawn(move || {
+            let mut s = arc_cb.lock().unwrap();
+            // Simulate `on_submitted_work_done` for seq 7.
+            if s.done_seq < 7 {
+                s.done_seq = 7;
+                s.last_pipeline = Some(Duration::from_micros(420));
+            }
+        });
+        handle.join().unwrap();
+        let s = arc.lock().unwrap();
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(!in_flight);
+        assert_eq!(s.last_pipeline, Some(Duration::from_micros(420)));
     }
 }

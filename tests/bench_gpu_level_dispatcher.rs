@@ -1526,3 +1526,1415 @@ fn gpu_level_4_throughput() {
         );
     }
 }
+
+// ===========================================================================
+// L5 spike (hash-thing-szqv): recursive→recursive transition at level 5.
+//
+// abwm.3 proved base-case → recursive across one queue.submit fence. szqv
+// closes the remaining structural unknown: a recursive→recursive transition
+// where dispatch N+1 reads dispatch N's *recursive* output (not just base
+// case output).
+//
+// Scope (matches `.ship-notes/plan-spark-hash-thing-szqv-gpu-l5.md`):
+// - Toy rule unchanged (Bays-5766).
+// - World root level 5 (32³). Two recursive levels above the level-3 base.
+// - Three GPU dispatches across two cross-dispatch fences.
+// - var<private> scratch from abwm.3 migrated to var<workgroup> in the new
+//   kernels (Gemini IMPORTANT on abwm.3); abwm.3's `cs_step_recursive_l4`
+//   stays unchanged so its §8.7 numbers remain reproducible.
+// - Brute-force 4-generation Bays-5766 CPU oracle (`cpu_brute_force_l5_step`)
+//   added as a third-party tripwire that does not share code with
+//   `cpu_level_5_step` — catches shared-algorithm bugs in the 27/8
+//   decomposition itself.
+//
+// Hashlife semantics for L5 (`cpu_level_5_step`):
+// - 27 L4 intermediates from 32³ input (each 16³, tiled at offset (i*8, j*8, k*8)).
+// - Step each via `cpu_level_4_step` → 27 L3 (8³) intermediate results.
+// - 8 L4 sub-cubes assembled from 27 intermediate results (each sub-cube
+//   16³, octants tiled from (si+ox, sj+oy, sk+oz)).
+// - Step each via `cpu_level_4_step` → 8 L3 (8³) sub-cube results.
+// - Tile 8 results into 16³ output at sub-cube offsets (si*8, sj*8, sk*8).
+// Net effect: 4 generations on 32³ → 16³ output (lose 8 cells per side).
+// ===========================================================================
+
+const L5_SIDE: usize = 32;
+const L5_CELLS: usize = L5_SIDE * L5_SIDE * L5_SIDE;
+
+fn build_l4_intermediate_from_l5(
+    input: &[u32; L5_CELLS],
+    i: usize,
+    j: usize,
+    k: usize,
+) -> [u32; L4_CELLS] {
+    // L4 intermediate (i, j, k) tiles a 16³ slab of the 32³ L5 input at
+    // offset (i*8, j*8, k*8). Linearization within the L4 block: x fastest.
+    let mut block = [0u32; L4_CELLS];
+    for bz in 0..L4_SIDE {
+        for by in 0..L4_SIDE {
+            for bx in 0..L4_SIDE {
+                let gx = i * 8 + bx;
+                let gy = j * 8 + by;
+                let gz = k * 8 + bz;
+                block[bz * L4_SIDE * L4_SIDE + by * L4_SIDE + bx] =
+                    input[gz * L5_SIDE * L5_SIDE + gy * L5_SIDE + gx];
+            }
+        }
+    }
+    block
+}
+
+fn build_l4_subcube_from_l3_results(
+    intermediate_results: &[[u32; L3_CELLS]; NUM_INTERMEDIATES],
+    si: usize,
+    sj: usize,
+    sk: usize,
+) -> [u32; L4_CELLS] {
+    // L4 sub-cube (si, sj, sk) tiles 8 of the 27 intermediate L3 (8³) results
+    // into a 16³ block. Octant (cx, cy, cz) ∈ {0,1}³ takes intermediate
+    // (si+cx, sj+cy, sk+cz) at sub-cube positions [cx*8, cx*8+8) × etc.
+    let mut block = [0u32; L4_CELLS];
+    for cz in 0..2 {
+        for cy in 0..2 {
+            for cx in 0..2 {
+                let im_idx = (sk + cz) * 9 + (sj + cy) * 3 + (si + cx);
+                let im = &intermediate_results[im_idx];
+                for fz in 0..L3_SIDE {
+                    for fy in 0..L3_SIDE {
+                        for fx in 0..L3_SIDE {
+                            let bx = cx * L3_SIDE + fx;
+                            let by = cy * L3_SIDE + fy;
+                            let bz = cz * L3_SIDE + fz;
+                            block[bz * L4_SIDE * L4_SIDE + by * L4_SIDE + bx] =
+                                im[fz * L3_SIDE * L3_SIDE + fy * L3_SIDE + fx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    block
+}
+
+// CPU L5 step (the structural oracle the GPU dispatcher matches against).
+//
+// **Oracle independence note (per plan A4):** this function shares the
+// 27/8 decomposition with the GPU kernels. A bug in that shared algorithm
+// would pass GPU == CPU on corpus checks. The third-party tripwire is
+// `cpu_brute_force_l5_step` below, which uses naive 4-generation stencil
+// without any decomposition. They must agree on every fixture.
+fn cpu_level_5_step(input: &[u32; L5_CELLS]) -> [u32; L4_CELLS] {
+    // Phase 1: 27 L4 intermediates, each stepped via cpu_level_4_step.
+    let mut l4_intermediate_results = [[0u32; L3_CELLS]; NUM_INTERMEDIATES];
+    for k in 0..3 {
+        for j in 0..3 {
+            for i in 0..3 {
+                let l4_int = build_l4_intermediate_from_l5(input, i, j, k);
+                l4_intermediate_results[k * 9 + j * 3 + i] = cpu_level_4_step(&l4_int);
+            }
+        }
+    }
+    // Phase 2: 8 L4 sub-cubes, each stepped via cpu_level_4_step, tiled
+    // into the 16³ L4 output at sub-cube offsets (si*8, sj*8, sk*8).
+    let mut output = [0u32; L4_CELLS];
+    for sk in 0..2 {
+        for sj in 0..2 {
+            for si in 0..2 {
+                let sub_block = build_l4_subcube_from_l3_results(
+                    &l4_intermediate_results,
+                    si,
+                    sj,
+                    sk,
+                );
+                let sub_result = cpu_level_4_step(&sub_block);
+                for fz in 0..L3_SIDE {
+                    for fy in 0..L3_SIDE {
+                        for fx in 0..L3_SIDE {
+                            let ox = si * L3_SIDE + fx;
+                            let oy = sj * L3_SIDE + fy;
+                            let oz = sk * L3_SIDE + fz;
+                            output[oz * L4_SIDE * L4_SIDE + oy * L4_SIDE + ox] =
+                                sub_result[fz * L3_SIDE * L3_SIDE + fy * L3_SIDE + fx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
+// Brute-force CPU oracle: naive 4-generation Bays-5766 stencil on 32³,
+// zero-padded boundary, double-buffered. NO recursive decomposition. The
+// inner [8, 24)³ region after 4 generations equals what `cpu_level_5_step`
+// produces by mathematical definition (the 27/8 decomposition is just a
+// reordering of stencil applications that preserves locality).
+//
+// This is the third-party tripwire from plan A4. If it disagrees with
+// `cpu_level_5_step` on any fixture, there's a bug in the decomposition
+// (or in this brute-force) that the live-count tripwire alone can't
+// distinguish.
+//
+// Cost: 32³ × 27 stencil reads × 4 generations ≈ 3.5M ops. Milliseconds
+// on CPU; safe to run in default `cargo test` (not behind `--ignored`).
+fn cpu_brute_force_l5_step(input: &[u32; L5_CELLS]) -> [u32; L4_CELLS] {
+    let mut current: Vec<u32> = input.to_vec();
+    let mut next: Vec<u32> = vec![0u32; L5_CELLS];
+    for _gen in 0..4 {
+        for cz in 0..L5_SIDE {
+            for cy in 0..L5_SIDE {
+                for cx in 0..L5_SIDE {
+                    let cur = current[cz * L5_SIDE * L5_SIDE + cy * L5_SIDE + cx];
+                    let mut alive: u32 = 0;
+                    for dz in -1i32..=1 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                if dx == 0 && dy == 0 && dz == 0 {
+                                    continue;
+                                }
+                                let nx = cx as i32 + dx;
+                                let ny = cy as i32 + dy;
+                                let nz = cz as i32 + dz;
+                                if nx < 0
+                                    || ny < 0
+                                    || nz < 0
+                                    || nx >= L5_SIDE as i32
+                                    || ny >= L5_SIDE as i32
+                                    || nz >= L5_SIDE as i32
+                                {
+                                    continue;
+                                }
+                                alive += current[(nz as usize) * L5_SIDE * L5_SIDE
+                                    + (ny as usize) * L5_SIDE
+                                    + nx as usize];
+                            }
+                        }
+                    }
+                    next[cz * L5_SIDE * L5_SIDE + cy * L5_SIDE + cx] = bays_step_cell(cur, alive);
+                }
+            }
+        }
+        std::mem::swap(&mut current, &mut next);
+    }
+    // Extract inner [8, 24)³ as the 16³ L4-equivalent output.
+    let mut output = [0u32; L4_CELLS];
+    for oz in 0..L4_SIDE {
+        for oy in 0..L4_SIDE {
+            for ox in 0..L4_SIDE {
+                output[oz * L4_SIDE * L4_SIDE + oy * L4_SIDE + ox] = current
+                    [(oz + 8) * L5_SIDE * L5_SIDE + (oy + 8) * L5_SIDE + (ox + 8)];
+            }
+        }
+    }
+    output
+}
+
+// ---------------------------------------------------------------------------
+// L5 fixtures.
+// ---------------------------------------------------------------------------
+
+fn fixture_l5_empty() -> Box<[u32; L5_CELLS]> {
+    Box::new([0u32; L5_CELLS])
+}
+
+fn fixture_l5_full() -> Box<[u32; L5_CELLS]> {
+    Box::new([1u32; L5_CELLS])
+}
+
+fn fixture_l5_single_live_center() -> Box<[u32; L5_CELLS]> {
+    let mut g = Box::new([0u32; L5_CELLS]);
+    let i = 16 * L5_SIDE * L5_SIDE + 16 * L5_SIDE + 16;
+    g[i] = 1;
+    g
+}
+
+/// 5×5×5 live block at corner (0,0,0). Tests boundary handling: cells near
+/// (0,0,0) are zero-padded outside the L5 input, and the 27/8 decomposition
+/// must agree with the brute-force oracle on how that propagates over 4
+/// generations.
+fn fixture_l5_boundary_touching() -> Box<[u32; L5_CELLS]> {
+    let mut g = Box::new([0u32; L5_CELLS]);
+    for z in 0..5 {
+        for y in 0..5 {
+            for x in 0..5 {
+                g[z * L5_SIDE * L5_SIDE + y * L5_SIDE + x] = 1;
+            }
+        }
+    }
+    g
+}
+
+fn fixture_l5_seeded_random(seed: u64, density: f32) -> Box<[u32; L5_CELLS]> {
+    let mut state: u64 = seed;
+    let mut g = Box::new([0u32; L5_CELLS]);
+    for cell in g.iter_mut() {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let r = (z as f64) / (u64::MAX as f64);
+        *cell = if (r as f32) < density { 1 } else { 0 };
+    }
+    g
+}
+
+fn level_5_corpus() -> Vec<(&'static str, Box<[u32; L5_CELLS]>)> {
+    vec![
+        ("empty", fixture_l5_empty()),
+        ("full", fixture_l5_full()),
+        ("single_live_center", fixture_l5_single_live_center()),
+        ("boundary_touching", fixture_l5_boundary_touching()),
+        ("random_seed_42", fixture_l5_seeded_random(42, 0.30)),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// L5 default tests (no GPU): exercise the structural CPU oracle and the
+// brute-force tripwire. These run under `cargo test` without --ignored.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cpu_level_5_empty_stays_empty() {
+    let inp = fixture_l5_empty();
+    let out = cpu_level_5_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "empty L5 → empty L4");
+}
+
+#[test]
+fn cpu_level_5_full_dies() {
+    // Bays-5766 collapses dense regions: gen-1 has 26 alive neighbors
+    // everywhere in the interior → dies (S = {5,6}). All subsequent gens
+    // see no alive neighbors → no births. Final inner 16³ = all zeros.
+    let inp = fixture_l5_full();
+    let out = cpu_level_5_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "full L5 → empty L4");
+}
+
+#[test]
+fn cpu_level_5_single_live_dies() {
+    // Single live cell with 0 neighbors → dies (S excludes 0). All
+    // surrounding dead cells have ≤ 1 alive neighbor → no birth.
+    let inp = fixture_l5_single_live_center();
+    let out = cpu_level_5_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "single-live L5 → empty L4");
+}
+
+// ---------------------------------------------------------------------------
+// L5 GPU dispatcher (commit 2): three dispatches across two cross-dispatch
+// fences. See plan §"Dispatch structure" in
+// `.ship-notes/plan-spark-hash-thing-szqv-gpu-l5.md`.
+//
+// D1: existing `cs_base_case` kernel, dispatched on 729·N L3 base cases
+//     (one per (world, L4-intermediate, sub-intermediate, cell)).
+// D2: NEW `cs_step_l4_recursive_wg` (workgroup_size=64). One workgroup per
+//     (world, L4-intermediate). No scratch; reads D1 output directly per
+//     stencil. Replaces abwm.3's `var<private> scratch: array<u32, 512>`
+//     with zero-scratch direct-global-reads — addresses Gemini's abwm.3
+//     IMPORTANT (occupancy) without needing workgroup-shared staging at
+//     this dispatch.
+// D3: NEW `cs_step_l5_recursive` (workgroup_size=64). One workgroup per L5
+//     world. Serial outer loop over 8 L5 sub-cubes; per sub-cube runs phase A
+//     (27 base cases → workgroup-shared `phase_a_results: array<u32, 27*64>`
+//     = 6912 B, fits within 16 KB default workgroup-storage limit) followed
+//     by phase B (8 base cases → tile to global L5 output). `workgroupBarrier()`
+//     sequence per plan A2: at sub-cube boundary (S0), and between phase A
+//     and phase B (S1).
+// ---------------------------------------------------------------------------
+
+const SHADER_L4_RECURSIVE_WG: &str = r#"
+struct L4Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> l4_params: L4Params;
+// D1 output: indexed [world * 27 * 27 * 64 + l4_int * 27 * 64 + sub_int * 64 + cell]
+@group(0) @binding(1) var<storage, read> intermediate_l3_results: array<u32>;
+// D2 output: indexed [world * 27 * 512 + l4_int * 512 + cell]
+@group(0) @binding(2) var<storage, read_write> l4_intermediate_results: array<u32>;
+
+const BAYS_BIRTH_MASK: u32 = 0xE0u;   // bits 5,6,7
+const BAYS_SURVIVE_MASK: u32 = 0x60u; // bits 5,6
+
+// Read the 8³ L4 sub-cube cell at (x, y, z) where x,y,z ∈ [0, 8). The 8³
+// is implicitly assembled from 8 of 27 D1 outputs (each 4³). Octant within
+// 8³ sub-cube: (x>>2, y>>2, z>>2). Phase-A index = (sk+oz)*9 + (sj+oy)*3 + (si+ox).
+// Within-phase-A cell (4³): (x & 3, y & 3, z & 3).
+fn read_l4_subcube(world: u32, l4_int: u32, si: u32, sj: u32, sk: u32,
+                   x: u32, y: u32, z: u32) -> u32 {
+    let ox = x >> 2u;
+    let oy = y >> 2u;
+    let oz = z >> 2u;
+    let sub_int = (sk + oz) * 9u + (sj + oy) * 3u + (si + ox);
+    let cx = x & 3u;
+    let cy = y & 3u;
+    let cz = z & 3u;
+    let off = world * 27u * 27u * 64u
+            + l4_int * 27u * 64u
+            + sub_int * 64u
+            + cz * 16u + cy * 4u + cx;
+    return intermediate_l3_results[off];
+}
+
+@compute @workgroup_size(64)
+fn cs_step_l4_recursive_wg(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let world = wid.x / 27u;
+    let l4_int = wid.x % 27u;
+    if (world >= l4_params.num_worlds) { return; }
+    let tid = lid.x;
+
+    // Phase 2 of cpu_level_4_step: 8 sub-cubes × 64 output cells = 512 work
+    // units. Each thread handles 8 cells, one per sub-cube, at position tid.
+    let cell_idx = tid;
+    let cx = cell_idx & 3u;
+    let cy = (cell_idx >> 2u) & 3u;
+    let cz = cell_idx >> 4u;
+    for (var sub: u32 = 0u; sub < 8u; sub = sub + 1u) {
+        let si = sub & 1u;
+        let sj = (sub >> 1u) & 1u;
+        let sk = sub >> 2u;
+        // Output cell (cx, cy, cz) ∈ [0, 4)³ within phase-B base-case 4³ output.
+        // Input center at (cx+2, cy+2, cz+2) of the 8³ phase-B input.
+        let ix = cx + 2u;
+        let iy = cy + 2u;
+        let iz = cz + 2u;
+        let cur = read_l4_subcube(world, l4_int, si, sj, sk, ix, iy, iz);
+        var alive: u32 = 0u;
+        for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+            for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                    if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                    let nx = u32(i32(ix) + dx);
+                    let ny = u32(i32(iy) + dy);
+                    let nz = u32(i32(iz) + dz);
+                    alive = alive + read_l4_subcube(world, l4_int, si, sj, sk, nx, ny, nz);
+                }
+            }
+        }
+        var next: u32 = 0u;
+        if (cur == 1u) {
+            next = (BAYS_SURVIVE_MASK >> alive) & 1u;
+        } else {
+            next = (BAYS_BIRTH_MASK >> alive) & 1u;
+        }
+        // Tile output cell into 8³ L4-step output: position (si*4+cx, sj*4+cy, sk*4+cz).
+        let out_x = si * 4u + cx;
+        let out_y = sj * 4u + cy;
+        let out_z = sk * 4u + cz;
+        let out_off = world * 27u * 512u
+                    + l4_int * 512u
+                    + out_z * 64u + out_y * 8u + out_x;
+        l4_intermediate_results[out_off] = next;
+    }
+}
+"#;
+
+const SHADER_L5_RECURSIVE: &str = r#"
+struct L5Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> l5_params: L5Params;
+// D2 output: indexed [world * 27 * 512 + l4_int * 512 + cell]
+@group(0) @binding(1) var<storage, read> l4_intermediate_results: array<u32>;
+// D3 output: indexed [world * 4096 + cell] where cell is 16³ linear (x fastest)
+@group(0) @binding(2) var<storage, read_write> l5_final_outputs: array<u32>;
+
+const BAYS_BIRTH_MASK: u32 = 0xE0u;
+const BAYS_SURVIVE_MASK: u32 = 0x60u;
+
+// Workgroup-shared phase-A results: 27 L2 (4³ = 64 cell) results per current
+// outer L5 sub-cube. 27 × 64 × 4 B = 6912 B. Below the 16 KB default workgroup
+// storage limit; runtime-validated in GpuCtx::new() via device.limits().
+var<workgroup> phase_a_results: array<u32, 1728>;  // 27 * 64
+
+// Read the 16³ L5-sub-cube cell at (x, y, z) where x,y,z ∈ [0, 16). The 16³
+// is implicitly assembled from 8 of 27 L4 intermediate results (each 8³).
+// Octant within 16³: (x>>3, y>>3, z>>3). L4-intermediate index =
+// (sk+oz)*9 + (sj+oy)*3 + (si+ox). Within-intermediate cell (8³):
+// (x & 7, y & 7, z & 7).
+fn read_l5_subcube(world: u32, si: u32, sj: u32, sk: u32,
+                   x: u32, y: u32, z: u32) -> u32 {
+    let ox = x >> 3u;
+    let oy = y >> 3u;
+    let oz = z >> 3u;
+    let im_idx = (sk + oz) * 9u + (sj + oy) * 3u + (si + ox);
+    let cx = x & 7u;
+    let cy = y & 7u;
+    let cz = z & 7u;
+    let off = world * 27u * 512u + im_idx * 512u + cz * 64u + cy * 8u + cx;
+    return l4_intermediate_results[off];
+}
+
+// Read the 8³ phase-B input cell at (x, y, z) where x,y,z ∈ [0, 8). The 8³
+// is implicitly assembled from 8 of 27 phase_a_results (each 4³).
+fn read_phase_a(psi: u32, psj: u32, psk: u32, x: u32, y: u32, z: u32) -> u32 {
+    let ox = x >> 2u;
+    let oy = y >> 2u;
+    let oz = z >> 2u;
+    let pa_idx = (psk + oz) * 9u + (psj + oy) * 3u + (psi + ox);
+    let cx = x & 3u;
+    let cy = y & 3u;
+    let cz = z & 3u;
+    return phase_a_results[pa_idx * 64u + cz * 16u + cy * 4u + cx];
+}
+
+@compute @workgroup_size(64)
+fn cs_step_l5_recursive(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let world = wid.x;
+    if (world >= l5_params.num_worlds) { return; }
+    let tid = lid.x;
+
+    // Per-thread base-case-output cell index (4³ linear, x fastest).
+    let cx = tid & 3u;
+    let cy = (tid >> 2u) & 3u;
+    let cz = tid >> 4u;
+
+    // Outer loop: 8 L5 sub-cubes serial. phase_a_results is reused.
+    for (var L5_sub: u32 = 0u; L5_sub < 8u; L5_sub = L5_sub + 1u) {
+        let si = L5_sub & 1u;
+        let sj = (L5_sub >> 1u) & 1u;
+        let sk = L5_sub >> 2u;
+
+        // Barrier S0: at sub-cube boundary. Prevents iter k+1's phase-A
+        // writes from racing iter k's phase-B reads of phase_a_results.
+        // (workgroupBarrier is a synchronization point, not a no-op even
+        // on the first iter — first iter has no read-after-write to gate
+        // but the barrier still costs a per-warp simdgroup wait. WGSL
+        // does not let us skip it on first iter without a uniform branch.)
+        workgroupBarrier();
+
+        // Phase A: 27 base cases × 64 cells = 1728 work units.
+        // Each thread handles 27 cells (one per base case at position cx,cy,cz).
+        // Phase-A base-case (b) reads 8³ block at sub-cube positions
+        // [bi*4, bi*4+8) × [bj*4, bj*4+8) × [bk*4, bk*4+8).
+        // Inner 4³ output at base-case-internal-position (cx, cy, cz).
+        // Input center maps to sub-cube position (bi*4 + cx + 2, ...).
+        for (var b: u32 = 0u; b < 27u; b = b + 1u) {
+            let bi = b % 3u;
+            let bj = (b / 3u) % 3u;
+            let bk = b / 9u;
+            let center_x = bi * 4u + cx + 2u;
+            let center_y = bj * 4u + cy + 2u;
+            let center_z = bk * 4u + cz + 2u;
+            let cur = read_l5_subcube(world, si, sj, sk, center_x, center_y, center_z);
+            var alive: u32 = 0u;
+            for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+                for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                        let nx = u32(i32(center_x) + dx);
+                        let ny = u32(i32(center_y) + dy);
+                        let nz = u32(i32(center_z) + dz);
+                        alive = alive + read_l5_subcube(world, si, sj, sk, nx, ny, nz);
+                    }
+                }
+            }
+            var next: u32 = 0u;
+            if (cur == 1u) {
+                next = (BAYS_SURVIVE_MASK >> alive) & 1u;
+            } else {
+                next = (BAYS_BIRTH_MASK >> alive) & 1u;
+            }
+            phase_a_results[b * 64u + tid] = next;
+        }
+
+        // Barrier S1: phase A writes → phase B reads.
+        workgroupBarrier();
+
+        // Phase B: 8 base cases × 64 cells = 512 work units.
+        // Each thread handles 8 cells, one per phase-B base case at position cx,cy,cz.
+        // Phase-B base case (pb) input is 8³ assembled from 8 of 27 phase_a_results.
+        // Output tiles into L5 output at L5 position
+        //   (si*8 + psi*4 + cx, sj*8 + psj*4 + cy, sk*8 + psk*4 + cz).
+        let ix = cx + 2u;
+        let iy = cy + 2u;
+        let iz = cz + 2u;
+        for (var pb: u32 = 0u; pb < 8u; pb = pb + 1u) {
+            let psi = pb & 1u;
+            let psj = (pb >> 1u) & 1u;
+            let psk = pb >> 2u;
+            let cur = read_phase_a(psi, psj, psk, ix, iy, iz);
+            var alive: u32 = 0u;
+            for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+                for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                        let nx = u32(i32(ix) + dx);
+                        let ny = u32(i32(iy) + dy);
+                        let nz = u32(i32(iz) + dz);
+                        alive = alive + read_phase_a(psi, psj, psk, nx, ny, nz);
+                    }
+                }
+            }
+            var next: u32 = 0u;
+            if (cur == 1u) {
+                next = (BAYS_SURVIVE_MASK >> alive) & 1u;
+            } else {
+                next = (BAYS_BIRTH_MASK >> alive) & 1u;
+            }
+            let l5_x = si * 8u + psi * 4u + cx;
+            let l5_y = sj * 8u + psj * 4u + cy;
+            let l5_z = sk * 8u + psk * 4u + cz;
+            let out_off = world * 4096u + l5_z * 256u + l5_y * 16u + l5_x;
+            l5_final_outputs[out_off] = next;
+        }
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct L4Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct L5Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct L5GpuPipelines {
+    pipeline_l4_wg: wgpu::ComputePipeline,
+    bgl_l4_wg: wgpu::BindGroupLayout,
+    pipeline_l5: wgpu::ComputePipeline,
+    bgl_l5: wgpu::BindGroupLayout,
+}
+
+fn build_l5_pipelines(ctx: &GpuCtx) -> L5GpuPipelines {
+    // Plan A3: validate workgroup-storage budget vs spec default.
+    let max_wg_storage = ctx.device.limits().max_compute_workgroup_storage_size;
+    let required_wg_storage: u32 = 27 * 64 * 4; // phase_a_results in D3
+    assert!(
+        max_wg_storage >= required_wg_storage,
+        "device.max_compute_workgroup_storage_size = {} < required {} for L5 D3 phase_a_results",
+        max_wg_storage,
+        required_wg_storage,
+    );
+
+    let bgl_l4_wg = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("l4_wg_bgl"),
+        entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
+    });
+    let shader_l4_wg = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("l4_wg_shader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_L4_RECURSIVE_WG.into()),
+    });
+    let pl_l4_wg = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("l4_wg_pl"),
+        bind_group_layouts: &[Some(&bgl_l4_wg)],
+        immediate_size: 0,
+    });
+    let pipeline_l4_wg = ctx
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cs_step_l4_recursive_wg"),
+            layout: Some(&pl_l4_wg),
+            module: &shader_l4_wg,
+            entry_point: Some("cs_step_l4_recursive_wg"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+    let bgl_l5 = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("l5_bgl"),
+        entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
+    });
+    let shader_l5 = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("l5_shader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_L5_RECURSIVE.into()),
+    });
+    let pl_l5 = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("l5_pl"),
+        bind_group_layouts: &[Some(&bgl_l5)],
+        immediate_size: 0,
+    });
+    let pipeline_l5 = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("cs_step_l5_recursive"),
+        layout: Some(&pl_l5),
+        module: &shader_l5,
+        entry_point: Some("cs_step_l5_recursive"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    L5GpuPipelines {
+        pipeline_l4_wg,
+        bgl_l4_wg,
+        pipeline_l5,
+        bgl_l5,
+    }
+}
+
+// L5 GPU dispatcher driver. Three dispatches across two queue.submit fences.
+fn run_level_5_step_gpu(
+    ctx: &GpuCtx,
+    pipes: &L5GpuPipelines,
+    worlds: &[Box<[u32; L5_CELLS]>],
+) -> Vec<[u32; L4_CELLS]> {
+    let num_worlds = worlds.len() as u32;
+    assert!(num_worlds > 0, "need at least one L5 world");
+
+    // ---- D1 input prep: extract 27 × 27 × N L3 sub-blocks per world. ----
+    // For each world, for each L4 intermediate (i, j, k) ∈ {0,1,2}³, build
+    // the 16³ block (offset (i*8, j*8, k*8) of L5 input) and extract its
+    // 27 L3 sub-blocks (offset (a*4, b*4, c*4) of the 16³, each 8³).
+    let total_base_cases = (num_worlds as usize) * 27 * 27;
+    let mut flat_inputs: Vec<u32> = Vec::with_capacity(total_base_cases * L3_CELLS);
+    for input in worlds {
+        for k in 0..3usize {
+            for j in 0..3usize {
+                for i in 0..3usize {
+                    let l4_int = build_l4_intermediate_from_l5(input, i, j, k);
+                    for sk in 0..3usize {
+                        for sj in 0..3usize {
+                            for si in 0..3usize {
+                                let sub = build_intermediate(&l4_int, si, sj, sk);
+                                flat_inputs.extend_from_slice(&sub);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let intermediate_input_buf = make_input_buffer(ctx, "l5_d1_inputs", &flat_inputs);
+    let intermediate_l3_results_buf =
+        make_output_buffer(ctx, "l5_d1_outputs", total_base_cases as u32 * L2_CELLS as u32);
+    let l4_intermediate_results_buf = make_output_buffer(
+        ctx,
+        "l5_d2_outputs",
+        num_worlds * 27 * L3_CELLS as u32,
+    );
+    let l5_final_outputs_buf =
+        make_output_buffer(ctx, "l5_d3_outputs", num_worlds * L4_CELLS as u32);
+
+    // ---- D1: cs_base_case on 729·N intermediates ----
+    let d1_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_d1_params"),
+            contents: bytemuck::bytes_of(&BaseCaseParams {
+                num_inputs: total_base_cases as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_d1_bg"),
+        layout: &ctx.bgl_base_case,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d1_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc1 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_enc_d1"),
+        });
+    {
+        let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_pass_d1"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_base_case);
+        cpass.set_bind_group(0, &bg_d1, &[]);
+        let total_threads = total_base_cases as u32 * L2_CELLS as u32;
+        let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+        cpass.dispatch_workgroups(groups, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc1.finish()));
+    // Fence 1: queue.submit boundary.
+
+    // ---- D2: cs_step_l4_recursive_wg on 27·N (world, l4_int) tuples ----
+    let d2_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_d2_params"),
+            contents: bytemuck::bytes_of(&L4Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_d2_bg"),
+        layout: &pipes.bgl_l4_wg,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d2_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc2 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_enc_d2"),
+        });
+    {
+        let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_pass_d2"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l4_wg);
+        cpass.set_bind_group(0, &bg_d2, &[]);
+        cpass.dispatch_workgroups(27 * num_worlds, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc2.finish()));
+    // Fence 2: queue.submit boundary.
+
+    // ---- D3: cs_step_l5_recursive on N (worlds) ----
+    let d3_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_d3_params"),
+            contents: bytemuck::bytes_of(&L5Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_d3_bg"),
+        layout: &pipes.bgl_l5,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d3_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l5_final_outputs_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc3 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_enc_d3"),
+        });
+    {
+        let mut cpass = enc3.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_pass_d3"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l5);
+        cpass.set_bind_group(0, &bg_d3, &[]);
+        cpass.dispatch_workgroups(num_worlds, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc3.finish()));
+
+    // ---- Readback ----
+    let flat = read_buffer_u32(ctx, &l5_final_outputs_buf, num_worlds * L4_CELLS as u32);
+    let mut out: Vec<[u32; L4_CELLS]> = Vec::with_capacity(worlds.len());
+    for chunk in flat.chunks(L4_CELLS) {
+        let mut arr = [0u32; L4_CELLS];
+        arr.copy_from_slice(chunk);
+        out.push(arr);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// L5 throughput driver (commit 3 — perf measurement for §8.8 paper appendix).
+//
+// Mirrors `run_level_4_step_gpu_timed` but extends to three dispatches with
+// per-dispatch in-encoder timestamps. Per-column medians, N=64 worlds,
+// 10 warm runs, fresh buffers each iter — matches abwm.3 methodology.
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Debug, Clone, Copy)]
+struct L5TimedRun {
+    dispatch_1_gpu: Option<std::time::Duration>,
+    dispatch_2_gpu: Option<std::time::Duration>,
+    dispatch_3_gpu: Option<std::time::Duration>,
+    wall_total: std::time::Duration,
+    // Decomposition (per code-review I1: split cpu_prep into "purely CPU
+    // work" vs "GPU buffer alloc + upload"; the latter is wgpu/Metal
+    // overhead, not CPU prep as §8.8 originally claimed).
+    cpu_inputs: std::time::Duration,
+    buf_alloc: std::time::Duration,
+    readback: std::time::Duration,
+}
+
+fn run_level_5_step_gpu_timed(
+    ctx: &GpuCtx,
+    pipes: &L5GpuPipelines,
+    worlds: &[Box<[u32; L5_CELLS]>],
+) -> (Vec<[u32; L4_CELLS]>, L5TimedRun) {
+    let num_worlds = worlds.len() as u32;
+    assert!(num_worlds > 0, "need at least one L5 world");
+    let wall_start = Instant::now();
+
+    // Decomposition I1: cpu_inputs covers only the Rust loop that builds
+    // flat_inputs (extracting 27*27*N L3 sub-blocks from N*32³ L5 inputs).
+    let cpu_inputs_start = Instant::now();
+    let total_base_cases = (num_worlds as usize) * 27 * 27;
+    let mut flat_inputs: Vec<u32> = Vec::with_capacity(total_base_cases * L3_CELLS);
+    for input in worlds {
+        for k in 0..3usize {
+            for j in 0..3usize {
+                for i in 0..3usize {
+                    let l4_int = build_l4_intermediate_from_l5(input, i, j, k);
+                    for sk in 0..3usize {
+                        for sj in 0..3usize {
+                            for si in 0..3usize {
+                                let sub = build_intermediate(&l4_int, si, sj, sk);
+                                flat_inputs.extend_from_slice(&sub);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let cpu_inputs = cpu_inputs_start.elapsed();
+
+    // Decomposition I1: buf_alloc covers wgpu/Metal device-buffer creation
+    // and the mapped-at-creation upload. This is GPU-driver overhead, not
+    // CPU prep — pre-fix it was bundled into "cpu_prep" in §8.8.
+    let buf_alloc_start = Instant::now();
+    let intermediate_input_buf = make_input_buffer(ctx, "l5_timed_d1_inputs", &flat_inputs);
+    let intermediate_l3_results_buf = make_output_buffer(
+        ctx,
+        "l5_timed_d1_outputs",
+        total_base_cases as u32 * L2_CELLS as u32,
+    );
+    let l4_intermediate_results_buf = make_output_buffer(
+        ctx,
+        "l5_timed_d2_outputs",
+        num_worlds * 27 * L3_CELLS as u32,
+    );
+    let l5_final_outputs_buf =
+        make_output_buffer(ctx, "l5_timed_d3_outputs", num_worlds * L4_CELLS as u32);
+    let buf_alloc = buf_alloc_start.elapsed();
+
+    let make_ts_set = |label: &str| -> Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer)> {
+        if !ctx.timestamp_supported {
+            return None;
+        }
+        let qs = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some(label),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts_resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts_readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some((qs, resolve, readback))
+    };
+    let ts1 = make_ts_set("l5_ts_d1");
+    let ts2 = make_ts_set("l5_ts_d2");
+    let ts3 = make_ts_set("l5_ts_d3");
+
+    // ---- D1 ----
+    let d1_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_timed_d1_params"),
+            contents: bytemuck::bytes_of(&BaseCaseParams {
+                num_inputs: total_base_cases as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_timed_d1_bg"),
+        layout: &ctx.bgl_base_case,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d1_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc1 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_timed_enc_d1"),
+        });
+    if let Some((qs, _, _)) = &ts1 {
+        enc1.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_timed_pass_d1"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_base_case);
+        cpass.set_bind_group(0, &bg_d1, &[]);
+        let total_threads = total_base_cases as u32 * L2_CELLS as u32;
+        let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+        cpass.dispatch_workgroups(groups, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts1 {
+        enc1.write_timestamp(qs, 1);
+        enc1.resolve_query_set(qs, 0..2, resolve, 0);
+        enc1.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc1.finish()));
+
+    // ---- D2 ----
+    let d2_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_timed_d2_params"),
+            contents: bytemuck::bytes_of(&L4Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_timed_d2_bg"),
+        layout: &pipes.bgl_l4_wg,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d2_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc2 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_timed_enc_d2"),
+        });
+    if let Some((qs, _, _)) = &ts2 {
+        enc2.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_timed_pass_d2"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l4_wg);
+        cpass.set_bind_group(0, &bg_d2, &[]);
+        cpass.dispatch_workgroups(27 * num_worlds, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts2 {
+        enc2.write_timestamp(qs, 1);
+        enc2.resolve_query_set(qs, 0..2, resolve, 0);
+        enc2.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc2.finish()));
+
+    // ---- D3 ----
+    let d3_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_timed_d3_params"),
+            contents: bytemuck::bytes_of(&L5Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_timed_d3_bg"),
+        layout: &pipes.bgl_l5,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d3_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l5_final_outputs_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc3 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_timed_enc_d3"),
+        });
+    if let Some((qs, _, _)) = &ts3 {
+        enc3.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc3.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_timed_pass_d3"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l5);
+        cpass.set_bind_group(0, &bg_d3, &[]);
+        cpass.dispatch_workgroups(num_worlds, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts3 {
+        enc3.write_timestamp(qs, 1);
+        enc3.resolve_query_set(qs, 0..2, resolve, 0);
+        enc3.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc3.finish()));
+
+    // ---- Readback ----
+    let readback_start = Instant::now();
+    let flat = read_buffer_u32(ctx, &l5_final_outputs_buf, num_worlds * L4_CELLS as u32);
+    let mut out: Vec<[u32; L4_CELLS]> = Vec::with_capacity(worlds.len());
+    for chunk in flat.chunks(L4_CELLS) {
+        let mut arr = [0u32; L4_CELLS];
+        arr.copy_from_slice(chunk);
+        out.push(arr);
+    }
+    let readback = readback_start.elapsed();
+
+    let read_ts = |readback: &wgpu::Buffer| -> Option<std::time::Duration> {
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        rx.recv().ok()?.ok()?;
+        let ticks = {
+            let data = slice.get_mapped_range();
+            let ts: &[u64] = bytemuck::cast_slice(&data);
+            if ts.len() >= 2 && ts[1] > ts[0] {
+                Some(ts[1] - ts[0])
+            } else {
+                None
+            }
+        };
+        readback.unmap();
+        ticks.map(|t| {
+            std::time::Duration::from_nanos((t as f64 * ctx.timestamp_period_ns as f64) as u64)
+        })
+    };
+    let dispatch_1_gpu = ts1.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+    let dispatch_2_gpu = ts2.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+    let dispatch_3_gpu = ts3.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+
+    (
+        out,
+        L5TimedRun {
+            dispatch_1_gpu,
+            dispatch_2_gpu,
+            dispatch_3_gpu,
+            wall_total: wall_start.elapsed(),
+            cpu_inputs,
+            buf_alloc,
+            readback,
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn gpu_level_5_throughput() {
+    let ctx = match GpuCtx::new() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no GPU adapter");
+            return;
+        }
+    };
+    let pipes = build_l5_pipelines(&ctx);
+    eprintln!(
+        "L5 GPU dispatcher throughput (timestamp_supported={}, period_ns={})",
+        ctx.timestamp_supported, ctx.timestamp_period_ns
+    );
+
+    const N_WORLDS: usize = 64;
+    const N_ITERS: usize = 10;
+
+    let worlds: Vec<Box<[u32; L5_CELLS]>> = (0..N_WORLDS)
+        .map(|i| fixture_l5_seeded_random(0x42u64.wrapping_add(i as u64), 0.30))
+        .collect();
+
+    // Warm-up.
+    let (_warm_out, _warm_t) = run_level_5_step_gpu_timed(&ctx, &pipes, &worlds);
+
+    let mut runs: Vec<L5TimedRun> = Vec::with_capacity(N_ITERS);
+    for _ in 0..N_ITERS {
+        let (_out, t) = run_level_5_step_gpu_timed(&ctx, &pipes, &worlds);
+        runs.push(t);
+    }
+
+    fn median_dur(values: &[std::time::Duration]) -> std::time::Duration {
+        let mut v = values.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    }
+    let median_wall = median_dur(&runs.iter().map(|r| r.wall_total).collect::<Vec<_>>());
+    let median_cpu_inputs = median_dur(&runs.iter().map(|r| r.cpu_inputs).collect::<Vec<_>>());
+    let median_buf_alloc = median_dur(&runs.iter().map(|r| r.buf_alloc).collect::<Vec<_>>());
+    let median_readback = median_dur(&runs.iter().map(|r| r.readback).collect::<Vec<_>>());
+    // Per code-review I2: compute per-iter residual BEFORE medianizing.
+    // median(wall) - median(cpu_inputs+buf_alloc) - median(readback) is not
+    // the same as median(wall_i - cpu_inputs_i - buf_alloc_i - readback_i)
+    // because medians don't commute with subtraction across non-monotonic
+    // decompositions.
+    let residual_samples: Vec<std::time::Duration> = runs
+        .iter()
+        .map(|r| {
+            r.wall_total
+                .saturating_sub(r.cpu_inputs + r.buf_alloc + r.readback)
+        })
+        .collect();
+    let median_residual = median_dur(&residual_samples);
+    let d1_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_1_gpu).collect();
+    let d2_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_2_gpu).collect();
+    let d3_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_3_gpu).collect();
+    let median_d1 = (!d1_samples.is_empty()).then(|| median_dur(&d1_samples));
+    let median_d2 = (!d2_samples.is_empty()).then(|| median_dur(&d2_samples));
+    let median_d3 = (!d3_samples.is_empty()).then(|| median_dur(&d3_samples));
+
+    let fmt_dur = |d: std::time::Duration| {
+        let ns = d.as_nanos();
+        if ns < 10_000 {
+            format!("{ns} ns")
+        } else {
+            format!("{:.3} ms", ns as f64 / 1e6)
+        }
+    };
+
+    let total_d1_threads = N_WORLDS * 27 * 27 * L2_CELLS;
+    let total_d2_workgroups = N_WORLDS * 27;
+    let total_d3_workgroups = N_WORLDS;
+
+    eprintln!(
+        "per-column medians (of {N_ITERS} runs, N={N_WORLDS} worlds, fresh buffers each iter):"
+    );
+    eprintln!(
+        "  dispatch 1 (729·N base case, {total_d1_threads} threads): {}",
+        median_d1.map(fmt_dur).unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  dispatch 2 (27·N L4-recursive-wg, {total_d2_workgroups} wgs × 64 threads = {} threads): {}",
+        total_d2_workgroups * 64,
+        median_d2.map(fmt_dur).unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  dispatch 3 (N L5-recursive, {total_d3_workgroups} wgs × 64 threads = {} threads): {}",
+        total_d3_workgroups * 64,
+        median_d3.map(fmt_dur).unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  wall total (incl. CPU inputs + buffer alloc + readback): {}",
+        fmt_dur(median_wall)
+    );
+    eprintln!(
+        "  decomposition (median): cpu_inputs = {}, buf_alloc = {}, readback = {}, residual = {}",
+        fmt_dur(median_cpu_inputs),
+        fmt_dur(median_buf_alloc),
+        fmt_dur(median_readback),
+        fmt_dur(median_residual),
+    );
+
+    // Plan A8 verdict criteria. Per code-review I3: split the verdict so the
+    // test output mirrors §8.8's two-line structure (GO for the dispatcher
+    // mechanism vs CAVEAT on wall-time at this spike scale).
+    if let (Some(d1), Some(d2), Some(d3)) = (median_d1, median_d2, median_d3) {
+        let max_dispatch = d1.max(d2).max(d3);
+        let dispatcher_verdict = if d3.as_micros() <= 1_000 {
+            "GO"
+        } else if max_dispatch.as_micros() > 5_000 {
+            "NO-GO"
+        } else {
+            "CAVEAT"
+        };
+        let wall_verdict = if median_wall.as_micros() <= 10_000 {
+            "GO"
+        } else {
+            "CAVEAT"
+        };
+        eprintln!(
+            "verdict (per plan A8): dispatcher={dispatcher_verdict}, wall={wall_verdict}"
+        );
+        eprintln!(
+            "  d3 = {} {} 1 ms (per-dispatch budget)",
+            fmt_dur(d3),
+            if d3.as_micros() <= 1_000 { "≤" } else { ">" }
+        );
+        eprintln!(
+            "  wall total = {} {} 10 ms (spike-scale ceiling — wall is dominated by cpu_inputs + buf_alloc + readback, all spike-scale artifacts)",
+            fmt_dur(median_wall),
+            if median_wall.as_micros() <= 10_000 {
+                "≤"
+            } else {
+                ">"
+            }
+        );
+    } else {
+        eprintln!("verdict: timestamps unavailable; cannot decide GO/NO-GO from this run");
+    }
+
+    eprintln!("--- per-iter detail ---");
+    for (i, r) in runs.iter().enumerate() {
+        let residual = r
+            .wall_total
+            .saturating_sub(r.cpu_inputs + r.buf_alloc + r.readback);
+        eprintln!(
+            "  iter {i}: d1={} d2={} d3={} cpu_inputs={} buf_alloc={} readback={} residual={} wall={}",
+            r.dispatch_1_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            r.dispatch_2_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            r.dispatch_3_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            fmt_dur(r.cpu_inputs),
+            fmt_dur(r.buf_alloc),
+            fmt_dur(r.readback),
+            fmt_dur(residual),
+            fmt_dur(r.wall_total),
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn gpu_level_5_matches_cpu_on_corpus() {
+    let ctx = match GpuCtx::new() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no GPU adapter");
+            return;
+        }
+    };
+    let pipes = build_l5_pipelines(&ctx);
+    let corpus = level_5_corpus();
+    let worlds: Vec<Box<[u32; L5_CELLS]>> =
+        corpus.iter().map(|(_, w)| w.clone()).collect();
+    let cpu_results: Vec<[u32; L4_CELLS]> =
+        worlds.iter().map(|w| cpu_level_5_step(w)).collect();
+    let gpu_results = run_level_5_step_gpu(&ctx, &pipes, &worlds);
+    assert_eq!(gpu_results.len(), worlds.len(), "L5 result count");
+    for (idx, (label, _)) in corpus.iter().enumerate() {
+        let cpu = &cpu_results[idx];
+        let gpu = &gpu_results[idx];
+        for (cell_idx, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert_eq!(
+                g, c,
+                "L5 fixture {label} cell {cell_idx}: GPU={g} CPU={c}"
+            );
+        }
+        let live_count = cpu.iter().filter(|&&c| c == 1).count();
+        eprintln!("L5 fixture {label}: {live_count} live cells in 16³ result");
+        if *label == "random_seed_42" {
+            assert_eq!(
+                live_count, 909,
+                "L5 random_seed_42: expected 909 live cells in 16³ inner; got {live_count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cpu_level_5_matches_brute_force_on_corpus() {
+    // The structural tripwire (plan A4): if `cpu_level_5_step` (the
+    // recursive 27/8 decomposition) and `cpu_brute_force_l5_step` (naive
+    // 4-gen stencil) disagree on any fixture, the decomposition is wrong.
+    // Catches shared-algorithm bugs that GPU == CPU corpus checks miss.
+    let corpus = level_5_corpus();
+    for (label, world) in corpus.iter() {
+        let recursive = cpu_level_5_step(world);
+        let brute = cpu_brute_force_l5_step(world);
+        for (cell_idx, (r, b)) in recursive.iter().zip(brute.iter()).enumerate() {
+            assert_eq!(
+                r, b,
+                "fixture {label} cell {cell_idx}: recursive={r} brute_force={b}"
+            );
+        }
+        let live_count = recursive.iter().filter(|&&c| c == 1).count();
+        eprintln!("fixture {label}: {live_count} live cells in 16³ inner result");
+        // Defense-in-depth tripwire: random_seed_42 produces 909 live cells
+        // after 4 generations on 32³ → inner 16³. If this number changes,
+        // either the rule, the seeded fixture, or the decomposition drifted.
+        // Stronger than abwm.3's live-count alone because the brute-force
+        // oracle above already validates the decomposition itself.
+        if *label == "random_seed_42" {
+            assert_eq!(
+                live_count, 909,
+                "random_seed_42: expected 909 live cells in 16³ inner; got {live_count}"
+            );
+        }
+    }
+}
