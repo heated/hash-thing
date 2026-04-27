@@ -1526,3 +1526,327 @@ fn gpu_level_4_throughput() {
         );
     }
 }
+
+// ===========================================================================
+// L5 spike (hash-thing-szqv): recursive→recursive transition at level 5.
+//
+// abwm.3 proved base-case → recursive across one queue.submit fence. szqv
+// closes the remaining structural unknown: a recursive→recursive transition
+// where dispatch N+1 reads dispatch N's *recursive* output (not just base
+// case output).
+//
+// Scope (matches `.ship-notes/plan-spark-hash-thing-szqv-gpu-l5.md`):
+// - Toy rule unchanged (Bays-5766).
+// - World root level 5 (32³). Two recursive levels above the level-3 base.
+// - Three GPU dispatches across two cross-dispatch fences.
+// - var<private> scratch from abwm.3 migrated to var<workgroup> in the new
+//   kernels (Gemini IMPORTANT on abwm.3); abwm.3's `cs_step_recursive_l4`
+//   stays unchanged so its §8.7 numbers remain reproducible.
+// - Brute-force 4-generation Bays-5766 CPU oracle (`cpu_brute_force_l5_step`)
+//   added as a third-party tripwire that does not share code with
+//   `cpu_level_5_step` — catches shared-algorithm bugs in the 27/8
+//   decomposition itself.
+//
+// Hashlife semantics for L5 (`cpu_level_5_step`):
+// - 27 L4 intermediates from 32³ input (each 16³, tiled at offset (i*8, j*8, k*8)).
+// - Step each via `cpu_level_4_step` → 27 L3 (8³) intermediate results.
+// - 8 L4 sub-cubes assembled from 27 intermediate results (each sub-cube
+//   16³, octants tiled from (si+ox, sj+oy, sk+oz)).
+// - Step each via `cpu_level_4_step` → 8 L3 (8³) sub-cube results.
+// - Tile 8 results into 16³ output at sub-cube offsets (si*8, sj*8, sk*8).
+// Net effect: 4 generations on 32³ → 16³ output (lose 8 cells per side).
+// ===========================================================================
+
+const L5_SIDE: usize = 32;
+const L5_CELLS: usize = L5_SIDE * L5_SIDE * L5_SIDE;
+
+fn build_l4_intermediate_from_l5(
+    input: &[u32; L5_CELLS],
+    i: usize,
+    j: usize,
+    k: usize,
+) -> [u32; L4_CELLS] {
+    // L4 intermediate (i, j, k) tiles a 16³ slab of the 32³ L5 input at
+    // offset (i*8, j*8, k*8). Linearization within the L4 block: x fastest.
+    let mut block = [0u32; L4_CELLS];
+    for bz in 0..L4_SIDE {
+        for by in 0..L4_SIDE {
+            for bx in 0..L4_SIDE {
+                let gx = i * 8 + bx;
+                let gy = j * 8 + by;
+                let gz = k * 8 + bz;
+                block[bz * L4_SIDE * L4_SIDE + by * L4_SIDE + bx] =
+                    input[gz * L5_SIDE * L5_SIDE + gy * L5_SIDE + gx];
+            }
+        }
+    }
+    block
+}
+
+fn build_l4_subcube_from_l3_results(
+    intermediate_results: &[[u32; L3_CELLS]; NUM_INTERMEDIATES],
+    si: usize,
+    sj: usize,
+    sk: usize,
+) -> [u32; L4_CELLS] {
+    // L4 sub-cube (si, sj, sk) tiles 8 of the 27 intermediate L3 (8³) results
+    // into a 16³ block. Octant (cx, cy, cz) ∈ {0,1}³ takes intermediate
+    // (si+cx, sj+cy, sk+cz) at sub-cube positions [cx*8, cx*8+8) × etc.
+    let mut block = [0u32; L4_CELLS];
+    for cz in 0..2 {
+        for cy in 0..2 {
+            for cx in 0..2 {
+                let im_idx = (sk + cz) * 9 + (sj + cy) * 3 + (si + cx);
+                let im = &intermediate_results[im_idx];
+                for fz in 0..L3_SIDE {
+                    for fy in 0..L3_SIDE {
+                        for fx in 0..L3_SIDE {
+                            let bx = cx * L3_SIDE + fx;
+                            let by = cy * L3_SIDE + fy;
+                            let bz = cz * L3_SIDE + fz;
+                            block[bz * L4_SIDE * L4_SIDE + by * L4_SIDE + bx] =
+                                im[fz * L3_SIDE * L3_SIDE + fy * L3_SIDE + fx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    block
+}
+
+// CPU L5 step (the structural oracle the GPU dispatcher matches against).
+//
+// **Oracle independence note (per plan A4):** this function shares the
+// 27/8 decomposition with the GPU kernels. A bug in that shared algorithm
+// would pass GPU == CPU on corpus checks. The third-party tripwire is
+// `cpu_brute_force_l5_step` below, which uses naive 4-generation stencil
+// without any decomposition. They must agree on every fixture.
+fn cpu_level_5_step(input: &[u32; L5_CELLS]) -> [u32; L4_CELLS] {
+    // Phase 1: 27 L4 intermediates, each stepped via cpu_level_4_step.
+    let mut l4_intermediate_results = [[0u32; L3_CELLS]; NUM_INTERMEDIATES];
+    for k in 0..3 {
+        for j in 0..3 {
+            for i in 0..3 {
+                let l4_int = build_l4_intermediate_from_l5(input, i, j, k);
+                l4_intermediate_results[k * 9 + j * 3 + i] = cpu_level_4_step(&l4_int);
+            }
+        }
+    }
+    // Phase 2: 8 L4 sub-cubes, each stepped via cpu_level_4_step, tiled
+    // into the 16³ L4 output at sub-cube offsets (si*8, sj*8, sk*8).
+    let mut output = [0u32; L4_CELLS];
+    for sk in 0..2 {
+        for sj in 0..2 {
+            for si in 0..2 {
+                let sub_block = build_l4_subcube_from_l3_results(
+                    &l4_intermediate_results,
+                    si,
+                    sj,
+                    sk,
+                );
+                let sub_result = cpu_level_4_step(&sub_block);
+                for fz in 0..L3_SIDE {
+                    for fy in 0..L3_SIDE {
+                        for fx in 0..L3_SIDE {
+                            let ox = si * L3_SIDE + fx;
+                            let oy = sj * L3_SIDE + fy;
+                            let oz = sk * L3_SIDE + fz;
+                            output[oz * L4_SIDE * L4_SIDE + oy * L4_SIDE + ox] =
+                                sub_result[fz * L3_SIDE * L3_SIDE + fy * L3_SIDE + fx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
+// Brute-force CPU oracle: naive 4-generation Bays-5766 stencil on 32³,
+// zero-padded boundary, double-buffered. NO recursive decomposition. The
+// inner [8, 24)³ region after 4 generations equals what `cpu_level_5_step`
+// produces by mathematical definition (the 27/8 decomposition is just a
+// reordering of stencil applications that preserves locality).
+//
+// This is the third-party tripwire from plan A4. If it disagrees with
+// `cpu_level_5_step` on any fixture, there's a bug in the decomposition
+// (or in this brute-force) that the live-count tripwire alone can't
+// distinguish.
+//
+// Cost: 32³ × 27 stencil reads × 4 generations ≈ 3.5M ops. Milliseconds
+// on CPU; safe to run in default `cargo test` (not behind `--ignored`).
+fn cpu_brute_force_l5_step(input: &[u32; L5_CELLS]) -> [u32; L4_CELLS] {
+    let mut current: Vec<u32> = input.to_vec();
+    let mut next: Vec<u32> = vec![0u32; L5_CELLS];
+    for _gen in 0..4 {
+        for cz in 0..L5_SIDE {
+            for cy in 0..L5_SIDE {
+                for cx in 0..L5_SIDE {
+                    let cur = current[cz * L5_SIDE * L5_SIDE + cy * L5_SIDE + cx];
+                    let mut alive: u32 = 0;
+                    for dz in -1i32..=1 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                if dx == 0 && dy == 0 && dz == 0 {
+                                    continue;
+                                }
+                                let nx = cx as i32 + dx;
+                                let ny = cy as i32 + dy;
+                                let nz = cz as i32 + dz;
+                                if nx < 0
+                                    || ny < 0
+                                    || nz < 0
+                                    || nx >= L5_SIDE as i32
+                                    || ny >= L5_SIDE as i32
+                                    || nz >= L5_SIDE as i32
+                                {
+                                    continue;
+                                }
+                                alive += current[(nz as usize) * L5_SIDE * L5_SIDE
+                                    + (ny as usize) * L5_SIDE
+                                    + nx as usize];
+                            }
+                        }
+                    }
+                    next[cz * L5_SIDE * L5_SIDE + cy * L5_SIDE + cx] = bays_step_cell(cur, alive);
+                }
+            }
+        }
+        std::mem::swap(&mut current, &mut next);
+    }
+    // Extract inner [8, 24)³ as the 16³ L4-equivalent output.
+    let mut output = [0u32; L4_CELLS];
+    for oz in 0..L4_SIDE {
+        for oy in 0..L4_SIDE {
+            for ox in 0..L4_SIDE {
+                output[oz * L4_SIDE * L4_SIDE + oy * L4_SIDE + ox] = current
+                    [(oz + 8) * L5_SIDE * L5_SIDE + (oy + 8) * L5_SIDE + (ox + 8)];
+            }
+        }
+    }
+    output
+}
+
+// ---------------------------------------------------------------------------
+// L5 fixtures.
+// ---------------------------------------------------------------------------
+
+fn fixture_l5_empty() -> Box<[u32; L5_CELLS]> {
+    Box::new([0u32; L5_CELLS])
+}
+
+fn fixture_l5_full() -> Box<[u32; L5_CELLS]> {
+    Box::new([1u32; L5_CELLS])
+}
+
+fn fixture_l5_single_live_center() -> Box<[u32; L5_CELLS]> {
+    let mut g = Box::new([0u32; L5_CELLS]);
+    let i = 16 * L5_SIDE * L5_SIDE + 16 * L5_SIDE + 16;
+    g[i] = 1;
+    g
+}
+
+/// 5×5×5 live block at corner (0,0,0). Tests boundary handling: cells near
+/// (0,0,0) are zero-padded outside the L5 input, and the 27/8 decomposition
+/// must agree with the brute-force oracle on how that propagates over 4
+/// generations.
+fn fixture_l5_boundary_touching() -> Box<[u32; L5_CELLS]> {
+    let mut g = Box::new([0u32; L5_CELLS]);
+    for z in 0..5 {
+        for y in 0..5 {
+            for x in 0..5 {
+                g[z * L5_SIDE * L5_SIDE + y * L5_SIDE + x] = 1;
+            }
+        }
+    }
+    g
+}
+
+fn fixture_l5_seeded_random(seed: u64, density: f32) -> Box<[u32; L5_CELLS]> {
+    let mut state: u64 = seed;
+    let mut g = Box::new([0u32; L5_CELLS]);
+    for cell in g.iter_mut() {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let r = (z as f64) / (u64::MAX as f64);
+        *cell = if (r as f32) < density { 1 } else { 0 };
+    }
+    g
+}
+
+fn level_5_corpus() -> Vec<(&'static str, Box<[u32; L5_CELLS]>)> {
+    vec![
+        ("empty", fixture_l5_empty()),
+        ("full", fixture_l5_full()),
+        ("single_live_center", fixture_l5_single_live_center()),
+        ("boundary_touching", fixture_l5_boundary_touching()),
+        ("random_seed_42", fixture_l5_seeded_random(42, 0.30)),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// L5 default tests (no GPU): exercise the structural CPU oracle and the
+// brute-force tripwire. These run under `cargo test` without --ignored.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cpu_level_5_empty_stays_empty() {
+    let inp = fixture_l5_empty();
+    let out = cpu_level_5_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "empty L5 → empty L4");
+}
+
+#[test]
+fn cpu_level_5_full_dies() {
+    // Bays-5766 collapses dense regions: gen-1 has 26 alive neighbors
+    // everywhere in the interior → dies (S = {5,6}). All subsequent gens
+    // see no alive neighbors → no births. Final inner 16³ = all zeros.
+    let inp = fixture_l5_full();
+    let out = cpu_level_5_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "full L5 → empty L4");
+}
+
+#[test]
+fn cpu_level_5_single_live_dies() {
+    // Single live cell with 0 neighbors → dies (S excludes 0). All
+    // surrounding dead cells have ≤ 1 alive neighbor → no birth.
+    let inp = fixture_l5_single_live_center();
+    let out = cpu_level_5_step(&inp);
+    assert!(out.iter().all(|&c| c == 0), "single-live L5 → empty L4");
+}
+
+#[test]
+fn cpu_level_5_matches_brute_force_on_corpus() {
+    // The structural tripwire (plan A4): if `cpu_level_5_step` (the
+    // recursive 27/8 decomposition) and `cpu_brute_force_l5_step` (naive
+    // 4-gen stencil) disagree on any fixture, the decomposition is wrong.
+    // Catches shared-algorithm bugs that GPU == CPU corpus checks miss.
+    let corpus = level_5_corpus();
+    for (label, world) in corpus.iter() {
+        let recursive = cpu_level_5_step(world);
+        let brute = cpu_brute_force_l5_step(world);
+        for (cell_idx, (r, b)) in recursive.iter().zip(brute.iter()).enumerate() {
+            assert_eq!(
+                r, b,
+                "fixture {label} cell {cell_idx}: recursive={r} brute_force={b}"
+            );
+        }
+        let live_count = recursive.iter().filter(|&&c| c == 1).count();
+        eprintln!("fixture {label}: {live_count} live cells in 16³ inner result");
+        // Defense-in-depth tripwire: random_seed_42 produces 909 live cells
+        // after 4 generations on 32³ → inner 16³. If this number changes,
+        // either the rule, the seeded fixture, or the decomposition drifted.
+        // Stronger than abwm.3's live-count alone because the brute-force
+        // oracle above already validates the decomposition itself.
+        if *label == "random_seed_42" {
+            assert_eq!(
+                live_count, 909,
+                "random_seed_42: expected 909 live cells in 16³ inner; got {live_count}"
+            );
+        }
+    }
+}
