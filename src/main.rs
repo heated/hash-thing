@@ -1716,6 +1716,14 @@ impl App {
                 // baseline reference is now meaningless. Reset it so the
                 // next growth ratio reflects the post-compact size.
                 lod.policy.reset_growth_baseline();
+                // Rebase the cached (world_root, view_root) pair into the
+                // post-compact epoch. NodeId allocation in
+                // `compacted_with_remap_keeping` is deterministic, so an
+                // unchanged subtree can land on the numerically-same
+                // NodeId — without this rebase, the next update() would
+                // hit the cache against a stale pre-compact view_root
+                // (hash-thing-e4ep BLOCKER).
+                lod.policy.apply_compaction_remap(&remap);
             }
             // cswp.8.3: derive render-only view_root from canonical root.
             // Returns world.root unchanged when policy is disabled or

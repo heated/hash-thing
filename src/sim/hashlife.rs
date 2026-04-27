@@ -284,17 +284,21 @@ impl World {
     ///   (no extra roots beyond cache references).
     /// - The cswp.8.3 chunk-LOD path (hash-thing-e4ep) to shed ghost
     ///   interior chains accumulated by repeated `lod_collapse_chunk`
-    ///   calls without losing the live `view_root`. Bin-crate `main.rs`
-    ///   is the only out-of-lib caller; within the lib, prefer
-    ///   `maybe_compact` so the threshold gating stays in one place.
+    ///   calls without losing the live `view_root`. Within the lib,
+    ///   prefer `maybe_compact` so the 2× threshold gating stays in one
+    ///   place; out-of-lib callers (e.g. the bin-crate's per-frame
+    ///   chunk-LOD trigger) drive their own threshold and pass live
+    ///   roots that aren't on the hashlife cache list.
     ///
     /// Updates `self.store`, `self.root`, the four hashlife caches (via
     /// [`Self::remap_caches`]), the `store_size_at_last_compact` meter,
     /// and publishes the remap to `last_compaction_remap` with
-    /// compose-on-write semantics so back-to-back compactions in one
-    /// frame (e.g. a sim step's `maybe_compact` followed by a
-    /// post-`upload_volume` `compact_keeping`) don't clobber the
-    /// pending A→B map with B→C (hash-thing-rk4n.1).
+    /// compose-on-write semantics so back-to-back compactions before
+    /// the renderer next drains the slot — for example two sim steps
+    /// each tripping `maybe_compact` between frames, or a sim-step
+    /// `maybe_compact` followed in the next frame by a chunk-LOD
+    /// `compact_keeping` if the renderer hasn't yet drained — don't
+    /// clobber the pending A→B map with B→C (hash-thing-rk4n.1).
     pub fn compact_keeping(&mut self, extra_roots: &[NodeId]) {
         let mut roots = self.cache_referenced_nodes();
         roots.extend_from_slice(extra_roots);

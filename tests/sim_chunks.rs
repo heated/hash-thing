@@ -427,6 +427,10 @@ fn repeated_lod_recompute_with_periodic_compaction_bounds_growth() {
     let baseline = world.store.node_count();
     let mut peak = baseline;
     let mut compactions = 0u32;
+    // Did at least one compaction actually shed nodes? Without this, the
+    // peak-bounded assertion below would still pass on a no-op compactor
+    // (e.g. one that publishes an identity remap and frees nothing).
+    let mut observed_shrink = false;
 
     // 64 player-chunk crossings — long enough to exercise the trigger
     // multiple times without blowing past a small per-test budget.
@@ -442,7 +446,12 @@ fn repeated_lod_recompute_with_periodic_compaction_bounds_growth() {
         // Mirror the main.rs trigger condition (src/main.rs upload_volume).
         if let Some(ratio) = policy.store_growth_ratio(world.store.node_count()) {
             if ratio > LOD_COMPACT_RATIO_THRESHOLD {
+                let pre = world.store.node_count();
                 world.compact_keeping(&[view_root]);
+                let post = world.store.node_count();
+                if post < pre {
+                    observed_shrink = true;
+                }
                 policy.reset_growth_baseline();
                 compactions += 1;
             }
@@ -465,6 +474,15 @@ fn repeated_lod_recompute_with_periodic_compaction_bounds_growth() {
         peak <= cap,
         "store grew unbounded across recomputes: baseline={baseline} \
          peak={peak} cap={cap} compactions={compactions}"
+    );
+
+    // Stronger statement: at least one compaction actually shed nodes.
+    // Defends against a regression where compact_keeping retains so many
+    // extra roots that nothing is reclaimed — peak would still pass.
+    assert!(
+        observed_shrink,
+        "at least one compact_keeping call must shrink the store \
+         (baseline={baseline} peak={peak} compactions={compactions})"
     );
 }
 
@@ -519,4 +537,74 @@ fn compact_keeping_composes_with_pending_remap() {
     // pin_c must point at a real node in the post-C store; NodeStore::get
     // panics on a dangling NodeId, so reaching here proves the chain held.
     let _ = world.store.get(pin_c);
+}
+
+#[test]
+fn cache_invalidates_after_compact_keeping_with_unchanged_world_root() {
+    // hash-thing-e4ep BLOCKER regression: ChunkLodPolicy.cache keys on
+    // world_root NodeId, and `compacted_with_remap_keeping` allocates
+    // NodeIds deterministically (post-order DFS in a fresh store). When
+    // the world.root subtree is structurally unchanged across a
+    // compaction, the new world.root NodeId can numerically equal the
+    // pre-compact one. Without explicit cache rebase, the next update()
+    // sees a matching key and returns the stale view_root from the old
+    // store epoch.
+    //
+    // This test drives that scenario: cache a view_root, compact while
+    // the world.root is structurally stable, then call update() against
+    // the post-compact store and verify the returned view_root is valid
+    // in the *new* store (i.e. the cache was either rebased via
+    // apply_compaction_remap, or invalidated).
+    let mut world = make_4x4x4_chunk_world();
+    // Plant a far cell so the policy actually mints ghost chains.
+    world.set(
+        WorldCoord(3 * CHUNK_SIDE as i64 + 5),
+        WorldCoord(5),
+        WorldCoord(5),
+        stone(),
+    );
+    let mut policy = ChunkLodPolicy::new();
+    policy.enabled = true;
+
+    // Prime the cache with a view_root keyed on the current world.root.
+    let player_pos = [(CHUNK_SIDE as f64) + 1.0, 1.0, 1.0];
+    let view_before = policy.update(&mut world.store, world.root, world.level, player_pos);
+
+    // Compact, keeping both world.root and view_before alive (mirrors the
+    // main.rs upload_volume flow, which passes view_root as the extra root
+    // and gets world.root preserved by Hashlife::compact_keeping).
+    world.compact_keeping(&[view_before]);
+    let remap = world
+        .last_compaction_remap
+        .take()
+        .expect("compact_keeping must publish a remap");
+    // Apply the remap as the runtime would.
+    policy.apply_compaction_remap(&remap);
+
+    // Expected post-compact view_root, mapped through the remap.
+    let expected_view = *remap
+        .get(&view_before)
+        .expect("view_root must survive compaction (it was an extra root)");
+
+    // Now call update() with identical inputs (player hasn't moved).
+    // Either: cache hit returns the rebased view_root, or cache miss
+    // recomputes against the post-compact store. Both must produce a
+    // NodeId that's valid in the post-compact store.
+    let view_after = policy.update(&mut world.store, world.root, world.level, player_pos);
+
+    // Smoke: NodeStore::get_cell panics on a dangling NodeId, so reading
+    // any cell through view_after proves it lives in the post-compact
+    // store (not stranded in the old epoch).
+    let _ = world.store.get_cell(view_after, 5, 5, 5);
+
+    // Stronger: if the cache was rebased correctly, view_after must
+    // equal the remapped view_before. (If the policy chose to drop the
+    // cache instead, this would still be a valid implementation — but
+    // apply_compaction_remap's contract is "rebase when both ids are in
+    // the remap," and both are by construction here.)
+    assert_eq!(
+        view_after, expected_view,
+        "post-compact update() must return the remapped cached view_root \
+         (got {view_after:?}, expected {expected_view:?})"
+    );
 }

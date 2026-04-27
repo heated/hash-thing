@@ -10,10 +10,16 @@
 //! §4 (hard swap + ±0.25 chunk-unit hysteresis), §6 (chunk_level=7 starting
 //! point).
 //!
-//! Cache key includes the source `world_root` NodeId, so any mutation that
-//! changes the canonical root — sim step, player edit, scene swap, terrain
-//! reseed, [`World::compact()`](crate::sim::World) — auto-invalidates the
-//! cached view. There is no external `invalidate()` API to forget.
+//! Cache key includes the source `world_root` NodeId, so most mutations that
+//! change the canonical root — sim step, player edit, scene swap, terrain
+//! reseed — auto-invalidate the cached view via key inequality.
+//! `World::compact_keeping` is the exception: post-order DFS in
+//! `compacted_with_remap_keeping` allocates NodeIds deterministically in the
+//! fresh store, so an unchanged subtree's `world.root` can land on the
+//! numerically-same NodeId in the new epoch and produce a stale cache HIT.
+//! The runtime must call [`ChunkLodPolicy::apply_compaction_remap`] when it
+//! drains `World::last_compaction_remap` to rebase the cached pair into the
+//! new epoch (or drop it).
 
 use ht_octree::{NodeId, NodeStore};
 use rustc_hash::FxHashMap;
@@ -150,9 +156,11 @@ pub fn target_lod_with_hysteresis(
 }
 
 /// Cache key — any change vs the previous `update()` call triggers a
-/// recompute. Pinning `world_root` makes the cache self-defensive: every
-/// mutation path that produces a fresh root NodeId (sim step, edit, scene
-/// swap, compaction remap) auto-invalidates without any external bookkeeping.
+/// recompute. Pinning `world_root` covers sim step / edit / scene swap /
+/// terrain reseed (each produces a fresh root NodeId). Compaction is the
+/// exception: NodeId allocation is deterministic, so the runtime must call
+/// [`ChunkLodPolicy::apply_compaction_remap`] to rebase the cached pair
+/// into the post-compact epoch.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CacheKey {
     world_root: NodeId,
@@ -164,7 +172,8 @@ struct CacheKey {
 }
 
 /// Per-frame chunk-LOD policy. Owns hysteresis state, cached view root,
-/// and the optional growth baseline for `log::warn!` heuristics.
+/// and the growth baseline that drives the runtime's compaction trigger
+/// (hash-thing-e4ep, threshold [`LOD_COMPACT_RATIO_THRESHOLD`]).
 pub struct ChunkLodPolicy {
     pub enabled: bool,
     pub lod_bias: f32,
@@ -199,8 +208,11 @@ impl ChunkLodPolicy {
     /// Otherwise walks every chunk in lex order, computes target LOD with
     /// hysteresis, and chains [`NodeStore::lod_collapse_chunk`] calls.
     ///
-    /// Self-defensive: any change to `world_root` (sim step, edit, scene
-    /// swap, compaction) yields a different cache key → automatic recompute.
+    /// A change to `world_root` for sim step / edit / scene swap yields a
+    /// different cache key → automatic recompute. Compaction is handled
+    /// out-of-band by [`Self::apply_compaction_remap`] (NodeId allocation
+    /// is deterministic, so a numerically-equal post-compact root can
+    /// otherwise produce a stale cache HIT).
     pub fn update(
         &mut self,
         store: &mut NodeStore,
@@ -306,6 +318,35 @@ impl ChunkLodPolicy {
     /// next ratio measurement reflects the post-compact size, not pre.
     pub fn reset_growth_baseline(&mut self) {
         self.baseline_store_nodes = None;
+    }
+
+    /// Rebase the cached `(world_root, view_root)` pair into the post-compact
+    /// epoch using a `World::compact_keeping` remap. Must be called whenever
+    /// the runtime drains `World::last_compaction_remap`.
+    ///
+    /// `compacted_with_remap_keeping` allocates NodeIds deterministically by
+    /// post-order DFS in a fresh store, so an unchanged subtree's
+    /// `world.root` can land on the numerically-same NodeId across the
+    /// transition. Without this rebase, the next `update()` call would see
+    /// `key.world_root == cache.key.world_root` and return the stale
+    /// `view_root` from the pre-compact store — wrong cells, or a
+    /// dangling-NodeId panic.
+    ///
+    /// If either id is missing from the remap (the runtime kept neither
+    /// `world.root` nor the just-returned `view_root` alive — should never
+    /// happen under the documented main.rs flow, where both are passed as
+    /// `extra_roots`), drops the cache so the next `update()` recomputes
+    /// from scratch.
+    pub fn apply_compaction_remap(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
+        let Some((mut key, view)) = self.cache.take() else {
+            return;
+        };
+        let (Some(&new_world), Some(&new_view)) = (remap.get(&key.world_root), remap.get(&view))
+        else {
+            return;
+        };
+        key.world_root = new_world;
+        self.cache = Some((key, new_view));
     }
 }
 
