@@ -236,6 +236,7 @@ All Phase-0+ measurements use this protocol or override with rationale:
 - **Capture:** every metric in `Perf` + memory + memo-cache stats per generation. JSON or CSV serialization for cross-run comparison.
 - **Statistic:** mean ± p95 over the second half (post-warmup).
 - **Repeats:** 3 independent runs per arm (reduce timer noise).
+- **Focus knob (qny5):** prefer `HASH_THING_PERF_CAPTURE=1` over `HASH_THING_FOCUS=1` for long-form windowed captures. `PERF_CAPTURE` keeps the redraw treadmill alive while the window is unfocused, so a perf run does not steal focus from whoever is using the machine. `FOCUS=1` remains correct for cases that need the window foregrounded (interactive testing, screenshot workflows that depend on activation). The `occluded` short-circuit (8jp) still applies under `PERF_CAPTURE`: a hidden surface still pauses, since there's no point measuring it.
 
 **Convention:** when a bead reports a perf-relevant measurement, it cites this protocol or explicitly notes deviation.
 

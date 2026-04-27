@@ -540,6 +540,13 @@ struct App {
     jump_was_held: bool,
     /// Pause redraw-driven rendering when the window loses focus.
     focused: bool,
+    /// hash-thing-qny5: when `HASH_THING_PERF_CAPTURE=1`, keep rendering
+    /// even when the window is unfocused. Long-form perf captures (e.g.
+    /// szyh / 9k4w-style 120s steady-state runs) can then proceed without
+    /// stealing focus from the user. Cached at startup; the env var is
+    /// read once. The `occluded` short-circuit is unaffected — a hidden
+    /// surface still pauses (8jp), since there's no point rendering it.
+    render_when_unfocused: bool,
     /// Camera mode: orbit (debug) or first-person (gameplay).
     camera_mode: CameraMode,
     /// The player entity, if spawned.
@@ -836,6 +843,8 @@ impl App {
             keys_held: HashSet::new(),
             jump_was_held: false,
             focused: true,
+            render_when_unfocused: std::env::var("HASH_THING_PERF_CAPTURE").ok().as_deref()
+                == Some("1"),
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
@@ -900,6 +909,11 @@ impl App {
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
+        }
+        if app.render_when_unfocused {
+            log::info!(
+                "HASH_THING_PERF_CAPTURE=1: rendering will continue while window is unfocused (qny5)"
+            );
         }
         if let Some(qos) = app.sim_qos {
             log::info!(
@@ -2829,7 +2843,9 @@ impl ApplicationHandler for App {
                 // (which already defaults true, but defense-in-depth: also
                 // skip the `occluded` short-circuit so an Occluded surface
                 // never strands a one-shot dump).
-                if self.dump_frame_path.is_none() && (self.occluded || !self.focused) {
+                if self.dump_frame_path.is_none()
+                    && (self.occluded || (!self.focused && !self.render_when_unfocused))
+                {
                     return;
                 }
 
