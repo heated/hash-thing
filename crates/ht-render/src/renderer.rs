@@ -3194,9 +3194,11 @@ mod tests {
 
     #[test]
     fn submit_fence_in_flight_after_submit_before_callback() {
-        let mut s = SubmitFenceState::default();
-        s.submit_seq = 1; // simulate one submit having happened
-                          // Callback hasn't fired yet → done_seq still 0.
+        // One submit has happened; callback hasn't fired yet → done_seq still 0.
+        let s = SubmitFenceState {
+            submit_seq: 1,
+            ..Default::default()
+        };
         let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
         assert!(in_flight, "submit registered but no callback yet");
         assert!(s.last_pipeline.is_none(), "no completed pipeline yet");
@@ -3204,10 +3206,11 @@ mod tests {
 
     #[test]
     fn submit_fence_not_in_flight_after_callback() {
-        let mut s = SubmitFenceState::default();
-        s.submit_seq = 1;
-        s.done_seq = 1;
-        s.last_pipeline = Some(Duration::from_millis(5));
+        let s = SubmitFenceState {
+            submit_seq: 1,
+            done_seq: 1,
+            last_pipeline: Some(Duration::from_millis(5)),
+        };
         let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
         assert!(
             !in_flight,
@@ -3223,10 +3226,11 @@ mod tests {
         // The guard `if s.done_seq < this_seq` prevents this in the
         // real callback; this test mirrors that contract on the state
         // struct directly.
-        let mut s = SubmitFenceState::default();
-        s.submit_seq = 5;
-        s.done_seq = 4;
-        s.last_pipeline = Some(Duration::from_millis(3));
+        let mut s = SubmitFenceState {
+            submit_seq: 5,
+            done_seq: 4,
+            last_pipeline: Some(Duration::from_millis(3)),
+        };
 
         // A stale callback for seq=3 arrives. Apply guard manually.
         let stale_seq = 3u64;
