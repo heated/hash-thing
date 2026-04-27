@@ -419,7 +419,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 6. Consider SSVDAG / transform-aware compression once baseline is stable.
 7. Consider LOD streaming (Aokana-style) when scaling to 4096³+.
 
-**Performance ownership:** the crew owns the SVDAG performance story top-down — any seat may pick up sub-beads. Mayor surfaces decisions and re-derives the spec from the paper. See `docs/perf/svdag-perf-paper.md` (long form, living) and `docs/perf/svdag-perf-spec.md` (re-derived intuition). For open research frontiers, dated experiments, and threads that have not yet graduated to the settled model, see `docs/perf/svdag-research-log.md`. Reference hardware: M1 MacBook Air 8 GB. Bead: `hash-thing-stue`.
+**Performance ownership:** the crew owns the SVDAG performance story top-down — any seat may pick up sub-beads. Mayor surfaces decisions and re-derives the spec from the paper. See `docs/perf/svdag-perf-paper.md` (long form, living), `docs/perf/svdag-perf-spec.md` (re-derived intuition), and `docs/perf/render-perf-direction.md` (forward-looking roadmap, post-2w1u 2026-04-26). For open research frontiers, dated experiments, and threads that have not yet graduated to the settled model, see `docs/perf/svdag-research-log.md`. Reference hardware: M1 MacBook Air 8 GB. Bead: `hash-thing-stue`.
 
 ### Distribution
 
@@ -509,7 +509,7 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 - ✅ **SVDAG rendering** (epic `5bb`, 10/11): `5bb.1`–`5bb.5` serialization through incremental uploads, `bx7` stale-slot compaction, `5bb.7` palette sync, `5bb.8` zero-direction guard, `5bb.9` particle renderer, `5bb.10` HUD overlay. Remaining: `5bb.6` SSVDAG/LOD research (P4).
 - ✅ Foundations & determinism (`h34`, complete): all 4 beads landed including `h34.4` retire GoL3D + `h34.5` iterative clone_reachable (8m7)
 - ✅ Terrain generation & infinite worlds (`3fq`): heightmap gen + lazy terrain expansion + perf tracking. Cave CA removed (72s — O(n³) bottleneck). Sand biomes (`y2s`): low-freq noise selects sandy regions where grass/dirt → sand (gravity block rule). Sea-level water (`4t6`): `HeightmapField.sea_level` fills air below sea level with water; `classify_box` proof updated. Dungeon carving reverted (t2n.1, design gate); code on `feature/dungeons`. `l1t` terrain gen 15× speedup via `PrecomputedHeightmapField`: 2D heightmap + min/max mipmap for O(1) `classify_box` bounds + precomputed biome grid. `m1f.7.1` scale-aware `TerrainParams::for_level()`.
-- ✅ **Build infra (`4yb`, `3sw`)**: shared `CARGO_TARGET_DIR` across worktrees (saves ~15GB), `[profile.bench]` for fast representative builds, benchmarks use `--profile bench` instead of `--release`. `3sw`: sccache + per-worktree target dirs to eliminate cargo lock contention.
+- ✅ **Build infra (`4yb`, `3sw`)**: shared `CARGO_TARGET_DIR` across worktrees (saves ~15GB), `[profile.perf]` for fast representative builds (renamed from `bench` per `xer4`), benchmarks use `--profile perf` instead of `--release`. `3sw`: sccache + per-worktree target dirs to eliminate cargo lock contention.
 - ✅ **Bug fixes**: `0xq` BlockRule boundary asymmetry (absorbing BCs instead of clipping), `08c` has_block_rule_cells O(n³)→O(nodes) walk, `bhi` NodeStore/SVDAG overflow diagnostics.
 - ✅ **Demo playability (`x5w`)**: sim step moved to background thread (render loop unblocked), SVDAG raycast LOD cutoff (sub-pixel voxels short-circuit to nearest color, cutting GPU step count for complex/distant geometry).
 
@@ -547,6 +547,7 @@ Notes:
 - Felt FPS is the metric, not log-reported `render_gpu` (see hash-thing-dbz5). A fix that moves a single number without moving the felt experience does not count as hitting the target.
 - Tiered features are allowed: e.g. shadows / higher-quality LOD can require more VRAM, as long as the 2 GB tier still renders cleanly with the defaults.
 - Higher resolutions (4K, ultrawide) and beefier rigs are nice-to-have, not the design target.
+- **Audience-distribution context:** per `docs/perf/audience-hw-distribution.md` (cairn 2026-04-26 research), the median Steam gamer has ~3.5–5× the FP32 throughput of an Apple M1/M2 base GPU. Apple Silicon sits at the bottom-25% of active Steam GPUs; macOS is 2.35% of Steam. Implication: optimization budget targets the median Steam GPU (RTX 3060/4060-class), not Mac-specific perf. Mac defaults to `render_scale=0.5` and is treated as the minimum-spec smoke test.
 
 ---
 

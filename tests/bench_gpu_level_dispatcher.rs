@@ -31,7 +31,7 @@
 //! (fast, no `--ignored`). The full level-4 dispatcher chain + throughput
 //! batch is `--ignored`:
 //! ```
-//! cargo test --profile bench --test bench_gpu_level_dispatcher -- --ignored --nocapture
+//! cargo test --profile perf --test bench_gpu_level_dispatcher -- --ignored --nocapture
 //! ```
 
 use std::time::Instant;

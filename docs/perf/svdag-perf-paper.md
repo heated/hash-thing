@@ -319,7 +319,7 @@ Candidate #2a is the narrowest thing still worth trying before conceding to #3: 
 
 Our `Renderer::render` (`crates/ht-render/src/renderer.rs:1843`) calls `surface.get_current_texture()` *before* the SVDAG raycast compute dispatch (`renderer.rs:1989`) — the exact anti-pattern the doc warns about. Our compute pass writes to an off-screen `raycast_texture` that the on-screen render pass later blits from, so the Apple-sanctioned reorder is a mechanical move: encode compute first, then acquire the drawable immediately before the render-pass encode. This is the same class of fix Flutter Impeller shipped on iOS for the same symptom (flutter/flutter#138490). No `surface.as_hal`, no `CADisplayLink`, no unsafe code. Tracked as `hash-thing-dlse.2.2.2`; candidate #2a/#2b above remain as the fallbacks if the reorder doesn't land the signal.
 
-**Candidate #2a outcome 2026-04-21 (onyx) — null result + paper correction.** Shipped the reorder (move `get_current_texture()` after the compute-pass encode, immediately before the on-screen render pass), built both pre- and post-reorder `--profile bench` binaries of `hash-thing 256`, ran each for 35 s on M2 with `RUST_LOG=info`, and compared `surface_acquire_cpu`. Reviewer pass was clean (2 Claude + 1 Codex reviewers, all ship-verdict; full wgpu 29.0.1 + Metal HAL audit of the drop-encoder path confirmed no leak / no partial submit). The measurement was the deciding input, and the measurement said the reorder does not move the signal:
+**Candidate #2a outcome 2026-04-21 (onyx) — null result + paper correction.** Shipped the reorder (move `get_current_texture()` after the compute-pass encode, immediately before the on-screen render pass), built both pre- and post-reorder `--profile bench` binaries (historical: profile renamed to `perf` per `xer4`) of `hash-thing 256`, ran each for 35 s on M2 with `RUST_LOG=info`, and compared `surface_acquire_cpu`. Reviewer pass was clean (2 Claude + 1 Codex reviewers, all ship-verdict; full wgpu 29.0.1 + Metal HAL audit of the drop-encoder path confirmed no leak / no partial submit). The measurement was the deciding input, and the measurement said the reorder does not move the signal:
 
 | window (s) | before mean (ms) | before p95 (ms) | after mean (ms) | after p95 (ms) |
 |-----------:|-----------------:|----------------:|----------------:|---------------:|
@@ -447,7 +447,17 @@ No follow-up shader-opt bead filed. The real lowest-hanging user-visible win at 
 
 **Scope note.** The matrix is `FREEZE_SIM=1` throughout, so `upload_cpu` does not appear — it is a sim-step-rate cost, not a raycast cost, and its own beads (`hash-thing-jw3k`, `hash-thing-t02q`, `hash-thing-71mp`) own it.
 
-### 3.13 Cold-gen baseline at 1024³ and 4096³ (`hash-thing-71t7`, `hash-thing-cswp`)
+### 3.13 Forward-looking direction (cairn 2026-04-26)
+
+After tonight's 2w1u session and Triple plan review, the perf direction for render work is captured in **`docs/perf/render-perf-direction.md`** — a forward-looking roadmap document, not measurement record. Read it before claiming any sub-bead under `9k4w` (cheaper rays), `m59h` (async surface acquire), `adp-res` (adaptive resolution), or `me6i` (frame_total growth-over-time).
+
+Key v3 corrections relevant to this paper:
+- The "Apple Metal compositor pacing" framing in `docs/perf/render-perf-direction.md` v1/v2 was wrong; v3 grounds it in §3.9 instead.
+- Tonight's 30s 64³ captures sampled the dlse.2.2.3 warmup transient; the apparent "30→80ms surface_acquire growth" is the same self-resolving shape characterized at §3.9 step `Addendum 2026-04-21`.
+- Cheaper-rays optimization (sparse-8 vs sparse-64 caveats incorporated; expected yield 1.7–2.2× at 256³, 1.3–1.7× at 4096³).
+- Phase-0 measurement extension protocol standardized (`--profile perf`, 120s/arm, 256³+512³ at 0.5/1.0 render scale, post-warmup statistic).
+
+### 3.14 Cold-gen baseline at 1024³ and 4096³ (`hash-thing-71t7`, `hash-thing-cswp`)
 
 Baseline cold-gen latency for the today-codepath, captured before gen-time hash-consing (cswp.3) lands. Bench harness: `tests/bench_cold_gen_big_map.rs`, 3-run mean, bench profile. M2 16 GB, commit 8fdfd6b. Procedural terrain via `TerrainParams::for_level` (scale-aware defaults).
 
@@ -466,10 +476,10 @@ Run-to-run variance is small at both scales (~5% spread). 4096³ seed completes 
 
 **Reproduce:**
 ```text
-cargo test --profile bench --test bench_cold_gen_big_map -- --ignored --nocapture
+cargo test --profile perf --test bench_cold_gen_big_map -- --ignored --nocapture
 ```
 
-### 3.14 Gen-time hash-cons is already in (`hash-thing-cswp.3`)
+### 3.15 Gen-time hash-cons is already in (`hash-thing-cswp.3`)
 
 cswp.3 was filed expecting "≥10× faster than cswp.1's baseline" from adding gen-time hash-cons. Reading the gen pipeline (`World::seed_terrain` → `terrain::gen::gen_region`, `src/sim/world.rs:2459` → `src/terrain/gen.rs:89`) shows the path already builds the SVDAG via recursive `Builder::build` with two intern channels: `WorldGen::classify` short-circuits uniform sub-cubes to `store.uniform`, and the recursive case interns the 8-child node via `store.interior`. cswp.1's measurements (§3.13) ARE the hash-cons-on numbers — the 10–50× analytical estimate was anchored to the stale 25 s no-dedup projection (`hash-thing-stue.2`), which the current codepath already beats by ~100×.
 
@@ -487,11 +497,49 @@ The voxel-to-node ratio is a *lower bound* on dedup (it counts cells, not subtre
 
 **Reproduce:**
 ```text
-cargo test --profile bench --test verify_gen_hash_cons -- --ignored --nocapture
+cargo test --profile perf --test verify_gen_hash_cons -- --ignored --nocapture
 ```
 (64³ runs unignored as a CI guard.)
 
 **Implication.** cswp.3's stated 10× target was anchored to a no-dedup baseline that does not exist in the codebase. Hunting an additional 10× on top of the 236 ms / 3.7 s in §3.13 is its own work item if/when cold gen becomes a felt user latency — file under cswp follow-ups, not under this verification bead.
+
+---
+
+### 3.16 Steady-state characterization at 256³ × 50% windowed (`hash-thing-29xk`)
+
+Phase-0 of `docs/perf/render-perf-direction.md`. Per the standardized measurement protocol (§3.10's successor in render-perf-direction.md): M2 MBA 16GB, `--profile perf`, world 256³, `HASH_THING_RENDER_SCALE=0.5`, `--res 1080p` windowed on the external 4K display, run length 130s, first 34s discarded as warmup. Three independent runs.
+
+| Metric (post-warmup mean) | Run 1 | Run 2 | Run 3 | Across-run mean |
+|---|---:|---:|---:|---:|
+| `frame_total` | 36.85 ms | 37.41 ms | 37.48 ms | **37.25 ms** |
+| `surface_acquire_cpu` | 14.98 ms | 14.90 ms | 16.97 ms | 15.62 ms |
+| `render_cpu` | 15.21 ms | 15.13 ms | 17.22 ms | 15.85 ms |
+| `render_gpu` (compute pass) | 0.10 ms | 0.10 ms | 0.10 ms | 0.10 ms |
+| `render_pass_gpu` (blit + overlays) | 0.07 ms | 0.06 ms | 0.07 ms | 0.07 ms |
+| `submit_cpu` | 0.15 ms | 0.16 ms | 0.16 ms | 0.16 ms |
+| `prior_gpu_pipeline_cpu` | 59.54 ms | 60.54 ms | 64.14 ms | 61.41 ms |
+| `step` (background sim thread) | 126.77 ms | 126.68 ms | 139.86 ms | 131.10 ms |
+
+Per-window p95 (each log line emits mean/p95 over the most recent 64 samples ≈ 2 s) sits at ~38–44 ms across runs for `surface_acquire_cpu`, with maximum-of-windows reaching 44.94 / 45.48 / 50.02 ms — all consistent with the same multi-modal acquire distribution that §3.9 catalogued at shorter horizons.
+
+**Decision per render-perf-direction.md Phase-0 acceptance:** frame_total steady-state ≫ 17 ms (37 ms vs the 60 FPS budget). The ramp is **NOT** the dlse.2.2.3 warmup transient — it is a true scaling cost at 256³. **Phase 1 (cheaper rays) proceeds.**
+
+**Two findings worth carrying forward:**
+
+1. **Run-to-run reproducibility is excellent** (frame_total mean within 1.7 % across three independent runs). The scaling cost is robust, not a sampling artefact.
+2. **`prior_gpu_pipeline_cpu ≈ 61 ms` is roughly 1.6 × `frame_total`.** This metric tracks the wait for the previous frame's GPU pipeline to complete; the fact that it exceeds a single frame budget confirms the 2w1u surface-acquire pattern is in effect — the M2 surface is forcing implicit GPU sync that pipelines roughly 1.6 frames of work behind the CPU. Compute work itself is tiny (`render_gpu` = 0.10 ms, `render_pass_gpu` = 0.07 ms together = ~0.17 ms of *measured* GPU time per frame — ~0.5 % of frame budget). The remaining 36 ms is acquire/encode CPU + deferred GPU completion, not raycast cost.
+
+**Limitations.** These are the **256³ / 50% / windowed-external** arm only. Run length is 130 s (96 s post-warmup); even within this window, `frame_total` keeps drifting upward (range 18 ms → 79 ms within run 1, 23 ms → 80 ms within run 2 — see the `me6i` Phase-2 lead). The full Phase-0 matrix calls for 64³ / 256³ / 512³ × 0.5 / 1.0 × windowed-external + fullscreen-internal (12 arms × 3 runs = 36 captures); only 3 captures of one arm are recorded here. Follow-up arms left for sub-beads: 64³ + 512³ scale sensitivity at 50 %, render-scale sensitivity at 1.0, fullscreen-internal arm (requires interactive Mac display switch).
+
+**Reproduce (per-run command):**
+
+```text
+RUST_LOG=info HASH_THING_RENDER_SCALE=0.5 HASH_THING_FOCUS=1 \
+  timeout 130 ./target/perf/hash-thing 256 --res 1080p \
+  > /tmp/29xk-256-run.log 2>&1
+```
+
+Analyzer: `/tmp/29xk-analyze.py` (parses `frame_total=mean/p95ms` log lines, drops first 34 s, reports per-metric mean across post-warmup windows). Raw logs preserved at `/tmp/29xk-256-run{1,2,3}.log` for the 2026-04-27 capture session.
 
 ---
 
@@ -1109,7 +1157,7 @@ PoC is intentionally toy-scale and validates *structure*, not throughput.
   level-3 base-case kernel computes, validating that the structural
   recursion encodes correctly across the dispatch boundary.
 
-**Throughput** (`gpu_level_4_throughput`, `--profile bench --ignored`,
+**Throughput** (`gpu_level_4_throughput`, `--profile perf --ignored`,
 N=64 worlds, 10 iters with fresh buffers each iter; M2 MBA, Apple
 Silicon Metal, in-encoder timestamps per dlse.2.3 methodology):
 

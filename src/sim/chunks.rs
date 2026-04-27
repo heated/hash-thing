@@ -1134,6 +1134,154 @@ mod tests {
         }
     }
 
+    /// 7hqn idempotency oracle: with no world mutations and the player
+    /// held still, two back-to-back `recompute` calls must produce
+    /// identical `view_root` + `chunk_lod`. Any churn (iteration-order
+    /// non-determinism in the descent, hashing instability, frame-state
+    /// leakage) shows up as a failure here. Complements the existing
+    /// lex-loop equivalence tests at level 8/10 — those check
+    /// correctness against an oracle; this checks self-stability, which
+    /// is the only practical invariant at the depths where the lex-loop
+    /// oracle is too slow to use.
+    ///
+    /// Level 10 keeps the default-suite cost low (~1 s). Deeper coverage
+    /// at level 12 / 13 is in the `#[ignore]`'d companion tests below.
+    #[test]
+    fn descent_idempotent_at_level_10() {
+        use crate::sim::World;
+        let level = 10u32;
+        let mut world = World::new(level);
+        plant_seeded_cells(&mut world, 24, 17);
+        let chunks_per_axis = 1u32 << (level - CHUNK_LEVEL);
+
+        for &player in &[
+            ChunkCoord::new(0, 0, 0),
+            ChunkCoord::new(
+                chunks_per_axis / 2,
+                chunks_per_axis / 2,
+                chunks_per_axis / 2,
+            ),
+            ChunkCoord::new(chunks_per_axis - 1, 0, 0),
+        ] {
+            let mut policy = ChunkLodPolicy::new();
+            policy.enabled = true;
+
+            // Frame 1 primes hysteresis state.
+            let view_a = policy.recompute(&mut world.store, world.root, world.level, player);
+            let lod_a = policy.chunk_lod.clone();
+
+            // Frame 2 at the same player, same world — must be identical.
+            let view_b = policy.recompute(&mut world.store, world.root, world.level, player);
+            assert_eq!(
+                view_a, view_b,
+                "view_root churn across back-to-back recomputes at player={player:?}"
+            );
+            assert_eq!(
+                policy.chunk_lod, lod_a,
+                "chunk_lod churn across back-to-back recomputes at player={player:?}"
+            );
+
+            // Frame 3 — once stable, stay stable. Catches a hypothetical
+            // "settle after two frames" non-determinism the 1-vs-2 check
+            // alone would miss.
+            let view_c = policy.recompute(&mut world.store, world.root, world.level, player);
+            assert_eq!(
+                view_a, view_c,
+                "view_root drift on third recompute at player={player:?}"
+            );
+            assert_eq!(
+                policy.chunk_lod, lod_a,
+                "chunk_lod drift on third recompute at player={player:?}"
+            );
+        }
+    }
+
+    /// Same idempotency check at level 13 (production target). `#[ignore]`'d
+    /// because cold-cache `recompute` on a planted-cells level-13 world
+    /// runs ~20 s per call; 6 calls (3 positions × 2 frames) overruns the
+    /// default suite budget. Run on demand via:
+    ///
+    ///   cargo test --profile perf --lib -p hash-thing \
+    ///       sim::chunks::tests::descent_idempotent_at_level_13 \
+    ///       -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn descent_idempotent_at_level_13() {
+        use crate::sim::World;
+        let level = 13u32;
+        let mut world = World::new(level);
+        plant_seeded_cells(&mut world, 64, 17);
+        let chunks_per_axis = 1u32 << (level - CHUNK_LEVEL);
+
+        for &player in &[
+            ChunkCoord::new(0, 0, 0),
+            ChunkCoord::new(
+                chunks_per_axis / 2,
+                chunks_per_axis / 2,
+                chunks_per_axis / 2,
+            ),
+            ChunkCoord::new(chunks_per_axis - 1, 0, 0),
+        ] {
+            let mut policy = ChunkLodPolicy::new();
+            policy.enabled = true;
+            let view_a = policy.recompute(&mut world.store, world.root, world.level, player);
+            let lod_a = policy.chunk_lod.clone();
+            let view_b = policy.recompute(&mut world.store, world.root, world.level, player);
+            assert_eq!(view_a, view_b, "view churn at player={player:?}");
+            assert_eq!(policy.chunk_lod, lod_a, "chunk_lod churn at player={player:?}");
+        }
+    }
+
+    /// 7hqn extension: idempotency on a hand-built world with raw `Leaf`
+    /// nodes at contextual level above CHUNK_LEVEL. Mirrors the structure
+    /// `descent_handles_compressed_leaf_above_chunk_level` exercises, but
+    /// scales to level 13 (production target) and checks self-stability
+    /// instead of cross-path equivalence. Fast even at level 13 because
+    /// the world is a uniform Leaf — the descent's fast path engages
+    /// across the full root and avoids per-chunk recursion. Catches
+    /// divergences that only manifest when the descent's Leaf arm is hit
+    /// at deep levels.
+    #[test]
+    fn descent_idempotent_on_compressed_leaf_at_level_13() {
+        use ht_octree::NodeStore;
+
+        let world_level = 13u32;
+        let chunks_per_axis = 1u32 << (world_level - CHUNK_LEVEL);
+        let mut store = NodeStore::new();
+        let stone = store.leaf(stone_cell());
+        // All-stone level-13 root via a single uniform Leaf — the descent
+        // sees raw `Leaf` at every contextual level from 13 down.
+        let world_root = store.interior(world_level, [stone; 8]);
+
+        for &player in &[
+            ChunkCoord::new(0, 0, 0),
+            ChunkCoord::new(
+                chunks_per_axis / 2,
+                chunks_per_axis / 2,
+                chunks_per_axis / 2,
+            ),
+            ChunkCoord::new(
+                chunks_per_axis - 1,
+                chunks_per_axis - 1,
+                chunks_per_axis - 1,
+            ),
+        ] {
+            let mut policy = ChunkLodPolicy::new();
+            policy.enabled = true;
+            let view_a = policy.recompute(&mut store, world_root, world_level, player);
+            let lod_a = policy.chunk_lod.clone();
+            let view_b = policy.recompute(&mut store, world_root, world_level, player);
+            assert_eq!(
+                view_a, view_b,
+                "compressed-leaf scene: view_root churn at player={player:?}"
+            );
+            assert_eq!(
+                policy.chunk_lod, lod_a,
+                "compressed-leaf scene: chunk_lod churn at player={player:?}"
+            );
+        }
+    }
+
     /// Box-Chebyshev arithmetic spot checks. Verifies the helper directly
     /// before relying on it through descent.
     #[test]

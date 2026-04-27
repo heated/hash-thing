@@ -127,6 +127,19 @@ pub struct RendererCpuPhaseTimes {
     pub prior_gpu_in_flight_at_acquire: bool,
 }
 
+/// hash-thing-hc0g: row-tightly-packed RGBA8 readback of the off-surface
+/// render target. Returned by `Renderer::read_off_surface_pixels`. PNG
+/// encoding lives in the binary; this struct is just the shape of the
+/// raw pixel data after row-padding stripping and BGRA→RGBA byteswap.
+pub struct OffSurfacePixels {
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` bytes. sRGB-encoded if the surface format is
+    /// `*Srgb`; raw linear otherwise. Caller writes this to a PNG with
+    /// `ColorType::Rgba` + `BitDepth::Eight` directly.
+    pub rgba8: Vec<u8>,
+}
+
 /// hash-thing-dbz5.1: shared state for tracking the prior frame's GPU
 /// submission fence. The render thread bumps `submit_seq` after each
 /// `queue.submit()`; the wgpu polling thread updates `done_seq` and
@@ -1539,6 +1552,10 @@ impl Renderer {
     /// next frame's `GpuTiming::poll` fires before the prior frame's
     /// `map_async` readback callback lands. The diagnostic's primary signal
     /// (`surface_acquire_cpu`, `render_cpu`) is CPU-side and unaffected.
+    ///
+    /// hash-thing-hc0g: `COPY_SRC` is included so `read_off_surface_pixels`
+    /// can stage the texture into a CPU-mappable buffer for PNG dumps.
+    /// Permission-only — no behavioral change for the dlse.2.2 path.
     pub fn enable_off_surface(&mut self) {
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("off_surface_target"),
@@ -1551,7 +1568,7 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         log::info!(
@@ -1561,6 +1578,124 @@ impl Renderer {
             self.config.format,
         );
         self.off_surface_target = Some(tex);
+    }
+
+    /// Synchronously read the off-surface render target back to CPU memory
+    /// as row-tightly-packed RGBA8 bytes. Returns `None` if off-surface mode
+    /// is not enabled. Blocks the calling thread on `device.poll(wait)` —
+    /// intended for one-shot CLI use (`--dump-frame`), not the hot redraw
+    /// loop.
+    ///
+    /// Handles two surface-format quirks:
+    /// - GPU row strides must be aligned to `COPY_BYTES_PER_ROW_ALIGNMENT`
+    ///   (256 bytes); padding is stripped on the way out.
+    /// - macOS Metal typically picks `Bgra8UnormSrgb`; we byteswap each
+    ///   pixel's R↔B so the returned buffer is always RGBA. sRGB encoding
+    ///   passes through unchanged (PNG with `ColorType::Rgba` stores sRGB
+    ///   bytes directly when the upstream texels are `*Srgb`).
+    ///
+    /// Panics on unrecognised surface formats — better to fail loudly than
+    /// silently swizzle. Today we expect `Bgra8UnormSrgb` / `Bgra8Unorm` /
+    /// `Rgba8UnormSrgb` / `Rgba8Unorm`.
+    ///
+    /// hash-thing-hc0g.
+    pub fn read_off_surface_pixels(&self) -> Option<OffSurfacePixels> {
+        let tex = self.off_surface_target.as_ref()?;
+        let width = self.config.width.max(1);
+        let height = self.config.height.max(1);
+        let bytes_per_pixel: u32 = 4;
+        let unpadded_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row = unpadded_row.div_ceil(align) * align;
+        let buffer_size = (padded_row as u64) * (height as u64);
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dump_frame_staging"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dump_frame_encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        // Capture the `map_async` callback result so a mapping failure
+        // (device lost, OOM, etc.) surfaces with attribution instead of
+        // panicking inside `get_mapped_range` with an opaque inner-wgpu
+        // message. Only matters in pathological cases — for healthy
+        // single-shot dumps the callback always reports `Ok(())` —
+        // but it makes the failure mode debuggable.
+        let map_result: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            Arc::new(Mutex::new(None));
+        let map_result_cb = Arc::clone(&map_result);
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            *map_result_cb.lock().expect("dump_frame map_async lock") = Some(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        match map_result
+            .lock()
+            .expect("dump_frame map_async lock")
+            .as_ref()
+        {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("read_off_surface_pixels: staging buffer map failed: {e:?}"),
+            None => panic!("read_off_surface_pixels: map_async callback never fired"),
+        }
+
+        let mapped = slice.get_mapped_range();
+        let mut rgba8 = Vec::with_capacity((unpadded_row as usize) * (height as usize));
+        for row in 0..height {
+            let start = (row * padded_row) as usize;
+            let end = start + unpadded_row as usize;
+            rgba8.extend_from_slice(&mapped[start..end]);
+        }
+        drop(mapped);
+        staging.unmap();
+
+        match self.config.format {
+            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm => {
+                for px in rgba8.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+            }
+            wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Rgba8Unorm => {}
+            other => panic!(
+                "read_off_surface_pixels: unsupported surface format {other:?} \
+                 (supported: Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, Rgba8UnormSrgb)"
+            ),
+        }
+
+        Some(OffSurfacePixels {
+            width,
+            height,
+            rgba8,
+        })
     }
 
     /// Create the storage texture used as compute raycast output (5bb.6.1).
@@ -3059,9 +3194,11 @@ mod tests {
 
     #[test]
     fn submit_fence_in_flight_after_submit_before_callback() {
-        let mut s = SubmitFenceState::default();
-        s.submit_seq = 1; // simulate one submit having happened
-                          // Callback hasn't fired yet → done_seq still 0.
+        // One submit has happened; callback hasn't fired yet → done_seq still 0.
+        let s = SubmitFenceState {
+            submit_seq: 1,
+            ..Default::default()
+        };
         let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
         assert!(in_flight, "submit registered but no callback yet");
         assert!(s.last_pipeline.is_none(), "no completed pipeline yet");
@@ -3069,10 +3206,11 @@ mod tests {
 
     #[test]
     fn submit_fence_not_in_flight_after_callback() {
-        let mut s = SubmitFenceState::default();
-        s.submit_seq = 1;
-        s.done_seq = 1;
-        s.last_pipeline = Some(Duration::from_millis(5));
+        let s = SubmitFenceState {
+            submit_seq: 1,
+            done_seq: 1,
+            last_pipeline: Some(Duration::from_millis(5)),
+        };
         let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
         assert!(
             !in_flight,
@@ -3088,10 +3226,11 @@ mod tests {
         // The guard `if s.done_seq < this_seq` prevents this in the
         // real callback; this test mirrors that contract on the state
         // struct directly.
-        let mut s = SubmitFenceState::default();
-        s.submit_seq = 5;
-        s.done_seq = 4;
-        s.last_pipeline = Some(Duration::from_millis(3));
+        let mut s = SubmitFenceState {
+            submit_seq: 5,
+            done_seq: 4,
+            last_pipeline: Some(Duration::from_millis(3)),
+        };
 
         // A stale callback for seq=3 arrives. Apply guard manually.
         let stale_seq = 3u64;

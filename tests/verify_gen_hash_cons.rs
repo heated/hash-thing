@@ -15,7 +15,7 @@
 //!
 //! Run with:
 //! ```text
-//! cargo test --profile bench --test verify_gen_hash_cons -- --ignored --nocapture
+//! cargo test --profile perf --test verify_gen_hash_cons -- --ignored --nocapture
 //! ```
 //! The 64³ case runs unignored as a quick CI guard.
 

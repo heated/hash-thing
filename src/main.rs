@@ -601,6 +601,12 @@ struct App {
     /// `with_activate_ignoring_other_apps` flag so both gates fire from
     /// the same input.
     want_focus_on_launch: bool,
+    /// hash-thing-hc0g: when `Some(path)`, render exactly one frame to
+    /// off-surface, write a PNG to `path`, then exit. The window stays
+    /// hidden so there is no foreground-window contamination. Set from
+    /// `main()` after construction; default `None` for the 40+ existing
+    /// `App::new(N)` test callers.
+    dump_frame_path: Option<std::path::PathBuf>,
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -842,6 +848,7 @@ impl App {
             volume_size,
             target_pixels_override: None,
             want_focus_on_launch: false,
+            dump_frame_path: None,
             step_handle: None,
             step_start: std::time::Instant::now(),
             render_origin,
@@ -2258,9 +2265,14 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.window.is_none() {
+            let dump_frame = self.dump_frame_path.is_some();
             let attrs = WindowAttributes::default()
                 .with_title("hash-thing | 3D Hashlife Engine")
-                .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080));
+                .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080))
+                // hash-thing-hc0g: dump-frame mode uses a hidden window so
+                // there is no foreground-window contamination. wgpu still
+                // gets a usable surface; we just never present.
+                .with_visible(!dump_frame);
             let window = Arc::new(
                 event_loop
                     .create_window(attrs)
@@ -2273,9 +2285,14 @@ impl ApplicationHandler for App {
             // `main()`. The macOS event_loop_builder's
             // `with_activate_ignoring_other_apps` is set from the same
             // signal, so both gates fire together.
-            window.set_visible(true);
-            if self.want_focus_on_launch {
-                window.focus_window();
+            // hash-thing-hc0g: dump-frame mode skips both visibility and
+            // focus — the window stays hidden so there is no foreground
+            // contamination.
+            if !dump_frame {
+                window.set_visible(true);
+                if self.want_focus_on_launch {
+                    window.focus_window();
+                }
             }
             self.window = Some(window.clone());
 
@@ -2289,7 +2306,9 @@ impl ApplicationHandler for App {
             // `surface.get_current_texture()` + `present()`; pairs with the
             // acquire harness to measure whether the ~25 ms surface_acquire
             // stall is swapchain-pacing (collapses) or elsewhere (persists).
-            if std::env::var("HASH_THING_OFF_SURFACE").ok().as_deref() == Some("1") {
+            // hash-thing-hc0g: dump-frame mode reuses the same off-surface
+            // path so `read_off_surface_pixels` has something to read.
+            if dump_frame || std::env::var("HASH_THING_OFF_SURFACE").ok().as_deref() == Some("1") {
                 renderer.enable_off_surface();
             }
             self.renderer = Some(renderer);
@@ -2781,7 +2800,14 @@ impl ApplicationHandler for App {
                 // stepping the sim + uploading the SVDAG during a 100%-CPU
                 // spin on an invisible surface is exactly what 8jp was about.
                 // `WindowEvent::Occluded(false)` re-arms the loop.
-                if self.occluded || !self.focused {
+                //
+                // hash-thing-hc0g: dump-frame mode runs to completion
+                // regardless of focus/occlusion. The window is hidden on
+                // purpose; no focus event will fire to flip `self.focused`
+                // (which already defaults true, but defense-in-depth: also
+                // skip the `occluded` short-circuit so an Occluded surface
+                // never strands a one-shot dump).
+                if self.dump_frame_path.is_none() && (self.occluded || !self.focused) {
                     return;
                 }
 
@@ -2852,7 +2878,7 @@ impl ApplicationHandler for App {
                             )
                         {
                             log::warn!(
-                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile bench -- {}` for interactive playtesting.",
+                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile perf -- {}` for interactive playtesting.",
                                 step_elapsed.as_secs_f64() * 1000.0,
                                 self.volume_size,
                                 self.volume_size,
@@ -3271,6 +3297,47 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                // hash-thing-hc0g: dump first rendered frame to PNG, then
+                // exit. Off-surface mode was enabled in `resumed()` so the
+                // render target carries valid pixel data with `COPY_SRC`.
+                // Runs only on the FIRST `Rendered` outcome — earlier
+                // `Reconfigured` / `Timeout` frames retry naturally via
+                // the bottom-of-arm `request_redraw()`.
+                //
+                // `take()` (not `clone()`): `event_loop.exit()` on macOS
+                // doesn't terminate synchronously, so winit may still
+                // deliver another Resized + RedrawRequested before the
+                // exit lands. Without taking ownership we'd dump twice.
+                if matches!(outcome, Some(render::FrameOutcome::Rendered)) {
+                    if let Some(path) = self.dump_frame_path.take() {
+                        let renderer = self
+                            .renderer
+                            .as_ref()
+                            .expect("renderer present after Rendered outcome");
+                        let pixels = renderer
+                            .read_off_surface_pixels()
+                            .expect("off_surface_target enabled in resumed() for dump-frame mode");
+                        if let Err(e) =
+                            write_dump_frame_png(&path, pixels.width, pixels.height, &pixels.rgba8)
+                        {
+                            log::error!(
+                                "--dump-frame: PNG write to {} failed: {e}",
+                                path.display()
+                            );
+                            event_loop.exit();
+                            std::process::exit(2);
+                        }
+                        log::info!(
+                            "--dump-frame: wrote {}x{} PNG to {}",
+                            pixels.width,
+                            pixels.height,
+                            path.display(),
+                        );
+                        event_loop.exit();
+                        return;
+                    }
+                }
+
                 // Kick off the next background step only after this frame has
                 // finished consuming the live world snapshot.
                 self.maybe_start_background_step();
@@ -3330,23 +3397,43 @@ fn parse_res_value(s: &str) -> Option<u64> {
     }
 }
 
-/// Parsed CLI arguments. Returned as a struct rather than a tuple so future
-/// flags (xu3d's `--focused`, etc.) can be added without re-tupling every
-/// call site / test (kh9l plan-review IMPORTANT).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParsedArgs {
-    volume_size: u32,
-    /// `--demo` or `--res VALUE` pinned-pixel budget. `None` → auto-pick.
-    target_pixels_override: Option<u64>,
-    /// `--demo` was passed (independent of target_pixels_override, since
-    /// `--res 1080p` happens to produce the same target). Used by kh9l
-    /// to wire window focus-on-launch to the demo flag.
-    demo: bool,
+/// hash-thing-hc0g: write `rgba8` (row-tightly-packed, `width * height * 4`
+/// bytes, sRGB-encoded for `*Srgb` surface formats) as an 8-bit RGBA PNG.
+/// Used by the `--dump-frame` headless screenshot harness.
+fn write_dump_frame_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba8: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(path)?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png_writer = encoder.write_header()?;
+    png_writer.write_image_data(rgba8)?;
+    Ok(())
 }
 
-/// Parse `[SIZE] [--demo | --res VALUE]` from an arg iterator.
-/// `args` should already have the binary path stripped (callers usually
-/// pass `std::env::args().skip(1)`). Pure function for unit testing.
+/// Parsed CLI args. Field-named struct so adding flags doesn't churn every
+/// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
+/// `demo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedArgs {
+    volume_size: u32,
+    target_pixels: Option<u64>,
+    /// hash-thing-kh9l: `--demo` was passed (independent of target_pixels,
+    /// since `--res 1080p` produces the same pixel budget). Drives
+    /// window focus-on-launch in main().
+    demo: bool,
+    /// `--dump-frame PATH`: render one frame to PNG at `PATH`, then exit.
+    dump_frame: Option<std::path::PathBuf>,
+}
+
+/// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
+/// iterator. `args` should already have the binary path stripped (callers
+/// usually pass `std::env::args().skip(1)`). Pure function for unit testing.
 ///
 /// Panics with a usage message on invalid input — same idiom as the prior
 /// bare-positional parse this replaces. `--help` / `-h` short-circuit by
@@ -3356,16 +3443,18 @@ struct ParsedArgs {
 /// `--demo` and `--res VALUE` are mutually exclusive — passing both
 /// panics rather than silent last-one-wins. Multiple `--res` likewise
 /// panics rather than last-one-wins (hash-thing-06so plan-review +
-/// code-review findings).
+/// code-review findings). Multiple `--dump-frame` follows the same rule.
 fn parse_args_from<I, S>(args: I) -> ParsedArgs
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH]";
+    const USAGE: &str =
+        "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] [--dump-frame PATH]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
+    let mut dump_frame: Option<std::path::PathBuf> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -3390,6 +3479,22 @@ where
                     .unwrap_or_else(|| panic!("{USAGE}\n--res VALUE: unrecognised '{v_str}'"));
                 res_target = Some(parsed);
             }
+            "--dump-frame" => {
+                if dump_frame.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-frame");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-frame requires a PATH"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-frame requires a PATH; saw '{v_str}'");
+                }
+                if v_str.is_empty() {
+                    panic!("{USAGE}\n--dump-frame requires a non-empty PATH");
+                }
+                dump_frame = Some(std::path::PathBuf::from(v_str));
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -3408,15 +3513,16 @@ where
     if demo && res_target.is_some() {
         panic!("{USAGE}\n--demo and --res are mutually exclusive");
     }
-    let target = if demo {
+    let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
         res_target
     };
     ParsedArgs {
         volume_size: volume_size.unwrap_or(DEFAULT_VOLUME_SIZE),
-        target_pixels_override: target,
+        target_pixels,
         demo,
+        dump_frame,
     }
 }
 
@@ -3456,8 +3562,9 @@ fn main() {
 
     let ParsedArgs {
         volume_size,
-        target_pixels_override,
+        target_pixels: target_pixels_override,
         demo,
+        dump_frame: dump_frame_path,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -3465,6 +3572,12 @@ fn main() {
     );
     if let Some(target) = target_pixels_override {
         log::info!("CLI render target: {target} px (--demo / --res)");
+    }
+    if let Some(path) = dump_frame_path.as_ref() {
+        log::info!(
+            "--dump-frame: will render one frame to {} and exit",
+            path.display()
+        );
     }
 
     // Single source of truth for focus-on-launch. Two downstream sites
@@ -3504,6 +3617,7 @@ fn main() {
     let mut app = App::new(volume_size);
     app.target_pixels_override = target_pixels_override;
     app.want_focus_on_launch = want_focus_on_launch;
+    app.dump_frame_path = dump_frame_path;
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -3567,70 +3681,123 @@ mod tests {
 
     #[test]
     fn parse_args_from_size_only() {
-        let p = parse_args_from(["256"]);
-        assert_eq!(p.volume_size, 256);
-        assert_eq!(p.target_pixels_override, None);
-        assert!(!p.demo);
+        let r = parse_args_from(["256"]);
+        assert_eq!(r.volume_size, 256);
+        assert_eq!(r.target_pixels, None);
+        assert!(!r.demo);
+        assert_eq!(r.dump_frame, None);
     }
 
     #[test]
     fn parse_args_from_no_args_uses_default() {
-        let p = parse_args_from(std::iter::empty::<&str>());
-        assert_eq!(p.volume_size, DEFAULT_VOLUME_SIZE);
-        assert_eq!(p.target_pixels_override, None);
-        assert!(!p.demo);
+        let r = parse_args_from(std::iter::empty::<&str>());
+        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.target_pixels, None);
+        assert!(!r.demo);
+        assert_eq!(r.dump_frame, None);
     }
 
     #[test]
     fn parse_args_from_demo_alone() {
-        let p = parse_args_from(["--demo"]);
-        assert_eq!(p.volume_size, DEFAULT_VOLUME_SIZE);
-        assert_eq!(p.target_pixels_override, Some(1920 * 1080));
-        assert!(p.demo, "kh9l: --demo must surface as demo=true");
+        let r = parse_args_from(["--demo"]);
+        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(r.demo, "kh9l: --demo must surface as demo=true");
     }
 
     #[test]
     fn parse_args_from_demo_with_size_either_order() {
-        let p1 = parse_args_from(["--demo", "256"]);
-        let p2 = parse_args_from(["256", "--demo"]);
-        assert_eq!(p1.volume_size, 256);
-        assert_eq!(p1.target_pixels_override, Some(1920 * 1080));
-        assert!(p1.demo);
-        assert_eq!(p2.volume_size, 256);
-        assert_eq!(p2.target_pixels_override, Some(1920 * 1080));
-        assert!(p2.demo);
+        let r1 = parse_args_from(["--demo", "256"]);
+        let r2 = parse_args_from(["256", "--demo"]);
+        assert_eq!((r1.volume_size, r1.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r1.demo);
+        assert_eq!((r2.volume_size, r2.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r2.demo);
     }
 
     #[test]
     fn parse_args_from_res_named() {
-        let p = parse_args_from(["--res", "1440p", "512"]);
-        assert_eq!(p.volume_size, 512);
-        assert_eq!(p.target_pixels_override, Some(2560 * 1440));
+        let r = parse_args_from(["--res", "1440p", "512"]);
+        assert_eq!(r.volume_size, 512);
+        assert_eq!(r.target_pixels, Some(2560 * 1440));
         assert!(
-            !p.demo,
-            "kh9l: --res 1440p is NOT --demo, even with same target_pixels would happen at 1080p"
+            !r.demo,
+            "kh9l: --res 1440p is NOT --demo, even with same pixel budget"
         );
     }
 
     #[test]
     fn parse_args_from_res_arbitrary_wxh() {
-        let p = parse_args_from(["--res", "1920x1080"]);
-        assert_eq!(p.volume_size, DEFAULT_VOLUME_SIZE);
-        assert_eq!(p.target_pixels_override, Some(1920 * 1080));
+        let r = parse_args_from(["--res", "1920x1080"]);
+        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.target_pixels, Some(1920 * 1080));
         assert!(
-            !p.demo,
-            "kh9l: --res 1920x1080 has same target_pixels as --demo but demo=false"
+            !r.demo,
+            "kh9l: --res 1920x1080 has same target as --demo but demo=false"
         );
     }
 
     #[test]
     fn parse_args_from_res_1080p_is_not_demo() {
-        // kh9l regression guard: --res 1080p produces the same
-        // target_pixels_override as --demo, but `demo` is false. This bit
-        // drives focus-on-launch and must not fire for --res 1080p.
-        let p = parse_args_from(["--res", "1080p"]);
-        assert_eq!(p.target_pixels_override, Some(1920 * 1080));
-        assert!(!p.demo);
+        // kh9l regression guard: --res 1080p produces the same target
+        // pixel budget as --demo, but `demo` is false. This bit drives
+        // focus-on-launch and must not fire for --res 1080p.
+        let r = parse_args_from(["--res", "1080p"]);
+        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(!r.demo);
+    }
+
+    // --- hash-thing-hc0g: --dump-frame CLI flag parsing ---
+
+    #[test]
+    fn parse_args_from_dump_frame_path() {
+        let r = parse_args_from(["--dump-frame", "/tmp/foo.png"]);
+        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.target_pixels, None);
+        assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
+    }
+
+    #[test]
+    fn parse_args_from_dump_frame_with_size_and_demo() {
+        // --dump-frame is orthogonal to --demo / size: all three coexist.
+        let r = parse_args_from(["64", "--demo", "--dump-frame", "/tmp/foo.png"]);
+        assert_eq!(r.volume_size, 64);
+        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(r.demo);
+        assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
+    }
+
+    #[test]
+    fn parse_args_from_dump_frame_with_res() {
+        let r = parse_args_from(["--res", "720p", "--dump-frame", "out.png", "256"]);
+        assert_eq!(r.volume_size, 256);
+        assert_eq!(r.target_pixels, Some(1280 * 720));
+        assert!(!r.demo);
+        assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("out.png")));
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-frame requires a PATH")]
+    fn parse_args_from_dump_frame_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-frame requires a PATH; saw '--demo'")]
+    fn parse_args_from_dump_frame_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-frame")]
+    fn parse_args_from_two_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-frame", "a.png", "--dump-frame", "b.png"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-frame requires a non-empty PATH")]
+    fn parse_args_from_dump_frame_empty_path_panics() {
+        let _ = parse_args_from(["--dump-frame", ""]);
     }
 
     #[test]

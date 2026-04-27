@@ -1106,10 +1106,12 @@ impl NodeStore {
 
     /// Recursive worker for [`Self::lod_collapse_chunk`]. Descends the unique path
     /// to the target chunk, calling `lod_collapse` once at the chunk
-    /// boundary. The Leaf early-return preserves uniform regions: if the
-    /// path passes through a raw `Leaf(s)` above `chunk_level` (the
-    /// uniform-compression case), the chunk is already represented by that
-    /// leaf and collapsing it cannot change anything.
+    /// boundary. The Leaf early-return preserves uniform regions at any
+    /// descent level: if the path passes through (or terminates at) a raw
+    /// `Leaf(s)` — including when the chunk subtree itself is a uniform
+    /// Leaf — the chunk is already represented by that leaf and
+    /// collapsing it cannot change anything. The Leaf arm must precede
+    /// the `level == chunk_level` delegation; see hash-thing-d8qa.
     fn lod_collapse_chunk_rec(
         &mut self,
         node: NodeId,
@@ -1118,12 +1120,18 @@ impl NodeStore {
         chunk_level: u32,
         target_lod: u32,
     ) -> NodeId {
-        if level == chunk_level {
-            return self.lod_collapse(node, target_lod);
-        }
         match *self.get(node) {
+            // A raw Leaf at any descent level represents a uniform region;
+            // collapsing a uniform region cannot change anything. The Leaf
+            // arm must precede the `level == chunk_level` delegation
+            // because `lod_collapse` asserts `target_lod <= Node::level()`
+            // and `Node::Leaf::level()` is 0 regardless of the leaf's
+            // semantic level (hash-thing-d8qa).
             Node::Leaf(_) => node,
             Node::Interior { children, .. } => {
+                if level == chunk_level {
+                    return self.lod_collapse(node, target_lod);
+                }
                 // At descent step from `level` to `level-1`, the chunk grid
                 // halves. The target chunk's high bit at this depth picks
                 // the octant; the remaining bits address the sub-chunk
@@ -3333,6 +3341,53 @@ mod tests {
             collapsed_1, raw_root,
             "uniform-Leaf-above-chunk_level chunk collapse (target_lod=1) must still return root unchanged",
         );
+    }
+
+    /// Regression for hash-thing-d8qa: when the recursive descent of
+    /// `lod_collapse_chunk` reaches `level == chunk_level` and the node at
+    /// that position is a raw uniform-region `Leaf` (the chunk subtree IS
+    /// a Leaf, distinct from the uniform-Leaf-above-chunk_level case
+    /// pinned in `lod_collapse_chunk_uniform_leaf_above_chunk_level`),
+    /// the inner delegation to `lod_collapse(node, target_lod)` used to
+    /// panic on `target_lod <= root_level` because `Node::Leaf::level()`
+    /// is 0 regardless of the leaf's semantic level. The fix moves the
+    /// `Leaf` early-return ahead of the `level == chunk_level` branch.
+    ///
+    /// The fixture builds a `raw_root` directly with a `store.leaf(s)`
+    /// placed as a child of `store.interior(...)` — `set_cell` against
+    /// `empty(N)` produces Interior chains all the way down (no
+    /// canonicalization to raw uniform Leaves), so the bug must be
+    /// reproduced via direct uniform-region compression as the existing
+    /// above-chunk-level test does.
+    #[test]
+    fn lod_collapse_chunk_target_is_uniform_leaf_d8qa() {
+        let mut store = NodeStore::new();
+        // Level-3 root (8³). chunk_level=2 → 2 chunks per axis (chunks
+        // are 4³). Octant 1 of the root holds a raw `Leaf(stone)`
+        // representing a uniform-stone level-2 chunk; octants 0 and
+        // 2..7 are level-2 empty Interiors so the surrounding Interior
+        // doesn't degenerate to a uniform Leaf itself.
+        let stone_leaf = store.leaf(mat(1));
+        let empty2 = store.empty(2);
+        let mut children = [empty2; 8];
+        children[1] = stone_leaf;
+        let raw_root = store.interior(3, children);
+
+        // chunk (1,0,0) at chunk_level=2 lands directly on the raw Leaf.
+        // Pre-fix: rec walker hits `level == chunk_level` first, calls
+        // `lod_collapse(stone_leaf, target_lod)`, panics on
+        // `target_lod <= Node::level()=0` for any nonzero target_lod.
+        // Post-fix: the Leaf arm fires first, returns stone_leaf
+        // unchanged; the parent reassembles matching children, and
+        // `interior(3, children)` hash-cons-returns the original
+        // raw_root NodeId.
+        for target_lod in [1u32, 2u32] {
+            let collapsed = store.lod_collapse_chunk(raw_root, 1, 0, 0, 2, target_lod);
+            assert_eq!(
+                collapsed, raw_root,
+                "lod_collapse_chunk on uniform-Leaf chunk must short-circuit at target_lod={target_lod}",
+            );
+        }
     }
 
     /// Idempotence: collapsing twice at the same target_lod returns the

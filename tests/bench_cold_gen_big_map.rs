@@ -7,7 +7,7 @@
 //!
 //! Run with:
 //! ```text
-//! cargo test --profile bench --test bench_cold_gen_big_map -- --ignored --nocapture
+//! cargo test --profile perf --test bench_cold_gen_big_map -- --ignored --nocapture
 //! ```
 //!
 //! Confidence note: observational only — prints timings for the perf paper,
