@@ -17,7 +17,7 @@
 //!
 //! Run with:
 //! ```text
-//! cargo test --profile bench --test bench_chunk_reachable -- --ignored --nocapture
+//! cargo test --profile perf --test bench_chunk_reachable -- --ignored --nocapture
 //! ```
 
 use hash_thing::sim::World;

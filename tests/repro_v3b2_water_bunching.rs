@@ -3,7 +3,7 @@
 //! dumps a vertical y-slice as ASCII so a reader can see whether water
 //! settles cleanly or bunches/striates.
 //!
-//! Run: `cargo test --profile bench --test repro_v3b2_water_bunching
+//! Run: `cargo test --profile perf --test repro_v3b2_water_bunching
 //!       -- --ignored --nocapture`
 //!
 //! Scope: pure CPU, no GPU / winit. Visual artifacts observable only at
