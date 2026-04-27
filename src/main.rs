@@ -594,6 +594,13 @@ struct App {
     /// existing `App::new(N)` test callers default this to `None`).
     /// Threaded through to `Renderer::new`.
     target_pixels_override: Option<u64>,
+    /// hash-thing-kh9l: focus the window on launch. Set in `main()` from
+    /// `--demo` (kh9l) or `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults
+    /// to `false` so the 40+ test callers stay in the no-focus regime.
+    /// Mirrored into the macOS event_loop_builder's
+    /// `with_activate_ignoring_other_apps` flag so both gates fire from
+    /// the same input.
+    want_focus_on_launch: bool,
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -834,6 +841,7 @@ impl App {
             entities: sim::EntityStore::new(),
             volume_size,
             target_pixels_override: None,
+            want_focus_on_launch: false,
             step_handle: None,
             step_start: std::time::Instant::now(),
             render_origin,
@@ -2260,9 +2268,13 @@ impl ApplicationHandler for App {
             );
             // Do NOT focus-on-launch by default (edward 2026-04-21): the
             // game stealing focus mid-dev-loop blocks keyboard input to the
-            // terminal/agent surface. Opt in with HASH_THING_FOCUS=1.
+            // terminal/agent surface. Opt in with `HASH_THING_FOCUS=1` (sgcv)
+            // or `--demo` (kh9l). Both feed `App::want_focus_on_launch` via
+            // `main()`. The macOS event_loop_builder's
+            // `with_activate_ignoring_other_apps` is set from the same
+            // signal, so both gates fire together.
             window.set_visible(true);
-            if std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1") {
+            if self.want_focus_on_launch {
                 window.focus_window();
             }
             self.window = Some(window.clone());
@@ -3318,21 +3330,34 @@ fn parse_res_value(s: &str) -> Option<u64> {
     }
 }
 
+/// Parsed CLI arguments. Returned as a struct rather than a tuple so future
+/// flags (xu3d's `--focused`, etc.) can be added without re-tupling every
+/// call site / test (kh9l plan-review IMPORTANT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedArgs {
+    volume_size: u32,
+    /// `--demo` or `--res VALUE` pinned-pixel budget. `None` → auto-pick.
+    target_pixels_override: Option<u64>,
+    /// `--demo` was passed (independent of target_pixels_override, since
+    /// `--res 1080p` happens to produce the same target). Used by kh9l
+    /// to wire window focus-on-launch to the demo flag.
+    demo: bool,
+}
+
 /// Parse `[SIZE] [--demo | --res VALUE]` from an arg iterator.
 /// `args` should already have the binary path stripped (callers usually
 /// pass `std::env::args().skip(1)`). Pure function for unit testing.
 ///
-/// Returns `(volume_size, target_pixels_override)`. Panics with a usage
-/// message on invalid input — same idiom as the prior bare-positional
-/// parse this replaces. `--help` / `-h` short-circuit by panicking with
-/// the usage line (cleanest exit shape that doesn't drag `std::process`
-/// into a pure-function helper).
+/// Panics with a usage message on invalid input — same idiom as the prior
+/// bare-positional parse this replaces. `--help` / `-h` short-circuit by
+/// panicking with the usage line (cleanest exit shape that doesn't drag
+/// `std::process` into a pure-function helper).
 ///
 /// `--demo` and `--res VALUE` are mutually exclusive — passing both
 /// panics rather than silent last-one-wins. Multiple `--res` likewise
 /// panics rather than last-one-wins (hash-thing-06so plan-review +
 /// code-review findings).
-fn parse_args_from<I, S>(args: I) -> (u32, Option<u64>)
+fn parse_args_from<I, S>(args: I) -> ParsedArgs
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -3388,7 +3413,11 @@ where
     } else {
         res_target
     };
-    (volume_size.unwrap_or(DEFAULT_VOLUME_SIZE), target)
+    ParsedArgs {
+        volume_size: volume_size.unwrap_or(DEFAULT_VOLUME_SIZE),
+        target_pixels_override: target,
+        demo,
+    }
 }
 
 fn main() {
@@ -3425,7 +3454,11 @@ fn main() {
     log::info!("  ;/' : decrease/increase chunk-LOD bias by 0.25 (clamped 0.25..4.0)");
     log::info!("  Esc: quit");
 
-    let (volume_size, target_pixels_override) = parse_args_from(std::env::args().skip(1));
+    let ParsedArgs {
+        volume_size,
+        target_pixels_override,
+        demo,
+    } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
         volume_size.trailing_zeros()
@@ -3434,24 +3467,35 @@ fn main() {
         log::info!("CLI render target: {target} px (--demo / --res)");
     }
 
+    // Single source of truth for focus-on-launch. Two downstream sites
+    // both consume this: the macOS event-loop builder (must be set BEFORE
+    // event_loop.build()) and `App.want_focus_on_launch` (consumed at
+    // window-creation time after winit resumes the app). hash-thing-kh9l
+    // routes `--demo` into this gate so the wrapper-less invocation
+    // `cargo run -- --demo` activates the window the same way that
+    // `HASH_THING_FOCUS=1 cargo run` does today.
+    let want_focus_on_launch =
+        demo || std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
+
     let mut event_loop_builder = EventLoop::builder();
     #[cfg(target_os = "macos")]
     {
         // Make launch behavior explicit instead of depending on bundle/agent defaults.
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
-        // hash-thing-sgcv: gate the activate-ignoring-other-apps flag
-        // behind the same HASH_THING_FOCUS=1 env var that gates
-        // window.focus_window() at src/main.rs:1985. winit's default
-        // for this flag is `true` (PlatformSpecificEventLoopAttributes
-        // in winit/platform_impl/macos/event_loop.rs), so we MUST set
-        // it explicitly in both branches — omitting the setter would
+        // hash-thing-sgcv + kh9l: gate the activate-ignoring-other-apps
+        // flag behind the same `want_focus_on_launch` derived above
+        // (HASH_THING_FOCUS=1 env or `--demo` flag). Mirrors the
+        // window.focus_window() gate at src/main.rs:2266. winit's
+        // default for this flag is `true`
+        // (PlatformSpecificEventLoopAttributes in
+        // winit/platform_impl/macos/event_loop.rs), so we MUST set it
+        // explicitly in both branches — omitting the setter would
         // silently inherit the focus-stealing default and the gate
         // would be a no-op. Default is to NOT steal focus, so the
         // agent surface keeps keyboard input.
         // ActivationPolicy::Regular stays unconditional — it controls
         // dock/Cmd-Tab presence, not activation.
-        let want_focus = std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
-        event_loop_builder.with_activate_ignoring_other_apps(want_focus);
+        event_loop_builder.with_activate_ignoring_other_apps(want_focus_on_launch);
     }
     let event_loop = event_loop_builder
         .build()
@@ -3459,6 +3503,7 @@ fn main() {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
     app.target_pixels_override = target_pixels_override;
+    app.want_focus_on_launch = want_focus_on_launch;
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -3522,45 +3567,70 @@ mod tests {
 
     #[test]
     fn parse_args_from_size_only() {
-        let (vs, t) = parse_args_from(["256"]);
-        assert_eq!(vs, 256);
-        assert_eq!(t, None);
+        let p = parse_args_from(["256"]);
+        assert_eq!(p.volume_size, 256);
+        assert_eq!(p.target_pixels_override, None);
+        assert!(!p.demo);
     }
 
     #[test]
     fn parse_args_from_no_args_uses_default() {
-        let (vs, t) = parse_args_from(std::iter::empty::<&str>());
-        assert_eq!(vs, DEFAULT_VOLUME_SIZE);
-        assert_eq!(t, None);
+        let p = parse_args_from(std::iter::empty::<&str>());
+        assert_eq!(p.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(p.target_pixels_override, None);
+        assert!(!p.demo);
     }
 
     #[test]
     fn parse_args_from_demo_alone() {
-        let (vs, t) = parse_args_from(["--demo"]);
-        assert_eq!(vs, DEFAULT_VOLUME_SIZE);
-        assert_eq!(t, Some(1920 * 1080));
+        let p = parse_args_from(["--demo"]);
+        assert_eq!(p.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(p.target_pixels_override, Some(1920 * 1080));
+        assert!(p.demo, "kh9l: --demo must surface as demo=true");
     }
 
     #[test]
     fn parse_args_from_demo_with_size_either_order() {
-        let (vs1, t1) = parse_args_from(["--demo", "256"]);
-        let (vs2, t2) = parse_args_from(["256", "--demo"]);
-        assert_eq!((vs1, t1), (256, Some(1920 * 1080)));
-        assert_eq!((vs2, t2), (256, Some(1920 * 1080)));
+        let p1 = parse_args_from(["--demo", "256"]);
+        let p2 = parse_args_from(["256", "--demo"]);
+        assert_eq!(p1.volume_size, 256);
+        assert_eq!(p1.target_pixels_override, Some(1920 * 1080));
+        assert!(p1.demo);
+        assert_eq!(p2.volume_size, 256);
+        assert_eq!(p2.target_pixels_override, Some(1920 * 1080));
+        assert!(p2.demo);
     }
 
     #[test]
     fn parse_args_from_res_named() {
-        let (vs, t) = parse_args_from(["--res", "1440p", "512"]);
-        assert_eq!(vs, 512);
-        assert_eq!(t, Some(2560 * 1440));
+        let p = parse_args_from(["--res", "1440p", "512"]);
+        assert_eq!(p.volume_size, 512);
+        assert_eq!(p.target_pixels_override, Some(2560 * 1440));
+        assert!(
+            !p.demo,
+            "kh9l: --res 1440p is NOT --demo, even with same target_pixels would happen at 1080p"
+        );
     }
 
     #[test]
     fn parse_args_from_res_arbitrary_wxh() {
-        let (vs, t) = parse_args_from(["--res", "1920x1080"]);
-        assert_eq!(vs, DEFAULT_VOLUME_SIZE);
-        assert_eq!(t, Some(1920 * 1080));
+        let p = parse_args_from(["--res", "1920x1080"]);
+        assert_eq!(p.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(p.target_pixels_override, Some(1920 * 1080));
+        assert!(
+            !p.demo,
+            "kh9l: --res 1920x1080 has same target_pixels as --demo but demo=false"
+        );
+    }
+
+    #[test]
+    fn parse_args_from_res_1080p_is_not_demo() {
+        // kh9l regression guard: --res 1080p produces the same
+        // target_pixels_override as --demo, but `demo` is false. This bit
+        // drives focus-on-launch and must not fire for --res 1080p.
+        let p = parse_args_from(["--res", "1080p"]);
+        assert_eq!(p.target_pixels_override, Some(1920 * 1080));
+        assert!(!p.demo);
     }
 
     #[test]
