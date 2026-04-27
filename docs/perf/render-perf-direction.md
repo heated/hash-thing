@@ -77,7 +77,16 @@ Four 30s headless captures on M2, default scene at 64³, release profile (LTO + 
 
 ## Phase 1: cheaper rays (promoted to highest-leverage in v3)
 
-**Beads:** `9k4w.1` (ancestor-stack memo), `9k4w.2` (empty-cell bitmask), `9k4w.3` (ray-octant mirror), `9k4w.4` (Apple register flatten). Filed tonight, **priorities to be promoted from P2/P3 to P1/P2 once Phase 0 confirms scaling rather than warmup.**
+**Beads:** `9k4w.1` (ancestor-stack memo — already-landed, see audit below), `9k4w.2` (empty-cell bitmask — partial; the 64-bit grandchildren-mask variant still TODO), `9k4w.3` (ray-octant mirror — already-landed), `9k4w.4` (Apple register flatten — open).
+
+> **Audit update — `k6tm` (cairn) + `e0no` (flint cross-check) 2026-04-27.** Three of the four cheaper-rays sub-beads are already on main; current measurements bake in their benefit:
+>
+> - **9k4w.3 ray-octant mirror — LANDED.** `crates/ht-render/src/svdag_raycast.wgsl:310-315` (mirror_mask construction) + `:478-479,654` (XOR un-mirror at child lookup). Landing commit `ce97c64` ("render: Laine-Karras Stage 2 ray-octant mirroring"). → **`5m36` closed.**
+> - **9k4w.1 ancestor-stack memo — LANDED.** Within-ray pop-to-deepest-still-containing-ancestor at `:396-407` + per-ray register-resident `stack_node[]/stack_min[]/stack_half[]/stack_cmask[]` arrays. Landing commit `e02c55a` (original SVDAG pipeline) extended by `44f7630` (m1f.7.3, stack_cmask caching). The dubiousconst282 article confirms this is the ~1.9× optimization (per-ray stack in registers, not cross-ray) — duke-henry's "Next ray in the tile restarts" prose was a loose paraphrase. → **`5sjh` closed.**
+> - **9k4w.2 empty-cell bitmask — PARTIAL.** The 8-bit immediate-children-occupancy mask is landed (`:482-485` cmask pre-check before child_slot read, `44f7630` m1f.7.3; `:595-657` inner-DDA skip-empty-children loop, `d0c8b9a` x5w.1). The 64-bit *grandchildren* occupancy mask described in the bead — single bitscan in the parent skips an entire subtree without descending — is **still TODO**. The +22% memory bloat caveat applies only to that 64-bit grandchildren variant. → **`iqx7` stays open with refined scope.**
+> - **9k4w.4 Apple register flatten — open, out of audit scope.**
+>
+> **Roadmap impact:** Remaining Phase 1 work is `iqx7` refined (64-bit grandchildren bitmask) + `wck2` (Apple register flatten). The ~1.5×–2.2× combined-leverage estimate below was assuming all four sub-beads still to land; subtract the .1 + .3 already-banked contribution + the 8-bit immediate-children part of .2 already-banked, and the **incremental** Phase 1 yield over current main is closer to **1.1×–1.3× at 256³** (driven mostly by iqx7-refined and 9k4w.4 on Mac).
 
 Sources: [dubiousconst282 2024-10-03](https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/) (concrete cycle counts on integrated GPU, 2.66× stacked), [Aokana 2025 (arxiv 2505.02017)](https://arxiv.org/html/2505.02017v1) (structural confirmation on Vulkan).
 
