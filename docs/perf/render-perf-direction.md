@@ -1,19 +1,19 @@
 # Render-perf direction (post-69ip/29xk/j98h, 2026-04-27, v4)
 
-**Status:** Forward-looking roadmap. v4 incorporates Triple plan review of the wgbp update (Claude + Gemini lenses landed; Codex hung per hash-thing-pc95) and three closed-bead findings since v3 (`69ip` Phase-0a fence-poll, `29xk` Phase-0 256³ × 0.5 windowed steady-state, `j98h` Phase-0 follow-up arms 64³/512³/1.0). Two roadmap reversals from v3 + one phase reframing + one new sub-experiment phase. v3 reversals from v2 preserved below as history.
+**Status:** Forward-looking roadmap. v4 incorporates Triple plan review of the wgbp update (Claude + Gemini lenses landed; Codex hung per hash-thing-pc95) and three closed-bead findings since v3 (`69ip` Phase-0a fence-poll, `29xk` Phase-0 256³ × 0.5 windowed steady-state, `j98h` Phase-0 follow-up arms 64³/512³/1.0). **Four named reversals from v3** (Phase 1 Mac framing, Phase 4 P1 BLOCKED state, Phase 3 promotion, Phase 2 me6i reframing) **+ one new sub-experiment phase** (Phase 0c = `szyh`). v3 reversals from v2 preserved below as history.
 
 ## TL;DR (rewritten v4)
 
-**M2 at every measured scale × render-scale, in the post-warmup steady-state windows of perf paper §3.16 / §3.16.1, has `render_gpu` ≈ 0.06–0.10 ms per frame.** Mac frame budget at problem scenes is dominated by `surface_acquire_cpu`, and `surface_acquire_cpu` scales with framebuffer pixels (render-scale), not voxel volume. v3's "tonight's 30 s captures sampled the warmup transient" reading is now upgraded by 69ip's fence-poll evidence: forcing CPU-side serialization (`device.poll(Wait)` after every submit) collapsed `render_gpu` from 14.30 / 32.90 ms to **0.10 / 0.20 ms** at 64³, well below the 9k4w.0 decision threshold. The 9–26 ms off-surface `render_gpu` reading was queue/scheduler effects, not real shader cost. **High confidence**, no longer medium.
+**M2 at every measured scale × render-scale, in the post-warmup steady-state windows of perf paper §3.16 / §3.16.1, has `render_gpu` ≈ 0.06–0.10 ms per frame.** Mac frame budget at problem scenes is dominated by `surface_acquire_cpu`, and `surface_acquire_cpu` scales with framebuffer pixels (render-scale), not voxel volume. v3's "tonight's 30 s captures sampled the warmup transient" reading is now upgraded by 69ip's fence-poll evidence: forcing CPU-side serialization (`device.poll(Wait)` after every submit) collapsed `render_gpu` mean from 14.30 ms to **0.10 ms** at 64³, more than two orders of magnitude below the 9k4w.0 decision threshold (~0.16 ms mean); p95 fell from 32.90 ms to 0.20 ms — slightly above the mean-threshold but at the same order of magnitude as the §3.16 steady-state mean (0.10 ms) on the same hardware. The 9–26 ms off-surface `render_gpu` reading was queue/scheduler effects, not real shader cost. **High confidence**, no longer medium.
 
-**Roadmap (revised v4):**
+**Roadmap (revised v4; section order in body matches this list):**
 
 1. **Phase 0: DONE.** §3.16 + §3.16.1 of the perf paper extend §3.13 with 256³ × 0.5 windowed steady-state (37 ms `frame_total`) + 64³, 512³, and 256³ × 1.0 follow-up arms. 9k4w.0 (= `69ip`) fence-poll experiment closed; backpressure confirmed.
 2. **Phase 1: cheaper rays — cross-platform-only on Mac.** Highest-leverage on cross-platform targets where compute is the bottleneck (literature projection from dubiousconst282 sparse-64-tree + Aokana 2025; not yet measured on this codebase). On Mac, post-warmup steady-state Mac-incremental yield is bounded above by `render_gpu` ≈ 0.1 ms / frame — effectively zero on a 17 ms budget. Beads stay in flight (cross-platform yield is real); Mac-incremental closure clause added to Phase 1 acceptance.
-3. **Phase 0c (new, m59h evidence input): fence-poll experiment at 256³ × 1.0.** Filed as `szyh`. Disambiguates whether the 87 ms `surface_acquire_cpu` post-warmup mean is queue-backpressure (collapses under fence-poll, m59h's lever is dead) or true wall-clock compositor sync (m59h's lever is real). Cheap (~30 s harness extension); strong-recommended-prereq for m59h's design phase.
-4. **Phase 2: investigate `me6i` drift — reframed.** v3 framed me6i as "likely duplicate of dlse.2.2.3 warmup transient." j98h finding 4 reframes me6i as a *distinct* mechanism — drift scales with time × world × render-scale, not magnitude alone (arms A and B at 50% scale don't drift; arm C at 256³ × 1.0 drifts 97 → 133 within run, same shape as the §3.16 baseline). This is not the dlse.2.2.3 transient; it persists *post-warmup* in scaled-up cells.
-5. **Phase 3: adaptive render-scale (`pfpn`) — promoted to highest-leverage Mac knob.** j98h shows render-scale 0.5 → 1.0 at 256³ inflates `surface_acquire_cpu` 16 → 87 ms (5.5×) and `frame_total` 37 → 115 ms (3.1×). This is the dominant render-side knob on M2; `pfpn`'s adaptive ramp targets it directly. Phase 3 should land before Phase 4's design phase opens.
-6. **Phase 4 (m59h): async surface acquire — already-executed P2 → P1 BLOCKED.** v3 deferred this as "uncertain"; spark's 2026-04-27 update on `m59h` post-69ip already promoted it. v4 reflects the existing state. Design call still gated on edward; recommended-prereq sequence is **Phase 0c (szyh) → Phase 3 (pfpn) → re-measure → m59h design call**. Phase 3 attacks the *amount* of compositor work, Phase 4 attacks the *latency* of the compositor-sync wait — different surfaces of the same metric, but Phase 3 is cheaper-and-faster.
+3. **Phase 2: investigate `me6i` drift — reframed.** v3 framed me6i as "likely duplicate of dlse.2.2.3 warmup transient." j98h finding 4 reframes me6i as a *distinct* mechanism — drift scales with time × world × render-scale, not magnitude alone (arms A and B at 50% scale don't drift; arm C at 256³ × 1.0 drifts 97 → 133 within run, same shape as the §3.16 baseline). This is not the dlse.2.2.3 transient; it persists *post-warmup* in scaled-up cells.
+4. **Phase 3: adaptive render-scale (`pfpn`) — promoted to highest-leverage Mac knob.** j98h shows render-scale 0.5 → 1.0 at 256³ inflates `surface_acquire_cpu` 16 → 87 ms (5.5×) and `frame_total` 37 → 115 ms (3.1×). This is the dominant render-side knob on M2; `pfpn`'s adaptive ramp targets it directly. Phase 3 should land before Phase 4's design phase opens.
+5. **Phase 0c (new, m59h evidence input): fence-poll experiment at 256³ × 1.0.** Filed as `szyh`. Disambiguates whether the 87 ms `surface_acquire_cpu` post-warmup mean is queue-backpressure-shaped (collapses under fence-poll, m59h's lever is dead) or NOT queue-backpressure-shaped (m59h's lever may be real, but Phase 0c does not by itself prove compositor sync — see Phase 0c body for the full decision rule). Cheap (~30 s harness extension); strong-recommended-prereq for m59h's design phase. Section appears below Phase 3 in body (paired with Phase 4 since it gates m59h's design call).
+6. **Phase 4 (m59h): async surface acquire — already-executed P2 → P1 BLOCKED.** v3 deferred this as "uncertain"; spark's 2026-04-27 update on `m59h` post-69ip already promoted it. v4 reflects the existing state. Design call still gated on edward; recommended-prereq sequence is **Phase 0c (szyh) → Phase 3 (pfpn) → re-measure → m59h design call**. Phase 3 attacks the *amount* of compositor work, Phase 4 attacks the *latency* of the compositor-sync wait — different surfaces of the same metric, but Phase 3 is cheaper-and-faster. **v4 off-ramp:** if Phase 3's adaptive ramp meets the 60 FPS budget on M2 at 256³/50%, m59h closes as obsolete-by-Phase-3 without architectural rewrite.
 
 **Reversals from v3:**
 - v3 said "rays are highest-leverage everywhere." v4 says **highest-leverage cross-platform; on Mac, post-warmup steady-state incremental yield is bounded above by ≈0.1 ms / frame.** The cross-platform claim is unchanged but flagged as a literature projection until non-Mac measurement runs.
@@ -50,7 +50,7 @@ Four 2026-04-26 30s headless captures on M2, default scene at 64³, release prof
 - **`me6i` (frame_total growth over time) is now characterised by `j98h` finding 4 as a distinct mechanism.** v3 framed it as "likely duplicate of dlse.2.2.3." j98h finding 4 instead shows me6i drift scales with time × world × render-scale, not frame-magnitude alone — arms A (64³ × 0.5) and B (512³ × 0.5) are clean (drift ratio 0.95–1.09); arm C (256³ × 1.0) drifts 97→133 within each post-warmup run, same shape as the §3.16 baseline. **Not a duplicate of the dlse.2.2.3 pre-t=34 transient.**
 - **High confidence: present mode is not the lever.** AutoVsync vs Immediate within noise. Confirms §3.9 step 1.
 - **High confidence: per-frame compute pass is ~0.06–0.10 ms across every measured Mac cell.** §3.16 + §3.16.1 hold this flat across 64³ → 512³ × 0.5 → 1.0; render_gpu is not the bottleneck on M2 in any regime measured.
-- **High confidence (v4 upgrade from v3 medium): 9–26ms off-surface render_gpu reading IS queue/scheduler backpressure.** `69ip` fence-poll collapsed `render_gpu` from 14.30 / 32.90 ms (mean / p95) to **0.10 / 0.20 ms** when frames were CPU-serialized via `device.poll(Wait)`. Well below the 9k4w.0 decision threshold (~0.16 ms). Pipeline-depth metric `prior_gpu_pipeline_cpu` collapsed from ~20 s (off-surface unbounded) to ~6 ms (one-frame-deep), confirming the experiment was well-formed. The phantom 14 ms `render_gpu` reading was queue scheduling absorbed by CPU-GPU pipelining, not real shader work.
+- **High confidence (v4 upgrade from v3 medium): 9–26ms off-surface render_gpu reading IS queue/scheduler backpressure.** `69ip` fence-poll collapsed `render_gpu` from 14.30 / 32.90 ms (mean / p95) to **0.10 / 0.20 ms** when frames were CPU-serialized via `device.poll(Wait)`. The mean is more than two orders of magnitude below the 9k4w.0 decision threshold (~0.16 ms mean); the p95 is slightly above the mean-threshold but at the same order of magnitude as the §3.16 steady-state mean (0.10 ms) on the same hardware — consistent with backpressure being the carrier. Pipeline-depth metric `prior_gpu_pipeline_cpu` collapsed from ~20 s (off-surface unbounded) to ~6 ms (one-frame-deep), confirming the experiment was well-formed. The phantom 14 ms `render_gpu` reading was queue scheduling absorbed by CPU-GPU pipelining, not real shader work.
 - **Open question, v4: is `surface_acquire_cpu` itself queue-backpressure?** The 87 ms post-warmup mean at 256³ × 1.0 (`j98h` arm C) is wall-clock CPU time the renderer thread spends waiting for the next drawable. We don't yet know whether forcing serialization collapses *this* metric the way it collapsed `render_gpu`. Filed as `szyh` (Phase 0c, m59h evidence input). See Phase 0c subsection below.
 - **Wrong framing in v2 (corrected in v3, preserved here): "Apple Metal compositor pacing".** §3.9 step 2 refuted compositor (fullscreen worse than windowed). Don't say "compositor" without isolating the specific mechanism, which §3.9–§3.12 says is unidentified after sweeping every wgpu-exposed knob; v4 keeps the gap open.
 
@@ -135,7 +135,7 @@ dubiousconst282 measured on a sparse-64-tree (depth ~4–5). Our SVDAG is sparse
 - If `surface_acquire_cpu` carries the drift (mean climbs while `submit_cpu` + `render_gpu` stay flat): me6i is the same mechanism Phase 3 / Phase 4 attack — close `me6i` as a duplicate of the surface-acquire ladder, fold its acceptance into Phase 3's ramp test.
 - If `submit_cpu` or another carrier surfaces: distinct mechanism. File a sub-bead.
 
-**Acceptance:** one of the two outcomes documented in `me6i` comment, citing j98h finding 4.
+**Acceptance:** investigation result documented in `me6i` comment, citing j98h finding 4 and identifying the drift carrier(s). If carrier is `surface_acquire_cpu`-dominant → close as duplicate of Phase 3/4 territory (Phase 3's ramp acceptance subsumes me6i's). If other carrier(s) dominant → file sub-bead(s) per the carrier(s). If mixed → document the decomposition and let the dominant carrier drive close-out. v4 cross-cutting rule applies — see `Standardized measurement protocol` for the closure clause covering Mac-incremental-zero / cross-platform-only-measurable beads.
 
 **Why not parallel with Phase 1:** unchanged. If me6i resolves into Phase 3 territory, Phase 3's ramp acceptance subsumes me6i's; better to know.
 
@@ -163,6 +163,7 @@ Static GPU-class table at startup + dynamic ramp toward target frame budget. M-s
 - Reference non-Mac: launch on either an Nvidia RTX 3060 (or equivalent ~20 TFLOPs class) or an Intel Iris Xe (or equivalent ~2 TFLOPs class) hits ≤17ms at chosen render_scale at 256³.
 - Adaptive ramp converges in <2s with hysteresis ≤±5% over a 10s steady-state window (specified measurement window per Claude reviewer).
 - Trident plan review minimum.
+- v4 cross-cutting rule applies — see `Standardized measurement protocol` for the closure clause covering Mac-incremental-zero / cross-platform-only-measurable beads.
 
 **Depends on:** Phase 0 — DONE per §3.16 / §3.16.1.
 
@@ -170,21 +171,20 @@ Static GPU-class table at startup + dynamic ramp toward target frame budget. M-s
 
 ## Phase 0c (new in v4): `surface_acquire_cpu` fence-poll experiment at 256³ × 1.0
 
-**Bead:** `szyh` (filed 2026-04-27 by flint per wgbp Triple plan review R1). Sub-experiment under m59h's evidence-input lane; does NOT hard-block m59h (m59h is already P1 BLOCKED on edward's design call), but is a strong-recommended-prereq for that call.
+**Bead:** `szyh` (filed 2026-04-27 by flint per wgbp Triple plan review R1). Sub-experiment under m59h's evidence-input lane; **strong-recommended-prereq for m59h's design call**. Does not modify m59h's bd-graph blocker (m59h is already P1 BLOCKED on edward's design call), but the doc-level gate is: design without Phase 0c evidence risks committing the design phase to a one-way-door that the experiment would have ruled out in 30 s.
 
-**Open question.** 69ip showed `render_gpu` 9–26 ms at 64³ off-surface was queue/scheduler backpressure (collapses to 0.10 / 0.20 ms under fence-poll). j98h showed `surface_acquire_cpu` at 256³ × 1.0 windowed has a post-warmup mean of 86.73 ms (drifts 97 → 133 within window per finding 4 — drift mechanism shared with me6i). **We don't yet know whether the 87 ms `surface_acquire_cpu` reading is itself queue-backpressure** (in which case async surface acquire = m59h cannot help — the wait would just shift somewhere else on the queue) **or true wall-clock compositor sync** (in which case m59h's lever is real).
+**Open question.** 69ip showed `render_gpu` 9–26 ms at 64³ off-surface was queue/scheduler backpressure (collapses to 0.10 / 0.20 ms under fence-poll). j98h showed `surface_acquire_cpu` at 256³ × 1.0 windowed has a post-warmup mean of 86.73 ms (drifts 97 → 133 within window per finding 4 — drift mechanism shared with me6i). **We don't yet know whether the 87 ms `surface_acquire_cpu` reading is queue-backpressure-shaped** (in which case async surface acquire = m59h cannot help — the wait would just shift somewhere else on the queue) **or some other mechanism** (compositor sync, shared-resource contention, HAL CPU-side work, etc. — m59h's lever may or may not help, depending on which).
 
-**Procedure (cribbed from 69ip).** Re-enable `HASH_THING_FENCE_POLL=1` in renderer.rs (the 69ip experimental knob, currently reverted). Run `--profile perf` + 256³ + `HASH_THING_RENDER_SCALE=1.0`, windowed external display, ≥120 s, first 34 s warmup discarded. Compare `surface_acquire_cpu` mean / p95 baseline vs fence-poll. Cross-validate at 256³ × 0.5 (sanity: harness still works).
+**Procedure (cribbed from 69ip).** Re-enable `HASH_THING_FENCE_POLL=1` in renderer.rs (the 69ip experimental knob, currently reverted). Experimental code lives on a worktree branch and is never landed on main — same exception-lane treatment as 69ip; results land via comment on `szyh` + `m59h`, branch deleted post-experiment. Run `--profile perf` + 256³ + `HASH_THING_RENDER_SCALE=1.0`, windowed external display, ≥120 s, first 34 s warmup discarded. Compare `surface_acquire_cpu` mean / p95 baseline vs fence-poll. **Cross-validation arm:** also run at 256³ × 0.5 (sanity check that the harness still works at problem scale; expect the fence-poll collapse pattern to hold there too if the harness is healthy).
 
-**Decision rule.**
-- `surface_acquire_cpu` collapses to <1 ms under fence-poll → queue-backpressure confirmed; m59h's lever is dead. Close m59h as no-help; surface the queue-side mechanism as a follow-up.
-- Stays > 50 ms → true wall-clock compositor sync; m59h's lever is real, design phase proceeds with Phase 0c in evidence column.
-- Partial (5–50 ms) → document; let m59h design phase weight the partial evidence.
+**Decision rule** (softened from earlier draft per code-review finding 6):
+- `surface_acquire_cpu` collapses to <1 ms under fence-poll → **queue-backpressure-shaped confirmed**; m59h's lever (off-thread acquire) cannot help — the wait would just shift somewhere else on the queue. Close m59h as no-help; surface the queue-side mechanism as a follow-up.
+- Stays > 50 ms → **NOT queue-backpressure-shaped.** Three sub-cases possible — Phase 0c does not disambiguate among them: (a) true compositor sync (m59h's lever is real); (b) wgpu/Metal HAL CPU-side work that off-thread acquire would relocate but not eliminate; (c) shared-resource contention (M2 unified memory bus, IO, etc.) that off-thread won't help with. m59h's design phase still has to pick a mechanism explanation, but the queue-backpressure null result is logged as evidence.
+- Partial (5–50 ms) → document the partial collapse; let m59h design phase weight the partial evidence.
 
-**Why optional, not mandatory.** Phase 0c is cheap (~30 s harness extension) and its outcome is the cleanest evidence input to m59h. But m59h is already P1 BLOCKED on a separate gate (edward's design call); Phase 0c's result is recommended to feed that call but does not strictly block it. If edward decides to design without Phase 0c evidence, Phase 0c can still run post-design as confirmation.
-
-**Acceptance** (mirrors 69ip):
-- Experiment run, both conditions captured.
+**Acceptance** (mirrors 69ip + adds cross-validation gate):
+- Experiment run, both conditions (baseline + fence-poll) captured at 256³ × 1.0.
+- **Cross-validation arm (256³ × 0.5) captured under both conditions.** If fence-poll collapse pattern at 256³ × 0.5 disagrees with the 69ip 64³ result (e.g., 256³ × 0.5 fence-poll keeps `surface_acquire_cpu` near baseline instead of collapsing), document and surface — the harness behavior may have shifted since the 69ip revert.
 - Outcome posted as comment on `szyh` AND on `m59h`.
 - Experimental code reverted (pure diagnostic; not for shipping). Exception-lane work per project CLAUDE.md.
 
@@ -206,9 +206,16 @@ Async surface acquire is the fifth swapchain-pacing fix and the only architectur
 
 **How Phase 3 and Phase 4 differ.** Phase 3 reduces the *amount* of compositor work (smaller framebuffer = fewer pixels for the OS compositor to schedule). Phase 4 reduces the *latency* of the renderer thread blocking on the compositor sync (moves the wait off-thread). Both attack `surface_acquire_cpu` but for different reasons; Phase 3 is cheaper and lower-risk. Phase 3 first.
 
-**Acceptance** (Claude reviewer's correct critique from v3 preserved — explicit gate, not just promotion criterion):
-- frame_total ≤ 17ms mean over 60s warm steady-state on M2 windowed at 256³/50%, **OR** documented residual stall + close as can't-fix.
-- v4 addition: m59h closes as obsolete-by-Phase-3 if Phase 3's ramp meets the 60 FPS budget on M2 at 256³/50% before m59h's design phase opens.
+**Acceptance** (decision tree; explicit gate, not just promotion criterion):
+
+m59h close-out paths, in evaluation order (whichever fires first wins; later branches don't apply if an earlier branch closed the bead):
+
+1. **`szyh` (Phase 0c) shows queue-backpressure-shaped collapse** → close m59h as no-help; off-thread acquire wouldn't reduce the wait. Architectural rewrite avoided.
+2. **Phase 3 (`pfpn`) ramp meets ≤17 ms `frame_total` mean over 60 s warm steady-state on M2 windowed at 256³/50%** → close m59h as obsolete-by-Phase-3; Phase 3's smaller framebuffer absorbs the cost. Architectural rewrite avoided.
+3. **m59h design phase opens, ships, and meets ≤17 ms `frame_total` mean over 60 s warm steady-state on M2 windowed at 256³/50%** → close as success.
+4. **m59h design phase opens, ships, and does NOT meet the gate** → close as can't-fix with documented residual stall.
+
+Branches 1 and 2 are the v4-introduced off-ramps; branches 3 and 4 are the v3 acceptance preserved. The doc-level rule: don't open the design phase (branch 3 / 4) until branches 1 and 2 are both ruled out.
 
 **Risks** (Gemini + Claude reviewers added; v4 marks Phase-0c-conditional):
 - **Drawable pool exhaustion (Phase-0c-conditional probability).** If `szyh` shows `surface_acquire_cpu` collapses under fence-poll → queue-backpressure → exhaustion risk High; async-acquire path is dead. If `szyh` shows it doesn't collapse → compositor-sync → exhaustion risk Low (pool extension mitigates).
@@ -336,13 +343,15 @@ v3 received Triple plan review (Claude + Codex + Gemini), 2026-04-26. Reviewer o
 - Parent umbrella: `2w1u` (P0, claim released)
 - Indirect parent: `dbz5` (perceived-FPS umbrella)
 
-**Closed prior beads, named here so they aren't re-litigated:**
+**Older closed beads, named here so they aren't re-litigated:**
 - `dlse.2.2 exp#4` — `frame_latency` ∈ {1,2,3} swept null
 - `dlse.2.2.2` — late-acquire reorder shipped null
 - `dlse.2.2.3` — warmup transient characterized; v3 thought tonight's runs sampled it; v4 distinguishes me6i drift from dlse.2.2.3 per j98h finding 4
 - `dlse.2.3` — proof-of-honest-timestamp; `bench_raycast_256 ≈ 0.19ms`
 - `dlse.2.4` — render-pass attribution; **the bead that should have informed v1 of this doc**
-- `69ip` — Phase-0a fence-poll experiment; backpressure interpretation confirmed (`render_gpu` 14.30 → 0.10 ms)
+
+**v4-cycle closed beads** (already in `Closed/landed` above; named here with one-liner for the audit trail):
+- `69ip` — Phase-0a fence-poll experiment; backpressure interpretation confirmed (`render_gpu` 14.30 → 0.10 ms mean at 64³)
 - `29xk` — Phase-0 256³ × 0.5 windowed steady-state; perf paper §3.16
 - `j98h` — Phase-0 follow-up arms (64³ + 512³ + 256³ × 1.0); perf paper §3.16.1; **render-scale is the dominant Mac knob**
 
