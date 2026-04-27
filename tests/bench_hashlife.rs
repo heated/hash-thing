@@ -285,6 +285,26 @@ fn bench_water_scene(label: &str, level: u32, generations: usize) {
             max_us as f64 / 1000.0,
             total_us as f64 / 1_000_000.0,
         );
+        // Warm-only stats: skip first 5 gens (cold cache). Helps distinguish
+        // "warmup is slow" from "steady-state is slow" (hash-thing-wsq3).
+        let warm_skip = 5usize.min(generations.saturating_sub(1));
+        if generations > warm_skip {
+            let warm_count = generations - warm_skip;
+            let warm_total: u128 = times_us.iter().skip(warm_skip).sum();
+            let warm_mean = warm_total / warm_count as u128;
+            let mut warm_sorted: Vec<u128> = times_us.iter().skip(warm_skip).copied().collect();
+            warm_sorted.sort();
+            let warm_median = warm_sorted[warm_count / 2];
+            let warm_p95 = warm_sorted[(warm_count as f64 * 0.95) as usize];
+            let warm_max = *warm_sorted.last().unwrap();
+            eprintln!(
+                "  warm (skip {warm_skip}): {warm_count} gens, mean={:.1}ms, median={:.1}ms, p95={:.1}ms, max={:.1}ms",
+                warm_mean as f64 / 1000.0,
+                warm_median as f64 / 1000.0,
+                warm_p95 as f64 / 1000.0,
+                warm_max as f64 / 1000.0,
+            );
+        }
         eprintln!(
             "  pop: mean={mean_pop}, max={max_pop}, ratio_to_volume={:.2}",
             max_pop as f64 / (side as f64).powi(3),
@@ -412,6 +432,144 @@ fn bench_hashlife_water_128_profiled() {
 #[ignore]
 fn bench_hashlife_water_256_profiled() {
     bench_water_scene_profiled("256³ water+sand", 8, 40);
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_512_profiled() {
+    bench_water_scene_profiled("512³ water+sand", 9, 20);
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_512() {
+    bench_water_scene("512³ water+sand", 9, 50);
+}
+
+/// hash-thing-wsq3 regression bench. Mimics the production app's hot loop:
+/// every step has at least one entity-produced `SetCell` mutation queued,
+/// drained by `apply_mutations` before `step_recursive` runs. Pre-wsq3,
+/// `set_local` cleared all four hashlife caches on every cell write, so this
+/// loop paid cold-cache cost (~2-3s/gen at 512^3) even though the per-step
+/// mutation surface is one cell. With the wsq3 fix the cache survives, so
+/// warm-mean lands at ~200-400ms/gen and the per-step cache hit rate stays
+/// in the steady-state regime (50%+) instead of pinned at the cold-step rate
+/// (~15%).
+///
+/// `mean_hit_rate` is the load-bearing assertion — a regression to per-step
+/// cache wipe pins hit_rate near the cold ~15% reading regardless of the
+/// noisier wall-clock numbers.
+fn bench_water_scene_with_mutations(label: &str, level: u32, generations: usize) {
+    use hash_thing::sim::world::WorldCoord;
+    use hash_thing::sim::WorldMutation;
+
+    let side = 1u64 << level;
+    eprintln!("--- {label} +mutations (level={level}, side={side}³, water+sand) ---");
+
+    let mut world = World::new(level);
+    let params = TerrainParams::for_level(level);
+    world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
+    world.seed_water_and_sand();
+
+    // Pick a coord well inside the realized region and not in a region
+    // already heavily populated by water/sand — flipping a single cell here
+    // gives the cache wipe the same shape it has in production (one
+    // entity-produced SetCell per step).
+    let edit_x = WorldCoord((side / 2) as i64);
+    let edit_y = WorldCoord((side - 4) as i64);
+    let edit_z = WorldCoord((side / 2) as i64);
+
+    let mut times_us = Vec::with_capacity(generations);
+    let mut hit_rates = Vec::with_capacity(generations);
+
+    for gen in 0..generations {
+        // Alternate state so the same cell doesn't dedup into a noop write.
+        let state = if gen.is_multiple_of(2) { STONE } else { 0 };
+        world.queue.push(WorldMutation::SetCell {
+            x: edit_x,
+            y: edit_y,
+            z: edit_z,
+            state,
+        });
+
+        let t = Instant::now();
+        world.apply_mutations();
+        world.step_recursive();
+        let us = t.elapsed().as_micros();
+        times_us.push(us);
+
+        let s = world.hashlife_stats;
+        let total = s.cache_hits + s.cache_misses;
+        let hit_rate = if total > 0 {
+            s.cache_hits as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        hit_rates.push(hit_rate);
+
+        let want_print = gen < 3 || gen == generations - 1 || gen.is_multiple_of(10);
+        if want_print {
+            eprintln!(
+                "  gen {gen}: {:.1}ms  hits={} misses={} hit_rate={:.1}%",
+                us as f64 / 1000.0,
+                s.cache_hits,
+                s.cache_misses,
+                hit_rate,
+            );
+        }
+    }
+
+    if generations > 0 {
+        let total_us: u128 = times_us.iter().sum();
+        let mean_us = total_us / generations as u128;
+        let mut sorted = times_us.clone();
+        sorted.sort();
+        let median_us = sorted[generations / 2];
+        let p95_us = sorted[(generations as f64 * 0.95) as usize];
+        eprintln!(
+            "  summary: {generations} gens, mean={:.1}ms, median={:.1}ms, p95={:.1}ms",
+            mean_us as f64 / 1000.0,
+            median_us as f64 / 1000.0,
+            p95_us as f64 / 1000.0,
+        );
+        let warm_skip = 5usize.min(generations.saturating_sub(1));
+        if generations > warm_skip {
+            let warm_count = generations - warm_skip;
+            let warm_total: u128 = times_us.iter().skip(warm_skip).sum();
+            let warm_mean = warm_total / warm_count as u128;
+            let warm_hit_rate_mean: f64 =
+                hit_rates.iter().skip(warm_skip).sum::<f64>() / warm_count as f64;
+            eprintln!(
+                "  warm (skip {warm_skip}): {warm_count} gens, mean={:.1}ms, mean_hit_rate={:.1}%",
+                warm_mean as f64 / 1000.0,
+                warm_hit_rate_mean,
+            );
+            // Sharp regression signal: a per-step cache wipe pins hit_rate
+            // near the cold ~15% reading. Anything above 30% means the
+            // cache is surviving across mutation flushes — the wsq3
+            // invariant. Threshold is generous on purpose.
+            assert!(
+                warm_hit_rate_mean >= 30.0,
+                "wsq3 regression: warm mean_hit_rate={warm_hit_rate_mean:.1}% < 30%, \
+                 cache likely cleared on every mutation flush"
+            );
+        }
+    }
+    eprintln!();
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_256_with_mutations() {
+    bench_water_scene_with_mutations("256³ water+sand", 8, 30);
+}
+
+#[test]
+#[ignore]
+fn bench_hashlife_water_512_with_mutations() {
+    bench_water_scene_with_mutations("512³ water+sand", 9, 20);
 }
 
 #[test]

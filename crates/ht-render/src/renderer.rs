@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -111,6 +111,45 @@ pub struct RendererCpuPhaseTimes {
     pub surface_acquire: Duration,
     pub submit: Duration,
     pub present: Duration,
+    /// hash-thing-dbz5.1: full pipeline length of the prior frame's GPU
+    /// work, measured from `queue.submit()` returning to the
+    /// `on_submitted_work_done` callback firing. `None` on the first
+    /// frame (no prior submission), or when the prior callback hasn't
+    /// fired yet by the time this frame finishes acquire (we don't
+    /// retroactively patch past samples).
+    pub prior_gpu_pipeline: Option<Duration>,
+    /// hash-thing-dbz5.1: was the prior frame's GPU submission still in
+    /// flight (callback not yet fired) at the moment this frame's
+    /// `surface.get_current_texture()` was called? Disambiguates "acquire
+    /// blocked on prior frame" (true) from "acquire blocked on something
+    /// else, e.g. swapchain pacing or compositor" (false). On the first
+    /// frame this is false (no prior submission to wait on).
+    pub prior_gpu_in_flight_at_acquire: bool,
+}
+
+/// hash-thing-dbz5.1: shared state for tracking the prior frame's GPU
+/// submission fence. The render thread bumps `submit_seq` after each
+/// `queue.submit()`; the wgpu polling thread updates `done_seq` and
+/// `last_pipeline` from the `on_submitted_work_done` callback. Sequence
+/// numbers disambiguate "submission in flight" (`done_seq <
+/// submit_seq`) from "submission complete" (`done_seq == submit_seq`).
+/// The callback computes the pipeline duration from a captured
+/// `Instant` so we never have to align stale `submit_at` / `done_at`
+/// pairs across frames.
+#[derive(Default)]
+struct SubmitFenceState {
+    /// Sequence number of the most recent `queue.submit()` call. Starts
+    /// at 0 (never submitted); incremented before each new submit.
+    submit_seq: u64,
+    /// Sequence number of the most recent `on_submitted_work_done`
+    /// callback that fired. `done_seq < submit_seq` means a submission
+    /// is currently in flight on the GPU.
+    done_seq: u64,
+    /// Pipeline duration of the most recently completed submission:
+    /// elapsed time from `queue.submit()` returning to the matching
+    /// `on_submitted_work_done` callback firing. Computed inside the
+    /// callback so it doesn't suffer cross-submit aliasing.
+    last_pipeline: Option<Duration>,
 }
 
 /// GPU-side render pass timing via `wgpu::Features::TIMESTAMP_QUERY`.
@@ -435,6 +474,11 @@ pub struct Renderer {
     /// LOD bias multiplier. 1.0 = default, higher = more aggressive LOD.
     pub lod_bias: f32,
     /// Render resolution scale. 0.5 = half-res (4x fewer pixels), 1.0 = full.
+    /// Picked once at construction (env / CLI / auto). `resize()` reuses
+    /// this value, so a `--demo`/`--res` pixel budget will drift from its
+    /// target if the window is resized — acceptable for the fixed-window
+    /// demo flow; revisit if the demo wrapper grows a resize affordance
+    /// (hash-thing-06so code-review N-5).
     pub render_scale: f32,
 
     // GPU-timestamp instrumentation. `None` on adapters without
@@ -473,6 +517,12 @@ pub struct Renderer {
     /// submit/encode path (persists). Env-var gated at startup; zero-cost
     /// in normal runs.
     off_surface_target: Option<wgpu::Texture>,
+    /// hash-thing-dbz5.1: shared state for tracking when the prior
+    /// frame's GPU work completes. Read at the top of `render()` to
+    /// answer "is the prior submission still in flight?"; updated after
+    /// each `queue.submit()` and from the wgpu polling thread when the
+    /// `on_submitted_work_done` callback fires.
+    submit_fence: Arc<Mutex<SubmitFenceState>>,
     start_time: Instant,
 }
 
@@ -483,10 +533,14 @@ pub struct Renderer {
 enum RenderScaleSource {
     /// `HASH_THING_RENDER_SCALE` was set and valid.
     EnvOverride,
-    /// Env var absent — used the auto-pick.
+    /// Env var absent (or invalid) and CLI flag absent — used the auto-pick.
     AutoPicked,
-    /// Env var was set but failed parsing or fell outside `0.25..=1.0`.
+    /// Env var was set but failed parsing or fell outside `0.25..=1.0`,
+    /// and no CLI override fired either.
     EnvInvalidFallback,
+    /// `--demo` / `--res` CLI flag pinned a target pixel count.
+    /// Env var was unset or invalid; CLI wins (hash-thing-06so).
+    CliOverride,
 }
 
 /// Target rendered-pixel budget for a given world side length
@@ -523,22 +577,36 @@ fn auto_render_scale(physical_pixels: u64, volume_size: u32) -> f32 {
     raw.clamp(0.25, 1.0)
 }
 
-/// Resolve the effective render scale + which branch fired. Env-var
-/// override wins if it is present AND valid (parses as f32 AND lies
-/// in `0.25..=1.0`). Otherwise the auto-pick applies. Invalid env
-/// values still fall back to auto-pick but are reported distinctly
-/// so the log line can flag the typo (hash-thing-zytn).
+/// Resolve the effective render scale + which branch fired. Precedence:
+/// 1. `HASH_THING_RENDER_SCALE` env (if present AND valid).
+/// 2. `--res` / `--demo` CLI override (if `cli_target` is `Some`).
+/// 3. Auto-pick keyed by `volume_size`.
+///
+/// Invalid env still loses to CLI when CLI is set; otherwise it falls
+/// back to auto-pick and reports `EnvInvalidFallback` so the log line
+/// can surface the typo (hash-thing-zytn extended by hash-thing-06so).
 fn resolved_render_scale(
     env: Option<&str>,
+    cli_target: Option<u64>,
     physical_pixels: u64,
     volume_size: u32,
 ) -> (f32, RenderScaleSource) {
+    let cli_scale = cli_target.map(|target| {
+        let physical = physical_pixels.max(1) as f64;
+        ((target as f64 / physical).sqrt() as f32).clamp(0.25, 1.0)
+    });
     let auto = auto_render_scale(physical_pixels, volume_size);
     match env {
-        None => (auto, RenderScaleSource::AutoPicked),
+        None => match cli_scale {
+            Some(s) => (s, RenderScaleSource::CliOverride),
+            None => (auto, RenderScaleSource::AutoPicked),
+        },
         Some(raw) => match raw.parse::<f32>() {
             Ok(s) if (0.25..=1.0).contains(&s) => (s, RenderScaleSource::EnvOverride),
-            _ => (auto, RenderScaleSource::EnvInvalidFallback),
+            _ => match cli_scale {
+                Some(s) => (s, RenderScaleSource::CliOverride),
+                None => (auto, RenderScaleSource::EnvInvalidFallback),
+            },
         },
     }
 }
@@ -565,7 +633,14 @@ fn parse_present_mode(s: &str) -> Option<wgpu::PresentMode> {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, volume_size: u32) -> Self {
+    /// `cli_target_pixels`: when `Some`, pin the rendered-pixel budget to
+    /// this total (e.g. `1920 * 1080` for `--demo`). Env override still
+    /// wins if set. wasm/unit-test callers can pass `None`. (hash-thing-06so)
+    pub async fn new(
+        window: Arc<Window>,
+        volume_size: u32,
+        cli_target_pixels: Option<u64>,
+    ) -> Self {
         let size = window.inner_size();
 
         // hash-thing-dlse.2.2 step 1: log windowing/display context at init so
@@ -669,8 +744,12 @@ impl Renderer {
         // matching o98b's measured sweet spot (§3.12).
         let env_raw = std::env::var("HASH_THING_RENDER_SCALE").ok();
         let physical_pixels: u64 = (size.width as u64) * (size.height as u64);
-        let (render_scale, scale_source) =
-            resolved_render_scale(env_raw.as_deref(), physical_pixels, volume_size);
+        let (render_scale, scale_source) = resolved_render_scale(
+            env_raw.as_deref(),
+            cli_target_pixels,
+            physical_pixels,
+            volume_size,
+        );
         match scale_source {
             RenderScaleSource::EnvOverride => log::info!(
                 "render_scale={:.3} (HASH_THING_RENDER_SCALE override; auto-pick would have been {:.3})",
@@ -690,6 +769,35 @@ impl Renderer {
                 env_raw.as_deref().unwrap_or(""),
                 render_scale,
             ),
+            RenderScaleSource::CliOverride => {
+                // hash-thing-06so: surface the env-typo signal even when CLI
+                // wins, so a user passing both `HASH_THING_RENDER_SCALE=foo`
+                // and `--demo` still notices the typo.
+                if let Some(raw) = env_raw.as_deref() {
+                    log::warn!(
+                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.25..=1.0); ignored — using --res / --demo CLI override instead",
+                    );
+                }
+                // Show the resulting framebuffer dimensions so a user
+                // who passed `--demo` doesn't have to multiply scale ×
+                // physical to confirm they got their target — the
+                // pixel-budget interpretation of "1080p" means the
+                // rendered W×H is generally NOT literal 1920×1080
+                // (uniform scale preserves physical aspect ratio).
+                let rendered_w =
+                    ((size.width as f32 * render_scale) as u32).max(1);
+                let rendered_h =
+                    ((size.height as f32 * render_scale) as u32).max(1);
+                log::info!(
+                    "render_scale={:.3} (--res / --demo override; rendered={}x{}, cli_target={} px, physical={}x{})",
+                    render_scale,
+                    rendered_w,
+                    rendered_h,
+                    cli_target_pixels.expect("CliOverride implies cli_target_pixels=Some"),
+                    size.width,
+                    size.height,
+                );
+            }
         }
         // dlse.2.2 exp#4: env-var gated so latency=3 (and other values)
         // can be A/B tested without a default change. Invalid values
@@ -1416,6 +1524,7 @@ impl Renderer {
             last_render_pass_gpu_frame_time: None,
             last_cpu_phase_times: None,
             off_surface_target: None,
+            submit_fence: Arc::new(Mutex::new(SubmitFenceState::default())),
             start_time: Instant::now(),
         }
     }
@@ -1986,6 +2095,20 @@ impl Renderer {
         // `self.off_surface_target` is `Some`, bypass the surface entirely
         // and draw into the throwaway texture. `surface_acquire` records
         // ~0 in that mode.
+        //
+        // hash-thing-dbz5.1: snapshot the prior-frame fence state BEFORE
+        // entering acquire. The acquire call itself may pump wgpu's
+        // poll loop and let the prior submission's callback fire
+        // mid-acquire, so taking the snapshot here pins "in flight at
+        // acquire start" semantics independent of when the callback
+        // ultimately lands. The pipeline duration we report is the
+        // most-recently-completed submission's pipeline at the moment
+        // we entered acquire — typically the prior frame.
+        let (prior_in_flight_at_acquire, prior_gpu_pipeline) = {
+            let s = self.submit_fence.lock().unwrap();
+            let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+            (in_flight, s.last_pipeline)
+        };
         let acquire_start = Instant::now();
         let (surface_texture, view) = if let Some(off) = self.off_surface_target.as_ref() {
             let view = off.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2327,15 +2450,49 @@ impl Renderer {
         let submit_start = Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
         let submit = submit_start.elapsed();
+
+        // hash-thing-dbz5.1: bump the submit sequence and register an
+        // `on_submitted_work_done` callback so the next frame can tell
+        // whether `surface_acquire` is "blocked on prior GPU" (callback
+        // hasn't fired yet at acquire time) vs "blocked on something
+        // else" (callback fired well before acquire). The callback
+        // captures `submit_at` by move and computes the pipeline
+        // duration itself, so cross-submit aliasing is impossible. It
+        // runs from wgpu's polling thread; the Mutex makes the
+        // cross-thread update safe. The `done_seq < this_seq` guard
+        // defends against out-of-order callbacks (shouldn't happen in
+        // practice, but cheap).
+        let submit_at = Instant::now();
+        let this_seq = {
+            let mut s = self.submit_fence.lock().unwrap();
+            s.submit_seq += 1;
+            s.submit_seq
+        };
+        {
+            let arc = Arc::clone(&self.submit_fence);
+            self.queue.on_submitted_work_done(move || {
+                let pipeline = submit_at.elapsed();
+                if let Ok(mut s) = arc.lock() {
+                    if s.done_seq < this_seq {
+                        s.done_seq = this_seq;
+                        s.last_pipeline = Some(pipeline);
+                    }
+                }
+            });
+        }
+
         let present_start = Instant::now();
         if let Some(st) = surface_texture {
             st.present();
         }
         let present = present_start.elapsed();
+
         self.last_cpu_phase_times = Some(RendererCpuPhaseTimes {
             surface_acquire,
             submit,
             present,
+            prior_gpu_pipeline,
+            prior_gpu_in_flight_at_acquire: prior_in_flight_at_acquire,
         });
 
         if captured_compute_this_frame {
@@ -2358,7 +2515,9 @@ mod tests {
     use super::{
         auto_render_scale, parse_present_mode, resolved_render_scale, target_pixels_for_volume,
         ticks_to_duration, FrameOutcome, GpuTiming, RenderScaleSource, RendererLifecycleSnapshot,
+        SubmitFenceState,
     };
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     // --- hash-thing-zytn: render-scale auto-picker ---
@@ -2424,14 +2583,14 @@ mod tests {
 
     #[test]
     fn resolved_render_scale_env_valid_wins() {
-        let (s, src) = resolved_render_scale(Some("0.75"), 2940 * 1782, 1024);
+        let (s, src) = resolved_render_scale(Some("0.75"), None, 2940 * 1782, 1024);
         assert_eq!(src, RenderScaleSource::EnvOverride);
         assert!((s - 0.75).abs() < 1e-6);
     }
 
     #[test]
     fn resolved_render_scale_env_absent_uses_auto() {
-        let (s, src) = resolved_render_scale(None, 2940 * 1782, 1024);
+        let (s, src) = resolved_render_scale(None, None, 2940 * 1782, 1024);
         assert_eq!(src, RenderScaleSource::AutoPicked);
         assert!((s - 0.498).abs() < 0.01);
     }
@@ -2441,7 +2600,7 @@ mod tests {
         // Above clamp → fallback. Below clamp → fallback.
         // Non-parseable → fallback.
         for bad in ["1.5", "0.1", "nonsense", ""] {
-            let (s, src) = resolved_render_scale(Some(bad), 2940 * 1782, 1024);
+            let (s, src) = resolved_render_scale(Some(bad), None, 2940 * 1782, 1024);
             assert_eq!(
                 src,
                 RenderScaleSource::EnvInvalidFallback,
@@ -2454,13 +2613,56 @@ mod tests {
     #[test]
     fn resolved_render_scale_env_boundary_values_accepted() {
         // 0.25 and 1.0 are both inside the inclusive range.
-        let (s_lo, src_lo) = resolved_render_scale(Some("0.25"), 2940 * 1782, 1024);
+        let (s_lo, src_lo) = resolved_render_scale(Some("0.25"), None, 2940 * 1782, 1024);
         assert_eq!(src_lo, RenderScaleSource::EnvOverride);
         assert!((s_lo - 0.25).abs() < 1e-6);
 
-        let (s_hi, src_hi) = resolved_render_scale(Some("1.0"), 2940 * 1782, 1024);
+        let (s_hi, src_hi) = resolved_render_scale(Some("1.0"), None, 2940 * 1782, 1024);
         assert_eq!(src_hi, RenderScaleSource::EnvOverride);
         assert!((s_hi - 1.0).abs() < 1e-6);
+    }
+
+    // --- hash-thing-06so: --res / --demo CLI override path ---
+
+    #[test]
+    fn resolved_render_scale_cli_used_when_no_env() {
+        // 1080p budget (2.07 M px) on a 5.24 M physical → scale ≈ 0.629.
+        let (s, src) = resolved_render_scale(None, Some(1920 * 1080), 2940 * 1782, 512);
+        assert_eq!(src, RenderScaleSource::CliOverride);
+        assert!((s - 0.629).abs() < 0.01, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_env_wins_over_cli() {
+        // Valid env beats CLI override.
+        let (s, src) = resolved_render_scale(Some("0.75"), Some(1920 * 1080), 2940 * 1782, 512);
+        assert_eq!(src, RenderScaleSource::EnvOverride);
+        assert!((s - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolved_render_scale_cli_used_when_env_invalid() {
+        // Invalid env + CLI present → CliOverride (typo signal surfaced
+        // separately by the call site's log line, not by source enum).
+        let (s, src) = resolved_render_scale(Some("garbage"), Some(1920 * 1080), 2940 * 1782, 512);
+        assert_eq!(src, RenderScaleSource::CliOverride);
+        assert!((s - 0.629).abs() < 0.01, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_cli_clamps_high() {
+        // Asking for 4K on a 720p screen → clamps to 1.0 (native, no upscale).
+        let (s, src) = resolved_render_scale(None, Some(3840 * 2160), 1280 * 720, 256);
+        assert_eq!(src, RenderScaleSource::CliOverride);
+        assert!((s - 1.0).abs() < 1e-6, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_cli_clamps_low() {
+        // Asking for tiny budget on a huge display clamps to 0.25 floor.
+        let (s, src) = resolved_render_scale(None, Some(160 * 90), 5000 * 5000, 1024);
+        assert_eq!(src, RenderScaleSource::CliOverride);
+        assert!((s - 0.25).abs() < 1e-6, "scale was {s}");
     }
 
     // --- hash-thing-2w1u: HASH_THING_PRESENT_MODE parser ---
@@ -2833,5 +3035,104 @@ mod tests {
         assert!(compute.is_idle(), "compute must return to IDLE after take");
         assert!(render.is_idle(), "render still untouched");
         assert!(render.take_resolved().is_none());
+    }
+
+    // --- hash-thing-dbz5.1: SubmitFenceState semantics ---
+    //
+    // The state machine is small but the semantics are subtle: we have
+    // to distinguish "no submission yet" (frame 0) from "submission
+    // in flight" from "submission complete", and the callback may fire
+    // after the next submit has already incremented `submit_seq`. These
+    // tests pin the predicate the renderer reads at acquire time.
+
+    #[test]
+    fn submit_fence_initial_state_reports_no_inflight() {
+        // First-ever frame: no submit has happened, so there is no
+        // prior submission to wait on. The renderer must NOT report
+        // "in flight" in this case (would mis-attribute the first
+        // frame's surface_acquire to a phantom prior frame).
+        let s = SubmitFenceState::default();
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(!in_flight, "first-frame fence must not report in-flight");
+        assert!(s.last_pipeline.is_none());
+    }
+
+    #[test]
+    fn submit_fence_in_flight_after_submit_before_callback() {
+        let mut s = SubmitFenceState::default();
+        s.submit_seq = 1; // simulate one submit having happened
+                          // Callback hasn't fired yet → done_seq still 0.
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(in_flight, "submit registered but no callback yet");
+        assert!(s.last_pipeline.is_none(), "no completed pipeline yet");
+    }
+
+    #[test]
+    fn submit_fence_not_in_flight_after_callback() {
+        let mut s = SubmitFenceState::default();
+        s.submit_seq = 1;
+        s.done_seq = 1;
+        s.last_pipeline = Some(Duration::from_millis(5));
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(
+            !in_flight,
+            "callback fired and matches submit_seq → not in flight"
+        );
+        assert_eq!(s.last_pipeline, Some(Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn submit_fence_callback_only_advances_done_seq() {
+        // Out-of-order callback (older seq fires after newer one
+        // already updated done_seq) must not roll done_seq backward.
+        // The guard `if s.done_seq < this_seq` prevents this in the
+        // real callback; this test mirrors that contract on the state
+        // struct directly.
+        let mut s = SubmitFenceState::default();
+        s.submit_seq = 5;
+        s.done_seq = 4;
+        s.last_pipeline = Some(Duration::from_millis(3));
+
+        // A stale callback for seq=3 arrives. Apply guard manually.
+        let stale_seq = 3u64;
+        let guarded_apply = s.done_seq < stale_seq;
+        if guarded_apply {
+            s.done_seq = stale_seq;
+            s.last_pipeline = Some(Duration::from_millis(99));
+        }
+        assert!(!guarded_apply);
+        assert_eq!(s.done_seq, 4, "stale callback must not roll seq back");
+        assert_eq!(
+            s.last_pipeline,
+            Some(Duration::from_millis(3)),
+            "stale callback must not overwrite pipeline"
+        );
+    }
+
+    #[test]
+    fn submit_fence_callback_runs_from_other_thread() {
+        // Sanity: the Arc<Mutex<...>> is the actual cross-thread channel
+        // the renderer uses (callback fires from wgpu's polling thread).
+        // Spawn a thread, have it touch the state under lock, join,
+        // confirm the render-thread side observes the update.
+        let arc = Arc::new(Mutex::new(SubmitFenceState::default()));
+        {
+            let mut s = arc.lock().unwrap();
+            s.submit_seq = 7;
+        }
+        let arc_cb = Arc::clone(&arc);
+        let handle = std::thread::spawn(move || {
+            let mut s = arc_cb.lock().unwrap();
+            // Simulate `on_submitted_work_done` for seq 7.
+            if s.done_seq < 7 {
+                s.done_seq = 7;
+                s.last_pipeline = Some(Duration::from_micros(420));
+            }
+        });
+        handle.join().unwrap();
+        let s = arc.lock().unwrap();
+        let in_flight = s.submit_seq > 0 && s.done_seq < s.submit_seq;
+        assert!(!in_flight);
+        assert_eq!(s.last_pipeline, Some(Duration::from_micros(420)));
     }
 }

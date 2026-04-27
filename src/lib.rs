@@ -111,7 +111,8 @@ impl ApplicationHandler for WasmApp {
         let gpu = Rc::clone(&self.gpu);
         let window = Arc::clone(self.window.as_ref().expect("window just created"));
         wasm_bindgen_futures::spawn_local(async move {
-            let renderer = render::Renderer::new(window.clone(), WASM_VOLUME_SIZE).await;
+            // wasm: no CLI flag plumbing; auto-pick the render scale.
+            let renderer = render::Renderer::new(window.clone(), WASM_VOLUME_SIZE, None).await;
             gpu.borrow_mut().renderer = Some(renderer);
             log::info!("WASM renderer initialized");
             window.request_redraw();

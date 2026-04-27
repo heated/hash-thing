@@ -74,6 +74,9 @@ dolt-server-launchd.log
 # Per-worktree actor identity
 actor
 
+# Embedded Dolt server data (bd 1.0+ runtime, not versioned)
+embeddeddolt/
+
 # NOTE: Do NOT add negation patterns here.
 # They would override fork protection in .git/info/exclude.
 # config.yaml is tracked by git (team defaults).
