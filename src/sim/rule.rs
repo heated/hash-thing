@@ -132,74 +132,6 @@ pub trait BlockRule {
     fn clone_box(&self) -> Box<dyn BlockRule + Send>;
 }
 
-/// A 1-vertical-radius local CA rule (hash-thing-qy4g).
-///
-/// Applied as a third phase after CaRule (phase 1) and BlockRule (phase 2)
-/// in `step_grid_once`. Reads the cell's vertical neighbors (above, below) in
-/// addition to the cell itself. Read-old/write-new: all reads come from a
-/// snapshot of post-BlockRule state, all writes go into the next buffer
-/// without feeding back into the same phase.
-///
-/// This is an enum (vvun convention), not a trait, to avoid vtable dispatch
-/// in the per-cell hot path. Adding a variant requires updating the dispatch
-/// match in `step_cell` and `is_self_inert`.
-///
-/// Read window is intentionally narrow (cur + above + below). Future
-/// requirements for wider windows (e.g. r7fi per-material gravity rules
-/// needing horizontal context) should widen `step_cell` rather than adding
-/// a parallel rule type — the apply site in `step_grid_once` is the single
-/// integration point.
-#[derive(Clone, Debug)]
-pub enum LocalRule {
-    Identity(IdentityLocalRule),
-}
-
-impl LocalRule {
-    #[inline]
-    pub fn step_cell(&self, cur: Cell, above: Cell, below: Cell) -> Cell {
-        match self {
-            LocalRule::Identity(r) => r.step_cell(cur, above, below),
-        }
-    }
-
-    /// True if this rule returns `cur` unchanged for every (above, below)
-    /// pair, given any cur. Mirrors `CaRule::is_self_inert` and gates the
-    /// `cell_is_inert_fixed_point` short-circuit so uniform subtrees of
-    /// stone-with-Identity (or any future self-inert LocalRule) still skip.
-    #[inline]
-    pub fn is_self_inert(&self) -> bool {
-        match self {
-            LocalRule::Identity(r) => r.is_self_inert(),
-        }
-    }
-}
-
-/// Identity LocalRule — returns `cur` unchanged for any (above, below).
-///
-/// Used by tests as a no-op proof that the apply site preserves state under
-/// the read-old/write-new contract, and as a sentinel "this material has a
-/// LocalRule but doesn't change" value during incremental decomposition.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IdentityLocalRule;
-
-impl IdentityLocalRule {
-    #[inline]
-    pub fn step_cell(&self, cur: Cell, _above: Cell, _below: Cell) -> Cell {
-        cur
-    }
-
-    #[inline]
-    pub fn is_self_inert(&self) -> bool {
-        true
-    }
-}
-
-impl From<IdentityLocalRule> for LocalRule {
-    fn from(r: IdentityLocalRule) -> LocalRule {
-        LocalRule::Identity(r)
-    }
-}
-
 /// Map local (dx, dy, dz) offsets (each 0 or 1) to an index in `[Cell; 8]`.
 ///
 /// Matches `octant_index` in `src/octree/node.rs` — this is a load-bearing
@@ -1486,23 +1418,4 @@ mod tests {
         assert!(seen.iter().all(|&s| s));
     }
 
-    #[test]
-    fn identity_local_rule_returns_cur_unchanged() {
-        let rule = IdentityLocalRule;
-        let cur = Cell::pack(7, 3);
-        let above = Cell::pack(2, 0);
-        let below = Cell::EMPTY;
-        assert_eq!(rule.step_cell(cur, above, below), cur);
-        assert_eq!(rule.step_cell(Cell::EMPTY, above, below), Cell::EMPTY);
-        assert!(rule.is_self_inert());
-    }
-
-    #[test]
-    fn local_rule_enum_dispatch_to_identity() {
-        let rule: LocalRule = IdentityLocalRule.into();
-        let cur = Cell::pack(5, 11);
-        assert_eq!(rule.step_cell(cur, Cell::EMPTY, Cell::EMPTY), cur);
-        assert_eq!(rule.step_cell(cur, Cell::pack(8, 1), Cell::pack(3, 0)), cur);
-        assert!(rule.is_self_inert());
-    }
 }
