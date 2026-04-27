@@ -6,9 +6,21 @@
 //! in this codebase (infinite worlds 3fq.4, HashDAG edits) — keep it small
 //! and uniform.
 //!
-//! There is exactly one short-circuit path: `WorldGen::classify`. No
-//! corner-agreement heuristic. Heuristic collapse is not allowed in the first
-//! direct-octree generator; it would set the wrong project convention.
+//! The default builder ([`gen_region`]) has exactly one short-circuit path:
+//! `WorldGen::classify`. No corner-agreement heuristic. Heuristic collapse is
+//! not allowed in the default direct-octree generator; it would set the wrong
+//! project convention.
+//!
+//! [`gen_region_with_lod`] (cswp.8.4) adds a *separate* opt-in heuristic
+//! short-circuit: at `level == target_lod`, after a classify miss, it samples
+//! 8 octant centroids and emits a single representative-material leaf. Exact
+//! at `target_lod == 1` (the 8 samples ARE the 8 leaves) and approximate
+//! ("first non-empty centroid wins") at `target_lod >= 2`. Callers needing
+//! canonical-rule LOD should use `gen_region` + `NodeStore::lod_collapse_chunk`.
+//! Empirically, this heuristic diverges materially from the canonical rule on
+//! heightmap-style terrain (~37% of skipped chunks at chunk_level=8,
+//! target_lod=8) — see `tests/bench_cold_gen_lod.rs`. The default
+//! `gen_region` path is unchanged.
 
 use rustc_hash::FxHashMap;
 
@@ -39,6 +51,13 @@ pub struct GenStats {
     /// the current builder; stored explicitly so a future restructure of
     /// the recursion (e.g. early-outs, lazy child generation) can't silently
     /// break the invariant without a test failing.
+    ///
+    /// In `gen_region_with_lod`, a lod-skip at `level == target_lod` still
+    /// bumps `classify_calls` (classify is queried first; the skip only fires
+    /// after classify misses). So the `leaves + classify_calls == calls_total`
+    /// invariant holds for both `gen_region` and `gen_region_with_lod`, and
+    /// `lod_skips` is a subset of `classify_calls` (every skip is preceded by
+    /// a classify miss).
     pub classify_calls: u64,
     pub interiors_interned: u64,
     /// Wall-clock time for the heightmap precomputation pass (set by seed_terrain).
@@ -205,10 +224,14 @@ impl<'a, F: WorldGen> Builder<'a, F> {
     ///    before the lod-skip check, so a uniform-AIR chunk still collapses
     ///    to the canonical proof-collapsed form regardless of target_lod.
     /// 3. `level == target_lod` after a classify miss → **lod-skip**. Sample
-    ///    8 octant centroids (or 8 cells for `target_lod == 1`), apply the
-    ///    canonical Leaf-only representative-state rule from
-    ///    `representative_state_memo`, and emit `store.leaf(rep)`. Bumps
-    ///    `lod_skips`.
+    ///    8 octant centroids (or 8 cells for `target_lod == 1`) and emit
+    ///    `store.leaf(rep)` where `rep` is the first non-empty sample in
+    ///    octant-traversal order, or AIR if all samples are empty. Bumps
+    ///    `lod_skips`. This is **exact** for `target_lod == 1` (the 8 samples
+    ///    are the 8 leaves; "first non-empty" matches the canonical Leaf-only
+    ///    rule) and **approximate** for `target_lod >= 2` (treats each
+    ///    octant centroid as that octant's representative; biased toward
+    ///    earlier-traversal-order octants).
     ///
     /// At `level == target_lod`, the emitted output is a raw `Leaf(rep)`
     /// NodeId standing in for a `2^target_lod`-cube uniform-region — the
@@ -247,16 +270,19 @@ impl<'a, F: WorldGen> Builder<'a, F> {
         }
 
         if level == target_lod {
-            // lod-skip: 8-octant centroid samples + canonical Leaf-only
-            // rule from `representative_state_memo` (store.rs:1009).
+            // lod-skip: 8-octant centroid samples; first non-empty wins.
             //
-            // Sub-octant cell offset:
-            //   target_lod == 1 → 0 (the 8 octants ARE the 8 cells).
-            //   target_lod >= 2 → 2^(target_lod - 2) (lower-corner-of-upper-half).
+            // Cell layout per octant: child octant size is `2^(level-1)`
+            // (`half`); the centroid of that child sits at offset
+            // `2^(level-2)` (`sub_offset`) from the child's lower corner.
+            //   target_lod == 1 → half=1, sub_offset=0 (the 8 octants ARE
+            //     the 8 cells; "first non-empty" matches the canonical
+            //     Leaf-only rule from `representative_state_memo`).
+            //   target_lod >= 2 → sub_offset = 2^(target_lod - 2). One
+            //     centroid per octant; approximate, biased to early octants.
             let half = 1i64 << (level - 1);
             let sub_offset: i64 = if level >= 2 { 1i64 << (level - 2) } else { 0 };
             let mut rep_state: CellState = 0;
-            let mut rep_pop: u64 = 0;
             for oct in 0..8usize {
                 let (cx, cy, cz) = octant_coords(oct);
                 let cell = [
@@ -265,9 +291,8 @@ impl<'a, F: WorldGen> Builder<'a, F> {
                     origin[2] + cz as i64 * half + sub_offset,
                 ];
                 let s = self.field.sample(cell);
-                if s != 0 && (rep_state == 0 || rep_pop == 0) {
+                if s != 0 && rep_state == 0 {
                     rep_state = s;
-                    rep_pop = 1;
                 }
             }
             self.stats.lod_skips += 1;
@@ -324,19 +349,28 @@ pub fn gen_region<F: WorldGen>(
 ///   `[0, 2^(size_log2 - chunk_level))` per axis.
 ///
 /// **Representative-material proxy** (when lod-skip fires): 8 cells at the
-/// octant centroids of the `2^target_lod` cube, with the canonical
-/// Leaf-only rule from `NodeStore::representative_state_memo` applied to
-/// the samples (first non-empty wins). This is **exact** for
-/// `target_lod == 1` (the 8 cells ARE the 8 leaves) and **approximate** for
-/// `target_lod >= 2` (treats each octant centroid as the canonical
-/// representative of that octant). Callers needing the canonical rule for
-/// `target_lod >= 2` should use [`gen_region`] followed by
-/// `NodeStore::lod_collapse_chunk`.
+/// octant centroids of the `2^target_lod` cube; the **first non-empty sample
+/// in octant-traversal order wins** (or AIR if all 8 samples are empty).
+///
+/// - **Exact** for `target_lod == 1`: the 8 cells ARE the 8 leaves, and
+///   "first non-empty" coincides with the canonical Leaf-only rule from
+///   `NodeStore::representative_state_memo`.
+/// - **Approximate** for `target_lod >= 2`: only one cell sampled per
+///   octant. The rule is a single-sample, octant-order-biased proxy — it is
+///   **not** the canonical largest-populated-child rule. On heightmap-style
+///   surface terrain, `tests/bench_cold_gen_lod.rs` reports ~37% material
+///   divergence from `lod_collapse_chunk` at `chunk_level == target_lod == 8`.
+///   Callers needing the canonical rule should use [`gen_region`] followed
+///   by `NodeStore::lod_collapse_chunk`. This API exists so the bench can
+///   measure the speed/fidelity tradeoff side-by-side; it is not the
+///   recommended runtime path.
 ///
 /// Panics if:
 /// - `chunk_level == 0` (degenerate; every leaf would be a chunk)
 /// - `chunk_level > size_log2`
-/// - any `chunk_lod_fn` output exceeds `chunk_level`
+/// - any *visited* chunk's `chunk_lod_fn` output exceeds `chunk_level`
+///   (chunks that proof-collapse above `chunk_level` are never visited and
+///   their `chunk_lod_fn` output is never queried)
 pub fn gen_region_with_lod<F: WorldGen>(
     store: &mut NodeStore,
     field: &F,

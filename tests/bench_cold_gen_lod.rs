@@ -160,6 +160,9 @@ fn run_bench(level: u32, chunk_level: u32, target_lod: u32, runs: usize) {
         let (root_bp, _) = gen_region(&mut s_bp, &field, [0, 0, 0], level);
         let _root_bp_collapsed = s_bp.lod_collapse(root_bp, target_lod);
         bp_stats.record(t.elapsed().as_micros());
+        // nodes_bp is intentionally post-collapse: it's the steady-state
+        // memory footprint of the build-then-collapse strategy, which is
+        // what we want to compare against (c)'s in-place skip-at-gen output.
         let nodes_bp = s_bp.node_count();
         drop(s_bp);
 
@@ -267,6 +270,14 @@ fn run_bench(level: u32, chunk_level: u32, target_lod: u32, runs: usize) {
             (divergence as f64) / (last_lod_skips as f64) <= 0.05
         }
     };
+    // Cheap regression check: any divergence between (b') and (c) requires
+    // the skip path to have fired at least once. Survives even if the
+    // canonicalization step is changed.
+    debug_assert!(
+        divergence == 0 || last_lod_skips > 0,
+        "divergence={divergence} but lod_skips=0 (skip path never fired)",
+    );
+
     let recommendation = match (speedup_ok, div_ok) {
         (true, true) => "skip-at-gen wins (recommend gen_region_with_lod)",
         (true, false) => "build-then-collapse is fine (skip-at-gen too divergent)",
@@ -274,7 +285,13 @@ fn run_bench(level: u32, chunk_level: u32, target_lod: u32, runs: usize) {
         (false, false) => "build-then-collapse is fine (skip-at-gen neither faster nor exact)",
     };
     eprintln!(
-        "  gate: speedup>=1.5×: {speedup_ok} | divergence acceptable: {div_ok} -> {recommendation}",
+        "  gate: speedup (b')/(c)={speedup_bp_c:.0}× (>=1.5×: {speedup_ok}) | \
+         divergence={divergence}/{last_lod_skips} skipped \
+         (acceptable: {div_ok}) -> {recommendation}",
+    );
+    eprintln!(
+        "  note: gate compares against (b') global lod_collapse, not (b) per-chunk; \
+         the runtime path today is closer to (b).",
     );
     eprintln!();
 }
@@ -282,8 +299,16 @@ fn run_bench(level: u32, chunk_level: u32, target_lod: u32, runs: usize) {
 #[test]
 #[ignore]
 fn bench_cold_gen_lod_1024() {
-    // Default scale: 1024³, chunk_level=8 (256³ chunks), full chunk
-    // collapse (target_lod = chunk_level).
+    // Default scale: 1024³ (level=10), chunk_level=8 (256³ chunks), 3 runs.
+    //
+    // Two target_lod rows for the speed/fidelity tradeoff:
+    // - target_lod=1: skip-at-gen heuristic IS the canonical Leaf-only
+    //   rule (the 8 octant samples ARE the 8 leaves). Divergence MUST be 0
+    //   by construction; this row is the un-deniable speedup baseline.
+    // - target_lod=8: maximum collapse (one Leaf per chunk). Heuristic is
+    //   approximate; divergence is empirical. This is the row Adjustment D's
+    //   gate is computed against.
+    run_bench(10, 8, 1, 3);
     run_bench(10, 8, 8, 3);
 }
 
