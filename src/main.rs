@@ -100,6 +100,68 @@ mod thread_qos {
     }
 }
 
+/// hash-thing-3lb8: when running as an x86_64 binary translated by Rosetta on
+/// Apple Silicon, emit a one-line warning recommending an arm64 toolchain.
+/// Reads the `sysctl.proc_translated` kernel selector via raw libc FFI to
+/// avoid pulling in a full libc crate for one symbol — same pattern as
+/// `mod thread_qos` above.
+mod rosetta_check {
+    #[cfg(target_os = "macos")]
+    mod imp {
+        use std::ffi::{c_char, c_int, c_void};
+
+        extern "C" {
+            fn sysctlbyname(
+                name: *const c_char,
+                oldp: *mut c_void,
+                oldlenp: *mut usize,
+                newp: *mut c_void,
+                newlen: usize,
+            ) -> c_int;
+        }
+
+        pub fn warn_if_translated() {
+            let mut value: c_int = 0;
+            let mut size: usize = std::mem::size_of::<c_int>();
+            // SAFETY: Apple-documented libc entrypoint. `name` is a static
+            // NUL-terminated C string; `oldp`/`oldlenp` point to a stack
+            // `c_int`/`usize` that outlive the call and are sized to match
+            // each other; `newp`/`newlen` are null/0 because we are reading,
+            // not writing. sysctl writes at most `*oldlenp` bytes through
+            // `oldp`, which is `sizeof(c_int)` here.
+            let rc = unsafe {
+                sysctlbyname(
+                    c"sysctl.proc_translated".as_ptr(),
+                    &mut value as *mut _ as *mut c_void,
+                    &mut size as *mut _,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 && value == 1 {
+                log::warn!(
+                    "hash-thing is running under Rosetta translation (x86_64 \
+                     binary on Apple Silicon). For ~10x faster startup and \
+                     runtime perf, switch to an arm64 toolchain. \
+                     See .ship-notes/session-handoff-2026-04-26.md or hash-thing-82bt."
+                );
+            }
+            // rc != 0 → sysctl missing or errored; treat as "can't tell" and
+            // stay silent. value == 0 → native arm64 (or native x86_64 on
+            // an Intel Mac); also stay silent.
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    mod imp {
+        pub fn warn_if_translated() {}
+    }
+
+    pub fn warn_if_translated() {
+        imp::warn_if_translated();
+    }
+}
+
 /// One-line gen summary. Centralised so the `App::new` startup path and the
 /// `R`-key reset path emit identical formatting. hash-thing-3fq.5 added the
 /// classify_calls / nodes_delta / noise_fraction fields; the rest is carried
@@ -3213,6 +3275,8 @@ impl ApplicationHandler for App {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    rosetta_check::warn_if_translated();
 
     log::info!("hash-thing: 3D Hashlife Engine");
     log::info!("Controls:");
