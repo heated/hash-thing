@@ -514,6 +514,30 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ---
 
+## Minimum spec target (rendering / perf budget)
+
+This is the hardware we **target for 60 FPS at the listed resolution**. It's an invariant we want to hit, not a "might work" floor — it's the budget that constrains what rendering / sim features we ship by default. Heavier features may live behind a higher tier (LOD bias, optional shadows, etc.) but the default experience must hit 60 FPS on this rig.
+
+Sourced from edward's read of public hardware surveys (Steam HW Survey and similar). Numbers are not pinned to any specific survey snapshot; revise when the public-PC floor visibly moves.
+
+| Component | Target |
+|---|---|
+| RAM | **8 GB** |
+| CPU | **4 physical cores** (clock speed unconstrained) |
+| GPU VRAM | **2 GB** (open to pushback; some features may gate behind higher tiers) |
+| Display resolution | **1440p (2560×1440)** at 60 FPS |
+| Disk install footprint | **≤ 2 GB** (negotiable) |
+| Architecture | **x86_64** + **Apple Silicon (arm64)** |
+| Operating systems | macOS, Linux, Windows (per `xb7` distribution work) |
+
+Notes:
+- "Minimum" here means **the default experience runs at 60 FPS at 1440p on this rig.** If we can't hit that, either we lower the rendering budget or the spec target moves up — not both silently.
+- Felt FPS is the metric, not log-reported `render_gpu` (see hash-thing-dbz5). A fix that moves a single number without moving the felt experience does not count as hitting the target.
+- Tiered features are allowed: e.g. shadows / higher-quality LOD can require more VRAM, as long as the 2 GB tier still renders cleanly with the defaults.
+- Higher resolutions (4K, ultrawide) and beefier rigs are nice-to-have, not the design target.
+
+---
+
 ## Anti-goals
 
 Things we are NOT doing, to be clear about scope:
