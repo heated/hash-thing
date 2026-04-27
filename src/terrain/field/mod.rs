@@ -85,7 +85,7 @@ pub mod terrain_blend;
 
 pub use density::DensityField;
 pub use gyroid::{GyroidField, GyroidParams};
-pub use heightmap::HeightmapField;
+pub use heightmap::{HeightmapField, PrecomputedHeightmapField};
 pub use lattice::LatticeField;
 pub use terrain_blend::{TerrainBlendField, TerrainSurface};
 

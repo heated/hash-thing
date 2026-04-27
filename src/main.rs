@@ -515,7 +515,6 @@ struct LodUploadCtx<'a> {
     player_pos: [f64; 3],
     last_histogram: &'a mut [u32; 5],
     last_growth_ratio: &'a mut Option<f32>,
-    growth_warned: &'a mut bool,
 }
 
 struct App {
@@ -695,9 +694,6 @@ struct App {
     /// Last store-growth ratio captured during `upload_volume` for the HUD
     /// line. `None` until LOD has been enabled at least once.
     last_lod_growth_ratio: Option<f32>,
-    /// Latches the LOD-growth `log::warn!` so it fires once per
-    /// >4× excursion, not every frame.
-    lod_growth_warned: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -873,7 +869,6 @@ impl App {
             },
             last_lod_histogram: [0; 5],
             last_lod_growth_ratio: None,
-            lod_growth_warned: false,
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
@@ -1187,7 +1182,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         self.sync_render_cache();
@@ -1702,7 +1696,6 @@ impl App {
                     player_pos,
                     last_histogram: &mut self.last_lod_histogram,
                     last_growth_ratio: &mut self.last_lod_growth_ratio,
-                    growth_warned: &mut self.lod_growth_warned,
                 },
             );
         }
@@ -1752,7 +1745,6 @@ impl App {
                     player_pos,
                     last_histogram: &mut self.last_lod_histogram,
                     last_growth_ratio: &mut self.last_lod_growth_ratio,
-                    growth_warned: &mut self.lod_growth_warned,
                 },
             );
             if let Some(window) = &self.window {
@@ -1787,6 +1779,14 @@ impl App {
                 // baseline reference is now meaningless. Reset it so the
                 // next growth ratio reflects the post-compact size.
                 lod.policy.reset_growth_baseline();
+                // Rebase the cached (world_root, view_root) pair into the
+                // post-compact epoch. NodeId allocation in
+                // `compacted_with_remap_keeping` is deterministic, so an
+                // unchanged subtree can land on the numerically-same
+                // NodeId — without this rebase, the next update() would
+                // hit the cache against a stale pre-compact view_root
+                // (hash-thing-e4ep BLOCKER).
+                lod.policy.apply_compaction_remap(&remap);
             }
             // cswp.8.3: derive render-only view_root from canonical root.
             // Returns world.root unchanged when policy is disabled or
@@ -1803,23 +1803,21 @@ impl App {
             *last_svdag_stats = (svdag.node_count, svdag.byte_size(), svdag.root_level);
             *lod.last_histogram = lod.policy.lod_histogram();
             *lod.last_growth_ratio = lod.policy.store_growth_ratio(world.store.node_count());
-            // Warn-once on >4× growth from baseline. Cleared whenever we
-            // drop back under 4× so a transient excursion can re-arm.
+            renderer.upload_svdag(svdag);
+            // hash-thing-e4ep: shed ghost interior chains accumulated by
+            // repeated `lod_collapse_chunk` calls. Triggered AFTER the SVDAG
+            // has consumed the pre-compact `view_root`; the published remap
+            // is drained at the top of next frame's upload_volume, where
+            // `apply_remap` rebases the SVDAG's NodeId cache and
+            // `reset_growth_baseline()` re-bases the growth meter. Keeps
+            // `view_root` alive through the compaction so its (still
+            // referenced) substructure can hash-cons-dedupe with the next
+            // frame's collapses instead of being re-interned.
             if let Some(ratio) = *lod.last_growth_ratio {
-                if ratio > 4.0 {
-                    if !*lod.growth_warned {
-                        log::warn!(
-                            "cswp.8.3 LOD store growth ratio {:.2}× baseline (>4× threshold) — \
-                             investigate ghost-chain accumulation; consider compaction",
-                            ratio
-                        );
-                        *lod.growth_warned = true;
-                    }
-                } else {
-                    *lod.growth_warned = false;
+                if ratio > sim::chunks::LOD_COMPACT_RATIO_THRESHOLD {
+                    world.compact_keeping(&[view_root]);
                 }
             }
-            renderer.upload_svdag(svdag);
         }
     }
 
@@ -1858,7 +1856,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         if let Some(window) = self.window.as_ref() {
@@ -1923,7 +1920,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         self.sync_render_cache();
@@ -2012,7 +2008,6 @@ impl App {
                     player_pos,
                     last_histogram: &mut self.last_lod_histogram,
                     last_growth_ratio: &mut self.last_lod_growth_ratio,
-                    growth_warned: &mut self.lod_growth_warned,
                 },
             );
         }
@@ -2055,7 +2050,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         self.sync_render_cache();
@@ -2105,7 +2099,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         self.sync_render_cache();
@@ -2143,7 +2136,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         self.sync_render_cache();
@@ -2184,7 +2176,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         self.sync_render_cache();
@@ -2231,7 +2222,6 @@ impl App {
                 player_pos,
                 last_histogram: &mut self.last_lod_histogram,
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                growth_warned: &mut self.lod_growth_warned,
             },
         );
         let nodes_after = self.world.store.stats();
@@ -2295,7 +2285,6 @@ impl ApplicationHandler for App {
                     player_pos,
                     last_histogram: &mut self.last_lod_histogram,
                     last_growth_ratio: &mut self.last_lod_growth_ratio,
-                    growth_warned: &mut self.lod_growth_warned,
                 },
             );
             self.sync_cursor_capture();
@@ -2490,7 +2479,6 @@ impl ApplicationHandler for App {
                                     player_pos,
                                     last_histogram: &mut self.last_lod_histogram,
                                     last_growth_ratio: &mut self.last_lod_growth_ratio,
-                                    growth_warned: &mut self.lod_growth_warned,
                                 },
                             );
                             log::info!(
@@ -2615,7 +2603,6 @@ impl ApplicationHandler for App {
                         // default 256³ scene without this gate).
                         winit::keyboard::Key::Character("L") => {
                             self.lod_policy.enabled = !self.lod_policy.enabled;
-                            self.lod_growth_warned = false;
                             log::info!(
                                 "Chunk-LOD policy: {} (bias={:.2}, max_lod={})",
                                 if self.lod_policy.enabled { "ON" } else { "OFF" },
@@ -2891,7 +2878,6 @@ impl ApplicationHandler for App {
                                             player_pos,
                                             last_histogram: &mut self.last_lod_histogram,
                                             last_growth_ratio: &mut self.last_lod_growth_ratio,
-                                            growth_warned: &mut self.lod_growth_warned,
                                         },
                                     );
                                 }
@@ -3129,7 +3115,6 @@ impl ApplicationHandler for App {
                                                 player_pos,
                                                 last_histogram: &mut self.last_lod_histogram,
                                                 last_growth_ratio: &mut self.last_lod_growth_ratio,
-                                                growth_warned: &mut self.lod_growth_warned,
                                             },
                                         );
                                         self.sync_render_cache();
