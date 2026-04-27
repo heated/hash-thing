@@ -589,6 +589,9 @@ struct App {
     /// applied at the start of the next tick.
     entities: sim::EntityStore,
     volume_size: u32,
+    /// hash-thing-06so: pinned rendered-pixel budget from `--demo` / `--res`.
+    /// `None` → auto-pick. Threaded through to `Renderer::new`.
+    target_pixels_override: Option<u64>,
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -828,6 +831,7 @@ impl App {
             last_title_update: None,
             entities: sim::EntityStore::new(),
             volume_size,
+            target_pixels_override: None,
             step_handle: None,
             step_start: std::time::Instant::now(),
             render_origin,
@@ -2261,8 +2265,11 @@ impl ApplicationHandler for App {
             }
             self.window = Some(window.clone());
 
-            let mut renderer =
-                pollster::block_on(render::Renderer::new(window.clone(), self.volume_size));
+            let mut renderer = pollster::block_on(render::Renderer::new(
+                window.clone(),
+                self.volume_size,
+                self.target_pixels_override,
+            ));
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
             // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
             // `surface.get_current_texture()` + `present()`; pairs with the
@@ -3259,6 +3266,94 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Map a `--res VALUE` argument to a total rendered-pixel budget.
+/// Recognises named presets (`720p`/`1080p`/`1440p`/`2160p`) and
+/// arbitrary `WxH` (case-insensitive). Returns `None` for unrecognised
+/// input — caller panics with a usage line.
+///
+/// hash-thing-06so.
+fn parse_res_value(s: &str) -> Option<u64> {
+    let lower = s.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "720p" => Some(1280 * 720),
+        "1080p" => Some(1920 * 1080),
+        "1440p" => Some(2560 * 1440),
+        "2160p" | "4k" => Some(3840 * 2160),
+        _ => {
+            // Arbitrary WxH. Strict: both sides must be > 0 and the
+            // product must not overflow u64 (won't with u32 inputs but
+            // keep the saturation explicit).
+            let (w_str, h_str) = lower.split_once('x')?;
+            let w: u32 = w_str.parse().ok()?;
+            let h: u32 = h_str.parse().ok()?;
+            if w == 0 || h == 0 {
+                return None;
+            }
+            Some((w as u64).saturating_mul(h as u64))
+        }
+    }
+}
+
+/// Parse `[SIZE] [--demo | --res VALUE]` from an arg iterator.
+/// `args` should already have the binary path stripped (callers usually
+/// pass `std::env::args().skip(1)`). Pure function for unit testing.
+///
+/// Returns `(volume_size, target_pixels_override)`. Panics with a usage
+/// message on invalid input — same idiom as the prior bare-positional
+/// parse this replaces.
+///
+/// `--demo` and `--res VALUE` are mutually exclusive — passing both
+/// panics rather than silent last-one-wins (hash-thing-06so plan-review
+/// finding).
+fn parse_args_from<I, S>(args: I) -> (u32, Option<u64>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH]";
+    let mut volume_size: Option<u32> = None;
+    let mut demo: bool = false;
+    let mut res_target: Option<u64> = None;
+    let mut iter = args.into_iter();
+    while let Some(arg_owned) = iter.next() {
+        let arg = arg_owned.as_ref();
+        match arg {
+            "--demo" => demo = true,
+            "--res" => {
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--res requires a VALUE"));
+                let parsed = parse_res_value(v.as_ref()).unwrap_or_else(|| {
+                    panic!("{USAGE}\n--res VALUE: unrecognised '{}'", v.as_ref())
+                });
+                res_target = Some(parsed);
+            }
+            other => {
+                let n: u32 = other
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{USAGE}\nunknown arg: {other}"));
+                assert!(
+                    n.is_power_of_two(),
+                    "volume size must be a power of 2 (got {n})"
+                );
+                if volume_size.is_some() {
+                    panic!("{USAGE}\nmore than one SIZE positional");
+                }
+                volume_size = Some(n);
+            }
+        }
+    }
+    if demo && res_target.is_some() {
+        panic!("{USAGE}\n--demo and --res are mutually exclusive");
+    }
+    let target = if demo {
+        Some(1920u64 * 1080u64)
+    } else {
+        res_target
+    };
+    (volume_size.unwrap_or(DEFAULT_VOLUME_SIZE), target)
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -3293,23 +3388,14 @@ fn main() {
     log::info!("  ;/' : decrease/increase chunk-LOD bias by 0.25 (clamped 0.25..4.0)");
     log::info!("  Esc: quit");
 
-    let volume_size = std::env::args()
-        .nth(1)
-        .map(|s| {
-            let n: u32 = s
-                .parse()
-                .expect("usage: hash-thing [SIZE]  (SIZE must be a power of 2)");
-            assert!(
-                n.is_power_of_two(),
-                "volume size must be a power of 2 (got {n})"
-            );
-            n
-        })
-        .unwrap_or(DEFAULT_VOLUME_SIZE);
+    let (volume_size, target_pixels_override) = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
         volume_size.trailing_zeros()
     );
+    if let Some(target) = target_pixels_override {
+        log::info!("CLI render target: {target} px (--demo / --res)");
+    }
 
     let mut event_loop_builder = EventLoop::builder();
     #[cfg(target_os = "macos")]
@@ -3335,6 +3421,7 @@ fn main() {
         .expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
+    app.target_pixels_override = target_pixels_override;
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -3352,6 +3439,121 @@ mod tests {
         // Negative prev (shouldn't occur in practice) hits the same
         // sentinel branch rather than producing a nonsense blend.
         assert_eq!(smooth_fps(-1.0, 20.0, 0.1), 20.0);
+    }
+
+    // --- hash-thing-06so: --demo / --res CLI flag parsing ---
+
+    #[test]
+    fn parse_res_value_named_presets() {
+        assert_eq!(parse_res_value("720p"), Some(1280 * 720));
+        assert_eq!(parse_res_value("1080p"), Some(1920 * 1080));
+        assert_eq!(parse_res_value("1440p"), Some(2560 * 1440));
+        assert_eq!(parse_res_value("2160p"), Some(3840 * 2160));
+        assert_eq!(parse_res_value("4k"), Some(3840 * 2160));
+    }
+
+    #[test]
+    fn parse_res_value_named_presets_case_insensitive() {
+        assert_eq!(parse_res_value("1080P"), Some(1920 * 1080));
+        assert_eq!(parse_res_value("4K"), Some(3840 * 2160));
+    }
+
+    #[test]
+    fn parse_res_value_arbitrary_wxh() {
+        assert_eq!(parse_res_value("1920x1080"), Some(1920 * 1080));
+        assert_eq!(parse_res_value("800x600"), Some(800 * 600));
+        // Case-insensitive on the 'x' (both 1920X1080 and 1920x1080 work).
+        assert_eq!(parse_res_value("1920X1080"), Some(1920 * 1080));
+    }
+
+    #[test]
+    fn parse_res_value_zero_dimension_rejected() {
+        assert_eq!(parse_res_value("0x1080"), None);
+        assert_eq!(parse_res_value("1920x0"), None);
+        assert_eq!(parse_res_value("0x0"), None);
+    }
+
+    #[test]
+    fn parse_res_value_garbage_rejected() {
+        assert_eq!(parse_res_value("nonsense"), None);
+        assert_eq!(parse_res_value(""), None);
+        assert_eq!(parse_res_value("1080"), None); // no 'p' or 'x'
+        assert_eq!(parse_res_value("xy"), None);
+        assert_eq!(parse_res_value("1920x"), None);
+        assert_eq!(parse_res_value("x1080"), None);
+    }
+
+    #[test]
+    fn parse_args_from_size_only() {
+        let (vs, t) = parse_args_from(["256"]);
+        assert_eq!(vs, 256);
+        assert_eq!(t, None);
+    }
+
+    #[test]
+    fn parse_args_from_no_args_uses_default() {
+        let (vs, t) = parse_args_from(std::iter::empty::<&str>());
+        assert_eq!(vs, DEFAULT_VOLUME_SIZE);
+        assert_eq!(t, None);
+    }
+
+    #[test]
+    fn parse_args_from_demo_alone() {
+        let (vs, t) = parse_args_from(["--demo"]);
+        assert_eq!(vs, DEFAULT_VOLUME_SIZE);
+        assert_eq!(t, Some(1920 * 1080));
+    }
+
+    #[test]
+    fn parse_args_from_demo_with_size_either_order() {
+        let (vs1, t1) = parse_args_from(["--demo", "256"]);
+        let (vs2, t2) = parse_args_from(["256", "--demo"]);
+        assert_eq!((vs1, t1), (256, Some(1920 * 1080)));
+        assert_eq!((vs2, t2), (256, Some(1920 * 1080)));
+    }
+
+    #[test]
+    fn parse_args_from_res_named() {
+        let (vs, t) = parse_args_from(["--res", "1440p", "512"]);
+        assert_eq!(vs, 512);
+        assert_eq!(t, Some(2560 * 1440));
+    }
+
+    #[test]
+    fn parse_args_from_res_arbitrary_wxh() {
+        let (vs, t) = parse_args_from(["--res", "1920x1080"]);
+        assert_eq!(vs, DEFAULT_VOLUME_SIZE);
+        assert_eq!(t, Some(1920 * 1080));
+    }
+
+    #[test]
+    #[should_panic(expected = "--demo and --res are mutually exclusive")]
+    fn parse_args_from_demo_and_res_both_panics() {
+        let _ = parse_args_from(["--demo", "--res", "1080p"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--res requires a VALUE")]
+    fn parse_args_from_res_without_value_panics() {
+        let _ = parse_args_from(["--res"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognised")]
+    fn parse_args_from_res_garbage_panics() {
+        let _ = parse_args_from(["--res", "nonsense"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a power of 2")]
+    fn parse_args_from_size_must_be_pow2() {
+        let _ = parse_args_from(["100"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one SIZE positional")]
+    fn parse_args_from_two_sizes_panics() {
+        let _ = parse_args_from(["64", "128"]);
     }
 
     #[test]
