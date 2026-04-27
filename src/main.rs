@@ -607,6 +607,12 @@ struct App {
     /// `main()` after construction; default `None` for the 40+ existing
     /// `App::new(N)` test callers.
     dump_frame_path: Option<std::path::PathBuf>,
+    /// hash-thing-j1mg: when `Some(scene)` (only valid alongside
+    /// `dump_frame_path`), dispatch the matching `PendingSceneSwap` in
+    /// `resumed()` so the captured frame shows that scene at its default
+    /// pose instead of the App-default terrain. `None` keeps the previous
+    /// hc0g default-terrain behavior unchanged.
+    dump_scene: Option<DumpScene>,
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -849,6 +855,7 @@ impl App {
             target_pixels_override: None,
             want_focus_on_launch: false,
             dump_frame_path: None,
+            dump_scene: None,
             step_handle: None,
             step_start: std::time::Instant::now(),
             render_origin,
@@ -2312,6 +2319,21 @@ impl ApplicationHandler for App {
                 renderer.enable_off_surface();
             }
             self.renderer = Some(renderer);
+            // hash-thing-j1mg: in dump-frame mode, optionally swap scenes
+            // before the first render so the captured frame shows e.g. the
+            // lattice intro beat instead of the App-default terrain. The
+            // scene loader runs synchronously here (we're not stepping yet)
+            // and uploads its own world to the renderer.
+            //
+            // We must also clear `startup_scene_pending` — otherwise the
+            // first RedrawRequested calls `load_initial_scene` which
+            // re-seeds terrain on top of the lattice/spectacle/etc. world
+            // we just loaded.
+            if let Some(scene) = self.dump_scene {
+                log::info!("--dump-scene: dispatching {} before first frame", scene.label());
+                self.dispatch_scene_swap(scene.to_swap());
+                self.startup_scene_pending = false;
+            }
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
             let player_pos = self.player_world_pos();
@@ -3416,6 +3438,60 @@ fn write_dump_frame_png(
     Ok(())
 }
 
+/// hash-thing-j1mg: which scene to dispatch via `PendingSceneSwap` before
+/// the dump-frame render. `None` keeps the default (terrain heightmap, the
+/// scene `App::new` seeds). Each variant maps 1:1 to a scene-loader the user
+/// would otherwise reach by pressing a key (R/G/B/M/N + U/I/O lattice jumps).
+///
+/// The `LatticeBeat` variants reseed the lattice demo and then jump the
+/// camera to the matching beat pose — same semantics as the `U`/`I`/`O`
+/// debug-jump keys in orbit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpScene {
+    Terrain,
+    GolSmoke,
+    Spectacle,
+    Gyroid,
+    LatticeBeat(LatticeDemoBeat),
+}
+
+impl DumpScene {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "terrain" => Some(Self::Terrain),
+            "gol" => Some(Self::GolSmoke),
+            "spectacle" => Some(Self::Spectacle),
+            "gyroid" => Some(Self::Gyroid),
+            "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
+            "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
+            "lattice-panorama" => Some(Self::LatticeBeat(LatticeDemoBeat::Panorama)),
+            _ => None,
+        }
+    }
+
+    fn to_swap(self) -> PendingSceneSwap {
+        match self {
+            Self::Terrain => PendingSceneSwap::ResetTerrain,
+            Self::GolSmoke => PendingSceneSwap::ResetGolSmoke,
+            Self::Spectacle => PendingSceneSwap::LoadDemoSpectacle,
+            Self::Gyroid => PendingSceneSwap::LoadGyroid,
+            Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terrain => "terrain",
+            Self::GolSmoke => "gol",
+            Self::Spectacle => "spectacle",
+            Self::Gyroid => "gyroid",
+            Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
+            Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
+            Self::LatticeBeat(LatticeDemoBeat::Panorama) => "lattice-panorama",
+        }
+    }
+}
+
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
 /// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
 /// `demo`).
@@ -3429,6 +3505,9 @@ struct ParsedArgs {
     demo: bool,
     /// `--dump-frame PATH`: render one frame to PNG at `PATH`, then exit.
     dump_frame: Option<std::path::PathBuf>,
+    /// `--dump-scene KIND`: hash-thing-j1mg, only meaningful with
+    /// `--dump-frame`. Selects which scene to dispatch before the dump.
+    dump_scene: Option<DumpScene>,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -3449,12 +3528,14 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    const USAGE: &str =
-        "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] [--dump-frame PATH]";
+    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
+                         [--dump-frame PATH] \
+                         [--dump-scene terrain|gol|spectacle|gyroid|lattice-intro|lattice-interior|lattice-panorama]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
     let mut dump_frame: Option<std::path::PathBuf> = None;
+    let mut dump_scene: Option<DumpScene> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -3495,6 +3576,21 @@ where
                 }
                 dump_frame = Some(std::path::PathBuf::from(v_str));
             }
+            "--dump-scene" => {
+                if dump_scene.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-scene");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene requires a KIND"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-scene requires a KIND; saw '{v_str}'");
+                }
+                let parsed = DumpScene::parse(v_str)
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene KIND: unrecognised '{v_str}'"));
+                dump_scene = Some(parsed);
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -3513,6 +3609,9 @@ where
     if demo && res_target.is_some() {
         panic!("{USAGE}\n--demo and --res are mutually exclusive");
     }
+    if dump_scene.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-scene requires --dump-frame");
+    }
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
@@ -3523,6 +3622,7 @@ where
         target_pixels,
         demo,
         dump_frame,
+        dump_scene,
     }
 }
 
@@ -3565,6 +3665,7 @@ fn main() {
         target_pixels: target_pixels_override,
         demo,
         dump_frame: dump_frame_path,
+        dump_scene,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -3578,6 +3679,9 @@ fn main() {
             "--dump-frame: will render one frame to {} and exit",
             path.display()
         );
+    }
+    if let Some(scene) = dump_scene {
+        log::info!("--dump-scene: {} (will dispatch before dump-frame render)", scene.label());
     }
 
     // Single source of truth for focus-on-launch. Two downstream sites
@@ -3618,6 +3722,7 @@ fn main() {
     app.target_pixels_override = target_pixels_override;
     app.want_focus_on_launch = want_focus_on_launch;
     app.dump_frame_path = dump_frame_path;
+    app.dump_scene = dump_scene;
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -3798,6 +3903,71 @@ mod tests {
     #[should_panic(expected = "--dump-frame requires a non-empty PATH")]
     fn parse_args_from_dump_frame_empty_path_panics() {
         let _ = parse_args_from(["--dump-frame", ""]);
+    }
+
+    // --- hash-thing-j1mg: --dump-scene CLI flag parsing ---
+
+    #[test]
+    fn parse_args_from_dump_scene_lattice_intro() {
+        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "lattice-intro"]);
+        assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/x.png")));
+        assert_eq!(
+            r.dump_scene,
+            Some(DumpScene::LatticeBeat(LatticeDemoBeat::Intro))
+        );
+    }
+
+    #[test]
+    fn parse_args_from_dump_scene_all_kinds() {
+        for (raw, expected) in [
+            ("terrain", DumpScene::Terrain),
+            ("gol", DumpScene::GolSmoke),
+            ("spectacle", DumpScene::Spectacle),
+            ("gyroid", DumpScene::Gyroid),
+            ("lattice-intro", DumpScene::LatticeBeat(LatticeDemoBeat::Intro)),
+            ("lattice-interior", DumpScene::LatticeBeat(LatticeDemoBeat::Interior)),
+            ("lattice-panorama", DumpScene::LatticeBeat(LatticeDemoBeat::Panorama)),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", raw]);
+            assert_eq!(r.dump_scene, Some(expected), "kind={raw}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires --dump-frame")]
+    fn parse_args_from_dump_scene_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-scene", "lattice-intro"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires a KIND")]
+    fn parse_args_from_dump_scene_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires a KIND; saw '--demo'")]
+    fn parse_args_from_dump_scene_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognised 'bogus'")]
+    fn parse_args_from_dump_scene_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-scene")]
+    fn parse_args_from_two_dump_scene_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "lattice-intro",
+            "--dump-scene",
+            "gol",
+        ]);
     }
 
     #[test]
