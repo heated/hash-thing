@@ -745,6 +745,25 @@ Plausible bands at 4096³:
 - **CPU step cost: the binding concern.** Scales directly with active-region misses; macro-cache short-circuits are load-bearing. The bench harness SIGKILLed a single 4096³ hashlife step at the 60-second ignore-mode ceiling — step cost is already ≫ per-frame budget without further optimization. ivms doesn't re-measure step cost; `hash-thing-hashlife-stride` is the adjacent bead that would.
 - Streaming not needed at 4096³ (strong claim). 8192³ *probably* needs streaming, but that call is intuition.
 
+**4.7.5a LOD policy fly-through measurement (`hash-thing-cswp.8.5`).** First end-to-end measurement of the cswp.8.3 chunk-LOD policy at the 4096³ design target. Bench: `tests/bench_flythrough_4096.rs`, M2 16 GB, profile=bench, base commit `3ad2ada`. Cold-gen 18.4 s (one shared world across biases); 8 trajectory samples per bias, anchored at chunk (0,0,0), sweeping diagonally to chunk (31,31,31). Run with `cargo test --profile bench --test bench_flythrough_4096 -- --ignored --nocapture` (~14.4 min wall).
+
+| `lod_bias` | dt_ms mean | dt_ms max | nodes_max | growth_max | hist[0..5] @ mid-traj |
+|---:|---:|---:|---:|---:|---|
+| 0.25 | 8 113 | 12 182 | 1 172 383 | 2.14× | [1/0/361/26134/6272] |
+| 0.50 | 10 573 | 14 090 | 1 609 286 | 1.37× | [1/26/3679/29062/0] |
+| 1.00 | 30 400 | 55 895 | 2 161 626 | 1.34× | [1/361/26134/6272/0] |
+| 2.00 | 56 799 | 79 676 | 2 659 268 | 1.23× | [27/3679/29062/0/0] |
+
+Three things this table establishes:
+
+- **The cswp.8.3.1 optimization is load-bearing, not a nice-to-have.** Per-frame `policy.update` cost at 4096³ is 8–80 s with the chained-recompute algorithm — three orders of magnitude above the 16.7 ms per-frame budget. The single-pass-recursive-descent rewrite (`hash-thing-cswp.8.3.1`) needs to land before the policy can be enabled by default at 4096³.
+- **`lod_bias` does what it says.** Higher bias shifts more chunks into lower-LOD bands (less collapse) and produces a larger working set: `nodes_max` grows monotonically 1.17M → 2.66M from bias 0.25 → 2.0. The histogram column shows the band shift directly. Both are smooth; the knob exposes the design-doc curve as expected.
+- **The 4× growth tripwire holds across the full bias sweep.** `growth_max` peaks at 2.14× (bias 0.25, where most chunks land in LODs 3–4 and the policy interns the most scaffold nodes). At biases 0.5, 1.0, 2.0 the ratio sits at 1.23×–1.37× — comfortably under the cswp.8.3 warn-once threshold. Per `docs/perf/cswp-lod.md` §0 this bench does **not** claim the policy reduces resident memory at 4096³; it shows the per-chunk cost stays bounded as the camera moves.
+
+LOD-4 reachability: at chunk_level=7 with a 32-chunk-per-axis world, max Chebyshev radius is 31. Band edges per `src/sim/chunks.rs` `target_lod_for_radius` put the LOD-4 boundary at raw radius {32, 64, 128} for biases {0.5, 1.0, 2.0} — all unreachable by construction. Bias 0.25 is included as a diagnostic so the bench output exercises the LOD-4 collapse path (band edge at raw radius 16). This is a curve-vs-world-size property of the design, not a bench limitation; it stops being true at chunk_level=8 in 4096³ or any chunk_level in 8192³+.
+
+What this bench does **not** measure: CA-driven macro-cache growth (no `world.step()` in the trajectory — a single warm 4096³ step exceeds the 60 s soft-max-command-seconds budget per §4.7.2a). `macro_cache_bytes_est()` reads 0 across the table for that reason. Sim-coupled measurement is filed under cswp.8.3.1's perf-rerun follow-up, not this bead.
+
 ---
 
 ## 5. Gap report
