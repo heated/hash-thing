@@ -65,15 +65,30 @@ Defaults: world=512, res=1080p, scene=default
 # ----- TOML helpers (flat key=value, optional quotes) -----
 toml_read() {
     # toml_read <key> <file> <default>
+    # Tolerates: CRLF, leading/trailing whitespace, quoted or bare values,
+    # trailing `# comment`. Quoted values are taken literally between the
+    # first pair of `"` (anything after the closing quote, including a
+    # comment, is dropped). Bare values are truncated at the first `#`.
     local key="$1" file="$2" def="$3" line val
     if [ -f "$file" ]; then
-        # Strip CR (CRLF tolerance), trim, match key, take last occurrence.
         line=$(tr -d '\r' < "$file" \
                | grep -E "^[[:space:]]*${key}[[:space:]]*=" \
                | tail -1 || true)
         if [ -n "$line" ]; then
+            # Strip "key = " prefix.
             val=$(printf '%s' "$line" \
-                  | sed -E 's/^[[:space:]]*[^=]+=[[:space:]]*//; s/[[:space:]]*$//; s/^"(.*)"$/\1/')
+                  | sed -E 's/^[[:space:]]*[^=]+=[[:space:]]*//')
+            case "$val" in
+                \"*)
+                    val=${val#\"}            # leading quote
+                    val=${val%%\"*}          # everything from next quote on
+                    ;;
+                *)
+                    val=${val%%#*}           # trailing comment
+                    ;;
+            esac
+            # Trim whitespace.
+            val=$(printf '%s' "$val" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
             if [ -n "$val" ]; then
                 printf '%s\n' "$val"
                 return
@@ -110,11 +125,13 @@ validate_world() {
 }
 
 validate_res() {
-    local v="$1"
+    # Mirror the binary's case-insensitive accept set
+    # (src/main.rs:3300 lowercases first).
+    local v
+    v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
     case "$v" in
         720p|1080p|1440p|2160p|4k) return 0 ;;
         *x*)
-            # WxH: both sides positive ints.
             local w h
             w="${v%x*}"
             h="${v#*x}"
@@ -132,7 +149,9 @@ validate_scene() {
 }
 
 # ----- Binary picker -----
-pick_binary() {
+# try_pick_binary: observational. Returns the prebuilt binary path or empty
+# string. Never builds. Used by `show`.
+try_pick_binary() {
     local stable="$REPO_ROOT/target/stable/hash-thing"
     local release="$REPO_ROOT/target/release/hash-thing"
     if [ -x "$stable" ]; then
@@ -141,6 +160,17 @@ pick_binary() {
     fi
     if [ -x "$release" ]; then
         printf '%s\n' "$release"
+        return
+    fi
+}
+
+# pick_binary: side-effecting. Falls through to `cargo build --release` if
+# nothing prebuilt. Used by `cmd_run`.
+pick_binary() {
+    local picked release="$REPO_ROOT/target/release/hash-thing"
+    picked=$(try_pick_binary)
+    if [ -n "$picked" ]; then
+        printf '%s\n' "$picked"
         return
     fi
     echo "hash-thing-demo: no prebuilt binary; building (cargo build --release, ~10-15min cold)..." >&2
@@ -180,7 +210,8 @@ cmd_show() {
     cur_world=$(toml_read world "$CONFIG_FILE" "$DEFAULT_WORLD")
     cur_res=$(toml_read resolution "$CONFIG_FILE" "$DEFAULT_RES")
     cur_scene=$(toml_read scene "$CONFIG_FILE" "$DEFAULT_SCENE")
-    picked=$(pick_binary 2>/dev/null || true)
+    # `show` is observational: never trigger a build.
+    picked=$(try_pick_binary)
     echo "config:  $CONFIG_FILE"
     if [ -f "$CONFIG_FILE" ]; then
         echo "         (exists)"
@@ -193,7 +224,7 @@ cmd_show() {
     if [ -n "$picked" ]; then
         echo "binary:     $(binary_metadata "$picked")"
     else
-        echo "binary:     (would build via cargo build --release)"
+        echo "binary:     (would build via cargo build --release on next run)"
     fi
 }
 

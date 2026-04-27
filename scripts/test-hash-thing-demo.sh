@@ -10,7 +10,16 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WRAPPER="$REPO_ROOT/scripts/hash-thing-demo"
 
 TMP_HOME=$(mktemp -d)
-trap 'rm -rf "$TMP_HOME"' EXIT
+STUB_BINARY=""
+cleanup() {
+    rm -rf "$TMP_HOME"
+    if [ -n "$STUB_BINARY" ] && [ -f "$STUB_BINARY" ] && [ ! -s "$STUB_BINARY" ]; then
+        # Only delete the stub we created (zero-byte sentinel), never an
+        # already-built real binary.
+        rm -f "$STUB_BINARY"
+    fi
+}
+trap cleanup EXIT
 
 export XDG_CONFIG_HOME="$TMP_HOME/.config"
 export HASH_THING_DEMO_DRY_RUN=1
@@ -135,20 +144,18 @@ out=$("$WRAPPER" --help)
 assert_contains "--help prints usage" "$out" "usage: hash-thing-demo"
 
 echo "== test 14: show prints binary metadata when present =="
-# Create a fake binary at target/release/hash-thing
+# Create a fake binary at target/release/hash-thing if none exists.
+# The trap cleanup at top of file removes only this zero-byte sentinel,
+# never a real prebuilt binary.
 mkdir -p "$REPO_ROOT/target/release"
-created_fake=0
 if [ ! -e "$REPO_ROOT/target/release/hash-thing" ]; then
     touch "$REPO_ROOT/target/release/hash-thing"
     chmod +x "$REPO_ROOT/target/release/hash-thing"
-    created_fake=1
+    STUB_BINARY="$REPO_ROOT/target/release/hash-thing"
 fi
 out=$("$WRAPPER" show)
 assert_contains "show prints binary line" "$out" "binary:"
 assert_contains "show prints binary mtime" "$out" "mtime "
-if [ "$created_fake" = 1 ]; then
-    rm -f "$REPO_ROOT/target/release/hash-thing"
-fi
 
 echo "== test 15: hand-edited TOML with quotes / whitespace tolerated =="
 mkdir -p "$XDG_CONFIG_HOME/hash-thing"
@@ -161,6 +168,55 @@ EOF
 out=$("$WRAPPER" show)
 assert_contains "tolerates whitespace world" "$out" "world:      64"
 assert_contains "tolerates quoted res" "$out" "resolution: 720p"
+
+echo "== test 16: hand-edited TOML with trailing # comment tolerated =="
+cat > "$CONFIG" <<'EOF'
+world = 128 # my preferred size
+resolution = "1440p" # default
+scene = default
+EOF
+out=$("$WRAPPER" show)
+assert_contains "strips bare # comment" "$out" "world:      128"
+assert_contains "strips quoted-value # comment" "$out" "resolution: 1440p"
+# Verify the binary invocation doesn't carry the comment as an arg.
+out=$("$WRAPPER")
+assert_contains "dry-run uses cleaned world" "$out" " 128 "
+out_with_hash=$(echo "$out" | grep '#' || true)
+assert_eq "no '#' leaked into invoked cmd" "$out_with_hash" ""
+
+echo "== test 17: validate_res accepts uppercase X =="
+assert_status "set res 1920X1080 ok" 0 "$WRAPPER" set res 1920X1080
+assert_status "set res 4K ok" 0 "$WRAPPER" set res 4K
+
+echo "== test 18: show does not trigger build (observational) =="
+# Move any prebuilt binary out of the way so the wrapper has nothing to
+# pick. `show` must NOT fall through to cargo build.
+RELEASE_BIN="$REPO_ROOT/target/release/hash-thing"
+MOVED=""
+if [ -e "$RELEASE_BIN" ]; then
+    MOVED="$RELEASE_BIN.shtest-aside"
+    mv "$RELEASE_BIN" "$MOVED"
+fi
+restore_release_bin() {
+    [ -n "$MOVED" ] && [ -e "$MOVED" ] && mv "$MOVED" "$RELEASE_BIN" || true
+}
+# Belt-and-suspenders: also restore on EXIT in case a fatal error skips
+# the inline restore.
+trap 'restore_release_bin; cleanup' EXIT
+start=$(date +%s)
+out=$("$WRAPPER" show 2>&1)
+end=$(date +%s)
+elapsed=$((end - start))
+assert_contains "show announces would-build" "$out" "would build"
+if [ "$elapsed" -lt 5 ]; then
+    PASS=$((PASS + 1))
+    echo "  PASS: show ran fast (${elapsed}s, no build)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: show took ${elapsed}s (>=5s suggests it built)"
+fi
+restore_release_bin
+trap cleanup EXIT
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="

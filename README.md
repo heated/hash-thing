@@ -38,8 +38,10 @@ mkdir -p ~/bin
 ln -sf "$(pwd)/scripts/hash-thing-demo" ~/bin/hash-thing-demo
 ```
 
-Make sure `~/bin` is on your `$PATH`. Then any session can run
-`! hash-thing-demo` (or just `hash-thing-demo` from a regular shell).
+Make sure `~/bin` is on your `$PATH` (`echo "$PATH" | tr ':' '\n' | grep -F "$HOME/bin"`
+should print a line). On a fresh macOS, you may need to add
+`export PATH="$HOME/bin:$PATH"` to your shell rc. Then any session can
+run `! hash-thing-demo` (or just `hash-thing-demo` from a regular shell).
 
 ## Build from source
 
