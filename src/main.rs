@@ -3213,6 +3213,29 @@ impl ApplicationHandler for App {
                             .record("surface_acquire_cpu", cpu_times.surface_acquire);
                         self.perf.record("submit_cpu", cpu_times.submit);
                         self.perf.record("present_cpu", cpu_times.present);
+                        // hash-thing-dbz5.1: split surface_acquire by
+                        // whether the prior frame's GPU submission was
+                        // still in flight at the moment we called
+                        // `get_current_texture()`. Sample counts on
+                        // `acq_inflight_cpu` vs `acq_done_cpu` give the
+                        // ratio; mean values explain whether the
+                        // 30-70ms wait is "blocked on prior GPU"
+                        // (inflight bucket) vs "blocked on swapchain
+                        // pacing / compositor / drawable count" (done
+                        // bucket). `prior_gpu_pipeline_cpu` is the
+                        // prior frame's full submit→done duration —
+                        // tells us whether the GPU itself is the
+                        // bottleneck when in-flight is high.
+                        if cpu_times.prior_gpu_in_flight_at_acquire {
+                            self.perf
+                                .record("acq_inflight_cpu", cpu_times.surface_acquire);
+                        } else {
+                            self.perf
+                                .record("acq_done_cpu", cpu_times.surface_acquire);
+                        }
+                        if let Some(pipeline) = cpu_times.prior_gpu_pipeline {
+                            self.perf.record("prior_gpu_pipeline_cpu", pipeline);
+                        }
                     }
                     if let Some(d) = renderer.take_last_gpu_frame_time() {
                         self.perf.record("render_gpu", d);
