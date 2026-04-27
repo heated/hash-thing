@@ -579,7 +579,7 @@ impl World {
             z.0,
         );
         // hash-thing-wsq3: do NOT clear hashlife caches on cell edits.
-        // The four caches are keyed by NodeId (hash-thing-cons interned subtrees)
+        // The four caches are keyed by NodeId (hash-cons interned subtrees)
         // plus, for the recursive cache, schedule_phase = generation %
         // memo_period(). All four are pure functions of NodeId content +
         // material registry, so cell edits leave existing entries
@@ -5184,7 +5184,7 @@ mod tests {
     /// Hash-consed NodeIds plus phase-derived keys make existing entries
     /// semantically valid across edits — only material-registry mutation
     /// (`mutate_materials` -> `invalidate_material_caches`) and fresh-store
-    /// epoch boundaries (`commit_step` at line 2378-2405, plus the seed_*
+    /// epoch boundaries (`commit_step`, plus the seed_*
     /// paths) require a clear. The pre-wsq3 unconditional clear in
     /// `set_local` was correctness-paranoia leftover from 53f7414's
     /// `(NodeId, [origin], parity)` cache shape and forced every entity-
@@ -5229,6 +5229,30 @@ mod tests {
             all_inert_before,
             "direct edits must preserve all-inert cache entries"
         );
+
+        // Stronger: capture a specific (key, value) from the live cache
+        // and confirm both NodeIds and their mapping survive byte-identical
+        // across the edit. "len unchanged" alone permits a pathological
+        // implementation that drops one entry and inserts a different one;
+        // "this exact entry is still here with the same value" doesn't.
+        // hash-thing-wsq3 review.
+        let sample = world
+            .hashlife_cache
+            .iter()
+            .next()
+            .map(|(k, v)| (*k, *v))
+            .expect("cache populated above");
+        let edit_root = world.root;
+        world.set(wc(6), wc(6), wc(6), STONE);
+        assert_ne!(
+            world.root, edit_root,
+            "precondition: a cell write must produce a fresh root NodeId"
+        );
+        assert_eq!(
+            world.hashlife_cache.get(&sample.0).copied(),
+            Some(sample.1),
+            "preserved cache entry must keep its exact (key, value) mapping across edits"
+        );
     }
 
     /// hash-thing-wsq3: paired with `direct_set_preserves_hashlife_caches`.
@@ -5247,6 +5271,8 @@ mod tests {
         world.set(wc(4), wc(2), wc(2), WATER);
         world.step_recursive();
         let recursive_before = world.hashlife_cache.len();
+        let inert_before = world.hashlife_inert_cache.len();
+        let all_inert_before = world.hashlife_all_inert_cache.len();
         assert!(
             recursive_before > 0,
             "precondition: stepping a seeded small world should populate the recursive cache"
@@ -5264,6 +5290,43 @@ mod tests {
             world.hashlife_cache.len(),
             recursive_before,
             "mutation flush must preserve recursive cache entries"
+        );
+        assert_eq!(
+            world.hashlife_inert_cache.len(),
+            inert_before,
+            "mutation flush must preserve inert-uniform cache entries"
+        );
+        assert_eq!(
+            world.hashlife_all_inert_cache.len(),
+            all_inert_before,
+            "mutation flush must preserve all-inert cache entries"
+        );
+
+        // Stronger: capture a specific (key, value) and confirm it
+        // survives byte-identical (paired with the same check in
+        // `direct_set_preserves_hashlife_caches`). hash-thing-wsq3 review.
+        let sample = world
+            .hashlife_cache
+            .iter()
+            .next()
+            .map(|(k, v)| (*k, *v))
+            .expect("cache populated above");
+        let pre_root = world.root;
+        world.queue.push(WorldMutation::SetCell {
+            x: wc(6),
+            y: wc(6),
+            z: wc(6),
+            state: STONE,
+        });
+        world.apply_mutations();
+        assert_ne!(
+            world.root, pre_root,
+            "precondition: an applied mutation must produce a fresh root NodeId"
+        );
+        assert_eq!(
+            world.hashlife_cache.get(&sample.0).copied(),
+            Some(sample.1),
+            "preserved cache entry must keep its exact (key, value) mapping across mutation flush"
         );
     }
 
