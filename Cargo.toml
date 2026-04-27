@@ -38,9 +38,15 @@ opt-level = 2
 opt-level = 3
 lto = "thin"
 
-# Fast-compile benchmark profile: representative for relative perf comparisons
-# without LTO cost. Usage: cargo test --profile bench ...
-[profile.bench]
+# Fast-compile perf profile: representative for relative perf comparisons
+# without LTO cost. Usage: cargo build --profile perf ...
+#
+# NOTE: This is a custom profile name (not `[profile.bench]`) so the artifact
+# lands in `target/perf/` rather than colliding with `target/release/` (the
+# demo binary). See hash-thing-xer4: Cargo built-in `bench` profile shares
+# `target/release/` with `release` (rust-lang/cargo#6988 explicitly rejected
+# stabilizing per-profile dir-name).
+[profile.perf]
 inherits = "release"
 lto = false
 debug = 1

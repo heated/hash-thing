@@ -44,7 +44,9 @@ Mac integrated GPU works — wgpu/Metal renders fine. Agents can launch the app,
 
 ## Build profiles
 
-Default to dev. **Use `--profile bench` for perf work — not `--release`.** `bench` inherits release's `opt-level = 3` but drops LTO and keeps `debug = 1`, so it builds fast on iteration and stays representative for *relative* perf comparisons (which is all we measure). `--release` is reserved for distributable artifacts only. If you catch yourself typing `cargo build --release` while measuring latency, stop and switch to `--profile bench` — otherwise you wait on LTO for no measurement benefit.
+Default to dev. **Use `--profile perf` for perf work — not `--release`.** `perf` inherits release's `opt-level = 3` but drops LTO and keeps `debug = 1`, so it builds fast on iteration and stays representative for *relative* perf comparisons (which is all we measure). `--release` is reserved for distributable artifacts only. If you catch yourself typing `cargo build --release` while measuring latency, stop and switch to `--profile perf` — otherwise you wait on LTO for no measurement benefit.
+
+**Why `perf` not `bench`:** built-in `[profile.bench]` shares `target/release/` with release (cargo#6988, won't-fix), so it clobbers the demo binary. Custom `[profile.perf]` writes to `target/perf/`. Detail: hash-thing-xer4.
 
 ## Agent surface — where project skills and commands live
 

@@ -667,7 +667,7 @@ fn bench_raycast_256_app_spawn() {
 /// world once, rebuild the SVDAG, and render again.
 ///
 /// Preferred command:
-/// `cargo test --profile bench --test bench_gpu_raycast headless_game_smoke_256 -- --ignored --nocapture`
+/// `cargo test --profile perf --test bench_gpu_raycast headless_game_smoke_256 -- --ignored --nocapture`
 ///
 /// The default test profile also works, but it takes close to a minute at
 /// 256³ because the simulated step runs unoptimized.

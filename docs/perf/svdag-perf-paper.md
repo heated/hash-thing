@@ -319,7 +319,7 @@ Candidate #2a is the narrowest thing still worth trying before conceding to #3: 
 
 Our `Renderer::render` (`crates/ht-render/src/renderer.rs:1843`) calls `surface.get_current_texture()` *before* the SVDAG raycast compute dispatch (`renderer.rs:1989`) — the exact anti-pattern the doc warns about. Our compute pass writes to an off-screen `raycast_texture` that the on-screen render pass later blits from, so the Apple-sanctioned reorder is a mechanical move: encode compute first, then acquire the drawable immediately before the render-pass encode. This is the same class of fix Flutter Impeller shipped on iOS for the same symptom (flutter/flutter#138490). No `surface.as_hal`, no `CADisplayLink`, no unsafe code. Tracked as `hash-thing-dlse.2.2.2`; candidate #2a/#2b above remain as the fallbacks if the reorder doesn't land the signal.
 
-**Candidate #2a outcome 2026-04-21 (onyx) — null result + paper correction.** Shipped the reorder (move `get_current_texture()` after the compute-pass encode, immediately before the on-screen render pass), built both pre- and post-reorder `--profile bench` binaries of `hash-thing 256`, ran each for 35 s on M2 with `RUST_LOG=info`, and compared `surface_acquire_cpu`. Reviewer pass was clean (2 Claude + 1 Codex reviewers, all ship-verdict; full wgpu 29.0.1 + Metal HAL audit of the drop-encoder path confirmed no leak / no partial submit). The measurement was the deciding input, and the measurement said the reorder does not move the signal:
+**Candidate #2a outcome 2026-04-21 (onyx) — null result + paper correction.** Shipped the reorder (move `get_current_texture()` after the compute-pass encode, immediately before the on-screen render pass), built both pre- and post-reorder `--profile bench` binaries (historical: profile renamed to `perf` per `xer4`) of `hash-thing 256`, ran each for 35 s on M2 with `RUST_LOG=info`, and compared `surface_acquire_cpu`. Reviewer pass was clean (2 Claude + 1 Codex reviewers, all ship-verdict; full wgpu 29.0.1 + Metal HAL audit of the drop-encoder path confirmed no leak / no partial submit). The measurement was the deciding input, and the measurement said the reorder does not move the signal:
 
 | window (s) | before mean (ms) | before p95 (ms) | after mean (ms) | after p95 (ms) |
 |-----------:|-----------------:|----------------:|----------------:|---------------:|
@@ -466,7 +466,7 @@ Run-to-run variance is small at both scales (~5% spread). 4096³ seed completes 
 
 **Reproduce:**
 ```text
-cargo test --profile bench --test bench_cold_gen_big_map -- --ignored --nocapture
+cargo test --profile perf --test bench_cold_gen_big_map -- --ignored --nocapture
 ```
 
 ### 3.14 Gen-time hash-cons is already in (`hash-thing-cswp.3`)
@@ -487,7 +487,7 @@ The voxel-to-node ratio is a *lower bound* on dedup (it counts cells, not subtre
 
 **Reproduce:**
 ```text
-cargo test --profile bench --test verify_gen_hash_cons -- --ignored --nocapture
+cargo test --profile perf --test verify_gen_hash_cons -- --ignored --nocapture
 ```
 (64³ runs unignored as a CI guard.)
 
@@ -1109,7 +1109,7 @@ PoC is intentionally toy-scale and validates *structure*, not throughput.
   level-3 base-case kernel computes, validating that the structural
   recursion encodes correctly across the dispatch boundary.
 
-**Throughput** (`gpu_level_4_throughput`, `--profile bench --ignored`,
+**Throughput** (`gpu_level_4_throughput`, `--profile perf --ignored`,
 N=64 worlds, 10 iters with fresh buffers each iter; M2 MBA, Apple
 Silicon Metal, in-encoder timestamps per dlse.2.3 methodology):
 

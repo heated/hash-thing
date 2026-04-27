@@ -2865,7 +2865,7 @@ impl ApplicationHandler for App {
                             )
                         {
                             log::warn!(
-                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile bench -- {}` for interactive playtesting.",
+                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile perf -- {}` for interactive playtesting.",
                                 step_elapsed.as_secs_f64() * 1000.0,
                                 self.volume_size,
                                 self.volume_size,

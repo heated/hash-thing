@@ -3448,7 +3448,7 @@ mod tests {
     /// doing — the gate is "does Phase 1 dominate, and if so is allocation
     /// a big enough chunk to matter."
     ///
-    /// Run: `cargo test --profile bench --lib
+    /// Run: `cargo test --profile perf --lib
     /// hashlife_phase_timing_scout_water_64 -- --ignored --nocapture`
     #[test]
     #[ignore = "scout/profiling — prints timing, no assertions"]
@@ -3623,7 +3623,7 @@ mod tests {
     /// scout. If neither moves, the lever doesn't help in this dispatch
     /// shape — document the negative result inline and on the bd.
     ///
-    /// Run: `cargo test --profile bench --lib
+    /// Run: `cargo test --profile perf --lib
     /// hashlife_phase_timing_scout_heterogeneous_64 -- --ignored --nocapture`
     /// Repeat 3× and report min/median/max spread.
     ///
@@ -3759,7 +3759,7 @@ mod tests {
     /// (see `compose_remap`); this test stays as a regression guard.
     ///
     /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
-    /// always-on under the 60s soft-max in release / `--profile bench`
+    /// always-on under the 60s soft-max in release / `--profile perf`
     /// (~10s observed); in debug builds the 128³ voxel walk dominates
     /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
     /// hash-thing-1imu. Run via `cargo test --release` (or any
@@ -3772,7 +3772,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile bench (hash-thing-1imu)"
+        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile perf (hash-thing-1imu)"
     )]
     fn water_and_sand_128_commit_step_skip_sync_corrupts_svdag() {
         let mut world = World::new(7);
@@ -3811,7 +3811,7 @@ mod tests {
     /// this test stays as a regression guard.
     ///
     /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
-    /// always-on under the 60s soft-max in release / `--profile bench`
+    /// always-on under the 60s soft-max in release / `--profile perf`
     /// (~5s observed); in debug builds the 128³ voxel walk dominates
     /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
     /// hash-thing-1imu. Run via `cargo test --release` (or any
@@ -3821,7 +3821,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile bench (hash-thing-1imu)"
+        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile perf (hash-thing-1imu)"
     )]
     fn water_and_sand_128_step_recursive_with_sync_every_step() {
         let mut world = World::new(7);

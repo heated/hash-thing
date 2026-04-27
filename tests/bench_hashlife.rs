@@ -1,9 +1,9 @@
 //! Hashlife step benchmarks at multiple world scales (m1f.1).
 //!
-//! Run with: `cargo test --profile bench -p hash-thing --test bench_hashlife -- --ignored --nocapture`
+//! Run with: `cargo test --profile perf -p hash-thing --test bench_hashlife -- --ignored --nocapture`
 //!
 //! These are `#[ignore]` tests, not criterion benchmarks, to avoid adding
-//! dependencies. `--profile bench` is the intended perf profile per repo
+//! dependencies. `--profile perf` is the intended perf profile per repo
 //! policy — it inherits release opts but drops LTO for fast iteration and
 //! stays representative for relative latency comparisons (debug builds are
 //! 10-50x slower and not representative).
