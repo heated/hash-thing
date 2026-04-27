@@ -1,10 +1,13 @@
-//! Per-chunk LOD policy for camera-anchored streaming (cswp.8.3).
+//! Per-chunk LOD policy for camera-anchored streaming (cswp.8.3,
+//! single-pass descent in cswp.8.3.1).
 //!
-//! Wires the cswp.8.2 [`NodeStore::lod_collapse_chunk`] primitive into a
-//! per-frame chunk-LOD policy. Each frame, [`ChunkLodPolicy::update`]
-//! derives a "view root" from the canonical sim root by collapsing far
-//! chunks per the design-doc curve. The sim continues to read/write
-//! the canonical root; the policy is render-only this iteration.
+//! Each frame, [`ChunkLodPolicy::update`] derives a "view root" from the
+//! canonical sim root via a single recursive descent over the SVDAG that
+//! detects uniform-LOD subtrees and collapses them in one
+//! [`NodeStore::lod_collapse`] call. Per-chunk hysteresis is preserved
+//! exactly via a held-divergence sidecar (`held_chunks = { c | prev != raw }`)
+//! that gates the fast path. The sim continues to read/write the canonical
+//! root; the policy is render-only.
 //!
 //! Design anchors: `docs/perf/cswp-lod.md` §2 (distance→LOD curve),
 //! §4 (hard swap + ±0.25 chunk-unit hysteresis), §6 (chunk_level=7 starting
@@ -16,7 +19,7 @@
 //! cached view. There is no external `invalidate()` API to forget.
 
 use ht_octree::{Node, NodeId, NodeStore};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 /// Octree level for a single chunk subtree. Chunks are 128³ = level 7 per
 /// `docs/perf/cswp-lod.md` §6 starting recommendation.
@@ -227,16 +230,6 @@ impl ChunkBox {
             side: half,
         }
     }
-
-    /// Membership test for a chunk coordinate.
-    fn contains(self, c: ChunkCoord) -> bool {
-        c.x >= self.lo[0]
-            && c.x < self.lo[0] + self.side
-            && c.y >= self.lo[1]
-            && c.y < self.lo[1] + self.side
-            && c.z >= self.lo[2]
-            && c.z < self.lo[2] + self.side
-    }
 }
 
 /// Test-only descent counters. Threaded through `DescentCtx` and bumped at
@@ -292,8 +285,10 @@ impl ChunkLodPolicy {
     ///
     /// Returns `world_root` unchanged when LOD is disabled or the world fits
     /// inside the near band (`world_level <= CHUNK_LEVEL`, e.g. 256³ default).
-    /// Otherwise walks every chunk in lex order, computes target LOD with
-    /// hysteresis, and chains [`NodeStore::lod_collapse_chunk`] calls.
+    /// Otherwise runs the cswp.8.3.1 single-pass recursive descent over the
+    /// canonical SVDAG, detecting uniform-LOD subtrees and collapsing them
+    /// in one shot via [`NodeStore::lod_collapse`]; per-chunk hysteresis is
+    /// preserved by the held-divergence sidecar built at descent entry.
     ///
     /// Self-defensive: any change to `world_root` (sim step, edit, scene
     /// swap, compaction) yields a different cache key → automatic recompute.
@@ -364,15 +359,17 @@ impl ChunkLodPolicy {
         // disagrees with the raw target at the new player position. The
         // hysteresis predicate `target_lod_with_hysteresis` can return a
         // value other than `raw` *only* when `prev != raw`, so this set
-        // over-approximates the divergent chunks. "Not in held_chunks" is
-        // sufficient (but not necessary) for the fast path's
-        // bit-equivalence to the per-chunk path.
-        let mut held_chunks: FxHashSet<ChunkCoord> = FxHashSet::default();
+        // over-approximates the divergent chunks. The descent partitions
+        // this slice into per-octant sub-slices at each recursion step, so
+        // each held chunk is touched O(D) = O(log_2(C)) times total —
+        // worst-case work is O(D · |held|), not O(C³ · |held|) as it would
+        // be with a global hashset linearly scanned per node.
+        let mut held_chunks: Vec<ChunkCoord> = Vec::new();
         for (&chunk, &prev) in self.chunk_lod.iter() {
             let radius = chunk.radius_to(player_chunk);
             let raw = target_lod_for_radius(radius, self.lod_bias, self.max_lod);
             if prev != raw {
-                held_chunks.insert(chunk);
+                held_chunks.push(chunk);
             }
         }
 
@@ -384,7 +381,6 @@ impl ChunkLodPolicy {
             store,
             next_lod: &mut next_lod,
             prev_lod: prev_lod_snapshot,
-            held_chunks: &held_chunks,
             bias: self.lod_bias,
             max_lod: self.max_lod,
             player_chunk,
@@ -395,7 +391,7 @@ impl ChunkLodPolicy {
             lo: [0; 3],
             side: chunks_per_axis,
         };
-        let view = ctx.descend(world_root, world_level, root_box);
+        let view = ctx.descend(world_root, world_level, root_box, &held_chunks);
         self.chunk_lod = next_lod;
         view
     }
@@ -486,13 +482,14 @@ impl ChunkLodPolicy {
 
 /// Borrowed context threaded through the cswp.8.3.1 descent. Bundles the
 /// mutable `store`/`next_lod` and the read-only sidecars (`prev_lod`,
-/// `held_chunks`, hysteresis params, player position) so the recursive
-/// `descend` method's signature stays small.
+/// hysteresis params, player position) that don't vary across recursion.
+/// The held-chunks slice is passed positionally to `descend` instead of
+/// living here so it can be partitioned per-octant at each step (see
+/// `recompute` for the cost argument).
 struct DescentCtx<'a> {
     store: &'a mut NodeStore,
     next_lod: &'a mut FxHashMap<ChunkCoord, u8>,
     prev_lod: &'a FxHashMap<ChunkCoord, u8>,
-    held_chunks: &'a FxHashSet<ChunkCoord>,
     bias: f32,
     max_lod: u8,
     player_chunk: ChunkCoord,
@@ -504,11 +501,20 @@ impl<'a> DescentCtx<'a> {
     /// Recursive descent worker. `level` is the contextual level of `node`
     /// as seen from its parent (mirrors `lod_collapse_rec`'s convention so
     /// raw `Leaf` subtrees above `CHUNK_LEVEL` are interpreted at their
-    /// true contextual level rather than `Node::level()`'s 0).
+    /// true contextual level rather than `Node::level()`'s 0). `held_in_box`
+    /// is the slice of held-divergence chunks that lie inside `chunk_box`;
+    /// when the recursion descends into octants, the slice is partitioned
+    /// so each child sees only its own chunks.
     ///
     /// Returns the new NodeId for this subtree (possibly `node` unchanged
     /// if no chunk under it required collapsing).
-    fn descend(&mut self, node: NodeId, level: u32, chunk_box: ChunkBox) -> NodeId {
+    fn descend(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        chunk_box: ChunkBox,
+        held_in_box: &[ChunkCoord],
+    ) -> NodeId {
         #[cfg(test)]
         self.counters.bump_visit();
 
@@ -551,17 +557,17 @@ impl<'a> DescentCtx<'a> {
                 let raw_min = target_lod_for_radius(rmin, self.bias, self.max_lod);
                 let raw_max = target_lod_for_radius(rmax, self.bias, self.max_lod);
 
-                if raw_min == raw_max && !self.any_held_in_box(chunk_box) {
+                if raw_min == raw_max && held_in_box.is_empty() {
                     // Uniform-collapse fast path. Soundness:
                     // - `node` is Interior, so `node.level() == level >
                     //   CHUNK_LEVEL`, satisfying lod_collapse's
                     //   `target_lod <= root_level` assertion.
                     // - `raw <= max_lod <= CHUNK_LEVEL <= level`.
-                    // - `held_chunks` over-approximates divergent chunks
-                    //   (any chunk where hysteresis returns ≠ raw must have
-                    //   `prev != raw`), so its absence guarantees every
-                    //   chunk in the box would have computed LOD == raw via
-                    //   the per-chunk path → bit-identical result.
+                    // - `held_in_box` over-approximates divergent chunks
+                    //   inside the box (any chunk where hysteresis returns
+                    //   ≠ raw must have `prev != raw`), so empty guarantees
+                    //   every chunk in the box would have computed LOD ==
+                    //   raw via the per-chunk path → bit-identical result.
                     let raw = raw_min;
                     self.record_box_uniform(chunk_box, raw);
                     #[cfg(test)]
@@ -572,10 +578,12 @@ impl<'a> DescentCtx<'a> {
                     return node;
                 }
 
+                let partitioned = partition_held(chunk_box, held_in_box);
                 let mut new_children = children;
                 for oct in 0..8 {
                     let child_box = chunk_box.child(oct);
-                    new_children[oct] = self.descend(children[oct], level - 1, child_box);
+                    new_children[oct] =
+                        self.descend(children[oct], level - 1, child_box, &partitioned[oct]);
                 }
                 self.store.interior(level, new_children)
             }
@@ -612,19 +620,32 @@ impl<'a> DescentCtx<'a> {
             }
         }
     }
+}
 
-    /// Predicate: any chunk in `held_chunks` lies inside `b`. Linear scan
-    /// over `held_chunks`. Cheap when the set is empty (steady-state
-    /// player) or small (gradual movement). Worst case after teleport
-    /// degenerates to O(C³) per call but stays cheaper than the lex
-    /// loop's per-chunk `lod_collapse_chunk` interning, and converges to
-    /// O(1) within one frame.
-    fn any_held_in_box(&self, b: ChunkBox) -> bool {
-        if self.held_chunks.is_empty() {
-            return false;
-        }
-        self.held_chunks.iter().any(|&c| b.contains(c))
+/// Partition `held` into 8 sub-slices keyed by which octant of `b` each
+/// chunk falls in. Caller passes only the chunks already in `b`; this
+/// routes them to the matching child box via the same `oct = x | y<<1 |
+/// z<<2` encoding used throughout the SVDAG. Each held chunk is touched
+/// O(D) = O(log_2(C)) times across the full descent, so total work is
+/// O(D · |held|) — independent of the world's chunk count.
+fn partition_held(b: ChunkBox, held: &[ChunkCoord]) -> [Vec<ChunkCoord>; 8] {
+    let half = b.side / 2;
+    let mid_x = b.lo[0] + half;
+    let mid_y = b.lo[1] + half;
+    let mid_z = b.lo[2] + half;
+    // `Default::default()` initializes each Vec empty; capacity grows on
+    // first push. Held sets are typically tiny (steady-state empty;
+    // worst-case post-teleport bounded by `prev_chunk_lod.len()`), so the
+    // up-front allocation cost is negligible compared to the O(C³) lex
+    // loop we're replacing.
+    let mut out: [Vec<ChunkCoord>; 8] = Default::default();
+    for &c in held {
+        let oct = ((c.x >= mid_x) as usize)
+            | (((c.y >= mid_y) as usize) << 1)
+            | (((c.z >= mid_z) as usize) << 2);
+        out[oct].push(c);
     }
+    out
 }
 
 #[cfg(test)]
@@ -904,50 +925,60 @@ mod tests {
     /// Plan-review test 3: a held chunk straddling a band boundary causes
     /// the descent to punt back to per-chunk granularity in any subtree
     /// containing it; the resulting view + chunk_lod still matches legacy.
+    ///
+    /// Setup math (with `lod_bias = 0.25`, `max_lod = 4`):
+    /// - `target_lod_for_radius(4, 0.25, 4)`: scaled = 16, log_4 = 2,
+    ///   +1 = 3 → raw = 3.
+    /// - hysteresis hold-zone for `prev = 2, bias = 0.25`:
+    ///   `(4·0.25 − 0.25, 16·0.25 + 0.25) = (0.75, 4.25)`. Since `r = 4 ∈
+    ///   (0.75, 4.25)`, hysteresis returns 2 instead of raw=3. So the
+    ///   target chunk is genuinely held-divergent: `held` set contains it,
+    ///   any fast-path check covering its sub-box must fall through to
+    ///   per-chunk recursion. Equivalence vs. the lex loop then proves
+    ///   the punt code path produces the same NodeId + chunk_lod map.
     #[test]
     fn descent_with_held_chunk_matches_legacy() {
         use crate::sim::World;
         let level = 10u32;
         let mut world = World::new(level);
         plant_seeded_cells(&mut world, 16, 11);
-        let player = ChunkCoord::new(2, 2, 2);
+        let player = ChunkCoord::new(0, 0, 0);
+        let target = ChunkCoord::new(4, 0, 0); // Chebyshev radius 4.
 
-        // Frame 1: prime both policies' chunk_lod state.
+        // Sanity-check the divergence math directly so future tweaks to the
+        // LOD curve or hysteresis constants surface here as test failures
+        // rather than as silent skips of the held path.
+        let raw = target_lod_for_radius(4.0, 0.25, 4);
+        let held = target_lod_with_hysteresis(4.0, Some(2), 0.25, 4);
+        assert_eq!(raw, 3, "test setup: raw at r=4, bias=0.25 must be 3");
+        assert_eq!(held, 2, "test setup: held at r=4, prev=2 must stay 2");
+
         let mut p_descent = ChunkLodPolicy::new();
         p_descent.enabled = true;
+        p_descent.lod_bias = 0.25;
         let mut p_legacy = ChunkLodPolicy::new();
         p_legacy.enabled = true;
-        let _ = p_descent.recompute(&mut world.store, world.root, world.level, player);
-        let _ = p_legacy.recompute_lex_loop(&mut world.store, world.root, world.level, player);
-        // Hand-poison one chunk's prev to a divergent value so frame 2's
-        // hysteresis on that chunk lands inside the held-zone.
-        // chunk (3,2,2) has Chebyshev radius 1 (band [1,4) → raw LOD 1).
-        // Force prev=2 so radius=1.0 lies inside the LOD-2 band's hold-zone
-        // (lo_threshold = 4-0.25 = 3.75; held zone is (3.75, 16+0.25)).
-        // r=1 is below the lo threshold → fallthrough to raw=1. Use a
-        // chunk whose held value really catches: chunk (4,2,2), radius 2,
-        // raw LOD 1, force prev=0; held check: prev=0 → lo_threshold=-inf,
-        // hi_threshold = 4^0 + 0.25 = 1.25; r=2 > 1.25 → fallthrough to raw.
-        // Pick a chunk where r=4 (band boundary) and force prev=2: held
-        // zone for prev=2 is (4-0.25, 16+0.25) = (3.75, 16.25), r=4 ∈
-        // (3.75, 16.25) → held at 2 instead of raw 2 — same value, no test.
-        // Better: chunk at r=3.99 with prev=2. raw at r=3.99 → 1
-        // (band [1,4)). prev=2 → held zone (3.75, 16.25), r=3.99 inside →
-        // returns 2. So held diverges from raw=1.
-        // But we can only force prev by mutating chunk_lod directly.
-        let target = ChunkCoord::new(player.x + 4, player.y, player.z); // r=4
+        p_legacy.lod_bias = 0.25;
+        // Hand-poison one chunk's prev to 2 so frame 1's held-divergence
+        // sidecar contains `target`. Other chunks' `prev` is unset → enter
+        // hysteresis path with `current = None`, no held divergence there.
         p_descent.chunk_lod.insert(target, 2);
         p_legacy.chunk_lod.insert(target, 2);
 
-        // Frame 2: same player position. Held divergence at `target`
-        // forces descent to bypass uniform-collapse for any subtree
-        // containing that chunk.
         let view_d = p_descent.recompute(&mut world.store, world.root, world.level, player);
         let view_l = p_legacy.recompute_lex_loop(&mut world.store, world.root, world.level, player);
         assert_eq!(view_d, view_l, "view_root must match under held divergence");
         assert_eq!(
             p_descent.chunk_lod, p_legacy.chunk_lod,
             "chunk_lod must match under held divergence"
+        );
+        // Positively assert the held chunk really did diverge: the raw
+        // target at r=4 with bias=0.25 is 3, and the recorded LOD must be
+        // the held value 2.
+        assert_eq!(
+            p_descent.chunk_lod.get(&target).copied(),
+            Some(2),
+            "held chunk must record held LOD (2), not raw (3)"
         );
     }
 

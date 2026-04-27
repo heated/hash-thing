@@ -619,11 +619,11 @@ struct App {
     /// means the OS just toggled fullscreen, which matters for dlse.2.2
     /// A/B perf comparisons.
     was_fullscreen: bool,
-    /// Per-frame chunk-LOD policy (cswp.8.3). Off by default; toggled with
-    /// `L`. When enabled, `upload_volume` derives a render-only `view_root`
-    /// from `world.root` by chaining `lod_collapse_chunk` per chunk per the
-    /// design-doc distance→LOD curve. The sim still reads/writes the
-    /// canonical root.
+    /// Per-frame chunk-LOD policy (cswp.8.3 / cswp.8.3.1). Off by default;
+    /// toggled with `L`. When enabled, `upload_volume` derives a render-only
+    /// `view_root` from `world.root` via a single recursive descent over the
+    /// SVDAG that collapses uniform-LOD subtrees per the design-doc
+    /// distance→LOD curve. The sim still reads/writes the canonical root.
     lod_policy: sim::chunks::ChunkLodPolicy,
     /// Last LOD-policy histogram captured during `upload_volume`, so the
     /// HUD/log line can read it without recomputing. Index k = chunks at
