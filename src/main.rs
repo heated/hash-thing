@@ -3485,7 +3485,7 @@ fn main() {
         // hash-thing-sgcv + kh9l: gate the activate-ignoring-other-apps
         // flag behind the same `want_focus_on_launch` derived above
         // (HASH_THING_FOCUS=1 env or `--demo` flag). Mirrors the
-        // window.focus_window() gate at src/main.rs:2266. winit's
+        // window.focus_window() gate around src/main.rs:2277. winit's
         // default for this flag is `true`
         // (PlatformSpecificEventLoopAttributes in
         // winit/platform_impl/macos/event_loop.rs), so we MUST set it
