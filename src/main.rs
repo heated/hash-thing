@@ -141,9 +141,10 @@ mod rosetta_check {
             if rc == 0 && value == 1 {
                 log::warn!(
                     "hash-thing is running under Rosetta translation (x86_64 \
-                     binary on Apple Silicon). For ~10x faster startup and \
-                     runtime perf, switch to an arm64 toolchain. \
-                     See .ship-notes/session-handoff-2026-04-26.md or hash-thing-82bt."
+                     binary on Apple Silicon). For much faster startup and \
+                     runtime perf, install an arm64 Rust toolchain \
+                     (`rustup toolchain install stable-aarch64-apple-darwin`) \
+                     and re-run from an arm64 shell (verify with `arch` / `rustup show`)."
                 );
             }
             // rc != 0 → sysctl missing or errored; treat as "can't tell" and
