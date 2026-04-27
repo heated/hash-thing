@@ -2253,4 +2253,192 @@ mod tests {
             wr as isize - w0 as isize,
         );
     }
+
+    /// hash-thing-0z5d divergent-window capture (Angle A from cairn 2026-04-27).
+    ///
+    /// Steps brute `World::step()` and recursive `World::step_recursive()` in
+    /// lockstep on the same pool-over-terrain scene. After each step, flattens
+    /// both worlds and finds every cell where the two paths disagree. Dumps:
+    ///
+    /// 1. Total divergent cell count + per-material breakdown for the gen.
+    /// 2. The 8-aligned bucket histogram of divergent x and z coordinates
+    ///    (Angle B: cross-leaf-boundary check — if losses cluster at world
+    ///    coordinates 7,8,15,16,... that's the 8³ leaf boundary signature).
+    /// 3. For the first divergent gen, full hex dumps of the pre-step state,
+    ///    brute post-state, and recursive post-state for the 8³ window
+    ///    containing the first divergent cell.
+    ///
+    /// The dump is structured to localize whether the leak is in:
+    /// - Phase 1 / Phase 2 within a single 8³ leaf window, or
+    /// - the recursive composition between adjacent leaves.
+    #[test]
+    #[ignore]
+    fn repro_0z5d_divergent_window_capture() {
+        use crate::octree::Cell;
+        use crate::terrain::materials::WATER;
+        use crate::terrain::TerrainParams;
+
+        let level = 6u32;
+        let side = 1i64 << level;
+        let side_u = side as usize;
+
+        let make_world = || -> World {
+            let mut w = World::new(level);
+            let params = TerrainParams::for_level(level);
+            w.seed_terrain(&params).expect("terrain");
+            let center = side_u as u64 / 2;
+            let water_y = center + center / 4;
+            let pool_radius = side_u as u64 / 6;
+            let pool_depth = (side_u as u64 / 32).max(2);
+            let lo_x = center.saturating_sub(pool_radius);
+            let hi_x = (center + pool_radius).min(side_u as u64);
+            let lo_z = center.saturating_sub(pool_radius);
+            let hi_z = (center + pool_radius).min(side_u as u64);
+            for z in lo_z..hi_z {
+                for x in lo_x..hi_x {
+                    for dy in 0..pool_depth {
+                        let y = water_y + dy;
+                        if y < side_u as u64 {
+                            w.set(wc(x), wc(y), wc(z), WATER);
+                        }
+                    }
+                }
+            }
+            w
+        };
+
+        let mut brute = make_world();
+        let mut recur = make_world();
+
+        // Confirm initial states are identical.
+        let init_b = brute.flatten();
+        let init_r = recur.flatten();
+        assert_eq!(init_b, init_r, "initial state mismatch");
+
+        let mut first_divergence_gen: Option<u32> = None;
+
+        for gen in 0..80u32 {
+            // Snapshot pre-step state from brute (== recur, by induction over
+            // post-condition below).
+            let pre = brute.flatten();
+
+            brute.step();
+            recur.step_recursive();
+
+            let post_b = brute.flatten();
+            let post_r = recur.flatten();
+
+            if post_b == post_r {
+                continue;
+            }
+
+            // Find every divergent cell.
+            let mut diverged: Vec<(usize, usize, usize, u16, u16)> = Vec::new();
+            let idx = |x: usize, y: usize, z: usize| {
+                x + y * side_u + z * side_u * side_u
+            };
+            for z in 0..side_u {
+                for y in 0..side_u {
+                    for x in 0..side_u {
+                        let bb = post_b[idx(x, y, z)];
+                        let rr = post_r[idx(x, y, z)];
+                        if bb != rr {
+                            let mb = Cell::from_raw(bb).material();
+                            let mr = Cell::from_raw(rr).material();
+                            diverged.push((x, y, z, mb, mr));
+                        }
+                    }
+                }
+            }
+
+            eprintln!(
+                "\n=== gen {gen}: {n} divergent cells ===",
+                n = diverged.len()
+            );
+
+            // Per-material summary (brute -> recur).
+            let mut counts: std::collections::BTreeMap<(u16, u16), usize> =
+                std::collections::BTreeMap::new();
+            for &(_, _, _, mb, mr) in &diverged {
+                *counts.entry((mb, mr)).or_insert(0) += 1;
+            }
+            for ((mb, mr), n) in &counts {
+                eprintln!("  brute={mb:>3} recur={mr:>3}  n={n}");
+            }
+
+            // 8-aligned bucket histogram for x, y, z (Angle B).
+            let mut x_buckets: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            let mut y_buckets: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            let mut z_buckets: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for &(x, y, z, _, _) in &diverged {
+                *x_buckets.entry(x % 8).or_insert(0) += 1;
+                *y_buckets.entry(y % 8).or_insert(0) += 1;
+                *z_buckets.entry(z % 8).or_insert(0) += 1;
+            }
+            eprintln!("  x % 8 histogram: {x_buckets:?}");
+            eprintln!("  y % 8 histogram: {y_buckets:?}");
+            eprintln!("  z % 8 histogram: {z_buckets:?}");
+
+            // Dump 8³ window for the first divergence only.
+            if first_divergence_gen.is_none() {
+                first_divergence_gen = Some(gen);
+
+                let (fx, fy, fz, _, _) = diverged[0];
+                // Align to the 8-grid window containing (fx, fy, fz).
+                let wx = (fx / 8) * 8;
+                let wy = (fy / 8) * 8;
+                let wz = (fz / 8) * 8;
+                eprintln!(
+                    "\n  first divergent cell: (x={fx}, y={fy}, z={fz})"
+                );
+                eprintln!(
+                    "  dumping 8³ window starting at (wx={wx}, wy={wy}, wz={wz})"
+                );
+                eprintln!(
+                    "  window y/z slabs: pre | post-brute | post-recur (cell.material())"
+                );
+                let dump_window = |grid: &[u16], label: &str| {
+                    eprintln!("  {label}:");
+                    for dy in 0..8 {
+                        let y = wy + dy;
+                        if y >= side_u {
+                            continue;
+                        }
+                        eprintln!("    y={y}:");
+                        for dz in 0..8 {
+                            let z = wz + dz;
+                            if z >= side_u {
+                                continue;
+                            }
+                            let mut row = String::new();
+                            for dx in 0..8 {
+                                let x = wx + dx;
+                                if x >= side_u {
+                                    row.push_str("  .");
+                                    continue;
+                                }
+                                let m = Cell::from_raw(grid[idx(x, y, z)]).material();
+                                row.push_str(&format!(" {m:>2}"));
+                            }
+                            eprintln!("      z={z}: {row}");
+                        }
+                    }
+                };
+                dump_window(&pre, "pre-step");
+                dump_window(&post_b, "post-step brute");
+                dump_window(&post_r, "post-step recursive");
+
+                // Stop after first window dump to keep output bounded.
+                break;
+            }
+        }
+
+        match first_divergence_gen {
+            Some(g) => eprintln!("\n=== first divergence at gen {g} (window dumped above) ==="),
+            None => eprintln!("\n=== no divergence in 80 gens ==="),
+        }
+    }
 }
