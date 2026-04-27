@@ -1819,6 +1819,608 @@ fn cpu_level_5_single_live_dies() {
     assert!(out.iter().all(|&c| c == 0), "single-live L5 → empty L4");
 }
 
+// ---------------------------------------------------------------------------
+// L5 GPU dispatcher (commit 2): three dispatches across two cross-dispatch
+// fences. See plan §"Dispatch structure" in
+// `.ship-notes/plan-spark-hash-thing-szqv-gpu-l5.md`.
+//
+// D1: existing `cs_base_case` kernel, dispatched on 729·N L3 base cases
+//     (one per (world, L4-intermediate, sub-intermediate, cell)).
+// D2: NEW `cs_step_l4_recursive_wg` (workgroup_size=64). One workgroup per
+//     (world, L4-intermediate). No scratch; reads D1 output directly per
+//     stencil. Replaces abwm.3's `var<private> scratch: array<u32, 512>`
+//     with zero-scratch direct-global-reads — addresses Gemini's abwm.3
+//     IMPORTANT (occupancy) without needing workgroup-shared staging at
+//     this dispatch.
+// D3: NEW `cs_step_l5_recursive` (workgroup_size=64). One workgroup per L5
+//     world. Serial outer loop over 8 L5 sub-cubes; per sub-cube runs phase A
+//     (27 base cases → workgroup-shared `phase_a_results: array<u32, 27*64>`
+//     = 6912 B, fits within 16 KB default workgroup-storage limit) followed
+//     by phase B (8 base cases → tile to global L5 output). `workgroupBarrier()`
+//     sequence per plan A2: at sub-cube boundary (S0), and between phase A
+//     and phase B (S1).
+// ---------------------------------------------------------------------------
+
+const SHADER_L4_RECURSIVE_WG: &str = r#"
+struct L4Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> l4_params: L4Params;
+// D1 output: indexed [world * 27 * 27 * 64 + l4_int * 27 * 64 + sub_int * 64 + cell]
+@group(0) @binding(1) var<storage, read> intermediate_l3_results: array<u32>;
+// D2 output: indexed [world * 27 * 512 + l4_int * 512 + cell]
+@group(0) @binding(2) var<storage, read_write> l4_intermediate_results: array<u32>;
+
+const BAYS_BIRTH_MASK: u32 = 0xE0u;   // bits 5,6,7
+const BAYS_SURVIVE_MASK: u32 = 0x60u; // bits 5,6
+
+// Read the 8³ L4 sub-cube cell at (x, y, z) where x,y,z ∈ [0, 8). The 8³
+// is implicitly assembled from 8 of 27 D1 outputs (each 4³). Octant within
+// 8³ sub-cube: (x>>2, y>>2, z>>2). Phase-A index = (sk+oz)*9 + (sj+oy)*3 + (si+ox).
+// Within-phase-A cell (4³): (x & 3, y & 3, z & 3).
+fn read_l4_subcube(world: u32, l4_int: u32, si: u32, sj: u32, sk: u32,
+                   x: u32, y: u32, z: u32) -> u32 {
+    let ox = x >> 2u;
+    let oy = y >> 2u;
+    let oz = z >> 2u;
+    let sub_int = (sk + oz) * 9u + (sj + oy) * 3u + (si + ox);
+    let cx = x & 3u;
+    let cy = y & 3u;
+    let cz = z & 3u;
+    let off = world * 27u * 27u * 64u
+            + l4_int * 27u * 64u
+            + sub_int * 64u
+            + cz * 16u + cy * 4u + cx;
+    return intermediate_l3_results[off];
+}
+
+@compute @workgroup_size(64)
+fn cs_step_l4_recursive_wg(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let world = wid.x / 27u;
+    let l4_int = wid.x % 27u;
+    if (world >= l4_params.num_worlds) { return; }
+    let tid = lid.x;
+
+    // Phase 2 of cpu_level_4_step: 8 sub-cubes × 64 output cells = 512 work
+    // units. Each thread handles 8 cells, one per sub-cube, at position tid.
+    let cell_idx = tid;
+    let cx = cell_idx & 3u;
+    let cy = (cell_idx >> 2u) & 3u;
+    let cz = cell_idx >> 4u;
+    for (var sub: u32 = 0u; sub < 8u; sub = sub + 1u) {
+        let si = sub & 1u;
+        let sj = (sub >> 1u) & 1u;
+        let sk = sub >> 2u;
+        // Output cell (cx, cy, cz) ∈ [0, 4)³ within phase-B base-case 4³ output.
+        // Input center at (cx+2, cy+2, cz+2) of the 8³ phase-B input.
+        let ix = cx + 2u;
+        let iy = cy + 2u;
+        let iz = cz + 2u;
+        let cur = read_l4_subcube(world, l4_int, si, sj, sk, ix, iy, iz);
+        var alive: u32 = 0u;
+        for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+            for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                    if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                    let nx = u32(i32(ix) + dx);
+                    let ny = u32(i32(iy) + dy);
+                    let nz = u32(i32(iz) + dz);
+                    alive = alive + read_l4_subcube(world, l4_int, si, sj, sk, nx, ny, nz);
+                }
+            }
+        }
+        var next: u32 = 0u;
+        if (cur == 1u) {
+            next = (BAYS_SURVIVE_MASK >> alive) & 1u;
+        } else {
+            next = (BAYS_BIRTH_MASK >> alive) & 1u;
+        }
+        // Tile output cell into 8³ L4-step output: position (si*4+cx, sj*4+cy, sk*4+cz).
+        let out_x = si * 4u + cx;
+        let out_y = sj * 4u + cy;
+        let out_z = sk * 4u + cz;
+        let out_off = world * 27u * 512u
+                    + l4_int * 512u
+                    + out_z * 64u + out_y * 8u + out_x;
+        l4_intermediate_results[out_off] = next;
+    }
+}
+"#;
+
+const SHADER_L5_RECURSIVE: &str = r#"
+struct L5Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> l5_params: L5Params;
+// D2 output: indexed [world * 27 * 512 + l4_int * 512 + cell]
+@group(0) @binding(1) var<storage, read> l4_intermediate_results: array<u32>;
+// D3 output: indexed [world * 4096 + cell] where cell is 16³ linear (x fastest)
+@group(0) @binding(2) var<storage, read_write> l5_final_outputs: array<u32>;
+
+const BAYS_BIRTH_MASK: u32 = 0xE0u;
+const BAYS_SURVIVE_MASK: u32 = 0x60u;
+
+// Workgroup-shared phase-A results: 27 L2 (4³ = 64 cell) results per current
+// outer L5 sub-cube. 27 × 64 × 4 B = 6912 B. Below the 16 KB default workgroup
+// storage limit; runtime-validated in GpuCtx::new() via device.limits().
+var<workgroup> phase_a_results: array<u32, 1728>;  // 27 * 64
+
+// Read the 16³ L5-sub-cube cell at (x, y, z) where x,y,z ∈ [0, 16). The 16³
+// is implicitly assembled from 8 of 27 L4 intermediate results (each 8³).
+// Octant within 16³: (x>>3, y>>3, z>>3). L4-intermediate index =
+// (sk+oz)*9 + (sj+oy)*3 + (si+ox). Within-intermediate cell (8³):
+// (x & 7, y & 7, z & 7).
+fn read_l5_subcube(world: u32, si: u32, sj: u32, sk: u32,
+                   x: u32, y: u32, z: u32) -> u32 {
+    let ox = x >> 3u;
+    let oy = y >> 3u;
+    let oz = z >> 3u;
+    let im_idx = (sk + oz) * 9u + (sj + oy) * 3u + (si + ox);
+    let cx = x & 7u;
+    let cy = y & 7u;
+    let cz = z & 7u;
+    let off = world * 27u * 512u + im_idx * 512u + cz * 64u + cy * 8u + cx;
+    return l4_intermediate_results[off];
+}
+
+// Read the 8³ phase-B input cell at (x, y, z) where x,y,z ∈ [0, 8). The 8³
+// is implicitly assembled from 8 of 27 phase_a_results (each 4³).
+fn read_phase_a(psi: u32, psj: u32, psk: u32, x: u32, y: u32, z: u32) -> u32 {
+    let ox = x >> 2u;
+    let oy = y >> 2u;
+    let oz = z >> 2u;
+    let pa_idx = (psk + oz) * 9u + (psj + oy) * 3u + (psi + ox);
+    let cx = x & 3u;
+    let cy = y & 3u;
+    let cz = z & 3u;
+    return phase_a_results[pa_idx * 64u + cz * 16u + cy * 4u + cx];
+}
+
+@compute @workgroup_size(64)
+fn cs_step_l5_recursive(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let world = wid.x;
+    if (world >= l5_params.num_worlds) { return; }
+    let tid = lid.x;
+
+    // Per-thread base-case-output cell index (4³ linear, x fastest).
+    let cx = tid & 3u;
+    let cy = (tid >> 2u) & 3u;
+    let cz = tid >> 4u;
+
+    // Outer loop: 8 L5 sub-cubes serial. phase_a_results is reused.
+    for (var L5_sub: u32 = 0u; L5_sub < 8u; L5_sub = L5_sub + 1u) {
+        let si = L5_sub & 1u;
+        let sj = (L5_sub >> 1u) & 1u;
+        let sk = L5_sub >> 2u;
+
+        // Barrier S0: at sub-cube boundary, ensures the previous iter's
+        // phase-A reads have completed before phase A overwrites
+        // phase_a_results. First iter: barrier is a no-op for correctness
+        // (phase_a_results is uninitialized on first entry but Phase A
+        // writes BEFORE Phase B reads, and S1 enforces that).
+        workgroupBarrier();
+
+        // Phase A: 27 base cases × 64 cells = 1728 work units.
+        // Each thread handles 27 cells (one per base case at position cx,cy,cz).
+        // Phase-A base-case (b) reads 8³ block at sub-cube positions
+        // [bi*4, bi*4+8) × [bj*4, bj*4+8) × [bk*4, bk*4+8).
+        // Inner 4³ output at base-case-internal-position (cx, cy, cz).
+        // Input center maps to sub-cube position (bi*4 + cx + 2, ...).
+        for (var b: u32 = 0u; b < 27u; b = b + 1u) {
+            let bi = b % 3u;
+            let bj = (b / 3u) % 3u;
+            let bk = b / 9u;
+            let center_x = bi * 4u + cx + 2u;
+            let center_y = bj * 4u + cy + 2u;
+            let center_z = bk * 4u + cz + 2u;
+            let cur = read_l5_subcube(world, si, sj, sk, center_x, center_y, center_z);
+            var alive: u32 = 0u;
+            for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+                for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                        let nx = u32(i32(center_x) + dx);
+                        let ny = u32(i32(center_y) + dy);
+                        let nz = u32(i32(center_z) + dz);
+                        alive = alive + read_l5_subcube(world, si, sj, sk, nx, ny, nz);
+                    }
+                }
+            }
+            var next: u32 = 0u;
+            if (cur == 1u) {
+                next = (BAYS_SURVIVE_MASK >> alive) & 1u;
+            } else {
+                next = (BAYS_BIRTH_MASK >> alive) & 1u;
+            }
+            phase_a_results[b * 64u + tid] = next;
+        }
+
+        // Barrier S1: phase A writes → phase B reads.
+        workgroupBarrier();
+
+        // Phase B: 8 base cases × 64 cells = 512 work units.
+        // Each thread handles 8 cells, one per phase-B base case at position cx,cy,cz.
+        // Phase-B base case (pb) input is 8³ assembled from 8 of 27 phase_a_results.
+        // Output tiles into L5 output at L5 position
+        //   (si*8 + psi*4 + cx, sj*8 + psj*4 + cy, sk*8 + psk*4 + cz).
+        let ix = cx + 2u;
+        let iy = cy + 2u;
+        let iz = cz + 2u;
+        for (var pb: u32 = 0u; pb < 8u; pb = pb + 1u) {
+            let psi = pb & 1u;
+            let psj = (pb >> 1u) & 1u;
+            let psk = pb >> 2u;
+            let cur = read_phase_a(psi, psj, psk, ix, iy, iz);
+            var alive: u32 = 0u;
+            for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+                for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+                    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                        let nx = u32(i32(ix) + dx);
+                        let ny = u32(i32(iy) + dy);
+                        let nz = u32(i32(iz) + dz);
+                        alive = alive + read_phase_a(psi, psj, psk, nx, ny, nz);
+                    }
+                }
+            }
+            var next: u32 = 0u;
+            if (cur == 1u) {
+                next = (BAYS_SURVIVE_MASK >> alive) & 1u;
+            } else {
+                next = (BAYS_BIRTH_MASK >> alive) & 1u;
+            }
+            let l5_x = si * 8u + psi * 4u + cx;
+            let l5_y = sj * 8u + psj * 4u + cy;
+            let l5_z = sk * 8u + psk * 4u + cz;
+            let out_off = world * 4096u + l5_z * 256u + l5_y * 16u + l5_x;
+            l5_final_outputs[out_off] = next;
+        }
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct L4Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct L5Params {
+    num_worlds: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct L5GpuPipelines {
+    pipeline_l4_wg: wgpu::ComputePipeline,
+    bgl_l4_wg: wgpu::BindGroupLayout,
+    pipeline_l5: wgpu::ComputePipeline,
+    bgl_l5: wgpu::BindGroupLayout,
+}
+
+fn build_l5_pipelines(ctx: &GpuCtx) -> L5GpuPipelines {
+    // Plan A3: validate workgroup-storage budget vs spec default.
+    let max_wg_storage = ctx.device.limits().max_compute_workgroup_storage_size;
+    let required_wg_storage: u32 = 27 * 64 * 4; // phase_a_results in D3
+    assert!(
+        max_wg_storage >= required_wg_storage,
+        "device.max_compute_workgroup_storage_size = {} < required {} for L5 D3 phase_a_results",
+        max_wg_storage,
+        required_wg_storage,
+    );
+
+    let bgl_l4_wg = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("l4_wg_bgl"),
+        entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
+    });
+    let shader_l4_wg = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("l4_wg_shader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_L4_RECURSIVE_WG.into()),
+    });
+    let pl_l4_wg = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("l4_wg_pl"),
+        bind_group_layouts: &[Some(&bgl_l4_wg)],
+        immediate_size: 0,
+    });
+    let pipeline_l4_wg = ctx
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cs_step_l4_recursive_wg"),
+            layout: Some(&pl_l4_wg),
+            module: &shader_l4_wg,
+            entry_point: Some("cs_step_l4_recursive_wg"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+    let bgl_l5 = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("l5_bgl"),
+        entries: &[bgl_uniform(0), bgl_storage_ro(1), bgl_storage_rw(2)],
+    });
+    let shader_l5 = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("l5_shader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_L5_RECURSIVE.into()),
+    });
+    let pl_l5 = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("l5_pl"),
+        bind_group_layouts: &[Some(&bgl_l5)],
+        immediate_size: 0,
+    });
+    let pipeline_l5 = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("cs_step_l5_recursive"),
+        layout: Some(&pl_l5),
+        module: &shader_l5,
+        entry_point: Some("cs_step_l5_recursive"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    L5GpuPipelines {
+        pipeline_l4_wg,
+        bgl_l4_wg,
+        pipeline_l5,
+        bgl_l5,
+    }
+}
+
+// L5 GPU dispatcher driver. Three dispatches across two queue.submit fences.
+fn run_level_5_step_gpu(
+    ctx: &GpuCtx,
+    pipes: &L5GpuPipelines,
+    worlds: &[Box<[u32; L5_CELLS]>],
+) -> Vec<[u32; L4_CELLS]> {
+    let num_worlds = worlds.len() as u32;
+    assert!(num_worlds > 0, "need at least one L5 world");
+
+    // ---- D1 input prep: extract 27 × 27 × N L3 sub-blocks per world. ----
+    // For each world, for each L4 intermediate (i, j, k) ∈ {0,1,2}³, build
+    // the 16³ block (offset (i*8, j*8, k*8) of L5 input) and extract its
+    // 27 L3 sub-blocks (offset (a*4, b*4, c*4) of the 16³, each 8³).
+    let total_base_cases = (num_worlds as usize) * 27 * 27;
+    let mut flat_inputs: Vec<u32> = Vec::with_capacity(total_base_cases * L3_CELLS);
+    for input in worlds {
+        for k in 0..3usize {
+            for j in 0..3usize {
+                for i in 0..3usize {
+                    let l4_int = build_l4_intermediate_from_l5(input, i, j, k);
+                    for sk in 0..3usize {
+                        for sj in 0..3usize {
+                            for si in 0..3usize {
+                                let sub = build_intermediate(&l4_int, si, sj, sk);
+                                flat_inputs.extend_from_slice(&sub);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let intermediate_input_buf = make_input_buffer(ctx, "l5_d1_inputs", &flat_inputs);
+    let intermediate_l3_results_buf =
+        make_output_buffer(ctx, "l5_d1_outputs", total_base_cases as u32 * L2_CELLS as u32);
+    let l4_intermediate_results_buf = make_output_buffer(
+        ctx,
+        "l5_d2_outputs",
+        num_worlds * 27 * L3_CELLS as u32,
+    );
+    let l5_final_outputs_buf =
+        make_output_buffer(ctx, "l5_d3_outputs", num_worlds * L4_CELLS as u32);
+
+    // ---- D1: cs_base_case on 729·N intermediates ----
+    let d1_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_d1_params"),
+            contents: bytemuck::bytes_of(&BaseCaseParams {
+                num_inputs: total_base_cases as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_d1_bg"),
+        layout: &ctx.bgl_base_case,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d1_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc1 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_enc_d1"),
+        });
+    {
+        let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_pass_d1"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_base_case);
+        cpass.set_bind_group(0, &bg_d1, &[]);
+        let total_threads = total_base_cases as u32 * L2_CELLS as u32;
+        let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+        cpass.dispatch_workgroups(groups, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc1.finish()));
+    // Fence 1: queue.submit boundary.
+
+    // ---- D2: cs_step_l4_recursive_wg on 27·N (world, l4_int) tuples ----
+    let d2_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_d2_params"),
+            contents: bytemuck::bytes_of(&L4Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_d2_bg"),
+        layout: &pipes.bgl_l4_wg,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d2_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc2 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_enc_d2"),
+        });
+    {
+        let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_pass_d2"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l4_wg);
+        cpass.set_bind_group(0, &bg_d2, &[]);
+        cpass.dispatch_workgroups(27 * num_worlds, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc2.finish()));
+    // Fence 2: queue.submit boundary.
+
+    // ---- D3: cs_step_l5_recursive on N (worlds) ----
+    let d3_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_d3_params"),
+            contents: bytemuck::bytes_of(&L5Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_d3_bg"),
+        layout: &pipes.bgl_l5,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d3_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l5_final_outputs_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc3 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_enc_d3"),
+        });
+    {
+        let mut cpass = enc3.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_pass_d3"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l5);
+        cpass.set_bind_group(0, &bg_d3, &[]);
+        cpass.dispatch_workgroups(num_worlds, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc3.finish()));
+
+    // ---- Readback ----
+    let flat = read_buffer_u32(ctx, &l5_final_outputs_buf, num_worlds * L4_CELLS as u32);
+    let mut out: Vec<[u32; L4_CELLS]> = Vec::with_capacity(worlds.len());
+    for chunk in flat.chunks(L4_CELLS) {
+        let mut arr = [0u32; L4_CELLS];
+        arr.copy_from_slice(chunk);
+        out.push(arr);
+    }
+    out
+}
+
+#[test]
+#[ignore]
+fn gpu_level_5_matches_cpu_on_corpus() {
+    let ctx = match GpuCtx::new() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no GPU adapter");
+            return;
+        }
+    };
+    let pipes = build_l5_pipelines(&ctx);
+    let corpus = level_5_corpus();
+    let worlds: Vec<Box<[u32; L5_CELLS]>> =
+        corpus.iter().map(|(_, w)| w.clone()).collect();
+    let cpu_results: Vec<[u32; L4_CELLS]> =
+        worlds.iter().map(|w| cpu_level_5_step(w)).collect();
+    let gpu_results = run_level_5_step_gpu(&ctx, &pipes, &worlds);
+    assert_eq!(gpu_results.len(), worlds.len(), "L5 result count");
+    for (idx, (label, _)) in corpus.iter().enumerate() {
+        let cpu = &cpu_results[idx];
+        let gpu = &gpu_results[idx];
+        for (cell_idx, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert_eq!(
+                g, c,
+                "L5 fixture {label} cell {cell_idx}: GPU={g} CPU={c}"
+            );
+        }
+        let live_count = cpu.iter().filter(|&&c| c == 1).count();
+        eprintln!("L5 fixture {label}: {live_count} live cells in 16³ result");
+        if *label == "random_seed_42" {
+            assert_eq!(
+                live_count, 909,
+                "L5 random_seed_42: expected 909 live cells in 16³ inner; got {live_count}"
+            );
+        }
+    }
+}
+
 #[test]
 fn cpu_level_5_matches_brute_force_on_corpus() {
     // The structural tripwire (plan A4): if `cpu_level_5_step` (the
