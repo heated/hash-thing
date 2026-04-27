@@ -590,7 +590,9 @@ struct App {
     entities: sim::EntityStore,
     volume_size: u32,
     /// hash-thing-06so: pinned rendered-pixel budget from `--demo` / `--res`.
-    /// `None` → auto-pick. Threaded through to `Renderer::new`.
+    /// `None` → auto-pick. Set in `main()` after construction (the 40+
+    /// existing `App::new(N)` test callers default this to `None`).
+    /// Threaded through to `Renderer::new`.
     target_pixels_override: Option<u64>,
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
@@ -3300,11 +3302,14 @@ fn parse_res_value(s: &str) -> Option<u64> {
 ///
 /// Returns `(volume_size, target_pixels_override)`. Panics with a usage
 /// message on invalid input — same idiom as the prior bare-positional
-/// parse this replaces.
+/// parse this replaces. `--help` / `-h` short-circuit by panicking with
+/// the usage line (cleanest exit shape that doesn't drag `std::process`
+/// into a pure-function helper).
 ///
 /// `--demo` and `--res VALUE` are mutually exclusive — passing both
-/// panics rather than silent last-one-wins (hash-thing-06so plan-review
-/// finding).
+/// panics rather than silent last-one-wins. Multiple `--res` likewise
+/// panics rather than last-one-wins (hash-thing-06so plan-review +
+/// code-review findings).
 fn parse_args_from<I, S>(args: I) -> (u32, Option<u64>)
 where
     I: IntoIterator<Item = S>,
@@ -3318,14 +3323,24 @@ where
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
         match arg {
+            "--help" | "-h" => panic!("{USAGE}"),
             "--demo" => demo = true,
             "--res" => {
+                if res_target.is_some() {
+                    panic!("{USAGE}\nmore than one --res");
+                }
                 let v = iter
                     .next()
                     .unwrap_or_else(|| panic!("{USAGE}\n--res requires a VALUE"));
-                let parsed = parse_res_value(v.as_ref()).unwrap_or_else(|| {
-                    panic!("{USAGE}\n--res VALUE: unrecognised '{}'", v.as_ref())
-                });
+                let v_str = v.as_ref();
+                // Reject the next-arg-is-a-flag case explicitly so the
+                // panic blames "missing value" rather than "unrecognised
+                // resolution '--demo'" (code-review N-4).
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--res requires a VALUE; saw '{v_str}'");
+                }
+                let parsed = parse_res_value(v_str)
+                    .unwrap_or_else(|| panic!("{USAGE}\n--res VALUE: unrecognised '{v_str}'"));
                 res_target = Some(parsed);
             }
             other => {
@@ -3554,6 +3569,48 @@ mod tests {
     #[should_panic(expected = "more than one SIZE positional")]
     fn parse_args_from_two_sizes_panics() {
         let _ = parse_args_from(["64", "128"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --res")]
+    fn parse_args_from_two_res_panics() {
+        // Code-review N-1: multiple --res should reject, mirroring SIZE.
+        let _ = parse_args_from(["--res", "1080p", "--res", "1440p"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--demo and --res are mutually exclusive")]
+    fn parse_args_from_res_then_demo_panics() {
+        // Code-review N-2: assert order-symmetric mutual exclusion.
+        let _ = parse_args_from(["--res", "1080p", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--demo and --res are mutually exclusive")]
+    fn parse_args_from_size_then_demo_then_res_panics() {
+        // Code-review N-2: third ordering with SIZE interleaved.
+        let _ = parse_args_from(["256", "--demo", "--res", "1080p"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--res requires a VALUE; saw '--demo'")]
+    fn parse_args_from_res_followed_by_flag_panics_clearly() {
+        // Code-review N-4: misleading "unrecognised '--demo'" replaced
+        // by "missing VALUE" framing when the next token is a flag.
+        let _ = parse_args_from(["--res", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "usage: hash-thing")]
+    fn parse_args_from_help_short_circuits() {
+        // Code-review N-3: --help no longer falls into "unknown arg".
+        let _ = parse_args_from(["--help"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "usage: hash-thing")]
+    fn parse_args_from_dash_h_short_circuits() {
+        let _ = parse_args_from(["-h"]);
     }
 
     #[test]

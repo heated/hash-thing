@@ -435,6 +435,11 @@ pub struct Renderer {
     /// LOD bias multiplier. 1.0 = default, higher = more aggressive LOD.
     pub lod_bias: f32,
     /// Render resolution scale. 0.5 = half-res (4x fewer pixels), 1.0 = full.
+    /// Picked once at construction (env / CLI / auto). `resize()` reuses
+    /// this value, so a `--demo`/`--res` pixel budget will drift from its
+    /// target if the window is resized — acceptable for the fixed-window
+    /// demo flow; revisit if the demo wrapper grows a resize affordance
+    /// (hash-thing-06so code-review N-5).
     pub render_scale: f32,
 
     // GPU-timestamp instrumentation. `None` on adapters without
@@ -728,10 +733,22 @@ impl Renderer {
                         "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.25..=1.0); ignored — using --res / --demo CLI override instead",
                     );
                 }
+                // Show the resulting framebuffer dimensions so a user
+                // who passed `--demo` doesn't have to multiply scale ×
+                // physical to confirm they got their target — the
+                // pixel-budget interpretation of "1080p" means the
+                // rendered W×H is generally NOT literal 1920×1080
+                // (uniform scale preserves physical aspect ratio).
+                let rendered_w =
+                    ((size.width as f32 * render_scale) as u32).max(1);
+                let rendered_h =
+                    ((size.height as f32 * render_scale) as u32).max(1);
                 log::info!(
-                    "render_scale={:.3} (--res / --demo override; cli_target={} px on {}x{} physical)",
+                    "render_scale={:.3} (--res / --demo override; rendered={}x{}, cli_target={} px, physical={}x{})",
                     render_scale,
-                    cli_target_pixels.unwrap_or(0),
+                    rendered_w,
+                    rendered_h,
+                    cli_target_pixels.expect("CliOverride implies cli_target_pixels=Some"),
                     size.width,
                     size.height,
                 );
