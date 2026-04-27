@@ -34,6 +34,14 @@ const HYSTERESIS: f64 = 0.25;
 /// Default `lod_bias` (1.0 matches the design-doc table verbatim).
 pub const DEFAULT_LOD_BIAS: f32 = 1.0;
 
+/// Store-growth ratio at which the runtime compacts the gameplay
+/// `NodeStore` to shed ghost interior chains accumulated by repeated
+/// `lod_collapse_chunk` calls (hash-thing-e4ep).
+///
+/// 4× matches the original cswp.8.3 warn-once gate — that breadcrumb's
+/// remediation ("consider compaction") is now automated.
+pub const LOD_COMPACT_RATIO_THRESHOLD: f32 = 4.0;
+
 /// Chunk-space coordinates: `chunk_xyz = world_cell_xyz / CHUNK_SIDE`. `u32`
 /// matches the SVDAG coord space (root world is `[0, 2^level)` cells per
 /// axis; chunk count per axis is `1 << (world_level - CHUNK_LEVEL)`).

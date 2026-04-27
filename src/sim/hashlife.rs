@@ -273,16 +273,36 @@ impl World {
         if current_size <= self.store_size_at_last_compact * 2 {
             return;
         }
-        let extra_roots = self.cache_referenced_nodes();
-        let (new_store, new_root, remap) = self
-            .store
-            .compacted_with_remap_keeping(self.root, &extra_roots);
+        self.compact_keeping(&[]);
+    }
+
+    /// Unconditional compaction, preserving the world root, hashlife
+    /// cache-referenced nodes, and any caller-provided `extra_roots`.
+    ///
+    /// Used by:
+    /// - [`Self::maybe_compact`] when the 2× growth threshold is met
+    ///   (no extra roots beyond cache references).
+    /// - The cswp.8.3 chunk-LOD path (hash-thing-e4ep) to shed ghost
+    ///   interior chains accumulated by repeated `lod_collapse_chunk`
+    ///   calls without losing the live `view_root`. Bin-crate `main.rs`
+    ///   is the only out-of-lib caller; within the lib, prefer
+    ///   `maybe_compact` so the threshold gating stays in one place.
+    ///
+    /// Updates `self.store`, `self.root`, the four hashlife caches (via
+    /// [`Self::remap_caches`]), the `store_size_at_last_compact` meter,
+    /// and publishes the remap to `last_compaction_remap` with
+    /// compose-on-write semantics so back-to-back compactions in one
+    /// frame (e.g. a sim step's `maybe_compact` followed by a
+    /// post-`upload_volume` `compact_keeping`) don't clobber the
+    /// pending A→B map with B→C (hash-thing-rk4n.1).
+    pub fn compact_keeping(&mut self, extra_roots: &[NodeId]) {
+        let mut roots = self.cache_referenced_nodes();
+        roots.extend_from_slice(extra_roots);
+        let (new_store, new_root, remap) =
+            self.store.compacted_with_remap_keeping(self.root, &roots);
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
-        // Publish to the renderer-facing slot with compose-on-write so back-to-back
-        // compactions without an intervening SVDAG sync don't clobber the A→B map
-        // with B→C (hash-thing-rk4n.1).
         self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
             Some(existing) => super::world::compose_remap(existing, &remap),
             None => remap,
