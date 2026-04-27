@@ -273,16 +273,40 @@ impl World {
         if current_size <= self.store_size_at_last_compact * 2 {
             return;
         }
-        let extra_roots = self.cache_referenced_nodes();
-        let (new_store, new_root, remap) = self
-            .store
-            .compacted_with_remap_keeping(self.root, &extra_roots);
+        self.compact_keeping(&[]);
+    }
+
+    /// Unconditional compaction, preserving the world root, hashlife
+    /// cache-referenced nodes, and any caller-provided `extra_roots`.
+    ///
+    /// Used by:
+    /// - [`Self::maybe_compact`] when the 2× growth threshold is met
+    ///   (no extra roots beyond cache references).
+    /// - The cswp.8.3 chunk-LOD path (hash-thing-e4ep) to shed ghost
+    ///   interior chains accumulated by repeated `lod_collapse_chunk`
+    ///   calls without losing the live `view_root`. Within the lib,
+    ///   prefer `maybe_compact` so the 2× threshold gating stays in one
+    ///   place; out-of-lib callers (e.g. the bin-crate's per-frame
+    ///   chunk-LOD trigger) drive their own threshold and pass live
+    ///   roots that aren't on the hashlife cache list.
+    ///
+    /// Updates `self.store`, `self.root`, the four hashlife caches (via
+    /// [`Self::remap_caches`]), the `store_size_at_last_compact` meter,
+    /// and publishes the remap to `last_compaction_remap` with
+    /// compose-on-write semantics so back-to-back compactions before
+    /// the renderer next drains the slot — for example two sim steps
+    /// each tripping `maybe_compact` between frames, or a sim-step
+    /// `maybe_compact` followed in the next frame by a chunk-LOD
+    /// `compact_keeping` if the renderer hasn't yet drained — don't
+    /// clobber the pending A→B map with B→C (hash-thing-rk4n.1).
+    pub fn compact_keeping(&mut self, extra_roots: &[NodeId]) {
+        let mut roots = self.cache_referenced_nodes();
+        roots.extend_from_slice(extra_roots);
+        let (new_store, new_root, remap) =
+            self.store.compacted_with_remap_keeping(self.root, &roots);
         self.store = new_store;
         self.root = new_root;
         self.remap_caches(&remap);
-        // Publish to the renderer-facing slot with compose-on-write so back-to-back
-        // compactions without an intervening SVDAG sync don't clobber the A→B map
-        // with B→C (hash-thing-rk4n.1).
         self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
             Some(existing) => super::world::compose_remap(existing, &remap),
             None => remap,
