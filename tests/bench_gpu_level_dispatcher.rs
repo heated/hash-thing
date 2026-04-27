@@ -2383,6 +2383,453 @@ fn run_level_5_step_gpu(
     out
 }
 
+// ---------------------------------------------------------------------------
+// L5 throughput driver (commit 3 — perf measurement for §8.8 paper appendix).
+//
+// Mirrors `run_level_4_step_gpu_timed` but extends to three dispatches with
+// per-dispatch in-encoder timestamps. Per-column medians, N=64 worlds,
+// 10 warm runs, fresh buffers each iter — matches abwm.3 methodology.
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Debug, Clone, Copy)]
+struct L5TimedRun {
+    dispatch_1_gpu: Option<std::time::Duration>,
+    dispatch_2_gpu: Option<std::time::Duration>,
+    dispatch_3_gpu: Option<std::time::Duration>,
+    wall_total: std::time::Duration,
+    cpu_prep: std::time::Duration,
+    readback: std::time::Duration,
+}
+
+fn run_level_5_step_gpu_timed(
+    ctx: &GpuCtx,
+    pipes: &L5GpuPipelines,
+    worlds: &[Box<[u32; L5_CELLS]>],
+) -> (Vec<[u32; L4_CELLS]>, L5TimedRun) {
+    let num_worlds = worlds.len() as u32;
+    assert!(num_worlds > 0, "need at least one L5 world");
+    let wall_start = Instant::now();
+    let cpu_prep_start = Instant::now();
+
+    let total_base_cases = (num_worlds as usize) * 27 * 27;
+    let mut flat_inputs: Vec<u32> = Vec::with_capacity(total_base_cases * L3_CELLS);
+    for input in worlds {
+        for k in 0..3usize {
+            for j in 0..3usize {
+                for i in 0..3usize {
+                    let l4_int = build_l4_intermediate_from_l5(input, i, j, k);
+                    for sk in 0..3usize {
+                        for sj in 0..3usize {
+                            for si in 0..3usize {
+                                let sub = build_intermediate(&l4_int, si, sj, sk);
+                                flat_inputs.extend_from_slice(&sub);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let intermediate_input_buf = make_input_buffer(ctx, "l5_timed_d1_inputs", &flat_inputs);
+    let intermediate_l3_results_buf = make_output_buffer(
+        ctx,
+        "l5_timed_d1_outputs",
+        total_base_cases as u32 * L2_CELLS as u32,
+    );
+    let l4_intermediate_results_buf = make_output_buffer(
+        ctx,
+        "l5_timed_d2_outputs",
+        num_worlds * 27 * L3_CELLS as u32,
+    );
+    let l5_final_outputs_buf =
+        make_output_buffer(ctx, "l5_timed_d3_outputs", num_worlds * L4_CELLS as u32);
+    let cpu_prep = cpu_prep_start.elapsed();
+
+    let make_ts_set = |label: &str| -> Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer)> {
+        if !ctx.timestamp_supported {
+            return None;
+        }
+        let qs = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some(label),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts_resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts_readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some((qs, resolve, readback))
+    };
+    let ts1 = make_ts_set("l5_ts_d1");
+    let ts2 = make_ts_set("l5_ts_d2");
+    let ts3 = make_ts_set("l5_ts_d3");
+
+    // ---- D1 ----
+    let d1_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_timed_d1_params"),
+            contents: bytemuck::bytes_of(&BaseCaseParams {
+                num_inputs: total_base_cases as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_timed_d1_bg"),
+        layout: &ctx.bgl_base_case,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d1_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc1 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_timed_enc_d1"),
+        });
+    if let Some((qs, _, _)) = &ts1 {
+        enc1.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc1.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_timed_pass_d1"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&ctx.pipeline_base_case);
+        cpass.set_bind_group(0, &bg_d1, &[]);
+        let total_threads = total_base_cases as u32 * L2_CELLS as u32;
+        let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+        cpass.dispatch_workgroups(groups, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts1 {
+        enc1.write_timestamp(qs, 1);
+        enc1.resolve_query_set(qs, 0..2, resolve, 0);
+        enc1.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc1.finish()));
+
+    // ---- D2 ----
+    let d2_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_timed_d2_params"),
+            contents: bytemuck::bytes_of(&L4Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_timed_d2_bg"),
+        layout: &pipes.bgl_l4_wg,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d2_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: intermediate_l3_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc2 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_timed_enc_d2"),
+        });
+    if let Some((qs, _, _)) = &ts2 {
+        enc2.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_timed_pass_d2"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l4_wg);
+        cpass.set_bind_group(0, &bg_d2, &[]);
+        cpass.dispatch_workgroups(27 * num_worlds, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts2 {
+        enc2.write_timestamp(qs, 1);
+        enc2.resolve_query_set(qs, 0..2, resolve, 0);
+        enc2.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc2.finish()));
+
+    // ---- D3 ----
+    let d3_params_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l5_timed_d3_params"),
+            contents: bytemuck::bytes_of(&L5Params {
+                num_worlds,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let bg_d3 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("l5_timed_d3_bg"),
+        layout: &pipes.bgl_l5,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d3_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: l4_intermediate_results_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: l5_final_outputs_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut enc3 = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("l5_timed_enc_d3"),
+        });
+    if let Some((qs, _, _)) = &ts3 {
+        enc3.write_timestamp(qs, 0);
+    }
+    {
+        let mut cpass = enc3.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("l5_timed_pass_d3"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipes.pipeline_l5);
+        cpass.set_bind_group(0, &bg_d3, &[]);
+        cpass.dispatch_workgroups(num_worlds, 1, 1);
+    }
+    if let Some((qs, resolve, readback)) = &ts3 {
+        enc3.write_timestamp(qs, 1);
+        enc3.resolve_query_set(qs, 0..2, resolve, 0);
+        enc3.copy_buffer_to_buffer(resolve, 0, readback, 0, 16);
+    }
+    ctx.queue.submit(std::iter::once(enc3.finish()));
+
+    // ---- Readback ----
+    let readback_start = Instant::now();
+    let flat = read_buffer_u32(ctx, &l5_final_outputs_buf, num_worlds * L4_CELLS as u32);
+    let mut out: Vec<[u32; L4_CELLS]> = Vec::with_capacity(worlds.len());
+    for chunk in flat.chunks(L4_CELLS) {
+        let mut arr = [0u32; L4_CELLS];
+        arr.copy_from_slice(chunk);
+        out.push(arr);
+    }
+    let readback = readback_start.elapsed();
+
+    let read_ts = |readback: &wgpu::Buffer| -> Option<std::time::Duration> {
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        rx.recv().ok()?.ok()?;
+        let ticks = {
+            let data = slice.get_mapped_range();
+            let ts: &[u64] = bytemuck::cast_slice(&data);
+            if ts.len() >= 2 && ts[1] > ts[0] {
+                Some(ts[1] - ts[0])
+            } else {
+                None
+            }
+        };
+        readback.unmap();
+        ticks.map(|t| {
+            std::time::Duration::from_nanos((t as f64 * ctx.timestamp_period_ns as f64) as u64)
+        })
+    };
+    let dispatch_1_gpu = ts1.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+    let dispatch_2_gpu = ts2.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+    let dispatch_3_gpu = ts3.as_ref().and_then(|(_, _, rb)| read_ts(rb));
+
+    (
+        out,
+        L5TimedRun {
+            dispatch_1_gpu,
+            dispatch_2_gpu,
+            dispatch_3_gpu,
+            wall_total: wall_start.elapsed(),
+            cpu_prep,
+            readback,
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn gpu_level_5_throughput() {
+    let ctx = match GpuCtx::new() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no GPU adapter");
+            return;
+        }
+    };
+    let pipes = build_l5_pipelines(&ctx);
+    eprintln!(
+        "L5 GPU dispatcher throughput (timestamp_supported={}, period_ns={})",
+        ctx.timestamp_supported, ctx.timestamp_period_ns
+    );
+
+    const N_WORLDS: usize = 64;
+    const N_ITERS: usize = 10;
+
+    let worlds: Vec<Box<[u32; L5_CELLS]>> = (0..N_WORLDS)
+        .map(|i| fixture_l5_seeded_random(0x42u64.wrapping_add(i as u64), 0.30))
+        .collect();
+
+    // Warm-up.
+    let (_warm_out, _warm_t) = run_level_5_step_gpu_timed(&ctx, &pipes, &worlds);
+
+    let mut runs: Vec<L5TimedRun> = Vec::with_capacity(N_ITERS);
+    for _ in 0..N_ITERS {
+        let (_out, t) = run_level_5_step_gpu_timed(&ctx, &pipes, &worlds);
+        runs.push(t);
+    }
+
+    fn median_dur(values: &[std::time::Duration]) -> std::time::Duration {
+        let mut v = values.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    }
+    let median_wall = median_dur(&runs.iter().map(|r| r.wall_total).collect::<Vec<_>>());
+    let median_cpu_prep = median_dur(&runs.iter().map(|r| r.cpu_prep).collect::<Vec<_>>());
+    let median_readback = median_dur(&runs.iter().map(|r| r.readback).collect::<Vec<_>>());
+    let d1_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_1_gpu).collect();
+    let d2_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_2_gpu).collect();
+    let d3_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_3_gpu).collect();
+    let median_d1 = (!d1_samples.is_empty()).then(|| median_dur(&d1_samples));
+    let median_d2 = (!d2_samples.is_empty()).then(|| median_dur(&d2_samples));
+    let median_d3 = (!d3_samples.is_empty()).then(|| median_dur(&d3_samples));
+
+    let fmt_dur = |d: std::time::Duration| {
+        let ns = d.as_nanos();
+        if ns < 10_000 {
+            format!("{ns} ns")
+        } else {
+            format!("{:.3} ms", ns as f64 / 1e6)
+        }
+    };
+
+    let total_d1_threads = N_WORLDS * 27 * 27 * L2_CELLS;
+    let total_d2_workgroups = N_WORLDS * 27;
+    let total_d3_workgroups = N_WORLDS;
+
+    eprintln!(
+        "per-column medians (of {N_ITERS} runs, N={N_WORLDS} worlds, fresh buffers each iter):"
+    );
+    eprintln!(
+        "  dispatch 1 (729·N base case, {total_d1_threads} threads): {}",
+        median_d1.map(fmt_dur).unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  dispatch 2 (27·N L4-recursive-wg, {total_d2_workgroups} wgs × 64 threads = {} threads): {}",
+        total_d2_workgroups * 64,
+        median_d2.map(fmt_dur).unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  dispatch 3 (N L5-recursive, {total_d3_workgroups} wgs × 64 threads = {} threads): {}",
+        total_d3_workgroups * 64,
+        median_d3.map(fmt_dur).unwrap_or_else(|| "n/a".into())
+    );
+    eprintln!(
+        "  wall total (incl. CPU prep + readback): {}",
+        fmt_dur(median_wall)
+    );
+    eprintln!(
+        "  decomposition (median): cpu_prep = {}, readback = {}, residual = {}",
+        fmt_dur(median_cpu_prep),
+        fmt_dur(median_readback),
+        fmt_dur(median_wall.saturating_sub(median_cpu_prep + median_readback)),
+    );
+
+    // Plan A8 verdict criteria:
+    //   GO: per-column d3 ≤ 1 ms, d1/d2 within 2× of abwm.3 baselines, total wall ≤ 10 ms.
+    //   CAVEAT: GO on correctness + per-dispatch budgets but with a structural finding.
+    //   NO-GO: per-dispatch d3 > 5 ms or correctness mismatch (caught earlier).
+    if let (Some(d1), Some(d2), Some(d3)) = (median_d1, median_d2, median_d3) {
+        let max_dispatch = d1.max(d2).max(d3);
+        let verdict = if d3.as_micros() <= 1_000 && median_wall.as_micros() <= 10_000 {
+            "GO"
+        } else if max_dispatch.as_micros() > 5_000 {
+            "NO-GO"
+        } else {
+            "CAVEAT"
+        };
+        eprintln!("verdict (per plan A8): {verdict}");
+        eprintln!(
+            "  d3 = {} {} 1 ms",
+            fmt_dur(d3),
+            if d3.as_micros() <= 1_000 { "≤" } else { ">" }
+        );
+        eprintln!(
+            "  wall total = {} {} 10 ms",
+            fmt_dur(median_wall),
+            if median_wall.as_micros() <= 10_000 {
+                "≤"
+            } else {
+                ">"
+            }
+        );
+    } else {
+        eprintln!("verdict: timestamps unavailable; cannot decide GO/NO-GO from this run");
+    }
+
+    eprintln!("--- per-iter detail ---");
+    for (i, r) in runs.iter().enumerate() {
+        eprintln!(
+            "  iter {i}: d1={} d2={} d3={} cpu_prep={} readback={} wall={}",
+            r.dispatch_1_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            r.dispatch_2_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            r.dispatch_3_gpu
+                .map(fmt_dur)
+                .unwrap_or_else(|| "n/a".into()),
+            fmt_dur(r.cpu_prep),
+            fmt_dur(r.readback),
+            fmt_dur(r.wall_total),
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn gpu_level_5_matches_cpu_on_corpus() {
