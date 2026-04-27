@@ -547,6 +547,7 @@ Notes:
 - Felt FPS is the metric, not log-reported `render_gpu` (see hash-thing-dbz5). A fix that moves a single number without moving the felt experience does not count as hitting the target.
 - Tiered features are allowed: e.g. shadows / higher-quality LOD can require more VRAM, as long as the 2 GB tier still renders cleanly with the defaults.
 - Higher resolutions (4K, ultrawide) and beefier rigs are nice-to-have, not the design target.
+- **Audience-distribution context:** per `docs/perf/audience-hw-distribution.md` (cairn 2026-04-26 research), the median Steam gamer has ~3.5–5× the FP32 throughput of an Apple M1/M2 base GPU. Apple Silicon sits at the bottom-25% of active Steam GPUs; macOS is 2.35% of Steam. Implication: optimization budget targets the median Steam GPU (RTX 3060/4060-class), not Mac-specific perf. Mac defaults to `render_scale=0.5` and is treated as the minimum-spec smoke test.
 
 ---
 
