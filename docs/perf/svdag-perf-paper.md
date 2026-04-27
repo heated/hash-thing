@@ -447,7 +447,17 @@ No follow-up shader-opt bead filed. The real lowest-hanging user-visible win at 
 
 **Scope note.** The matrix is `FREEZE_SIM=1` throughout, so `upload_cpu` does not appear — it is a sim-step-rate cost, not a raycast cost, and its own beads (`hash-thing-jw3k`, `hash-thing-t02q`, `hash-thing-71mp`) own it.
 
-### 3.13 Cold-gen baseline at 1024³ and 4096³ (`hash-thing-71t7`, `hash-thing-cswp`)
+### 3.13 Forward-looking direction (cairn 2026-04-26)
+
+After tonight's 2w1u session and Triple plan review, the perf direction for render work is captured in **`docs/perf/render-perf-direction.md`** — a forward-looking roadmap document, not measurement record. Read it before claiming any sub-bead under `9k4w` (cheaper rays), `m59h` (async surface acquire), `adp-res` (adaptive resolution), or `me6i` (frame_total growth-over-time).
+
+Key v3 corrections relevant to this paper:
+- The "Apple Metal compositor pacing" framing in `docs/perf/render-perf-direction.md` v1/v2 was wrong; v3 grounds it in §3.9 instead.
+- Tonight's 30s 64³ captures sampled the dlse.2.2.3 warmup transient; the apparent "30→80ms surface_acquire growth" is the same self-resolving shape characterized at §3.9 step `Addendum 2026-04-21`.
+- Cheaper-rays optimization (sparse-8 vs sparse-64 caveats incorporated; expected yield 1.7–2.2× at 256³, 1.3–1.7× at 4096³).
+- Phase-0 measurement extension protocol standardized (`--profile perf`, 120s/arm, 256³+512³ at 0.5/1.0 render scale, post-warmup statistic).
+
+### 3.14 Cold-gen baseline at 1024³ and 4096³ (`hash-thing-71t7`, `hash-thing-cswp`)
 
 Baseline cold-gen latency for the today-codepath, captured before gen-time hash-consing (cswp.3) lands. Bench harness: `tests/bench_cold_gen_big_map.rs`, 3-run mean, bench profile. M2 16 GB, commit 8fdfd6b. Procedural terrain via `TerrainParams::for_level` (scale-aware defaults).
 
@@ -469,7 +479,7 @@ Run-to-run variance is small at both scales (~5% spread). 4096³ seed completes 
 cargo test --profile perf --test bench_cold_gen_big_map -- --ignored --nocapture
 ```
 
-### 3.14 Gen-time hash-cons is already in (`hash-thing-cswp.3`)
+### 3.15 Gen-time hash-cons is already in (`hash-thing-cswp.3`)
 
 cswp.3 was filed expecting "≥10× faster than cswp.1's baseline" from adding gen-time hash-cons. Reading the gen pipeline (`World::seed_terrain` → `terrain::gen::gen_region`, `src/sim/world.rs:2459` → `src/terrain/gen.rs:89`) shows the path already builds the SVDAG via recursive `Builder::build` with two intern channels: `WorldGen::classify` short-circuits uniform sub-cubes to `store.uniform`, and the recursive case interns the 8-child node via `store.interior`. cswp.1's measurements (§3.13) ARE the hash-cons-on numbers — the 10–50× analytical estimate was anchored to the stale 25 s no-dedup projection (`hash-thing-stue.2`), which the current codepath already beats by ~100×.
 
