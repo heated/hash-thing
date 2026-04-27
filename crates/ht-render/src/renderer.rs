@@ -1645,8 +1645,28 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
+        // Capture the `map_async` callback result so a mapping failure
+        // (device lost, OOM, etc.) surfaces with attribution instead of
+        // panicking inside `get_mapped_range` with an opaque inner-wgpu
+        // message. Only matters in pathological cases — for healthy
+        // single-shot dumps the callback always reports `Ok(())` —
+        // but it makes the failure mode debuggable.
+        let map_result: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            Arc::new(Mutex::new(None));
+        let map_result_cb = Arc::clone(&map_result);
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            *map_result_cb.lock().expect("dump_frame map_async lock") = Some(r);
+        });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        match map_result
+            .lock()
+            .expect("dump_frame map_async lock")
+            .as_ref()
+        {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("read_off_surface_pixels: staging buffer map failed: {e:?}"),
+            None => panic!("read_off_surface_pixels: map_async callback never fired"),
+        }
 
         let mapped = slice.get_mapped_range();
         let mut rgba8 = Vec::with_capacity((unpadded_row as usize) * (height as usize));
@@ -1665,7 +1685,10 @@ impl Renderer {
                 }
             }
             wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Rgba8Unorm => {}
-            other => panic!("read_off_surface_pixels: unsupported surface format {other:?}"),
+            other => panic!(
+                "read_off_surface_pixels: unsupported surface format {other:?} \
+                 (supported: Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, Rgba8UnormSrgb)"
+            ),
         }
 
         Some(OffSurfacePixels {

@@ -3472,6 +3472,9 @@ where
                 if v_str.starts_with("--") || v_str == "-h" {
                     panic!("{USAGE}\n--dump-frame requires a PATH; saw '{v_str}'");
                 }
+                if v_str.is_empty() {
+                    panic!("{USAGE}\n--dump-frame requires a non-empty PATH");
+                }
                 dump_frame = Some(std::path::PathBuf::from(v_str));
             }
             other => {
@@ -3731,6 +3734,12 @@ mod tests {
     #[should_panic(expected = "more than one --dump-frame")]
     fn parse_args_from_two_dump_frame_panics() {
         let _ = parse_args_from(["--dump-frame", "a.png", "--dump-frame", "b.png"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-frame requires a non-empty PATH")]
+    fn parse_args_from_dump_frame_empty_path_panics() {
+        let _ = parse_args_from(["--dump-frame", ""]);
     }
 
     #[test]
