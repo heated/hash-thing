@@ -2007,11 +2007,12 @@ fn cs_step_l5_recursive(
         let sj = (L5_sub >> 1u) & 1u;
         let sk = L5_sub >> 2u;
 
-        // Barrier S0: at sub-cube boundary, ensures the previous iter's
-        // phase-A reads have completed before phase A overwrites
-        // phase_a_results. First iter: barrier is a no-op for correctness
-        // (phase_a_results is uninitialized on first entry but Phase A
-        // writes BEFORE Phase B reads, and S1 enforces that).
+        // Barrier S0: at sub-cube boundary. Prevents iter k+1's phase-A
+        // writes from racing iter k's phase-B reads of phase_a_results.
+        // (workgroupBarrier is a synchronization point, not a no-op even
+        // on the first iter — first iter has no read-after-write to gate
+        // but the barrier still costs a per-warp simdgroup wait. WGSL
+        // does not let us skip it on first iter without a uniform branch.)
         workgroupBarrier();
 
         // Phase A: 27 base cases × 64 cells = 1728 work units.
@@ -2397,7 +2398,11 @@ struct L5TimedRun {
     dispatch_2_gpu: Option<std::time::Duration>,
     dispatch_3_gpu: Option<std::time::Duration>,
     wall_total: std::time::Duration,
-    cpu_prep: std::time::Duration,
+    // Decomposition (per code-review I1: split cpu_prep into "purely CPU
+    // work" vs "GPU buffer alloc + upload"; the latter is wgpu/Metal
+    // overhead, not CPU prep as §8.8 originally claimed).
+    cpu_inputs: std::time::Duration,
+    buf_alloc: std::time::Duration,
     readback: std::time::Duration,
 }
 
@@ -2409,8 +2414,10 @@ fn run_level_5_step_gpu_timed(
     let num_worlds = worlds.len() as u32;
     assert!(num_worlds > 0, "need at least one L5 world");
     let wall_start = Instant::now();
-    let cpu_prep_start = Instant::now();
 
+    // Decomposition I1: cpu_inputs covers only the Rust loop that builds
+    // flat_inputs (extracting 27*27*N L3 sub-blocks from N*32³ L5 inputs).
+    let cpu_inputs_start = Instant::now();
     let total_base_cases = (num_worlds as usize) * 27 * 27;
     let mut flat_inputs: Vec<u32> = Vec::with_capacity(total_base_cases * L3_CELLS);
     for input in worlds {
@@ -2430,7 +2437,12 @@ fn run_level_5_step_gpu_timed(
             }
         }
     }
+    let cpu_inputs = cpu_inputs_start.elapsed();
 
+    // Decomposition I1: buf_alloc covers wgpu/Metal device-buffer creation
+    // and the mapped-at-creation upload. This is GPU-driver overhead, not
+    // CPU prep — pre-fix it was bundled into "cpu_prep" in §8.8.
+    let buf_alloc_start = Instant::now();
     let intermediate_input_buf = make_input_buffer(ctx, "l5_timed_d1_inputs", &flat_inputs);
     let intermediate_l3_results_buf = make_output_buffer(
         ctx,
@@ -2444,7 +2456,7 @@ fn run_level_5_step_gpu_timed(
     );
     let l5_final_outputs_buf =
         make_output_buffer(ctx, "l5_timed_d3_outputs", num_worlds * L4_CELLS as u32);
-    let cpu_prep = cpu_prep_start.elapsed();
+    let buf_alloc = buf_alloc_start.elapsed();
 
     let make_ts_set = |label: &str| -> Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer)> {
         if !ctx.timestamp_supported {
@@ -2684,7 +2696,8 @@ fn run_level_5_step_gpu_timed(
             dispatch_2_gpu,
             dispatch_3_gpu,
             wall_total: wall_start.elapsed(),
-            cpu_prep,
+            cpu_inputs,
+            buf_alloc,
             readback,
         },
     )
@@ -2728,8 +2741,22 @@ fn gpu_level_5_throughput() {
         v[v.len() / 2]
     }
     let median_wall = median_dur(&runs.iter().map(|r| r.wall_total).collect::<Vec<_>>());
-    let median_cpu_prep = median_dur(&runs.iter().map(|r| r.cpu_prep).collect::<Vec<_>>());
+    let median_cpu_inputs = median_dur(&runs.iter().map(|r| r.cpu_inputs).collect::<Vec<_>>());
+    let median_buf_alloc = median_dur(&runs.iter().map(|r| r.buf_alloc).collect::<Vec<_>>());
     let median_readback = median_dur(&runs.iter().map(|r| r.readback).collect::<Vec<_>>());
+    // Per code-review I2: compute per-iter residual BEFORE medianizing.
+    // median(wall) - median(cpu_inputs+buf_alloc) - median(readback) is not
+    // the same as median(wall_i - cpu_inputs_i - buf_alloc_i - readback_i)
+    // because medians don't commute with subtraction across non-monotonic
+    // decompositions.
+    let residual_samples: Vec<std::time::Duration> = runs
+        .iter()
+        .map(|r| {
+            r.wall_total
+                .saturating_sub(r.cpu_inputs + r.buf_alloc + r.readback)
+        })
+        .collect();
+    let median_residual = median_dur(&residual_samples);
     let d1_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_1_gpu).collect();
     let d2_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_2_gpu).collect();
     let d3_samples: Vec<_> = runs.iter().filter_map(|r| r.dispatch_3_gpu).collect();
@@ -2768,37 +2795,44 @@ fn gpu_level_5_throughput() {
         median_d3.map(fmt_dur).unwrap_or_else(|| "n/a".into())
     );
     eprintln!(
-        "  wall total (incl. CPU prep + readback): {}",
+        "  wall total (incl. CPU inputs + buffer alloc + readback): {}",
         fmt_dur(median_wall)
     );
     eprintln!(
-        "  decomposition (median): cpu_prep = {}, readback = {}, residual = {}",
-        fmt_dur(median_cpu_prep),
+        "  decomposition (median): cpu_inputs = {}, buf_alloc = {}, readback = {}, residual = {}",
+        fmt_dur(median_cpu_inputs),
+        fmt_dur(median_buf_alloc),
         fmt_dur(median_readback),
-        fmt_dur(median_wall.saturating_sub(median_cpu_prep + median_readback)),
+        fmt_dur(median_residual),
     );
 
-    // Plan A8 verdict criteria:
-    //   GO: per-column d3 ≤ 1 ms, d1/d2 within 2× of abwm.3 baselines, total wall ≤ 10 ms.
-    //   CAVEAT: GO on correctness + per-dispatch budgets but with a structural finding.
-    //   NO-GO: per-dispatch d3 > 5 ms or correctness mismatch (caught earlier).
+    // Plan A8 verdict criteria. Per code-review I3: split the verdict so the
+    // test output mirrors §8.8's two-line structure (GO for the dispatcher
+    // mechanism vs CAVEAT on wall-time at this spike scale).
     if let (Some(d1), Some(d2), Some(d3)) = (median_d1, median_d2, median_d3) {
         let max_dispatch = d1.max(d2).max(d3);
-        let verdict = if d3.as_micros() <= 1_000 && median_wall.as_micros() <= 10_000 {
+        let dispatcher_verdict = if d3.as_micros() <= 1_000 {
             "GO"
         } else if max_dispatch.as_micros() > 5_000 {
             "NO-GO"
         } else {
             "CAVEAT"
         };
-        eprintln!("verdict (per plan A8): {verdict}");
+        let wall_verdict = if median_wall.as_micros() <= 10_000 {
+            "GO"
+        } else {
+            "CAVEAT"
+        };
         eprintln!(
-            "  d3 = {} {} 1 ms",
+            "verdict (per plan A8): dispatcher={dispatcher_verdict}, wall={wall_verdict}"
+        );
+        eprintln!(
+            "  d3 = {} {} 1 ms (per-dispatch budget)",
             fmt_dur(d3),
             if d3.as_micros() <= 1_000 { "≤" } else { ">" }
         );
         eprintln!(
-            "  wall total = {} {} 10 ms",
+            "  wall total = {} {} 10 ms (spike-scale ceiling — wall is dominated by cpu_inputs + buf_alloc + readback, all spike-scale artifacts)",
             fmt_dur(median_wall),
             if median_wall.as_micros() <= 10_000 {
                 "≤"
@@ -2812,8 +2846,11 @@ fn gpu_level_5_throughput() {
 
     eprintln!("--- per-iter detail ---");
     for (i, r) in runs.iter().enumerate() {
+        let residual = r
+            .wall_total
+            .saturating_sub(r.cpu_inputs + r.buf_alloc + r.readback);
         eprintln!(
-            "  iter {i}: d1={} d2={} d3={} cpu_prep={} readback={} wall={}",
+            "  iter {i}: d1={} d2={} d3={} cpu_inputs={} buf_alloc={} readback={} residual={} wall={}",
             r.dispatch_1_gpu
                 .map(fmt_dur)
                 .unwrap_or_else(|| "n/a".into()),
@@ -2823,8 +2860,10 @@ fn gpu_level_5_throughput() {
             r.dispatch_3_gpu
                 .map(fmt_dur)
                 .unwrap_or_else(|| "n/a".into()),
-            fmt_dur(r.cpu_prep),
+            fmt_dur(r.cpu_inputs),
+            fmt_dur(r.buf_alloc),
             fmt_dur(r.readback),
+            fmt_dur(residual),
             fmt_dur(r.wall_total),
         );
     }
