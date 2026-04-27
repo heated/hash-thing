@@ -47,6 +47,11 @@ pub struct GenStats {
     pub gen_region_us: u64,
     /// Node count in the store after gen_region.
     pub nodes_after_gen: usize,
+    /// Skip-at-gen: count of subtrees the builder shortcut at
+    /// `level == target_lod` (one per LOD'd chunk that wasn't already
+    /// proof-collapsed). Always zero on plain `gen_region`; only
+    /// `gen_region_with_lod` increments it.
+    pub lod_skips: u64,
 }
 
 impl GenStats {
@@ -122,6 +127,170 @@ impl<'a, F: WorldGen> Builder<'a, F> {
         self.stats.interiors_interned += 1;
         self.store.interior(size_log2, children)
     }
+
+    /// Top-level recursion for `gen_region_with_lod`. Above the chunk
+    /// boundary this is identical to [`Self::build`] (classify-then-recurse,
+    /// no LOD logic). At `level == chunk_level`, dispatches into
+    /// [`Self::build_with_lod`] using the per-chunk `target_lod` returned
+    /// by `chunk_lod_fn`.
+    fn top_build(
+        &mut self,
+        region_origin: [i64; 3],
+        origin: [i64; 3],
+        level: u32,
+        chunk_level: u32,
+        chunk_lod_fn: &dyn Fn([u64; 3]) -> u32,
+    ) -> NodeId {
+        debug_assert!(
+            (level as usize) < self.stats.calls_per_level.len(),
+            "level {level} exceeds GenStats fixed-size arrays (cap 32)",
+        );
+        debug_assert!(
+            level >= chunk_level,
+            "top_build invariant: level {level} < chunk_level {chunk_level}",
+        );
+
+        if level == chunk_level {
+            // Tail-call into build_with_lod — the dispatch itself doesn't
+            // sample or classify, so no counter increment here. build_with_lod
+            // will increment its own calls_total/classify_calls.
+            let cx = ((origin[0] - region_origin[0]) >> chunk_level) as u64;
+            let cy = ((origin[1] - region_origin[1]) >> chunk_level) as u64;
+            let cz = ((origin[2] - region_origin[2]) >> chunk_level) as u64;
+            let target_lod = chunk_lod_fn([cx, cy, cz]);
+            assert!(
+                target_lod <= chunk_level,
+                "chunk_lod_fn returned target_lod {target_lod} > chunk_level {chunk_level} for chunk ({cx},{cy},{cz})",
+            );
+            return self.build_with_lod(origin, level, target_lod);
+        }
+
+        // level > chunk_level: plain build-style recursion with proof-collapse.
+        self.stats.calls_total += 1;
+        self.stats.calls_per_level[level as usize] += 1;
+        self.stats.classify_calls += 1;
+        if let Some(state) = self.field.classify(origin, level) {
+            self.stats.collapses_by_proof[level as usize] += 1;
+            return self.uniform(level, state);
+        }
+
+        let half = 1i64 << (level - 1);
+        let mut children = [NodeId::EMPTY; 8];
+        for (oct, child_slot) in children.iter_mut().enumerate() {
+            let (cx, cy, cz) = octant_coords(oct);
+            let child_origin = [
+                origin[0] + cx as i64 * half,
+                origin[1] + cy as i64 * half,
+                origin[2] + cz as i64 * half,
+            ];
+            *child_slot = self.top_build(
+                region_origin,
+                child_origin,
+                level - 1,
+                chunk_level,
+                chunk_lod_fn,
+            );
+        }
+        self.stats.interiors_interned += 1;
+        self.store.interior(level, children)
+    }
+
+    /// LOD-aware recursion inside one chunk subtree. Worker for
+    /// [`Self::top_build`]. Invariant: `level >= target_lod`.
+    ///
+    /// Three short-circuits, evaluated in this order:
+    /// 1. `level == 0` → sample one leaf (only reachable when
+    ///    `target_lod == 0`).
+    /// 2. Proof-collapse via `WorldGen::classify` — same as `build()`. Fires
+    ///    before the lod-skip check, so a uniform-AIR chunk still collapses
+    ///    to the canonical proof-collapsed form regardless of target_lod.
+    /// 3. `level == target_lod` after a classify miss → **lod-skip**. Sample
+    ///    8 octant centroids (or 8 cells for `target_lod == 1`), apply the
+    ///    canonical Leaf-only representative-state rule from
+    ///    `representative_state_memo`, and emit `store.leaf(rep)`. Bumps
+    ///    `lod_skips`.
+    ///
+    /// At `level == target_lod`, the emitted output is a raw `Leaf(rep)`
+    /// NodeId standing in for a `2^target_lod`-cube uniform-region — the
+    /// same convention `lod_collapse` uses (see
+    /// `crates/ht-octree/src/store.rs:983`). Proof-collapse at
+    /// `level > target_lod` still emits a `store.uniform(level, state)`
+    /// Interior chain; this differs structurally from
+    /// `lod_collapse_chunk`'s output (which emits a Leaf at `target_lod`
+    /// with Interior chain above) but flattens to the same cell grid.
+    fn build_with_lod(&mut self, origin: [i64; 3], level: u32, target_lod: u32) -> NodeId {
+        debug_assert!(
+            (level as usize) < self.stats.calls_per_level.len(),
+            "level {level} exceeds GenStats fixed-size arrays (cap 32)",
+        );
+        debug_assert!(
+            level >= target_lod,
+            "build_with_lod invariant: level {level} < target_lod {target_lod}",
+        );
+        self.stats.calls_total += 1;
+        self.stats.calls_per_level[level as usize] += 1;
+
+        if level == 0 {
+            // Reachable only when target_lod == 0: descend to leaves.
+            self.stats.leaves += 1;
+            let s = self.field.sample(origin);
+            return self.store.leaf(s);
+        }
+
+        // Proof-based collapse — same short-circuit as `build()`. Wins over
+        // the lod-skip check, so uniform regions always collapse via the
+        // canonical proof rule.
+        self.stats.classify_calls += 1;
+        if let Some(state) = self.field.classify(origin, level) {
+            self.stats.collapses_by_proof[level as usize] += 1;
+            return self.uniform(level, state);
+        }
+
+        if level == target_lod {
+            // lod-skip: 8-octant centroid samples + canonical Leaf-only
+            // rule from `representative_state_memo` (store.rs:1009).
+            //
+            // Sub-octant cell offset:
+            //   target_lod == 1 → 0 (the 8 octants ARE the 8 cells).
+            //   target_lod >= 2 → 2^(target_lod - 2) (lower-corner-of-upper-half).
+            let half = 1i64 << (level - 1);
+            let sub_offset: i64 = if level >= 2 { 1i64 << (level - 2) } else { 0 };
+            let mut rep_state: CellState = 0;
+            let mut rep_pop: u64 = 0;
+            for oct in 0..8usize {
+                let (cx, cy, cz) = octant_coords(oct);
+                let cell = [
+                    origin[0] + cx as i64 * half + sub_offset,
+                    origin[1] + cy as i64 * half + sub_offset,
+                    origin[2] + cz as i64 * half + sub_offset,
+                ];
+                let s = self.field.sample(cell);
+                if s != 0 && (rep_state == 0 || rep_pop == 0) {
+                    rep_state = s;
+                    rep_pop = 1;
+                }
+            }
+            self.stats.lod_skips += 1;
+            // Raw Leaf compression — matches `lod_collapse` output shape at
+            // target_lod (store.rs:983).
+            return self.store.leaf(rep_state);
+        }
+
+        // level > target_lod: recurse into 8 octants.
+        let half = 1i64 << (level - 1);
+        let mut children = [NodeId::EMPTY; 8];
+        for (oct, child_slot) in children.iter_mut().enumerate() {
+            let (cx, cy, cz) = octant_coords(oct);
+            let child_origin = [
+                origin[0] + cx as i64 * half,
+                origin[1] + cy as i64 * half,
+                origin[2] + cz as i64 * half,
+            ];
+            *child_slot = self.build_with_lod(child_origin, level - 1, target_lod);
+        }
+        self.stats.interiors_interned += 1;
+        self.store.interior(level, children)
+    }
 }
 
 /// Build a canonical `NodeId` directly from a `WorldGen` over the cube
@@ -134,6 +303,58 @@ pub fn gen_region<F: WorldGen>(
 ) -> (NodeId, GenStats) {
     let mut builder = Builder::new(store, field);
     let root = builder.build(origin, size_log2);
+    (root, builder.stats)
+}
+
+/// LOD-aware variant of [`gen_region`] (cswp.8.4).
+///
+/// Above the chunk boundary (`level > chunk_level`), behaves identically to
+/// [`gen_region`]: classify-based proof-collapse and 8-way recursion. At
+/// `level == chunk_level`, queries `chunk_lod_fn` for the chunk's
+/// `target_lod` and dispatches into a per-chunk LOD-aware sub-builder. If
+/// `target_lod > 0` and proof-collapse misses at `level == target_lod`, the
+/// sub-builder skips deeper recursion and emits a single representative-
+/// material leaf instead.
+///
+/// **Convention** (matches `docs/perf/cswp-lod.md` §2.1 and
+/// `lod_collapse_chunk`):
+/// - `target_lod = 0` is identity (recurse to leaves).
+/// - `target_lod = chunk_level` is full chunk-collapse (one Leaf per chunk).
+/// - `chunk_lod_fn` takes `[u64; 3]` chunk-relative coordinates indexed
+///   `[0, 2^(size_log2 - chunk_level))` per axis.
+///
+/// **Representative-material proxy** (when lod-skip fires): 8 cells at the
+/// octant centroids of the `2^target_lod` cube, with the canonical
+/// Leaf-only rule from `NodeStore::representative_state_memo` applied to
+/// the samples (first non-empty wins). This is **exact** for
+/// `target_lod == 1` (the 8 cells ARE the 8 leaves) and **approximate** for
+/// `target_lod >= 2` (treats each octant centroid as the canonical
+/// representative of that octant). Callers needing the canonical rule for
+/// `target_lod >= 2` should use [`gen_region`] followed by
+/// `NodeStore::lod_collapse_chunk`.
+///
+/// Panics if:
+/// - `chunk_level == 0` (degenerate; every leaf would be a chunk)
+/// - `chunk_level > size_log2`
+/// - any `chunk_lod_fn` output exceeds `chunk_level`
+pub fn gen_region_with_lod<F: WorldGen>(
+    store: &mut NodeStore,
+    field: &F,
+    origin: [i64; 3],
+    size_log2: u32,
+    chunk_level: u32,
+    chunk_lod_fn: &dyn Fn([u64; 3]) -> u32,
+) -> (NodeId, GenStats) {
+    assert!(
+        chunk_level >= 1,
+        "gen_region_with_lod: chunk_level must be >= 1 (got 0)",
+    );
+    assert!(
+        chunk_level <= size_log2,
+        "gen_region_with_lod: chunk_level {chunk_level} > size_log2 {size_log2}",
+    );
+    let mut builder = Builder::new(store, field);
+    let root = builder.top_build(origin, origin, size_log2, chunk_level, chunk_lod_fn);
     (root, builder.stats)
 }
 
@@ -541,5 +762,265 @@ mod tests {
             Node::Leaf(0) => {}
             _ => panic!("EMPTY is not Leaf(0)"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // hash-thing-cswp.8.4: skip-at-gen LOD path.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn lod_target_zero_is_identity_with_gen_region() {
+        // target_lod=0 everywhere → recurse to leaves, identical to gen_region.
+        let field = default_heightmap(1);
+        let mut s_a = NodeStore::new();
+        let mut s_b = NodeStore::new();
+        let (root_a, _) = gen_region(&mut s_a, &field, [0, 0, 0], 6);
+        let (root_b, stats) = gen_region_with_lod(&mut s_b, &field, [0, 0, 0], 6, 4, &|_| 0);
+        // Hash-cons: same field + same recursion shape ⇒ same NodeId across
+        // independent stores.
+        assert_eq!(root_a, root_b, "target_lod=0 must equal gen_region");
+        assert_eq!(stats.lod_skips, 0, "target_lod=0 must not lod-skip");
+    }
+
+    #[test]
+    fn lod_const_field_collapses_via_proof_not_skip() {
+        // ConstField → classify proof-collapses at every level. The lod-skip
+        // check fires *after* classify, so skip count is zero.
+        let mut store = NodeStore::new();
+        let field = ConstField::new(STONE);
+        let (root, stats) = gen_region_with_lod(&mut store, &field, [0, 0, 0], 6, 4, &|_| 4);
+        let expected = store.uniform(6, STONE);
+        assert_eq!(
+            root, expected,
+            "uniform stone must proof-collapse to root uniform"
+        );
+        assert_eq!(
+            stats.lod_skips, 0,
+            "classify must short-circuit before lod-skip"
+        );
+        assert!(
+            stats.collapses_by_proof[6] >= 1,
+            "uniform field must proof-collapse at the root: {stats:?}",
+        );
+    }
+
+    #[test]
+    fn lod_half_space_below_proof_collapses_no_skip() {
+        // HalfSpace fully below threshold → classify proves STONE; lod-skip never fires.
+        let mut store = NodeStore::new();
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 1024,
+            below: STONE,
+            above: AIR,
+        };
+        let (_, stats) = gen_region_with_lod(&mut store, &field, [0, 0, 0], 6, 6, &|_| 6);
+        assert_eq!(stats.lod_skips, 0, "fully-below box must not lod-skip");
+        assert!(stats.collapses_by_proof[6] >= 1);
+    }
+
+    #[test]
+    fn lod_half_space_straddling_skips_at_root() {
+        // HalfSpace y=8 with size-4 cube [0,16) → classify returns None at
+        // root. With chunk_level=4, target_lod=4, exactly one skip at the root.
+        let mut store = NodeStore::new();
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 8,
+            below: STONE,
+            above: AIR,
+        };
+        let (_, stats) = gen_region_with_lod(&mut store, &field, [0, 0, 0], 4, 4, &|_| 4);
+        assert_eq!(
+            stats.lod_skips, 1,
+            "exactly one skip at the chunk root: {stats:?}"
+        );
+        assert_eq!(stats.collapses_by_proof[4], 0, "root cannot proof-collapse");
+    }
+
+    #[test]
+    fn lod_half_space_skip_picks_first_non_empty() {
+        // Threshold y=12 → centroids at y=4 (below=STONE) and y=12 (above=AIR).
+        // First non-empty in octant order (oct=0,1,2,3 are y=4 STONE) wins.
+        let mut store = NodeStore::new();
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 12,
+            below: STONE,
+            above: AIR,
+        };
+        let (root, stats) = gen_region_with_lod(&mut store, &field, [0, 0, 0], 4, 4, &|_| 4);
+        assert_eq!(stats.lod_skips, 1);
+        match *store.get(root) {
+            Node::Leaf(s) => assert_eq!(s, STONE, "leaf rep must be STONE"),
+            _ => panic!("expected raw Leaf at chunk root for target_lod=chunk_level"),
+        }
+    }
+
+    #[test]
+    fn lod_classify_calls_invariant_holds() {
+        // Re-affirm `leaves + classify_calls == calls_total` on the new path
+        // with non-zero lod_skips. lod-skip increments classify_calls
+        // because classify is invoked before the skip check fires.
+        //
+        // Threshold=20 with size_log2=5 (cube [0,32)), chunk_level=4 → 8
+        // chunks of size 16. Lower 4 chunks (y∈[0,16)) proof-collapse to
+        // STONE. Upper 4 chunks (y∈[16,32)) straddle threshold → lod-skip.
+        let mut store = NodeStore::new();
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 20,
+            below: STONE,
+            above: AIR,
+        };
+        let (_, stats) = gen_region_with_lod(&mut store, &field, [0, 0, 0], 5, 4, &|_| 4);
+        assert!(
+            stats.lod_skips > 0,
+            "expected at least one lod-skip: {stats:?}"
+        );
+        assert_eq!(
+            stats.leaves + stats.classify_calls,
+            stats.calls_total,
+            "invariant violated under lod-skip: {stats:?}",
+        );
+    }
+
+    /// Per-column flatten — handles raw `Leaf(s)` at non-zero levels via
+    /// `flatten_column_into`, unlike `NodeStore::flatten` which writes a
+    /// single cell for any Leaf regardless of contextual level.
+    fn flatten_full(store: &NodeStore, root: NodeId, side: usize) -> Vec<CellState> {
+        let mut grid = vec![0 as CellState; side * side * side];
+        let mut col = vec![0 as CellState; side];
+        for z in 0..side {
+            for x in 0..side {
+                store.flatten_column_into(root, x as u64, z as u64, &mut col);
+                for y in 0..side {
+                    grid[x + y * side + z * side * side] = col[y];
+                }
+            }
+        }
+        grid
+    }
+
+    #[test]
+    fn lod_target_one_flatten_matches_lod_collapse_chunk() {
+        // Adjustment K: target_lod=1 must flatten-match
+        // gen_region + per-chunk lod_collapse_chunk(target_lod=1).
+        //
+        // Use a threshold offset slightly inside a chunk (y=33) so some
+        // chunks proof-collapse and others descend into the chunk. At
+        // level=1 inside straddling chunks, the 8-cell heuristic is
+        // identical to `representative_state_memo`'s Leaf-only rule on the
+        // 8 leaf children — exact equivalence is required.
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 33,
+            below: STONE,
+            above: AIR,
+        };
+        let size_log2 = 6u32;
+        let chunk_level = 4u32;
+        let side = 1usize << size_log2;
+
+        // (a) skip-at-gen path with target_lod=1.
+        let mut s_a = NodeStore::new();
+        let (root_a, _) =
+            gen_region_with_lod(&mut s_a, &field, [0, 0, 0], size_log2, chunk_level, &|_| 1);
+
+        // (b) gen_region + per-chunk lod_collapse_chunk(target_lod=1).
+        let mut s_b = NodeStore::new();
+        let (mut root_b, _) = gen_region(&mut s_b, &field, [0, 0, 0], size_log2);
+        let chunks_per_axis = 1u64 << (size_log2 - chunk_level);
+        for cz in 0..chunks_per_axis {
+            for cy in 0..chunks_per_axis {
+                for cx in 0..chunks_per_axis {
+                    root_b = s_b.lod_collapse_chunk(root_b, cx, cy, cz, chunk_level, 1);
+                }
+            }
+        }
+
+        let grid_a = flatten_full(&s_a, root_a, side);
+        let grid_b = flatten_full(&s_b, root_b, side);
+        assert_eq!(
+            grid_a, grid_b,
+            "target_lod=1 flatten divergence: skip-at-gen vs lod_collapse_chunk",
+        );
+    }
+
+    #[test]
+    fn lod_mixed_policy_non_skipped_chunks_match_gen_region() {
+        // Adjustment J: with mixed target_lod (some 0, some k), the chunks at
+        // target_lod=0 must flatten-match gen_region for that chunk.
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 24,
+            below: STONE,
+            above: AIR,
+        };
+        let size_log2 = 6u32;
+        let chunk_level = 4u32;
+        let side = 1usize << size_log2;
+
+        // chunk_lod_fn: target_lod=0 for chunk (0,0,0), target_lod=4 elsewhere.
+        let policy = |c: [u64; 3]| -> u32 {
+            if c == [0, 0, 0] {
+                0
+            } else {
+                4
+            }
+        };
+
+        let mut s_a = NodeStore::new();
+        let (root_a, _) =
+            gen_region_with_lod(&mut s_a, &field, [0, 0, 0], size_log2, chunk_level, &policy);
+        let mut s_b = NodeStore::new();
+        let (root_b, _) = gen_region(&mut s_b, &field, [0, 0, 0], size_log2);
+
+        let grid_a = s_a.flatten(root_a, side);
+        let grid_b = s_b.flatten(root_b, side);
+
+        // chunk (0,0,0) spans x,y,z ∈ [0, 16). Compare cells inside that range.
+        let cs = 1usize << chunk_level;
+        for z in 0..cs {
+            for y in 0..cs {
+                for x in 0..cs {
+                    let idx = x + y * side + z * side * side;
+                    assert_eq!(
+                        grid_a[idx], grid_b[idx],
+                        "non-skipped chunk (0,0,0) cell ({x},{y},{z}) diverged",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_level must be >= 1")]
+    fn lod_chunk_level_zero_panics() {
+        let mut store = NodeStore::new();
+        let field = ConstField::new(AIR);
+        let _ = gen_region_with_lod(&mut store, &field, [0, 0, 0], 4, 0, &|_| 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_level")]
+    fn lod_chunk_level_above_size_log2_panics() {
+        let mut store = NodeStore::new();
+        let field = ConstField::new(AIR);
+        let _ = gen_region_with_lod(&mut store, &field, [0, 0, 0], 4, 5, &|_| 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "target_lod")]
+    fn lod_target_lod_above_chunk_level_panics() {
+        let mut store = NodeStore::new();
+        let field = HalfSpaceField {
+            axis: HalfSpaceAxis::Y,
+            threshold: 8,
+            below: STONE,
+            above: AIR,
+        };
+        // target_lod=5 > chunk_level=4 → assert at top_build dispatch.
+        let _ = gen_region_with_lod(&mut store, &field, [0, 0, 0], 5, 4, &|_| 5);
     }
 }

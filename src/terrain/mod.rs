@@ -12,10 +12,10 @@ pub mod materials;
 pub mod noise;
 
 pub use field::{
-    ComposedWorldGen, DensityField, GyroidField, GyroidParams, HeightmapField, TerrainBlendField,
-    TerrainSurface, WorldGen,
+    ComposedWorldGen, DensityField, GyroidField, GyroidParams, HeightmapField,
+    PrecomputedHeightmapField, TerrainBlendField, TerrainSurface, WorldGen,
 };
-pub use gen::{gen_region, probe_sample_ns, GenStats};
+pub use gen::{gen_region, gen_region_with_lod, probe_sample_ns, GenStats};
 
 /// Parameters for the v1 heightmap seeder. Lifted into a struct so the
 /// runtime can swap them without touching the builder.
