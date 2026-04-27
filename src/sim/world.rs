@@ -255,7 +255,7 @@ pub struct World {
     pub memo_window: MemoWindow,
     /// Store size after the last compaction, used to trigger periodic GC.
     pub(crate) store_size_at_last_compact: usize,
-    /// Cache for `inert_uniform_state`: NodeId → Option<CellState>.
+    /// Cache for `inert_uniform_state`: NodeId → `Option<CellState>`.
     /// `Some(state)` = all leaves are the same inert material; `None` = mixed or active.
     pub(crate) hashlife_inert_cache: FxHashMap<NodeId, Option<CellState>>,
     /// Cache for `is_all_inert`: NodeId → bool.
@@ -1042,55 +1042,16 @@ impl World {
         }
 
         // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
+        // Static internal gaps close in 1-2 ticks via the alternating
+        // partition offset (qy4g epic decision 2026-04-26, option G).
+        // Gaps within free-falling columns are co-moving with the column
+        // and appear as a sustained checkerboard until the leading edge
+        // compacts against a solid surface — see SPEC.md for the in-flight
+        // visible-artifact tradeoff and fallbacks A/F. No post-pass
+        // gap-fill runs in production.
         self.step_blocks(&mut next, side);
 
-        // Phase 3: gravity gap-fill — prevents Margolus rarefaction.
-        // Fills air gaps within gravity-bearing bodies by cascading cells
-        // down, but only at positions with gravity cells on both sides.
-        gravity_gap_fill(&mut next, side, &self.materials);
-
         self.commit_step(&next, side);
-    }
-
-    /// Probe variant of [`World::step`]: runs phases 1 (CaRule) and 2
-    /// (BlockRule) into a scratch buffer and returns a clone of that
-    /// buffer *before* phase 3 (`gravity_gap_fill`) runs on it, then
-    /// completes the step normally so the world advances identically
-    /// to `step()`. Used by `tests/probe_gap_fill_lightcone.rs`
-    /// (hash-thing-7nj6) to measure the gap_fill light cone on the
-    /// exact input distribution that the real step path sees.
-    pub fn step_returning_pre_gap_fill(&mut self) -> Vec<CellState> {
-        let side = self.side();
-        let grid = self.flatten();
-        let mut next = vec![0 as CellState; side * side * side];
-        let divisor_by_material = self.materials.tick_divisor_flags();
-        let generation = self.generation;
-
-        for z in 0..side {
-            for y in 0..side {
-                for x in 0..side {
-                    let idx = x + y * side + z * side * side;
-                    let raw = grid[idx];
-                    let center = Cell::from_raw(raw);
-                    let mat = center.material() as usize;
-                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
-                    if divisor > 1 && !generation.is_multiple_of(divisor) {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    let neighbors = get_neighbors(&grid, side, x, y, z);
-                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
-                        panic!("missing CaRule for material {}", center.material())
-                    });
-                    next[idx] = rule.step_cell(center, &neighbors).raw();
-                }
-            }
-        }
-        self.step_blocks(&mut next, side);
-        let pre_gap_fill = next.clone();
-        gravity_gap_fill(&mut next, side, &self.materials);
-        self.commit_step(&next, side);
-        pre_gap_fill
     }
 
     /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
@@ -2490,15 +2451,13 @@ impl World {
     }
 }
 
-/// Gravity gap-fill: cascading bottom-to-top sweep that fills air gaps
-/// WITHIN gravity-bearing bodies, preventing Margolus rarefaction.
-///
-/// Only swaps cell[y] (air) with cell[y+1] (gravity-bearing) when cell[y-1]
-/// is also gravity-bearing — i.e., only fills internal gaps, never extends
-/// the falling front. This prevents isolated cells from cascading to the
-/// bottom while still compacting bodies after block-rule gravity creates gaps.
+/// Cascading bottom-to-top sweep that fills internal air gaps in
+/// gravity-bearing bodies. Retained as a `#[cfg(test)]` reference for
+/// divergence/regression tests after qy4g option G removed it from the
+/// production step path (2026-04-26).
 ///
 /// Mass-conserving: only swaps, never creates or destroys cells.
+#[cfg(test)]
 pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &MaterialRegistry) {
     for z in 0..side {
         for x in 0..side {
@@ -2524,7 +2483,8 @@ pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &
     }
 }
 
-/// 1D column variant of [`gravity_gap_fill`] (hash-thing-jw3k.1).
+/// 1D column variant of [`gravity_gap_fill`]. Retained as a `#[cfg(test)]`
+/// reference (qy4g option G, 2026-04-26).
 ///
 /// Operates on a single `(x, z)` column (length = `side`), mutating in place.
 /// Returns `true` when any swap fired so callers can skip the splice step
@@ -2534,7 +2494,11 @@ pub(crate) fn gravity_gap_fill(grid: &mut [CellState], side: usize, materials: &
 /// in order and later iterations read values that earlier iterations wrote.
 /// A fresh-read variant (read whole column, write to an out-buffer) would
 /// diverge on cascade patterns like `[B, A, B, B]` — see Rev 2 plan tests.
-pub fn gravity_gap_fill_column(column: &mut [CellState], materials: &MaterialRegistry) -> bool {
+#[cfg(test)]
+pub(crate) fn gravity_gap_fill_column(
+    column: &mut [CellState],
+    materials: &MaterialRegistry,
+) -> bool {
     let side = column.len();
     if side < 3 {
         return false;
@@ -2798,6 +2762,174 @@ mod tests {
             mismatches, 0,
             "{label}: {mismatches} voxel mismatches between world octree and Svdag"
         );
+
+        assert_svdag_lod_rep_mat_matches_world(world, svdag, label);
+    }
+
+    // ---------------------------------------------------------------
+    // eiu9: LOD rep_mat consistency check (mirror of qaca's ht-render walker)
+    // ---------------------------------------------------------------
+    //
+    // The voxel-walk above only inspects leaves; the LOD `rep_mat` field packed
+    // into `(slot[0] >> 8) & 0xFFFF` is unread. Walk the SVDAG and the World's
+    // NodeStore in lockstep so post-compact and cross-epoch SVDAG syncs (the
+    // path that motivated rk4n) gain the same rep_mat-staleness coverage that
+    // qaca added on the ht-render m1f.5 corpus. Mirrored inline because
+    // ht-render's helpers are gated on its own `cfg(test)`.
+
+    fn assert_svdag_lod_rep_mat_matches_world(world: &World, svdag: &Svdag, label: &str) {
+        use crate::octree::Node;
+
+        if svdag.nodes.is_empty() {
+            return;
+        }
+
+        // Empty world: SVDAG holds only the root header (no interior slots).
+        if world.store.get(world.root).is_empty() {
+            return;
+        }
+
+        // Memoize on NodeId — without this, validate's per-node call to
+        // expected_rep_mat re-recurses the subtree at every level, blowing the
+        // 128³ skip-sync test from ~5s to >9 min.
+        fn expected_rep_mat(
+            store: &NodeStore,
+            id: NodeId,
+            cache: &mut FxHashMap<NodeId, u32>,
+        ) -> u32 {
+            if let Some(&hit) = cache.get(&id) {
+                return hit;
+            }
+            let val = match store.get(id) {
+                Node::Leaf(state) => (*state as u32) & 0xFFFF,
+                Node::Interior { children, .. } => {
+                    let children = *children;
+                    let mut rep_mat: u32 = 0;
+                    let mut rep_pop: u64 = 0;
+                    for &child_id in children.iter() {
+                        match store.get(child_id) {
+                            Node::Leaf(state) => {
+                                if *state != 0 && (rep_mat == 0 || rep_pop == 0) {
+                                    rep_mat = (*state as u32) & 0xFFFF;
+                                    rep_pop = 1;
+                                }
+                            }
+                            Node::Interior { population, .. } => {
+                                if *population > 0 && *population > rep_pop {
+                                    let p = *population;
+                                    rep_mat = expected_rep_mat(store, child_id, cache);
+                                    rep_pop = p;
+                                }
+                            }
+                        }
+                    }
+                    rep_mat
+                }
+            };
+            cache.insert(id, val);
+            val
+        }
+
+        fn validate(
+            svdag: &Svdag,
+            store: &NodeStore,
+            id: NodeId,
+            offset: usize,
+            path: &str,
+            out: &mut Vec<String>,
+            cache: &mut FxHashMap<NodeId, u32>,
+        ) {
+            const LEAF_BIT: u32 = 0x8000_0000;
+            let cmask = svdag.nodes[offset];
+            let encoded_rep = (cmask >> 8) & 0xFFFF;
+            let want_rep = expected_rep_mat(store, id, cache);
+            if encoded_rep != want_rep {
+                out.push(format!(
+                    "rep_mat mismatch at offset={offset} path='{}': encoded={} expected={}",
+                    if path.is_empty() { "/" } else { path },
+                    encoded_rep,
+                    want_rep,
+                ));
+            }
+
+            if let Node::Interior { children, .. } = store.get(id) {
+                let children = *children;
+                for (i, &child_id) in children.iter().enumerate() {
+                    let child_word = svdag.nodes[offset + 1 + i];
+                    match store.get(child_id) {
+                        Node::Leaf(state) => {
+                            let want = LEAF_BIT | (*state as u32);
+                            if child_word != want {
+                                out.push(format!(
+                                    "leaf child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
+                                    offset + 1 + i,
+                                    if path.is_empty() { "/" } else { path },
+                                    child_word,
+                                    want,
+                                ));
+                            }
+                        }
+                        Node::Interior { population, .. } => {
+                            if *population == 0 {
+                                if child_word != LEAF_BIT {
+                                    out.push(format!(
+                                        "empty-interior child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
+                                        offset + 1 + i,
+                                        if path.is_empty() { "/" } else { path },
+                                        child_word,
+                                        LEAF_BIT,
+                                    ));
+                                }
+                            } else if child_word & LEAF_BIT != 0 {
+                                out.push(format!(
+                                    "populated-interior child slot has LEAF_BIT at offset={} (child {i} of '{}'): encoded={:#010x}",
+                                    offset + 1 + i,
+                                    if path.is_empty() { "/" } else { path },
+                                    child_word,
+                                ));
+                            } else {
+                                let child_path = if path.is_empty() {
+                                    format!("/{i}")
+                                } else {
+                                    format!("{path}/{i}")
+                                };
+                                validate(
+                                    svdag,
+                                    store,
+                                    child_id,
+                                    child_word as usize,
+                                    &child_path,
+                                    out,
+                                    cache,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let root_offset = svdag.nodes[0] as usize;
+        let mut mismatches: Vec<String> = Vec::new();
+        let mut cache: FxHashMap<NodeId, u32> = FxHashMap::default();
+        validate(
+            svdag,
+            &world.store,
+            world.root,
+            root_offset,
+            "",
+            &mut mismatches,
+            &mut cache,
+        );
+        if !mismatches.is_empty() {
+            for line in mismatches.iter().take(5) {
+                eprintln!("  {line} [{label}]");
+            }
+            panic!(
+                "{label}: {} LOD rep_mat / slot-encoding mismatches between world octree and Svdag",
+                mismatches.len()
+            );
+        }
     }
 
     fn wc(coord: u64) -> WorldCoord {
@@ -3611,13 +3743,21 @@ mod tests {
     /// (see `compose_remap`); this test stays as a regression guard.
     ///
     /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
-    /// always-on under the 60s soft-max (~10s observed). With the fix
-    /// reverted, the assertion fires at step 42 with ~254k mismatches.
-    /// Water pool sits at `water_y = center + center/4` with
-    /// `pool_depth = (side/32).max(2)` — at 128^3 the pool bottom is ~16
-    /// cells above the mid-terrain floor, so 60 steps covers impact plus
-    /// tail comfortably.
+    /// always-on under the 60s soft-max in release / `--profile bench`
+    /// (~10s observed); in debug builds the 128³ voxel walk dominates
+    /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
+    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// non-`debug_assertions` profile) to exercise the regression
+    /// guard. With the fix reverted, the assertion fires at step 42
+    /// with ~254k mismatches. Water pool sits at
+    /// `water_y = center + center/4` with `pool_depth = (side/32).max(2)`
+    /// — at 128^3 the pool bottom is ~16 cells above the mid-terrain
+    /// floor, so 60 steps covers impact plus tail comfortably.
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile bench (hash-thing-1imu)"
+    )]
     fn water_and_sand_128_commit_step_skip_sync_corrupts_svdag() {
         let mut world = World::new(7);
         let params = TerrainParams::for_level(7);
@@ -3655,9 +3795,18 @@ mod tests {
     /// this test stays as a regression guard.
     ///
     /// Scaled down to 128^3 (level 7) per hash-thing-uh7o so it runs
-    /// always-on under the 60s soft-max (~5s observed). With the fix
-    /// reverted, the assertion fires at step 24 with ~974k mismatches.
+    /// always-on under the 60s soft-max in release / `--profile bench`
+    /// (~5s observed); in debug builds the 128³ voxel walk dominates
+    /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
+    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// non-`debug_assertions` profile) to exercise the regression
+    /// guard. With the fix reverted, the assertion fires at step 24
+    /// with ~974k mismatches.
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile bench (hash-thing-1imu)"
+    )]
     fn water_and_sand_128_step_recursive_with_sync_every_step() {
         let mut world = World::new(7);
         let params = TerrainParams::for_level(7);
@@ -4213,6 +4362,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::sim::margolus::{GravityBlockRule, IdentityBlockRule};
+    use crate::sim::rule::Phase;
     use crate::terrain::materials::{DIRT_MATERIAL_ID, STONE_MATERIAL_ID};
 
     fn simple_density(cell: Cell) -> f32 {
@@ -4226,6 +4376,21 @@ mod tests {
             4 => 0.05, // fire
             5 => 1.0,  // water
             _ => 1.0,
+        }
+    }
+
+    /// Phase classification matching `simple_density` for these gravity tests
+    /// (hash-thing-nagw). Air → Gas, water (5) → Liquid, fire (4) → Gas,
+    /// everything else → Solid. The block-rule predicate uses this to refuse
+    /// solid-on-solid swaps.
+    fn simple_phase(cell: Cell) -> Phase {
+        if cell.is_empty() {
+            return Phase::Gas;
+        }
+        match cell.material() {
+            4 => Phase::Gas,    // fire
+            5 => Phase::Liquid, // water
+            _ => Phase::Solid,
         }
     }
 
@@ -4243,7 +4408,8 @@ mod tests {
             for &mat_id in materials_with_gravity {
                 m.set_tick_divisor(mat_id, 1);
             }
-            let gravity_id = m.register_block_rule(GravityBlockRule::new(simple_density));
+            let gravity_id =
+                m.register_block_rule(GravityBlockRule::new(simple_density, simple_phase));
             for &mat_id in materials_with_gravity {
                 m.assign_block_rule(mat_id, gravity_id);
             }
@@ -4347,10 +4513,10 @@ mod tests {
         let mut world = World::new(3);
         let gravity_a = world
             .materials
-            .register_block_rule(GravityBlockRule::new(simple_density));
+            .register_block_rule(GravityBlockRule::new(simple_density, simple_phase));
         let gravity_b = world
             .materials
-            .register_block_rule(GravityBlockRule::new(simple_density));
+            .register_block_rule(GravityBlockRule::new(simple_density, simple_phase));
         world
             .materials
             .assign_block_rule(DIRT_MATERIAL_ID, gravity_a);
@@ -4420,6 +4586,37 @@ mod tests {
             a.flatten(),
             b.flatten(),
             "block stepping must be deterministic"
+        );
+    }
+
+    // hash-thing-nagw: production-wiring regression. SAND on top of GUNPOWDER
+    // (both Solid in `material_phase`) must not swap even though SAND density
+    // (1.5) > GUNPOWDER density (1.4). Catches drift if a future material is
+    // added to `material_density` but forgotten in `material_phase`.
+    #[test]
+    fn solid_does_not_sink_through_solid_via_terrain_defaults() {
+        use crate::terrain::materials::{GUNPOWDER_MATERIAL_ID, SAND_MATERIAL_ID};
+        // terrain_defaults wires gravity onto SAND and GUNPOWDER (both
+        // movable solids). Before nagw, SAND would have swapped with
+        // GUNPOWDER below it; now neither moves.
+        let mut world = World::new(3); // 8³, terrain_defaults
+                                       // Place sand at y=3 and gunpowder at y=2 in same block column.
+        let sand = Cell::pack(SAND_MATERIAL_ID, 0).raw();
+        let gunpowder = Cell::pack(GUNPOWDER_MATERIAL_ID, 0).raw();
+        world.set(wc(2), wc(2), wc(2), gunpowder);
+        world.set(wc(2), wc(3), wc(2), sand);
+
+        world.step();
+
+        assert_eq!(
+            world.get(wc(2), wc(2), wc(2)),
+            gunpowder,
+            "gunpowder must not be displaced by sand (solid-on-solid)"
+        );
+        assert_eq!(
+            world.get(wc(2), wc(3), wc(2)),
+            sand,
+            "sand must stay above gunpowder (no solid-on-solid swap)"
         );
     }
 
@@ -5429,10 +5626,23 @@ mod tests {
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 
-    /// Reproduction test for hash-thing-u4w: checkerboard density bug.
-    /// A solid block of water should not develop every-other-column air gaps.
+    /// qy4g.2 option G regression. Two invariants checked under the new
+    /// no-gap-fill regime:
+    ///
+    /// 1. **Mass conservation every step.** Population is constant under
+    ///    pure CaRule + Margolus BlockRule (option G's strongest guarantee).
+    /// 2. **Post-compaction contiguity.** Once the falling water block
+    ///    compacts against the floor (or another solid), the resulting
+    ///    settled pile is contiguous (no every-other-y holes left behind).
+    ///
+    /// What this test does **NOT** verify: gap closure during free-fall.
+    /// Option G accepts an in-flight every-other-y checkerboard while a
+    /// column is falling — see `World::step` and SPEC.md "Internal-gap
+    /// closure rides parity-flip" for the explicit tradeoff and fallbacks
+    /// A/F. The 32-tick run lets the 6-cell starter block fall ~16 cells
+    /// onto the floor and settle.
     #[test]
-    fn water_block_no_checkerboard_gaps() {
+    fn water_block_gaps_close_via_parity_flip() {
         let mut world = World::new(5); // 32³
                                        // Place a 6×6×6 water block in the center, well away from boundaries.
         for z in 10..16 {
@@ -5444,19 +5654,17 @@ mod tests {
         }
         let pop_before = world.population();
 
-        // Step 6 times — enough for the falling front to develop.
-        for step in 0..6 {
+        let max_steps = 32;
+        for step in 0..max_steps {
             world.step();
             let pop_after = world.population();
             assert_eq!(
                 pop_before, pop_after,
-                "population changed at step {} ({} → {})",
-                step, pop_before, pop_after
+                "population changed at step {step} ({pop_before} → {pop_after})",
             );
         }
 
         // Check: for each y-level that contains water, count water cells.
-        // If there's a checkerboard, some y-levels will have ~50% of expected.
         let side = world.side() as u64;
         let grid = world.flatten();
         let mut water_by_y = vec![0u64; side as usize];
@@ -5473,16 +5681,13 @@ mod tests {
             }
         }
 
-        // Print water distribution for diagnosis
-        eprintln!("Water cells per y-level:");
+        eprintln!("Water cells per y-level after {max_steps} steps:");
         for (y, &count) in water_by_y.iter().enumerate() {
             if count > 0 {
                 eprintln!("  y={y}: {count} water cells");
             }
         }
 
-        // Water should occupy CONTIGUOUS y-levels (no alternating gaps).
-        // Count how many y-levels have water and check for gaps.
         let water_levels: Vec<usize> = water_by_y
             .iter()
             .enumerate()
@@ -5493,12 +5698,12 @@ mod tests {
             !water_levels.is_empty(),
             "water should still exist after stepping"
         );
-        // Check for gaps: consecutive water levels should differ by 1.
         for pair in water_levels.windows(2) {
             assert_eq!(
                 pair[1] - pair[0],
                 1,
-                "gap between y={} and y={} — checkerboard rarefaction bug",
+                "gap between y={} and y={} — settled pile not contiguous \
+                 after {max_steps} steps",
                 pair[0],
                 pair[1]
             );
@@ -6097,5 +6302,40 @@ mod tests {
         world.set_material_tick_divisor(crate::terrain::materials::WATER_MATERIAL_ID, 1);
 
         assert_material_caches_cleared(&world);
+    }
+
+    // ---- eiu9 rep_mat-walker adversarial guard ------------------------
+    //
+    // Mirror of qaca_walker_catches_corrupted_rep_mat in ht-render. Confirms
+    // assert_svdag_lod_rep_mat_matches_world actually fires when a slot's
+    // rep_mat field is corrupted post-build. Without this, the walker could
+    // silently no-op on the world.rs path and we'd close rk4n's blind spot
+    // only on paper.
+    #[test]
+    #[should_panic(expected = "LOD rep_mat / slot-encoding mismatches")]
+    fn eiu9_walker_catches_corrupted_rep_mat() {
+        let mut world = World::new(5); // 32³
+                                       // Solid 16³ water block in one octant gives an interior root with
+                                       // a non-trivial rep_mat the walker can validate.
+        for z in 0..16 {
+            for y in 0..16 {
+                for x in 0..16 {
+                    world.set(wc(x), wc(y), wc(z), WATER);
+                }
+            }
+        }
+
+        let mut svdag = Svdag::new();
+        sync_svdag_with_world(&mut world, &mut svdag);
+        assert_svdag_matches_world(&world, &svdag, "pre-corruption water block");
+
+        // Stomp the root node's rep_mat field to a bogus material id while
+        // preserving the child mask; the walker must catch the mismatch.
+        let root_offset = svdag.nodes[0] as usize;
+        let original = svdag.nodes[root_offset];
+        let bogus_mat: u32 = 0xABCD;
+        svdag.nodes[root_offset] = (original & 0xFF) | (bogus_mat << 8);
+
+        assert_svdag_matches_world(&world, &svdag, "corrupted rep_mat");
     }
 }

@@ -1,3 +1,4 @@
+pub mod disk;
 pub mod node;
 pub mod rng;
 pub mod store;

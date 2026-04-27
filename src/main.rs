@@ -444,6 +444,17 @@ fn lattice_demo_waypoint(
     }
 }
 
+/// Disjoint-borrow bundle for the cswp.8.3 chunk-LOD policy plumbed
+/// through `Self::upload_volume`. Bundling these into one struct keeps
+/// the function under the `clippy::too_many_arguments` threshold.
+struct LodUploadCtx<'a> {
+    policy: &'a mut sim::chunks::ChunkLodPolicy,
+    player_pos: [f64; 3],
+    last_histogram: &'a mut [u32; 5],
+    last_growth_ratio: &'a mut Option<f32>,
+    growth_warned: &'a mut bool,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
@@ -608,6 +619,22 @@ struct App {
     /// means the OS just toggled fullscreen, which matters for dlse.2.2
     /// A/B perf comparisons.
     was_fullscreen: bool,
+    /// Per-frame chunk-LOD policy (cswp.8.3). Off by default; toggled with
+    /// `L`. When enabled, `upload_volume` derives a render-only `view_root`
+    /// from `world.root` by chaining `lod_collapse_chunk` per chunk per the
+    /// design-doc distance→LOD curve. The sim still reads/writes the
+    /// canonical root.
+    lod_policy: sim::chunks::ChunkLodPolicy,
+    /// Last LOD-policy histogram captured during `upload_volume`, so the
+    /// HUD/log line can read it without recomputing. Index k = chunks at
+    /// LOD k.
+    last_lod_histogram: [u32; 5],
+    /// Last store-growth ratio captured during `upload_volume` for the HUD
+    /// line. `None` until LOD has been enabled at least once.
+    last_lod_growth_ratio: Option<f32>,
+    /// Latches the LOD-growth `log::warn!` so it fires once per
+    /// >4× excursion, not every frame.
+    lod_growth_warned: bool,
 }
 
 fn should_warn_about_slow_dev_step(
@@ -769,6 +796,21 @@ impl App {
                 .and_then(thread_qos::parse),
             collision_snapshot: None,
             was_fullscreen: false,
+            lod_policy: {
+                // cswp.8.3: opt-in via HASH_THING_LOD=1. Off by default;
+                // also runtime-toggleable with `L`. The env var matches
+                // the existing HASH_THING_* convention (memo HUD, freeze
+                // sim, focus, sim QoS).
+                let mut policy = sim::chunks::ChunkLodPolicy::new();
+                if std::env::var("HASH_THING_LOD").ok().as_deref() == Some("1") {
+                    policy.enabled = true;
+                    log::info!("HASH_THING_LOD=1: chunk-LOD policy enabled (cswp.8.3)");
+                }
+                policy
+            },
+            last_lod_histogram: [0; 5],
+            last_lod_growth_ratio: None,
+            lod_growth_warned: false,
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
@@ -1033,6 +1075,17 @@ impl App {
     /// (back-to-back redraws within one timer tick) is also skipped to
     /// avoid blending a 0-FPS sample that would silently decay the
     /// readout by 5%.
+    ///
+    /// Also records `dt_wall` as the `frame_total` perf metric so the
+    /// log summary line includes wall-clock per-frame period alongside
+    /// `render_gpu` / `render_cpu` (hash-thing-dbz5). The components
+    /// alone don't sum to the frame budget — winit dispatch, input
+    /// handling, scene-state mutation, and `Queue::write_*` upload land
+    /// outside any `_cpu` / `_gpu` bracket, so a "fast `render_gpu`"
+    /// reading was easy to misread as "60 FPS" when frame_total was
+    /// actually 33-66 ms (15-30 FPS perceived). Shares the suppress
+    /// gate with the EWMA so post-resume bogus dt's don't pollute the
+    /// metric either.
     fn apply_fps_sample(&mut self, dt_wall: f64) {
         if self.suppress_next_fps_sample {
             self.suppress_next_fps_sample = false;
@@ -1040,6 +1093,8 @@ impl App {
         }
         if dt_wall > 0.0 {
             self.smoothed_fps = smooth_fps(self.smoothed_fps, 1.0 / dt_wall, 0.05);
+            self.perf
+                .record("frame_total", std::time::Duration::from_secs_f64(dt_wall));
         }
     }
 
@@ -1058,11 +1113,19 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
+        let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
@@ -1565,11 +1628,19 @@ impl App {
                 hash_thing::octree::Cell::EMPTY.raw(),
             );
             // Re-upload volume since we modified the world directly.
+            let player_pos = self.player_world_pos();
             Self::upload_volume(
                 &mut self.renderer,
                 &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
+                LodUploadCtx {
+                    policy: &mut self.lod_policy,
+                    player_pos,
+                    last_histogram: &mut self.last_lod_histogram,
+                    last_growth_ratio: &mut self.last_lod_growth_ratio,
+                    growth_warned: &mut self.lod_growth_warned,
+                },
             );
         }
     }
@@ -1607,11 +1678,19 @@ impl App {
                 sim::WorldCoord(prev[2]),
                 state,
             );
+            let player_pos = self.player_world_pos();
             Self::upload_volume(
                 &mut self.renderer,
                 &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
+                LodUploadCtx {
+                    policy: &mut self.lod_policy,
+                    player_pos,
+                    last_histogram: &mut self.last_lod_histogram,
+                    last_growth_ratio: &mut self.last_lod_growth_ratio,
+                    growth_warned: &mut self.lod_growth_warned,
+                },
             );
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -1632,6 +1711,7 @@ impl App {
         world: &mut sim::World,
         svdag: &mut render::Svdag,
         last_svdag_stats: &mut (usize, usize, u32),
+        lod: LodUploadCtx<'_>,
     ) {
         if let Some(renderer) = renderer {
             // Apply the NodeId remap from the last compaction so the SVDAG's
@@ -1640,16 +1720,114 @@ impl App {
             // (hash-thing-5bb.11).
             if let Some(remap) = world.last_compaction_remap.take() {
                 svdag.apply_remap(&remap);
+                // Compaction renumbered nodes — the cswp.8.3 policy's
+                // baseline reference is now meaningless. Reset it so the
+                // next growth ratio reflects the post-compact size.
+                lod.policy.reset_growth_baseline();
             }
+            // cswp.8.3: derive render-only view_root from canonical root.
+            // Returns world.root unchanged when policy is disabled or
+            // world_level <= CHUNK_LEVEL (small-world fast path).
+            let view_root =
+                lod.policy
+                    .update(&mut world.store, world.root, world.level, lod.player_pos);
             // Incremental rebuild: reuses cached offsets for unchanged subtrees.
-            svdag.update(&world.store, world.root, world.level);
+            svdag.update(&world.store, view_root, world.level);
             // Compact when >50% of the buffer is stale slots (hash-thing-bx7).
             if svdag.stale_ratio() > 0.5 {
-                svdag.compact(&world.store, world.root);
+                svdag.compact(&world.store, view_root);
             }
             *last_svdag_stats = (svdag.node_count, svdag.byte_size(), svdag.root_level);
+            *lod.last_histogram = lod.policy.lod_histogram();
+            *lod.last_growth_ratio = lod.policy.store_growth_ratio(world.store.node_count());
+            // Warn-once on >4× growth from baseline. Cleared whenever we
+            // drop back under 4× so a transient excursion can re-arm.
+            if let Some(ratio) = *lod.last_growth_ratio {
+                if ratio > 4.0 {
+                    if !*lod.growth_warned {
+                        log::warn!(
+                            "cswp.8.3 LOD store growth ratio {:.2}× baseline (>4× threshold) — \
+                             investigate ghost-chain accumulation; consider compaction",
+                            ratio
+                        );
+                        *lod.growth_warned = true;
+                    }
+                } else {
+                    *lod.growth_warned = false;
+                }
+            }
             renderer.upload_svdag(svdag);
         }
+    }
+
+    /// One-line summary of the cswp.8.3 chunk-LOD state for the periodic
+    /// log line. `OFF` when the policy is disabled, otherwise reports the
+    /// per-band chunk histogram and the store-growth ratio (vs the
+    /// node-count baseline captured the first time the policy ran).
+    fn lod_summary(&self) -> String {
+        if !self.lod_policy.enabled {
+            return "lod=OFF".to_string();
+        }
+        let h = self.last_lod_histogram;
+        let growth = self
+            .last_lod_growth_ratio
+            .map(|r| format!("{r:.2}x"))
+            .unwrap_or_else(|| "n/a".to_string());
+        format!(
+            "lod=ON bias={:.2} hist[0..=4]={}/{}/{}/{}/{} grow={}",
+            self.lod_policy.lod_bias, h[0], h[1], h[2], h[3], h[4], growth
+        )
+    }
+
+    /// Re-run [`Self::upload_volume`] and request a redraw so a chunk-LOD
+    /// hotkey takes effect immediately, even in a paused/static scene
+    /// where no sim-step would otherwise trigger an upload (cswp.8.3
+    /// review fix — Codex-standard "important" finding).
+    fn refresh_view_after_lod_change(&mut self) {
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
+        );
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Player position in **local-cell coords** (`[0, 1 << world.level)` per
+    /// axis), with a sane fallback when no player exists yet (e.g. during
+    /// demo-load before `reset_scene_entities` runs). Used by
+    /// [`Self::upload_volume`] to anchor the cswp.8.3 chunk-LOD policy.
+    ///
+    /// `entity.pos` is world-space (`world.origin + local_offset`); the
+    /// chunk grid is local-cell-space, so `world.origin` is subtracted.
+    /// When `world.origin == [0,0,0]` (the default for non-grown worlds)
+    /// the two coincide and this function is the identity on the entity
+    /// position. Without the subtraction the LOD anchor would jump as the
+    /// world auto-grows negatively (`hash-thing-cswp.8.3` review fix).
+    fn player_world_pos(&self) -> [f64; 3] {
+        let origin = self.world.origin;
+        if let Some(pid) = self.player_id {
+            if let Some(entity) = self.entities.iter().find(|e| e.id == pid) {
+                return [
+                    entity.pos[0] - origin[0] as f64,
+                    entity.pos[1] - origin[1] as f64,
+                    entity.pos[2] - origin[2] as f64,
+                ];
+            }
+        }
+        // Local-cell center: the LOD anchor lives in local-cell space.
+        let center = self.world.side() as f64 * 0.5;
+        [center, center, center]
     }
 
     fn select_rule(&mut self, rule: sim::GameOfLife3D, label: &'static str) {
@@ -1671,11 +1849,19 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
+        let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
@@ -1752,11 +1938,19 @@ impl App {
                 "Placed clone block (spawns material {held_material}) at {:?}",
                 pos
             );
+            let player_pos = self.player_world_pos();
             Self::upload_volume(
                 &mut self.renderer,
                 &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
+                LodUploadCtx {
+                    policy: &mut self.lod_policy,
+                    player_pos,
+                    last_histogram: &mut self.last_lod_histogram,
+                    last_growth_ratio: &mut self.last_lod_growth_ratio,
+                    growth_warned: &mut self.lod_growth_warned,
+                },
             );
         }
     }
@@ -1787,11 +1981,19 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
+        let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
@@ -1829,11 +2031,19 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
+        let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
@@ -1859,11 +2069,19 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
+        let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
@@ -1892,11 +2110,19 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
         }
+        let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
         );
         self.sync_render_cache();
         self.current_demo_beat = None;
@@ -1931,11 +2157,19 @@ impl App {
         self.gol_smoke_scene = false;
         self.paused = true;
         self.reset_scene_perf_state();
+        let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
             &mut self.world,
             &mut self.svdag,
             &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                growth_warned: &mut self.lod_growth_warned,
+            },
         );
         let nodes_after = self.world.store.stats();
         let nodes_delta = nodes_after.saturating_sub(nodes_before);
@@ -1987,11 +2221,19 @@ impl ApplicationHandler for App {
             self.renderer = Some(renderer);
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
+            let player_pos = self.player_world_pos();
             Self::upload_volume(
                 &mut self.renderer,
                 &mut self.world,
                 &mut self.svdag,
                 &mut self.last_svdag_stats,
+                LodUploadCtx {
+                    policy: &mut self.lod_policy,
+                    player_pos,
+                    last_histogram: &mut self.last_lod_histogram,
+                    last_growth_ratio: &mut self.last_lod_growth_ratio,
+                    growth_warned: &mut self.lod_growth_warned,
+                },
             );
             self.sync_cursor_capture();
             // 4ioh: new window starts with the bootstrap title. Clear
@@ -2174,11 +2416,19 @@ impl ApplicationHandler for App {
                             }
                             self.last_memo_summary = self.world.memo_summary();
                             self.memo_hud_dirty = true;
+                            let player_pos = self.player_world_pos();
                             Self::upload_volume(
                                 &mut self.renderer,
                                 &mut self.world,
                                 &mut self.svdag,
                                 &mut self.last_svdag_stats,
+                                LodUploadCtx {
+                                    policy: &mut self.lod_policy,
+                                    player_pos,
+                                    last_histogram: &mut self.last_lod_histogram,
+                                    last_growth_ratio: &mut self.last_lod_growth_ratio,
+                                    growth_warned: &mut self.lod_growth_warned,
+                                },
                             );
                             log::info!(
                                 "Gen {}: pop={}",
@@ -2286,14 +2536,48 @@ impl ApplicationHandler for App {
                             }
                         }
                         winit::keyboard::Key::Character("l") => {
-                            // Cycle LOD bias: 1 → 2 → 4 → 8 → 1.
+                            // Cycle render-LOD bias: 1 → 2 → 4 → 8 → 1.
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.lod_bias = if renderer.lod_bias >= 8.0 {
                                     1.0
                                 } else {
                                     renderer.lod_bias * 2.0
                                 };
-                                log::info!("LOD bias: {}x", renderer.lod_bias);
+                                log::info!("Render LOD bias: {}x", renderer.lod_bias);
+                            }
+                        }
+                        // cswp.8.3: chunk-LOD policy toggle (off-by-default
+                        // belt-and-suspenders; the small-world identity
+                        // branch in ChunkLodPolicy::update covers the
+                        // default 256³ scene without this gate).
+                        winit::keyboard::Key::Character("L") => {
+                            self.lod_policy.enabled = !self.lod_policy.enabled;
+                            self.lod_growth_warned = false;
+                            log::info!(
+                                "Chunk-LOD policy: {} (bias={:.2}, max_lod={})",
+                                if self.lod_policy.enabled { "ON" } else { "OFF" },
+                                self.lod_policy.lod_bias,
+                                self.lod_policy.max_lod,
+                            );
+                            self.refresh_view_after_lod_change();
+                        }
+                        // cswp.8.3: chunk-LOD bias step (semicolon = down,
+                        // apostrophe = up). Clamped to [0.25, 4.0]; lower
+                        // bias keeps detail closer, higher collapses sooner.
+                        winit::keyboard::Key::Character(";") => {
+                            let next = (self.lod_policy.lod_bias - 0.25).max(0.25);
+                            if next != self.lod_policy.lod_bias {
+                                self.lod_policy.lod_bias = next;
+                                log::info!("Chunk-LOD bias: {:.2}x", self.lod_policy.lod_bias);
+                                self.refresh_view_after_lod_change();
+                            }
+                        }
+                        winit::keyboard::Key::Character("'") => {
+                            let next = (self.lod_policy.lod_bias + 0.25).min(4.0);
+                            if next != self.lod_policy.lod_bias {
+                                self.lod_policy.lod_bias = next;
+                                log::info!("Chunk-LOD bias: {:.2}x", self.lod_policy.lod_bias);
+                                self.refresh_view_after_lod_change();
                             }
                         }
                         winit::keyboard::Key::Character("=")
@@ -2532,12 +2816,20 @@ impl ApplicationHandler for App {
                                 self.sync_render_cache();
                                 // SVDAG rebuild + GPU upload.
                                 {
+                                    let player_pos = self.player_world_pos();
                                     let _t = self.perf.start("upload_cpu");
                                     Self::upload_volume(
                                         &mut self.renderer,
                                         &mut self.world,
                                         &mut self.svdag,
                                         &mut self.last_svdag_stats,
+                                        LodUploadCtx {
+                                            policy: &mut self.lod_policy,
+                                            player_pos,
+                                            last_histogram: &mut self.last_lod_histogram,
+                                            last_growth_ratio: &mut self.last_lod_growth_ratio,
+                                            growth_warned: &mut self.lod_growth_warned,
+                                        },
                                     );
                                 }
                             }
@@ -2589,7 +2881,7 @@ impl ApplicationHandler for App {
                         self.mem_stats.update(nodes);
                         let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
                         log::info!(
-                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {} | {}",
+                            "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {} | {} | {}",
                             self.world.generation,
                             self.world.population(),
                             svdag_nodes,
@@ -2598,6 +2890,7 @@ impl ApplicationHandler for App {
                             self.mem_stats.summary(),
                             self.perf.summary(),
                             self.last_memo_summary,
+                            self.lod_summary(),
                         );
                     }
                     self.log_timer = std::time::Instant::now();
@@ -2762,11 +3055,19 @@ impl ApplicationHandler for App {
                                             self.world.side(),
                                             self.world.origin,
                                         );
+                                        let player_pos = self.player_world_pos();
                                         Self::upload_volume(
                                             &mut self.renderer,
                                             &mut self.world,
                                             &mut self.svdag,
                                             &mut self.last_svdag_stats,
+                                            LodUploadCtx {
+                                                policy: &mut self.lod_policy,
+                                                player_pos,
+                                                last_histogram: &mut self.last_lod_histogram,
+                                                last_growth_ratio: &mut self.last_lod_growth_ratio,
+                                                growth_warned: &mut self.lod_growth_warned,
+                                            },
                                         );
                                         self.sync_render_cache();
                                     }
@@ -2938,6 +3239,8 @@ fn main() {
     log::info!("  G: reset to legacy GoL sphere seed");
     log::info!("  1-4: switch rules (amoeba, crystal, 445, pyroclastic)");
     log::info!("  P: dump perf + memory summary (on demand)");
+    log::info!("  L (shift): toggle chunk-LOD policy (cswp.8.3)");
+    log::info!("  ;/' : decrease/increase chunk-LOD bias by 0.25 (clamped 0.25..4.0)");
     log::info!("  Esc: quit");
 
     let volume_size = std::env::args()
@@ -2963,7 +3266,19 @@ fn main() {
     {
         // Make launch behavior explicit instead of depending on bundle/agent defaults.
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
-        event_loop_builder.with_activate_ignoring_other_apps(true);
+        // hash-thing-sgcv: gate the activate-ignoring-other-apps flag
+        // behind the same HASH_THING_FOCUS=1 env var that gates
+        // window.focus_window() at src/main.rs:1985. winit's default
+        // for this flag is `true` (PlatformSpecificEventLoopAttributes
+        // in winit/platform_impl/macos/event_loop.rs), so we MUST set
+        // it explicitly in both branches — omitting the setter would
+        // silently inherit the focus-stealing default and the gate
+        // would be a no-op. Default is to NOT steal focus, so the
+        // agent surface keeps keyboard input.
+        // ActivationPolicy::Regular stays unconditional — it controls
+        // dock/Cmd-Tab presence, not activation.
+        let want_focus = std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
+        event_loop_builder.with_activate_ignoring_other_apps(want_focus);
     }
     let event_loop = event_loop_builder
         .build()
@@ -4439,6 +4754,11 @@ mod tests {
             !app.suppress_next_fps_sample,
             "flag must be consumed after the suppressed frame"
         );
+        assert_eq!(
+            app.perf.stats("frame_total").map(|s| s.2).unwrap_or(0),
+            0,
+            "suppressed bogus frame must not pollute the frame_total ring (hash-thing-dbz5)"
+        );
     }
 
     #[test]
@@ -4456,6 +4776,11 @@ mod tests {
             (app.smoothed_fps - 60.0).abs() < 1e-9,
             "subsequent real frames must blend normally; got {}",
             app.smoothed_fps
+        );
+        assert_eq!(
+            app.perf.stats("frame_total").map(|s| s.2).unwrap_or(0),
+            1,
+            "real post-resume frame must record exactly one frame_total sample (hash-thing-dbz5)"
         );
     }
 

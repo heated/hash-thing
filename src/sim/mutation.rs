@@ -13,7 +13,7 @@
 //!   // entities.update(&world, &mut world.queue)  // lands in 1v0.6
 //! ```
 //!
-//! [`World::step_ca`] debug-asserts the queue is empty on entry.
+//! [`crate::sim::world::World::step_ca`] debug-asserts the queue is empty on entry.
 
 use super::world::WorldCoord;
 use crate::octree::CellState;

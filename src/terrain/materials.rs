@@ -12,7 +12,7 @@ use crate::sim::margolus::GravityBlockRule;
 use crate::sim::rule::{
     AcidRule, AirRule, AirVineGrowthRule, BlockRule, CaRule, DissolvableRule, FanCarriedMaterial,
     FanDrivenRule, FanRule, FireRule, FireworkRule, FlammableRule, GameOfLife3D, IceRule, LavaRule,
-    LocalRule, NoopRule, SteamRule, VineRule, WaterRule,
+    LocalRule, NoopRule, Phase, SteamRule, VineRule, WaterRule,
 };
 
 pub type MaterialId = u16;
@@ -158,6 +158,46 @@ pub fn material_density(cell: Cell) -> f32 {
         id if FAN_ARMED_FIREWORK_MATERIAL_IDS.contains(&id) => -0.3,
         CLONE_MATERIAL_ID => 10.0, // immovable
         _ => 0.0,
+    }
+}
+
+/// Phase classification for block-rule gravity gating (hash-thing-nagw).
+///
+/// Solids never sink through other solids regardless of density gap; this
+/// keeps stratified terrain (e.g. SAND on top of GUNPOWDER) stable instead of
+/// letting one heavy block sift through another. Solid-on-gas, gas-on-gas,
+/// and liquid-* swaps remain density-driven via `material_density`.
+///
+/// Unknown materials fall through to Gas — same permissive default as
+/// `material_density` (unregistered cells behave like air). This is a
+/// defensive fallback; live materials are expected to be classified
+/// explicitly.
+pub fn material_phase(cell: Cell) -> Phase {
+    if cell.is_empty() {
+        return Phase::Gas;
+    }
+    match cell.material() {
+        STONE_MATERIAL_ID => Phase::Solid,
+        DIRT_MATERIAL_ID => Phase::Solid,
+        GRASS_MATERIAL_ID => Phase::Solid,
+        FIRE_MATERIAL_ID => Phase::Gas,
+        WATER_MATERIAL_ID => Phase::Liquid,
+        SAND_MATERIAL_ID => Phase::Solid,
+        LAVA_MATERIAL_ID => Phase::Liquid,
+        ICE_MATERIAL_ID => Phase::Solid,
+        ACID_MATERIAL_ID => Phase::Liquid,
+        OIL_MATERIAL_ID => Phase::Liquid,
+        GUNPOWDER_MATERIAL_ID => Phase::Solid,
+        STEAM_MATERIAL_ID => Phase::Gas,
+        id if FAN_ARMED_STEAM_MATERIAL_IDS.contains(&id) => Phase::Gas,
+        GAS_MATERIAL_ID => Phase::Gas,
+        METAL_MATERIAL_ID => Phase::Solid,
+        VINE_MATERIAL_ID => Phase::Solid,
+        FAN_MATERIAL_ID => Phase::Solid,
+        FIREWORK_MATERIAL_ID => Phase::Gas,
+        id if FAN_ARMED_FIREWORK_MATERIAL_IDS.contains(&id) => Phase::Gas,
+        CLONE_MATERIAL_ID => Phase::Solid,
+        _ => Phase::Gas,
     }
 }
 
@@ -366,15 +406,27 @@ impl MaterialRegistry {
 
         // Block rules.
         let gravity_block_rule =
-            registry.register_block_rule(GravityBlockRule::new(material_density));
-        let water_fluid_block_rule =
-            registry.register_block_rule(FluidBlockRule::new(material_density, WATER_MATERIAL_ID));
-        let lava_fluid_block_rule =
-            registry.register_block_rule(FluidBlockRule::new(material_density, LAVA_MATERIAL_ID));
-        let acid_fluid_block_rule =
-            registry.register_block_rule(FluidBlockRule::new(material_density, ACID_MATERIAL_ID));
-        let oil_fluid_block_rule =
-            registry.register_block_rule(FluidBlockRule::new(material_density, OIL_MATERIAL_ID));
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
+        let water_fluid_block_rule = registry.register_block_rule(FluidBlockRule::new(
+            material_density,
+            material_phase,
+            WATER_MATERIAL_ID,
+        ));
+        let lava_fluid_block_rule = registry.register_block_rule(FluidBlockRule::new(
+            material_density,
+            material_phase,
+            LAVA_MATERIAL_ID,
+        ));
+        let acid_fluid_block_rule = registry.register_block_rule(FluidBlockRule::new(
+            material_density,
+            material_phase,
+            ACID_MATERIAL_ID,
+        ));
+        let oil_fluid_block_rule = registry.register_block_rule(FluidBlockRule::new(
+            material_density,
+            material_phase,
+            OIL_MATERIAL_ID,
+        ));
 
         registry.insert(
             AIR_MATERIAL_ID,
@@ -1862,7 +1914,8 @@ mod tests {
     fn block_rule_tick_divisors_matches_uniform_sharers() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
-        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let block_rule_id =
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
         // Two materials sharing one BlockRule with the SAME divisor.
         registry.insert(
             0,
@@ -1895,7 +1948,8 @@ mod tests {
     fn validate_rejects_mixed_divisors_on_shared_block_rule() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
-        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let block_rule_id =
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
         registry.insert(
             0,
             MaterialEntry {
@@ -1927,7 +1981,8 @@ mod tests {
     fn insert_rejects_mixed_divisors_on_shared_block_rule_without_explicit_validate() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
-        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let block_rule_id =
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
         registry.insert(
             0,
             MaterialEntry {
@@ -1959,7 +2014,8 @@ mod tests {
     fn assign_block_rule_rejects_mixed_divisors_without_explicit_validate() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
-        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let block_rule_id =
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
         registry.insert(
             0,
             MaterialEntry {
@@ -1994,7 +2050,8 @@ mod tests {
     fn set_tick_divisor_rejects_mixed_divisors_on_shared_block_rule() {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
-        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let block_rule_id =
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
         registry.insert(
             0,
             MaterialEntry {
@@ -2057,7 +2114,8 @@ mod tests {
     fn block_rule_tick_divisors_dead_rule_is_one() {
         let mut registry = MaterialRegistry::new();
         let _rule_id = registry.register_rule(NoopRule);
-        let block_rule_id = registry.register_block_rule(GravityBlockRule::new(material_density));
+        let block_rule_id =
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
         // No material references this block rule — treat as divisor=1.
         let divisors = registry.block_rule_tick_divisors();
         assert_eq!(divisors[block_rule_id.0], 1);
@@ -2074,7 +2132,7 @@ mod tests {
         let mut registry = MaterialRegistry::new();
         let rule_id = registry.register_rule(NoopRule);
         let first_block_rule =
-            registry.register_block_rule(GravityBlockRule::new(material_density));
+            registry.register_block_rule(GravityBlockRule::new(material_density, material_phase));
         registry.insert(
             0,
             MaterialEntry {
@@ -2086,7 +2144,7 @@ mod tests {
         );
         // Register a second block rule AFTER the insert — cache length must grow.
         let second_block_rule =
-            registry.register_block_rule(FluidBlockRule::new(material_density, 1));
+            registry.register_block_rule(FluidBlockRule::new(material_density, material_phase, 1));
         assert_eq!(
             registry.block_rule_tick_divisors().len(),
             2,
@@ -2186,5 +2244,86 @@ mod tests {
         reg.insert(13, entry_with(rule_id, [0.0; 4]));
         // No LocalRule registered or assigned → behavior must match pre-qy4g.1.
         assert!(reg.cell_is_inert_fixed_point(Cell::pack(13, 0)));
+    }
+
+    // hash-thing-nagw: density and phase classifications must agree on a per-
+    // material basis — every material that has a density also has a phase, and
+    // both functions agree on what air is. Catches drift if a future material
+    // is added to one table but forgotten in the other.
+    #[test]
+    fn material_density_and_phase_agree_on_known_materials() {
+        // Pin every reachable material's exact (density, phase) pair so a
+        // drift in either table — a forgotten entry, a Gas getting silently
+        // re-tagged Liquid, a fan-armed material disappearing — fails this
+        // test loudly. Includes the eight reachable FAN_ARMED_* gravity
+        // materials; both `material_density` and `material_phase` classify
+        // them specially, so they must be pinned here too.
+        let cases: &[(MaterialId, f32, Phase)] = &[
+            (AIR_MATERIAL_ID, 0.0, Phase::Gas),
+            (STONE_MATERIAL_ID, 5.0, Phase::Solid),
+            (DIRT_MATERIAL_ID, 2.0, Phase::Solid),
+            (GRASS_MATERIAL_ID, 1.2, Phase::Solid),
+            (FIRE_MATERIAL_ID, 0.05, Phase::Gas),
+            (WATER_MATERIAL_ID, 1.0, Phase::Liquid),
+            (SAND_MATERIAL_ID, 1.5, Phase::Solid),
+            (LAVA_MATERIAL_ID, 3.0, Phase::Liquid),
+            (ICE_MATERIAL_ID, 0.9, Phase::Solid),
+            (ACID_MATERIAL_ID, 1.1, Phase::Liquid),
+            (OIL_MATERIAL_ID, 0.8, Phase::Liquid),
+            (GUNPOWDER_MATERIAL_ID, 1.4, Phase::Solid),
+            (STEAM_MATERIAL_ID, -0.1, Phase::Gas),
+            (GAS_MATERIAL_ID, -0.2, Phase::Gas),
+            (METAL_MATERIAL_ID, 7.0, Phase::Solid),
+            (VINE_MATERIAL_ID, 1.1, Phase::Solid),
+            (FAN_MATERIAL_ID, 1.0, Phase::Solid),
+            (FIREWORK_MATERIAL_ID, -0.3, Phase::Gas),
+            (CLONE_MATERIAL_ID, 10.0, Phase::Solid),
+        ];
+        for &(id, expected_density, expected_phase) in cases {
+            let cell = if id == AIR_MATERIAL_ID {
+                Cell::EMPTY
+            } else {
+                Cell::pack(id, 0)
+            };
+            let d = material_density(cell);
+            let p = material_phase(cell);
+            assert_eq!(
+                d, expected_density,
+                "material {id}: density {d} ≠ expected {expected_density} (table drift?)"
+            );
+            assert_eq!(
+                p, expected_phase,
+                "material {id}: phase {p:?} ≠ expected {expected_phase:?} (table drift?)"
+            );
+        }
+
+        // Fan-armed steam variants (4 ids): all density -0.1, Gas.
+        for &id in FAN_ARMED_STEAM_MATERIAL_IDS.iter() {
+            let cell = Cell::pack(id, 0);
+            assert_eq!(
+                material_density(cell),
+                -0.1,
+                "FAN_ARMED_STEAM {id}: density drift"
+            );
+            assert_eq!(
+                material_phase(cell),
+                Phase::Gas,
+                "FAN_ARMED_STEAM {id}: phase drift"
+            );
+        }
+        // Fan-armed firework variants (4 ids): all density -0.3, Gas.
+        for &id in FAN_ARMED_FIREWORK_MATERIAL_IDS.iter() {
+            let cell = Cell::pack(id, 0);
+            assert_eq!(
+                material_density(cell),
+                -0.3,
+                "FAN_ARMED_FIREWORK {id}: density drift"
+            );
+            assert_eq!(
+                material_phase(cell),
+                Phase::Gas,
+                "FAN_ARMED_FIREWORK {id}: phase drift"
+            );
+        }
     }
 }

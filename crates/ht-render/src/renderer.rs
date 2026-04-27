@@ -543,6 +543,27 @@ fn resolved_render_scale(
     }
 }
 
+/// Parse the `HASH_THING_PRESENT_MODE` env var to a `wgpu::PresentMode`
+/// (hash-thing-2w1u). Pure function — case-insensitive, whitespace-tolerant.
+/// Returns `None` for unrecognised input so the caller can distinguish a
+/// typo from an unset var. The `auto-vsync` / `auto` aliases both map to
+/// `AutoVsync`; `auto-no-vsync` maps to `AutoNoVsync`. The two `Auto*`
+/// variants are wgpu-internal aliases that the instance maps to a backend-
+/// supported mode at surface-configure time, so they may not appear in
+/// `surface.get_capabilities().present_modes`.
+fn parse_present_mode(s: &str) -> Option<wgpu::PresentMode> {
+    use wgpu::PresentMode;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" | "auto-vsync" => Some(PresentMode::AutoVsync),
+        "auto-no-vsync" => Some(PresentMode::AutoNoVsync),
+        "fifo" => Some(PresentMode::Fifo),
+        "fifo-relaxed" => Some(PresentMode::FifoRelaxed),
+        "immediate" => Some(PresentMode::Immediate),
+        "mailbox" => Some(PresentMode::Mailbox),
+        _ => None,
+    }
+}
+
 impl Renderer {
     pub async fn new(window: Arc<Window>, volume_size: u32) -> Self {
         let size = window.inner_size();
@@ -680,12 +701,48 @@ impl Renderer {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_FRAME_LATENCY);
+        // hash-thing-2w1u: env-var gated so a non-default present mode can be
+        // A/B tested without changing the default. The default stays `AutoVsync`
+        // so this commit is a knob-only change. Unrecognised input or a mode
+        // not in `surface_caps.present_modes` falls back to `AutoVsync` with a
+        // `log::warn!` so typos and backend-availability mismatches are
+        // discoverable. The `Auto*` variants are wgpu aliases that the instance
+        // maps to a backend-supported mode at surface-configure time, so they
+        // are not validated against `surface_caps.present_modes`.
+        let requested_present_mode = std::env::var("HASH_THING_PRESENT_MODE").ok();
+        let present_mode: wgpu::PresentMode = match requested_present_mode.as_deref() {
+            None | Some("") => wgpu::PresentMode::AutoVsync,
+            Some(s) => match parse_present_mode(s) {
+                Some(mode) => {
+                    let needs_check = !matches!(
+                        mode,
+                        wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync
+                    );
+                    if needs_check && !surface_caps.present_modes.contains(&mode) {
+                        log::warn!(
+                            "HASH_THING_PRESENT_MODE={s:?} → {mode:?} not in surface_caps.present_modes={:?}; falling back to AutoVsync",
+                            surface_caps.present_modes
+                        );
+                        wgpu::PresentMode::AutoVsync
+                    } else {
+                        log::info!("HASH_THING_PRESENT_MODE={s:?} → effective={mode:?}");
+                        mode
+                    }
+                }
+                None => {
+                    log::warn!(
+                        "HASH_THING_PRESENT_MODE={s:?} unrecognised (need one of auto, auto-vsync, auto-no-vsync, fifo, fifo-relaxed, immediate, mailbox); falling back to AutoVsync"
+                    );
+                    wgpu::PresentMode::AutoVsync
+                }
+            },
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: ((size.width as f32 * render_scale) as u32).max(1),
             height: ((size.height as f32 * render_scale) as u32).max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: desired_max_frame_latency,
@@ -2299,8 +2356,8 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_render_scale, resolved_render_scale, target_pixels_for_volume, ticks_to_duration,
-        FrameOutcome, GpuTiming, RenderScaleSource, RendererLifecycleSnapshot,
+        auto_render_scale, parse_present_mode, resolved_render_scale, target_pixels_for_volume,
+        ticks_to_duration, FrameOutcome, GpuTiming, RenderScaleSource, RendererLifecycleSnapshot,
     };
     use std::time::Duration;
 
@@ -2404,6 +2461,84 @@ mod tests {
         let (s_hi, src_hi) = resolved_render_scale(Some("1.0"), 2940 * 1782, 1024);
         assert_eq!(src_hi, RenderScaleSource::EnvOverride);
         assert!((s_hi - 1.0).abs() < 1e-6);
+    }
+
+    // --- hash-thing-2w1u: HASH_THING_PRESENT_MODE parser ---
+
+    #[test]
+    fn parse_present_mode_canonical_strings() {
+        use wgpu::PresentMode;
+        assert_eq!(
+            parse_present_mode("auto-vsync"),
+            Some(PresentMode::AutoVsync)
+        );
+        assert_eq!(
+            parse_present_mode("auto-no-vsync"),
+            Some(PresentMode::AutoNoVsync)
+        );
+        assert_eq!(parse_present_mode("fifo"), Some(PresentMode::Fifo));
+        assert_eq!(
+            parse_present_mode("fifo-relaxed"),
+            Some(PresentMode::FifoRelaxed)
+        );
+        assert_eq!(
+            parse_present_mode("immediate"),
+            Some(PresentMode::Immediate)
+        );
+        assert_eq!(parse_present_mode("mailbox"), Some(PresentMode::Mailbox));
+    }
+
+    #[test]
+    fn parse_present_mode_auto_alias_maps_to_auto_vsync() {
+        // `auto` is the bare alias; both spellings must hit AutoVsync since
+        // that's the documented default in the env-var contract.
+        assert_eq!(
+            parse_present_mode("auto"),
+            Some(wgpu::PresentMode::AutoVsync)
+        );
+        assert_eq!(
+            parse_present_mode("auto-vsync"),
+            Some(wgpu::PresentMode::AutoVsync)
+        );
+    }
+
+    #[test]
+    fn parse_present_mode_is_case_insensitive() {
+        use wgpu::PresentMode;
+        assert_eq!(
+            parse_present_mode("AUTO-VSYNC"),
+            Some(PresentMode::AutoVsync)
+        );
+        assert_eq!(
+            parse_present_mode("Immediate"),
+            Some(PresentMode::Immediate)
+        );
+        assert_eq!(
+            parse_present_mode("FIFO-RELAXED"),
+            Some(PresentMode::FifoRelaxed)
+        );
+    }
+
+    #[test]
+    fn parse_present_mode_trims_whitespace() {
+        // Shells frequently pad env-var values; the parser must tolerate it.
+        assert_eq!(
+            parse_present_mode("  immediate  "),
+            Some(wgpu::PresentMode::Immediate)
+        );
+        assert_eq!(
+            parse_present_mode("\tfifo\n"),
+            Some(wgpu::PresentMode::Fifo)
+        );
+    }
+
+    #[test]
+    fn parse_present_mode_rejects_unknown_inputs() {
+        assert_eq!(parse_present_mode("vsync"), None);
+        assert_eq!(parse_present_mode("triple-buffer"), None);
+        assert_eq!(parse_present_mode("auto-fifo"), None);
+        assert_eq!(parse_present_mode(""), None);
+        assert_eq!(parse_present_mode("   "), None);
     }
 
     /// Try to build a headless wgpu device with TIMESTAMP_QUERY. Returns

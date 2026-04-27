@@ -1,3 +1,4 @@
+pub mod chunks;
 pub mod entity;
 pub mod hashlife;
 pub mod margolus;
