@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# hash-thing-demo — standardized demo runner (hash-thing-4xmw / 06so.1).
+#
+# Reads ~/.config/hash-thing/demo.toml for current settings (world size,
+# resolution), one-shot overrides via --world / --res, persistent updates
+# via `set <KEY> <VALUE>`. Picks a binary in priority order:
+# target/stable -> target/release -> cargo build --release.
+#
+# Always sets HASH_THING_FOCUS=1 so the demo window starts focused (today
+# the binary's only focus opt-in). Future kh9l (06so.2) may also wire
+# --demo to focus; the env var still works as the wrapper's source of
+# truth so non-1080p runs aren't accidentally unfocused.
+#
+# `cargo build --release` (not `--profile bench`) is intentional: the
+# wrapper's fallback is the distributable binary path, matching what
+# z54e (stable build) produces. Iteration / perf work uses bench profile;
+# the wrapper does not.
+#
+# Internal: HASH_THING_DEMO_DRY_RUN=1 makes the wrapper print the resolved
+# command + picked binary instead of executing. Used by the test harness.
+
+set -euo pipefail
+
+# ----- Resolve repo root (portable; macOS readlink lacks -f) -----
+resolve_self() {
+    local p="$1"
+    while [ -L "$p" ]; do
+        local target
+        target=$(readlink "$p")
+        case "$target" in
+            /*) p="$target" ;;
+            *)  p="$(cd "$(dirname "$p")" && pwd)/$target" ;;
+        esac
+    done
+    local d
+    d=$(cd "$(dirname "$p")" && pwd)
+    printf '%s/%s\n' "$d" "$(basename "$p")"
+}
+SELF=$(resolve_self "$0")
+SCRIPT_DIR=$(dirname "$SELF")
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+if [ ! -f "$REPO_ROOT/Cargo.toml" ]; then
+    echo "hash-thing-demo: cannot find repo root (no Cargo.toml above $SCRIPT_DIR)" >&2
+    exit 2
+fi
+
+# ----- Config path / defaults -----
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hash-thing"
+CONFIG_FILE="$CONFIG_DIR/demo.toml"
+
+DEFAULT_WORLD=512
+DEFAULT_RES=1080p
+DEFAULT_SCENE=default
+
+# shellcheck disable=SC2016  # ${XDG_...} here is literal documentation, not expansion.
+USAGE='usage: hash-thing-demo [--world N] [--res V]
+       hash-thing-demo set {world|res|scene} VALUE
+       hash-thing-demo show
+       hash-thing-demo --help | -h
+
+Reads/writes config at ${XDG_CONFIG_HOME:-$HOME/.config}/hash-thing/demo.toml
+Defaults: world=512, res=1080p, scene=default
+--res accepts: 720p|1080p|1440p|2160p|4k|WxH (e.g. 1920x1080)'
+
+# ----- TOML helpers (flat key=value, optional quotes) -----
+toml_read() {
+    # toml_read <key> <file> <default>
+    # Tolerates: CRLF, leading/trailing whitespace, quoted or bare values,
+    # trailing `# comment`. Quoted values are taken literally between the
+    # first pair of `"` (anything after the closing quote, including a
+    # comment, is dropped). Bare values are truncated at the first `#`.
+    local key="$1" file="$2" def="$3" line val
+    if [ -f "$file" ]; then
+        line=$(tr -d '\r' < "$file" \
+               | grep -E "^[[:space:]]*${key}[[:space:]]*=" \
+               | tail -1 || true)
+        if [ -n "$line" ]; then
+            # Strip "key = " prefix.
+            val=$(printf '%s' "$line" \
+                  | sed -E 's/^[[:space:]]*[^=]+=[[:space:]]*//')
+            case "$val" in
+                \"*)
+                    val=${val#\"}            # leading quote
+                    val=${val%%\"*}          # everything from next quote on
+                    ;;
+                *)
+                    val=${val%%#*}           # trailing comment
+                    ;;
+            esac
+            # Trim whitespace.
+            val=$(printf '%s' "$val" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+            if [ -n "$val" ]; then
+                printf '%s\n' "$val"
+                return
+            fi
+        fi
+    fi
+    printf '%s\n' "$def"
+}
+
+toml_write() {
+    # toml_write <world> <res> <scene>; atomic via mktemp + mv
+    local world="$1" res="$2" scene="$3" tmp
+    mkdir -p "$CONFIG_DIR"
+    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    {
+        printf '# hash-thing-demo config — managed by scripts/hash-thing-demo\n'
+        printf 'world = %s\n' "$world"
+        printf 'resolution = "%s"\n' "$res"
+        printf 'scene = "%s"\n' "$scene"
+    } > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# ----- Validators -----
+validate_world() {
+    local v="$1"
+    case "$v" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$v" -gt 0 ] || return 1
+    # Power of two: v & (v-1) == 0.
+    [ "$(( v & (v - 1) ))" -eq 0 ] || return 1
+    return 0
+}
+
+validate_res() {
+    # Mirror the binary's case-insensitive accept set
+    # (src/main.rs:3300 lowercases first).
+    local v
+    v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$v" in
+        720p|1080p|1440p|2160p|4k) return 0 ;;
+        *x*)
+            local w h
+            w="${v%x*}"
+            h="${v#*x}"
+            case "$w" in ''|*[!0-9]*) return 1 ;; esac
+            case "$h" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$w" -gt 0 ] && [ "$h" -gt 0 ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_scene() {
+    # Forward-compat: only "default" is supported today.
+    [ "$1" = default ]
+}
+
+# ----- Binary picker -----
+# try_pick_binary: observational. Returns the prebuilt binary path or empty
+# string. Never builds. Used by `show`.
+try_pick_binary() {
+    local stable="$REPO_ROOT/target/stable/hash-thing"
+    local release="$REPO_ROOT/target/release/hash-thing"
+    if [ -x "$stable" ]; then
+        printf '%s\n' "$stable"
+        return
+    fi
+    if [ -x "$release" ]; then
+        printf '%s\n' "$release"
+        return
+    fi
+}
+
+# pick_binary: side-effecting. Falls through to `cargo build --release` if
+# nothing prebuilt. Used by `cmd_run`.
+pick_binary() {
+    local picked release="$REPO_ROOT/target/release/hash-thing"
+    picked=$(try_pick_binary)
+    if [ -n "$picked" ]; then
+        printf '%s\n' "$picked"
+        return
+    fi
+    echo "hash-thing-demo: no prebuilt binary; building (cargo build --release, ~10-15min cold)..." >&2
+    (cd "$REPO_ROOT" && cargo build --release >&2)
+    if [ -x "$release" ]; then
+        printf '%s\n' "$release"
+        return
+    fi
+    echo "hash-thing-demo: cargo build --release succeeded but $release missing" >&2
+    exit 3
+}
+
+binary_metadata() {
+    # Print "<path>  (<source>, mtime <ts>)" — used by `show`.
+    local p="$1" src mtime
+    if [ -L "$p" ]; then
+        local target
+        target=$(readlink "$p")
+        src="symlink -> $target"
+    else
+        src="file"
+    fi
+    if [ -e "$p" ]; then
+        # Cross-platform mtime: macOS stat -f, GNU stat -c.
+        mtime=$(stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%S' "$p" 2>/dev/null \
+                || stat -c '%y' "$p" 2>/dev/null \
+                || echo unknown)
+    else
+        mtime=missing
+    fi
+    printf '%s  (%s, mtime %s)\n' "$p" "$src" "$mtime"
+}
+
+# ----- Subcommands -----
+cmd_show() {
+    local cur_world cur_res cur_scene picked
+    cur_world=$(toml_read world "$CONFIG_FILE" "$DEFAULT_WORLD")
+    cur_res=$(toml_read resolution "$CONFIG_FILE" "$DEFAULT_RES")
+    cur_scene=$(toml_read scene "$CONFIG_FILE" "$DEFAULT_SCENE")
+    # `show` is observational: never trigger a build.
+    picked=$(try_pick_binary)
+    echo "config:  $CONFIG_FILE"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "         (exists)"
+    else
+        echo "         (does not exist; using defaults)"
+    fi
+    echo "world:      $cur_world"
+    echo "resolution: $cur_res"
+    echo "scene:      $cur_scene"
+    if [ -n "$picked" ]; then
+        echo "binary:     $(binary_metadata "$picked")"
+    else
+        echo "binary:     (would build via cargo build --release on next run)"
+    fi
+}
+
+cmd_set() {
+    local key="$1" val="$2"
+    local cur_world cur_res cur_scene
+    cur_world=$(toml_read world "$CONFIG_FILE" "$DEFAULT_WORLD")
+    cur_res=$(toml_read resolution "$CONFIG_FILE" "$DEFAULT_RES")
+    cur_scene=$(toml_read scene "$CONFIG_FILE" "$DEFAULT_SCENE")
+    case "$key" in
+        world)
+            if ! validate_world "$val"; then
+                echo "hash-thing-demo: world must be a positive power of two (got '$val')" >&2
+                exit 1
+            fi
+            cur_world="$val"
+            ;;
+        res|resolution)
+            if ! validate_res "$val"; then
+                echo "hash-thing-demo: --res VALUE must be 720p|1080p|1440p|2160p|4k|WxH (got '$val')" >&2
+                exit 1
+            fi
+            cur_res="$val"
+            ;;
+        scene)
+            if ! validate_scene "$val"; then
+                echo "hash-thing-demo: scene only supports 'default' today (got '$val')" >&2
+                exit 1
+            fi
+            cur_scene="$val"
+            ;;
+        *)
+            echo "hash-thing-demo: unknown key '$key' (use world|res|scene)" >&2
+            exit 1
+            ;;
+    esac
+    toml_write "$cur_world" "$cur_res" "$cur_scene"
+    echo "set $key=$val (config: $CONFIG_FILE)"
+}
+
+cmd_run() {
+    local one_world="" one_res=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --world)
+                shift
+                [ $# -gt 0 ] || { echo "$USAGE" >&2; echo "--world requires N" >&2; exit 1; }
+                if ! validate_world "$1"; then
+                    echo "hash-thing-demo: --world must be a positive power of two (got '$1')" >&2
+                    exit 1
+                fi
+                [ -z "$one_world" ] || { echo "hash-thing-demo: --world specified more than once" >&2; exit 1; }
+                one_world="$1"
+                ;;
+            --res)
+                shift
+                [ $# -gt 0 ] || { echo "$USAGE" >&2; echo "--res requires VALUE" >&2; exit 1; }
+                if ! validate_res "$1"; then
+                    echo "hash-thing-demo: --res VALUE must be 720p|1080p|1440p|2160p|4k|WxH (got '$1')" >&2
+                    exit 1
+                fi
+                [ -z "$one_res" ] || { echo "hash-thing-demo: --res specified more than once" >&2; exit 1; }
+                one_res="$1"
+                ;;
+            *)
+                echo "$USAGE" >&2
+                echo "unknown arg: $1" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    local world res
+    world=${one_world:-$(toml_read world "$CONFIG_FILE" "$DEFAULT_WORLD")}
+    res=${one_res:-$(toml_read resolution "$CONFIG_FILE" "$DEFAULT_RES")}
+
+    # --demo and --res are mutually exclusive in the binary (src/main.rs:3383).
+    # Emit --demo only when res is the 1080p default; otherwise pass --res.
+    # Either way, set HASH_THING_FOCUS=1 so the demo window starts focused
+    # — the wrapper's identity is "demo runner", focus is part of that.
+    local picked
+    picked=$(pick_binary)
+
+    local cmd
+    if [ "$res" = 1080p ]; then
+        cmd=("$picked" "$world" --demo)
+    else
+        cmd=("$picked" "$world" --res "$res")
+    fi
+
+    if [ "${HASH_THING_DEMO_DRY_RUN:-0}" = 1 ]; then
+        echo "binary: $picked"
+        echo "env: HASH_THING_FOCUS=1"
+        printf 'cmd:'
+        for a in "${cmd[@]}"; do
+            printf ' %q' "$a"
+        done
+        printf '\n'
+        return
+    fi
+
+    HASH_THING_FOCUS=1 exec "${cmd[@]}"
+}
+
+# ----- Entry -----
+if [ $# -eq 0 ]; then
+    cmd_run
+    exit 0
+fi
+
+case "$1" in
+    --help|-h)
+        echo "$USAGE"
+        exit 0
+        ;;
+    show)
+        shift
+        [ $# -eq 0 ] || { echo "hash-thing-demo: show takes no args" >&2; exit 1; }
+        cmd_show
+        ;;
+    set)
+        shift
+        [ $# -eq 2 ] || { echo "$USAGE" >&2; echo "set requires KEY VALUE" >&2; exit 1; }
+        cmd_set "$1" "$2"
+        ;;
+    *)
+        cmd_run "$@"
+        ;;
+esac
