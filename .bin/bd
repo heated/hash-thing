@@ -12,7 +12,10 @@
 
 set -euo pipefail
 
-BD_REAL="${BD_REAL:-/usr/local/bin/bd}"
+BD_REAL="${BD_REAL:-/opt/homebrew/bin/bd}"
+# Fallback to Rosetta brew prefix if arm64 brew prefix isn't present.
+# Once every seat has finished the arm64 migration this can be removed.
+[ -x "$BD_REAL" ] || BD_REAL="/usr/local/bin/bd"
 MAX_RETRIES=5
 BASE_DELAY=1  # seconds
 
