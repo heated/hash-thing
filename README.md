@@ -10,6 +10,37 @@ If you've already built once on this machine:
 ./target/release/hash-thing
 ```
 
+## Demo command
+
+Standardized demo runner with a per-user config file:
+
+```
+scripts/hash-thing-demo                   # run with current config
+scripts/hash-thing-demo --world 256       # one-shot world override
+scripts/hash-thing-demo --res 1440p       # one-shot resolution override
+scripts/hash-thing-demo set world 256     # persist
+scripts/hash-thing-demo set res 1440p     # persist
+scripts/hash-thing-demo show              # current config + which binary will run
+```
+
+Defaults: `world=512`, `res=1080p`, `scene=default`. Config lives at
+`${XDG_CONFIG_HOME:-$HOME/.config}/hash-thing/demo.toml` so changes
+propagate to other sessions on next invocation (no `source` needed).
+
+The wrapper picks a binary in this priority order: `target/stable/hash-thing`
+→ `target/release/hash-thing` → `cargo build --release`. It always sets
+`HASH_THING_FOCUS=1` so the demo window starts focused.
+
+To invoke from any cwd, symlink the wrapper into `$HOME/bin/`:
+
+```
+mkdir -p ~/bin
+ln -sf "$(pwd)/scripts/hash-thing-demo" ~/bin/hash-thing-demo
+```
+
+Make sure `~/bin` is on your `$PATH`. Then any session can run
+`! hash-thing-demo` (or just `hash-thing-demo` from a regular shell).
+
 ## Build from source
 
 ```
