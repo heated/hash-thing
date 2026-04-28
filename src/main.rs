@@ -7,7 +7,6 @@ use hash_thing::terrain;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 /// hash-thing-imvg (vqke.1): timing data the sim thread returns alongside
 /// the World so the main thread can attribute the non-Hashlife portion of
@@ -15,9 +14,9 @@ use std::thread::JoinHandle;
 ///
 /// `sim_finished_at` is captured immediately before the thread closure
 /// returns. The main thread compares against `Instant::now()` at the
-/// moment it detects `step_handle.is_finished()` to measure the
-/// once-per-frame polling lag — i.e. the wall-clock between the sim
-/// thread actually finishing and the main loop noticing.
+/// moment it ingests the sim result (via `apply_step_result`) to measure
+/// the polling lag — i.e. the wall-clock between the sim thread actually
+/// finishing and the main loop noticing.
 #[derive(Debug)]
 struct SimThreadTimings {
     apply_mutations_ns: u64,
@@ -25,12 +24,33 @@ struct SimThreadTimings {
     step_recursive_ns: u64,
     sim_finished_at: std::time::Instant,
 }
+
+/// hash-thing-dbv3 (vqke.1.1): user-event payload used to wake the main
+/// loop the moment the sim worker finishes. Replaces the previous
+/// once-per-RedrawRequested `JoinHandle::is_finished` poll. The payload
+/// rides on the user-event itself (no separate channel) — winit's
+/// `EventLoopProxy::send_event(T)` already moves `T` cross-thread, and
+/// inlining the payload eliminates the channel-vs-event ordering race
+/// the multi-step design would have exposed.
+///
+/// No `Debug` derive: `sim::World` doesn't implement `Debug`, and
+/// `EventLoopProxy::send_event` only requires `T: Send + 'static`.
+enum AppUserEvent {
+    /// The sim worker finished. The payload is `Ok((world, timings))` on
+    /// a clean step or `Err(panic_msg)` if the worker's
+    /// `catch_unwind`-wrapped body panicked. The receiving handler
+    /// (`App::user_event`) clears `step_pending`, restores `self.world`,
+    /// records the wrapper / poll-lag perf samples, and calls
+    /// `request_redraw()` so the next frame uses the fresh world.
+    SimDone(Result<(sim::World, SimThreadTimings), String>),
+}
+
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
-    event_loop::EventLoop,
+    event_loop::{EventLoop, EventLoopProxy},
     keyboard::KeyCode,
     window::{CursorGrabMode, Window, WindowAttributes},
 };
@@ -637,15 +657,29 @@ struct App {
     /// pose instead of the App-default terrain. `None` keeps the previous
     /// hc0g default-terrain behavior unchanged.
     dump_scene: Option<DumpScene>,
-    /// Background sim step thread (x5w). While `Some`, `self.world` is a
-    /// tiny placeholder — all world reads must use `render_origin` /
+    /// Background sim step liveness flag (x5w). While `true`, `self.world`
+    /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
-    /// hash-thing-imvg (vqke.1): the sim thread returns timing data
-    /// alongside the World so the main thread can attribute the
-    /// non-Hashlife portion of `step` to the right wrapper phase.
-    step_handle: Option<JoinHandle<Result<(sim::World, SimThreadTimings), String>>>,
+    ///
+    /// hash-thing-dbv3 (vqke.1.1): replaces the previous
+    /// `Option<JoinHandle<...>>` shape. The result no longer travels via
+    /// the `JoinHandle`; it's delivered directly as the
+    /// `AppUserEvent::SimDone` payload. `step_pending` is the single
+    /// liveness signal: set to `true` when `maybe_start_background_step`
+    /// kicks the worker, cleared in `apply_step_result` when the user
+    /// event arrives. The detached worker thread cleans itself up.
+    step_pending: bool,
     /// When the background step was spawned, for perf timing.
     step_start: std::time::Instant,
+    /// hash-thing-dbv3 (vqke.1.1): proxy used by the sim worker thread
+    /// to wake the main loop the moment the step finishes
+    /// (`proxy.send_event(AppUserEvent::SimDone(_))`). `None` until
+    /// `App::set_event_proxy` runs in `main()` after the EventLoop
+    /// builds — `App::new()` test callers leave it `None` and the
+    /// worker silently no-ops the wake call (the worker still runs to
+    /// completion; tests that need the result should bypass the
+    /// kick-off path).
+    event_proxy: Option<EventLoopProxy<AppUserEvent>>,
     /// Cached world origin for rendering during background step.
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
@@ -885,8 +919,9 @@ impl App {
             want_focus_on_launch: false,
             dump_frame_path: None,
             dump_scene: None,
-            step_handle: None,
+            step_pending: false,
             step_start: std::time::Instant::now(),
+            event_proxy: None,
             render_origin,
             render_inv_size,
             warned_dev_profile_perf: false,
@@ -1430,7 +1465,7 @@ impl App {
 
     /// True while the sim step is running on a background thread.
     fn is_stepping(&self) -> bool {
-        self.step_handle.is_some()
+        self.step_pending
     }
 
     fn maybe_start_background_step(&mut self) {
@@ -1444,10 +1479,10 @@ impl App {
         // (hash-thing-0s9v). Timed so we can validate the clone-cost
         // estimate against live sweeps.
         //
-        // Ordering invariant: the snapshot MUST be set before `step_handle`
-        // becomes `Some(...)`. `is_stepping()` ⟺ `step_handle.is_some()`, and
-        // grounded movement unwraps `collision_snapshot` via `expect` when
-        // stepping; inverting these lines would expose that expect.
+        // Ordering invariant: the snapshot MUST be set before `step_pending`
+        // becomes `true`. `is_stepping()` ⟺ `step_pending`, and grounded
+        // movement unwraps `collision_snapshot` via `expect` when stepping;
+        // inverting these lines would expose that expect.
         {
             let _t = self.perf.start("collision_snapshot_refresh");
             self.collision_snapshot = Some(self.world.collision_snapshot());
@@ -1456,11 +1491,33 @@ impl App {
         // consumed the live snapshot for movement, interaction, and render.
         let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
         let sim_qos = self.sim_qos;
-        self.step_handle = Some(std::thread::spawn(move || {
-            if let Some(qos) = sim_qos {
-                thread_qos::apply(qos);
-            }
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // hash-thing-dbv3 (vqke.1.1): clone the wake handles into the
+        // worker. The worker uses `proxy.send_event` to deliver the
+        // payload + wake the main loop (low-lag path); it ALSO calls
+        // `window.request_redraw` as a defense-in-depth wake (covers
+        // paths where user-event dispatch is delayed behind a queued
+        // WindowEvent). Either may be `None` in the test path
+        // (`App::new` callers without an EventLoop / Window): the worker
+        // silently no-ops the missing wake side and the result is
+        // dropped on worker exit — tests that need the result should
+        // not rely on the kick-off path.
+        let proxy = self.event_proxy.clone();
+        let window = self.window.clone();
+        self.step_pending = true;
+        std::thread::spawn(move || {
+            // Wrap the ENTIRE worker body in `catch_unwind`, including
+            // `thread_qos::apply` — a panic before the sim work starts
+            // (e.g. invalid QoS class on an OS that rejected it) must
+            // still produce an `Err(...)` payload so the main loop's
+            // `step_pending` flag can clear. Without the broader catch,
+            // a pre-sim panic would strand the flag and freeze the sim
+            // (every subsequent `maybe_start_background_step` call
+            // would early-return on `is_stepping()`). Codex
+            // standard-review feedback (notes/PR-dbv3-Codex-Standard-*).
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(qos) = sim_qos {
+                    thread_qos::apply(qos);
+                }
                 // hash-thing-imvg (vqke.1): bracket each wrapper phase
                 // separately. Phase 0 evidence showed step ≈ 140 ms with
                 // step_recursive ≈ 73 ms — leaving ~67 ms in this
@@ -1495,8 +1552,134 @@ impl App {
                 } else {
                     "unknown panic".to_string()
                 }
-            })
-        }));
+            });
+
+            // Wake the main loop. send_event returns Err(EventLoopClosed)
+            // if the loop already exited (process shutting down) — drop
+            // it; nothing useful to do. request_redraw is fire-and-forget.
+            if let Some(p) = proxy {
+                let _ = p.send_event(AppUserEvent::SimDone(payload));
+            }
+            if let Some(w) = window {
+                w.request_redraw();
+            }
+        });
+    }
+
+    /// hash-thing-dbv3 (vqke.1.1): ingest the sim worker's result. Called
+    /// from `fn user_event(SimDone(payload))` the moment winit dispatches
+    /// the wake event — which is "as soon as the current event handler
+    /// returns" on the main thread. Replaces the previous once-per-
+    /// RedrawRequested `step_handle.is_finished()` poll path.
+    ///
+    /// Restores `self.world`, records the wrapper / poll-lag perf
+    /// samples, refreshes the collision snapshot from the post-step
+    /// world, runs the entity update, syncs the render cache, and
+    /// uploads the new SVDAG.
+    ///
+    /// `detect_at` is `Instant::now()` captured by the caller at the
+    /// moment of dispatch, so `step_poll_lag` measures wake-dispatch
+    /// latency rather than ingest-block-internal time.
+    fn apply_step_result(
+        &mut self,
+        payload: Result<(sim::World, SimThreadTimings), String>,
+        detect_at: std::time::Instant,
+    ) {
+        if !self.step_pending {
+            // Stale event — already ingested, or never kicked. Defensive;
+            // shouldn't happen with single-event delivery and a 1-bit
+            // pending flag, but a no-op keeps double-deliveries safe.
+            return;
+        }
+        self.step_pending = false;
+
+        let step_elapsed = self.step_start.elapsed();
+        self.perf.record("step", step_elapsed);
+        if !self.warned_dev_profile_perf
+            && should_warn_about_slow_dev_step(
+                cfg!(debug_assertions),
+                self.volume_size,
+                step_elapsed,
+            )
+        {
+            log::warn!(
+                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile perf -- {}` for interactive playtesting.",
+                step_elapsed.as_secs_f64() * 1000.0,
+                self.volume_size,
+                self.volume_size,
+            );
+            self.warned_dev_profile_perf = true;
+        }
+
+        match payload {
+            Ok((world, sim_timings)) => {
+                self.world = world;
+                // hash-thing-imvg (vqke.1): record the wrapper-and-polling
+                // breakdown into perf so the periodic summary line shows
+                // apply / spawn / step_recursive / poll-lag separately.
+                // Together they should sum to approximately `step` (modulo
+                // timer granularity).
+                self.perf.record(
+                    "step_apply_mut",
+                    std::time::Duration::from_nanos(sim_timings.apply_mutations_ns),
+                );
+                self.perf.record(
+                    "step_spawn_clones",
+                    std::time::Duration::from_nanos(sim_timings.spawn_clones_ns),
+                );
+                self.perf.record(
+                    "step_recursive",
+                    std::time::Duration::from_nanos(sim_timings.step_recursive_ns),
+                );
+                let poll_lag = detect_at.saturating_duration_since(sim_timings.sim_finished_at);
+                self.perf.record("step_poll_lag", poll_lag);
+                // Refresh the collision snapshot from the just-returned
+                // world so the next frame's player physics reads
+                // post-step geometry (hash-thing-0s9v). Same clone-cost
+                // surface as the step-start refresh; timed under the same
+                // metric so sweeps see both samples.
+                {
+                    let _t = self.perf.start("collision_snapshot_refresh");
+                    self.collision_snapshot = Some(self.world.collision_snapshot());
+                }
+                // Refresh cached memo-health summary while the real world
+                // is in hand (hash-thing-stue.6): the (stepping) log
+                // branch below cannot read self.world (it's about to be
+                // replaced by a placeholder again on the next step).
+                self.last_memo_summary = self.world.memo_summary();
+                self.memo_hud_dirty = true;
+                // Entity update on main thread (needs both &World and
+                // &mut EntityStore).
+                let mut queue = std::mem::take(&mut self.world.queue);
+                self.entities.update(&self.world, &mut queue);
+                self.world.queue = queue;
+                self.sync_render_cache();
+                // SVDAG rebuild + GPU upload.
+                {
+                    let player_pos = self.player_world_pos();
+                    let _t = self.perf.start("upload_cpu");
+                    Self::upload_volume(
+                        &mut self.renderer,
+                        &mut self.world,
+                        &mut self.svdag,
+                        &mut self.last_svdag_stats,
+                        LodUploadCtx {
+                            policy: &mut self.lod_policy,
+                            player_pos,
+                            last_histogram: &mut self.last_lod_histogram,
+                            last_growth_ratio: &mut self.last_lod_growth_ratio,
+                        },
+                    );
+                }
+            }
+            Err(msg) => {
+                // Step panicked — log and pause sim. The placeholder
+                // world stays in place; render continues with the stale
+                // SVDAG (4lp).
+                log::error!("Sim step panicked: {msg}");
+                self.paused = true;
+            }
+        }
     }
 
     fn run_pending_player_action(&mut self) {
@@ -2324,7 +2507,31 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppUserEvent> for App {
+    /// hash-thing-dbv3 (vqke.1.1): wake-up hook for the sim worker. The
+    /// worker calls `proxy.send_event(AppUserEvent::SimDone(payload))`
+    /// the moment its `catch_unwind`-wrapped body finishes. winit
+    /// dispatches the event on the main thread the moment the current
+    /// event handler returns — well before the next RedrawRequested
+    /// would have fired. `apply_step_result` does the world swap +
+    /// upload; `request_redraw` schedules a render so the next frame
+    /// shows the fresh world.
+    fn user_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        event: AppUserEvent,
+    ) {
+        match event {
+            AppUserEvent::SimDone(payload) => {
+                let detect_at = std::time::Instant::now();
+                self.apply_step_result(payload, detect_at);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.window.is_none() {
             let dump_frame = self.dump_frame_path.is_some();
@@ -2943,109 +3150,16 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // --- Background step: collect completed result (x5w) ---
-                if let Some(ref handle) = self.step_handle {
-                    if handle.is_finished() {
-                        let handle = self.step_handle.take().unwrap();
-                        let step_elapsed = self.step_start.elapsed();
-                        self.perf.record("step", step_elapsed);
-                        if !self.warned_dev_profile_perf
-                            && should_warn_about_slow_dev_step(
-                                cfg!(debug_assertions),
-                                self.volume_size,
-                                step_elapsed,
-                            )
-                        {
-                            log::warn!(
-                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile perf -- {}` for interactive playtesting.",
-                                step_elapsed.as_secs_f64() * 1000.0,
-                                self.volume_size,
-                                self.volume_size,
-                            );
-                            self.warned_dev_profile_perf = true;
-                        }
-                        // hash-thing-imvg (vqke.1): capture the moment we
-                        // detect the sim is done, so we can subtract the
-                        // sim-thread-finish timestamp from it and measure
-                        // the once-per-frame polling lag (the wall between
-                        // sim actually finishing and the main loop noticing).
-                        let detect_at = std::time::Instant::now();
-                        match handle.join().expect("step thread aborted") {
-                            Ok((world, sim_timings)) => {
-                                self.world = world;
-                                // hash-thing-imvg (vqke.1): record the
-                                // wrapper-and-polling breakdown into perf
-                                // so the periodic summary line shows
-                                // apply / spawn / step_recursive / poll-lag
-                                // separately. Together they should sum to
-                                // approximately `step` (modulo timer
-                                // granularity).
-                                self.perf.record(
-                                    "step_apply_mut",
-                                    std::time::Duration::from_nanos(sim_timings.apply_mutations_ns),
-                                );
-                                self.perf.record(
-                                    "step_spawn_clones",
-                                    std::time::Duration::from_nanos(sim_timings.spawn_clones_ns),
-                                );
-                                self.perf.record(
-                                    "step_recursive",
-                                    std::time::Duration::from_nanos(sim_timings.step_recursive_ns),
-                                );
-                                let poll_lag = detect_at
-                                    .saturating_duration_since(sim_timings.sim_finished_at);
-                                self.perf.record("step_poll_lag", poll_lag);
-                                // Refresh the collision snapshot from the
-                                // just-returned world so the next frame's
-                                // player physics reads post-step geometry
-                                // (hash-thing-0s9v). Same clone-cost surface
-                                // as the step-start refresh; timed under the
-                                // same metric so sweeps see both samples.
-                                {
-                                    let _t = self.perf.start("collision_snapshot_refresh");
-                                    self.collision_snapshot = Some(self.world.collision_snapshot());
-                                }
-                                // Refresh cached memo-health summary while the
-                                // real world is in hand (hash-thing-stue.6):
-                                // the (stepping) log branch below cannot read
-                                // self.world (it's about to be replaced by a
-                                // placeholder again on the next step).
-                                self.last_memo_summary = self.world.memo_summary();
-                                self.memo_hud_dirty = true;
-                                // Entity update on main thread (needs both
-                                // &World and &mut EntityStore).
-                                let mut queue = std::mem::take(&mut self.world.queue);
-                                self.entities.update(&self.world, &mut queue);
-                                self.world.queue = queue;
-                                self.sync_render_cache();
-                                // SVDAG rebuild + GPU upload.
-                                {
-                                    let player_pos = self.player_world_pos();
-                                    let _t = self.perf.start("upload_cpu");
-                                    Self::upload_volume(
-                                        &mut self.renderer,
-                                        &mut self.world,
-                                        &mut self.svdag,
-                                        &mut self.last_svdag_stats,
-                                        LodUploadCtx {
-                                            policy: &mut self.lod_policy,
-                                            player_pos,
-                                            last_histogram: &mut self.last_lod_histogram,
-                                            last_growth_ratio: &mut self.last_lod_growth_ratio,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(msg) => {
-                                // Step panicked — log and pause sim. The
-                                // placeholder world stays in place; render
-                                // continues with the stale SVDAG (4lp).
-                                log::error!("Sim step panicked: {msg}");
-                                self.paused = true;
-                            }
-                        }
-                    }
-                }
+                // hash-thing-dbv3 (vqke.1.1): the once-per-RedrawRequested
+                // `step_handle.is_finished()` poll moved out of this arm.
+                // The sim worker now wakes the main loop directly via
+                // `AppUserEvent::SimDone` (see fn user_event below); that
+                // path runs `apply_step_result` the moment winit
+                // dispatches the event — typically before the next
+                // RedrawRequested fires. This arm proceeds with whatever
+                // world state was in place at the start of the frame
+                // (real post-ingest world, or sim::World::placeholder
+                // while a step is mid-flight, gated by `is_stepping()`).
 
                 if !self.is_stepping() {
                     // a9jd: drain a queued scene swap FIRST. If one is set and
@@ -3779,7 +3893,11 @@ fn main() {
     let want_focus_on_launch =
         demo || std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
 
-    let mut event_loop_builder = EventLoop::builder();
+    // hash-thing-dbv3 (vqke.1.1): use `EventLoop::<AppUserEvent>::with_user_event()`
+    // so the sim worker can wake the main loop via
+    // `EventLoopProxy::send_event(AppUserEvent::SimDone(...))`. The proxy
+    // is cloned into each spawned worker by `maybe_start_background_step`.
+    let mut event_loop_builder = EventLoop::<AppUserEvent>::with_user_event();
     #[cfg(target_os = "macos")]
     {
         // Make launch behavior explicit instead of depending on bundle/agent defaults.
@@ -3808,6 +3926,12 @@ fn main() {
     app.want_focus_on_launch = want_focus_on_launch;
     app.dump_frame_path = dump_frame_path;
     app.dump_scene = dump_scene;
+    // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
+    // worker (spawned later by `maybe_start_background_step`) can wake
+    // the main loop. Cloning the proxy into the worker is the correct
+    // pattern — `EventLoopProxy<T>: Send + Sync + Clone` for any
+    // `T: Send` (verified against winit-0.30.13/src/platform_impl/macos/event_loop.rs:467).
+    app.event_proxy = Some(event_loop.create_proxy());
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -4886,12 +5010,18 @@ mod tests {
         assert_eq!(player.pos[2], expected_z);
         assert!(app.is_stepping(), "step should start after player update");
 
-        let handle = app.step_handle.take().expect("step handle should exist");
-        let (world, _timings) = handle
-            .join()
-            .expect("step thread should not panic")
-            .expect("step thread should return a world");
-        app.world = world;
+        // hash-thing-dbv3 (vqke.1.1): `step_handle: Option<JoinHandle<...>>`
+        // is gone — the worker now delivers its result via the
+        // `AppUserEvent::SimDone` user event, which only fires inside
+        // an active winit event loop. This test runs without a loop, so
+        // the worker can't deliver: it spins up, runs to completion
+        // (with `event_proxy = None` and `window = None` it silently
+        // no-ops the wake), and the result is dropped on worker exit.
+        // The detached worker holds the moved `world` for ~one step's
+        // worth of wall time before drop. That's fine for the test:
+        // we've already asserted the kick-off behaviour
+        // (`is_stepping()` true after `maybe_start_background_step`),
+        // which is the contract the test is named for.
     }
 
     #[test]
