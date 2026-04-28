@@ -340,20 +340,24 @@ pub struct HashlifeStats {
     /// Set the env var when you want to reproduce vqke.2's diagnostic
     /// run and check the new memo_summary tokens.
     ///
-    /// Macro path note: `step_node_macro` (`hashlife.rs:548`) shares
-    /// `cache_misses` with the micro path. On the 256³ default scene
-    /// `step_recursive_pow2` is not used, so macro misses are 0 and
-    /// the ratio is meaningful. If a future caller exercises the
-    /// macro path, `memo_phase_alias` becomes a lower-bound across
-    /// micro-only misses.
+    /// Macro path note: `step_node_macro` (`hashlife.rs:645` —
+    /// `step_recursive_pow2` path) shares `cache_misses` with the
+    /// micro path. On the 256³ default scene that path is not
+    /// exercised, so macro misses are 0 (`memo_mac=0` in
+    /// `memo_summary`) and the ratio is exact. If a future caller
+    /// uses the macro path, `cache_misses_phase_aliased / cache_misses`
+    /// becomes a lower-bound on the micro-path's true alias rate
+    /// (the macro path doesn't probe).
     pub cache_misses_phase_aliased: u64,
     /// hash-thing-bjdl (vqke.2): probe for hypothesis 2 (cache eviction
     /// too aggressive). Counts hashlife_cache entries dropped during
-    /// `remap_caches` because their NodeId or result NodeId was not in
-    /// the post-compaction reachability set. Most steps are 0 because
-    /// `maybe_compact` is gated on the 2× growth threshold. A spike
-    /// where dropped/(dropped+kept) > 0.5 means eviction is throwing
-    /// live entries away.
+    /// `remap_caches` because their NodeId or result NodeId was not
+    /// present in the post-compaction reachability set. Most steps
+    /// are 0 because `maybe_compact` is gated on the 2× growth
+    /// threshold. A high `dropped/(dropped+kept)` ratio shows the
+    /// cache is fragmenting against the reachability sweep — not
+    /// necessarily a sweep bug, but evidence that cache lifetime is
+    /// shorter than the reuse horizon. A low ratio rules H2 out.
     pub compact_entries_dropped: u64,
     /// hash-thing-bjdl (vqke.2): paired with `compact_entries_dropped`.
     /// Counts hashlife_cache entries that survived the most recent
@@ -6055,6 +6059,12 @@ mod tests {
         a.misses_by_level[0] = 1;
         a.misses_by_level[3] = 13;
         a.misses_by_level[7] = 17;
+        // hash-thing-bjdl (vqke.2): exercise the new accumulators
+        // alongside the existing scalar fields, so a future refactor
+        // that drops one of these from `accumulate` is caught.
+        a.cache_misses_phase_aliased = 2;
+        a.compact_entries_kept = 100;
+        a.compact_entries_dropped = 25;
 
         b.cache_hits = 2;
         b.cache_misses = 4;
@@ -6063,6 +6073,9 @@ mod tests {
         b.misses_by_level[0] = 10;
         b.misses_by_level[3] = 100;
         b.misses_by_level[7] = 1000;
+        b.cache_misses_phase_aliased = 1;
+        b.compact_entries_kept = 50;
+        b.compact_entries_dropped = 0;
 
         total.accumulate(&a);
         total.accumulate(&b);
@@ -6074,6 +6087,9 @@ mod tests {
         assert_eq!(total.misses_by_level[0], 11);
         assert_eq!(total.misses_by_level[3], 113);
         assert_eq!(total.misses_by_level[7], 1017);
+        assert_eq!(total.cache_misses_phase_aliased, 3);
+        assert_eq!(total.compact_entries_kept, 150);
+        assert_eq!(total.compact_entries_dropped, 25);
         // Untouched indices must remain zero — catches the "summed into
         // index 0" copy-paste bug.
         for (i, &v) in total.misses_by_level.iter().enumerate() {
@@ -6189,6 +6205,23 @@ mod tests {
                 line.len(),
             );
         }
+
+        // hash-thing-bjdl (vqke.2): the three new tokens must be
+        // present in the formatted line. Per Codex code-review §3:
+        // lock the bounded summary tokens into the output-contract
+        // tests so a future refactor that drops them is caught.
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_period=")),
+            "memo_summary must include memo_period= token, got {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_phase_aliased=")),
+            "memo_summary must include memo_phase_aliased= token, got {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_compact_drop=")),
+            "memo_summary must include memo_compact_drop= token, got {lines:?}",
+        );
     }
 
     #[test]

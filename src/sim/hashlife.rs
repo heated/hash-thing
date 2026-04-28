@@ -64,9 +64,33 @@ static MEMO_DIAG_STATE: AtomicU8 = AtomicU8::new(0);
 const MEMO_DIAG_ON: u8 = 1;
 const MEMO_DIAG_OFF: u8 = 2;
 
+// hash-thing-bjdl (vqke.2): test-only override for the diag gate,
+// kept on the test thread's local storage so a parallel sibling
+// test running on a different worker thread continues to observe
+// the production global state (per Codex code-review §1 on the
+// landed diagnostic — a process-wide override leaks the diag-ON
+// signal to whichever sibling happens to call `step_node` during
+// the override window). Each test thread reads its own override
+// (default `None` = "no override, use the global atomic"); tests
+// that need to set it write their value here. Cleared per-thread,
+// not per-process.
+#[cfg(test)]
+thread_local! {
+    static MEMO_DIAG_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Read-only accessor for the memo-diag flag. After the first call
 /// the env-var lookup is cached as an atomic load on the hot path.
+/// In test builds, a thread-local override (`force_memo_diag_for_test`)
+/// takes precedence so unit tests can exercise the probe without
+/// affecting parallel sibling tests.
 fn memo_diag_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(override_val) = MEMO_DIAG_OVERRIDE.with(|c| c.get()) {
+            return override_val;
+        }
+    }
     match MEMO_DIAG_STATE.load(Ordering::Relaxed) {
         MEMO_DIAG_ON => true,
         MEMO_DIAG_OFF => false,
@@ -81,20 +105,25 @@ fn memo_diag_enabled() -> bool {
     }
 }
 
-/// Test-only override for the memo-diag gate. Lets unit tests
-/// exercise the probe path without depending on the process
-/// environment. Race-free under the test harness's per-test
-/// serialisation: tests that touch the global gate must run on a
-/// dedicated thread or accept that their changes are visible to
-/// concurrent tests until reset. Pair every `force_memo_diag_for_test(true)`
-/// with a `force_memo_diag_for_test(false)` at scope exit if other
-/// concurrent tests would care.
+/// Test-only override for the memo-diag gate. Sets a thread-local
+/// flag that takes precedence over the process-wide atomic for the
+/// calling thread only — sibling tests running on other worker
+/// threads continue to see the production-default value (OFF unless
+/// the env var was set at process start). Pair with
+/// `clear_memo_diag_test_override()` at scope exit if a downstream
+/// helper on the same thread should resume reading the global gate.
 #[cfg(test)]
 pub(crate) fn force_memo_diag_for_test(enabled: bool) {
-    MEMO_DIAG_STATE.store(
-        if enabled { MEMO_DIAG_ON } else { MEMO_DIAG_OFF },
-        Ordering::Relaxed,
-    );
+    MEMO_DIAG_OVERRIDE.with(|c| c.set(Some(enabled)));
+}
+
+/// Clear the test-thread's override, so subsequent
+/// `memo_diag_enabled()` calls on this thread fall through to the
+/// process-wide atomic (production default).
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn clear_memo_diag_test_override() {
+    MEMO_DIAG_OVERRIDE.with(|c| c.set(None));
 }
 
 /// Per-phase micro-timing of one [`World::step_recursive_profiled`] invocation
