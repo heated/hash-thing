@@ -261,6 +261,22 @@ pub struct World {
     /// Cache for `is_all_inert`: NodeId → bool.
     /// True if every leaf in the subtree has CaRule::Noop and no BlockRule.
     pub(crate) hashlife_all_inert_cache: FxHashMap<NodeId, bool>,
+    /// hash-thing-5ie4 (vqke.2.1): cache for `subtree_has_slow_divisor`:
+    /// `NodeId → bool`. True if the subtree contains any cell whose
+    /// material has `tick_divisor > 1`. Drives the phase-fold in
+    /// `step_node`: a node with no slow-divisor descendants has a step
+    /// result that depends only on `(NodeId, gen % 2)`, so the cache
+    /// key collapses from period N → period 2 for that branch.
+    ///
+    /// **Invalidation surface** (must be cleared on every path that
+    /// changes the answer): material registry mutations
+    /// (`invalidate_material_caches`, called via `mutate_materials`)
+    /// and the same world-reset / megastructure-seed paths that drop
+    /// `hashlife_inert_cache` / `hashlife_all_inert_cache`. The
+    /// answer is content-determined so node-mutation paths (cell
+    /// edits) get new NodeIds and hit the cache fresh — no manual
+    /// invalidation needed there.
+    pub(crate) hashlife_slow_divisor_cache: FxHashMap<NodeId, bool>,
     /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
     /// Avoids O(n³) flatten-and-scan on every `step_recursive_pow2` call.
     pub(crate) block_rule_present: Option<bool>,
@@ -513,6 +529,7 @@ impl World {
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
+            hashlife_slow_divisor_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
             clone_sources: Vec::new(),
@@ -543,6 +560,7 @@ impl World {
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
+            hashlife_slow_divisor_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
             clone_sources: Vec::new(),
@@ -585,6 +603,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         self.block_rule_present = None;
     }
 
@@ -1645,6 +1669,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         self.clone_sources.clear();
         let terrain_params = TerrainParams::for_level(self.level);
         let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level)
@@ -1678,6 +1708,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         self.clone_sources.clear();
         let field = GyroidField::for_world(self.level, 42);
         let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
@@ -2531,6 +2567,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
     }
 
     /// Replace the world with terrain generated from `params`. Uses
@@ -2553,6 +2595,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         // New epoch: the renderer's cache holds entries keyed in the previous
         // epoch's NodeId namespace, which is meaningless against a brand-new
         // NodeStore. Publishing an *empty* remap drives `Svdag::apply_remap`

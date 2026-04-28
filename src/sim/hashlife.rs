@@ -478,6 +478,46 @@ impl World {
         result
     }
 
+    /// hash-thing-5ie4 (vqke.2.1): does the subtree contain any cell
+    /// whose material has `tick_divisor > 1`? Drives the phase-fold
+    /// in `step_node`: when this returns `false` for a node, its
+    /// step result depends only on `(node, generation % 2)`, so the
+    /// memo key collapses from the registry's full `memo_period` to
+    /// Margolus parity.
+    ///
+    /// Cached per NodeId on `self.hashlife_slow_divisor_cache`. The
+    /// answer is content-determined (NodeIds are content-addressed),
+    /// so cell-edit paths produce a fresh NodeId and hit the cache
+    /// cold — only material-registry mutation invalidates existing
+    /// entries (`World::invalidate_material_caches`).
+    ///
+    /// Implementation note (per Codex plan-review §1): the
+    /// `tick_divisor_flags()` slice is queried INSIDE the `Leaf`
+    /// arm, not before the `match`. Holding the slice across the
+    /// recursive `Interior` call would conflict with the recursive
+    /// `&mut self` borrow.
+    fn subtree_has_slow_divisor(&mut self, node: NodeId) -> bool {
+        if node == NodeId::EMPTY {
+            return false;
+        }
+        if let Some(&cached) = self.hashlife_slow_divisor_cache.get(&node) {
+            return cached;
+        }
+        let result = match self.store.get(node).clone() {
+            Node::Leaf(state) => {
+                let cell = Cell::from_raw(state);
+                let mat = cell.material() as usize;
+                let divisors = self.materials.tick_divisor_flags();
+                divisors.get(mat).copied().unwrap_or(1) > 1
+            }
+            Node::Interior { children, .. } => children
+                .into_iter()
+                .any(|c| self.subtree_has_slow_divisor(c)),
+        };
+        self.hashlife_slow_divisor_cache.insert(node, result);
+        result
+    }
+
     /// Check if a subtree is uniformly one inert material.
     /// Returns Some(state) if all leaves are the same inert state.
     fn inert_uniform_state(&mut self, node: NodeId) -> Option<CellState> {
@@ -553,6 +593,18 @@ impl World {
                 self.hashlife_all_inert_cache.insert(new_node, inert);
             }
         }
+
+        // hash-thing-5ie4 (vqke.2.1): remap hashlife_slow_divisor_cache:
+        // NodeId → bool. Same lifecycle as the inert / all-inert
+        // caches above. Entries whose NodeId is unreachable in the
+        // post-compact namespace are dropped on the same principle.
+        let old_slow_div = std::mem::take(&mut self.hashlife_slow_divisor_cache);
+        self.hashlife_slow_divisor_cache.reserve(old_slow_div.len());
+        for (node, has_slow) in old_slow_div {
+            if let Some(&new_node) = remap.get(&node) {
+                self.hashlife_slow_divisor_cache.insert(new_node, has_slow);
+            }
+        }
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -614,7 +666,37 @@ impl World {
             return self.center_node(node, level);
         }
 
-        let key = (node, schedule_phase);
+        // hash-thing-5ie4 (vqke.2.1): phase-fold for fast subtrees.
+        // When `memo_period > 2` the registry has at least one
+        // material with `tick_divisor > 1`, so the cache key uses
+        // `gen % LCM(2 * d_i) > 2`. But for a subtree containing no
+        // slow-divisor cells, the step result depends only on
+        // `(node, gen % 2)` — the divisor gates in
+        // `step_grid_once` are dead code (all divisors = 1) and the
+        // BlockRule offset is `(gen / 1) % 2 = gen % 2`. Fold the
+        // key for those subtrees so cache reuse extends across
+        // every-other-generation pairs.
+        //
+        // The check is gated on `memo_period > 2` so the only-Margolus
+        // (period=2) world does not pay for the predicate: the fold
+        // would be a no-op there anyway (`schedule_phase % 2 ==
+        // schedule_phase`). The predicate cache is hot in steady
+        // state (one map lookup per call); first-population cost
+        // amortises across the recursive descent.
+        //
+        // Correctness note (per Claude plan-review §1): this fold
+        // is sound because `step_recursive_case` builds intermediate
+        // nodes from grandchildren of `node`, and the content-addressed
+        // `store.interior` returns the same NodeId for the same
+        // content. A fast subtree's descendants are by induction
+        // also fast, so every recursive call inside the fast branch
+        // sees the same predicate value and the same fold.
+        let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
+            schedule_phase % 2
+        } else {
+            schedule_phase
+        };
+        let key = (node, effective_phase);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
@@ -632,9 +714,18 @@ impl World {
         // per step (5-10 ms) which the rest of vqke is trying to
         // speed up — hence the gate. Boolean-per-miss semantics: a
         // node aliased at three other phases counts ONCE.
+        //
+        // Probe is anchored on `effective_phase` (post-fold), so a
+        // miss whose fast-subtree fold already collapsed it to
+        // phase=0/1 only flags as aliased when the *folded* key has
+        // an alternate-phase sibling — which after vqke.2.1 should
+        // be rare. The pre-fold raw `schedule_phase` could expose a
+        // higher alias rate, but post-fold is the relevant signal
+        // for whether further key-shape changes (vqke.2.2) would
+        // recoup more.
         if memo_diag_enabled() && memo_period > 1 {
             for p in 0..memo_period {
-                if p == schedule_phase {
+                if p == effective_phase {
                     continue;
                 }
                 if self.hashlife_cache.contains_key(&(node, p)) {
@@ -645,9 +736,9 @@ impl World {
         }
 
         let result = if level == 3 {
-            self.step_base_case(node, schedule_phase)
+            self.step_base_case(node, effective_phase)
         } else {
-            self.step_recursive_case(node, level, schedule_phase, memo_period)
+            self.step_recursive_case(node, level, effective_phase, memo_period)
         };
 
         self.hashlife_cache.insert(key, result);
@@ -2709,5 +2800,129 @@ mod tests {
         world.remap_caches(&remap);
         assert_eq!(world.hashlife_stats.compact_entries_kept, 0);
         assert_eq!(world.hashlife_stats.compact_entries_dropped, 0);
+    }
+
+    // ============================================================
+    // hash-thing-5ie4 (vqke.2.1): phase-fold tests for the
+    // memo cache key. The fold collapses (NodeId, schedule_phase)
+    // to (NodeId, schedule_phase % 2) for subtrees containing no
+    // slow-divisor materials.
+    // ============================================================
+
+    /// `subtree_has_slow_divisor` correctly classifies a leaf containing
+    /// water (tick_divisor=2 in terrain_defaults) as slow, and an empty
+    /// or stone-only subtree as fast.
+    #[test]
+    fn subtree_has_slow_divisor_classifies_water_vs_stone() {
+        use crate::terrain::materials::{STONE, WATER};
+        let mut world = World::new(4);
+
+        // Empty world root: predicate must be false.
+        assert!(
+            !world.subtree_has_slow_divisor(world.root),
+            "empty subtree must be fast"
+        );
+
+        // Stone-only subtree: stone has tick_divisor=1, predicate false.
+        world.set(wc(1), wc(1), wc(1), STONE);
+        let stone_root = world.root;
+        assert!(
+            !world.subtree_has_slow_divisor(stone_root),
+            "stone-only subtree must be fast (tick_divisor=1)"
+        );
+
+        // Insert one water cell anywhere — predicate flips to true.
+        world.set(wc(8), wc(8), wc(8), WATER);
+        let mixed_root = world.root;
+        assert!(
+            world.subtree_has_slow_divisor(mixed_root),
+            "subtree containing water (tick_divisor=2) must be slow"
+        );
+    }
+
+    /// hash-thing-5ie4 / Codex plan-review §5: stale-cache regression.
+    /// After `mutate_materials` raises a divisor on a material that
+    /// was previously fast, the predicate must reflect the new value
+    /// for previously-cached nodes. Without invalidation in
+    /// `invalidate_material_caches`, the predicate would silently
+    /// return the stale `false` and corrupt the fold.
+    #[test]
+    fn subtree_has_slow_divisor_invalidates_on_material_mutation() {
+        use crate::terrain::materials::{STONE, STONE_MATERIAL_ID};
+        let mut world = World::new(4);
+        world.set(wc(2), wc(2), wc(2), STONE);
+        let stone_root = world.root;
+
+        // Initially fast (stone tick_divisor=1).
+        assert!(
+            !world.subtree_has_slow_divisor(stone_root),
+            "stone subtree starts fast"
+        );
+
+        // Mutate registry: bump stone's divisor to 4.
+        world.set_material_tick_divisor(STONE_MATERIAL_ID, 4);
+
+        // After invalidation, the predicate cache must be cleared
+        // so the fresh query reflects the updated divisor.
+        assert!(
+            world.subtree_has_slow_divisor(stone_root),
+            "after raising stone's tick_divisor, the previously-fast subtree must reclassify as slow — otherwise the fold corrupts the memo"
+        );
+    }
+
+    /// Semantic correctness of the fold: for a fast subtree at a
+    /// period-4 world, `step_recursive` at gen=0 and gen=2 must
+    /// produce identical world.root values when the world's content
+    /// is reset between runs (i.e. without cache reuse). Per Codex
+    /// plan-review §5 this is the test that proves the fold is
+    /// computationally sound, not just that it caches correctly.
+    #[test]
+    fn fast_subtree_step_result_invariant_under_gen_plus_two() {
+        use crate::terrain::materials::STONE;
+
+        // Build the same fast (stone-only, no water) world twice;
+        // step once each at gen=0 and gen=2. Result roots must match.
+        fn make_fast_world() -> World {
+            let mut world = World::new(4);
+            // 4×4×4 stone region; mixed alive/dead is impossible
+            // here (stone is inert), but inert subtrees short-circuit
+            // before the cache. Use stone+air pattern that exercises
+            // CaRule (stone next to air boundaries).
+            for x in 1..5 {
+                for y in 1..5 {
+                    for z in 1..5 {
+                        world.set(wc(x), wc(y), wc(z), STONE);
+                    }
+                }
+            }
+            world
+        }
+
+        // Run A: gen=0.
+        let mut world_a = make_fast_world();
+        let memo_period_a = world_a.materials.memo_period();
+        // Sanity: terrain_defaults has water (divisor=2) → period=4.
+        assert_eq!(
+            memo_period_a, 4,
+            "this test relies on memo_period=4 from terrain_defaults"
+        );
+        world_a.step_recursive();
+        let root_a_gen1 = world_a.root;
+
+        // Run B: gen=2 (skip ahead by 2 BEFORE stepping).
+        let mut world_b = make_fast_world();
+        world_b.generation = 2;
+        world_b.step_recursive();
+        let root_b_gen3 = world_b.root;
+
+        // Both worlds did one step on identical content. World A
+        // stepped at gen=0 (phase=0), World B at gen=2 (phase=2 in
+        // raw period; effective_phase=0 after fold). For a fast
+        // subtree the result must be identical — that's the
+        // theorem the fold relies on.
+        assert_eq!(
+            root_a_gen1, root_b_gen3,
+            "fast subtree must produce identical step result at gen=0 and gen=2 (proves the fold's correctness independent of cache reuse)"
+        );
     }
 }
