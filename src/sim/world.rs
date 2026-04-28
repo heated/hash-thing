@@ -307,6 +307,22 @@ pub struct HashlifeStats {
     /// BlockRule / Margolus) across all memo-miss base cases in one step
     /// (hash-thing-71mp).
     pub phase2_ns: u64,
+    /// hash-thing-vqke Phase 0: total wall-clock nanoseconds inside the
+    /// top-level `step_node` call from `step_recursive`. Includes p1+p2
+    /// at the leaves PLUS the recursive-descent / hash-cons / memo-lookup
+    /// overhead between leaves. `step_node_wall_ns - phase1_ns - phase2_ns`
+    /// approximates the descent-and-intern cost — the unaccounted slice
+    /// the bead's szyh-baseline evidence (~94 ms at 256³) was about.
+    /// Recorded once per `step_recursive` call (not accumulated across
+    /// the recursion); per-step, not lifetime — matches phase1/phase2
+    /// shape so the `memo_summary` line gives a self-consistent
+    /// breakdown.
+    pub step_node_wall_ns: u64,
+    /// hash-thing-vqke Phase 0: wall-clock nanoseconds spent in
+    /// `maybe_compact()` after `step_node` completes. Most steps are
+    /// 0 (the 2× growth threshold gates compaction); the spikes show
+    /// up roughly every N steps where N depends on churn. Per-step.
+    pub compact_ns: u64,
 }
 
 impl HashlifeStats {
@@ -319,6 +335,11 @@ impl HashlifeStats {
         self.fixed_point_skips += step.fixed_point_skips;
         self.phase1_ns += step.phase1_ns;
         self.phase2_ns += step.phase2_ns;
+        // hash-thing-vqke: lifetime accumulators for the per-step
+        // wall-clock decompositions. Useful for long-run averages
+        // (the per-step values fluctuate with churn / compact cadence).
+        self.step_node_wall_ns += step.step_node_wall_ns;
+        self.compact_ns += step.compact_ns;
         for (dst, src) in self
             .misses_by_level
             .iter_mut()
@@ -2213,7 +2234,17 @@ impl World {
     ///
     /// Format: `memo_hit=<fraction> memo_churn=<signed-fraction>
     /// memo_tbl=<int> memo_mac=<int> memo_mac_bytes=<int>
-    /// p1=<ms>ms p2=<ms>ms`.
+    /// p1=<ms>ms p2=<ms>ms p3=<ms>ms p4=<ms>ms`.
+    ///
+    /// `p3` (hash-thing-vqke Phase 0) is the descent-and-intern overhead:
+    /// `step_node_wall_ns - phase1_ns - phase2_ns`. It captures the
+    /// recursive memo lookup, hash-cons interning, and intermediate-node
+    /// allocation cost between leaf evaluations.
+    ///
+    /// `p4` is `compact_ns` — the wall-clock spent in `maybe_compact()`
+    /// after `step_node`. Most steps are 0 (the 2× growth gate); compact
+    /// spikes are the cost spread across N steps where N depends on
+    /// churn.
     ///
     /// `memo_churn` is `window_hit_rate − lifetime_hit_rate` over the last
     /// `MemoWindow::CAPACITY` steps. Positive = recent steps cache better
@@ -2239,8 +2270,19 @@ impl World {
         let last_step = &self.hashlife_stats;
         let p1_ms = last_step.phase1_ns as f64 / 1_000_000.0;
         let p2_ms = last_step.phase2_ns as f64 / 1_000_000.0;
+        // hash-thing-vqke Phase 0: descent-and-intern overhead is
+        // step_node wall minus the per-cell + per-block leaf wall.
+        // saturating_sub keeps the number sane on the rare frame
+        // where leaf timers overlap with descent timers slightly
+        // (e.g. inner-loop measurement quantization).
+        let descent_ns = last_step
+            .step_node_wall_ns
+            .saturating_sub(last_step.phase1_ns)
+            .saturating_sub(last_step.phase2_ns);
+        let p3_ms = descent_ns as f64 / 1_000_000.0;
+        let p4_ms = last_step.compact_ns as f64 / 1_000_000.0;
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} p1={:.2}ms p2={:.2}ms",
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms",
             hit_rate,
             churn,
             self.hashlife_cache.len(),
@@ -2248,6 +2290,8 @@ impl World {
             self.macro_cache_bytes_est(),
             p1_ms,
             p2_ms,
+            p3_ms,
+            p4_ms,
         )
     }
 
@@ -6067,8 +6111,12 @@ mod tests {
         );
         for line in &lines {
             assert!(
-                line.starts_with("memo_") || line.starts_with("p1=") || line.starts_with("p2="),
-                "field must use an approved HUD prefix (memo_ / p1 / p2), got {line:?}",
+                line.starts_with("memo_")
+                    || line.starts_with("p1=")
+                    || line.starts_with("p2=")
+                    || line.starts_with("p3=")
+                    || line.starts_with("p4="),
+                "field must use an approved HUD prefix (memo_ / p1 / p2 / p3 / p4), got {line:?}",
             );
             assert!(
                 line.len() <= 25,
@@ -6130,6 +6178,53 @@ mod tests {
             stats.phase2_ns > 0,
             "phase2_ns should accumulate across step_grid_once calls, got 0",
         );
+    }
+
+    #[test]
+    fn step_recursive_records_step_node_wall_and_compact_ns() {
+        // hash-thing-vqke Phase 0: step_node_wall_ns must be non-zero
+        // (always taken, every step). compact_ns is 0 on a fresh tiny
+        // world (the 2× growth gate hasn't tripped) — so we only assert
+        // it stays well-defined (saturating arithmetic, no panic) and
+        // that step_node_wall_ns >= phase1_ns + phase2_ns (descent
+        // always at least sees the leaves).
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+
+        let stats = &world.hashlife_stats;
+        assert!(
+            stats.step_node_wall_ns > 0,
+            "step_node_wall_ns should be set on every step, got 0",
+        );
+        // p1+p2 happen INSIDE step_node, so step_node_wall must be >= their sum.
+        // (Inequality is non-strict because the timers nest precisely.)
+        assert!(
+            stats.step_node_wall_ns >= stats.phase1_ns + stats.phase2_ns,
+            "step_node_wall_ns ({}) should be >= phase1_ns ({}) + phase2_ns ({})",
+            stats.step_node_wall_ns,
+            stats.phase1_ns,
+            stats.phase2_ns,
+        );
+        // compact_ns stays 0 unless the 2× growth gate fired — fine
+        // here, just confirm the field exists and didn't panic.
+        let _ = stats.compact_ns;
+    }
+
+    #[test]
+    fn memo_summary_includes_p3_and_p4_phase_breakdown() {
+        // hash-thing-vqke Phase 0: the perf summary must include p3
+        // (descent overhead) and p4 (compact wall) so the szyh-baseline
+        // unaccounted-94ms slice gets a phase-by-phase breakdown.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+
+        let summary = world.memo_summary();
+        assert!(summary.contains("p3="), "missing p3 in summary: {summary}");
+        assert!(summary.contains("p4="), "missing p4 in summary: {summary}");
+        // The HUD-overlay tester (memo_summary_splits_cleanly_for_hud_overlay)
+        // independently asserts the field-prefix whitelist + width caps.
     }
 
     #[test]

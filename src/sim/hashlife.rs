@@ -97,12 +97,14 @@ impl World {
         // phase always produce identical outputs (iowh).
         let period = self.materials.memo_period();
         let phase = self.generation % period;
+        // hash-thing-vqke Phase 0: bracket step_node (recursive descent
+        // + leaf evaluation) and maybe_compact separately so the perf
+        // log decomposes the previously-unaccounted slice of `step`.
+        let t_step_node = std::time::Instant::now();
         let result = self.step_node(padded_root, padded_level, phase);
+        self.hashlife_stats.step_node_wall_ns = t_step_node.elapsed().as_nanos() as u64;
         self.root = result;
-        let step_stats = self.hashlife_stats;
-        self.hashlife_stats_total.accumulate(&step_stats);
-        self.memo_window
-            .push(step_stats.cache_hits, step_stats.cache_misses);
+        let step_stats_pre_compact = self.hashlife_stats;
 
         // No post-pass gap-fill: qy4g option G (2026-04-26) — static
         // internal gaps close in 1-2 ticks via parity-flip; falling
@@ -110,7 +112,19 @@ impl World {
         // World::step and SPEC.md for the visible-artifact tradeoff.
         self.generation += 1;
 
+        let t_compact = std::time::Instant::now();
         self.maybe_compact();
+        self.hashlife_stats.compact_ns = t_compact.elapsed().as_nanos() as u64;
+
+        // hash-thing-vqke: accumulate AFTER compact so the lifetime
+        // accumulator includes p4 (compact) and p3 (step_node wall).
+        // memo_window only tracks hit/miss counts, so it stays based
+        // on the pre-compact stats snapshot (compact doesn't change
+        // those counters).
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window
+            .push(step_stats_pre_compact.cache_hits, step_stats_pre_compact.cache_misses);
     }
 
     /// Per-column gap-fill path. Retained `#[cfg(test)]` after qy4g option G
