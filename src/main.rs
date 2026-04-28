@@ -540,6 +540,13 @@ struct App {
     jump_was_held: bool,
     /// Pause redraw-driven rendering when the window loses focus.
     focused: bool,
+    /// hash-thing-qny5: when `HASH_THING_PERF_CAPTURE=1`, keep rendering
+    /// even when the window is unfocused. Long-form perf captures (e.g.
+    /// szyh / 9k4w-style 120s steady-state runs) can then proceed without
+    /// stealing focus from the user. Cached at startup; the env var is
+    /// read once. The `occluded` short-circuit is unaffected — a hidden
+    /// surface still pauses (8jp), since there's no point rendering it.
+    render_when_unfocused: bool,
     /// Camera mode: orbit (debug) or first-person (gameplay).
     camera_mode: CameraMode,
     /// The player entity, if spawned.
@@ -594,12 +601,25 @@ struct App {
     /// existing `App::new(N)` test callers default this to `None`).
     /// Threaded through to `Renderer::new`.
     target_pixels_override: Option<u64>,
+    /// hash-thing-kh9l: focus the window on launch. Set in `main()` from
+    /// `--demo` (kh9l) or `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults
+    /// to `false` so the 40+ test callers stay in the no-focus regime.
+    /// Mirrored into the macOS event_loop_builder's
+    /// `with_activate_ignoring_other_apps` flag so both gates fire from
+    /// the same input.
+    want_focus_on_launch: bool,
     /// hash-thing-hc0g: when `Some(path)`, render exactly one frame to
     /// off-surface, write a PNG to `path`, then exit. The window stays
     /// hidden so there is no foreground-window contamination. Set from
     /// `main()` after construction; default `None` for the 40+ existing
     /// `App::new(N)` test callers.
     dump_frame_path: Option<std::path::PathBuf>,
+    /// hash-thing-j1mg: when `Some(scene)` (only valid alongside
+    /// `dump_frame_path`), dispatch the matching `PendingSceneSwap` in
+    /// `resumed()` so the captured frame shows that scene at its default
+    /// pose instead of the App-default terrain. `None` keeps the previous
+    /// hc0g default-terrain behavior unchanged.
+    dump_scene: Option<DumpScene>,
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -823,6 +843,8 @@ impl App {
             keys_held: HashSet::new(),
             jump_was_held: false,
             focused: true,
+            render_when_unfocused: std::env::var("HASH_THING_PERF_CAPTURE").ok().as_deref()
+                == Some("1"),
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
@@ -840,7 +862,9 @@ impl App {
             entities: sim::EntityStore::new(),
             volume_size,
             target_pixels_override: None,
+            want_focus_on_launch: false,
             dump_frame_path: None,
+            dump_scene: None,
             step_handle: None,
             step_start: std::time::Instant::now(),
             render_origin,
@@ -885,6 +909,11 @@ impl App {
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
+        }
+        if app.render_when_unfocused {
+            log::info!(
+                "HASH_THING_PERF_CAPTURE=1: rendering will continue while window is unfocused (qny5)"
+            );
         }
         if let Some(qos) = app.sim_qos {
             log::info!(
@@ -2272,12 +2301,17 @@ impl ApplicationHandler for App {
             );
             // Do NOT focus-on-launch by default (edward 2026-04-21): the
             // game stealing focus mid-dev-loop blocks keyboard input to the
-            // terminal/agent surface. Opt in with HASH_THING_FOCUS=1.
-            // hash-thing-hc0g: dump-frame mode never focuses (window is
-            // hidden anyway).
+            // terminal/agent surface. Opt in with `HASH_THING_FOCUS=1` (sgcv)
+            // or `--demo` (kh9l). Both feed `App::want_focus_on_launch` via
+            // `main()`. The macOS event_loop_builder's
+            // `with_activate_ignoring_other_apps` is set from the same
+            // signal, so both gates fire together.
+            // hash-thing-hc0g: dump-frame mode skips both visibility and
+            // focus — the window stays hidden so there is no foreground
+            // contamination.
             if !dump_frame {
                 window.set_visible(true);
-                if std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1") {
+                if self.want_focus_on_launch {
                     window.focus_window();
                 }
             }
@@ -2299,6 +2333,21 @@ impl ApplicationHandler for App {
                 renderer.enable_off_surface();
             }
             self.renderer = Some(renderer);
+            // hash-thing-j1mg: in dump-frame mode, optionally swap scenes
+            // before the first render so the captured frame shows e.g. the
+            // lattice intro beat instead of the App-default terrain. The
+            // scene loader runs synchronously here (we're not stepping yet)
+            // and uploads its own world to the renderer.
+            //
+            // We must also clear `startup_scene_pending` — otherwise the
+            // first RedrawRequested calls `load_initial_scene` which
+            // re-seeds terrain on top of the lattice/spectacle/etc. world
+            // we just loaded.
+            if let Some(scene) = self.dump_scene {
+                log::info!("--dump-scene: dispatching {} before first frame", scene.label());
+                self.dispatch_scene_swap(scene.to_swap());
+                self.startup_scene_pending = false;
+            }
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
             let player_pos = self.player_world_pos();
@@ -2794,7 +2843,9 @@ impl ApplicationHandler for App {
                 // (which already defaults true, but defense-in-depth: also
                 // skip the `occluded` short-circuit so an Occluded surface
                 // never strands a one-shot dump).
-                if self.dump_frame_path.is_none() && (self.occluded || !self.focused) {
+                if self.dump_frame_path.is_none()
+                    && (self.occluded || (!self.focused && !self.render_when_unfocused))
+                {
                     return;
                 }
 
@@ -3403,14 +3454,76 @@ fn write_dump_frame_png(
     Ok(())
 }
 
+/// hash-thing-j1mg: which scene to dispatch via `PendingSceneSwap` before
+/// the dump-frame render. `None` keeps the default (terrain heightmap, the
+/// scene `App::new` seeds). Each variant maps 1:1 to a scene-loader the user
+/// would otherwise reach by pressing a key (R/G/B/M/N + U/I/O lattice jumps).
+///
+/// The `LatticeBeat` variants reseed the lattice demo and then jump the
+/// camera to the matching beat pose — same semantics as the `U`/`I`/`O`
+/// debug-jump keys in orbit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpScene {
+    Terrain,
+    GolSmoke,
+    Spectacle,
+    Gyroid,
+    LatticeBeat(LatticeDemoBeat),
+}
+
+impl DumpScene {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "terrain" => Some(Self::Terrain),
+            "gol" => Some(Self::GolSmoke),
+            "spectacle" => Some(Self::Spectacle),
+            "gyroid" => Some(Self::Gyroid),
+            "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
+            "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
+            "lattice-panorama" => Some(Self::LatticeBeat(LatticeDemoBeat::Panorama)),
+            _ => None,
+        }
+    }
+
+    fn to_swap(self) -> PendingSceneSwap {
+        match self {
+            Self::Terrain => PendingSceneSwap::ResetTerrain,
+            Self::GolSmoke => PendingSceneSwap::ResetGolSmoke,
+            Self::Spectacle => PendingSceneSwap::LoadDemoSpectacle,
+            Self::Gyroid => PendingSceneSwap::LoadGyroid,
+            Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terrain => "terrain",
+            Self::GolSmoke => "gol",
+            Self::Spectacle => "spectacle",
+            Self::Gyroid => "gyroid",
+            Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
+            Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
+            Self::LatticeBeat(LatticeDemoBeat::Panorama) => "lattice-panorama",
+        }
+    }
+}
+
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
-/// caller's destructure (hash-thing-hc0g added `dump_frame`).
+/// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
+/// `demo`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedArgs {
     volume_size: u32,
     target_pixels: Option<u64>,
+    /// hash-thing-kh9l: `--demo` was passed (independent of target_pixels,
+    /// since `--res 1080p` produces the same pixel budget). Drives
+    /// window focus-on-launch in main().
+    demo: bool,
     /// `--dump-frame PATH`: render one frame to PNG at `PATH`, then exit.
     dump_frame: Option<std::path::PathBuf>,
+    /// `--dump-scene KIND`: hash-thing-j1mg, only meaningful with
+    /// `--dump-frame`. Selects which scene to dispatch before the dump.
+    dump_scene: Option<DumpScene>,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -3431,12 +3544,14 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    const USAGE: &str =
-        "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] [--dump-frame PATH]";
+    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
+                         [--dump-frame PATH] \
+                         [--dump-scene terrain|gol|spectacle|gyroid|lattice-intro|lattice-interior|lattice-panorama]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
     let mut dump_frame: Option<std::path::PathBuf> = None;
+    let mut dump_scene: Option<DumpScene> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -3477,6 +3592,21 @@ where
                 }
                 dump_frame = Some(std::path::PathBuf::from(v_str));
             }
+            "--dump-scene" => {
+                if dump_scene.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-scene");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene requires a KIND"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-scene requires a KIND; saw '{v_str}'");
+                }
+                let parsed = DumpScene::parse(v_str)
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene KIND: unrecognised '{v_str}'"));
+                dump_scene = Some(parsed);
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -3495,6 +3625,9 @@ where
     if demo && res_target.is_some() {
         panic!("{USAGE}\n--demo and --res are mutually exclusive");
     }
+    if dump_scene.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-scene requires --dump-frame");
+    }
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
@@ -3503,7 +3636,9 @@ where
     ParsedArgs {
         volume_size: volume_size.unwrap_or(DEFAULT_VOLUME_SIZE),
         target_pixels,
+        demo,
         dump_frame,
+        dump_scene,
     }
 }
 
@@ -3541,10 +3676,13 @@ fn main() {
     log::info!("  ;/' : decrease/increase chunk-LOD bias by 0.25 (clamped 0.25..4.0)");
     log::info!("  Esc: quit");
 
-    let parsed = parse_args_from(std::env::args().skip(1));
-    let volume_size = parsed.volume_size;
-    let target_pixels_override = parsed.target_pixels;
-    let dump_frame_path = parsed.dump_frame;
+    let ParsedArgs {
+        volume_size,
+        target_pixels: target_pixels_override,
+        demo,
+        dump_frame: dump_frame_path,
+        dump_scene,
+    } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
         volume_size.trailing_zeros()
@@ -3558,25 +3696,39 @@ fn main() {
             path.display()
         );
     }
+    if let Some(scene) = dump_scene {
+        log::info!("--dump-scene: {} (will dispatch before dump-frame render)", scene.label());
+    }
+
+    // Single source of truth for focus-on-launch. Two downstream sites
+    // both consume this: the macOS event-loop builder (must be set BEFORE
+    // event_loop.build()) and `App.want_focus_on_launch` (consumed at
+    // window-creation time after winit resumes the app). hash-thing-kh9l
+    // routes `--demo` into this gate so the wrapper-less invocation
+    // `cargo run -- --demo` activates the window the same way that
+    // `HASH_THING_FOCUS=1 cargo run` does today.
+    let want_focus_on_launch =
+        demo || std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
 
     let mut event_loop_builder = EventLoop::builder();
     #[cfg(target_os = "macos")]
     {
         // Make launch behavior explicit instead of depending on bundle/agent defaults.
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
-        // hash-thing-sgcv: gate the activate-ignoring-other-apps flag
-        // behind the same HASH_THING_FOCUS=1 env var that gates
-        // window.focus_window() at src/main.rs:1985. winit's default
-        // for this flag is `true` (PlatformSpecificEventLoopAttributes
-        // in winit/platform_impl/macos/event_loop.rs), so we MUST set
-        // it explicitly in both branches — omitting the setter would
+        // hash-thing-sgcv + kh9l: gate the activate-ignoring-other-apps
+        // flag behind the same `want_focus_on_launch` derived above
+        // (HASH_THING_FOCUS=1 env or `--demo` flag). Mirrors the
+        // window.focus_window() gate around src/main.rs:2277. winit's
+        // default for this flag is `true`
+        // (PlatformSpecificEventLoopAttributes in
+        // winit/platform_impl/macos/event_loop.rs), so we MUST set it
+        // explicitly in both branches — omitting the setter would
         // silently inherit the focus-stealing default and the gate
         // would be a no-op. Default is to NOT steal focus, so the
         // agent surface keeps keyboard input.
         // ActivationPolicy::Regular stays unconditional — it controls
         // dock/Cmd-Tab presence, not activation.
-        let want_focus = std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
-        event_loop_builder.with_activate_ignoring_other_apps(want_focus);
+        event_loop_builder.with_activate_ignoring_other_apps(want_focus_on_launch);
     }
     let event_loop = event_loop_builder
         .build()
@@ -3584,7 +3736,9 @@ fn main() {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
     app.target_pixels_override = target_pixels_override;
+    app.want_focus_on_launch = want_focus_on_launch;
     app.dump_frame_path = dump_frame_path;
+    app.dump_scene = dump_scene;
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -3651,6 +3805,7 @@ mod tests {
         let r = parse_args_from(["256"]);
         assert_eq!(r.volume_size, 256);
         assert_eq!(r.target_pixels, None);
+        assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
     }
 
@@ -3659,6 +3814,7 @@ mod tests {
         let r = parse_args_from(std::iter::empty::<&str>());
         assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
         assert_eq!(r.target_pixels, None);
+        assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
     }
 
@@ -3667,6 +3823,7 @@ mod tests {
         let r = parse_args_from(["--demo"]);
         assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(r.demo, "kh9l: --demo must surface as demo=true");
     }
 
     #[test]
@@ -3674,7 +3831,9 @@ mod tests {
         let r1 = parse_args_from(["--demo", "256"]);
         let r2 = parse_args_from(["256", "--demo"]);
         assert_eq!((r1.volume_size, r1.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r1.demo);
         assert_eq!((r2.volume_size, r2.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r2.demo);
     }
 
     #[test]
@@ -3682,6 +3841,10 @@ mod tests {
         let r = parse_args_from(["--res", "1440p", "512"]);
         assert_eq!(r.volume_size, 512);
         assert_eq!(r.target_pixels, Some(2560 * 1440));
+        assert!(
+            !r.demo,
+            "kh9l: --res 1440p is NOT --demo, even with same pixel budget"
+        );
     }
 
     #[test]
@@ -3689,6 +3852,20 @@ mod tests {
         let r = parse_args_from(["--res", "1920x1080"]);
         assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(
+            !r.demo,
+            "kh9l: --res 1920x1080 has same target as --demo but demo=false"
+        );
+    }
+
+    #[test]
+    fn parse_args_from_res_1080p_is_not_demo() {
+        // kh9l regression guard: --res 1080p produces the same target
+        // pixel budget as --demo, but `demo` is false. This bit drives
+        // focus-on-launch and must not fire for --res 1080p.
+        let r = parse_args_from(["--res", "1080p"]);
+        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(!r.demo);
     }
 
     // --- hash-thing-hc0g: --dump-frame CLI flag parsing ---
@@ -3707,6 +3884,7 @@ mod tests {
         let r = parse_args_from(["64", "--demo", "--dump-frame", "/tmp/foo.png"]);
         assert_eq!(r.volume_size, 64);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
     }
 
@@ -3715,6 +3893,7 @@ mod tests {
         let r = parse_args_from(["--res", "720p", "--dump-frame", "out.png", "256"]);
         assert_eq!(r.volume_size, 256);
         assert_eq!(r.target_pixels, Some(1280 * 720));
+        assert!(!r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("out.png")));
     }
 
@@ -3740,6 +3919,71 @@ mod tests {
     #[should_panic(expected = "--dump-frame requires a non-empty PATH")]
     fn parse_args_from_dump_frame_empty_path_panics() {
         let _ = parse_args_from(["--dump-frame", ""]);
+    }
+
+    // --- hash-thing-j1mg: --dump-scene CLI flag parsing ---
+
+    #[test]
+    fn parse_args_from_dump_scene_lattice_intro() {
+        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "lattice-intro"]);
+        assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/x.png")));
+        assert_eq!(
+            r.dump_scene,
+            Some(DumpScene::LatticeBeat(LatticeDemoBeat::Intro))
+        );
+    }
+
+    #[test]
+    fn parse_args_from_dump_scene_all_kinds() {
+        for (raw, expected) in [
+            ("terrain", DumpScene::Terrain),
+            ("gol", DumpScene::GolSmoke),
+            ("spectacle", DumpScene::Spectacle),
+            ("gyroid", DumpScene::Gyroid),
+            ("lattice-intro", DumpScene::LatticeBeat(LatticeDemoBeat::Intro)),
+            ("lattice-interior", DumpScene::LatticeBeat(LatticeDemoBeat::Interior)),
+            ("lattice-panorama", DumpScene::LatticeBeat(LatticeDemoBeat::Panorama)),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", raw]);
+            assert_eq!(r.dump_scene, Some(expected), "kind={raw}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires --dump-frame")]
+    fn parse_args_from_dump_scene_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-scene", "lattice-intro"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires a KIND")]
+    fn parse_args_from_dump_scene_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires a KIND; saw '--demo'")]
+    fn parse_args_from_dump_scene_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognised 'bogus'")]
+    fn parse_args_from_dump_scene_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-scene")]
+    fn parse_args_from_two_dump_scene_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "lattice-intro",
+            "--dump-scene",
+            "gol",
+        ]);
     }
 
     #[test]

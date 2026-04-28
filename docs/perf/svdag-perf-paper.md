@@ -505,6 +505,76 @@ cargo test --profile perf --test verify_gen_hash_cons -- --ignored --nocapture
 
 ---
 
+### 3.16 Steady-state characterization at 256³ × 50% windowed (`hash-thing-29xk`)
+
+Phase-0 of `docs/perf/render-perf-direction.md`. Per the standardized measurement protocol (§3.10's successor in render-perf-direction.md): M2 MBA 16GB, `--profile perf`, world 256³, `HASH_THING_RENDER_SCALE=0.5`, `--res 1080p` windowed on the external 4K display, run length 130s, first 34s discarded as warmup. Three independent runs.
+
+| Metric (post-warmup mean) | Run 1 | Run 2 | Run 3 | Across-run mean |
+|---|---:|---:|---:|---:|
+| `frame_total` | 36.85 ms | 37.41 ms | 37.48 ms | **37.25 ms** |
+| `surface_acquire_cpu` | 14.98 ms | 14.90 ms | 16.97 ms | 15.62 ms |
+| `render_cpu` | 15.21 ms | 15.13 ms | 17.22 ms | 15.85 ms |
+| `render_gpu` (compute pass) | 0.10 ms | 0.10 ms | 0.10 ms | 0.10 ms |
+| `render_pass_gpu` (blit + overlays) | 0.07 ms | 0.06 ms | 0.07 ms | 0.07 ms |
+| `submit_cpu` | 0.15 ms | 0.16 ms | 0.16 ms | 0.16 ms |
+| `prior_gpu_pipeline_cpu` | 59.54 ms | 60.54 ms | 64.14 ms | 61.41 ms |
+| `step` (background sim thread) | 126.77 ms | 126.68 ms | 139.86 ms | 131.10 ms |
+
+Per-window p95 (each log line emits mean/p95 over the most recent 64 samples ≈ 2 s) sits at ~38–44 ms across runs for `surface_acquire_cpu`, with maximum-of-windows reaching 44.94 / 45.48 / 50.02 ms — all consistent with the same multi-modal acquire distribution that §3.9 catalogued at shorter horizons.
+
+**Decision per render-perf-direction.md Phase-0 acceptance:** frame_total steady-state ≫ 17 ms (37 ms vs the 60 FPS budget). The ramp is **NOT** the dlse.2.2.3 warmup transient — it is a true scaling cost at 256³. **Phase 1 (cheaper rays) proceeds.**
+
+**Two findings worth carrying forward:**
+
+1. **Run-to-run reproducibility is excellent** (frame_total mean within 1.7 % across three independent runs). The scaling cost is robust, not a sampling artefact.
+2. **`prior_gpu_pipeline_cpu ≈ 61 ms` is roughly 1.6 × `frame_total`.** This metric tracks the wait for the previous frame's GPU pipeline to complete; the fact that it exceeds a single frame budget confirms the 2w1u surface-acquire pattern is in effect — the M2 surface is forcing implicit GPU sync that pipelines roughly 1.6 frames of work behind the CPU. Compute work itself is tiny (`render_gpu` = 0.10 ms, `render_pass_gpu` = 0.07 ms together = ~0.17 ms of *measured* GPU time per frame — ~0.5 % of frame budget). The remaining 36 ms is acquire/encode CPU + deferred GPU completion, not raycast cost.
+
+**Limitations.** These are the **256³ / 50% / windowed-external** arm only. Run length is 130 s (96 s post-warmup); even within this window, `frame_total` keeps drifting upward (range 18 ms → 79 ms within run 1, 23 ms → 80 ms within run 2 — see the `me6i` Phase-2 lead). The full Phase-0 matrix calls for 64³ / 256³ / 512³ × 0.5 / 1.0 × windowed-external + fullscreen-internal (12 arms × 3 runs = 36 captures); only 3 captures of one arm are recorded here. Follow-up arms left for sub-beads: 64³ + 512³ scale sensitivity at 50 %, render-scale sensitivity at 1.0, fullscreen-internal arm (requires interactive Mac display switch).
+
+**Reproduce (per-run command):**
+
+```text
+RUST_LOG=info HASH_THING_RENDER_SCALE=0.5 HASH_THING_FOCUS=1 \
+  timeout 130 ./target/perf/hash-thing 256 --res 1080p \
+  > /tmp/29xk-256-run.log 2>&1
+```
+
+Analyzer: `/tmp/29xk-analyze.py` (parses `frame_total=mean/p95ms` log lines, drops first 34 s, reports per-metric mean across post-warmup windows). Raw logs preserved at `/tmp/29xk-256-run{1,2,3}.log` for the 2026-04-27 capture session.
+
+### 3.16.1 Phase-0 follow-up arms — scale + render-scale sensitivity (`hash-thing-j98h`)
+
+Three additional arms × 3 runs each on the same M2 MBA / `--profile perf` setup as §3.16. Total 9 captures. Same per-run command shape, varying world size and `HASH_THING_RENDER_SCALE`.
+
+| Arm | World | Render scale | frame_total mean | surface_acquire_cpu mean | render_cpu mean | render_gpu mean | step (sim thread) | drift (h2/h1) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| §3.16 baseline | 256³ | 0.5 | 37.25 ms | 15.62 ms | 15.85 ms | 0.10 ms | 131.10 ms | drifting (18→80) |
+| **A** | 64³ | 0.5 | **24.30 ms** | 8.90 ms | 9.17 ms | 0.06 ms | 41.83 ms | steady (1.03–1.06) |
+| **B** | 512³ | 0.5 | **21.37 ms** | 15.72 ms | 15.96 ms | 0.08 ms | 577.53 ms | steady (0.95–1.09) |
+| **C** | 256³ | 1.0 | **114.92 ms** | 86.73 ms | 87.04 ms | 0.07 ms | 207.27 ms | drifting (97→133) |
+
+**Findings:**
+
+1. **The compute pass (`render_gpu`) is flat at 0.06–0.10 ms across all four cells.** 64³ → 512³ is a 512× volume change; render-scale 0.5 → 1.0 quadruples ray count; nothing moves on the shader. Confirms and extends §3.12's flatness conclusion to the 64³ / 512³ ends and to the headline 256³ × 1.0 cell.
+
+2. **At 0.5 render-scale, frame_total is roughly constant ~21–24 ms across 64³–512³ (in steady state).** The §3.16 baseline's 37 ms mean is inflated by the me6i drift documented there (range 18→80 ms within run); arm A and arm B are both clean (drift ratio 0.95–1.09) and land in the same neighborhood. So the **scene-size-scaling component of frame_total at 50 % render-scale is ≲ 3 ms across an 8× linear-side range** — not the dominant cost.
+
+3. **Render-scale 1.0 shifts frame_total by 3.1× (37 → 115 ms at 256³).** Far larger than scene-size sensitivity. `surface_acquire_cpu` carries it (16 → 87 ms). The compute pass remains 0.07 ms, but the windowed-presentation floor scales with framebuffer pixels, not voxel work. This is the dominant render-side knob on this hardware.
+
+4. **Arm C drifts in all 3 runs** (97 → 133 ms within each), same shape as the §3.16 baseline. Confirms me6i drift is a function of *time elapsed × scale × render-scale* together, not of `frame_total` magnitude alone — arms A and B at the same time horizon don't drift.
+
+5. **Step (sim thread) scales super-linearly:** 64³=42 ms, 256³=131 ms (3.1×), 512³=578 ms (4.4× from 256³, 13.7× from 64³). 8× volume between adjacent steps gives 3.1× and 4.4× cost; the gap widens. The 512³ sim is severely behind the renderer (578 ms ≫ 21 ms render frame), but the renderer doesn't wait — `step` lives on a background thread and the renderer reads whatever SVDAG snapshot it sees.
+
+**Implications for Phase 1 leverage:**
+
+- **Cheaper rays** (the 9k4w sub-children) is justified at 256³ × 1.0 — that's where ray work could plausibly bite. But render_gpu is still 0.07 ms even there, so the immediate win surface is `surface_acquire_cpu`, not ray cost. The ray-count optimisation is a Phase-1-as-written investment for non-Mac targets where the GPU genuinely does the work.
+- **render_scale** as a tuning knob (`pfpn` / adaptive ramp) targets the 87 ms acquire wait directly: every framebuffer-pixel reduction translates 1:1 into compositor budget. This is the highest-leverage Mac-side knob in the matrix.
+
+**Arm D (256³ × 0.5 × fullscreen-internal): parked as gate.** The binary has no programmatic fullscreen toggle (`--res` only sets the windowed dimensions); fullscreen requires Cmd+Ctrl+F or window-drag to the internal display, both interactive. Filed as a deferred sub-task on j98h's close comment; not a blocker for Phase 1.
+
+**Reproduce:** driver script preserved at `/tmp/j98h-driver.sh`, raw logs at `/tmp/j98h-logs/{A,B,C}-run{1,2,3}.log`, aggregator at `/tmp/j98h-aggregate.py`.
+
+---
+
 ## 4. SVDAG ↔ memo-step interaction
 
 Hashlife memo (`step_cache`) and the SVDAG share a deep structural assumption: **subtrees are deduplicated and addressed by content.** This section owns the architectural surface where they meet.
