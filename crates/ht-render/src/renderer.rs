@@ -558,7 +558,7 @@ enum RenderScaleSource {
     /// spec is "M1/M2 → 0.5, RTX 3060+ → 1.0" — clamping a dGPU pick
     /// to ~0.74 at 1440p would violate that).
     AutoPickedByGpuClass,
-    /// Env var was set but failed parsing or fell outside `0.25..=1.0`,
+    /// Env var was set but failed parsing or fell outside `0.125..=1.0`,
     /// and no CLI override fired either.
     EnvInvalidFallback,
     /// `--demo` / `--res` CLI flag pinned a target pixel count.
@@ -693,12 +693,12 @@ fn target_pixels_for_volume(volume_size: u32) -> u32 {
 
 /// Pick a render scale such that `physical_pixels * scale^2 ≈
 /// target_pixels_for_volume(volume_size)`. Clamped to the valid
-/// 0.25..=1.0 range (hash-thing-zytn).
+/// 0.125..=1.0 range (hash-thing-zytn; floor lowered from 0.25 by hash-thing-8v46).
 fn auto_render_scale(physical_pixels: u64, volume_size: u32) -> f32 {
     let target = target_pixels_for_volume(volume_size) as f64;
     let physical = physical_pixels.max(1) as f64;
     let raw = (target / physical).sqrt() as f32;
-    raw.clamp(0.25, 1.0)
+    raw.clamp(0.125, 1.0)
 }
 
 /// Resolve the effective render scale + which branch fired. Precedence:
@@ -718,7 +718,7 @@ fn resolved_render_scale(
 ) -> (f32, RenderScaleSource) {
     let cli_scale = cli_target.map(|target| {
         let physical = physical_pixels.max(1) as f64;
-        ((target as f64 / physical).sqrt() as f32).clamp(0.25, 1.0)
+        ((target as f64 / physical).sqrt() as f32).clamp(0.125, 1.0)
     });
     // hash-thing-pfpn: when neither env nor CLI fired, prefer the
     // GPU-class default over the pixel-budget pick. Per trident plan
@@ -728,7 +728,7 @@ fn resolved_render_scale(
     // budget remains the fallback when the adapter is unclassifiable.
     let class_pick = adapter_info
         .and_then(classify_gpu)
-        .map(|(_class, pick)| pick.clamp(0.25, 1.0));
+        .map(|(_class, pick)| pick.clamp(0.125, 1.0));
     let auto_pair = match class_pick {
         Some(s) => (s, RenderScaleSource::AutoPickedByGpuClass),
         None => (
@@ -742,7 +742,7 @@ fn resolved_render_scale(
             None => auto_pair,
         },
         Some(raw) => match raw.parse::<f32>() {
-            Ok(s) if (0.25..=1.0).contains(&s) => (s, RenderScaleSource::EnvOverride),
+            Ok(s) if (0.125..=1.0).contains(&s) => (s, RenderScaleSource::EnvOverride),
             _ => match cli_scale {
                 Some(s) => (s, RenderScaleSource::CliOverride),
                 None => (auto_pair.0, RenderScaleSource::EnvInvalidFallback),
@@ -957,7 +957,7 @@ impl Renderer {
             }
             RenderScaleSource::EnvInvalidFallback => match class_default {
                 Some((class, class_pick)) => log::info!(
-                    "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.25..=1.0); fell back to class default {:.3} (class={:?} class_pick={:.3} pixel_pick={:.3})",
+                    "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.125..=1.0); fell back to class default {:.3} (class={:?} class_pick={:.3} pixel_pick={:.3})",
                     env_raw.as_deref().unwrap_or(""),
                     render_scale,
                     class,
@@ -965,7 +965,7 @@ impl Renderer {
                     pixel_pick,
                 ),
                 None => log::info!(
-                    "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.25..=1.0); fell back to pixel-budget {:.3} (GPU class unknown)",
+                    "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.125..=1.0); fell back to pixel-budget {:.3} (GPU class unknown)",
                     env_raw.as_deref().unwrap_or(""),
                     render_scale,
                 ),
@@ -976,7 +976,7 @@ impl Renderer {
                 // and `--demo` still notices the typo.
                 if let Some(raw) = env_raw.as_deref() {
                     log::warn!(
-                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.25..=1.0); ignored — using --res / --demo CLI override instead",
+                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.125..=1.0); ignored — using --res / --demo CLI override instead",
                     );
                 }
                 // Show the resulting framebuffer dimensions so a user
@@ -2882,10 +2882,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_render_scale_clamps_to_quarter_on_huge_display() {
-        // Massive volume on an 8K+ display → clamp to floor.
-        let s = auto_render_scale(7680 * 4320, 8192);
-        assert_eq!(s, 0.25);
+    fn auto_render_scale_clamps_to_floor_on_huge_display() {
+        // Massive volume on a 16K+ display → clamp to floor (0.125).
+        // sqrt(800_000 / (16384 * 8192)) ≈ 0.077, well under floor.
+        let s = auto_render_scale(16384u64 * 8192u64, 8192);
+        assert_eq!(s, 0.125);
     }
 
     #[test]
@@ -2942,7 +2943,7 @@ mod tests {
     #[test]
     fn resolved_render_scale_env_out_of_range_falls_back() {
         // Above clamp → fallback. Below clamp → fallback.
-        // Non-parseable → fallback.
+        // Non-parseable → fallback. 0.1 is below the 0.125 floor.
         for bad in ["1.5", "0.1", "nonsense", ""] {
             let (s, src) = resolved_render_scale(Some(bad), None, 2940 * 1782, 1024, None);
             assert_eq!(
@@ -2956,10 +2957,10 @@ mod tests {
 
     #[test]
     fn resolved_render_scale_env_boundary_values_accepted() {
-        // 0.25 and 1.0 are both inside the inclusive range.
-        let (s_lo, src_lo) = resolved_render_scale(Some("0.25"), None, 2940 * 1782, 1024, None);
+        // 0.125 and 1.0 are both inside the inclusive range.
+        let (s_lo, src_lo) = resolved_render_scale(Some("0.125"), None, 2940 * 1782, 1024, None);
         assert_eq!(src_lo, RenderScaleSource::EnvOverride);
-        assert!((s_lo - 0.25).abs() < 1e-6);
+        assert!((s_lo - 0.125).abs() < 1e-6);
 
         let (s_hi, src_hi) = resolved_render_scale(Some("1.0"), None, 2940 * 1782, 1024, None);
         assert_eq!(src_hi, RenderScaleSource::EnvOverride);
@@ -3005,10 +3006,10 @@ mod tests {
 
     #[test]
     fn resolved_render_scale_cli_clamps_low() {
-        // Asking for tiny budget on a huge display clamps to 0.25 floor.
+        // Asking for tiny budget on a huge display clamps to the 0.125 floor.
         let (s, src) = resolved_render_scale(None, Some(160 * 90), 5000 * 5000, 1024, None);
         assert_eq!(src, RenderScaleSource::CliOverride);
-        assert!((s - 0.25).abs() < 1e-6, "scale was {s}");
+        assert!((s - 0.125).abs() < 1e-6, "scale was {s}");
     }
 
     // --- hash-thing-pfpn: GPU-class classifier + class-default

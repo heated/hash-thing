@@ -2763,7 +2763,7 @@ impl ApplicationHandler for App {
                             if let Some(renderer) = &mut self.renderer {
                                 let w = self.window.as_ref().unwrap();
                                 let size = w.inner_size();
-                                renderer.render_scale = (renderer.render_scale - 0.25).max(0.25);
+                                renderer.render_scale = (renderer.render_scale - 0.25).max(0.125);
                                 renderer.resize(size.width, size.height);
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
