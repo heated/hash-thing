@@ -581,26 +581,71 @@ pub(crate) enum GpuClass {
     AppleM3M4,
     /// Any future "Apple M…" not matched above. Conservative 0.6.
     AppleOther,
-    /// Discrete GPU (RTX 3060+ benchmark). v3.1 anchor: 1.0 outright.
-    DiscreteDgpu,
+    /// Discrete GPU known to be at-or-above the v3.1 audience anchor
+    /// (RTX 3060-class +). Defaults to 1.0. Recognised via name
+    /// substrings of strong consumer/workstation families. See
+    /// `is_strong_discrete_name` for the matched substrings.
+    DiscreteStrong,
+    /// Discrete GPU NOT recognised as strong (low-end / mobile / older
+    /// generations like GT 1030, MX, GTX 1050 mobile). Defaults to 0.7
+    /// — half a step above non-Apple integrated, well below native.
+    /// Conservative because the dynamic ramp (uzrr) that would catch
+    /// "actually fine, ramp up" is deferred. Codex Critical review
+    /// flagged the prior `DiscreteGpu → 1.0` blanket as a BLOCKER.
+    DiscreteOther,
     /// Non-Apple integrated (Intel UHD, AMD APU, etc). 0.7.
     IntegratedNonApple,
+}
+
+/// Substring whitelist for discrete GPU families at-or-above the v3.1
+/// audience anchor (RTX 3060-class +). Names below the anchor (GT,
+/// GTX 10xx mobile, MX, low-tier RX) are deliberately excluded.
+///
+/// Order matters: the matcher returns true on the FIRST hit, so put
+/// the more-specific "RTX " ahead of "RX " etc. to keep the substring
+/// search cheap. Lowercase comparison for vendor-string variation.
+fn is_strong_discrete_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    // NVIDIA: RTX 3xxx+ (Ampere) and RTX 4xxx+ (Ada). RTX 20xx (Turing)
+    // is borderline — RTX 2070 ≈ RTX 3060 in raster but TI / SUPER
+    // variants vary; left out conservatively until we get telemetry.
+    // GTX 16xx is below the anchor, so we keep "RTX " not "GTX ".
+    if lower.contains("rtx 30") || lower.contains("rtx 40") || lower.contains("rtx 50") {
+        return true;
+    }
+    // AMD: RX 6700+ (RDNA2 high tier) and RX 7xxx+ (RDNA3). RX 6600
+    // is borderline; left out. RX 5xxx (RDNA1) is below anchor.
+    if lower.contains("rx 67") || lower.contains("rx 68") || lower.contains("rx 69")
+        || lower.contains("rx 7")
+    {
+        return true;
+    }
+    // Workstation cards branded as "Quadro RTX " / "RTX A" (Ampere
+    // workstation) / "RTX " on Hopper / "L40" — generally above anchor.
+    if lower.contains("rtx a") || lower.contains("l40") {
+        return true;
+    }
+    false
 }
 
 /// Pure classifier used by `resolved_render_scale` and unit-tested
 /// directly. Returns `None` for `Cpu`, `VirtualGpu`, `Other`, and any
 /// adapter that doesn't match a known integrated/discrete bucket; the
 /// caller falls back to the pixel-budget auto-pick.
+///
+/// Apple Silicon detection requires `DeviceType::IntegratedGpu` —
+/// the wgpu 29 Metal backend reliably reports IntegratedGpu for
+/// every M-series chip. If a future wgpu/MoltenVK/Vulkan path mis-
+/// buckets Apple Silicon as `Other`, this returns `None` and the
+/// caller falls back to the pixel-budget pick (a safe default near
+/// 0.5 on the documented M2 reference display). A future bead can
+/// add an Apple-name-prefix-first check if telemetry shows that path
+/// matters.
 pub(crate) fn classify_gpu(info: &wgpu::AdapterInfo) -> Option<(GpuClass, f32)> {
     use wgpu::DeviceType;
     let name = info.name.as_str();
     match info.device_type {
         DeviceType::IntegratedGpu => {
-            // Apple-Silicon-shaped names sometimes come back through
-            // either the IntegratedGpu bucket (Metal) or with empty
-            // device_type on older wgpu paths. Match on the prefix
-            // first so the early-Apple buckets fire before the generic
-            // integrated fallback.
             if name.contains("Apple M1") || name.contains("Apple M2") {
                 Some((GpuClass::AppleM1M2, 0.5))
             } else if name.contains("Apple M3") || name.contains("Apple M4") {
@@ -611,7 +656,13 @@ pub(crate) fn classify_gpu(info: &wgpu::AdapterInfo) -> Option<(GpuClass, f32)> 
                 Some((GpuClass::IntegratedNonApple, 0.7))
             }
         }
-        DeviceType::DiscreteGpu => Some((GpuClass::DiscreteDgpu, 1.0)),
+        DeviceType::DiscreteGpu => {
+            if is_strong_discrete_name(name) {
+                Some((GpuClass::DiscreteStrong, 1.0))
+            } else {
+                Some((GpuClass::DiscreteOther, 0.7))
+            }
+        }
         DeviceType::Cpu | DeviceType::VirtualGpu | DeviceType::Other => None,
     }
 }
@@ -853,12 +904,33 @@ impl Renderer {
             volume_size,
             Some(&adapter_info),
         );
+        // hash-thing-pfpn (review-pass-2): the "would-have-been"
+        // diagnostics shown by EnvOverride / EnvInvalidFallback used
+        // to print only `auto_render_scale` (pixel-budget). With the
+        // class-aware default in play, that line was misleading on
+        // any classified adapter: e.g. on RTX 3060 @ 1440p / 256³ it
+        // would say "auto-pick would have been 0.74" when the actual
+        // no-env auto-pick is 1.0. Show BOTH (class default if known,
+        // pixel-budget always) so the user can see exactly what they
+        // overrode. Codex Critical / Claude Critical 2026-04-28
+        // IMPORTANT findings.
+        let pixel_pick = auto_render_scale(physical_pixels, volume_size);
+        let class_default = classify_gpu(&adapter_info);
         match scale_source {
-            RenderScaleSource::EnvOverride => log::info!(
-                "render_scale={:.3} (HASH_THING_RENDER_SCALE override; auto-pick would have been {:.3})",
-                render_scale,
-                auto_render_scale(physical_pixels, volume_size),
-            ),
+            RenderScaleSource::EnvOverride => match class_default {
+                Some((class, class_pick)) => log::info!(
+                    "render_scale={:.3} (HASH_THING_RENDER_SCALE override; class_default={:.3} class={:?} pixel_pick={:.3})",
+                    render_scale,
+                    class_pick,
+                    class,
+                    pixel_pick,
+                ),
+                None => log::info!(
+                    "render_scale={:.3} (HASH_THING_RENDER_SCALE override; pixel_pick={:.3}, GPU class unknown)",
+                    render_scale,
+                    pixel_pick,
+                ),
+            },
             RenderScaleSource::AutoPicked => log::info!(
                 "render_scale={:.3} (auto: volume_size={}, physical={}x{}, target={} px) — override with HASH_THING_RENDER_SCALE or use = / - keys at runtime",
                 render_scale,
@@ -868,24 +940,36 @@ impl Renderer {
                 target_pixels_for_volume(volume_size),
             ),
             RenderScaleSource::AutoPickedByGpuClass => {
-                let (class, class_pick) = classify_gpu(&adapter_info)
+                let (class, class_pick) = class_default
                     .expect("AutoPickedByGpuClass implies classify_gpu returned Some");
-                let pixel_pick = auto_render_scale(physical_pixels, volume_size);
                 log::info!(
-                    "render_scale={:.3} (auto-picked by GPU class: name={:?} device_type={:?} class={:?} class_pick={:.3} pixel_pick={:.3}) — override with HASH_THING_RENDER_SCALE or use = / - keys at runtime",
+                    "render_scale={:.3} (auto-picked by GPU class: name={:?} device_type={:?} class={:?} class_pick={:.3} pixel_pick={:.3} volume_size={} physical={}x{}) — override with HASH_THING_RENDER_SCALE or use = / - keys at runtime",
                     render_scale,
                     adapter_info.name,
                     adapter_info.device_type,
                     class,
                     class_pick,
                     pixel_pick,
+                    volume_size,
+                    size.width,
+                    size.height,
                 );
             }
-            RenderScaleSource::EnvInvalidFallback => log::info!(
-                "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.25..=1.0); auto-picked {:.3} instead",
-                env_raw.as_deref().unwrap_or(""),
-                render_scale,
-            ),
+            RenderScaleSource::EnvInvalidFallback => match class_default {
+                Some((class, class_pick)) => log::info!(
+                    "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.25..=1.0); fell back to class default {:.3} (class={:?} class_pick={:.3} pixel_pick={:.3})",
+                    env_raw.as_deref().unwrap_or(""),
+                    render_scale,
+                    class,
+                    class_pick,
+                    pixel_pick,
+                ),
+                None => log::info!(
+                    "HASH_THING_RENDER_SCALE={} invalid (need a number in 0.25..=1.0); fell back to pixel-budget {:.3} (GPU class unknown)",
+                    env_raw.as_deref().unwrap_or(""),
+                    render_scale,
+                ),
+            },
             RenderScaleSource::CliOverride => {
                 // hash-thing-06so: surface the env-typo signal even when CLI
                 // wins, so a user passing both `HASH_THING_RENDER_SCALE=foo`
@@ -2984,11 +3068,57 @@ mod tests {
     }
 
     #[test]
-    fn classify_discrete_dgpu_picks_one() {
-        // RTX 3060 = the v3.1 audience-distribution anchor: dGPU runs at 1.0.
-        let info =
-            synthetic_adapter_info("NVIDIA GeForce RTX 3060", wgpu::DeviceType::DiscreteGpu);
-        assert_eq!(classify_gpu(&info), Some((GpuClass::DiscreteDgpu, 1.0)));
+    fn classify_discrete_strong_picks_one() {
+        // v3.1 audience-distribution anchor: at-or-above RTX 3060 → 1.0.
+        // Spans NVIDIA Ampere/Ada/Blackwell + AMD RDNA2-high/RDNA3 +
+        // workstation Ampere — covers the families above the audience
+        // anchor, NOT every DiscreteGpu (see Codex Critical 2026-04-28
+        // BLOCKER).
+        for name in [
+            "NVIDIA GeForce RTX 3060",
+            "NVIDIA GeForce RTX 3060 Ti",
+            "NVIDIA GeForce RTX 3070",
+            "NVIDIA GeForce RTX 4090",
+            "NVIDIA GeForce RTX 5080",
+            "NVIDIA RTX A4000",
+            "NVIDIA L40",
+            "AMD Radeon RX 6700 XT",
+            "AMD Radeon RX 6800",
+            "AMD Radeon RX 6900 XT",
+            "AMD Radeon RX 7800 XT",
+        ] {
+            let info = synthetic_adapter_info(name, wgpu::DeviceType::DiscreteGpu);
+            assert_eq!(
+                classify_gpu(&info),
+                Some((GpuClass::DiscreteStrong, 1.0)),
+                "name={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_discrete_other_picks_seven_tenths() {
+        // Below-anchor / mobile / older / unknown discrete cards must
+        // NOT default to native. Codex Critical 2026-04-28 BLOCKER:
+        // GT 1030 / MX-series / GTX 1050 mobile reported as
+        // DiscreteGpu but weaker than (or close to) integrated-class.
+        for name in [
+            "NVIDIA GeForce GT 1030",
+            "NVIDIA GeForce MX450",
+            "NVIDIA GeForce GTX 1050 Ti",
+            "NVIDIA GeForce GTX 1650",
+            "NVIDIA GeForce RTX 2060", // Turing, deliberately below the strong cutoff
+            "AMD Radeon RX 580",
+            "AMD Radeon RX 6500 XT",
+            "Some Future dGPU We Have Not Seen",
+        ] {
+            let info = synthetic_adapter_info(name, wgpu::DeviceType::DiscreteGpu);
+            assert_eq!(
+                classify_gpu(&info),
+                Some((GpuClass::DiscreteOther, 0.7)),
+                "name={name}"
+            );
+        }
     }
 
     #[test]
@@ -3028,15 +3158,42 @@ mod tests {
 
     #[test]
     fn resolved_dgpu_class_default_not_clamped_by_pixel_budget() {
-        // Trident-review blocker: prior plan clamped class_pick by
+        // Trident-plan-review blocker: prior plan clamped class_pick by
         // pixel_pick. RTX 3060 @ 1440p (3.69 M phys) on 256³ would
         // clamp to ~0.74 instead of staying at the v3.1 spec's 1.0.
-        // This test enforces the unclamped class default.
+        // This test enforces the unclamped class default for the strong
+        // dGPU bucket.
         let info =
             synthetic_adapter_info("NVIDIA GeForce RTX 3060", wgpu::DeviceType::DiscreteGpu);
         let (s, src) = resolved_render_scale(None, None, 2560 * 1440, 256, Some(&info));
         assert_eq!(src, RenderScaleSource::AutoPickedByGpuClass);
         assert!((s - 1.0).abs() < 1e-6, "scale was {s}, expected 1.0");
+    }
+
+    #[test]
+    fn resolved_invalid_env_uses_class_default_when_adapter_known() {
+        // Codex Critical 2026-04-28 IMPORTANT: contract was unpinned.
+        // HASH_THING_RENDER_SCALE=garbage on a classified M2 must fall
+        // back to the class default (0.5), not the pixel-budget pick.
+        // Source stays EnvInvalidFallback so the typo signal is visible.
+        let info = synthetic_adapter_info("Apple M2", wgpu::DeviceType::IntegratedGpu);
+        let (s, src) =
+            resolved_render_scale(Some("garbage"), None, 2940 * 1782, 1024, Some(&info));
+        assert_eq!(src, RenderScaleSource::EnvInvalidFallback);
+        assert!((s - 0.5).abs() < 1e-6, "scale was {s}, expected class default 0.5");
+    }
+
+    #[test]
+    fn resolved_invalid_env_uses_class_default_for_strong_dgpu() {
+        // Same contract as above for the strong dGPU bucket — the
+        // class default of 1.0 must survive an env typo, not collapse
+        // to the pixel-budget pick.
+        let info =
+            synthetic_adapter_info("NVIDIA GeForce RTX 3070", wgpu::DeviceType::DiscreteGpu);
+        let (s, src) =
+            resolved_render_scale(Some("nonsense"), None, 2560 * 1440, 256, Some(&info));
+        assert_eq!(src, RenderScaleSource::EnvInvalidFallback);
+        assert!((s - 1.0).abs() < 1e-6, "scale was {s}, expected class default 1.0");
     }
 
     #[test]
