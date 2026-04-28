@@ -75,6 +75,8 @@ Sources:
 
 ## 5. Implication for hash-thing tuning priority
 
+> **STALE — superseded by SPEC.md "Hardware spec target" (edward 2026-04-27).** The recommendations below were built on a "tune for median Steam GPU, treat Mac as smoke test" frame. SPEC.md now sets the spec rig at **10th-percentile Steam ≈ M1 base**, with M2 as the dev measurement target. The per-bead re-prioritization in this section (9k4w.4 demoted, m59h deferred, adp-res promoted) likely flips under the new frame and needs a fresh pass — see follow-up bead `hash-thing-3q4a`. Treat the §1–§4 data and §6 caveats as still-canonical; treat the §5 conclusions below as historical.
+
 SPEC.md's minimum-spec target (8GB / 4-core / 2GB-VRAM / 1440p60) maps to roughly a **GTX 1650 / GTX 1060 3GB-class** discrete card (~3 TF). M1 base (2.6 TF, unified memory) is *just below* that line; M2 base (3.6 TF) is *just above*.
 
 **Recommendation:**

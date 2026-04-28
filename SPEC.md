@@ -526,35 +526,35 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ---
 
-## Hardware spec targets (rendering / perf budget)
+## Hardware spec target (rendering / perf budget)
 
-We track **two tiers**, because the prior single-tier "minimum" conflated "must boot and be playable" (a smoke-test floor) with "the default experience hits the contract" (the audience median we tune for). Per `docs/perf/audience-hw-distribution.md`, the Steam median GPU is ~3.5–5× faster in FP32 than an Apple M1/M2 base; treating those two as one line silently mis-budgets every rendering decision.
+**One tier. We tune for the low end of the distribution.** The spec rig is **10th-percentile Steam GPU ≈ Apple M1 base**: the game must run playably (50–60 FPS felt) at this tier, with reduced resolution (render_scale ≤ 0.5) acceptable to hit the FPS contract. Negotiable up to ~12th percentile if a rendering choice forces it; **not higher** without re-opening this section.
 
-Both tiers are subject to negotiation when reality drifts (a survey snapshot moves, distribution telemetry contradicts the assumptions, an option becomes laughably out of scope of who actually plays). Numbers are not pinned to a specific Steam HW Survey snapshot — revise when the public-PC floor visibly moves, and call it out in the changelog rather than letting it drift silently.
+Per `docs/perf/audience-hw-distribution.md` §2, M1 base sits at the 10–15th percentile of active Steam GPUs and M2 base at ~25th, so this target lands roughly where M1 lives. ~90% of the Steam audience clears it. For voxel/sandbox genres (Minecraft demographic skews low-end, see audience-hw §6) the realistic hash-thing-audience coverage is closer to 95%+.
 
-| Component | **Minimum** (smoke-test floor) | **Median** (default tuning target) |
-|---|---|---|
-| RAM | 8 GB | 16 GB |
-| CPU | 4 physical cores | 6+ physical cores |
-| GPU FP32 throughput | ~3 TFLOPS (M1/M2 base, GTX 1650-class) | ~12 TFLOPS (RTX 3060 / 4060-class) |
-| GPU VRAM | 4 GB | 8–12 GB |
-| Display resolution | 1080p, render_scale ≤ 0.5 OK | **1440p (2560×1440)** at native scale |
-| Frame-rate contract | "playable" — boots, no hitches, ≥30 FPS felt | **60 FPS felt** |
-| Disk install footprint | ≤ 2 GB | ≤ 2 GB |
-| Architecture | x86_64 + Apple Silicon (arm64) | same |
-| Operating systems | macOS, Linux, Windows (per `xb7` distribution work) | same |
+| Component | Target |
+|---|---|
+| RAM | 8 GB |
+| CPU | 4 physical cores (clock unconstrained) |
+| GPU FP32 throughput | ~2.5–3 TFLOPS (Apple M1 base / GTX 1650-class) |
+| GPU memory available | 4 GB discrete VRAM, or 8 GB unified (Apple Silicon) |
+| Display resolution | 1080p, render_scale ≤ 0.5 acceptable |
+| Frame-rate contract | 50–60 FPS felt on the spec rig |
+| Disk install footprint | ≤ 2 GB |
+| Architecture | x86_64 + Apple Silicon (arm64) |
+| Operating systems | macOS, Linux, Windows (per `xb7` distribution work) |
 
-What each tier means in practice:
+**Dev measurement target: edward's M2 base** (~3.6 TF, ~25th percentile — one tier above the spec floor). The crew owns M-series Macs, not RTX 3060s; we measure on what we have. Perf wins on M2 should translate cleanly down to M1 via existing quality knobs. Cross-checking on M1 is the smoke test, not the daily measurement loop.
 
-- **Minimum = smoke-test floor.** Must run, must not look broken, must not crash. Dynamic-resolution / `render_scale=0.5` defaults are allowed and expected here. Apple M1/M2 base sits exactly on this line and is treated as the canonical minimum-spec smoke test (we have one in the crew, so it gets tested every commit). A regression that makes the minimum tier *unplayable* is a P0; a regression that just makes it *uglier* at the same FPS is acceptable if median tier benefits.
-- **Median = the contract.** The 60-FPS-at-1440p invariant lives here, on RTX 3060/4060-class hardware. Default rendering settings are chosen so that this rig hits 60 FPS felt. Heavier features (shadows, higher LOD bias, larger render distance) may gate behind higher tiers, but **the default experience must hit 60 FPS on the median rig.** If we can't, either the rendering budget comes down or the median target moves up — not both silently.
+**Better-rig support is via continuous quality knobs, not feature gates.** Same game everywhere — same simulation, same renderer, same content. A 4090 owner gets render_scale=1.0, longer draw distance, higher-quality post-FX, and naturally higher FPS, all from continuous knobs the engine already exposes. We do **not** add "shadows-only-on-RTX" toggles, capability-tier SKUs, or anything that bands the experience. Rendering ambition scales with the rig; the game does not.
+
+**Ray-tracing caveat (deferred negotiation).** If we ever adopt true hardware raytracing as a default rendering path (distinct from the current shader raymarcher-on-bitmaps), this contract likely breaks — M1 base can't run HW RT competitively. At that point this section re-opens. Until then, the current shader-based renderer is assumed.
 
 Notes:
 
-- **Felt FPS, not `render_gpu` logs.** A fix that moves a single number without moving the felt experience does not count as hitting the contract (hash-thing-dbz5).
-- **Optimization budget follows the median, not the minimum.** ~98% of the audience is Windows/Linux on discrete GPUs comfortably above M1/M2; chasing Mac-specific micro-wins at the cost of median-rig clarity is mis-prioritized. Mac stays the smoke test; the median is where the perf work pays for itself. See `docs/perf/audience-hw-distribution.md` §5 for the per-bead re-prioritization derived from this.
-- **Higher resolutions (4K, ultrawide) and beefier rigs are nice-to-have, not the design target.** A 4090 owner getting 240 FPS is a bonus; the design constraint is the 3060 owner getting a clean 60 at 1440p.
-- **Re-negotiation triggers.** Bump the median target when (a) a Steam HW Survey snapshot moves the median GPU class, (b) early-access telemetry contradicts the "median = RTX 3060/4060" assumption, or (c) we ship a feature that fundamentally requires more (e.g. raytracing, mesh shaders). Lower the minimum only with strong evidence — pulling the floor down has high cost (more `render_scale=0.5` quality complaints).
+- **Felt FPS, not `render_gpu` logs.** A fix that moves a number without moving the felt experience does not count as hitting the contract (hash-thing-dbz5).
+- **Re-negotiation triggers.** Bump the target *up* if (a) a desired feature is genuinely impossible at 10th-percentile compute — RT is the canonical example, (b) early-access telemetry shows nobody at the low end actually plays voxel sandboxes, or (c) the public-PC floor visibly moves and 10th percentile of future-Steam is way past M1. Bump it *down* only with strong evidence we're crushing rendering ambition for an audience that doesn't exist. In every case, change the table here and call it out in the commit — don't drift silently.
+- **Supersedes audience-hw §5.** That section's per-bead re-prioritization (`9k4w.4` demoted, `m59h` deferred, `adp-res` promoted) flowed from a "tune for median, ignore Mac" frame that this section now overrides. See follow-up bead `hash-thing-3q4a` for the proper §5 rewrite.
 
 ---
 
