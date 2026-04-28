@@ -768,6 +768,31 @@ fn smooth_fps(prev: f64, instant: f64, alpha: f64) -> f64 {
     }
 }
 
+/// Render-scale presets the +/- keys snap between (hash-thing-sezr).
+/// Sorted ascending; floor 0.125 matches the renderer clamp (8v46).
+const RENDER_SCALE_PRESETS: &[f32] = &[0.125, 0.25, 0.5, 0.75, 1.0];
+
+/// Next preset strictly greater than `current`; saturates at the top.
+/// Off-grid values snap to the next preset above (e.g. 0.629 → 0.75).
+fn next_render_scale_up(current: f32) -> f32 {
+    RENDER_SCALE_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or_else(|| *RENDER_SCALE_PRESETS.last().unwrap())
+}
+
+/// Next preset strictly less than `current`; saturates at the floor.
+/// Off-grid values snap to the next preset below (e.g. 0.629 → 0.5).
+fn next_render_scale_down(current: f32) -> f32 {
+    RENDER_SCALE_PRESETS
+        .iter()
+        .copied()
+        .rev()
+        .find(|&p| p < current)
+        .unwrap_or_else(|| *RENDER_SCALE_PRESETS.first().unwrap())
+}
+
 /// Split the per-frame elapsed time into `(dt_wall, dt_clamped)`.
 ///
 /// The clamped value keeps xa7 player movement bounded under a hiccup
@@ -2753,7 +2778,7 @@ impl ApplicationHandler for App {
                             if let Some(renderer) = &mut self.renderer {
                                 let w = self.window.as_ref().unwrap();
                                 let size = w.inner_size();
-                                renderer.render_scale = (renderer.render_scale + 0.25).min(1.0);
+                                renderer.render_scale = next_render_scale_up(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
@@ -2763,7 +2788,7 @@ impl ApplicationHandler for App {
                             if let Some(renderer) = &mut self.renderer {
                                 let w = self.window.as_ref().unwrap();
                                 let size = w.inner_size();
-                                renderer.render_scale = (renderer.render_scale - 0.25).max(0.125);
+                                renderer.render_scale = next_render_scale_down(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
@@ -3825,6 +3850,46 @@ mod tests {
         // Negative prev (shouldn't occur in practice) hits the same
         // sentinel branch rather than producing a nonsense blend.
         assert_eq!(smooth_fps(-1.0, 20.0, 0.1), 20.0);
+    }
+
+    // --- hash-thing-sezr: render-scale preset snap ---
+
+    #[test]
+    fn render_scale_up_steps_through_presets() {
+        assert_eq!(next_render_scale_up(0.125), 0.25);
+        assert_eq!(next_render_scale_up(0.25), 0.5);
+        assert_eq!(next_render_scale_up(0.5), 0.75);
+        assert_eq!(next_render_scale_up(0.75), 1.0);
+    }
+
+    #[test]
+    fn render_scale_up_saturates_at_ceiling() {
+        assert_eq!(next_render_scale_up(1.0), 1.0);
+        assert_eq!(next_render_scale_up(2.0), 1.0);
+    }
+
+    #[test]
+    fn render_scale_down_steps_through_presets() {
+        assert_eq!(next_render_scale_down(1.0), 0.75);
+        assert_eq!(next_render_scale_down(0.75), 0.5);
+        assert_eq!(next_render_scale_down(0.5), 0.25);
+        assert_eq!(next_render_scale_down(0.25), 0.125);
+    }
+
+    #[test]
+    fn render_scale_down_saturates_at_floor() {
+        assert_eq!(next_render_scale_down(0.125), 0.125);
+        assert_eq!(next_render_scale_down(0.0), 0.125);
+    }
+
+    #[test]
+    fn render_scale_off_grid_snaps_to_next_preset_in_direction() {
+        // 0.629 from --demo at 720p, or env override 0.6
+        assert_eq!(next_render_scale_up(0.629), 0.75);
+        assert_eq!(next_render_scale_down(0.629), 0.5);
+        // Just above the floor → next up is 0.25, next down is the floor
+        assert_eq!(next_render_scale_up(0.2), 0.25);
+        assert_eq!(next_render_scale_down(0.2), 0.125);
     }
 
     // --- hash-thing-06so: --demo / --res CLI flag parsing ---
