@@ -674,11 +674,11 @@ struct App {
     /// hash-thing-dbv3 (vqke.1.1): proxy used by the sim worker thread
     /// to wake the main loop the moment the step finishes
     /// (`proxy.send_event(AppUserEvent::SimDone(_))`). `None` until
-    /// `App::set_event_proxy` runs in `main()` after the EventLoop
-    /// builds — `App::new()` test callers leave it `None` and the
-    /// worker silently no-ops the wake call (the worker still runs to
-    /// completion; tests that need the result should bypass the
-    /// kick-off path).
+    /// `main()` assigns `app.event_proxy = Some(event_loop.create_proxy())`
+    /// after the EventLoop builds and before `event_loop.run_app(&mut app)`.
+    /// `App::new()` test callers leave it `None` and the worker silently
+    /// no-ops the wake call (the worker still runs to completion; tests
+    /// that need the result should bypass the kick-off path).
     event_proxy: Option<EventLoopProxy<AppUserEvent>>,
     /// Cached world origin for rendering during background step.
     render_origin: [i64; 3],
@@ -3929,8 +3929,13 @@ fn main() {
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
-    // pattern — `EventLoopProxy<T>: Send + Sync + Clone` for any
-    // `T: Send` (verified against winit-0.30.13/src/platform_impl/macos/event_loop.rs:467).
+    // pattern — `EventLoopProxy<T>: Send + Clone` for any `T: Send`
+    // is what this code relies on (the worker moves a clone in and
+    // calls `send_event` on it). The macOS impl additionally declares
+    // `Sync` (winit-0.30.13/src/platform_impl/macos/event_loop.rs:467),
+    // but the Windows impl only declares `Send` (event_loop.rs:820);
+    // we don't share references across threads, so `Send + Clone` is
+    // the portable surface this depends on.
     app.event_proxy = Some(event_loop.create_proxy());
     event_loop
         .run_app(&mut app)
@@ -5022,6 +5027,76 @@ mod tests {
         // we've already asserted the kick-off behaviour
         // (`is_stepping()` true after `maybe_start_background_step`),
         // which is the contract the test is named for.
+    }
+
+    /// hash-thing-dbv3 (vqke.1.1): cover the `apply_step_result` seam
+    /// directly. The `background_step_starts_after_live_world_player_update`
+    /// test above asserts only the kickoff contract; these tests
+    /// validate the post-step ingest path that the worker now reaches
+    /// via `AppUserEvent::SimDone` on the main thread. Per Codex
+    /// standard-review (notes/CR-dbv3-Codex-Standard-*), the seam is
+    /// otherwise untested without faking `ActiveEventLoop`.
+    #[test]
+    fn apply_step_result_ok_clears_pending_and_swaps_world() {
+        let mut app = App::new(32);
+        // Simulate "step in flight": move app.world out into a
+        // payload (mimicking `maybe_start_background_step`'s
+        // placeholder swap), set step_pending true.
+        let payload_world = std::mem::replace(&mut app.world, sim::World::placeholder());
+        let payload_world_gen = payload_world.generation;
+        app.step_pending = true;
+        app.step_start = std::time::Instant::now();
+
+        let timings = SimThreadTimings {
+            apply_mutations_ns: 1_000_000,
+            spawn_clones_ns: 2_000_000,
+            step_recursive_ns: 3_000_000,
+            sim_finished_at: std::time::Instant::now(),
+        };
+        let detect_at = std::time::Instant::now();
+        app.apply_step_result(Ok((payload_world, timings)), detect_at);
+
+        assert!(!app.step_pending, "step_pending must clear after Ok");
+        assert_eq!(
+            app.world.generation, payload_world_gen,
+            "world must be swapped back from the payload"
+        );
+        assert!(
+            !app.paused,
+            "Ok payload must not pause the sim"
+        );
+    }
+
+    #[test]
+    fn apply_step_result_err_pauses_and_clears_pending() {
+        let mut app = App::new(32);
+        app.step_pending = true;
+        app.step_start = std::time::Instant::now();
+        let was_paused = app.paused;
+        assert!(!was_paused, "App::new should default to unpaused");
+        let detect_at = std::time::Instant::now();
+        app.apply_step_result(Err("simulated worker panic".to_string()), detect_at);
+
+        assert!(!app.step_pending, "step_pending must clear after Err");
+        assert!(app.paused, "Err payload must pause the sim (4lp behaviour)");
+    }
+
+    #[test]
+    fn apply_step_result_no_op_when_step_pending_false() {
+        // Defensive double-delivery guard: with the user-event +
+        // request_redraw fallback both potentially running, the ingest
+        // helper must be a no-op once the flag is already cleared.
+        let mut app = App::new(32);
+        app.step_pending = false;
+        let was_paused = app.paused;
+        let detect_at = std::time::Instant::now();
+        app.apply_step_result(Err("ignored".to_string()), detect_at);
+
+        assert!(!app.step_pending);
+        assert_eq!(
+            app.paused, was_paused,
+            "stale event must not flip paused state"
+        );
     }
 
     #[test]
