@@ -526,28 +526,35 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ---
 
-## Minimum spec target (rendering / perf budget)
+## Hardware spec targets (rendering / perf budget)
 
-This is the hardware we **target for 60 FPS at the listed resolution**. It's an invariant we want to hit, not a "might work" floor — it's the budget that constrains what rendering / sim features we ship by default. Heavier features may live behind a higher tier (LOD bias, optional shadows, etc.) but the default experience must hit 60 FPS on this rig.
+We track **two tiers**, because the prior single-tier "minimum" conflated "must boot and be playable" (a smoke-test floor) with "the default experience hits the contract" (the audience median we tune for). Per `docs/perf/audience-hw-distribution.md`, the Steam median GPU is ~3.5–5× faster in FP32 than an Apple M1/M2 base; treating those two as one line silently mis-budgets every rendering decision.
 
-Sourced from edward's read of public hardware surveys (Steam HW Survey and similar). Numbers are not pinned to any specific survey snapshot; revise when the public-PC floor visibly moves.
+Both tiers are subject to negotiation when reality drifts (a survey snapshot moves, distribution telemetry contradicts the assumptions, an option becomes laughably out of scope of who actually plays). Numbers are not pinned to a specific Steam HW Survey snapshot — revise when the public-PC floor visibly moves, and call it out in the changelog rather than letting it drift silently.
 
-| Component | Target |
-|---|---|
-| RAM | **8 GB** |
-| CPU | **4 physical cores** (clock speed unconstrained) |
-| GPU VRAM | **2 GB** (open to pushback; some features may gate behind higher tiers) |
-| Display resolution | **1440p (2560×1440)** at 60 FPS |
-| Disk install footprint | **≤ 2 GB** (negotiable) |
-| Architecture | **x86_64** + **Apple Silicon (arm64)** |
-| Operating systems | macOS, Linux, Windows (per `xb7` distribution work) |
+| Component | **Minimum** (smoke-test floor) | **Median** (default tuning target) |
+|---|---|---|
+| RAM | 8 GB | 16 GB |
+| CPU | 4 physical cores | 6+ physical cores |
+| GPU FP32 throughput | ~3 TFLOPS (M1/M2 base, GTX 1650-class) | ~12 TFLOPS (RTX 3060 / 4060-class) |
+| GPU VRAM | 4 GB | 8–12 GB |
+| Display resolution | 1080p, render_scale ≤ 0.5 OK | **1440p (2560×1440)** at native scale |
+| Frame-rate contract | "playable" — boots, no hitches, ≥30 FPS felt | **60 FPS felt** |
+| Disk install footprint | ≤ 2 GB | ≤ 2 GB |
+| Architecture | x86_64 + Apple Silicon (arm64) | same |
+| Operating systems | macOS, Linux, Windows (per `xb7` distribution work) | same |
+
+What each tier means in practice:
+
+- **Minimum = smoke-test floor.** Must run, must not look broken, must not crash. Dynamic-resolution / `render_scale=0.5` defaults are allowed and expected here. Apple M1/M2 base sits exactly on this line and is treated as the canonical minimum-spec smoke test (we have one in the crew, so it gets tested every commit). A regression that makes the minimum tier *unplayable* is a P0; a regression that just makes it *uglier* at the same FPS is acceptable if median tier benefits.
+- **Median = the contract.** The 60-FPS-at-1440p invariant lives here, on RTX 3060/4060-class hardware. Default rendering settings are chosen so that this rig hits 60 FPS felt. Heavier features (shadows, higher LOD bias, larger render distance) may gate behind higher tiers, but **the default experience must hit 60 FPS on the median rig.** If we can't, either the rendering budget comes down or the median target moves up — not both silently.
 
 Notes:
-- "Minimum" here means **the default experience runs at 60 FPS at 1440p on this rig.** If we can't hit that, either we lower the rendering budget or the spec target moves up — not both silently.
-- Felt FPS is the metric, not log-reported `render_gpu` (see hash-thing-dbz5). A fix that moves a single number without moving the felt experience does not count as hitting the target.
-- Tiered features are allowed: e.g. shadows / higher-quality LOD can require more VRAM, as long as the 2 GB tier still renders cleanly with the defaults.
-- Higher resolutions (4K, ultrawide) and beefier rigs are nice-to-have, not the design target.
-- **Audience-distribution context:** per `docs/perf/audience-hw-distribution.md` (cairn 2026-04-26 research), the median Steam gamer has ~3.5–5× the FP32 throughput of an Apple M1/M2 base GPU. Apple Silicon sits at the bottom-25% of active Steam GPUs; macOS is 2.35% of Steam. Implication: optimization budget targets the median Steam GPU (RTX 3060/4060-class), not Mac-specific perf. Mac defaults to `render_scale=0.5` and is treated as the minimum-spec smoke test.
+
+- **Felt FPS, not `render_gpu` logs.** A fix that moves a single number without moving the felt experience does not count as hitting the contract (hash-thing-dbz5).
+- **Optimization budget follows the median, not the minimum.** ~98% of the audience is Windows/Linux on discrete GPUs comfortably above M1/M2; chasing Mac-specific micro-wins at the cost of median-rig clarity is mis-prioritized. Mac stays the smoke test; the median is where the perf work pays for itself. See `docs/perf/audience-hw-distribution.md` §5 for the per-bead re-prioritization derived from this.
+- **Higher resolutions (4K, ultrawide) and beefier rigs are nice-to-have, not the design target.** A 4090 owner getting 240 FPS is a bonus; the design constraint is the 3060 owner getting a clean 60 at 1440p.
+- **Re-negotiation triggers.** Bump the median target when (a) a Steam HW Survey snapshot moves the median GPU class, (b) early-access telemetry contradicts the "median = RTX 3060/4060" assumption, or (c) we ship a feature that fundamentally requires more (e.g. raytracing, mesh shaders). Lower the minimum only with strong evidence — pulling the floor down has high cost (more `render_scale=0.5` quality complaints).
 
 ---
 
