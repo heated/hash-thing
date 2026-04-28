@@ -526,28 +526,35 @@ At 1024³ flat textures become 1GB (impossible). SVDAG is the state-of-the-art s
 
 ---
 
-## Minimum spec target (rendering / perf budget)
+## Hardware spec target (rendering / perf budget)
 
-This is the hardware we **target for 60 FPS at the listed resolution**. It's an invariant we want to hit, not a "might work" floor — it's the budget that constrains what rendering / sim features we ship by default. Heavier features may live behind a higher tier (LOD bias, optional shadows, etc.) but the default experience must hit 60 FPS on this rig.
+**One tier. We tune for the low end of the distribution.** The spec rig is **10th-percentile Steam GPU ≈ Apple M1 base**: the game must run playably (50–60 FPS felt) at this tier, with reduced resolution (render_scale ≤ 0.5) acceptable to hit the FPS contract. Negotiable up to ~12th percentile if a rendering choice forces it; **not higher** without re-opening this section.
 
-Sourced from edward's read of public hardware surveys (Steam HW Survey and similar). Numbers are not pinned to any specific survey snapshot; revise when the public-PC floor visibly moves.
+Per `docs/perf/audience-hw-distribution.md` §2, M1 base sits at the 10–15th percentile of active Steam GPUs and M2 base at ~25th, so this target lands roughly where M1 lives. ~90% of the Steam audience clears it. For voxel/sandbox genres (Minecraft demographic skews low-end, see audience-hw §6) the realistic hash-thing-audience coverage is closer to 95%+.
 
 | Component | Target |
 |---|---|
-| RAM | **8 GB** |
-| CPU | **4 physical cores** (clock speed unconstrained) |
-| GPU VRAM | **2 GB** (open to pushback; some features may gate behind higher tiers) |
-| Display resolution | **1440p (2560×1440)** at 60 FPS |
-| Disk install footprint | **≤ 2 GB** (negotiable) |
-| Architecture | **x86_64** + **Apple Silicon (arm64)** |
+| RAM | 8 GB |
+| CPU | 4 physical cores (clock unconstrained) |
+| GPU FP32 throughput | ~2.5–3 TFLOPS (Apple M1 base / GTX 1650-class) |
+| GPU memory available | 4 GB discrete VRAM, or 8 GB unified (Apple Silicon) |
+| Display resolution | 1080p, render_scale ≤ 0.5 acceptable |
+| Frame-rate contract | 50–60 FPS felt on the spec rig |
+| Disk install footprint | ≤ 2 GB |
+| Architecture | x86_64 + Apple Silicon (arm64) |
 | Operating systems | macOS, Linux, Windows (per `xb7` distribution work) |
 
+**Dev measurement target: edward's M2 base** (~3.6 TF, ~25th percentile — one tier above the spec floor). The crew owns M-series Macs, not RTX 3060s; we measure on what we have. Perf wins on M2 should translate cleanly down to M1 via existing quality knobs. Cross-checking on M1 is the smoke test, not the daily measurement loop.
+
+**Better-rig support is via continuous quality knobs, not feature gates.** Same game everywhere — same simulation, same renderer, same content. A 4090 owner gets render_scale=1.0, longer draw distance, higher-quality post-FX, and naturally higher FPS, all from continuous knobs the engine already exposes. We do **not** add "shadows-only-on-RTX" toggles, capability-tier SKUs, or anything that bands the experience. Rendering ambition scales with the rig; the game does not.
+
+**Ray-tracing caveat (deferred negotiation).** If we ever adopt true hardware raytracing as a default rendering path (distinct from the current shader raymarcher-on-bitmaps), this contract likely breaks — M1 base can't run HW RT competitively. At that point this section re-opens. Until then, the current shader-based renderer is assumed.
+
 Notes:
-- "Minimum" here means **the default experience runs at 60 FPS at 1440p on this rig.** If we can't hit that, either we lower the rendering budget or the spec target moves up — not both silently.
-- Felt FPS is the metric, not log-reported `render_gpu` (see hash-thing-dbz5). A fix that moves a single number without moving the felt experience does not count as hitting the target.
-- Tiered features are allowed: e.g. shadows / higher-quality LOD can require more VRAM, as long as the 2 GB tier still renders cleanly with the defaults.
-- Higher resolutions (4K, ultrawide) and beefier rigs are nice-to-have, not the design target.
-- **Audience-distribution context:** per `docs/perf/audience-hw-distribution.md` (cairn 2026-04-26 research), the median Steam gamer has ~3.5–5× the FP32 throughput of an Apple M1/M2 base GPU. Apple Silicon sits at the bottom-25% of active Steam GPUs; macOS is 2.35% of Steam. Implication: optimization budget targets the median Steam GPU (RTX 3060/4060-class), not Mac-specific perf. Mac defaults to `render_scale=0.5` and is treated as the minimum-spec smoke test.
+
+- **Felt FPS, not `render_gpu` logs.** A fix that moves a number without moving the felt experience does not count as hitting the contract (hash-thing-dbz5).
+- **Re-negotiation triggers.** Bump the target *up* if (a) a desired feature is genuinely impossible at 10th-percentile compute — RT is the canonical example, (b) early-access telemetry shows nobody at the low end actually plays voxel sandboxes, or (c) the public-PC floor visibly moves and 10th percentile of future-Steam is way past M1. Bump it *down* only with strong evidence we're crushing rendering ambition for an audience that doesn't exist. In every case, change the table here and call it out in the commit — don't drift silently.
+- **Supersedes audience-hw §5.** That section's per-bead re-prioritization (`9k4w.4` demoted, `m59h` deferred, `adp-res` promoted) flowed from a "tune for median, ignore Mac" frame that this section now overrides. See follow-up bead `hash-thing-3q4a` for the proper §5 rewrite.
 
 ---
 
