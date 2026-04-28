@@ -2876,22 +2876,33 @@ mod tests {
     /// is reset between runs (i.e. without cache reuse). Per Codex
     /// plan-review §5 this is the test that proves the fold is
     /// computationally sound, not just that it caches correctly.
+    ///
+    /// Per Claude code-review IMPORTANT: stone+air is self-inert
+    /// (stone has `CaRule::Noop` and no BlockRule), so a stone-only
+    /// world hits the `is_all_inert` short-circuit at the top of
+    /// `step_node` and never enters the fold path. **Use SAND** —
+    /// it has `tick_divisor=1` (so the predicate returns false →
+    /// fold applies) AND a non-trivial `block_rule_id`
+    /// (gravity_block_rule) so the world is not all-inert and
+    /// step_node descends through the cache + base case.
     #[test]
     fn fast_subtree_step_result_invariant_under_gen_plus_two() {
-        use crate::terrain::materials::STONE;
+        use crate::terrain::materials::SAND;
 
-        // Build the same fast (stone-only, no water) world twice;
-        // step once each at gen=0 and gen=2. Result roots must match.
+        // Build the same fast world twice (sand has tick_divisor=1
+        // → predicate=false → fold applies; gravity block rule →
+        // not inert → recursion + base case actually run); step
+        // once each at gen=0 and gen=2. Result roots must match.
         fn make_fast_world() -> World {
             let mut world = World::new(4);
-            // 4×4×4 stone region; mixed alive/dead is impossible
-            // here (stone is inert), but inert subtrees short-circuit
-            // before the cache. Use stone+air pattern that exercises
-            // CaRule (stone next to air boundaries).
+            // 4×4×4 sand floating in air. Gravity block rule will
+            // step it down, exercising the BlockRule path (which is
+            // where Margolus parity lives). The result must be the
+            // same at gen=0 and gen=2 because both have parity 0.
             for x in 1..5 {
-                for y in 1..5 {
+                for y in 5..9 {
                     for z in 1..5 {
-                        world.set(wc(x), wc(y), wc(z), STONE);
+                        world.set(wc(x), wc(y), wc(z), SAND);
                     }
                 }
             }
@@ -2907,13 +2918,27 @@ mod tests {
             "this test relies on memo_period=4 from terrain_defaults"
         );
         world_a.step_recursive();
-        let root_a_gen1 = world_a.root;
+        let root_a_after_gen0 = world_a.root;
 
-        // Run B: gen=2 (skip ahead by 2 BEFORE stepping).
+        // Run B: gen=2 (skip ahead by 2 BEFORE stepping). Without
+        // the fold this would run with `schedule_phase=2` and
+        // (without our cache fold logic) could produce a different
+        // root if the implementation accidentally referenced the
+        // generation as anything other than `gen % 2`.
         let mut world_b = make_fast_world();
         world_b.generation = 2;
         world_b.step_recursive();
-        let root_b_gen3 = world_b.root;
+        let root_b_after_gen2 = world_b.root;
+
+        // Sanity: the step actually moved cells (gravity dropped
+        // sand by one row). If both roots are unchanged from the
+        // pre-step state, the test isn't exercising anything.
+        let world_static = make_fast_world();
+        let static_root = world_static.root;
+        assert_ne!(
+            root_a_after_gen0, static_root,
+            "step_recursive on a sand world should change the root (gravity); test would be a no-op otherwise"
+        );
 
         // Both worlds did one step on identical content. World A
         // stepped at gen=0 (phase=0), World B at gen=2 (phase=2 in
@@ -2921,7 +2946,7 @@ mod tests {
         // subtree the result must be identical — that's the
         // theorem the fold relies on.
         assert_eq!(
-            root_a_gen1, root_b_gen3,
+            root_a_after_gen0, root_b_after_gen2,
             "fast subtree must produce identical step result at gen=0 and gen=2 (proves the fold's correctness independent of cache reuse)"
         );
     }
