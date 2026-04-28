@@ -8,6 +8,23 @@ use hash_thing::terrain;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+
+/// hash-thing-imvg (vqke.1): timing data the sim thread returns alongside
+/// the World so the main thread can attribute the non-Hashlife portion of
+/// the `step` perf metric to the right wrapper phase.
+///
+/// `sim_finished_at` is captured immediately before the thread closure
+/// returns. The main thread compares against `Instant::now()` at the
+/// moment it detects `step_handle.is_finished()` to measure the
+/// once-per-frame polling lag — i.e. the wall-clock between the sim
+/// thread actually finishing and the main loop noticing.
+#[derive(Debug)]
+struct SimThreadTimings {
+    apply_mutations_ns: u64,
+    spawn_clones_ns: u64,
+    step_recursive_ns: u64,
+    sim_finished_at: std::time::Instant,
+}
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
@@ -623,7 +640,10 @@ struct App {
     /// Background sim step thread (x5w). While `Some`, `self.world` is a
     /// tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
-    step_handle: Option<JoinHandle<Result<sim::World, String>>>,
+    /// hash-thing-imvg (vqke.1): the sim thread returns timing data
+    /// alongside the World so the main thread can attribute the
+    /// non-Hashlife portion of `step` to the right wrapper phase.
+    step_handle: Option<JoinHandle<Result<(sim::World, SimThreadTimings), String>>>,
     /// When the background step was spawned, for perf timing.
     step_start: std::time::Instant,
     /// Cached world origin for rendering during background step.
@@ -1441,10 +1461,31 @@ impl App {
                 thread_qos::apply(qos);
             }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // hash-thing-imvg (vqke.1): bracket each wrapper phase
+                // separately. Phase 0 evidence showed step ≈ 140 ms with
+                // step_recursive ≈ 73 ms — leaving ~67 ms in this
+                // wrapper. Splitting it three ways (apply_mutations,
+                // spawn_clones, step_recursive itself) tells us which
+                // is the dominant carrier.
+                let t_apply = std::time::Instant::now();
                 world.apply_mutations();
+                let apply_mutations_ns = t_apply.elapsed().as_nanos() as u64;
+
+                let t_spawn = std::time::Instant::now();
                 world.spawn_clones();
+                let spawn_clones_ns = t_spawn.elapsed().as_nanos() as u64;
+
+                let t_step = std::time::Instant::now();
                 world.step_recursive();
-                world
+                let step_recursive_ns = t_step.elapsed().as_nanos() as u64;
+
+                let timings = SimThreadTimings {
+                    apply_mutations_ns,
+                    spawn_clones_ns,
+                    step_recursive_ns,
+                    sim_finished_at: std::time::Instant::now(),
+                };
+                (world, timings)
             }))
             .map_err(|e| {
                 if let Some(s) = e.downcast_ref::<&str>() {
@@ -2923,9 +2964,37 @@ impl ApplicationHandler for App {
                             );
                             self.warned_dev_profile_perf = true;
                         }
+                        // hash-thing-imvg (vqke.1): capture the moment we
+                        // detect the sim is done, so we can subtract the
+                        // sim-thread-finish timestamp from it and measure
+                        // the once-per-frame polling lag (the wall between
+                        // sim actually finishing and the main loop noticing).
+                        let detect_at = std::time::Instant::now();
                         match handle.join().expect("step thread aborted") {
-                            Ok(world) => {
+                            Ok((world, sim_timings)) => {
                                 self.world = world;
+                                // hash-thing-imvg (vqke.1): record the
+                                // wrapper-and-polling breakdown into perf
+                                // so the periodic summary line shows
+                                // apply / spawn / step_recursive / poll-lag
+                                // separately. Together they should sum to
+                                // approximately `step` (modulo timer
+                                // granularity).
+                                self.perf.record(
+                                    "step_apply_mut",
+                                    std::time::Duration::from_nanos(sim_timings.apply_mutations_ns),
+                                );
+                                self.perf.record(
+                                    "step_spawn_clones",
+                                    std::time::Duration::from_nanos(sim_timings.spawn_clones_ns),
+                                );
+                                self.perf.record(
+                                    "step_recursive",
+                                    std::time::Duration::from_nanos(sim_timings.step_recursive_ns),
+                                );
+                                let poll_lag = detect_at
+                                    .saturating_duration_since(sim_timings.sim_finished_at);
+                                self.perf.record("step_poll_lag", poll_lag);
                                 // Refresh the collision snapshot from the
                                 // just-returned world so the next frame's
                                 // player physics reads post-step geometry
@@ -4818,10 +4887,11 @@ mod tests {
         assert!(app.is_stepping(), "step should start after player update");
 
         let handle = app.step_handle.take().expect("step handle should exist");
-        app.world = handle
+        let (world, _timings) = handle
             .join()
             .expect("step thread should not panic")
             .expect("step thread should return a world");
+        app.world = world;
     }
 
     #[test]
