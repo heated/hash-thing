@@ -323,6 +323,44 @@ pub struct HashlifeStats {
     /// 0 (the 2× growth threshold gates compaction); the spikes show
     /// up roughly every N steps where N depends on churn. Per-step.
     pub compact_ns: u64,
+    /// hash-thing-bjdl (vqke.2): probe for hypothesis 3 (schedule-phase
+    /// explosion). At each cache miss in `step_node`, count the miss
+    /// as "phase-aliased" iff the same NodeId is already cached at a
+    /// *different* schedule_phase. Boolean-per-miss semantics: a
+    /// node aliased at three other phases counts once, not three
+    /// times. A high `cache_misses_phase_aliased / cache_misses`
+    /// ratio means the period is fragmenting reuse — content-folding
+    /// or a wider key would have hit.
+    ///
+    /// **Always 0 unless `HASH_THING_MEMO_DIAG=1`** is set in the
+    /// process environment at first-step time. Always-on cost was
+    /// estimated at single-digit ms/step at observed miss volumes
+    /// (per Claude + Codex plan review of this bead — vqke is trying
+    /// to speed step_recursive UP, not pay 5-10ms for a diagnostic).
+    /// Set the env var when you want to reproduce vqke.2's diagnostic
+    /// run and check the new memo_summary tokens.
+    ///
+    /// Macro path note: `step_node_macro` (`hashlife.rs:548`) shares
+    /// `cache_misses` with the micro path. On the 256³ default scene
+    /// `step_recursive_pow2` is not used, so macro misses are 0 and
+    /// the ratio is meaningful. If a future caller exercises the
+    /// macro path, `memo_phase_alias` becomes a lower-bound across
+    /// micro-only misses.
+    pub cache_misses_phase_aliased: u64,
+    /// hash-thing-bjdl (vqke.2): probe for hypothesis 2 (cache eviction
+    /// too aggressive). Counts hashlife_cache entries dropped during
+    /// `remap_caches` because their NodeId or result NodeId was not in
+    /// the post-compaction reachability set. Most steps are 0 because
+    /// `maybe_compact` is gated on the 2× growth threshold. A spike
+    /// where dropped/(dropped+kept) > 0.5 means eviction is throwing
+    /// live entries away.
+    pub compact_entries_dropped: u64,
+    /// hash-thing-bjdl (vqke.2): paired with `compact_entries_dropped`.
+    /// Counts hashlife_cache entries that survived the most recent
+    /// `remap_caches`. Only the main hashlife_cache is counted (the
+    /// macro / inert / all-inert caches are tangential to the memo_hit
+    /// signal). Per-step.
+    pub compact_entries_kept: u64,
 }
 
 impl HashlifeStats {
@@ -340,6 +378,14 @@ impl HashlifeStats {
         // (the per-step values fluctuate with churn / compact cadence).
         self.step_node_wall_ns += step.step_node_wall_ns;
         self.compact_ns += step.compact_ns;
+        // hash-thing-bjdl (vqke.2): lifetime accumulators for the
+        // memo-hit-rate diagnostic counters. Same per-step → lifetime
+        // shape as the wall-clock decompositions above so `memo_summary`
+        // can compute lifetime ratios (`memo_phase_alias` =
+        // `cache_misses_phase_alias / cache_misses`).
+        self.cache_misses_phase_aliased += step.cache_misses_phase_aliased;
+        self.compact_entries_dropped += step.compact_entries_dropped;
+        self.compact_entries_kept += step.compact_entries_kept;
         for (dst, src) in self
             .misses_by_level
             .iter_mut()
@@ -2281,13 +2327,32 @@ impl World {
             .saturating_sub(last_step.phase2_ns);
         let p3_ms = descent_ns as f64 / 1_000_000.0;
         let p4_ms = last_step.compact_ns as f64 / 1_000_000.0;
+        // hash-thing-bjdl (vqke.2): diagnostic ratios for the
+        // memo_hit-rate hypotheses. Bounded-width ratio tokens (each
+        // ≤ 25 chars) so the HUD-overlay split test stays green even
+        // when the underlying counts are in the millions.
+        let memo_period = self.materials.memo_period();
+        let phase_aliased = if stats.cache_misses == 0 {
+            0.0
+        } else {
+            stats.cache_misses_phase_aliased as f64 / stats.cache_misses as f64
+        };
+        let compact_total = stats.compact_entries_kept + stats.compact_entries_dropped;
+        let compact_drop = if compact_total == 0 {
+            0.0
+        } else {
+            stats.compact_entries_dropped as f64 / compact_total as f64
+        };
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms",
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms",
             hit_rate,
             churn,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
             self.macro_cache_bytes_est(),
+            memo_period,
+            phase_aliased,
+            compact_drop,
             p1_ms,
             p2_ms,
             p3_ms,

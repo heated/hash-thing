@@ -41,6 +41,61 @@ use super::world::World;
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// hash-thing-bjdl (vqke.2): process-wide gate for the memo-hit-rate
+/// diagnostic probes inside `step_node`. Lazily initialised from
+/// `HASH_THING_MEMO_DIAG=1` on first read; `false` (= probes off) by
+/// default. Always-on probes were estimated at single-digit ms/step
+/// at observed miss volumes (per Claude + Codex plan review of this
+/// bead at notes/PR-bjdl-*-Standard-*.md); vqke is trying to make
+/// `step_recursive` *faster*, not pay 5-10 ms for a diagnostic. Set
+/// the env var to reproduce the diagnostic run described in the
+/// bead and read the new tokens in `memo_summary`.
+///
+/// State encoding (AtomicU8 instead of bool so tests can still get a
+/// "not yet read" sentinel and override before the first hot-path
+/// load): 0 = uninitialised, 1 = enabled, 2 = disabled.
+static MEMO_DIAG_STATE: AtomicU8 = AtomicU8::new(0);
+
+// MEMO_DIAG_UNINIT (= 0) is the AtomicU8 default; the discriminant
+// is checked inline via the `_` arm in `memo_diag_enabled` rather
+// than via a named constant, so no `MEMO_DIAG_UNINIT` is exposed.
+const MEMO_DIAG_ON: u8 = 1;
+const MEMO_DIAG_OFF: u8 = 2;
+
+/// Read-only accessor for the memo-diag flag. After the first call
+/// the env-var lookup is cached as an atomic load on the hot path.
+fn memo_diag_enabled() -> bool {
+    match MEMO_DIAG_STATE.load(Ordering::Relaxed) {
+        MEMO_DIAG_ON => true,
+        MEMO_DIAG_OFF => false,
+        _ => {
+            let v = std::env::var("HASH_THING_MEMO_DIAG").ok().as_deref() == Some("1");
+            MEMO_DIAG_STATE.store(
+                if v { MEMO_DIAG_ON } else { MEMO_DIAG_OFF },
+                Ordering::Relaxed,
+            );
+            v
+        }
+    }
+}
+
+/// Test-only override for the memo-diag gate. Lets unit tests
+/// exercise the probe path without depending on the process
+/// environment. Race-free under the test harness's per-test
+/// serialisation: tests that touch the global gate must run on a
+/// dedicated thread or accept that their changes are visible to
+/// concurrent tests until reset. Pair every `force_memo_diag_for_test(true)`
+/// with a `force_memo_diag_for_test(false)` at scope exit if other
+/// concurrent tests would care.
+#[cfg(test)]
+pub(crate) fn force_memo_diag_for_test(enabled: bool) {
+    MEMO_DIAG_STATE.store(
+        if enabled { MEMO_DIAG_ON } else { MEMO_DIAG_OFF },
+        Ordering::Relaxed,
+    );
+}
 
 /// Per-phase micro-timing of one [`World::step_recursive_profiled`] invocation
 /// (hash-thing-jw3k diagnostic harness). All `_us` fields are microseconds.
@@ -101,7 +156,7 @@ impl World {
         // + leaf evaluation) and maybe_compact separately so the perf
         // log decomposes the previously-unaccounted slice of `step`.
         let t_step_node = std::time::Instant::now();
-        let result = self.step_node(padded_root, padded_level, phase);
+        let result = self.step_node(padded_root, padded_level, phase, period);
         self.hashlife_stats.step_node_wall_ns = t_step_node.elapsed().as_nanos() as u64;
         self.root = result;
         let step_stats_pre_compact = self.hashlife_stats;
@@ -168,7 +223,7 @@ impl World {
         let padded_level = self.level + 1;
         let period = self.materials.memo_period();
         let phase = self.generation % period;
-        let result = self.step_node(padded_root, padded_level, phase);
+        let result = self.step_node(padded_root, padded_level, phase, period);
         self.root = result;
         let step_stats = self.hashlife_stats;
         self.hashlife_stats_total.accumulate(&step_stats);
@@ -200,7 +255,7 @@ impl World {
         let period = self.materials.memo_period();
         let phase = self.generation % period;
         let t_step = std::time::Instant::now();
-        let result = self.step_node(padded_root, padded_level, phase);
+        let result = self.step_node(padded_root, padded_level, phase, period);
         let step_node_us = t_step.elapsed().as_micros() as u64;
         self.root = result;
         let step_stats = self.hashlife_stats;
@@ -425,12 +480,22 @@ impl World {
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
         // Remap hashlife_cache: (NodeId, schedule_phase) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
+        let before = old_cache.len() as u64;
         self.hashlife_cache.reserve(old_cache.len());
+        // hash-thing-bjdl (vqke.2): count kept entries directly in the
+        // success branch (rather than reading the final map length)
+        // so the metric isn't conflated with any future key-coalescing
+        // change in this loop. Dropped is `before - kept` — exact.
+        // Per Codex plan-review §3.
+        let mut kept: u64 = 0;
         for ((node, phase), result) in old_cache {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
                 self.hashlife_cache.insert((new_node, phase), new_result);
+                kept += 1;
             }
         }
+        self.hashlife_stats.compact_entries_kept += kept;
+        self.hashlife_stats.compact_entries_dropped += before - kept;
 
         // Remap hashlife_macro_cache: (NodeId, generation) → NodeId
         let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
@@ -484,7 +549,19 @@ impl World {
     /// memo_period()` where memo_period = LCM over materials of 2*divisor
     /// (iowh). Identical subtrees at the same schedule_phase always produce
     /// identical outputs (9ww + iowh).
-    fn step_node(&mut self, node: NodeId, level: u32, schedule_phase: u64) -> NodeId {
+    ///
+    /// `memo_period` is the period passed by `step_recursive`'s top-level
+    /// call (computed once from `self.materials.memo_period()` at line
+    /// 98). It's threaded through so `step_node` can run the
+    /// hash-thing-bjdl phase-alias diagnostic probe at miss sites without
+    /// re-querying the registry on every miss.
+    fn step_node(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> NodeId {
         assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
@@ -517,11 +594,31 @@ impl World {
         if (level as usize) >= 3 {
             self.hashlife_stats.misses_by_level[(level - 3) as usize] += 1;
         }
+        // hash-thing-bjdl (vqke.2): hypothesis-3 probe, env-gated.
+        // Mass-zero in production (the LazyLock check is a single
+        // atomic load); only fires when HASH_THING_MEMO_DIAG=1 is set
+        // at process start. At default-scene period=4 the inner loop
+        // is at most 3 hashmap lookups per miss; on a 256³ default
+        // scene at ~6-50k misses/step that's 18-150k extra lookups
+        // per step (5-10 ms) which the rest of vqke is trying to
+        // speed up — hence the gate. Boolean-per-miss semantics: a
+        // node aliased at three other phases counts ONCE.
+        if memo_diag_enabled() && memo_period > 1 {
+            for p in 0..memo_period {
+                if p == schedule_phase {
+                    continue;
+                }
+                if self.hashlife_cache.contains_key(&(node, p)) {
+                    self.hashlife_stats.cache_misses_phase_aliased += 1;
+                    break;
+                }
+            }
+        }
 
         let result = if level == 3 {
             self.step_base_case(node, schedule_phase)
         } else {
-            self.step_recursive_case(node, level, schedule_phase)
+            self.step_recursive_case(node, level, schedule_phase, memo_period)
         };
 
         self.hashlife_cache.insert(key, result);
@@ -874,7 +971,13 @@ impl World {
     }
 
     /// Recursive case: level ≥ 3.
-    fn step_recursive_case(&mut self, node: NodeId, level: u32, schedule_phase: u64) -> NodeId {
+    fn step_recursive_case(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> NodeId {
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
@@ -926,7 +1029,7 @@ impl World {
                     }
                     let sub_root = self.store.interior(level - 1, sub_cube);
                     result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node(sub_root, level - 1, schedule_phase);
+                        self.step_node(sub_root, level - 1, schedule_phase, memo_period);
                 }
             }
         }
@@ -2454,5 +2557,128 @@ mod tests {
             Some(g) => eprintln!("\n=== first divergence at gen {g} (window dumped above) ==="),
             None => eprintln!("\n=== no divergence in 80 gens ==="),
         }
+    }
+
+    // ============================================================
+    // hash-thing-bjdl (vqke.2): targeted unit tests for the new
+    // memo-hit-rate diagnostic counters. Per Codex plan-review §5,
+    // a "step once on a real scene" test is too non-deterministic;
+    // these inject the exact precondition the counters care about.
+    // ============================================================
+
+    /// `cache_misses_phase_aliased` covers both contracts:
+    /// (a) when `HASH_THING_MEMO_DIAG` is on (forced via the test
+    ///     hook), a miss whose NodeId is already cached at another
+    ///     phase MUST increment the counter; and
+    /// (b) when the gate is off (production default), the same
+    ///     precondition MUST NOT increment — the always-zero-in-prod
+    ///     contract that justifies the env-var gate at all.
+    ///
+    /// Both arms run inline in the SAME test function so the gate
+    /// flag toggle can't race with a sibling test running in parallel
+    /// (cargo test runs tests on multiple threads by default; the
+    /// gate is process-wide). We use a GoL world with a populated
+    /// 4×4×4 region so step_node's inert/all-inert short-circuits
+    /// don't fire before the miss path.
+    #[test]
+    fn cache_misses_phase_aliased_obeys_diag_gate() {
+        // Helper: build the same GoL world + alias precondition
+        // twice (once per arm), so each arm starts from a clean
+        // counter without aliasing across them.
+        fn fresh_world_with_alias_precondition() -> (World, NodeId) {
+            let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+            for x in 2..6 {
+                for y in 2..6 {
+                    for z in 2..6 {
+                        world.set(wc(x), wc(y), wc(z), ALIVE.into());
+                    }
+                }
+            }
+            let any_node = world.root;
+            world.hashlife_cache.insert((any_node, 0), any_node);
+            (world, any_node)
+        }
+
+        // Arm A: gate ON → counter must increment.
+        force_memo_diag_for_test(true);
+        let (mut world_on, node_on) = fresh_world_with_alias_precondition();
+        let before_on = world_on.hashlife_stats.cache_misses_phase_aliased;
+        world_on.step_node(node_on, 3, /*schedule_phase*/ 1, /*memo_period*/ 4);
+        let after_on = world_on.hashlife_stats.cache_misses_phase_aliased;
+        assert!(
+            after_on > before_on,
+            "with diag ON the alias precondition must fire the counter (before={before_on} after={after_on})"
+        );
+
+        // Arm B: gate OFF → counter must stay at 0.
+        force_memo_diag_for_test(false);
+        let (mut world_off, node_off) = fresh_world_with_alias_precondition();
+        world_off.step_node(node_off, 3, 1, 4);
+        assert_eq!(
+            world_off.hashlife_stats.cache_misses_phase_aliased, 0,
+            "with diag OFF the probe must not fire even when the alias precondition is satisfied"
+        );
+
+        // Reset the gate so any later (parallel) test sees the
+        // production default.
+        force_memo_diag_for_test(false);
+    }
+
+    /// `remap_caches` must split its outcome into kept (entries whose
+    /// node + result both survived the remap) and dropped (everything
+    /// else). Three entries in, two survive, one dropped: counters
+    /// land at 2/1.
+    #[test]
+    fn remap_caches_counts_kept_and_dropped() {
+        let mut world = World::new(4);
+        let n1 = world.store.empty(2);
+        let n2 = world.store.empty(3);
+        let n3 = world.store.empty(4);
+        // Three cache entries: n1→n2, n2→n3, n3→n1. Two survive
+        // remap, one drops.
+        world.hashlife_cache.insert((n1, 0), n2);
+        world.hashlife_cache.insert((n2, 1), n3);
+        world.hashlife_cache.insert((n3, 0), n1);
+
+        let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        remap.insert(n1, n1);
+        remap.insert(n2, n2);
+        // n3 is intentionally NOT in the remap → both keys/values
+        // touching n3 should be dropped.
+
+        world.hashlife_stats = super::super::world::HashlifeStats::default();
+        world.remap_caches(&remap);
+
+        // Survivors: only the (n1, 0) → n2 entry (both endpoints in
+        // the remap). The (n2, 1) → n3 entry drops on the value side
+        // (n3 not in remap), and (n3, 0) → n1 drops on the key side.
+        assert_eq!(
+            world.hashlife_stats.compact_entries_kept, 1,
+            "exactly the (n1, 0) → n2 entry should survive"
+        );
+        assert_eq!(
+            world.hashlife_stats.compact_entries_dropped, 2,
+            "two entries reference the unmapped n3 and must be dropped"
+        );
+        assert_eq!(
+            world.hashlife_stats.compact_entries_kept
+                + world.hashlife_stats.compact_entries_dropped,
+            3,
+            "kept + dropped must equal the pre-remap cache size (3)"
+        );
+    }
+
+    /// `remap_caches` on an empty cache must report 0/0 — no
+    /// underflow on the `before - kept` subtraction (the dropped
+    /// counter is computed as `usize - usize` cast to `u64`).
+    #[test]
+    fn remap_caches_handles_empty_cache_with_zero_counters() {
+        let mut world = World::new(4);
+        world.hashlife_stats = super::super::world::HashlifeStats::default();
+        // hashlife_cache is empty by default.
+        let remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        world.remap_caches(&remap);
+        assert_eq!(world.hashlife_stats.compact_entries_kept, 0);
+        assert_eq!(world.hashlife_stats.compact_entries_dropped, 0);
     }
 }
