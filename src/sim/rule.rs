@@ -129,7 +129,7 @@ pub trait BlockRule {
     fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8];
 
     /// Clone into a boxed trait object.
-    fn clone_box(&self) -> Box<dyn BlockRule + Send>;
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync>;
 }
 
 /// Map local (dx, dy, dz) offsets (each 0 or 1) to an index in `[Cell; 8]`.

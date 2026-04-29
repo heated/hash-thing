@@ -128,6 +128,94 @@ fn bench_hashlife_256_tk4j() {
     bench_step("256³ tk4j", 8, 30);
 }
 
+/// hash-thing-ftuu (vqke.4): same scale as `bench_hashlife_256_tk4j`,
+/// run in two passes so the bench output decomposes the rayon win at the
+/// level-4 fanout.
+///
+/// Reads `HASH_THING_BASE_CASE_RAYON=0|1` is *not* required — this
+/// bench drives the toggle directly so a single invocation prints
+/// both columns side-by-side. Compare:
+///
+/// ```text
+/// cargo test --profile perf --test bench_hashlife \
+///     bench_hashlife_256_ftuu_rayon_compare -- --ignored --nocapture
+/// ```
+///
+/// Acceptance gate (informational, no panic): rayon p1 mean ≤ 15 ms
+/// matches the bead's target.
+#[test]
+#[ignore]
+fn bench_hashlife_256_ftuu_rayon_compare() {
+    bench_step_with_rayon_toggle("256³ ftuu serial", 8, 30, false);
+    bench_step_with_rayon_toggle("256³ ftuu rayon", 8, 30, true);
+}
+
+fn bench_step_with_rayon_toggle(label: &str, level: u32, generations: usize, use_rayon: bool) {
+    let side = 1u64 << level;
+    eprintln!("--- {label} (level={level}, side={side}³, base_case_use_rayon={use_rayon}) ---");
+
+    let t0 = Instant::now();
+    let mut world = World::new(level);
+    world.set_base_case_use_rayon(use_rayon);
+    let params = TerrainParams::for_level(level);
+    let stats = world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
+    let seed_ms = t0.elapsed().as_millis();
+    eprintln!(
+        "  seed: {seed_ms}ms (precompute: {}µs, gen: {}µs), pop: {}, \
+         nodes: {}",
+        stats.precompute_us,
+        stats.gen_region_us,
+        world.population(),
+        stats.nodes_after_gen,
+    );
+
+    let mut step_us = Vec::with_capacity(generations);
+    let mut p1_ns_per_step = Vec::with_capacity(generations);
+    let mut p2_ns_per_step = Vec::with_capacity(generations);
+    for _gen in 0..generations {
+        let t = Instant::now();
+        world.step_recursive();
+        step_us.push(t.elapsed().as_micros() as u64);
+        p1_ns_per_step.push(world.hashlife_stats.phase1_ns);
+        p2_ns_per_step.push(world.hashlife_stats.phase2_ns);
+    }
+
+    if generations > 0 {
+        let mut sorted = step_us.clone();
+        sorted.sort();
+        let median_us = sorted[generations / 2];
+        let p95_us = sorted[(generations as f64 * 0.95) as usize];
+        let mean_us = step_us.iter().sum::<u64>() / generations as u64;
+
+        let mut p1_sorted = p1_ns_per_step.clone();
+        p1_sorted.sort();
+        let p1_median_ns = p1_sorted[generations / 2];
+
+        let mut p2_sorted = p2_ns_per_step.clone();
+        p2_sorted.sort();
+        let p2_median_ns = p2_sorted[generations / 2];
+
+        eprintln!(
+            "  step: mean={:.1}ms median={:.1}ms p95={:.1}ms",
+            mean_us as f64 / 1000.0,
+            median_us as f64 / 1000.0,
+            p95_us as f64 / 1000.0,
+        );
+        eprintln!(
+            "  p1 (CaRule per-cell): median={:.1}ms",
+            p1_median_ns as f64 / 1_000_000.0,
+        );
+        eprintln!(
+            "  p2 (BlockRule per-block): median={:.1}ms",
+            p2_median_ns as f64 / 1_000_000.0,
+        );
+        eprintln!("  memo_summary: {}", world.memo_summary());
+    }
+    eprintln!();
+}
+
 #[test]
 #[ignore]
 fn bench_hashlife_1024() {

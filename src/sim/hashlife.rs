@@ -207,8 +207,10 @@ impl World {
         // those counters).
         let step_stats = self.hashlife_stats;
         self.hashlife_stats_total.accumulate(&step_stats);
-        self.memo_window
-            .push(step_stats_pre_compact.cache_hits, step_stats_pre_compact.cache_misses);
+        self.memo_window.push(
+            step_stats_pre_compact.cache_hits,
+            step_stats_pre_compact.cache_misses,
+        );
     }
 
     /// Per-column gap-fill path. Retained `#[cfg(test)]` after qy4g option G
@@ -822,126 +824,7 @@ impl World {
         grid: &[CellState],
         generation: u64,
     ) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
-        let side = LEVEL3_SIDE;
-        // Phase 1: CaRule on interior cells (1..side-1 on each axis).
-        // The outermost ring cannot be evolved correctly because its neighbors
-        // would wrap outside the padded region. Callers only extract the center
-        // that remains valid after the requested number of steps.
-        let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
-        // Phase 1 timer covers both the per-call setup (noop_flags,
-        // tick_divisor_flags) AND the cell loop. Both caches are now slice
-        // reads into MaterialRegistry (tick_divisor_flags by hash-thing-5yxk,
-        // noop_flags by hash-thing-2z3g). Attributing setup to p1 keeps
-        // p1+p2 close to the full step_grid_once wall time — if a future
-        // investigator sees p1+p2 ≪ observed step time, the missing cost is
-        // memo lookup/insert or `next`-array zeroing, not hidden setup.
-        let phase1_start = std::time::Instant::now();
-        // Precompute per-material noop flag to avoid vtable dispatch per cell.
-        // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
-        // entirely (next is zero-initialized). For GoL, air participates in birth
-        // rules and must NOT be skipped.
-        let noop_by_material = self.materials.noop_flags();
-        let divisor_by_material = self.materials.tick_divisor_flags();
-        let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
-        for z in 1..side - 1 {
-            for y in 1..side - 1 {
-                for x in 1..side - 1 {
-                    let idx = x + y * side + z * side * side;
-                    let raw = grid[idx];
-                    if raw == 0 && air_is_noop {
-                        continue;
-                    }
-                    let cell = Cell::from_raw(raw);
-                    let mat = cell.material() as usize;
-                    if mat < noop_by_material.len() && noop_by_material[mat] {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    // tick_divisor gate: rule fires only when generation is a
-                    // multiple of this material's divisor (iowh). Skipped ticks
-                    // keep the cell unchanged. Divisor=1 (default) reduces to
-                    // "every tick", identical to pre-iowh behavior.
-                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
-                    if divisor > 1 && !generation.is_multiple_of(divisor) {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    let rule = self.materials.rule_for_cell(cell).unwrap_or_else(|| {
-                        panic!("missing CaRule for material {}", cell.material())
-                    });
-                    let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
-                    next[idx] = rule.step_cell(cell, &neighbors).raw();
-                }
-            }
-        }
-
-        let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
-
-        // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
-        // Node-local alignment (9ww): partition is determined by grid-local
-        // coordinates, not world-space origin. With per-rule tick_divisors
-        // (iowh), each BlockRule has its own offset `(generation / divisor) % 2`
-        // derived from its slowed-down tick schedule — this preserves Margolus
-        // mass-conservation alternation for slowed rules. Default d=1 reduces
-        // to `generation % 2`, identical to pre-iowh behavior.
-        //
-        // Phase 2 timer covers the block_rule_tick_divisors cache read and
-        // the per-block loop, symmetric with Phase 1 covering its setup.
-        let phase2_start = std::time::Instant::now();
-        let block_rule_divisors = self.materials.block_rule_tick_divisors();
-
-        // Fast path: when all divisors are 1 (period 2), every rule uses the
-        // same offset = generation % 2. Keep the old single-offset loop to
-        // avoid extra iteration on the default hot path.
-        let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1)
-            && divisor_by_material.iter().all(|&d| d == 1);
-        if all_divisors_one {
-            let offset = (generation % 2) as usize;
-            let mut bz = offset;
-            while bz + 1 < side - 1 {
-                let mut by = offset;
-                while by + 1 < side - 1 {
-                    let mut bx = offset;
-                    while bx + 1 < side - 1 {
-                        self.apply_block_in_grid(&mut next, side, bx, by, bz);
-                        bx += 2;
-                    }
-                    by += 2;
-                }
-                bz += 2;
-            }
-        } else {
-            // Slow path: iterate both offsets, decide per-block based on the
-            // dominant rule's own slowed-down tick schedule. Empty blocks and
-            // mismatched-offset blocks early-exit cheaply.
-            for pass_offset in 0..2usize {
-                let mut bz = pass_offset;
-                while bz + 1 < side - 1 {
-                    let mut by = pass_offset;
-                    while by + 1 < side - 1 {
-                        let mut bx = pass_offset;
-                        while bx + 1 < side - 1 {
-                            self.apply_block_in_grid_with_schedule(
-                                &mut next,
-                                side,
-                                bx,
-                                by,
-                                bz,
-                                pass_offset,
-                                generation,
-                                block_rule_divisors,
-                            );
-                            bx += 2;
-                        }
-                        by += 2;
-                    }
-                    bz += 2;
-                }
-            }
-        }
-        let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
-
-        (next, phase1_ns, phase2_ns)
+        step_grid_once_pure(grid, generation, &self.materials)
     }
 
     fn center_level3_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
@@ -957,137 +840,6 @@ impl World {
             }
         }
         self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
-    }
-
-    /// Slow-path variant of `apply_block_in_grid` used when any BlockRule has
-    /// `tick_divisor > 1`. Only applies the block's dominant rule when the
-    /// current pass_offset matches that rule's Margolus offset for this tick
-    /// and the rule is active this tick (`generation % divisor == 0`). No-op
-    /// otherwise.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_block_in_grid_with_schedule(
-        &self,
-        grid: &mut [CellState],
-        side: usize,
-        bx: usize,
-        by: usize,
-        bz: usize,
-        pass_offset: usize,
-        generation: u64,
-        block_rule_divisors: &[u16],
-    ) {
-        let mut block = [Cell::EMPTY; 8];
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    block[octant_index(dx as u32, dy as u32, dz as u32)] =
-                        Cell::from_raw(grid[idx]);
-                }
-            }
-        }
-
-        if block.iter().all(|c| c.is_empty()) {
-            return;
-        }
-
-        let rule_id = match self.unique_block_rule(&block) {
-            Some(id) => id,
-            None => return,
-        };
-
-        let divisor = block_rule_divisors
-            .get(rule_id.0)
-            .copied()
-            .unwrap_or(1)
-            .max(1) as u64;
-        if !generation.is_multiple_of(divisor) {
-            return;
-        }
-        let rule_offset = ((generation / divisor) & 1) as usize;
-        if rule_offset != pass_offset {
-            return;
-        }
-
-        let movable: [bool; 8] = std::array::from_fn(|i| {
-            let c = block[i];
-            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
-        });
-
-        let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block, &movable);
-
-        debug_assert!(
-            (0..8).all(|i| movable[i] || result[i] == block[i]),
-            "block rule moved an immovable cell"
-        );
-
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if movable[i] {
-                        grid[idx] = result[i].raw();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Apply a single block rule within a flat grid.
-    fn apply_block_in_grid(
-        &self,
-        grid: &mut [CellState],
-        side: usize,
-        bx: usize,
-        by: usize,
-        bz: usize,
-    ) {
-        let mut block = [Cell::EMPTY; 8];
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    block[octant_index(dx as u32, dy as u32, dz as u32)] =
-                        Cell::from_raw(grid[idx]);
-                }
-            }
-        }
-
-        if block.iter().all(|c| c.is_empty()) {
-            return;
-        }
-
-        let rule_id = match self.unique_block_rule(&block) {
-            Some(id) => id,
-            None => return,
-        };
-
-        let movable: [bool; 8] = std::array::from_fn(|i| {
-            let c = block[i];
-            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
-        });
-
-        let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block, &movable);
-
-        debug_assert!(
-            (0..8).all(|i| movable[i] || result[i] == block[i]),
-            "block rule moved an immovable cell"
-        );
-
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if movable[i] {
-                        grid[idx] = result[i].raw();
-                    }
-                }
-            }
-        }
     }
 
     /// Recursive case: level ≥ 3.
@@ -1133,8 +885,11 @@ impl World {
             centered[i] = self.center_node(inter[i], level - 1);
         }
 
-        // Group into 8 overlapping sub-cubes (level n-1) and recurse.
-        let mut result_children = [NodeId::EMPTY; 8];
+        // Group into 8 overlapping sub-cubes (level n-1) and assemble their
+        // sub_roots up-front. The 8 step_node calls follow — at level==4
+        // (i.e. each sub-cube is a level-3 base case) the calls may be
+        // batched through rayon if `base_case_use_rayon` is enabled.
+        let mut sub_roots = [NodeId::EMPTY; 8];
         for oz in 0..2usize {
             for oy in 0..2usize {
                 for ox in 0..2usize {
@@ -1147,14 +902,172 @@ impl World {
                             }
                         }
                     }
-                    let sub_root = self.store.interior(level - 1, sub_cube);
-                    result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node(sub_root, level - 1, schedule_phase, memo_period);
+                    sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
+                        self.store.interior(level - 1, sub_cube);
                 }
             }
         }
 
+        let mut result_children = [NodeId::EMPTY; 8];
+        if level == 4 && self.base_case_use_rayon {
+            // hash-thing-ftuu (vqke.4): batch the 8 level-3 base cases through
+            // rayon. Replicates the prelude of `step_node` (empty / inert /
+            // cache lookup) inline so the parallel work is restricted to the
+            // pure `step_grid_once_pure` calls — the only non-trivial
+            // computation that can run without `&mut self`.
+            self.step_level4_fanout_rayon(
+                &sub_roots,
+                schedule_phase,
+                memo_period,
+                &mut result_children,
+            );
+        } else {
+            for i in 0..8 {
+                result_children[i] =
+                    self.step_node(sub_roots[i], level - 1, schedule_phase, memo_period);
+            }
+        }
+
         self.store.interior(level - 1, result_children)
+    }
+
+    /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 level-3
+    /// base cases under a level-4 fanout. Replaces the serial loop over
+    /// `step_node(sub_root, 3, ...)` calls when `base_case_use_rayon` is on.
+    ///
+    /// Phase A (sequential, mutates stats + reads store/cache): mirrors the
+    /// `step_node` prelude — empty-skip, fixed-point-skip, all-inert-skip,
+    /// fast-subtree phase fold, cache lookup. Sub-cubes that short-circuit
+    /// or hit the cache are recorded directly into `result_children`.
+    /// Sub-cubes that miss are recorded into a queue alongside their
+    /// flattened 8³ grid (read-only on store).
+    ///
+    /// Phase B (parallel, no `&self`): rayon `par_iter` over the queued
+    /// flat grids invokes `step_grid_once_pure` to compute each output
+    /// grid. The threshold below `4` falls back to serial `iter` because
+    /// rayon's per-task overhead exceeds the win at very small batch sizes
+    /// (a level-4 fanout caps at 8 base cases, and most steady-state
+    /// fanouts have fewer than 8 misses).
+    ///
+    /// Phase C (sequential, mutates store + cache + stats): commits each
+    /// output grid via `from_flat` + `center_level3_grid_to_node`, inserts
+    /// the result into `hashlife_cache` under the same `(sub_root,
+    /// effective_phase)` key the next `step_node` lookup would use, and
+    /// folds `phase1_ns` / `phase2_ns` into stats so observability stays
+    /// identical to the serial path.
+    ///
+    /// Bit-exact with the serial path — verified by
+    /// `tests/base_case_rayon_parity.rs`.
+    fn step_level4_fanout_rayon(
+        &mut self,
+        sub_roots: &[NodeId; 8],
+        schedule_phase: u64,
+        memo_period: u64,
+        result_children: &mut [NodeId; 8],
+    ) {
+        use rayon::prelude::*;
+
+        // Per-sub_root classification: either resolved (short-circuit or
+        // cache hit) or pending (miss, needs base-case compute).
+        let mut resolved: [Option<NodeId>; 8] = [None; 8];
+        let mut pending: Vec<(usize, u64)> = Vec::with_capacity(8); // (sub_root_index, effective_phase)
+        let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> = Vec::with_capacity(8);
+
+        for i in 0..8 {
+            let nid = sub_roots[i];
+
+            // Mirrors `step_node` lines 650-666: empty / uniform-inert /
+            // all-inert short-circuits.
+            if self.store.population(nid) == 0 {
+                self.hashlife_stats.empty_skips += 1;
+                resolved[i] = Some(self.store.empty(2));
+                continue;
+            }
+            if let Some(state) = self.inert_uniform_state(nid) {
+                self.hashlife_stats.fixed_point_skips += 1;
+                resolved[i] = Some(self.store.uniform(2, state));
+                continue;
+            }
+            if self.is_all_inert(nid) {
+                self.hashlife_stats.fixed_point_skips += 1;
+                resolved[i] = Some(self.center_node(nid, 3));
+                continue;
+            }
+
+            // Mirrors `step_node` lines 694-703: fast-subtree phase fold +
+            // cache lookup.
+            let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(nid) {
+                schedule_phase % 2
+            } else {
+                schedule_phase
+            };
+            let key = (nid, effective_phase);
+            if let Some(&cached) = self.hashlife_cache.get(&key) {
+                self.hashlife_stats.cache_hits += 1;
+                resolved[i] = Some(cached);
+                continue;
+            }
+
+            // Miss — record cache_misses now (matches `step_node` line 704
+            // which counts the miss before evaluation).
+            self.hashlife_stats.cache_misses += 1;
+            self.hashlife_stats.misses_by_level[0] += 1; // level 3 = misses_by_level[0]
+
+            // hash-thing-bjdl phase-aliasing diag probe (env-gated).
+            if memo_diag_enabled() && memo_period > 1 {
+                for p in 0..memo_period {
+                    if p == effective_phase {
+                        continue;
+                    }
+                    if self.hashlife_cache.contains_key(&(nid, p)) {
+                        self.hashlife_stats.cache_misses_phase_aliased += 1;
+                        break;
+                    }
+                }
+            }
+
+            let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+            self.store.flatten_buf(nid, &mut grid, LEVEL3_SIDE);
+            pending.push((i, effective_phase));
+            pending_grids.push(grid);
+        }
+
+        // Phase B: parallel step_grid_once_pure over the pending grids.
+        // Below the rayon threshold, fall back to serial iter — at very
+        // small batch sizes rayon's per-task overhead dominates the
+        // ~14 µs of step_grid_once work.
+        const RAYON_BATCH_THRESHOLD: usize = 4;
+        let generation = self.generation;
+        let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
+        let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> = if pending_grids.is_empty() {
+            Vec::new()
+        } else if pending_grids.len() < RAYON_BATCH_THRESHOLD {
+            pending_grids
+                .iter()
+                .map(|grid| step_grid_once_pure(grid, generation, materials))
+                .collect()
+        } else {
+            pending_grids
+                .par_iter()
+                .map(|grid| step_grid_once_pure(grid, generation, materials))
+                .collect()
+        };
+
+        // Phase C: commit outputs into store + cache + stats.
+        for (out_idx, &(sub_idx, effective_phase)) in pending.iter().enumerate() {
+            let (output_grid, p1ns, p2ns) = &outputs[out_idx];
+            self.hashlife_stats.phase1_ns += p1ns;
+            self.hashlife_stats.phase2_ns += p2ns;
+            let centered = self.center_level3_grid_to_node(output_grid);
+            self.hashlife_cache
+                .insert((sub_roots[sub_idx], effective_phase), centered);
+            resolved[sub_idx] = Some(centered);
+        }
+
+        for i in 0..8 {
+            result_children[i] =
+                resolved[i].expect("step_level4_fanout_rayon: every sub_root must be resolved");
+        }
     }
 
     fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
@@ -1276,6 +1189,252 @@ fn get_neighbors_from_grid_unchecked(
         }
     }
     neighbors
+}
+
+// hash-thing-ftuu (vqke.4): pure free-function form of the level-3 base case
+// step. Takes `&MaterialRegistry` instead of `&self` so it can be invoked
+// concurrently from rayon worker threads without aliasing `&mut World`.
+//
+// Bit-exact with the prior `World::step_grid_once` body. The wrapper at
+// `World::step_grid_once` forwards here unchanged so existing callers and
+// timer attribution (`phase1_ns` / `phase2_ns`) stay identical.
+//
+// Not part of the public API — only `super::World` and the level-4 rayon
+// path call into this module.
+pub(super) fn step_grid_once_pure(
+    grid: &[CellState],
+    generation: u64,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
+    let side = LEVEL3_SIDE;
+    // Phase 1: CaRule on interior cells (1..side-1 on each axis).
+    // The outermost ring cannot be evolved correctly because its neighbors
+    // would wrap outside the padded region. Callers only extract the center
+    // that remains valid after the requested number of steps.
+    let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+    let phase1_start = std::time::Instant::now();
+    let noop_by_material = materials.noop_flags();
+    let divisor_by_material = materials.tick_divisor_flags();
+    let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
+    for z in 1..side - 1 {
+        for y in 1..side - 1 {
+            for x in 1..side - 1 {
+                let idx = x + y * side + z * side * side;
+                let raw = grid[idx];
+                if raw == 0 && air_is_noop {
+                    continue;
+                }
+                let cell = Cell::from_raw(raw);
+                let mat = cell.material() as usize;
+                if mat < noop_by_material.len() && noop_by_material[mat] {
+                    next[idx] = raw;
+                    continue;
+                }
+                let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                if divisor > 1 && !generation.is_multiple_of(divisor) {
+                    next[idx] = raw;
+                    continue;
+                }
+                let rule = materials
+                    .rule_for_cell(cell)
+                    .unwrap_or_else(|| panic!("missing CaRule for material {}", cell.material()));
+                let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
+                next[idx] = rule.step_cell(cell, &neighbors).raw();
+            }
+        }
+    }
+    let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
+
+    // Phase 2: BlockRule on aligned 2×2×2 blocks. See the comment at the
+    // wrapper site for the parity / divisor schedule details.
+    let phase2_start = std::time::Instant::now();
+    let block_rule_divisors = materials.block_rule_tick_divisors();
+    let all_divisors_one =
+        block_rule_divisors.iter().all(|&d| d == 1) && divisor_by_material.iter().all(|&d| d == 1);
+    if all_divisors_one {
+        let offset = (generation % 2) as usize;
+        let mut bz = offset;
+        while bz + 1 < side - 1 {
+            let mut by = offset;
+            while by + 1 < side - 1 {
+                let mut bx = offset;
+                while bx + 1 < side - 1 {
+                    apply_block_in_grid_pure(&mut next, side, bx, by, bz, materials);
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+    } else {
+        for pass_offset in 0..2usize {
+            let mut bz = pass_offset;
+            while bz + 1 < side - 1 {
+                let mut by = pass_offset;
+                while by + 1 < side - 1 {
+                    let mut bx = pass_offset;
+                    while bx + 1 < side - 1 {
+                        apply_block_in_grid_with_schedule_pure(
+                            &mut next,
+                            side,
+                            bx,
+                            by,
+                            bz,
+                            pass_offset,
+                            generation,
+                            block_rule_divisors,
+                            materials,
+                        );
+                        bx += 2;
+                    }
+                    by += 2;
+                }
+                bz += 2;
+            }
+        }
+    }
+    let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
+    (next, phase1_ns, phase2_ns)
+}
+
+fn apply_block_in_grid_pure(
+    grid: &mut [CellState],
+    side: usize,
+    bx: usize,
+    by: usize,
+    bz: usize,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) {
+    let mut block = [Cell::EMPTY; 8];
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                block[octant_index(dx as u32, dy as u32, dz as u32)] = Cell::from_raw(grid[idx]);
+            }
+        }
+    }
+
+    if block.iter().all(|c| c.is_empty()) {
+        return;
+    }
+
+    let rule_id = match unique_block_rule_pure(materials, &block) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let movable: [bool; 8] = std::array::from_fn(|i| {
+        let c = block[i];
+        c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
+    });
+
+    let rule = materials.block_rule(rule_id);
+    let result = rule.step_block(&block, &movable);
+
+    debug_assert!(
+        (0..8).all(|i| movable[i] || result[i] == block[i]),
+        "block rule moved an immovable cell"
+    );
+
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let i = octant_index(dx as u32, dy as u32, dz as u32);
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                if movable[i] {
+                    grid[idx] = result[i].raw();
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_block_in_grid_with_schedule_pure(
+    grid: &mut [CellState],
+    side: usize,
+    bx: usize,
+    by: usize,
+    bz: usize,
+    pass_offset: usize,
+    generation: u64,
+    block_rule_divisors: &[u16],
+    materials: &crate::terrain::materials::MaterialRegistry,
+) {
+    let mut block = [Cell::EMPTY; 8];
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                block[octant_index(dx as u32, dy as u32, dz as u32)] = Cell::from_raw(grid[idx]);
+            }
+        }
+    }
+
+    if block.iter().all(|c| c.is_empty()) {
+        return;
+    }
+
+    let rule_id = match unique_block_rule_pure(materials, &block) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let divisor = block_rule_divisors
+        .get(rule_id.0)
+        .copied()
+        .unwrap_or(1)
+        .max(1) as u64;
+    if !generation.is_multiple_of(divisor) {
+        return;
+    }
+    let rule_offset = ((generation / divisor) & 1) as usize;
+    if rule_offset != pass_offset {
+        return;
+    }
+
+    let movable: [bool; 8] = std::array::from_fn(|i| {
+        let c = block[i];
+        c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
+    });
+
+    let rule = materials.block_rule(rule_id);
+    let result = rule.step_block(&block, &movable);
+
+    debug_assert!(
+        (0..8).all(|i| movable[i] || result[i] == block[i]),
+        "block rule moved an immovable cell"
+    );
+
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let i = octant_index(dx as u32, dy as u32, dz as u32);
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                if movable[i] {
+                    grid[idx] = result[i].raw();
+                }
+            }
+        }
+    }
+}
+
+fn unique_block_rule_pure(
+    materials: &crate::terrain::materials::MaterialRegistry,
+    block: &[Cell; 8],
+) -> Option<crate::terrain::materials::BlockRuleId> {
+    let mut found: Option<crate::terrain::materials::BlockRuleId> = None;
+    for cell in block {
+        if let Some(id) = materials.block_rule_id_for_cell(*cell) {
+            match found {
+                None => found = Some(id),
+                Some(existing) if existing == id => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -2571,9 +2730,7 @@ mod tests {
 
             // Find every divergent cell.
             let mut diverged: Vec<(usize, usize, usize, u16, u16)> = Vec::new();
-            let idx = |x: usize, y: usize, z: usize| {
-                x + y * side_u + z * side_u * side_u
-            };
+            let idx = |x: usize, y: usize, z: usize| x + y * side_u + z * side_u * side_u;
             for z in 0..side_u {
                 for y in 0..side_u {
                     for x in 0..side_u {
@@ -2628,15 +2785,9 @@ mod tests {
                 let wx = (fx / 8) * 8;
                 let wy = (fy / 8) * 8;
                 let wz = (fz / 8) * 8;
-                eprintln!(
-                    "\n  first divergent cell: (x={fx}, y={fy}, z={fz})"
-                );
-                eprintln!(
-                    "  dumping 8³ window starting at (wx={wx}, wy={wy}, wz={wz})"
-                );
-                eprintln!(
-                    "  window y/z slabs: pre | post-brute | post-recur (cell.material())"
-                );
+                eprintln!("\n  first divergent cell: (x={fx}, y={fy}, z={fz})");
+                eprintln!("  dumping 8³ window starting at (wx={wx}, wy={wy}, wz={wz})");
+                eprintln!("  window y/z slabs: pre | post-brute | post-recur (cell.material())");
                 let dump_window = |grid: &[u16], label: &str| {
                     eprintln!("  {label}:");
                     for dy in 0..8 {
@@ -2723,7 +2874,9 @@ mod tests {
         force_memo_diag_for_test(true);
         let (mut world_on, node_on) = fresh_world_with_alias_precondition();
         let before_on = world_on.hashlife_stats.cache_misses_phase_aliased;
-        world_on.step_node(node_on, 3, /*schedule_phase*/ 1, /*memo_period*/ 4);
+        world_on.step_node(
+            node_on, 3, /*schedule_phase*/ 1, /*memo_period*/ 4,
+        );
         let after_on = world_on.hashlife_stats.cache_misses_phase_aliased;
         assert!(
             after_on > before_on,

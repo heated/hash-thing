@@ -16,6 +16,13 @@ use crate::terrain::materials::{
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
 
+/// hash-thing-ftuu: read `HASH_THING_BASE_CASE_RAYON=1` once at world
+/// construction. Lets benches toggle the rayon path per-process by
+/// setting an env var instead of threading a setter through.
+fn env_base_case_rayon_default() -> bool {
+    std::env::var("HASH_THING_BASE_CASE_RAYON").ok().as_deref() == Some("1")
+}
+
 /// The axis-aligned cube of world-space that the octree currently covers.
 ///
 /// Origin is always (0,0,0) today (unsigned coords), but will shift once
@@ -305,6 +312,15 @@ pub struct World {
     /// `Some(empty)` after `seed_terrain` — the consumer drains and
     /// calls `apply_remap(&empty)`, which drops every cached entry.
     pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
+    /// hash-thing-ftuu (vqke.4): runtime opt-in for the level-4 rayon
+    /// fanout in `step_recursive_case`. When `true`, the 8 sub-cube
+    /// step calls at level 4 (the 8 base cases under the level-4
+    /// fanout) batch their `step_grid_once_pure` invocations through
+    /// rayon. Default `false` matches pre-ftuu behaviour bit-for-bit.
+    /// Initialised from `HASH_THING_BASE_CASE_RAYON=1` at construction
+    /// so benches can flip the mode per process without a setter.
+    /// Mutate via [`Self::set_base_case_use_rayon`].
+    pub(crate) base_case_use_rayon: bool,
 }
 
 /// Cache performance statistics from a single hashlife step.
@@ -535,6 +551,7 @@ impl World {
             clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
+            base_case_use_rayon: env_base_case_rayon_default(),
         }
     }
 
@@ -566,7 +583,17 @@ impl World {
             clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
+            base_case_use_rayon: false,
         }
+    }
+
+    /// hash-thing-ftuu (vqke.4): toggle the level-4 rayon fanout in
+    /// `step_recursive_case`. Default `false` matches pre-ftuu serial
+    /// behaviour. Set `true` to opt into batched parallel base-case
+    /// evaluation; the world's behaviour stays bit-exact across modes
+    /// (verified by `tests/base_case_rayon_parity.rs`).
+    pub fn set_base_case_use_rayon(&mut self, enabled: bool) {
+        self.base_case_use_rayon = enabled;
     }
 
     pub fn side(&self) -> usize {
@@ -2391,10 +2418,8 @@ impl World {
         // because skip detection is weak (low skip rate → CaRule runs on
         // cells that should be recognised as stable) or because the
         // remaining unskipped fraction is genuinely changing.
-        let total_calls = stats.cache_hits
-            + stats.cache_misses
-            + stats.empty_skips
-            + stats.fixed_point_skips;
+        let total_calls =
+            stats.cache_hits + stats.cache_misses + stats.empty_skips + stats.fixed_point_skips;
         let skip_empty_rate = if total_calls == 0 {
             0.0
         } else {
