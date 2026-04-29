@@ -101,6 +101,10 @@ fn bench_step(label: &str, level: u32, generations: usize) {
             p95_us as f64 / 1000.0,
             total_us as f64 / 1_000_000.0,
         );
+        // hash-thing-tk4j (vqke.3): print final memo_summary so the new
+        // memo_skip_empty / memo_skip_fixed rates show up in the bench
+        // output. Lifetime ratios across all `generations` steps.
+        eprintln!("  memo_summary: {}", world.memo_summary());
     }
     eprintln!();
 }
@@ -109,6 +113,19 @@ fn bench_step(label: &str, level: u32, generations: usize) {
 #[ignore]
 fn bench_hashlife_512() {
     bench_step("512³", 9, 20);
+}
+
+/// hash-thing-tk4j (vqke.3): 256³ matches the szyh baseline scale that
+/// surfaced p1=47ms / step=172ms. Used to read the new memo_skip_empty /
+/// memo_skip_fixed tokens against representative terrain so the bead can
+/// decide whether the dominant 47ms p1 cost is "skip detection isn't
+/// firing" (low skip rate → file optimisation bead) or "skip rate is high
+/// but per-cell CaRule is genuinely expensive on the unskipped fraction"
+/// (different lever — possibly tk4j follow-up on stable-region detection).
+#[test]
+#[ignore]
+fn bench_hashlife_256_tk4j() {
+    bench_step("256³ tk4j", 8, 30);
 }
 
 #[test]

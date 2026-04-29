@@ -2383,8 +2383,30 @@ impl World {
         } else {
             stats.compact_entries_dropped as f64 / compact_total as f64
         };
+        // hash-thing-tk4j (vqke.3): expose the rates at which step_node's
+        // pre-cache fast paths fire. Denominator is total step_node calls
+        // (skips + cache_hits + cache_misses), so the three rates plus
+        // memo_hit_rate-relative shares partition leaf traffic. Used to
+        // diagnose whether the 47ms p1 cost on mostly-stable scenes is
+        // because skip detection is weak (low skip rate → CaRule runs on
+        // cells that should be recognised as stable) or because the
+        // remaining unskipped fraction is genuinely changing.
+        let total_calls = stats.cache_hits
+            + stats.cache_misses
+            + stats.empty_skips
+            + stats.fixed_point_skips;
+        let skip_empty_rate = if total_calls == 0 {
+            0.0
+        } else {
+            stats.empty_skips as f64 / total_calls as f64
+        };
+        let skip_fixed_rate = if total_calls == 0 {
+            0.0
+        } else {
+            stats.fixed_point_skips as f64 / total_calls as f64
+        };
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms",
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms",
             hit_rate,
             churn,
             self.hashlife_cache.len(),
@@ -2393,6 +2415,8 @@ impl World {
             memo_period,
             phase_aliased,
             compact_drop,
+            skip_empty_rate,
+            skip_fixed_rate,
             p1_ms,
             p2_ms,
             p3_ms,
@@ -6269,6 +6293,17 @@ mod tests {
         assert!(
             lines.iter().any(|f| f.starts_with("memo_compact_drop=")),
             "memo_summary must include memo_compact_drop= token, got {lines:?}",
+        );
+        // hash-thing-tk4j (vqke.3): the two skip-rate tokens must be
+        // present so the HUD overlay reflects whether step_node's
+        // pre-cache fast paths are firing on mostly-stable scenes.
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_skip_empty=")),
+            "memo_summary must include memo_skip_empty= token, got {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_skip_fixed=")),
+            "memo_summary must include memo_skip_fixed= token, got {lines:?}",
         );
     }
 
