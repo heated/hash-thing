@@ -888,7 +888,7 @@ impl World {
         // Group into 8 overlapping sub-cubes (level n-1) and assemble their
         // sub_roots up-front. The 8 step_node calls follow — at level==4
         // (i.e. each sub-cube is a level-3 base case) the calls may be
-        // batched through rayon if `base_case_use_rayon` is enabled.
+        // batched through rayon if `base_case_strategy == RayonPerFanout`.
         let mut sub_roots = [NodeId::EMPTY; 8];
         for oz in 0..2usize {
             for oy in 0..2usize {
@@ -909,7 +909,12 @@ impl World {
         }
 
         let mut result_children = [NodeId::EMPTY; 8];
-        if level == 4 && self.base_case_use_rayon {
+        if level == 4
+            && matches!(
+                self.base_case_strategy,
+                super::world::BaseCaseStrategy::RayonPerFanout
+            )
+        {
             // hash-thing-ftuu (vqke.4): batch the 8 level-3 base cases through
             // rayon. Replicates the prelude of `step_node` (empty / inert /
             // cache lookup) inline so the parallel work is restricted to the
@@ -933,7 +938,8 @@ impl World {
 
     /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 level-3
     /// base cases under a level-4 fanout. Replaces the serial loop over
-    /// `step_node(sub_root, 3, ...)` calls when `base_case_use_rayon` is on.
+    /// `step_node(sub_root, 3, ...)` calls when
+    /// `base_case_strategy == RayonPerFanout`.
     ///
     /// Phase A (sequential, mutates stats + reads store/cache): mirrors the
     /// `step_node` prelude — empty-skip, fixed-point-skip, all-inert-skip,

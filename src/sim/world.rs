@@ -16,11 +16,47 @@ use crate::terrain::materials::{
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
 
-/// hash-thing-ftuu: read `HASH_THING_BASE_CASE_RAYON=1` once at world
-/// construction. Lets benches toggle the rayon path per-process by
-/// setting an env var instead of threading a setter through.
-fn env_base_case_rayon_default() -> bool {
-    std::env::var("HASH_THING_BASE_CASE_RAYON").ok().as_deref() == Some("1")
+/// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling strategy.
+/// `Serial` is pre-ftuu DFS (no rayon). `RayonPerFanout` is ftuu's
+/// shipped per-level-4-fanout 8-way batching. `RayonBfs` is ecmn's
+/// breadth-first whole-step level-3 batching (added in commit 2).
+///
+/// Default = `RayonPerFanout`: preserves the post-ftuu shipped state
+/// (env-var users got rayon; new construction gets the same behaviour
+/// without needing the env var). Override via
+/// `World::set_base_case_strategy` or `HASH_THING_BASE_CASE_STRATEGY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BaseCaseStrategy {
+    Serial,
+    #[default]
+    RayonPerFanout,
+    RayonBfs,
+}
+
+/// hash-thing-ecmn: parse strategy from env. Precedence:
+/// `HASH_THING_BASE_CASE_STRATEGY` (explicit) > `HASH_THING_BASE_CASE_RAYON=1`
+/// (ftuu shim, treated as RayonPerFanout) > default.
+///
+/// Invalid `HASH_THING_BASE_CASE_STRATEGY` values panic at construction
+/// — operators should get loud feedback, not silent fallback.
+fn env_base_case_strategy() -> BaseCaseStrategy {
+    if let Ok(v) = std::env::var("HASH_THING_BASE_CASE_STRATEGY") {
+        return match v.as_str() {
+            "serial" => BaseCaseStrategy::Serial,
+            "per-fanout" | "rayon" => BaseCaseStrategy::RayonPerFanout,
+            "bfs" => BaseCaseStrategy::RayonBfs,
+            other => panic!(
+                "HASH_THING_BASE_CASE_STRATEGY must be one of: serial | per-fanout | bfs (got {other:?})"
+            ),
+        };
+    }
+    if std::env::var("HASH_THING_BASE_CASE_RAYON").ok().as_deref() == Some("1") {
+        return BaseCaseStrategy::RayonPerFanout;
+    }
+    if std::env::var("HASH_THING_BASE_CASE_RAYON").ok().as_deref() == Some("0") {
+        return BaseCaseStrategy::Serial;
+    }
+    BaseCaseStrategy::default()
 }
 
 /// The axis-aligned cube of world-space that the octree currently covers.
@@ -312,15 +348,14 @@ pub struct World {
     /// `Some(empty)` after `seed_terrain` — the consumer drains and
     /// calls `apply_remap(&empty)`, which drops every cached entry.
     pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
-    /// hash-thing-ftuu (vqke.4): runtime opt-in for the level-4 rayon
-    /// fanout in `step_recursive_case`. When `true`, the 8 sub-cube
-    /// step calls at level 4 (the 8 base cases under the level-4
-    /// fanout) batch their `step_grid_once_pure` invocations through
-    /// rayon. Default `false` matches pre-ftuu behaviour bit-for-bit.
-    /// Initialised from `HASH_THING_BASE_CASE_RAYON=1` at construction
-    /// so benches can flip the mode per process without a setter.
-    /// Mutate via [`Self::set_base_case_use_rayon`].
-    pub(crate) base_case_use_rayon: bool,
+    /// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling
+    /// strategy. See [`BaseCaseStrategy`]. Default = `RayonPerFanout`
+    /// (ftuu shipped behaviour). Initialised from
+    /// `HASH_THING_BASE_CASE_STRATEGY` env var (and the legacy
+    /// `HASH_THING_BASE_CASE_RAYON` shim) at construction. Mutate via
+    /// [`Self::set_base_case_strategy`] (preferred) or
+    /// [`Self::set_base_case_use_rayon`] (legacy bool wrapper).
+    pub(crate) base_case_strategy: BaseCaseStrategy,
 }
 
 /// Cache performance statistics from a single hashlife step.
@@ -551,7 +586,7 @@ impl World {
             clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
-            base_case_use_rayon: env_base_case_rayon_default(),
+            base_case_strategy: env_base_case_strategy(),
         }
     }
 
@@ -583,17 +618,32 @@ impl World {
             clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
-            base_case_use_rayon: false,
+            base_case_strategy: BaseCaseStrategy::Serial,
         }
     }
 
-    /// hash-thing-ftuu (vqke.4): toggle the level-4 rayon fanout in
-    /// `step_recursive_case`. Default `false` matches pre-ftuu serial
-    /// behaviour. Set `true` to opt into batched parallel base-case
-    /// evaluation; the world's behaviour stays bit-exact across modes
-    /// (verified by `tests/base_case_rayon_parity.rs`).
+    /// hash-thing-ecmn (vqke.4.1): set the base-case scheduling
+    /// strategy. Bit-exact flattened cell content across all
+    /// strategies — verified by `tests/base_case_rayon_parity.rs`.
+    pub fn set_base_case_strategy(&mut self, strategy: BaseCaseStrategy) {
+        self.base_case_strategy = strategy;
+    }
+
+    /// hash-thing-ecmn: read the active strategy.
+    pub fn base_case_strategy(&self) -> BaseCaseStrategy {
+        self.base_case_strategy
+    }
+
+    /// Legacy bool wrapper (hash-thing-ftuu). Maps `true` to
+    /// `BaseCaseStrategy::RayonPerFanout`, `false` to `Serial`. Kept
+    /// so existing tests / benches that toggle this knob keep
+    /// compiling. Prefer [`Self::set_base_case_strategy`] in new code.
     pub fn set_base_case_use_rayon(&mut self, enabled: bool) {
-        self.base_case_use_rayon = enabled;
+        self.base_case_strategy = if enabled {
+            BaseCaseStrategy::RayonPerFanout
+        } else {
+            BaseCaseStrategy::Serial
+        };
     }
 
     pub fn side(&self) -> usize {
