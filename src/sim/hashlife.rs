@@ -969,9 +969,19 @@ impl World {
 
         // Per-sub_root classification: either resolved (short-circuit or
         // cache hit) or pending (miss, needs base-case compute).
+        //
+        // Dedupe at queue time so two equal `sub_roots[i] == sub_roots[j]`
+        // entries don't both run `step_grid_once_pure`: the second
+        // occurrence is recorded as a deferred dupe pointing at the
+        // unique miss's pending index, then resolves from the rayon
+        // output post-batch. This both saves recompute (worst case 8×
+        // for a fully-aliased fanout) AND makes the (cache_hits,
+        // cache_misses) accounting match the serial path's
+        // (1 miss + N-1 hits) exactly.
         let mut resolved: [Option<NodeId>; 8] = [None; 8];
-        let mut pending: Vec<(usize, u64)> = Vec::with_capacity(8); // (sub_root_index, effective_phase)
+        let mut pending: Vec<(usize, u64)> = Vec::with_capacity(8); // (sub_root_index, effective_phase) for unique misses
         let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> = Vec::with_capacity(8);
+        let mut deferred_dupes: Vec<(usize, usize)> = Vec::new(); // (sub_root_index, pending_index) for duplicate misses
 
         for i in 0..8 {
             let nid = sub_roots[i];
@@ -1008,8 +1018,21 @@ impl World {
                 continue;
             }
 
-            // Miss — record cache_misses now (matches `step_node` line 704
-            // which counts the miss before evaluation).
+            // Dedupe: if (nid, effective_phase) is already pending from a
+            // prior sub_root in this fanout, the serial path would have
+            // hit the cache after the first compute. Match that: count
+            // as a cache_hit and defer resolution until Phase C.
+            if let Some(pending_idx) = pending
+                .iter()
+                .position(|&(j, p)| sub_roots[j] == nid && p == effective_phase)
+            {
+                self.hashlife_stats.cache_hits += 1;
+                deferred_dupes.push((i, pending_idx));
+                continue;
+            }
+
+            // Unique miss — record cache_misses now (matches `step_node`
+            // line 704 which counts the miss before evaluation).
             self.hashlife_stats.cache_misses += 1;
             self.hashlife_stats.misses_by_level[0] += 1; // level 3 = misses_by_level[0]
 
@@ -1062,6 +1085,15 @@ impl World {
             self.hashlife_cache
                 .insert((sub_roots[sub_idx], effective_phase), centered);
             resolved[sub_idx] = Some(centered);
+        }
+
+        // Resolve duplicate-miss sub_roots from their twin's freshly-
+        // committed entry. Each dupe stored its `pending_index`; the
+        // corresponding pending sub_root's `resolved[...]` is set by
+        // Phase C above, so we copy the same NodeId across.
+        for &(sub_idx, pending_idx) in &deferred_dupes {
+            let original_sub = pending[pending_idx].0;
+            resolved[sub_idx] = resolved[original_sub];
         }
 
         for i in 0..8 {
