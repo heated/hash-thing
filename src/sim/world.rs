@@ -1748,6 +1748,117 @@ impl World {
         self.block_rule_present = None;
     }
 
+    /// Seed a stone chamber with lava embedded in the floor and water
+    /// embedded in the ceiling. Cold-start scene for the demo build —
+    /// the molten palette + ceiling-water-meets-floor-lava motion reads
+    /// as "volcanic" rather than "voxel landscape," which the demo's
+    /// first-impression contract requires (hash-thing-4eo8).
+    ///
+    /// Geometry (origin assumed `[0,0,0]`; the only caller paths reset
+    /// `World::new` first, mirroring `seed_demo_spectacle`):
+    /// - Walls/floor/ceiling: 1-cell-thick stone slabs at `lo` / `hi-1`
+    ///   with `margin = side/16`.
+    /// - Floor lava: 3×3 patches dotted on a `side/8` grid at `floor_y
+    ///   = lo+1`. Coarse spacing keeps cell-write cost ~O(side²).
+    /// - Ceiling water: 2×2 patches dotted on the same grid offset by
+    ///   `step/2` at `ceiling_y = hi-2`. Drips fall between lava pools
+    ///   so water-meets-lava produces visible steam from frame 1.
+    /// - Player platform: 7×7 stone pad at `(center, center +
+    ///   2*CELLS_PER_METER_INT - 1, center)`. `App::reset_scene_entities`
+    ///   places the player at `world_center + 2*CELLS_PER_METER` cells
+    ///   up; `App::recenter_player` (main.rs:1339-1378) only scans UP
+    ///   from that pose for grounded clearance, so the platform must
+    ///   sit directly under `blind_pos.y` — exactly mirrors the
+    ///   `seed_demo_spectacle` convention (world.rs above).
+    pub fn seed_pyroclastic_chamber(&mut self) {
+        let side = self.side() as u64;
+        let margin = (side / 16).max(1);
+        let lo = margin;
+        let hi = side - margin;
+
+        // Walls: four vertical slabs spanning the full chamber height.
+        for y in lo..hi {
+            for q in lo..hi {
+                self.set_local(LocalCoord(lo), LocalCoord(y), LocalCoord(q), STONE);
+                self.set_local(LocalCoord(hi - 1), LocalCoord(y), LocalCoord(q), STONE);
+                self.set_local(LocalCoord(q), LocalCoord(y), LocalCoord(lo), STONE);
+                self.set_local(LocalCoord(q), LocalCoord(y), LocalCoord(hi - 1), STONE);
+            }
+        }
+
+        // Floor + ceiling slabs (overwrite the wall corners; harmless).
+        for z in lo..hi {
+            for x in lo..hi {
+                self.set_local(LocalCoord(x), LocalCoord(lo), LocalCoord(z), STONE);
+                self.set_local(LocalCoord(x), LocalCoord(hi - 1), LocalCoord(z), STONE);
+            }
+        }
+
+        let step = (side / 8).max(4);
+        let floor_y = lo + 1;
+        let ceiling_y = hi - 2;
+
+        // Lava patches dotted into the floor surface (one cell above
+        // the stone slab). 3×3 per source — visible from across chamber.
+        let mut z = lo + step / 2;
+        while z + 2 < hi - 1 {
+            let mut x = lo + step / 2;
+            while x + 2 < hi - 1 {
+                for dz in 0..3 {
+                    for dx in 0..3 {
+                        self.set_local(
+                            LocalCoord(x + dx),
+                            LocalCoord(floor_y),
+                            LocalCoord(z + dz),
+                            LAVA,
+                        );
+                    }
+                }
+                x += step;
+            }
+            z += step;
+        }
+
+        // Water patches dotted into the ceiling surface (one cell
+        // below the stone slab), offset by `step/2` so drips land
+        // between lava pools and produce steam plumes on contact.
+        let mut z = lo + step;
+        while z + 1 < hi - 1 {
+            let mut x = lo + step;
+            while x + 1 < hi - 1 {
+                for dz in 0..2 {
+                    for dx in 0..2 {
+                        self.set_local(
+                            LocalCoord(x + dx),
+                            LocalCoord(ceiling_y),
+                            LocalCoord(z + dz),
+                            WATER,
+                        );
+                    }
+                }
+                x += step;
+            }
+            z += step;
+        }
+
+        // Player platform — see doc comment above for the Y-coord
+        // rationale (`recenter_player` upward-only scan contract).
+        let center = side / 2;
+        let platform_y = center + 2 * CELLS_PER_METER_INT as u64 - 1;
+        let pad: u64 = 3;
+        let plat_lo_x = center.saturating_sub(pad);
+        let plat_hi_x = (center + pad).min(hi - 1);
+        let plat_lo_z = center.saturating_sub(pad);
+        let plat_hi_z = (center + pad).min(hi - 1);
+        if platform_y < hi - 1 {
+            for z in plat_lo_z..=plat_hi_z {
+                for x in plat_lo_x..=plat_hi_x {
+                    self.set_local(LocalCoord(x), LocalCoord(platform_y), LocalCoord(z), STONE);
+                }
+            }
+        }
+    }
+
     /// Add water and sand to an existing terrain — water pools on a
     /// hilltop (so it cascades down) and sand dunes on one side.
     /// Call after `seed_terrain`.
@@ -3713,6 +3824,69 @@ mod tests {
         assert!(
             grid.contains(&0),
             "gyroid must leave air voids to walk through"
+        );
+    }
+
+    /// hash-thing-4eo8: cold-start scene for the demo build. Lock in the
+    /// volcanic palette (must contain stone/lava/water; must NOT contain
+    /// dirt/grass/sand — those are the Minecraft-disqualifier cells the
+    /// bead acceptance forbids).
+    #[test]
+    fn seed_pyroclastic_chamber_palette_is_volcanic_not_earthy() {
+        let mut w = World::new(6); // side 64
+        w.seed_pyroclastic_chamber();
+        assert!(w.population() > 0, "chamber must have stone/lava/water cells");
+        let grid = w.flatten();
+        assert!(grid.contains(&STONE), "chamber walls/floor/ceiling must be stone");
+        assert!(grid.contains(&LAVA), "chamber floor must have embedded lava");
+        assert!(grid.contains(&WATER), "chamber ceiling must have embedded water");
+        assert!(
+            !grid.contains(&DIRT),
+            "pyroclastic chamber must not contain DIRT (Minecraft-palette disqualifier)"
+        );
+        assert!(
+            !grid.contains(&GRASS),
+            "pyroclastic chamber must not contain GRASS (Minecraft-palette disqualifier)"
+        );
+        assert!(
+            !grid.contains(&SAND),
+            "pyroclastic chamber must not contain SAND (Minecraft-palette disqualifier)"
+        );
+    }
+
+    /// hash-thing-4eo8: `App::recenter_player` (main.rs:1339-1378) only
+    /// scans UPWARD from `world_center + 2 * CELLS_PER_METER` for a
+    /// grounded clearance. The chamber's player platform must therefore
+    /// sit directly under that blind pose so `is_grounded(blind_pos)`
+    /// finds support on iteration 1 — this test locks that contract in
+    /// place against a future refactor that moves the platform.
+    #[test]
+    fn seed_pyroclastic_chamber_provides_grounded_spawn_at_blind_pose() {
+        let mut w = World::new(6); // side 64
+        w.seed_pyroclastic_chamber();
+
+        let center_cell = (w.side() as i64) / 2;
+        let platform_y = center_cell + 2 * CELLS_PER_METER_INT as i64 - 1;
+
+        // Platform stone must be present right under the blind pose.
+        assert_eq!(
+            w.get(
+                WorldCoord(center_cell),
+                WorldCoord(platform_y),
+                WorldCoord(center_cell)
+            ),
+            STONE,
+            "platform support cell at ({center_cell},{platform_y},{center_cell}) must be stone — recenter_player needs is_grounded to succeed at blind_pos"
+        );
+        // The cell at blind_pos itself must be air (player body fits).
+        assert_eq!(
+            w.get(
+                WorldCoord(center_cell),
+                WorldCoord(platform_y + 1),
+                WorldCoord(center_cell)
+            ),
+            AIR,
+            "blind_pos cell must be air so player_collides returns false"
         );
     }
 

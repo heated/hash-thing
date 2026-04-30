@@ -1285,16 +1285,18 @@ impl App {
         }
     }
 
+    /// hash-thing-4eo8: cold-start scene for the demo build is the
+    /// Pyroclastic chamber — stone box, lava embedded in the floor,
+    /// water embedded in the ceiling. The molten palette + visible
+    /// motion (water drips → steam on lava + volcano emitters) reads
+    /// as "volcanic / sim-rich" rather than "voxel landscape" on
+    /// first impression. The terrain heightmap scene is still
+    /// reachable via the `r` scene-swap key (PendingSceneSwap::ResetTerrain).
     fn load_initial_scene(&mut self) {
-        let terrain_params = terrain::TerrainParams::for_level(self.volume_size.trailing_zeros());
-        let stats = self
-            .world
-            .seed_terrain(&terrain_params)
-            .expect("level-derived terrain params must validate");
-        self.world.seed_water_and_sand();
-        self.noise_ns_per_sample = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
+        self.world.seed_pyroclastic_chamber();
+        self.noise_ns_per_sample = 0.0;
         self.reset_scene_entities();
-        self.spawn_demo_entities();
+        self.spawn_pyroclastic_entities();
         self.paused = false;
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
@@ -1316,10 +1318,9 @@ impl App {
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
         log::info!(
-            "Initial scene: terrain pop={} nodes={} gen={}µs",
+            "Initial scene (pyroclastic): pop={} nodes={}",
             self.world.population(),
             self.world.store.stats(),
-            stats.gen_region_us,
         );
         log::debug!(
             "Material registry palette slots={}",
@@ -1446,6 +1447,54 @@ impl App {
             );
         }
         log::info!("Spawned environmental demo entities: geyser, volcano, whirlpool, critters");
+    }
+
+    /// hash-thing-4eo8: emitters tuned for the pyroclastic chamber
+    /// (cold-start demo scene). Volcano emitters dot the chamber floor
+    /// for orange/red bursts; two geysers add water-plume contrast that
+    /// flashes to steam on contact with lava. No critters (vine-green
+    /// fights the molten palette — acceptance forbids the green-on-dirt
+    /// Minecraft cue) and no whirlpool (no water surface for the orbit
+    /// to read against in this scene).
+    fn spawn_pyroclastic_entities(&mut self) {
+        let center = self.world_center();
+        // Place emitters one cell above the lava floor layer so their
+        // bursts come UP from the floor. The chamber is seeded with
+        // origin=[0,0,0] (fresh `World::new`), so world Y == local Y;
+        // floor stone is at `(side/16).max(1)` and lava at `+1`, so
+        // emitters at `+2` sit in air just above the lava surface.
+        let side = self.world.side() as f64;
+        let floor_local_y = (side / 16.0).max(1.0) + 1.0;
+        let emitter_y = self.world.origin[1] as f64 + floor_local_y + 1.0;
+        for (dx, dz) in [
+            (-12.0, -8.0),
+            (10.0, -10.0),
+            (0.0, 0.0),
+            (-8.0, 12.0),
+            (12.0, 8.0),
+        ] {
+            self.entities.add(
+                [
+                    center[0] + dx * CELLS_PER_METER,
+                    emitter_y,
+                    center[2] + dz * CELLS_PER_METER,
+                ],
+                [0.0; 3],
+                sim::EntityKind::Emitter(sim::EmitterState::volcano()),
+            );
+        }
+        for (dx, dz) in [(-14.0, 6.0), (14.0, -6.0)] {
+            self.entities.add(
+                [
+                    center[0] + dx * CELLS_PER_METER,
+                    emitter_y,
+                    center[2] + dz * CELLS_PER_METER,
+                ],
+                [0.0; 3],
+                sim::EntityKind::Emitter(sim::EmitterState::geyser()),
+            );
+        }
+        log::info!("Spawned pyroclastic entities: 5 volcanoes, 2 geysers");
     }
 
     fn renderer_camera_world_pos(&self, renderer: &render::Renderer) -> [f64; 3] {
