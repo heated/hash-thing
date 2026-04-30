@@ -174,6 +174,16 @@ Mayor should sweep for drift-parked beads during any invocation. Workers may unp
 
 **Human-initiated edits** (edward says "change CLAUDE.md, do X") are direct — any agent executes without queueing.
 
+## Perf claims cite regime coordinates
+
+Every perf number quoted in a comment/bead/message gets a coordinate
+prefix from `docs/perf/regimes.md`: `world · scene · intensity · regime`.
+
+Example: "At `demo·default-demo·cascade·churning`, step p95 = 67 ms."
+
+Unknown coordinate → say "regime unmeasured" instead of skipping. A
+number without coordinates is cherry-picked; reviewers should push back.
+
 ## Commit cadence
 
 Commit at every natural boundary — plan file written, first test green, helper extracted, review comment addressed, design gate reached. Push after each commit.
