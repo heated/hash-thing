@@ -12,7 +12,7 @@
 //! cache stats for manual comparison; it does not enforce a machine-checked
 //! performance budget in CI.
 
-use hash_thing::sim::World;
+use hash_thing::sim::{BaseCaseStrategy, World};
 use hash_thing::terrain::materials::STONE;
 use hash_thing::terrain::TerrainParams;
 use std::time::Instant;
@@ -128,35 +128,82 @@ fn bench_hashlife_256_tk4j() {
     bench_step("256³ tk4j", 8, 30);
 }
 
-/// hash-thing-ftuu (vqke.4): same scale as `bench_hashlife_256_tk4j`,
-/// run in two passes so the bench output decomposes the rayon win at the
-/// level-4 fanout.
+/// hash-thing-ftuu (vqke.4) + hash-thing-ecmn (vqke.4.1): same scale as
+/// `bench_hashlife_256_tk4j`, run in three passes so the bench output
+/// decomposes serial / per-fanout-rayon (ftuu) / BFS (ecmn) side-by-side.
 ///
-/// Reads `HASH_THING_BASE_CASE_RAYON=0|1` is *not* required — this
-/// bench drives the toggle directly so a single invocation prints
-/// both columns side-by-side. Compare:
+/// Drives strategies directly via `set_base_case_strategy` so a single
+/// invocation prints all three columns. Compare:
 ///
 /// ```text
 /// cargo test --profile perf --test bench_hashlife \
 ///     bench_hashlife_256_ftuu_rayon_compare -- --ignored --nocapture
 /// ```
 ///
-/// Acceptance gate (informational, no panic): rayon p1 mean ≤ 15 ms
-/// matches the bead's target.
+/// **Acceptance** (per ecmn plan review consensus):
+/// - Primary metric: `step_us` median (full-step wall, not just leaf
+///   compute) and `step_node_wall_ns` median. p1/p2 are sums of
+///   per-worker leaf compute under rayon and don't reflect latency.
+/// - Pre-committed slack: BFS step_us median ≤ 1.1× RayonPerFanout
+///   step_us median on this default-terrain scene. If exceeded, file a
+///   follow-up bead and ship behind the env-var only — do not flip
+///   default. (Catches "BFS infrastructure ships but never speeds
+///   anything up" — adversarial-claude's primary concern.)
+/// - Cold warm-up: skip the first 5 generations from median/p95
+///   computation to avoid first-allocation + cold-cache distortion.
+/// - Bench is informational (no panic) — the absolute "8 ms" bead
+///   gate depends on hash-thing-5e3e (churn injector) landing first.
 #[test]
 #[ignore]
 fn bench_hashlife_256_ftuu_rayon_compare() {
-    bench_step_with_rayon_toggle("256³ ftuu serial", 8, 30, false);
-    bench_step_with_rayon_toggle("256³ ftuu rayon", 8, 30, true);
+    let serial = bench_step_with_strategy("256³ serial", 8, 30, BaseCaseStrategy::Serial);
+    let per_fanout = bench_step_with_strategy(
+        "256³ ftuu rayon (per-fanout)",
+        8,
+        30,
+        BaseCaseStrategy::RayonPerFanout,
+    );
+    let bfs =
+        bench_step_with_strategy("256³ ecmn rayon (bfs)", 8, 30, BaseCaseStrategy::RayonBfs);
+
+    eprintln!("--- ecmn slack check ---");
+    eprintln!(
+        "  step_us median: serial={} per-fanout={} bfs={}",
+        serial.step_us_median, per_fanout.step_us_median, bfs.step_us_median,
+    );
+    let slack_ratio = bfs.step_us_median as f64 / per_fanout.step_us_median.max(1) as f64;
+    eprintln!(
+        "  bfs/per-fanout ratio: {slack_ratio:.3} (slack target: ≤ 1.10 on default terrain)",
+    );
+    if slack_ratio > 1.10 {
+        eprintln!(
+            "  WARN: BFS slower than per-fanout by >10% on default terrain. \
+             File follow-up bead — do not flip default to RayonBfs.",
+        );
+    }
 }
 
-fn bench_step_with_rayon_toggle(label: &str, level: u32, generations: usize, use_rayon: bool) {
+#[derive(Clone, Copy, Default)]
+struct StepBenchSummary {
+    step_us_median: u64,
+    #[allow(dead_code)]
+    step_us_p95: u64,
+    #[allow(dead_code)]
+    step_node_wall_ms_median: f64,
+}
+
+fn bench_step_with_strategy(
+    label: &str,
+    level: u32,
+    generations: usize,
+    strategy: BaseCaseStrategy,
+) -> StepBenchSummary {
     let side = 1u64 << level;
-    eprintln!("--- {label} (level={level}, side={side}³, base_case_use_rayon={use_rayon}) ---");
+    eprintln!("--- {label} (level={level}, side={side}³, strategy={strategy:?}) ---");
 
     let t0 = Instant::now();
     let mut world = World::new(level);
-    world.set_base_case_use_rayon(use_rayon);
+    world.set_base_case_strategy(strategy);
     let params = TerrainParams::for_level(level);
     let stats = world
         .seed_terrain(&params)
@@ -174,46 +221,66 @@ fn bench_step_with_rayon_toggle(label: &str, level: u32, generations: usize, use
     let mut step_us = Vec::with_capacity(generations);
     let mut p1_ns_per_step = Vec::with_capacity(generations);
     let mut p2_ns_per_step = Vec::with_capacity(generations);
+    let mut step_node_ns_per_step = Vec::with_capacity(generations);
     for _gen in 0..generations {
         let t = Instant::now();
         world.step_recursive();
         step_us.push(t.elapsed().as_micros() as u64);
         p1_ns_per_step.push(world.hashlife_stats.phase1_ns);
         p2_ns_per_step.push(world.hashlife_stats.phase2_ns);
+        step_node_ns_per_step.push(world.hashlife_stats.step_node_wall_ns);
     }
 
+    let mut summary = StepBenchSummary::default();
     if generations > 0 {
-        let mut sorted = step_us.clone();
+        // hash-thing-ecmn: skip first 5 generations from median/p95
+        // (cold-cache + first-allocation distortion).
+        let warmup = (5usize).min(generations.saturating_sub(1));
+        let warm_step_us: Vec<u64> = step_us[warmup..].to_vec();
+        let warm_count = warm_step_us.len();
+        let mut sorted = warm_step_us.clone();
         sorted.sort();
-        let median_us = sorted[generations / 2];
-        let p95_us = sorted[(generations as f64 * 0.95) as usize];
-        let mean_us = step_us.iter().sum::<u64>() / generations as u64;
+        let median_us = sorted[warm_count / 2];
+        let p95_us = sorted[((warm_count as f64) * 0.95) as usize];
+        let mean_us = warm_step_us.iter().sum::<u64>() / warm_count as u64;
 
-        let mut p1_sorted = p1_ns_per_step.clone();
+        let warm_step_node_ns: Vec<u64> = step_node_ns_per_step[warmup..].to_vec();
+        let mut step_node_sorted = warm_step_node_ns.clone();
+        step_node_sorted.sort();
+        let step_node_median_ns = step_node_sorted[warm_count / 2];
+
+        let warm_p1: Vec<u64> = p1_ns_per_step[warmup..].to_vec();
+        let mut p1_sorted = warm_p1.clone();
         p1_sorted.sort();
-        let p1_median_ns = p1_sorted[generations / 2];
+        let p1_median_ns = p1_sorted[warm_count / 2];
 
-        let mut p2_sorted = p2_ns_per_step.clone();
+        let warm_p2: Vec<u64> = p2_ns_per_step[warmup..].to_vec();
+        let mut p2_sorted = warm_p2.clone();
         p2_sorted.sort();
-        let p2_median_ns = p2_sorted[generations / 2];
+        let p2_median_ns = p2_sorted[warm_count / 2];
 
         eprintln!(
-            "  step: mean={:.1}ms median={:.1}ms p95={:.1}ms",
+            "  step (warm, skipped {warmup} cold): mean={:.1}ms median={:.1}ms p95={:.1}ms",
             mean_us as f64 / 1000.0,
             median_us as f64 / 1000.0,
             p95_us as f64 / 1000.0,
         );
         eprintln!(
-            "  p1 (CaRule per-cell): median={:.1}ms",
-            p1_median_ns as f64 / 1_000_000.0,
+            "  step_node_wall (warm): median={:.1}ms",
+            step_node_median_ns as f64 / 1_000_000.0,
         );
         eprintln!(
-            "  p2 (BlockRule per-block): median={:.1}ms",
+            "  p1/p2 sums (info — not latency under rayon): p1={:.1}ms p2={:.1}ms",
+            p1_median_ns as f64 / 1_000_000.0,
             p2_median_ns as f64 / 1_000_000.0,
         );
         eprintln!("  memo_summary: {}", world.memo_summary());
+        summary.step_us_median = median_us;
+        summary.step_us_p95 = p95_us;
+        summary.step_node_wall_ms_median = step_node_median_ns as f64 / 1_000_000.0;
     }
     eprintln!();
+    summary
 }
 
 #[test]

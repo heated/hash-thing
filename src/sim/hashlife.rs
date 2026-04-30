@@ -163,6 +163,30 @@ const CENTER_LEVEL3_SIDE: usize = 4;
 const CENTER_LEVEL3_CELL_COUNT: usize =
     CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE;
 
+/// hash-thing-ecmn (vqke.4.1): one node-step entry in the BFS frontier.
+/// `node` is the input at level n; `result` is filled at level-(n-1)
+/// time during Phase 2 (level-3 batch) or Phase 3 (ascend).
+/// `children[i]` resolves to the i-th sub-cube's stepped result at
+/// level (n-2): either Direct (short-circuit / cache hit at descent
+/// time) or Pending(idx) (lookup into `tasks[level - 1][idx].result`
+/// after the lower level resolves).
+#[derive(Clone)]
+struct BfsTask {
+    node: NodeId,
+    effective_phase: u64,
+    children: [BfsChildSlot; 8],
+    result: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BfsChildSlot {
+    /// Resolved at descent time — short-circuit or cache hit.
+    Direct(NodeId),
+    /// Pending until the lower-level task resolves; `usize` is an index
+    /// into the next level's `tasks` vec.
+    Pending(usize),
+}
+
 impl World {
     /// Step the world forward one generation using the recursive Hashlife path.
     pub fn step_recursive(&mut self) {
@@ -185,7 +209,7 @@ impl World {
         // + leaf evaluation) and maybe_compact separately so the perf
         // log decomposes the previously-unaccounted slice of `step`.
         let t_step_node = std::time::Instant::now();
-        let result = self.step_node(padded_root, padded_level, phase, period);
+        let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
         self.hashlife_stats.step_node_wall_ns = t_step_node.elapsed().as_nanos() as u64;
         self.root = result;
         let step_stats_pre_compact = self.hashlife_stats;
@@ -254,7 +278,7 @@ impl World {
         let padded_level = self.level + 1;
         let period = self.materials.memo_period();
         let phase = self.generation % period;
-        let result = self.step_node(padded_root, padded_level, phase, period);
+        let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
         self.root = result;
         let step_stats = self.hashlife_stats;
         self.hashlife_stats_total.accumulate(&step_stats);
@@ -286,7 +310,7 @@ impl World {
         let period = self.materials.memo_period();
         let phase = self.generation % period;
         let t_step = std::time::Instant::now();
-        let result = self.step_node(padded_root, padded_level, phase, period);
+        let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
         let step_node_us = t_step.elapsed().as_micros() as u64;
         self.root = result;
         let step_stats = self.hashlife_stats;
@@ -1106,6 +1130,404 @@ impl World {
             result_children[i] =
                 resolved[i].expect("step_level4_fanout_rayon: every sub_root must be resolved");
         }
+    }
+
+    /// hash-thing-ecmn (vqke.4.1): top-level dispatch picking the active
+    /// `BaseCaseStrategy`. Used by `step_recursive`,
+    /// `step_recursive_profiled`, and `step_margolus_only` so all three
+    /// entry points honor the strategy uniformly. Reviewer feedback
+    /// (Standard-Codex, Standard-Codex-Execution, Adversarial-Codex)
+    /// flagged that the absence of a shared dispatcher would let the
+    /// profiled path silently bypass `RayonBfs`.
+    fn step_root_dispatch(
+        &mut self,
+        padded_root: NodeId,
+        padded_level: u32,
+        phase: u64,
+        period: u64,
+    ) -> NodeId {
+        match self.base_case_strategy {
+            super::world::BaseCaseStrategy::Serial
+            | super::world::BaseCaseStrategy::RayonPerFanout => {
+                self.step_node(padded_root, padded_level, phase, period)
+            }
+            super::world::BaseCaseStrategy::RayonBfs => {
+                self.step_root_bfs(padded_root, padded_level, phase, period)
+            }
+        }
+    }
+
+    /// hash-thing-ecmn (vqke.4.1): try the short-circuit prelude that
+    /// `step_node` runs at lines 650-668. Mirrors that order exactly:
+    /// empty -> uniform-inert -> all-inert. Returns the resolved
+    /// level-(n-1) node if any short-circuit fires, plus increments the
+    /// matching skip counter; returns `None` if the caller should
+    /// proceed to cache lookup. `result_level` is the level the result
+    /// will live at (= input level - 1 in step_node terms).
+    ///
+    /// Extracted from step_node + step_level4_fanout_rayon so all three
+    /// callers (step_node, the per-fanout rayon path, and step_root_bfs)
+    /// share one implementation. Standard-Codex review specifically
+    /// asked for this consolidation.
+    fn try_resolve_short_circuit(
+        &mut self,
+        node: NodeId,
+        result_level: u32,
+    ) -> Option<NodeId> {
+        if self.store.population(node) == 0 {
+            self.hashlife_stats.empty_skips += 1;
+            return Some(self.store.empty(result_level));
+        }
+        if let Some(state) = self.inert_uniform_state(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return Some(self.store.uniform(result_level, state));
+        }
+        if self.is_all_inert(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return Some(self.center_node(node, result_level + 1));
+        }
+        None
+    }
+
+    /// hash-thing-ecmn: shared fast-subtree phase fold (mirror of
+    /// `step_node` lines 696-700). When the registry has slow divisors
+    /// (memo_period > 2) but the subtree at `node` contains no
+    /// slow-divisor cells, fold the schedule phase to `phase % 2` so
+    /// fast subtrees alias across every-other-generation pairs.
+    fn effective_phase_for(
+        &mut self,
+        node: NodeId,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> u64 {
+        if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
+            schedule_phase % 2
+        } else {
+            schedule_phase
+        }
+    }
+
+    /// hash-thing-ecmn: the env-gated phase-aliasing diagnostic probe
+    /// (mirror of `step_node` lines 728-738). Always-on cost was
+    /// estimated at single-digit ms/step at observed miss volumes, so
+    /// the probe is gated behind `HASH_THING_MEMO_DIAG=1`.
+    fn memo_diag_probe_alias(&mut self, node: NodeId, effective_phase: u64, memo_period: u64) {
+        if memo_diag_enabled() && memo_period > 1 {
+            for p in 0..memo_period {
+                if p == effective_phase {
+                    continue;
+                }
+                if self.hashlife_cache.contains_key(&(node, p)) {
+                    self.hashlife_stats.cache_misses_phase_aliased += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// hash-thing-ecmn: build the 27 intermediate nodes + 8 sub-cube
+    /// sub_roots at level (n-1) for a level-n parent. Mirrors
+    /// `step_recursive_case` lines 853-909 exactly. Extracted so the
+    /// BFS descent shares one source of truth with the DFS recursive
+    /// case (a future cleanup bead can refactor `step_recursive_case`
+    /// to call this helper too).
+    fn build_subroots(&mut self, node: NodeId, level: u32) -> [NodeId; 8] {
+        let children = self.store.children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+
+        let mut inter = [NodeId::EMPTY; 27];
+        for pz in 0..3usize {
+            for py in 0..3usize {
+                for px in 0..3usize {
+                    let mut octants = [NodeId::EMPTY; 8];
+                    for sz in 0..2usize {
+                        for sy in 0..2usize {
+                            for sx in 0..2usize {
+                                let (parent_x, sub_x) = source_index(px, sx);
+                                let (parent_y, sub_y) = source_index(py, sy);
+                                let (parent_z, sub_z) = source_index(pz, sz);
+                                let parent_oct =
+                                    octant_index(parent_x as u32, parent_y as u32, parent_z as u32);
+                                let sub_oct =
+                                    octant_index(sub_x as u32, sub_y as u32, sub_z as u32);
+                                octants[octant_index(sx as u32, sy as u32, sz as u32)] =
+                                    sub[parent_oct][sub_oct];
+                            }
+                        }
+                    }
+                    inter[px + py * 3 + pz * 9] = self.store.interior(level - 1, octants);
+                }
+            }
+        }
+
+        let mut centered = [NodeId::EMPTY; 27];
+        for i in 0..27 {
+            centered[i] = self.center_node(inter[i], level - 1);
+        }
+
+        let mut sub_roots = [NodeId::EMPTY; 8];
+        for oz in 0..2usize {
+            for oy in 0..2usize {
+                for ox in 0..2usize {
+                    let mut sub_cube = [NodeId::EMPTY; 8];
+                    for dz in 0..2usize {
+                        for dy in 0..2usize {
+                            for dx in 0..2usize {
+                                sub_cube[octant_index(dx as u32, dy as u32, dz as u32)] =
+                                    centered[(ox + dx) + (oy + dy) * 3 + (oz + dz) * 9];
+                            }
+                        }
+                    }
+                    sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
+                        self.store.interior(level - 1, sub_cube);
+                }
+            }
+        }
+        sub_roots
+    }
+
+    /// hash-thing-ecmn (vqke.4.1): breadth-first whole-step level
+    /// dispatcher. Walks `step_node` level-by-level instead of
+    /// depth-first, collecting all level-3 base-case misses across
+    /// the entire step into one large rayon batch.
+    ///
+    /// Three phases per call:
+    ///
+    /// 1. **Descending pass** (sequential, mutates store + cache):
+    ///    Process the root and each level n ∈ (root_level..=4) by
+    ///    building each task's 27 intermediates + 8 sub_roots, then
+    ///    classifying each sub_root via the `step_node` prelude
+    ///    (short-circuit / cache hit / pending miss). Pending unique
+    ///    misses queue as new tasks at level (n-1); duplicates dedupe
+    ///    against the per-level seen map and count as cache_hits.
+    ///
+    /// 2. **Level-3 batch** (parallel, pure): for every unique level-3
+    ///    task, flatten the 8³ grid (sequential read), then rayon
+    ///    par_iter over `step_grid_once_pure`. Below
+    ///    `RAYON_BATCH_THRESHOLD` (=4) fall back to serial iter — same
+    ///    threshold as ftuu's per-fanout path. Each output centers
+    ///    back into a level-2 NodeId, which becomes the task's result.
+    ///
+    /// 3. **Ascending pass** (sequential, mutates store + cache): for n
+    ///    ∈ 4..=root_level, each task at level n composes its 8 child
+    ///    results (level n-2) via `store.interior(n-1, ...)` and
+    ///    inserts the result into `hashlife_cache` under the same
+    ///    `(node, effective_phase)` key step_node would use.
+    ///
+    /// Bit-exact flattened-cell parity with the serial / per-fanout
+    /// paths (verified by `tests/base_case_rayon_parity.rs`). NodeIds
+    /// across `World` instances may differ due to intern allocation
+    /// order; the parity test compares `flatten()`, not NodeIds.
+    ///
+    /// `step_grid_once_pure` receives the raw `self.generation`, NOT
+    /// `effective_phase` — the compute path is generation-based and
+    /// only the cache key uses effective_phase. (Per Adversarial-Codex
+    /// plan-review feedback.)
+    ///
+    /// Stats accounting matches the serial path for cache_hits /
+    /// cache_misses / empty_skips / fixed_point_skips / misses_by_level
+    /// counts (modulo per-event ordering, which is intentionally not
+    /// part of the contract). Adds new BFS-specific counters
+    /// (`bfs_tasks_by_level`, `bfs_level3_unique_misses`,
+    /// `bfs_batches_parallel`, `bfs_batches_serial_fallback`,
+    /// `bfs_max_batch_len`) wired through `memo_summary()`.
+    fn step_root_bfs(
+        &mut self,
+        root: NodeId,
+        root_level: u32,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> NodeId {
+        debug_assert!(root_level >= 3, "step_root_bfs requires level >= 3");
+
+        // Root prelude — mirrors step_node lines 650-738.
+        if let Some(short) = self.try_resolve_short_circuit(root, root_level - 1) {
+            return short;
+        }
+        let root_eff = self.effective_phase_for(root, schedule_phase, memo_period);
+        let root_key = (root, root_eff);
+        if let Some(&cached) = self.hashlife_cache.get(&root_key) {
+            self.hashlife_stats.cache_hits += 1;
+            return cached;
+        }
+        self.hashlife_stats.cache_misses += 1;
+        self.hashlife_stats.misses_by_level[(root_level - 3) as usize] += 1;
+        self.memo_diag_probe_alias(root, root_eff, memo_period);
+
+        // Level-3 root: no BFS frontier needed — step the base case directly.
+        if root_level == 3 {
+            let result = self.step_base_case(root, root_eff);
+            self.hashlife_cache.insert(root_key, result);
+            return result;
+        }
+
+        // Per-level frontier. tasks[idx] holds the unique tasks at level
+        // `(idx + 3)`. seen[idx] is the dedupe map keyed by
+        // (NodeId, effective_phase) -> task index in tasks[idx].
+        //
+        // Cross-level dedupe is unnecessary because `Node::Interior`
+        // carries its level — identical content at different levels gets
+        // different NodeIds. NodeId::EMPTY-style sentinels are handled
+        // by the empty short-circuit BEFORE reaching the seen/resolved
+        // path.
+        let max_level_idx = (root_level - 3) as usize;
+        let mut tasks: Vec<Vec<BfsTask>> = (0..=max_level_idx).map(|_| Vec::new()).collect();
+        let mut seen: Vec<FxHashMap<(NodeId, u64), usize>> =
+            (0..=max_level_idx).map(|_| FxHashMap::default()).collect();
+
+        // Seed root.
+        tasks[max_level_idx].push(BfsTask {
+            node: root,
+            effective_phase: root_eff,
+            children: [BfsChildSlot::Direct(NodeId::EMPTY); 8],
+            result: None,
+        });
+        seen[max_level_idx].insert(root_key, 0);
+
+        // Phase 1: descending pass. Walk levels root_level..=4 (level-3
+        // tasks are pure leaves; they don't need sub_roots built).
+        for n in (4..=root_level).rev() {
+            let level_idx = (n - 3) as usize;
+            let lower_idx = level_idx - 1;
+            // Snapshot the count: tasks[level_idx] doesn't grow during
+            // this loop (we only append to tasks[lower_idx]), so an
+            // index-based loop is safe.
+            let n_tasks_count = tasks[level_idx].len();
+            for task_idx in 0..n_tasks_count {
+                let task_node = tasks[level_idx][task_idx].node;
+                let sub_roots = self.build_subroots(task_node, n);
+                let lower_level = n - 1;
+                let mut child_slots = [BfsChildSlot::Direct(NodeId::EMPTY); 8];
+                for i in 0..8 {
+                    let sub_nid = sub_roots[i];
+
+                    // Mirror step_node prelude order: short-circuit FIRST.
+                    if let Some(short) =
+                        self.try_resolve_short_circuit(sub_nid, lower_level - 1)
+                    {
+                        child_slots[i] = BfsChildSlot::Direct(short);
+                        continue;
+                    }
+                    let sub_eff =
+                        self.effective_phase_for(sub_nid, schedule_phase, memo_period);
+                    let sub_key = (sub_nid, sub_eff);
+
+                    if let Some(&cached) = self.hashlife_cache.get(&sub_key) {
+                        self.hashlife_stats.cache_hits += 1;
+                        child_slots[i] = BfsChildSlot::Direct(cached);
+                        continue;
+                    }
+
+                    // Dedupe against the lower-level seen map. A second
+                    // sibling pointing at the same (node, eff) counts as
+                    // a cache_hit (matches the per-fanout path's
+                    // accounting: the serial path would have hit-cache
+                    // after the first compute).
+                    if let Some(&pending_idx) = seen[lower_idx].get(&sub_key) {
+                        self.hashlife_stats.cache_hits += 1;
+                        child_slots[i] = BfsChildSlot::Pending(pending_idx);
+                        continue;
+                    }
+
+                    // Unique miss — count and queue.
+                    self.hashlife_stats.cache_misses += 1;
+                    self.hashlife_stats.misses_by_level[(lower_level - 3) as usize] += 1;
+                    self.memo_diag_probe_alias(sub_nid, sub_eff, memo_period);
+
+                    let new_idx = tasks[lower_idx].len();
+                    tasks[lower_idx].push(BfsTask {
+                        node: sub_nid,
+                        effective_phase: sub_eff,
+                        children: [BfsChildSlot::Direct(NodeId::EMPTY); 8],
+                        result: None,
+                    });
+                    seen[lower_idx].insert(sub_key, new_idx);
+                    child_slots[i] = BfsChildSlot::Pending(new_idx);
+                }
+                tasks[level_idx][task_idx].children = child_slots;
+            }
+        }
+
+        // Stats: bfs_tasks_by_level (per-step, not lifetime — accumulated
+        // by HashlifeStats::accumulate at the call-site of step_recursive).
+        for (idx, level_tasks) in tasks.iter().enumerate() {
+            self.hashlife_stats.bfs_tasks_by_level[idx] = level_tasks.len() as u64;
+        }
+
+        // Phase 2: level-3 parallel batch.
+        let level3_count = tasks[0].len();
+        self.hashlife_stats.bfs_level3_unique_misses = level3_count as u64;
+        self.hashlife_stats.bfs_max_batch_len = level3_count as u64;
+
+        if !tasks[0].is_empty() {
+            let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> =
+                Vec::with_capacity(level3_count);
+            for task in &tasks[0] {
+                let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+                self.store.flatten_buf(task.node, &mut grid, LEVEL3_SIDE);
+                pending_grids.push(grid);
+            }
+
+            const RAYON_BATCH_THRESHOLD: usize = 4;
+            // step_grid_once_pure receives raw self.generation, NOT
+            // effective_phase — the rule schedule (CaRule per-cell gates,
+            // BlockRule offset parity) is generation-driven; only the
+            // cache key uses effective_phase. (Per Adversarial-Codex
+            // plan-review feedback — restating the invariant for future
+            // readers.)
+            let generation = self.generation;
+            let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
+            let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> =
+                if level3_count < RAYON_BATCH_THRESHOLD {
+                    self.hashlife_stats.bfs_batches_serial_fallback += 1;
+                    pending_grids
+                        .iter()
+                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .collect()
+                } else {
+                    use rayon::prelude::*;
+                    self.hashlife_stats.bfs_batches_parallel += 1;
+                    pending_grids
+                        .par_iter()
+                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .collect()
+                };
+
+            for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
+                self.hashlife_stats.phase1_ns += p1ns;
+                self.hashlife_stats.phase2_ns += p2ns;
+                let centered = self.center_level3_grid_to_node(&output_grid);
+                let task = &mut tasks[0][out_idx];
+                self.hashlife_cache
+                    .insert((task.node, task.effective_phase), centered);
+                task.result = Some(centered);
+            }
+        }
+
+        // Phase 3: ascend levels 4..=root_level.
+        for n in 4..=root_level {
+            let level_idx = (n - 3) as usize;
+            let lower_idx = level_idx - 1;
+            let n_tasks_count = tasks[level_idx].len();
+            for task_idx in 0..n_tasks_count {
+                let result_children: [NodeId; 8] =
+                    std::array::from_fn(|i| match tasks[level_idx][task_idx].children[i] {
+                        BfsChildSlot::Direct(id) => id,
+                        BfsChildSlot::Pending(idx) => tasks[lower_idx][idx]
+                            .result
+                            .expect("BFS ascend: lower-level task must be resolved"),
+                    });
+                let composed = self.store.interior(n - 1, result_children);
+                let task = &mut tasks[level_idx][task_idx];
+                self.hashlife_cache
+                    .insert((task.node, task.effective_phase), composed);
+                task.result = Some(composed);
+            }
+        }
+
+        tasks[max_level_idx][0]
+            .result
+            .expect("BFS root must be resolved after ascend")
     }
 
     fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {

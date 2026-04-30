@@ -432,6 +432,30 @@ pub struct HashlifeStats {
     /// macro / inert / all-inert caches are tangential to the memo_hit
     /// signal). Per-step.
     pub compact_entries_kept: u64,
+    /// hash-thing-ecmn (vqke.4.1): unique BFS task count per level.
+    /// Index = level - 3. Populated only by `step_root_bfs`; zero on
+    /// Serial / RayonPerFanout strategies. Used to diagnose whether
+    /// the BFS dispatcher is actually batching meaningful work or
+    /// bottoming out on short-circuits.
+    pub bfs_tasks_by_level: [u64; 32],
+    /// hash-thing-ecmn: unique level-3 base-case misses queued for
+    /// the BFS rayon batch in this step. = bfs_tasks_by_level[0].
+    pub bfs_level3_unique_misses: u64,
+    /// hash-thing-ecmn: number of step_grid_once_pure invocations the
+    /// BFS path dispatched through rayon par_iter (batch size ≥
+    /// `RAYON_BATCH_THRESHOLD`). Per-step counter; usually 0 or 1
+    /// since whole-step BFS produces one large batch.
+    pub bfs_batches_parallel: u64,
+    /// hash-thing-ecmn: number of BFS level-3 batches that fell back
+    /// to serial iter because batch size was below the rayon
+    /// threshold. Tracks "BFS infrastructure ran but didn't actually
+    /// parallelise" — non-zero means the threshold may be too high or
+    /// the workload is short-circuit-dominated.
+    pub bfs_batches_serial_fallback: u64,
+    /// hash-thing-ecmn: largest level-3 batch size observed in this
+    /// step. = bfs_level3_unique_misses on the dominant path; useful
+    /// once a chunked-wavefront fallback is added.
+    pub bfs_max_batch_len: u64,
 }
 
 impl HashlifeStats {
@@ -457,10 +481,25 @@ impl HashlifeStats {
         self.cache_misses_phase_aliased += step.cache_misses_phase_aliased;
         self.compact_entries_dropped += step.compact_entries_dropped;
         self.compact_entries_kept += step.compact_entries_kept;
+        // hash-thing-ecmn: BFS observability counters.
+        self.bfs_level3_unique_misses += step.bfs_level3_unique_misses;
+        self.bfs_batches_parallel += step.bfs_batches_parallel;
+        self.bfs_batches_serial_fallback += step.bfs_batches_serial_fallback;
+        // bfs_max_batch_len is per-step max, not a sum — accumulator
+        // takes the running max so lifetime stat reflects the largest
+        // batch ever observed.
+        self.bfs_max_batch_len = self.bfs_max_batch_len.max(step.bfs_max_batch_len);
         for (dst, src) in self
             .misses_by_level
             .iter_mut()
             .zip(step.misses_by_level.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .bfs_tasks_by_level
+            .iter_mut()
+            .zip(step.bfs_tasks_by_level.iter())
         {
             *dst += *src;
         }
@@ -2480,8 +2519,17 @@ impl World {
         } else {
             stats.fixed_point_skips as f64 / total_calls as f64
         };
+        // hash-thing-ecmn: BFS observability tokens. Per-step values
+        // come from the most-recent-step `hashlife_stats`, not the
+        // lifetime accumulator, so they reflect the active step's BFS
+        // shape. `bfs_l3=0 bfs_par=0` on Serial / RayonPerFanout
+        // strategies — those paths never set the counters.
+        let bfs_l3 = last_step.bfs_level3_unique_misses;
+        let bfs_par = last_step.bfs_batches_parallel;
+        let bfs_serial_fb = last_step.bfs_batches_serial_fallback;
+        let bfs_max = last_step.bfs_max_batch_len;
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms",
+            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
             hit_rate,
             churn,
             self.hashlife_cache.len(),
@@ -2496,6 +2544,10 @@ impl World {
             p2_ms,
             p3_ms,
             p4_ms,
+            bfs_l3,
+            bfs_par,
+            bfs_serial_fb,
+            bfs_max,
         )
     }
 
@@ -6343,8 +6395,9 @@ mod tests {
                     || line.starts_with("p1=")
                     || line.starts_with("p2=")
                     || line.starts_with("p3=")
-                    || line.starts_with("p4="),
-                "field must use an approved HUD prefix (memo_ / p1 / p2 / p3 / p4), got {line:?}",
+                    || line.starts_with("p4=")
+                    || line.starts_with("bfs_"),
+                "field must use an approved HUD prefix (memo_ / p1 / p2 / p3 / p4 / bfs_), got {line:?}",
             );
             assert!(
                 line.len() <= 25,
