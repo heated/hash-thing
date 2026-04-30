@@ -174,6 +174,20 @@ Mayor should sweep for drift-parked beads during any invocation. Workers may unp
 
 **Human-initiated edits** (edward says "change CLAUDE.md, do X") are direct — any agent executes without queueing.
 
+## Sweep tiebreak — navigation epic wins
+
+When picking from `bd ready` during sweep, **any open child or grandchild of
+`hash-thing-8ppq` (autonomous game-direction navigation epic) beats
+unrelated work of the same priority OR one priority step higher.** A P1
+child of 8ppq beats a P0 unrelated bead unless the unrelated bead is an
+active production-blocking breakage (build broken, tests red on main).
+
+Rationale: the epic's children are the actual thesis-test work. Without
+this rule, P1/P2 leads under a P0 epic lose to unrelated P1s in the
+default `bd ready` ordering, and the epic becomes ceremony.
+
+When in doubt at sweep time: prefer 8ppq descendants.
+
 ## Perf claims cite regime coordinates
 
 Every perf number quoted in a comment/bead/message gets a coordinate
