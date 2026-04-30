@@ -803,8 +803,15 @@ fn smooth_fps(prev: f64, instant: f64, alpha: f64) -> f64 {
 }
 
 /// Render-scale presets the +/- keys snap between (hash-thing-sezr).
-/// Sorted ascending; floor 0.125 matches the renderer clamp (8v46).
-const RENDER_SCALE_PRESETS: &[f32] = &[0.125, 0.25, 0.5, 0.75, 1.0];
+/// Sorted ascending. Edward 2026-04-29: floor raised from 0.125 to
+/// 0.25 (12.5% looked unusably blurry on the demo target display, and
+/// the macOS-compositor bilinear-upscale issue at very low scales is a
+/// separate bug — xqva). Added 0.35 step between 0.25 and 0.5: at
+/// 256³ the M2 perf cliff sits between those two scales (25% pegs at
+/// 60 FPS, 50% drops to ~17 FPS), so an intermediate snap matters.
+/// Renderer's hard clamp at 0.125 still applies for env-var overrides
+/// — only the in-game +/- key ladder uses these presets.
+const RENDER_SCALE_PRESETS: &[f32] = &[0.25, 0.35, 0.5, 0.75, 1.0];
 
 /// Next preset strictly greater than `current`; saturates at the top.
 /// Off-grid values snap to the next preset above (e.g. 0.629 → 0.75).
@@ -3985,8 +3992,11 @@ mod tests {
 
     #[test]
     fn render_scale_up_steps_through_presets() {
+        // Below-floor values still snap to the lowest preset (0.25)
+        // even though the +/- ladder no longer includes 0.125 directly.
         assert_eq!(next_render_scale_up(0.125), 0.25);
-        assert_eq!(next_render_scale_up(0.25), 0.5);
+        assert_eq!(next_render_scale_up(0.25), 0.35);
+        assert_eq!(next_render_scale_up(0.35), 0.5);
         assert_eq!(next_render_scale_up(0.5), 0.75);
         assert_eq!(next_render_scale_up(0.75), 1.0);
     }
@@ -4001,14 +4011,19 @@ mod tests {
     fn render_scale_down_steps_through_presets() {
         assert_eq!(next_render_scale_down(1.0), 0.75);
         assert_eq!(next_render_scale_down(0.75), 0.5);
-        assert_eq!(next_render_scale_down(0.5), 0.25);
-        assert_eq!(next_render_scale_down(0.25), 0.125);
+        assert_eq!(next_render_scale_down(0.5), 0.35);
+        assert_eq!(next_render_scale_down(0.35), 0.25);
+        // Floor is 0.25 — saturates there, no longer drops to 0.125.
+        assert_eq!(next_render_scale_down(0.25), 0.25);
+        // Below-floor values still snap to the lowest preset (0.25).
+        assert_eq!(next_render_scale_down(0.20), 0.25);
     }
 
     #[test]
     fn render_scale_down_saturates_at_floor() {
-        assert_eq!(next_render_scale_down(0.125), 0.125);
-        assert_eq!(next_render_scale_down(0.0), 0.125);
+        // Floor is now 0.25 (was 0.125 pre-edward-2026-04-29).
+        assert_eq!(next_render_scale_down(0.25), 0.25);
+        assert_eq!(next_render_scale_down(0.0), 0.25);
     }
 
     #[test]
@@ -4016,9 +4031,13 @@ mod tests {
         // 0.629 from --demo at 720p, or env override 0.6
         assert_eq!(next_render_scale_up(0.629), 0.75);
         assert_eq!(next_render_scale_down(0.629), 0.5);
-        // Just above the floor → next up is 0.25, next down is the floor
+        // Just above the new floor → next up is 0.25 (since 0.25 > 0.20),
+        // next down snaps to 0.25 (the lowest preset).
         assert_eq!(next_render_scale_up(0.2), 0.25);
-        assert_eq!(next_render_scale_down(0.2), 0.125);
+        assert_eq!(next_render_scale_down(0.2), 0.25);
+        // Around the new 0.35 step.
+        assert_eq!(next_render_scale_up(0.30), 0.35);
+        assert_eq!(next_render_scale_down(0.40), 0.35);
     }
 
     // --- hash-thing-06so: --demo / --res CLI flag parsing ---
