@@ -48,6 +48,17 @@ Default to dev. **Use `--profile perf` for perf work — not `--release`.** `per
 
 **Why `perf` not `bench`:** built-in `[profile.bench]` shares `target/release/` with release (cargo#6988, won't-fix), so it clobbers the demo binary. Custom `[profile.perf]` writes to `target/perf/`. Detail: hash-thing-xer4.
 
+## Shared build cache
+
+Every worktree (claude/codex, all branches) builds into a single shared `target-dir` under `~/Library/Caches/hash-thing/target`. This is wired in repo-root `.cargo/config.toml` (hash-thing-a5mv). Cargo discriminates artifacts per-fingerprint, so different branches coexist; `incremental = false` because incremental rustc invocations bypass sccache, and the per-worktree `incremental/` directory was the dominant disk hog (~2.4 GiB × 10 worktrees).
+
+**Operational rules:**
+
+- **Never run `cargo clean` without `-p <crate>`.** Plain `cargo clean` wipes the whole crew's cache. Use `cargo clean -p hash-thing` (or whichever package) for surgical cleanup.
+- **Don't expect `<worktree>/target` to exist.** The compiled artifacts live outside the worktree under `~/Library/Caches/hash-thing/target/{debug,release,perf}/...`. Tools that look for binaries inside the worktree (older scripts, screenshot harnesses) need `cargo metadata --format-version=1 | jq .target_directory` or the absolute path above.
+- **First-edit rebuild latency is slightly worse** than with incremental, but sccache catches unchanged crates so warm rebuilds stay fast. Cold builds across worktrees on the same dep set are much faster (no recompile of winit/wgpu/etc).
+- **Bumping the sccache cap** is a one-time per-machine step: `export SCCACHE_CACHE_SIZE=30G` in your shell rc, then `sccache --stop-server` to apply.
+
 ## Agent surface — where project skills and commands live
 
 This project is designed to work with **any of three CLI agents**: Claude Code (the primary seat), Codex Exec, and Gemini CLI. To keep the three in sync:

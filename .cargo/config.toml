@@ -2,8 +2,27 @@
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-fuse-ld=/usr/bin/ld"]
 
-# sccache: cross-worktree compile caching. Each worktree has its own
-# target/ dir (no lock contention); sccache shares compiled artifacts.
-# CI overrides with RUSTC_WRAPPER="" in its env block.
+# hash-thing-a5mv: shared build cache for the multi-worktree crew.
+#
+# Why these three together:
+#   - target-dir: every worktree (claude/codex, all branches) writes to the
+#     same target dir. Cargo discriminates artifacts per-fingerprint, so
+#     different branches coexist; equal-fingerprint builds serialize on
+#     cargo's lockfile but release fast because sccache hits are seconds.
+#     Different absolute manifest paths (one per worktree) make hash-thing
+#     itself per-worktree-fingerprinted; the savings come from sharing
+#     dependency rlibs (winit/wgpu/rayon/etc.) once instead of N times.
+#   - incremental: hard-off. Cargo's incremental data is the single
+#     biggest disk hog (~2.4 GiB per worktree of ~6 GiB total) and
+#     sccache silently no-ops on incremental rustc invocations. Killing
+#     incremental finally lets sccache cache the dominant cost.
+#   - rustc-wrapper = sccache: keeps cross-build artifact reuse fast even
+#     when cargo evicts a fingerprint and rebuilds.
+#
+# Operational rule: do NOT run plain `cargo clean` — it wipes the whole
+# crew's cache. Use `cargo clean -p <crate>` for surgical cleanup.
+# Override per CI env with RUSTC_WRAPPER="" if needed.
 [build]
 rustc-wrapper = "sccache"
+target-dir = "/Users/edward/Library/Caches/hash-thing/target"
+incremental = false
