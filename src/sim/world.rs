@@ -2539,10 +2539,30 @@ impl World {
         let bfs_par = last_step.bfs_batches_parallel;
         let bfs_serial_fb = last_step.bfs_batches_serial_fallback;
         let bfs_max = last_step.bfs_max_batch_len;
+        // hash-thing-aqq4 verdict: surface the work-elision factor as a
+        // primary line so future field readings give the real signal
+        // directly (instead of being confused by memo_hit, which only
+        // counts cache_hits/(hits+misses) and ignores empty/inert
+        // short-circuits + the multiplicative effect of upper-level
+        // hits eliding many base cases).
+        //
+        // elision = (level-3 nodes in the world) / max(L3 misses last step, 1)
+        //         = (side / 8)^3 / L3_misses
+        // A naive every-cell stepper would do (side/8)^3 base-case
+        // evaluations per step. Hashlife does only L3_misses. The ratio
+        // is the multiplier hashlife is buying us. >>1 means the engine
+        // is paying off; ~1 means it's degenerating to brute force.
+        // Floor on `max(_, 1)` so a fully-cached step (L3 misses = 0)
+        // doesn't divide by zero — that's the perfect-hit case where
+        // the elision factor is effectively unbounded.
+        let l3_nodes_in_world = (1u64 << (3 * self.level)).saturating_div(512);
+        let l3_misses_last = last_step.misses_by_level[0].max(1);
+        let elision_factor = l3_nodes_in_world as f64 / l3_misses_last as f64;
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
+            "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
             hit_rate,
             churn,
+            elision_factor,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
             self.macro_cache_bytes_est(),
