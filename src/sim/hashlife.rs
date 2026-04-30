@@ -1467,8 +1467,10 @@ impl World {
         // the doubling beyond that gets dangerous fast (262K tasks ≈
         // 520 MiB at 256³ worst case, multi-GiB at 1024³). When this
         // warning fires, file a chunked-wavefront follow-up bead. The
-        // log only fires on opt-in BFS — Serial/RayonPerFanout never
-        // reach this path.
+        // log only fires on the BFS path — Serial/RayonPerFanout never
+        // reach this path. (BFS is the default since ite4; operators
+        // who want to revert can set HASH_THING_BASE_CASE_STRATEGY=
+        // per-fanout or serial.)
         const BFS_FRONTIER_SOFT_LIMIT: usize = 16_384;
         if level3_count > BFS_FRONTIER_SOFT_LIMIT {
             log::warn!(

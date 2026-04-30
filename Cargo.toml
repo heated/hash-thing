@@ -19,10 +19,11 @@ bytemuck = { version = "1", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 rustc-hash = "2"
-# hash-thing-ftuu (vqke.4): rayon for the level-4 8-way fanout in
-# step_recursive_case. Used only when base_case_use_rayon is opted into
-# (env HASH_THING_BASE_CASE_RAYON=1 or World::set_base_case_use_rayon).
-# Default behaviour stays serial — pre-ftuu bit-for-bit.
+# hash-thing-ftuu (vqke.4) + hash-thing-ecmn (vqke.4.1) +
+# hash-thing-ite4: rayon-driven base-case scheduling. Used by both
+# `RayonPerFanout` (level-4 8-way fanout, ftuu) and `RayonBfs`
+# (whole-step level-3 batch, ecmn). Default since ite4 (2026-04-29)
+# is `RayonBfs`. See src/sim/world.rs `BaseCaseStrategy` rustdoc.
 rayon = "1"
 # hash-thing-hc0g: --dump-frame headless screenshot harness writes PNG.
 # Pure-rust encoder, no transitive image-format bloat.
