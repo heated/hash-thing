@@ -18,18 +18,26 @@ use rustc_hash::FxHashMap;
 
 /// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling strategy.
 /// `Serial` is pre-ftuu DFS (no rayon). `RayonPerFanout` is ftuu's
-/// shipped per-level-4-fanout 8-way batching. `RayonBfs` is ecmn's
-/// breadth-first whole-step level-3 batching (added in commit 2).
+/// per-level-4-fanout 8-way batching. `RayonBfs` is ecmn's
+/// breadth-first whole-step level-3 batching.
 ///
-/// Default = `RayonPerFanout`: preserves the post-ftuu shipped state
-/// (env-var users got rayon; new construction gets the same behaviour
-/// without needing the env var). Override via
-/// `World::set_base_case_strategy` or `HASH_THING_BASE_CASE_STRATEGY`.
+/// Default = `RayonBfs` (hash-thing-ite4, 2026-04-29). Promoted from
+/// `RayonPerFanout` after the 5e3e churn bench showed BFS is 1.5× faster
+/// than per-fanout on the 256³ churn workload AND 2× faster on warm
+/// static — and per-fanout was actively slower than `Serial` under
+/// churn (the 8-way batches don't amortize rayon overhead at the
+/// observed miss volume). See notes/aqq4-thesis-verdict.md and the
+/// bench output of `bench_hashlife_256_churn_short` for the data.
+///
+/// Override via `World::set_base_case_strategy` or
+/// `HASH_THING_BASE_CASE_STRATEGY={serial|per-fanout|bfs}`. Legacy
+/// `HASH_THING_BASE_CASE_RAYON=1` still maps to `RayonPerFanout` for
+/// reproducing the ftuu-era default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BaseCaseStrategy {
     Serial,
-    #[default]
     RayonPerFanout,
+    #[default]
     RayonBfs,
 }
 
@@ -359,12 +367,13 @@ pub struct World {
     /// `Some(empty)` after `seed_terrain` — the consumer drains and
     /// calls `apply_remap(&empty)`, which drops every cached entry.
     pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
-    /// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling
-    /// strategy. See [`BaseCaseStrategy`]. Default = `RayonPerFanout`
-    /// (ftuu shipped behaviour). Initialised from
-    /// `HASH_THING_BASE_CASE_STRATEGY` env var (and the legacy
-    /// `HASH_THING_BASE_CASE_RAYON` shim) at construction. Mutate via
-    /// [`Self::set_base_case_strategy`] (preferred) or
+    /// hash-thing-ecmn (vqke.4.1) + hash-thing-ite4 (default flip):
+    /// selectable base-case scheduling strategy. See
+    /// [`BaseCaseStrategy`]. Default = `RayonBfs` (post-ite4 default;
+    /// see the enum's rustdoc for the 5e3e churn-bench evidence).
+    /// Initialised from `HASH_THING_BASE_CASE_STRATEGY` env var (and
+    /// the legacy `HASH_THING_BASE_CASE_RAYON` shim) at construction.
+    /// Mutate via [`Self::set_base_case_strategy`] (preferred) or
     /// [`Self::set_base_case_use_rayon`] (legacy bool wrapper).
     pub(crate) base_case_strategy: BaseCaseStrategy,
 }
@@ -6284,9 +6293,12 @@ mod tests {
 
     #[test]
     fn parse_base_case_strategy_default_when_unset() {
+        // hash-thing-ite4 (2026-04-29): default flipped to RayonBfs
+        // after 5e3e churn bench showed BFS is 1.5× faster than
+        // per-fanout under churn AND 2× faster on warm static.
         assert_eq!(
             super::parse_base_case_strategy(None, None),
-            BaseCaseStrategy::RayonPerFanout
+            BaseCaseStrategy::RayonBfs
         );
     }
 
@@ -6323,14 +6335,17 @@ mod tests {
             BaseCaseStrategy::Serial
         );
         // Unrecognised legacy value falls through to default — silent
-        // by design (legacy shim, documented as "1 to enable").
+        // by design (legacy shim, documented as "1 to enable"). The
+        // fall-through value is BaseCaseStrategy::default() and tracks
+        // whatever the project's active default is — currently
+        // RayonBfs (hash-thing-ite4, 2026-04-29).
         assert_eq!(
             super::parse_base_case_strategy(None, Some("yes".into())),
-            BaseCaseStrategy::RayonPerFanout
+            BaseCaseStrategy::default()
         );
         assert_eq!(
             super::parse_base_case_strategy(None, Some("".into())),
-            BaseCaseStrategy::RayonPerFanout
+            BaseCaseStrategy::default()
         );
     }
 
