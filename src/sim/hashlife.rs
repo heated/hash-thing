@@ -1459,6 +1459,28 @@ impl World {
         self.hashlife_stats.bfs_level3_unique_misses = level3_count as u64;
         self.hashlife_stats.bfs_max_batch_len = level3_count as u64;
 
+        // hash-thing-ecmn (review-pass): soft warning when the
+        // unbounded BFS frontier crosses a soft sanity threshold. Plan
+        // §11 documented "no cap, but soft warning if
+        // bfs_level3_unique_misses > 16384". At ~1 KiB grid + ~1 KiB
+        // output per task, 16384 tasks ≈ 32 MiB peak — still safe but
+        // the doubling beyond that gets dangerous fast (262K tasks ≈
+        // 520 MiB at 256³ worst case, multi-GiB at 1024³). When this
+        // warning fires, file a chunked-wavefront follow-up bead. The
+        // log only fires on opt-in BFS — Serial/RayonPerFanout never
+        // reach this path.
+        const BFS_FRONTIER_SOFT_LIMIT: usize = 16_384;
+        if level3_count > BFS_FRONTIER_SOFT_LIMIT {
+            log::warn!(
+                target: "hash_thing::hashlife::bfs",
+                "BFS level-3 frontier exceeded soft limit: {level3_count} unique tasks \
+                 (limit {BFS_FRONTIER_SOFT_LIMIT}). Memory peak ~{} MiB pending+output. \
+                 Consider chunked wavefront follow-up.",
+                (level3_count * (LEVEL3_CELL_COUNT * std::mem::size_of::<CellState>() * 2))
+                    / (1024 * 1024),
+            );
+        }
+
         if !tasks[0].is_empty() {
             let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> =
                 Vec::with_capacity(level3_count);

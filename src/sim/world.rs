@@ -40,7 +40,20 @@ pub enum BaseCaseStrategy {
 /// Invalid `HASH_THING_BASE_CASE_STRATEGY` values panic at construction
 /// — operators should get loud feedback, not silent fallback.
 fn env_base_case_strategy() -> BaseCaseStrategy {
-    if let Ok(v) = std::env::var("HASH_THING_BASE_CASE_STRATEGY") {
+    parse_base_case_strategy(
+        std::env::var("HASH_THING_BASE_CASE_STRATEGY").ok(),
+        std::env::var("HASH_THING_BASE_CASE_RAYON").ok(),
+    )
+}
+
+/// hash-thing-ecmn: pure env-string-to-strategy parser. Extracted from
+/// [`env_base_case_strategy`] so unit tests can drive it without
+/// mutating process env (which would race in a parallel test runner).
+fn parse_base_case_strategy(
+    strategy_env: Option<String>,
+    rayon_env: Option<String>,
+) -> BaseCaseStrategy {
+    if let Some(v) = strategy_env {
         return match v.as_str() {
             "serial" => BaseCaseStrategy::Serial,
             "per-fanout" | "rayon" => BaseCaseStrategy::RayonPerFanout,
@@ -50,13 +63,11 @@ fn env_base_case_strategy() -> BaseCaseStrategy {
             ),
         };
     }
-    if std::env::var("HASH_THING_BASE_CASE_RAYON").ok().as_deref() == Some("1") {
-        return BaseCaseStrategy::RayonPerFanout;
+    match rayon_env.as_deref() {
+        Some("1") => BaseCaseStrategy::RayonPerFanout,
+        Some("0") => BaseCaseStrategy::Serial,
+        _ => BaseCaseStrategy::default(),
     }
-    if std::env::var("HASH_THING_BASE_CASE_RAYON").ok().as_deref() == Some("0") {
-        return BaseCaseStrategy::Serial;
-    }
-    BaseCaseStrategy::default()
 }
 
 /// The axis-aligned cube of world-space that the octree currently covers.
@@ -6245,6 +6256,73 @@ mod tests {
     // hash-thing-stue.6: spatial-memo telemetry.
     // ---------------------------------------------------------------------
 
+    // hash-thing-ecmn (vqke.4.1) review-pass: pin the env-string ->
+    // BaseCaseStrategy parser so a future tweak doesn't silently change
+    // operator-visible behavior. Drives `parse_base_case_strategy` with
+    // injected Option<String> values rather than touching process env
+    // (which would race with the parallel test runner).
+
+    #[test]
+    fn parse_base_case_strategy_default_when_unset() {
+        assert_eq!(
+            super::parse_base_case_strategy(None, None),
+            BaseCaseStrategy::RayonPerFanout
+        );
+    }
+
+    #[test]
+    fn parse_base_case_strategy_explicit_strategy_overrides_rayon_legacy() {
+        // Explicit STRATEGY beats legacy RAYON shim regardless of value.
+        assert_eq!(
+            super::parse_base_case_strategy(Some("bfs".into()), Some("1".into())),
+            BaseCaseStrategy::RayonBfs
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(Some("serial".into()), Some("1".into())),
+            BaseCaseStrategy::Serial
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(Some("per-fanout".into()), Some("0".into())),
+            BaseCaseStrategy::RayonPerFanout
+        );
+        // `rayon` is an accepted alias for per-fanout (ftuu wording).
+        assert_eq!(
+            super::parse_base_case_strategy(Some("rayon".into()), None),
+            BaseCaseStrategy::RayonPerFanout
+        );
+    }
+
+    #[test]
+    fn parse_base_case_strategy_legacy_rayon_shim() {
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("1".into())),
+            BaseCaseStrategy::RayonPerFanout
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("0".into())),
+            BaseCaseStrategy::Serial
+        );
+        // Unrecognised legacy value falls through to default — silent
+        // by design (legacy shim, documented as "1 to enable").
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("yes".into())),
+            BaseCaseStrategy::RayonPerFanout
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("".into())),
+            BaseCaseStrategy::RayonPerFanout
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "HASH_THING_BASE_CASE_STRATEGY must be one of")]
+    fn parse_base_case_strategy_invalid_explicit_panics() {
+        // Operator-visible misconfig: hard panic with usage message,
+        // not silent fallback. (Adversarial-Codex-Dependencies plan
+        // review feedback — operators should get loud signal.)
+        let _ = super::parse_base_case_strategy(Some("turbo".into()), None);
+    }
+
     #[test]
     fn hashlife_stats_accumulate_sums_fields_and_levels_per_index() {
         let mut total = HashlifeStats::default();
@@ -6264,6 +6342,15 @@ mod tests {
         a.cache_misses_phase_aliased = 2;
         a.compact_entries_kept = 100;
         a.compact_entries_dropped = 25;
+        // hash-thing-ecmn (vqke.4.1): exercise the BFS accumulators
+        // alongside the older fields. Sum-shape for most counters; max
+        // for `bfs_max_batch_len`.
+        a.bfs_level3_unique_misses = 50;
+        a.bfs_batches_parallel = 1;
+        a.bfs_batches_serial_fallback = 0;
+        a.bfs_max_batch_len = 50;
+        a.bfs_tasks_by_level[0] = 50;
+        a.bfs_tasks_by_level[2] = 9;
 
         b.cache_hits = 2;
         b.cache_misses = 4;
@@ -6275,6 +6362,12 @@ mod tests {
         b.cache_misses_phase_aliased = 1;
         b.compact_entries_kept = 50;
         b.compact_entries_dropped = 0;
+        b.bfs_level3_unique_misses = 200;
+        b.bfs_batches_parallel = 1;
+        b.bfs_batches_serial_fallback = 1;
+        b.bfs_max_batch_len = 200; // larger; should win the running max
+        b.bfs_tasks_by_level[0] = 200;
+        b.bfs_tasks_by_level[2] = 17;
 
         total.accumulate(&a);
         total.accumulate(&b);
@@ -6289,11 +6382,25 @@ mod tests {
         assert_eq!(total.cache_misses_phase_aliased, 3);
         assert_eq!(total.compact_entries_kept, 150);
         assert_eq!(total.compact_entries_dropped, 25);
+        // hash-thing-ecmn: BFS counters.
+        assert_eq!(total.bfs_level3_unique_misses, 250);
+        assert_eq!(total.bfs_batches_parallel, 2);
+        assert_eq!(total.bfs_batches_serial_fallback, 1);
+        // bfs_max_batch_len is a running MAX, not a sum: the larger of
+        // the two wins.
+        assert_eq!(total.bfs_max_batch_len, 200);
+        assert_eq!(total.bfs_tasks_by_level[0], 250);
+        assert_eq!(total.bfs_tasks_by_level[2], 26);
         // Untouched indices must remain zero — catches the "summed into
         // index 0" copy-paste bug.
         for (i, &v) in total.misses_by_level.iter().enumerate() {
             if !matches!(i, 0 | 3 | 7) {
                 assert_eq!(v, 0, "misses_by_level[{i}] bled from another index");
+            }
+        }
+        for (i, &v) in total.bfs_tasks_by_level.iter().enumerate() {
+            if !matches!(i, 0 | 2) {
+                assert_eq!(v, 0, "bfs_tasks_by_level[{i}] bled from another index");
             }
         }
     }
@@ -6497,7 +6604,17 @@ mod tests {
         // it stays well-defined (saturating arithmetic, no panic) and
         // that step_node_wall_ns >= phase1_ns + phase2_ns (descent
         // always at least sees the leaves).
+        //
+        // hash-thing-ecmn (vqke.4.1) review-pass: pin the strategy to
+        // Serial. Under RayonPerFanout / RayonBfs, `phase1_ns` and
+        // `phase2_ns` sum across worker threads (per
+        // step_grid_once_pure return values) and can EXCEED the
+        // single-thread wall-clock `step_node_wall_ns`. The
+        // wall-vs-CPU-time invariant only holds for the serial path —
+        // gemini standard code review caught the mismatch when the
+        // default strategy flipped to RayonPerFanout.
         let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
         world.set(wc(4), wc(4), wc(4), ALIVE.raw());
         world.step_recursive();
 

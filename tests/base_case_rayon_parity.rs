@@ -244,6 +244,106 @@ fn rayon_parity_random_level5_full_sweep() {
     }
 }
 
+/// hash-thing-ecmn (vqke.4.1) review-pass: assert that BFS preserves
+/// the per-step stats counter shape vs serial. Beyond cell-content
+/// parity, the implementation claims that `cache_hits`,
+/// `cache_misses`, `empty_skips`, `fixed_point_skips`, and
+/// `misses_by_level` match the serial path's accounting. The plain
+/// parity test compares only `World::flatten()` and would silently
+/// pass a regression in dedupe accounting. This test pins the
+/// counter contract explicitly.
+///
+/// Strict equality is asserted for all 5 cumulative counters across
+/// `n_steps` of evolution. The new BFS-specific counters
+/// (`bfs_*`) are only populated by RayonBfs, so they're checked
+/// non-zero on the BFS run only.
+fn assert_stats_parity(level: u32, seeder: impl Fn(&mut World), n_steps: usize, label: &str) {
+    let mut serial = World::new(level);
+    seeder(&mut serial);
+    serial.set_base_case_strategy(BaseCaseStrategy::Serial);
+
+    let mut bfs = World::new(level);
+    seeder(&mut bfs);
+    bfs.set_base_case_strategy(BaseCaseStrategy::RayonBfs);
+
+    for step in 0..n_steps {
+        serial.step_recursive();
+        bfs.step_recursive();
+
+        let s = &serial.hashlife_stats;
+        let b = &bfs.hashlife_stats;
+
+        assert_eq!(
+            s.cache_hits, b.cache_hits,
+            "{label} step={step}: cache_hits diverged: serial={} bfs={}",
+            s.cache_hits, b.cache_hits,
+        );
+        assert_eq!(
+            s.cache_misses, b.cache_misses,
+            "{label} step={step}: cache_misses diverged: serial={} bfs={}",
+            s.cache_misses, b.cache_misses,
+        );
+        assert_eq!(
+            s.empty_skips, b.empty_skips,
+            "{label} step={step}: empty_skips diverged: serial={} bfs={}",
+            s.empty_skips, b.empty_skips,
+        );
+        assert_eq!(
+            s.fixed_point_skips, b.fixed_point_skips,
+            "{label} step={step}: fixed_point_skips diverged: serial={} bfs={}",
+            s.fixed_point_skips, b.fixed_point_skips,
+        );
+        assert_eq!(
+            s.misses_by_level, b.misses_by_level,
+            "{label} step={step}: misses_by_level diverged",
+        );
+    }
+}
+
+#[test]
+fn bfs_stats_parity_random_level5() {
+    // Level 5 random worlds — exercises BFS multi-level descent with
+    // mixed short-circuit / cache-hit / pending paths so the dedupe
+    // accounting is meaningfully tested.
+    for seed in 0..3u64 {
+        let label = format!("stats-parity seed={seed}");
+        assert_stats_parity(5, |w| seed_world(w, 0xcafe_0000 ^ seed, 3), 3, &label);
+    }
+}
+
+/// hash-thing-ecmn review-pass: assert that BFS actually queues
+/// non-trivial work — guards against a regression where the
+/// dispatcher silently routes through the DFS path or short-circuits
+/// every task. Asserts at least one step has a non-zero level-3 batch
+/// and at least one parallel batch (above the rayon threshold).
+#[test]
+fn bfs_observability_counters_fire_on_random_level5() {
+    let mut world = World::new(5);
+    seed_world(&mut world, 0xcafe_0001, 3);
+    world.set_base_case_strategy(BaseCaseStrategy::RayonBfs);
+
+    let mut max_l3 = 0u64;
+    let mut total_par = 0u64;
+    let mut total_serfb = 0u64;
+    for _ in 0..3 {
+        world.step_recursive();
+        max_l3 = max_l3.max(world.hashlife_stats.bfs_level3_unique_misses);
+        total_par += world.hashlife_stats.bfs_batches_parallel;
+        total_serfb += world.hashlife_stats.bfs_batches_serial_fallback;
+    }
+
+    assert!(
+        max_l3 > 0,
+        "BFS observability: bfs_level3_unique_misses stayed 0 across all 3 steps — \
+         dispatcher likely not actually batching",
+    );
+    assert!(
+        total_par + total_serfb > 0,
+        "BFS observability: neither bfs_batches_parallel nor bfs_batches_serial_fallback \
+         fired — Phase 2 did not execute",
+    );
+}
+
 /// hash-thing-ecmn (vqke.4.1) multi-level BFS coverage: level-7 (128³)
 /// worlds exercise the BFS dispatcher across 4 frontier levels (root=8 ->
 /// 7 -> 6 -> 5 -> 4 -> 3 batch). The serial / per-fanout paths are not
