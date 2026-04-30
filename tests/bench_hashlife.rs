@@ -12,8 +12,9 @@
 //! cache stats for manual comparison; it does not enforce a machine-checked
 //! performance budget in CI.
 
-use hash_thing::sim::{BaseCaseStrategy, World};
-use hash_thing::terrain::materials::STONE;
+use hash_thing::octree::Cell;
+use hash_thing::sim::{BaseCaseStrategy, World, WorldCoord};
+use hash_thing::terrain::materials::{SAND_MATERIAL_ID, STONE};
 use hash_thing::terrain::TerrainParams;
 use std::time::Instant;
 
@@ -281,6 +282,204 @@ fn bench_step_with_strategy(
     }
     eprintln!();
     summary
+}
+
+/// hash-thing-5e3e (tk4j.1): per-step mutation injector for the
+/// churn-regime bench. Default-terrain warm cache reaches a static
+/// state in ~10 generations because the world has no fresh dynamics.
+/// szyh's 172 ms baseline was captured under live churn (user dropping
+/// sand each step). Without injection the bench drops to ~1.5 ms total
+/// step time and misses the regime the perf work targets.
+///
+/// XorShift64* — pin-stable RNG so the bench is reproducible across
+/// runs and machines.
+struct BenchRng(u64);
+impl BenchRng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+fn churn_drop_sand(world: &mut World, rng: &mut BenchRng, n: usize) {
+    let side = world.side() as u64;
+    let sand = Cell::pack(SAND_MATERIAL_ID, 0).raw();
+    for _ in 0..n {
+        let x = rng.next_u64() % (side - 4) + 2;
+        // y biased to top so cells fall through the world (real demo
+        // usage pattern — drops from ~the player's head height).
+        let y = side - 4 + (rng.next_u64() % 2);
+        let z = rng.next_u64() % (side - 4) + 2;
+        world.set(WorldCoord(x as i64), WorldCoord(y as i64), WorldCoord(z as i64), sand);
+    }
+}
+
+fn bench_churn_step_with_strategy(
+    label: &str,
+    level: u32,
+    generations: usize,
+    sand_per_step: usize,
+    strategy: BaseCaseStrategy,
+) -> StepBenchSummary {
+    let side = 1u64 << level;
+    eprintln!(
+        "--- {label} (level={level}, side={side}³, strategy={strategy:?}, churn={sand_per_step} sand/step) ---",
+    );
+
+    let t0 = Instant::now();
+    let mut world = World::new(level);
+    world.set_base_case_strategy(strategy);
+    let params = TerrainParams::for_level(level);
+    let stats = world
+        .seed_terrain(&params)
+        .expect("level-derived terrain params must validate");
+    let seed_ms = t0.elapsed().as_millis();
+    eprintln!(
+        "  seed: {seed_ms}ms (precompute: {}µs, gen: {}µs), pop: {}, nodes: {}",
+        stats.precompute_us,
+        stats.gen_region_us,
+        world.population(),
+        stats.nodes_after_gen,
+    );
+
+    let mut rng = BenchRng::new(0x53e3_1234);
+    let mut step_us = Vec::with_capacity(generations);
+    let mut p1_ns_per_step = Vec::with_capacity(generations);
+    let mut p2_ns_per_step = Vec::with_capacity(generations);
+    let mut step_node_ns_per_step = Vec::with_capacity(generations);
+    for _gen in 0..generations {
+        churn_drop_sand(&mut world, &mut rng, sand_per_step);
+        let t = Instant::now();
+        world.step_recursive();
+        step_us.push(t.elapsed().as_micros() as u64);
+        p1_ns_per_step.push(world.hashlife_stats.phase1_ns);
+        p2_ns_per_step.push(world.hashlife_stats.phase2_ns);
+        step_node_ns_per_step.push(world.hashlife_stats.step_node_wall_ns);
+    }
+
+    let mut summary = StepBenchSummary::default();
+    if generations > 0 {
+        // Skip cold warm-up: first 10 generations populate the cache
+        // and let the churn injector reach the steady-state regime
+        // szyh observed.
+        let warmup = (10usize).min(generations.saturating_sub(1));
+        let warm_step_us: Vec<u64> = step_us[warmup..].to_vec();
+        let warm_count = warm_step_us.len();
+        let mut sorted = warm_step_us.clone();
+        sorted.sort();
+        let median_us = sorted[warm_count / 2];
+        let p95_us = sorted[((warm_count as f64) * 0.95) as usize];
+        let mean_us = warm_step_us.iter().sum::<u64>() / warm_count as u64;
+
+        let warm_step_node_ns: Vec<u64> = step_node_ns_per_step[warmup..].to_vec();
+        let mut step_node_sorted = warm_step_node_ns.clone();
+        step_node_sorted.sort();
+        let step_node_median_ns = step_node_sorted[warm_count / 2];
+
+        eprintln!(
+            "  step (warm, skipped {warmup} cold): mean={:.1}ms median={:.1}ms p95={:.1}ms",
+            mean_us as f64 / 1000.0,
+            median_us as f64 / 1000.0,
+            p95_us as f64 / 1000.0,
+        );
+        eprintln!(
+            "  step_node_wall (warm): median={:.1}ms",
+            step_node_median_ns as f64 / 1_000_000.0,
+        );
+        eprintln!("  memo_summary: {}", world.memo_summary());
+        summary.step_us_median = median_us;
+        summary.step_us_p95 = p95_us;
+        summary.step_node_wall_ms_median = step_node_median_ns as f64 / 1_000_000.0;
+    }
+    eprintln!();
+    summary
+}
+
+/// hash-thing-5e3e (tk4j.1) — short variant: 50 generations, 20 sand
+/// per step, 256³. Stays under 60s on M2 MBA dev machines so it can
+/// run in the default `cargo test --profile perf -- --ignored` agent
+/// loop. For the long-horizon "memo_tbl > 700k" measurement see
+/// `bench_hashlife_256_churn_full` below (`--ignored` only, slow).
+#[test]
+#[ignore]
+fn bench_hashlife_256_churn_short() {
+    let serial = bench_churn_step_with_strategy(
+        "256³ churn serial",
+        8,
+        50,
+        20,
+        BaseCaseStrategy::Serial,
+    );
+    let per_fanout = bench_churn_step_with_strategy(
+        "256³ churn rayon (per-fanout)",
+        8,
+        50,
+        20,
+        BaseCaseStrategy::RayonPerFanout,
+    );
+    let bfs = bench_churn_step_with_strategy(
+        "256³ churn rayon (bfs)",
+        8,
+        50,
+        20,
+        BaseCaseStrategy::RayonBfs,
+    );
+
+    eprintln!("--- 256³ churn comparison ---");
+    eprintln!(
+        "  step_us median: serial={} per-fanout={} bfs={}",
+        serial.step_us_median, per_fanout.step_us_median, bfs.step_us_median,
+    );
+    let bfs_vs_perfanout = bfs.step_us_median as f64 / per_fanout.step_us_median.max(1) as f64;
+    let bfs_vs_serial = bfs.step_us_median as f64 / serial.step_us_median.max(1) as f64;
+    eprintln!(
+        "  bfs/per-fanout ratio: {bfs_vs_perfanout:.3} (lower = bfs wins on churn)",
+    );
+    eprintln!(
+        "  bfs/serial ratio:     {bfs_vs_serial:.3} (parallelism multiplier under churn)",
+    );
+}
+
+/// hash-thing-5e3e (tk4j.1) — long variant: 200 generations, 30 sand
+/// per step. Designed to let the cache reach the 700k+ entry size at
+/// which 5ie4 saw memo_hit converge back to ~0.4 and step_recursive
+/// return to ~130ms (the szyh regime). Slow — runs in 1-3 minutes
+/// depending on strategy. NOT in the default `cargo test --ignored`
+/// loop; explicit invocation only:
+///
+/// ```text
+/// cargo test --profile perf --test bench_hashlife \
+///     bench_hashlife_256_churn_full -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore]
+fn bench_hashlife_256_churn_full() {
+    bench_churn_step_with_strategy(
+        "256³ churn-full serial",
+        8,
+        200,
+        30,
+        BaseCaseStrategy::Serial,
+    );
+    bench_churn_step_with_strategy(
+        "256³ churn-full rayon (per-fanout)",
+        8,
+        200,
+        30,
+        BaseCaseStrategy::RayonPerFanout,
+    );
+    bench_churn_step_with_strategy(
+        "256³ churn-full rayon (bfs)",
+        8,
+        200,
+        30,
+        BaseCaseStrategy::RayonBfs,
+    );
 }
 
 #[test]
