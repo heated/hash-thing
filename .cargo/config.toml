@@ -21,7 +21,13 @@ rustflags = ["-C", "link-arg=-fuse-ld=/usr/bin/ld"]
 #
 # Operational rule: do NOT run plain `cargo clean` — it wipes the whole
 # crew's cache. Use `cargo clean -p <crate>` for surgical cleanup.
-# Override per CI env with RUSTC_WRAPPER="" if needed.
+#
+# Per-machine portability: target-dir hardcodes edward's $HOME because
+# cargo's TOML config doesn't expand `~` or `$HOME`. Other contributors
+# (and CI) override via the `CARGO_TARGET_DIR` env var, which beats this
+# config entry per cargo precedence rules. CI typically sets
+# `CARGO_TARGET_DIR=target` to keep its sandbox build self-contained.
+# Override per CI env with RUSTC_WRAPPER="" if sccache should be skipped.
 [build]
 rustc-wrapper = "sccache"
 target-dir = "/Users/edward/Library/Caches/hash-thing/target"

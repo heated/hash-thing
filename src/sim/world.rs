@@ -1754,8 +1754,12 @@ impl World {
     /// as "volcanic" rather than "voxel landscape," which the demo's
     /// first-impression contract requires (hash-thing-4eo8).
     ///
-    /// Geometry (origin assumed `[0,0,0]`; the only caller paths reset
-    /// `World::new` first, mirroring `seed_demo_spectacle`):
+    /// **Origin invariance:** unlike `seed_demo_spectacle` (which writes
+    /// via `WorldCoord` and asserts `origin == [0,0,0]` at world.rs:1671),
+    /// this seeder uses `set_local` exclusively, so it is correct under
+    /// any `self.origin`. No origin assert needed here.
+    ///
+    /// Geometry:
     /// - Walls/floor/ceiling: 1-cell-thick stone slabs at `lo` / `hi-1`
     ///   with `margin = side/16`.
     /// - Floor lava: 3×3 patches dotted on a `side/8` grid at `floor_y
@@ -3830,7 +3834,10 @@ mod tests {
     /// hash-thing-4eo8: cold-start scene for the demo build. Lock in the
     /// volcanic palette (must contain stone/lava/water; must NOT contain
     /// dirt/grass/sand — those are the Minecraft-disqualifier cells the
-    /// bead acceptance forbids).
+    /// bead acceptance forbids) AND the geometric contract that lava
+    /// sits at `floor_y` and water at `ceiling_y`. Geometry locking
+    /// catches the case where a future refactor accidentally swaps lava
+    /// to the ceiling, etc. — palette membership alone wouldn't.
     #[test]
     fn seed_pyroclastic_chamber_palette_is_volcanic_not_earthy() {
         let mut w = World::new(6); // side 64
@@ -3851,6 +3858,35 @@ mod tests {
         assert!(
             !grid.contains(&SAND),
             "pyroclastic chamber must not contain SAND (Minecraft-palette disqualifier)"
+        );
+
+        // Geometric contract: lava lives at floor_y, water lives at ceiling_y.
+        // Mirrors the in-fn margins (margin = side/16, floor_y = lo+1, ceiling_y = hi-2).
+        let side = w.side() as u64;
+        let margin = (side / 16).max(1);
+        let lo = margin;
+        let hi = side - margin;
+        let floor_y = (lo + 1) as i64;
+        let ceiling_y = (hi - 2) as i64;
+        let lava_count_at_floor = (lo as i64..hi as i64)
+            .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
+            .filter(|(x, z)| {
+                w.get(WorldCoord(*x), WorldCoord(floor_y), WorldCoord(*z)) == LAVA
+            })
+            .count();
+        let water_count_at_ceiling = (lo as i64..hi as i64)
+            .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
+            .filter(|(x, z)| {
+                w.get(WorldCoord(*x), WorldCoord(ceiling_y), WorldCoord(*z)) == WATER
+            })
+            .count();
+        assert!(
+            lava_count_at_floor > 0,
+            "lava must sit at floor_y={floor_y}, not just somewhere in the volume"
+        );
+        assert!(
+            water_count_at_ceiling > 0,
+            "water must sit at ceiling_y={ceiling_y}, not just somewhere in the volume"
         );
     }
 

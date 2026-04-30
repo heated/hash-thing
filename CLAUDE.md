@@ -58,6 +58,7 @@ Every worktree (claude/codex, all branches) builds into a single shared `target-
 - **Don't expect `<worktree>/target` to exist.** The compiled artifacts live outside the worktree under `~/Library/Caches/hash-thing/target/{debug,release,perf}/...`. Tools that look for binaries inside the worktree (older scripts, screenshot harnesses) need `cargo metadata --format-version=1 | jq .target_directory` or the absolute path above.
 - **First-edit rebuild latency is slightly worse** than with incremental, but sccache catches unchanged crates so warm rebuilds stay fast. Cold builds across worktrees on the same dep set are much faster (no recompile of winit/wgpu/etc).
 - **Bumping the sccache cap** is a one-time per-machine step: `export SCCACHE_CACHE_SIZE=30G` in your shell rc, then `sccache --stop-server` to apply.
+- **Per-machine portability:** the committed `target-dir` is `/Users/edward/Library/Caches/hash-thing/target` (cargo's TOML doesn't expand `~`/`$HOME`). Contributors on other machines and CI override with `CARGO_TARGET_DIR` env var, which beats config.toml per cargo precedence. CI typically sets `CARGO_TARGET_DIR=target` for sandbox isolation.
 
 ## Agent surface — where project skills and commands live
 
