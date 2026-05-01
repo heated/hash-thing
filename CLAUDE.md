@@ -48,17 +48,17 @@ Default to dev. **Use `--profile perf` for perf work — not `--release`.** `per
 
 **Why `perf` not `bench`:** built-in `[profile.bench]` shares `target/release/` with release (cargo#6988, won't-fix), so it clobbers the demo binary. Custom `[profile.perf]` writes to `target/perf/`. Detail: hash-thing-xer4.
 
-## Shared build cache
+## Build cache
 
-Every worktree (claude/codex, all branches) builds into a single shared `target-dir` under `~/Library/Caches/hash-thing/target`. This is wired in repo-root `.cargo/config.toml` (hash-thing-a5mv). Cargo discriminates artifacts per-fingerprint, so different branches coexist; `incremental = false` because incremental rustc invocations bypass sccache, and the per-worktree `incremental/` directory was the dominant disk hog (~2.4 GiB × 10 worktrees).
+Each worktree has its own `target/` (no per-target-dir lock contention across concurrent crew builds — settled in `hash-thing-3sw`, 2026-04-12, after empirical observation of 10 cargo processes blocking on the lock under shared-target). `sccache` is the rustc-wrapper that shares **compiled artifacts** at the object-cache level across worktrees, so rebuilds stay fast even though target dirs are separate.
+
+**`incremental = false` (added in `hash-thing-a5mv`, 2026-04-30):** sccache silently no-ops on incremental rustc invocations, so pre-a5mv builds had zero cache hits even with the wrapper wired. Killing incremental costs a little first-edit rebuild latency (whole crate must re-codegen on a 1-line change) but unlocks sccache hit rates ≥ 80% on cold builds, and removes the ~2.4 GiB `target/debug/incremental/` per worktree (the single biggest disk hog).
 
 **Operational rules:**
 
-- **Never run `cargo clean` without `-p <crate>`.** Plain `cargo clean` wipes the whole crew's cache. Use `cargo clean -p hash-thing` (or whichever package) for surgical cleanup.
-- **Don't expect `<worktree>/target` to exist.** The compiled artifacts live outside the worktree under `~/Library/Caches/hash-thing/target/{debug,release,perf}/...`. Tools that look for binaries inside the worktree (older scripts, screenshot harnesses) need `cargo metadata --format-version=1 | jq .target_directory` or the absolute path above.
-- **First-edit rebuild latency is slightly worse** than with incremental, but sccache catches unchanged crates so warm rebuilds stay fast. Cold builds across worktrees on the same dep set are much faster (no recompile of winit/wgpu/etc).
-- **Bumping the sccache cap** is a one-time per-machine step: `export SCCACHE_CACHE_SIZE=30G` in your shell rc, then `sccache --stop-server` to apply.
-- **Per-machine portability:** the committed `target-dir` is `/Users/edward/Library/Caches/hash-thing/target` (cargo's TOML doesn't expand `~`/`$HOME`). Contributors on other machines and CI override with `CARGO_TARGET_DIR` env var, which beats config.toml per cargo precedence. CI typically sets `CARGO_TARGET_DIR=target` for sandbox isolation.
+- **Bump the sccache cap** to `30G`: `export SCCACHE_CACHE_SIZE=30G` in your shell rc, then `sccache --stop-server` (it autorestarts on next call). Default 10 GiB is too small for the multi-crew working set.
+- **Don't run plain `cargo clean`** in a worktree expecting it to free disk fast — it just nukes that one worktree's target. The shared dep cost is in `~/Library/Caches/Mozilla.sccache` (sccache's storage). For real disk recovery, `rm -rf <worktree>/target` for idle worktrees.
+- **CI override:** `RUSTC_WRAPPER=""` in CI env block to skip sccache when the build is sandboxed and won't benefit.
 
 ## Agent surface — where project skills and commands live
 

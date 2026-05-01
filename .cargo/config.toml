@@ -2,33 +2,19 @@
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-fuse-ld=/usr/bin/ld"]
 
-# hash-thing-a5mv: shared build cache for the multi-worktree crew.
+# sccache: cross-worktree compile caching. Each worktree has its own
+# target/ dir (no lock contention); sccache shares compiled artifacts.
 #
-# Why these three together:
-#   - target-dir: every worktree (claude/codex, all branches) writes to the
-#     same target dir. Cargo discriminates artifacts per-fingerprint, so
-#     different branches coexist; equal-fingerprint builds serialize on
-#     cargo's lockfile but release fast because sccache hits are seconds.
-#     Different absolute manifest paths (one per worktree) make hash-thing
-#     itself per-worktree-fingerprinted; the savings come from sharing
-#     dependency rlibs (winit/wgpu/rayon/etc.) once instead of N times.
-#   - incremental: hard-off. Cargo's incremental data is the single
-#     biggest disk hog (~2.4 GiB per worktree of ~6 GiB total) and
-#     sccache silently no-ops on incremental rustc invocations. Killing
-#     incremental finally lets sccache cache the dominant cost.
-#   - rustc-wrapper = sccache: keeps cross-build artifact reuse fast even
-#     when cargo evicts a fingerprint and rebuilds.
+# hash-thing-a5mv (2026-04-30 partial revert of the shared-target-dir
+# experiment): the shared `target-dir` approach was already empirically
+# rejected in hash-thing-3sw (2026-04-12) — 10 concurrent `cargo build`
+# processes serialized on cargo's per-target-dir lockfile. Per-worktree
+# target/ + sccache is the post-3sw consensus. The new bit a5mv adds on
+# top: `incremental = false` so sccache can actually cache rustc
+# invocations (sccache silently no-ops on incremental builds —
+# pre-a5mv stats showed 0 hits even though the wrapper was wired).
 #
-# Operational rule: do NOT run plain `cargo clean` — it wipes the whole
-# crew's cache. Use `cargo clean -p <crate>` for surgical cleanup.
-#
-# Per-machine portability: target-dir hardcodes edward's $HOME because
-# cargo's TOML config doesn't expand `~` or `$HOME`. Other contributors
-# (and CI) override via the `CARGO_TARGET_DIR` env var, which beats this
-# config entry per cargo precedence rules. CI typically sets
-# `CARGO_TARGET_DIR=target` to keep its sandbox build self-contained.
-# Override per CI env with RUSTC_WRAPPER="" if sccache should be skipped.
+# CI overrides with RUSTC_WRAPPER="" in its env block.
 [build]
 rustc-wrapper = "sccache"
-target-dir = "/Users/edward/Library/Caches/hash-thing/target"
 incremental = false
