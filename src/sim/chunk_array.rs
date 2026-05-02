@@ -21,35 +21,36 @@
 //! while the honest two-engines-agree parity work matures separately.
 
 use crate::octree::{Cell, CellState};
+use crate::sim::world::brute_step_grid;
 use crate::sim::World;
 use crate::terrain::materials::MaterialRegistry;
 use crate::terrain::TerrainParams;
 
-// Dead-code allow: this bead lands the storage type and its parity
-// tests; no production caller exists yet. The next bead in the chain
-// (phase / tick-divisor parity) wires the first non-test caller via the
-// chunk-array baseline bench.
+// Dead-code allow: only the in-module parity tests construct this type
+// today. The next bead promoting the chunk-array baseline bench to use
+// `ChunkArrayWorld::step` will wire the first non-test caller.
 #[allow(dead_code)]
 pub(crate) struct ChunkArrayWorld {
     level: u32,
     side: usize,
     grid: Vec<CellState>,
     materials: MaterialRegistry,
+    generation: u64,
 }
 
 #[allow(dead_code)]
 impl ChunkArrayWorld {
     /// Snapshot `source` into a flat-array world. The chunk grid is a
-    /// copy of `source.flatten()`; the materials registry is cloned.
-    /// Does not capture `source.generation` — the next bead in this
-    /// chain (phase / tick-divisor parity) wires that through when
-    /// stepping is added.
+    /// copy of `source.flatten()`; the materials registry is cloned;
+    /// `generation` mirrors the source so iterated stepping starts in
+    /// phase with a hashlife `World` built the same way.
     pub(crate) fn from_world(source: &World) -> Self {
         Self {
             level: source.level,
             side: source.side(),
             grid: source.flatten(),
             materials: source.materials().clone(),
+            generation: source.generation,
         }
     }
 
@@ -80,8 +81,44 @@ impl ChunkArrayWorld {
         &self.materials
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn population(&self) -> u64 {
         self.grid.iter().filter(|&&c| c != 0).count() as u64
+    }
+
+    /// Advance one generation. Mirrors `World::step` minus `commit_step`
+    /// (no octree to commit to). Both paths route through
+    /// `brute_step_grid`, so divergence between the two engines is
+    /// by-construction impossible.
+    ///
+    /// Generation timing matches `World::step`: the call reads
+    /// `self.generation`, computes the next grid, then bumps —
+    /// equivalent to `World::step` reading generation at world.rs:1260
+    /// and bumping inside `commit_step` at world.rs:2873-2875.
+    pub(crate) fn step(&mut self) {
+        let next = brute_step_grid(&self.grid, self.side, &self.materials, self.generation);
+        self.grid = next;
+        self.generation += 1;
+    }
+
+    /// Direct cell write — mirror of `World::set` for the chunk-array
+    /// path. Used by microchurn parity tests to drop sand identically
+    /// into both engines. OOB writes silently dropped (absorbing
+    /// boundary; matches `World::apply_mutations` semantics for OOB
+    /// `SetCell` mutations).
+    pub(crate) fn set(&mut self, x: i64, y: i64, z: i64, state: CellState) {
+        if x < 0 || y < 0 || z < 0 {
+            return;
+        }
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        if x >= self.side || y >= self.side || z >= self.side {
+            return;
+        }
+        let idx = x + y * self.side + z * self.side * self.side;
+        self.grid[idx] = state;
     }
 
     /// Population indexed by material id. Length matches
@@ -195,5 +232,137 @@ mod tests {
             convenience.population_by_material(),
             explicit.population_by_material()
         );
+    }
+
+    // --- Tick parity (8ppq.1.3) -----------------------------------------
+
+    use crate::sim::WorldCoord;
+    use crate::terrain::materials::SAND;
+
+    /// Failure-localization helper. On byte mismatch, prints the top
+    /// 3 (chunk_material, hashlife_material) pairs that disagreed —
+    /// per the bead's "material-class divergence map" verification ask.
+    fn assert_byte_parity_with_class_map(
+        chunk: &ChunkArrayWorld,
+        hashlife: &World,
+        gen: u64,
+    ) {
+        let h = hashlife.flatten();
+        let c = chunk.grid();
+        if c == &h[..] {
+            return;
+        }
+        let mut classes: std::collections::HashMap<(u16, u16), u64> =
+            std::collections::HashMap::new();
+        let mut first_diffs = 0usize;
+        for (i, (&a, &b)) in c.iter().zip(h.iter()).enumerate() {
+            if a == b {
+                continue;
+            }
+            let (ma, mb) = (Cell::from_raw(a).material(), Cell::from_raw(b).material());
+            *classes.entry((ma, mb)).or_default() += 1;
+            if first_diffs < 5 {
+                eprintln!("  diff at idx={i}: chunk={a:#x}(mat={ma}) hashlife={b:#x}(mat={mb})");
+                first_diffs += 1;
+            }
+        }
+        let mut top: Vec<_> = classes.into_iter().collect();
+        top.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        eprintln!("  divergence-class map (top 3, chunk_mat -> hashlife_mat):");
+        for ((ma, mb), n) in top.iter().take(3) {
+            eprintln!("    {ma:>3} -> {mb:<3}: {n} cells");
+        }
+        panic!(
+            "chunk vs hashlife diverged at gen {gen} (chunk gen={} hashlife gen={})",
+            chunk.generation(),
+            hashlife.generation,
+        );
+    }
+
+    fn tick_parity_idle(level: u32, ticks: usize) {
+        let params = TerrainParams::for_level(level);
+        let mut hashlife = World::new(level);
+        hashlife.seed_terrain(&params).unwrap();
+        let mut chunk = ChunkArrayWorld::from_world(&hashlife);
+
+        for n in 0..=ticks {
+            assert_byte_parity_with_class_map(&chunk, &hashlife, n as u64);
+            if n == ticks {
+                break;
+            }
+            chunk.step();
+            hashlife.step();
+        }
+    }
+
+    /// Bead Verification §1: one-tick parity is the cheapest divergence-
+    /// localization tool. If this fails, the bug is in single-tick
+    /// semantics, not iterated drift.
+    #[test]
+    fn tick_parity_level_5_one_tick() {
+        tick_parity_idle(5, 1);
+    }
+
+    #[test]
+    fn tick_parity_level_5_idle_30_ticks() {
+        tick_parity_idle(5, 30);
+    }
+
+    /// Level 6 / 100 ticks gated `#[ignore]` for soft-cap policy.
+    /// Run via:
+    ///   cargo test --profile perf -p hash-thing chunk_array::tests::tick_parity_level_6_idle_100_ticks -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn tick_parity_level_6_idle_100_ticks() {
+        tick_parity_idle(6, 100);
+    }
+
+    /// Microchurn parity (bead acceptance §microchurn): drop sand at
+    /// random top cells identically into both engines between steps.
+    /// This is what actually exercises Margolus parity + tick_divisor
+    /// — idle terrain reaches near-fixed-point fast.
+    fn tick_parity_microchurn(level: u32, ticks: usize, sand_per_step: usize) {
+        let params = TerrainParams::for_level(level);
+        let mut hashlife = World::new(level);
+        hashlife.seed_terrain(&params).unwrap();
+        let mut chunk = ChunkArrayWorld::from_world(&hashlife);
+
+        // Deterministic xorshift — both worlds get the same sand drops
+        // and the test is reproducible.
+        let side = (1i64) << level;
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next_u64 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for n in 0..=ticks {
+            assert_byte_parity_with_class_map(&chunk, &hashlife, n as u64);
+            if n == ticks {
+                break;
+            }
+            for _ in 0..sand_per_step {
+                let x = (next_u64() % (side as u64 - 4)) as i64 + 2;
+                let y = side - 4 + (next_u64() % 2) as i64;
+                let z = (next_u64() % (side as u64 - 4)) as i64 + 2;
+                hashlife.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), SAND);
+                chunk.set(x, y, z, SAND);
+            }
+            chunk.step();
+            hashlife.step();
+        }
+    }
+
+    #[test]
+    fn tick_parity_level_5_microchurn_30_ticks() {
+        tick_parity_microchurn(5, 30, 4);
+    }
+
+    #[test]
+    #[ignore]
+    fn tick_parity_level_6_microchurn_100_ticks() {
+        tick_parity_microchurn(6, 100, 8);
     }
 }
