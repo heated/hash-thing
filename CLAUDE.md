@@ -186,19 +186,30 @@ Mayor should sweep for drift-parked beads during any invocation. Workers may unp
 
 **Human-initiated edits** (edward says "change CLAUDE.md, do X") are direct — any agent executes without queueing.
 
-## Sweep tiebreak — navigation epic wins
+## Sweep tiebreak — navigation epic wins ties, not priority bumps
 
-When picking from `bd ready` during sweep, **any open child or grandchild of
-`hash-thing-8ppq` (autonomous game-direction navigation epic) beats
-unrelated work of the same priority OR one priority step higher.** A P1
-child of 8ppq beats a P0 unrelated bead unless the unrelated bead is an
-active production-blocking breakage (build broken, tests red on main).
+When picking from `bd ready` during sweep, **at the SAME priority** prefer
+descendants of `hash-thing-8ppq` (autonomous game-direction navigation
+epic) over unrelated work. **Never override an explicit higher priority.**
 
-Rationale: the epic's children are the actual thesis-test work. Without
-this rule, P1/P2 leads under a P0 epic lose to unrelated P1s in the
-default `bd ready` ordering, and the epic becomes ceremony.
+Specifically:
+- Two P1s, one is an `8ppq` descendant: pick the descendant.
+- A P0 unrelated bead vs a P1 `8ppq` descendant: pick the P0.
+- A P0 `8ppq` descendant vs a P0 unrelated bead: prefer the descendant if
+  both have the same urgency profile; pick the unrelated one if it's a
+  jump-the-queue (mayor/edward-filed) P0 or production-blocking breakage.
 
-When in doubt at sweep time: prefer 8ppq descendants.
+Rationale: per project policy "P0 is reserved for mayor/edward — moving
+a bead to P0 is a deliberate jump-the-queue signal." The v1 nav-epic
+filing tried to override this with "P1 child beats unrelated P0," which
+adversarial code review caught as a one-way door demoting legitimate P0s
+(non-build-breaking perf regressions, mayor cleanups, etc.). v2 narrows
+to "tiebreak only at equal priority" so the sweep still naturally pulls
+toward the navigation epic without silently overriding the priority
+system.
+
+When in doubt at sweep time: respect explicit priority first; prefer
+8ppq descendants only when priorities tie.
 
 ## Perf claims cite regime coordinates
 

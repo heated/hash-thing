@@ -47,8 +47,14 @@ to one of these (or you say "any" if the scene doesn't matter).
 | `uniform`         | One material everywhere (e.g. all stone). Tests the inert short-circuit.                             |
 | `lattice`         | Sparse identical sub-cubes (e.g. 1 stone every 8³). Tests hash-cons folding.                         |
 | `default-terrain` | The demo's terrain seed (heightmap + materials). Mostly stable post-warmup.                          |
-| `default-demo`    | Default terrain + volcano + water sheet + critters. The actual demo.                                 |
+| `default-demo`    | Default terrain + volcano + water sheet + critters. The current demo.                                |
 | `random-mix`      | Synthetic random material per cell. Tests upper levels of cache pressure.                            |
+| `factory-conveyor`| Conveyor-rule scene: 1-material moves in fixed direction. Tests hash-cons + repetition. (8ppq.6 family.) |
+| `puzzle-circuit`  | Wire/signal-propagation scene. Tests sparse-pattern memo + signal cascades.                          |
+| `replay-scrub`    | Recorded sim trace replayed at variable speed. Tests temporal cache hits at past timesteps. (5j7e family.) |
+| `soup-search`     | Many random initial seeds run in parallel for N gens, classifier picks survivors. (8ppq.5 family.)   |
+| `megastructure-stamp` | Pre-computed module stamped at K positions in a huge world. Tests hash-cons folding at scale.    |
+| `graph-cellular`  | Non-cube topology (hex / arbitrary graph) with CA on the graph. Tests subgraph-memo hypothesis. (ltt5 family.) |
 
 ### 3. `intensity` — how much is changing
 
@@ -57,7 +63,8 @@ levels; "any" if not relevant.
 
 | name       | what it means                                              | example                              |
 |------------|------------------------------------------------------------|--------------------------------------|
-| `idle`     | No edits, world fully settled                              | demo at gen 200 with no input        |
+| `idle`     | No edits, no emitters, world fully settled                 | empty world at gen 100               |
+| `passive-active` | No user input but world has emitters (volcano/water/critters) generating fresh content | demo "just walking around" — edward's 2026-04-30 observation |
 | `microchurn` | Small synthetic edit rate (~10-30 cells/step)            | `bench_hashlife_256_churn_short`     |
 | `cascade`  | Large-volume fluid / particle propagation per step        | demo's water sheet hitting terrain   |
 | `edit-active` | User input mid-play (placing/breaking)                  | real demo session                    |
