@@ -15,12 +15,14 @@ Not a settled spec. A starting point to sketch on.
 
 ## A measurement as coordinates
 
-Every perf number lives at four coordinates. A measurement that doesn't name
-all four is a measurement with hidden assumptions.
+Every perf number lives at **4 headline coordinates plus 6 mandatory metadata fields** (v2, hash-thing-8ppq.9, 2026-05-02). The 4 headline coordinates are the human-readable shorthand citation; the 6 metadata fields are filled in by the structured record (see [`perf-measurement-schema.md`](./perf-measurement-schema.md) for record shape).
 
 ```
-(world, scene, intensity, regime) → metric
+(world · scene · intensity · regime) → metric
+   + rule_set, backend, hardware, scenario_hash, confidence, schema_version
 ```
+
+A measurement that doesn't name the 4 headline coordinates is a measurement with hidden assumptions. A measurement that doesn't carry the 6 metadata fields can't be reproduced or compared.
 
 ### 1. `world` — physical scale
 
@@ -82,6 +84,9 @@ across these.
 | `saturated` | Cache at steady state for the world+scene. Hit rate stable.                |
 | `churning`  | Cache full but eviction-heavy. Each step produces fresh unique sub-cubes. |
 | `compacted` | Just after `maybe_compact()`. Fresh cache shape, may take a few gens to re-warm. |
+| `n/a`       | Backend has no memo cache (e.g. `chunk-array`). Required for non-memoized backends. |
+
+**Backend conditioning:** `regime` is *defined in terms of the hashlife memo cache*. For `backend = chunk-array` (or any future non-memoized backend), `regime` MUST be `n/a` — `(backend=chunk-array, regime=churning)` is a category error. For `backend = hashlife-recursive`, `regime` takes one of the 5 cache-state values above. See [`perf-measurement-schema.md`](./perf-measurement-schema.md) for the per-backend constraint table.
 
 ---
 
@@ -109,25 +114,23 @@ gameplay regime, with target ≤ 16.6 ms (60 Hz) or ≤ 33.3 ms (30 Hz).
 
 ---
 
-## What I've actually been measuring (audit)
+## What I've actually been measuring (audit, v2-shape)
 
-Honest inventory of the numbers I've quoted this session, mapped to
-coordinates:
+Honest inventory of historical numbers, retrofitted to v2 coordinates with hardware archeology (every existing row was on edward's M2-class MBP). v1 rows pre-date the `scenario_hash` discipline so that field reads `unknown`; future rows are required to fill it. The `cherry_pick_audit` column self-discloses the regime the number came from.
 
-| claim                         | (world, scene, intensity, regime)                    | metric           | value      | confidence  |
-|-------------------------------|------------------------------------------------------|------------------|------------|-------------|
-| "elision 46×, thesis viable"  | (medium, default-terrain, idle, saturated)           | elision_factor   | 46×        | bench       |
-| "elision 16× under churn"     | (medium, default-terrain, microchurn, saturated)     | elision_factor   | 16×        | bench       |
-| "BFS 1.5× faster than ftuu"   | (demo, default-terrain, microchurn, saturated)       | step_us median   | 3.7 ms     | bench       |
-| "step 6.7 ms median post-ite4"| (demo, default-terrain, microchurn, saturated, full)| step_us median   | 6.7 ms     | bench       |
-| "step 36 ms / 67 p95"         | (demo, default-demo, cascade, churning)              | step / step_p95  | 36 / 67 ms | demo, n=1   |
-| "elision 5.6× at cascade peak"| (demo, default-demo, cascade, churning)              | elision_factor   | 5.6×       | demo, n=1   |
-| "memo_hit 0.41 → 0.72"        | (demo, default-terrain, ?, saturated)                | memo_hit         | varies     | mixed       |
+| claim                         | (world · scene · intensity · regime)                 | backend             | rule_set    | hardware     | metric           | value      | source       | cherry_pick_audit |
+|-------------------------------|------------------------------------------------------|---------------------|-------------|--------------|------------------|------------|--------------|-------------------|
+| "elision 46×, thesis viable"  | medium · default-terrain · idle · saturated          | hashlife-recursive  | default-ca  | m2-pro-mbp   | elision_factor   | 46×        | bench        | easy_only (8ppq.1.4) |
+| "elision 16× under churn"     | medium · default-terrain · microchurn · saturated    | hashlife-recursive  | default-ca  | m2-pro-mbp   | elision_factor   | 16×        | bench        | mixed             |
+| "BFS 1.5× faster than ftuu"   | demo · default-terrain · microchurn · saturated      | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_median_ms   | 3.7        | bench        | mixed             |
+| "step 6.7 ms median post-ite4"| demo · default-terrain · microchurn · saturated      | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_median_ms   | 6.7        | bench        | mixed             |
+| "step 36 ms / 67 p95"         | demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 67         | demo (n=1)   | hard_included     |
+| "elision 5.6× at cascade peak"| demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | elision_factor   | 5.6×       | demo (n=1)   | hard_included     |
+| "memo_hit 0.41 → 0.72"        | demo · default-terrain · unknown · saturated         | hashlife-recursive  | default-ca  | m2-pro-mbp   | memo_hit_ratio   | 0.41-0.72  | mixed        | mixed             |
+| "chunk-array p95=2.29ms"      | demo · default-terrain · idle · n/a                  | chunk-array         | default-ca  | m2-pro-mbp   | step_p95_ms      | 2.29       | bench (n=30) | easy_only (8ppq.1.4) |
+| "hashlife p95=1.20ms"         | demo · default-terrain · idle · saturated            | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 1.20       | bench (n=30) | easy_only (8ppq.1.4) |
 
-The cherry-pick problem is now visible: the rosier numbers were all from
-`(microchurn, saturated)` regimes; the demo's interesting regime
-(`cascade, churning`) is 5-10× worse on every metric. Future claims should
-say which coordinate they're at.
+The cherry-pick problem is now structurally visible: the rosier numbers are flagged `easy_only` and carry their `hard_followup_bead` (8ppq.1.4 cascade-regime measurement); the cascade-peak rows are `hard_included`. New claims that flag `easy_only` MUST cite a follow-up bead per the schema's `confidence.cherry_pick_audit` constraint — see [`perf-measurement-schema.md`](./perf-measurement-schema.md).
 
 ---
 
@@ -182,12 +185,12 @@ without naming which sub-claim feels uncomfortably loose now.
 
 - Are these the right archetypes, or do you have other named regimes in
   mind?
-- Is there a 6th coordinate I'm missing? (Maybe `hardware`, but that's
-  arguably a separate dimension that multiplies into `metric`.)
 - What's the right home for the perf-narrative — this file, or the bd
   description of an epic, or a Notion-style canvas, or the SPEC.md?
 - Should the `intensity` axis be more granular? `microchurn / cascade /
   edit-active` lumps things that may behave very differently.
+
+(v2 resolved the v1 "is hardware a 6th coordinate?" question: yes — but as a *metadata field*, not a headline coordinate. See the 6 metadata fields above.)
 
 ---
 
