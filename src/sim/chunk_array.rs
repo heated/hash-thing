@@ -76,6 +76,10 @@ impl ChunkArrayWorld {
         &self.grid
     }
 
+    pub(crate) fn materials(&self) -> &MaterialRegistry {
+        &self.materials
+    }
+
     pub(crate) fn population(&self) -> u64 {
         self.grid.iter().filter(|&&c| c != 0).count() as u64
     }
@@ -133,6 +137,15 @@ mod tests {
         assert_eq!(
             chunk.population_by_material(),
             count_by_material(&hashlife_grid, n)
+        );
+
+        // Cached-predicate parity. `MaterialRegistry: Clone` deep-clones
+        // the cached `tick_divisor_flags` and `block_rule_tick_divisors`
+        // vectors; if a future change to the Clone impl regresses to
+        // recomputing-from-stale-state, this assertion catches it.
+        assert_eq!(
+            chunk.materials().tick_divisor_flags(),
+            hashlife.materials().tick_divisor_flags(),
         );
 
         assert!(
