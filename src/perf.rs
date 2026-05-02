@@ -128,6 +128,7 @@ impl Default for Perf {
 }
 
 impl Perf {
+    /// Construct an empty tracker. Equivalent to `Perf::default()`.
     pub fn new() -> Self {
         Self {
             rings: HashMap::new(),
