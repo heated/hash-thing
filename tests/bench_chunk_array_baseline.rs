@@ -1,26 +1,45 @@
-//! Chunk-array baseline bench (hash-thing-8ppq.1.1 MVP).
+//! Chunk-array baseline bench — provisional comparator for the hashlife
+//! navigation epic. **Provisional, not closure-grade.** The honest
+//! baseline (parity proofs, cascade scene, regime-coordinate output) is
+//! the navigation-epic L0 follow-ups; this bench gives game-direction
+//! leads ballpark perf data without waiting on the 2–3 week honest scope.
 //!
-//! This is the **provisional** comparator. It is NOT the closure-grade
-//! baseline that 8ppq.1 calls for. Specifically, it is NOT:
+//! Specifically this bench is NOT:
+//! - regime-coordinate formatted,
+//! - cascade-scene measured,
+//! - same-scene-seeded against hashlife,
+//! - phase / tick-divisor-parity validated.
 //!
-//! - regime-coordinate formatted (that's 8ppq.1.4 + 8ppq.9),
-//! - cascade-scene measured (that's 8ppq.1.4),
-//! - same-scene-seeded against hashlife (that's 8ppq.1.2),
-//! - phase / tick-divisor-parity validated (that's 8ppq.1.3).
-//!
-//! What it IS: 32³ default-terrain idle, 30 generations, raw `(gen, ms, pop)`.
-//! L1 leads (`pa24`, `w88i`, cascade-peak) get ballpark perf data without
-//! waiting on the 2-3 week honest baseline.
+//! What it IS: 32³ default-terrain idle, 30 generations, raw
+//! `(gen, ms, pop, drops=0)`.
 //!
 //! Run with:
 //!   cargo test --profile perf -p hash-thing --test bench_chunk_array_baseline -- --ignored --nocapture
 //!
-//! The bench keeps the flat `Vec<CellState>` canonical and calls
-//! `World::step_grid` directly, skipping the octree rebuild that
-//! `commit_step` performs. `world.generation` is advanced manually after
-//! each step so per-material tick_divisor gating stays consistent —
-//! although the MVP scene asserts `all_divisors_one`, so that path doesn't
-//! actually fire in this bench. Slow-divisor scenes are 8ppq.1.3 scope.
+//! ## What the timing includes (read this before drawing conclusions)
+//!
+//! The bench times **`World::step_grid` only** — the CA + Margolus
+//! kernel that a chunk-array-native engine would pay. It deliberately
+//! skips `commit_step`, which today rebuilds the octree, runs store
+//! compaction, and clears the hashlife caches. A real chunk-array
+//! engine has none of those — the flat `Vec<CellState>` IS its storage.
+//!
+//! The sibling `bench_hashlife_32` (in `tests/bench_hashlife.rs`) times
+//! `World::step_recursive`, which **includes** hashlife's compaction,
+//! cache lookups, and generation advance — those are intrinsic to the
+//! hashlife engine, not skippable bookkeeping.
+//!
+//! So the two timings are "engine-cost per generation" measurements,
+//! NOT "kernel-cost per generation." Comparing `step_us` directly is
+//! valid only at the engine-cost level. Drawing micro-benchmark
+//! conclusions ("hashlife's CA kernel is X× faster than chunk-array's")
+//! from these numbers is a category error.
+//!
+//! Default terrain also includes fire/water materials with divisor > 1.
+//! Both `step_grid` and `step_recursive` honor the iowh divisor gate, so
+//! the comparison stays apples-to-apples — both engines are measured
+//! with their own slow-tick skip path active. Pure-brute-force (no
+//! divisor short-circuit) is out of MVP scope.
 
 use hash_thing::octree::CellState;
 use hash_thing::sim::World;
@@ -80,14 +99,18 @@ fn bench_chunk_array_baseline_32() {
         world.generation += 1;
         times_us.push(us);
         let pop = popcount(&grid);
-        // drops=0: the brute-force chunk-array path has no entity-drop
-        // counter. The bead spec asks for `drops=D`; we honor the shape
-        // with a constant zero and own the interpretation here. If any L1
-        // lead actually wants Margolus-fall counts, file a follow-up.
-        eprintln!(
-            "  gen {gen}: {:.3}ms, pop={pop}, drops=0",
-            us as f64 / 1000.0
-        );
+        // Mirror `bench_hashlife.rs::bench_step` verbosity (gens 0–2 +
+        // last) so the side-by-side comparison is symmetric. drops=0
+        // honors the bead spec shape — the chunk-array path has no
+        // entity-drop counter; Margolus-fall counting is a follow-up.
+        if gen < 3 || gen == generations - 1 {
+            eprintln!(
+                "  gen {gen}: {:.3}ms, pop={pop}, drops=0",
+                us as f64 / 1000.0
+            );
+        } else if gen == 3 {
+            eprintln!("  ...");
+        }
     }
 
     let total_us: u128 = times_us.iter().sum();

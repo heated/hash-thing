@@ -116,15 +116,20 @@ fn bench_hashlife_512() {
     bench_step("512³", 9, 20);
 }
 
-/// hash-thing-8ppq.1.1: small-scene comparator pair against
-/// `bench_chunk_array_baseline_32`. At level=5 (32³) hashlife is not
-/// expected to dominate brute-force chunk-array — memos at this scale
-/// are mostly trivial — and that *is* the data point: it shows where
-/// hashlife's content folding does and does not pay off.
+/// Small-scene comparator pair against `bench_chunk_array_baseline_32`
+/// in `tests/bench_chunk_array_baseline.rs`. At level=5 (32³) hashlife
+/// is not expected to dominate brute-force chunk-array — memos at this
+/// scale are mostly trivial — and that *is* the data point: it shows
+/// where hashlife's content folding does and does not pay off.
+///
+/// See the chunk-array bench's module-doc for the comparator semantics
+/// (this side times full `step_recursive`; the chunk-array side times
+/// the `step_grid` kernel only — both represent each engine's intrinsic
+/// per-generation cost).
 #[test]
 #[ignore]
 fn bench_hashlife_32() {
-    bench_step("32³ (8ppq.1.1 comparator)", 5, 30);
+    bench_step("32³ (chunk-array comparator)", 5, 30);
 }
 
 /// hash-thing-tk4j (vqke.3): 256³ matches the szyh baseline scale that

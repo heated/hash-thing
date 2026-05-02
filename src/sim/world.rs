@@ -1264,13 +1264,24 @@ impl World {
         self.commit_step(&next, side);
     }
 
-    /// Brute-force step on a flat grid; returns the new grid.
+    /// Brute-force step on a flat whole-world grid; returns the new grid.
     ///
-    /// Bench seam for the chunk-array baseline (8ppq.1.1) — keeps the flat
+    /// Bench seam for the chunk-array baseline — keeps the flat
     /// `Vec<CellState>` canonical so the comparator can skip the octree
     /// rebuild that `commit_step` performs. Does not mutate the octree and
     /// does not advance `generation`; callers that want full-step semantics
     /// (`step`) commit to the octree and bump `generation` themselves.
+    ///
+    /// **Not to be confused with** the leaf-level
+    /// `step_grid_once_pure` in `src/sim/hashlife.rs`, which evaluates a
+    /// single 2^L hashlife leaf and is what the recursive memo path
+    /// recurses into.
+    ///
+    /// `pub` because the integration bench in
+    /// `tests/bench_chunk_array_baseline.rs` cannot see `pub(crate)`.
+    /// `#[doc(hidden)]` flags this as a bench-only seam, not a stable
+    /// public API. May be tightened to a feature gate or removed once
+    /// the honest baseline (the cascade follow-up) lands.
     #[doc(hidden)]
     pub fn step_grid(&self, grid: &[CellState]) -> Vec<CellState> {
         let side = self.side();
