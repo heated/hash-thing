@@ -2,26 +2,15 @@
 
 ## Crew default workflow
 
-**Every code-touching bead runs `/ship-auto <bd-id>`.** See `.agents/commands/ship-auto.md`. Headless — no human plan-gate — **but plan review and code review still run** (tiers per `.agents/skills/review-tiers/`, dual minimum). Trident is **2 Claude + 3 Codex + 1 Gemini** (per hash-thing-2kkt: evolutionary-Claude lens dropped, Codex covers the evolutionary angle).
+`/crew` is the workflow. See `~/.claude/commands/crew.md` + `~/.claude/skills/crew-playbook/phases/`. The lane phase decides full-playbook vs narrow-exception per bead.
 
-Escalate by parking the bead (`status=blocked` + structured ESCALATION comment), never by `AskUserQuestion`. The human sweeps `bd list --status blocked` on their own cadence.
+**Hash-thing examples for the `lane.md` "must run full playbook" list** (the generic categories in `lane.md` cover these; spelled out here so the renderer/sim contract isn't accidentally classified as "small"):
 
-**Narrow exception lane — may proceed without full /ship-auto** (per moss's 882n.7.1 proposal, narrowed 2026-04-20 by edward after a w1yq landed unreviewed under the old bug-fix clause):
-- Audit / triage / review / harness work.
-- Diagnostics, repro harnesses, assertions, test additions, logging, small reverts.
-- Review/audit setup work that doesn't change ship policy.
-
-Bug fixes — even narrow, even "restores documented broken behavior" — go through /ship-auto. The crew has demonstrated that "narrow bug fix" is easy to rationalize into shipping an untested architectural change (event-routing rewrite) with zero external review. An extra review is cheap.
-
-**Must go through /ship-auto** (no exception lane):
-- Any code fix that changes program behavior, including bug fixes.
-- New features or capability expansion, even if small.
-- Broad refactors / cross-module cleanups whose main value is code quality.
 - Algorithm, caching, serialization, buffer-layout, renderer/sim contract changes.
-- Changes to invariant-bearing paths.
-- Crew-policy changes that alter review gates, landing rules, or what counts as done.
+- Hashlife / SVDAG / chunk-LOD invariant paths (anything that touches `step_recursive`, the macro cache, the LOD policy, or the SVDAG hash-cons).
+- Bug fixes that "restore documented broken behavior" — these have shipped untested architectural rewrites under that label before (event-routing). Run the full playbook.
 
-If ambiguous, route through /ship-auto. An extra review is cheap; a shipped bug in invariant-bearing code is not.
+**Trident composition for this repo:** 2 Claude + 3 Codex + 1 Gemini (per hash-thing-2kkt: evolutionary-Claude lens dropped, Codex covers the evolutionary angle). Documented in `.agents/skills/review-tiers/SKILL.md`.
 
 ---
 
@@ -53,13 +42,13 @@ Default to dev. **Use `--profile perf` for perf work — not `--release`.** `per
 This project is designed to work with **any of three CLI agents**: Claude Code (the primary seat), Codex Exec, and Gemini CLI. To keep the three in sync:
 
 - **`AGENTS.md`** is a symlink to this file (`CLAUDE.md`). Codex and Gemini auto-load `AGENTS.md`; Claude Code auto-loads `CLAUDE.md`. Same content, one source of truth.
-- **`.agents/commands/`** holds the project-local slash-command / prompt definitions that `/ship` and related workflows depend on: `code_review.md`, `code_review_critical.md`, `trident-code-review.md`, `trident-plan-review.md`, `ship.md`, `diagram.md`. These are **copies**, not symlinks into `~/.claude/`, so a fresh `git clone` on another machine has everything needed.
-- **`.agents/skills/`** holds the skill definitions the workflows reference, most importantly `review-tiers/SKILL.md` which `/ship` reads to pick its review tier.
-- **Refreshing from `~/.claude/`**: if edward updates his global Claude config, re-sync via `.agents/README.md`'s refresh command. Drift is a file the claude-md-edit queue (or any seat noticing stale content) should refile.
+- **`/crew` lives in user-global**: `~/.claude/commands/crew.md` + `~/.claude/skills/crew-playbook/phases/*.md` + `~/.claude/skills/human-gates/SKILL.md`, installed via the orchestrator-export port (o9zl). `crew-playbook` resolves the phase files at runtime; the `crew` slash command drives the loop.
+- **`.agents/commands/`** holds the project-local review-prompt definitions that the `/crew` `code-review.md` and `plan-review.md` phases dispatch into: `code_review.md`, `code_review_critical.md`, `trident-code-review.md`, `trident-plan-review.md`, `diagram.md`. Copies, not symlinks into `~/.claude/`, so a fresh `git clone` ports cleanly.
+- **`.agents/skills/`** holds skill definitions the project depends on, most importantly `review-tiers/SKILL.md` (consumed by the `/crew` plan-review and code-review phases for tier picks).
 
 **Why this matters for cost**: edward's Claude Code $200/month plan maxes out when trident is all-Claude (9 Claude agents). Shifting to multi-modal trident — **2 Claude + 3 Codex + 1 Gemini** — saves roughly 2/3 of Claude token spend. Only works if Codex and Gemini sessions can read the same project instructions and workflows, which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
 
-**When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
+**When invoking Codex or Gemini on this project** (e.g. from `/crew`'s code-review or plan-review phase), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
 
 ## The crew
 
@@ -132,10 +121,10 @@ At every gate (including design gates):
 
 1. `bd update <id> --status blocked`
 2. `bd comments add <id> "<one-line reason — what edward needs to decide>"`
-3. Pull the next task off `bd ready` and start a fresh `/ship <id>`
+3. Pull the next task off `bd ready` and start a fresh `/crew <id>`
 4. Keep cycling — see the dry-queue section below
 
-Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/ship` end-to-end.
+Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/crew` end-to-end.
 
 **Design gates are narrower than they look.** If a scout finds two independent implementations of the same bead, do NOT park at a human gate just because there's a choice to make. Review both and pick one yourself. Only genuine user-facing design calls (what the system *is*, not how it's built) warrant the gate. Internal-API / implementation-detail decisions are autonomous. See `hash-thing-52b` for the precedent.
 
@@ -187,7 +176,7 @@ Commit at every natural boundary — plan file written, first test green, helper
 **The default lifecycle for any seat:**
 
 1. Claim the bead (`bd update <id> --claim`) on your worktree branch.
-2. Implement / review / fix on the worktree branch — normal `/ship` flow, this part doesn't change.
+2. Implement / review / fix on the worktree branch — normal `/crew` flow, this part doesn't change.
 3. **Before declaring the bead closed, land it on main.** Either fast-forward `origin/main` or create a merge commit to it. If the tree hasn't moved, fast-forward. If it has, pull main first, resolve locally, push main forward. No PR dance, no waiting for edward.
 4. `bd close <id>` fires *after* main has the work, not after the worktree branch does.
 
@@ -204,7 +193,7 @@ Commit at every natural boundary — plan file written, first test green, helper
 - Design-gate parking — the bead is `blocked`, not ready; the branch goes quiet until unparked.
 - A seat found a genuine user-facing design question and is waiting on edward — rare, always a bead comment first.
 
-**What this does NOT mean:** We're not adopting GitLab/GitHub PR review as a gate. The `/ship` review tiers (dual/triple/trident) still run; the crew still cross-reviews. The difference is that "push passes" → "land on main" is one step, not two.
+**What this does NOT mean:** We're not adopting GitLab/GitHub PR review as a gate. The `/crew` review tiers (dual/triple/trident) still run via the `code-review.md` and `plan-review.md` phase files; the crew still cross-reviews. The difference is that "push passes" → "land on main" is one step, not two.
 
 The prior divergence backlog (18 commits on `worktree-vast-leaping-allen`, 9 on `worktree-sleepy-wiggling-fountain`, both ahead of main) was a bug, not a feature. 52b-A is the cleanup for that specific instance.
 
