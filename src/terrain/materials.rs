@@ -238,7 +238,7 @@ pub struct MaterialEntry {
 pub struct MaterialRegistry {
     entries: Vec<Option<MaterialEntry>>,
     rules: Vec<CaRule>,
-    block_rules: Vec<Box<dyn BlockRule + Send>>,
+    block_rules: Vec<Box<dyn BlockRule + Send + Sync>>,
     // Caches rebuilt after any mutation touching entries / block_rules (hash-thing-5yxk).
     // The sim step hot path reads these every tick; recomputing per step would
     // allocate two Vec<u16> per step, which shows up in jw3k-class profiles.
@@ -1042,7 +1042,7 @@ impl MaterialRegistry {
     /// Route via `world.mutate_materials(|m| m.register_block_rule(...))` instead.
     pub fn register_block_rule<R>(&mut self, rule: R) -> BlockRuleId
     where
-        R: BlockRule + Send + 'static,
+        R: BlockRule + Send + Sync + 'static,
     {
         let id = BlockRuleId(self.block_rules.len());
         self.block_rules.push(Box::new(rule));

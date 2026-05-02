@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Wrapper for `codex` that emits a hang-warning preamble at the call site.
+#
+# Why: codex `exec --full-auto --skip-git-repo-check` invoked via background
+# bash regularly hangs silently — process running, no stdout, no completion
+# notification. Documented in hash-thing-pc95 (closed but behavior persists)
+# and global ~/.claude/CLAUDE.md. The mitigation ("TaskStop after ~60s of
+# silence, proceed with peers") lived only in agent docs, not at the call
+# site. Fresh agents had to re-discover the warning. This wrapper surfaces
+# it on every invocation so it's impossible to miss.
+#
+# Behavior change: zero. Just an extra stderr preamble before exec'ing the
+# real codex.
+#
+# Suppress the preamble: set CODEX_NO_HANG_REMINDER=1.
+#
+# hash-thing-27j9.
+
+set -euo pipefail
+
+# Locate the real codex binary, skipping any wrappers (this script, or
+# anything else of the same name inside this script's directory).
+self_dir=$(cd "$(dirname "$0")" && pwd)
+real_codex=""
+IFS=':' read -ra _path_dirs <<<"$PATH"
+for _d in "${_path_dirs[@]}"; do
+    [ -z "$_d" ] && continue
+    [ "$_d" = "$self_dir" ] && continue
+    if [ -x "$_d/codex" ] && [ ! -L "$_d/codex" -o "$(readlink -f "$_d/codex" 2>/dev/null)" != "$(readlink -f "$0" 2>/dev/null)" ]; then
+        real_codex="$_d/codex"
+        break
+    fi
+done
+
+if [ -z "$real_codex" ]; then
+    echo "[.bin/codex] cannot locate real codex binary on PATH (excluding $self_dir). Set CODEX_REAL=/path/to/codex to override." >&2
+    exit 127
+fi
+
+# Allow override.
+real_codex="${CODEX_REAL:-$real_codex}"
+
+if [ -z "${CODEX_NO_HANG_REMINDER:-}" ]; then
+    cat >&2 <<'REMINDER'
+[.bin/codex] reminder: codex exec sometimes hangs silently when invoked in
+  the background (no stdout, no completion notification). Standard
+  mitigation: if there is no output within ~60s, TaskStop and proceed
+  with peer reviewers. See hash-thing-pc95 / global CLAUDE.md "Codex
+  may hang indefinitely" for context. Set CODEX_NO_HANG_REMINDER=1 to
+  silence this preamble in known-hang-aware paths.
+REMINDER
+fi
+
+exec "$real_codex" "$@"

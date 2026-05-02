@@ -16,6 +16,68 @@ use crate::terrain::materials::{
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
 
+/// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling strategy.
+/// `Serial` is pre-ftuu DFS (no rayon). `RayonPerFanout` is ftuu's
+/// per-level-4-fanout 8-way batching. `RayonBfs` is ecmn's
+/// breadth-first whole-step level-3 batching.
+///
+/// Default = `RayonBfs` (hash-thing-ite4, 2026-04-29). Promoted from
+/// `RayonPerFanout` after the 5e3e churn bench showed BFS is 1.5× faster
+/// than per-fanout on the 256³ churn workload AND 2× faster on warm
+/// static — and per-fanout was actively slower than `Serial` under
+/// churn (the 8-way batches don't amortize rayon overhead at the
+/// observed miss volume). See notes/aqq4-thesis-verdict.md and the
+/// bench output of `bench_hashlife_256_churn_short` for the data.
+///
+/// Override via `World::set_base_case_strategy` or
+/// `HASH_THING_BASE_CASE_STRATEGY={serial|per-fanout|bfs}`. Legacy
+/// `HASH_THING_BASE_CASE_RAYON=1` still maps to `RayonPerFanout` for
+/// reproducing the ftuu-era default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BaseCaseStrategy {
+    Serial,
+    RayonPerFanout,
+    #[default]
+    RayonBfs,
+}
+
+/// hash-thing-ecmn: parse strategy from env. Precedence:
+/// `HASH_THING_BASE_CASE_STRATEGY` (explicit) > `HASH_THING_BASE_CASE_RAYON=1`
+/// (ftuu shim, treated as RayonPerFanout) > default.
+///
+/// Invalid `HASH_THING_BASE_CASE_STRATEGY` values panic at construction
+/// — operators should get loud feedback, not silent fallback.
+fn env_base_case_strategy() -> BaseCaseStrategy {
+    parse_base_case_strategy(
+        std::env::var("HASH_THING_BASE_CASE_STRATEGY").ok(),
+        std::env::var("HASH_THING_BASE_CASE_RAYON").ok(),
+    )
+}
+
+/// hash-thing-ecmn: pure env-string-to-strategy parser. Extracted from
+/// [`env_base_case_strategy`] so unit tests can drive it without
+/// mutating process env (which would race in a parallel test runner).
+fn parse_base_case_strategy(
+    strategy_env: Option<String>,
+    rayon_env: Option<String>,
+) -> BaseCaseStrategy {
+    if let Some(v) = strategy_env {
+        return match v.as_str() {
+            "serial" => BaseCaseStrategy::Serial,
+            "per-fanout" | "rayon" => BaseCaseStrategy::RayonPerFanout,
+            "bfs" => BaseCaseStrategy::RayonBfs,
+            other => panic!(
+                "HASH_THING_BASE_CASE_STRATEGY must be one of: serial | per-fanout | bfs (got {other:?})"
+            ),
+        };
+    }
+    match rayon_env.as_deref() {
+        Some("1") => BaseCaseStrategy::RayonPerFanout,
+        Some("0") => BaseCaseStrategy::Serial,
+        _ => BaseCaseStrategy::default(),
+    }
+}
+
 /// The axis-aligned cube of world-space that the octree currently covers.
 ///
 /// Origin is always (0,0,0) today (unsigned coords), but will shift once
@@ -261,6 +323,22 @@ pub struct World {
     /// Cache for `is_all_inert`: NodeId → bool.
     /// True if every leaf in the subtree has CaRule::Noop and no BlockRule.
     pub(crate) hashlife_all_inert_cache: FxHashMap<NodeId, bool>,
+    /// hash-thing-5ie4 (vqke.2.1): cache for `subtree_has_slow_divisor`:
+    /// `NodeId → bool`. True if the subtree contains any cell whose
+    /// material has `tick_divisor > 1`. Drives the phase-fold in
+    /// `step_node`: a node with no slow-divisor descendants has a step
+    /// result that depends only on `(NodeId, gen % 2)`, so the cache
+    /// key collapses from period N → period 2 for that branch.
+    ///
+    /// **Invalidation surface** (must be cleared on every path that
+    /// changes the answer): material registry mutations
+    /// (`invalidate_material_caches`, called via `mutate_materials`)
+    /// and the same world-reset / megastructure-seed paths that drop
+    /// `hashlife_inert_cache` / `hashlife_all_inert_cache`. The
+    /// answer is content-determined so node-mutation paths (cell
+    /// edits) get new NodeIds and hit the cache fresh — no manual
+    /// invalidation needed there.
+    pub(crate) hashlife_slow_divisor_cache: FxHashMap<NodeId, bool>,
     /// Cached result of `has_block_rule_cells`. `None` = dirty, needs rescan.
     /// Avoids O(n³) flatten-and-scan on every `step_recursive_pow2` call.
     pub(crate) block_rule_present: Option<bool>,
@@ -289,6 +367,15 @@ pub struct World {
     /// `Some(empty)` after `seed_terrain` — the consumer drains and
     /// calls `apply_remap(&empty)`, which drops every cached entry.
     pub last_compaction_remap: Option<FxHashMap<NodeId, NodeId>>,
+    /// hash-thing-ecmn (vqke.4.1) + hash-thing-ite4 (default flip):
+    /// selectable base-case scheduling strategy. See
+    /// [`BaseCaseStrategy`]. Default = `RayonBfs` (post-ite4 default;
+    /// see the enum's rustdoc for the 5e3e churn-bench evidence).
+    /// Initialised from `HASH_THING_BASE_CASE_STRATEGY` env var (and
+    /// the legacy `HASH_THING_BASE_CASE_RAYON` shim) at construction.
+    /// Mutate via [`Self::set_base_case_strategy`] (preferred) or
+    /// [`Self::set_base_case_use_rayon`] (legacy bool wrapper).
+    pub(crate) base_case_strategy: BaseCaseStrategy,
 }
 
 /// Cache performance statistics from a single hashlife step.
@@ -307,6 +394,88 @@ pub struct HashlifeStats {
     /// BlockRule / Margolus) across all memo-miss base cases in one step
     /// (hash-thing-71mp).
     pub phase2_ns: u64,
+    /// hash-thing-vqke Phase 0: total wall-clock nanoseconds inside the
+    /// top-level `step_node` call from `step_recursive`. Includes p1+p2
+    /// at the leaves PLUS the recursive-descent / hash-cons / memo-lookup
+    /// overhead between leaves. `step_node_wall_ns - phase1_ns - phase2_ns`
+    /// approximates the descent-and-intern cost — the unaccounted slice
+    /// the bead's szyh-baseline evidence (~94 ms at 256³) was about.
+    /// Recorded once per `step_recursive` call (not accumulated across
+    /// the recursion); per-step, not lifetime — matches phase1/phase2
+    /// shape so the `memo_summary` line gives a self-consistent
+    /// breakdown.
+    pub step_node_wall_ns: u64,
+    /// hash-thing-vqke Phase 0: wall-clock nanoseconds spent in
+    /// `maybe_compact()` after `step_node` completes. Most steps are
+    /// 0 (the 2× growth threshold gates compaction); the spikes show
+    /// up roughly every N steps where N depends on churn. Per-step.
+    pub compact_ns: u64,
+    /// hash-thing-bjdl (vqke.2): probe for hypothesis 3 (schedule-phase
+    /// explosion). At each cache miss in `step_node`, count the miss
+    /// as "phase-aliased" iff the same NodeId is already cached at a
+    /// *different* schedule_phase. Boolean-per-miss semantics: a
+    /// node aliased at three other phases counts once, not three
+    /// times. A high `cache_misses_phase_aliased / cache_misses`
+    /// ratio means the period is fragmenting reuse — content-folding
+    /// or a wider key would have hit.
+    ///
+    /// **Always 0 unless `HASH_THING_MEMO_DIAG=1`** is set in the
+    /// process environment at first-step time. Always-on cost was
+    /// estimated at single-digit ms/step at observed miss volumes
+    /// (per Claude + Codex plan review of this bead — vqke is trying
+    /// to speed step_recursive UP, not pay 5-10ms for a diagnostic).
+    /// Set the env var when you want to reproduce vqke.2's diagnostic
+    /// run and check the new memo_summary tokens.
+    ///
+    /// Macro path note: `step_node_macro` (`hashlife.rs:645` —
+    /// `step_recursive_pow2` path) shares `cache_misses` with the
+    /// micro path. On the 256³ default scene that path is not
+    /// exercised, so macro misses are 0 (`memo_mac=0` in
+    /// `memo_summary`) and the ratio is exact. If a future caller
+    /// uses the macro path, `cache_misses_phase_aliased / cache_misses`
+    /// becomes a lower-bound on the micro-path's true alias rate
+    /// (the macro path doesn't probe).
+    pub cache_misses_phase_aliased: u64,
+    /// hash-thing-bjdl (vqke.2): probe for hypothesis 2 (cache eviction
+    /// too aggressive). Counts hashlife_cache entries dropped during
+    /// `remap_caches` because their NodeId or result NodeId was not
+    /// present in the post-compaction reachability set. Most steps
+    /// are 0 because `maybe_compact` is gated on the 2× growth
+    /// threshold. A high `dropped/(dropped+kept)` ratio shows the
+    /// cache is fragmenting against the reachability sweep — not
+    /// necessarily a sweep bug, but evidence that cache lifetime is
+    /// shorter than the reuse horizon. A low ratio rules H2 out.
+    pub compact_entries_dropped: u64,
+    /// hash-thing-bjdl (vqke.2): paired with `compact_entries_dropped`.
+    /// Counts hashlife_cache entries that survived the most recent
+    /// `remap_caches`. Only the main hashlife_cache is counted (the
+    /// macro / inert / all-inert caches are tangential to the memo_hit
+    /// signal). Per-step.
+    pub compact_entries_kept: u64,
+    /// hash-thing-ecmn (vqke.4.1): unique BFS task count per level.
+    /// Index = level - 3. Populated only by `step_root_bfs`; zero on
+    /// Serial / RayonPerFanout strategies. Used to diagnose whether
+    /// the BFS dispatcher is actually batching meaningful work or
+    /// bottoming out on short-circuits.
+    pub bfs_tasks_by_level: [u64; 32],
+    /// hash-thing-ecmn: unique level-3 base-case misses queued for
+    /// the BFS rayon batch in this step. = bfs_tasks_by_level[0].
+    pub bfs_level3_unique_misses: u64,
+    /// hash-thing-ecmn: number of step_grid_once_pure invocations the
+    /// BFS path dispatched through rayon par_iter (batch size ≥
+    /// `RAYON_BATCH_THRESHOLD`). Per-step counter; usually 0 or 1
+    /// since whole-step BFS produces one large batch.
+    pub bfs_batches_parallel: u64,
+    /// hash-thing-ecmn: number of BFS level-3 batches that fell back
+    /// to serial iter because batch size was below the rayon
+    /// threshold. Tracks "BFS infrastructure ran but didn't actually
+    /// parallelise" — non-zero means the threshold may be too high or
+    /// the workload is short-circuit-dominated.
+    pub bfs_batches_serial_fallback: u64,
+    /// hash-thing-ecmn: largest level-3 batch size observed in this
+    /// step. = bfs_level3_unique_misses on the dominant path; useful
+    /// once a chunked-wavefront fallback is added.
+    pub bfs_max_batch_len: u64,
 }
 
 impl HashlifeStats {
@@ -319,10 +488,38 @@ impl HashlifeStats {
         self.fixed_point_skips += step.fixed_point_skips;
         self.phase1_ns += step.phase1_ns;
         self.phase2_ns += step.phase2_ns;
+        // hash-thing-vqke: lifetime accumulators for the per-step
+        // wall-clock decompositions. Useful for long-run averages
+        // (the per-step values fluctuate with churn / compact cadence).
+        self.step_node_wall_ns += step.step_node_wall_ns;
+        self.compact_ns += step.compact_ns;
+        // hash-thing-bjdl (vqke.2): lifetime accumulators for the
+        // memo-hit-rate diagnostic counters. Same per-step → lifetime
+        // shape as the wall-clock decompositions above so `memo_summary`
+        // can compute lifetime ratios (`memo_phase_alias` =
+        // `cache_misses_phase_alias / cache_misses`).
+        self.cache_misses_phase_aliased += step.cache_misses_phase_aliased;
+        self.compact_entries_dropped += step.compact_entries_dropped;
+        self.compact_entries_kept += step.compact_entries_kept;
+        // hash-thing-ecmn: BFS observability counters.
+        self.bfs_level3_unique_misses += step.bfs_level3_unique_misses;
+        self.bfs_batches_parallel += step.bfs_batches_parallel;
+        self.bfs_batches_serial_fallback += step.bfs_batches_serial_fallback;
+        // bfs_max_batch_len is per-step max, not a sum — accumulator
+        // takes the running max so lifetime stat reflects the largest
+        // batch ever observed.
+        self.bfs_max_batch_len = self.bfs_max_batch_len.max(step.bfs_max_batch_len);
         for (dst, src) in self
             .misses_by_level
             .iter_mut()
             .zip(step.misses_by_level.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .bfs_tasks_by_level
+            .iter_mut()
+            .zip(step.bfs_tasks_by_level.iter())
         {
             *dst += *src;
         }
@@ -442,11 +639,13 @@ impl World {
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
+            hashlife_slow_divisor_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
             clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
+            base_case_strategy: env_base_case_strategy(),
         }
     }
 
@@ -472,12 +671,38 @@ impl World {
             store_size_at_last_compact: 0,
             hashlife_inert_cache: FxHashMap::default(),
             hashlife_all_inert_cache: FxHashMap::default(),
+            hashlife_slow_divisor_cache: FxHashMap::default(),
             block_rule_present: None,
             queue: MutationQueue::new(),
             clone_sources: Vec::new(),
             origin: [0, 0, 0],
             last_compaction_remap: None,
+            base_case_strategy: BaseCaseStrategy::Serial,
         }
+    }
+
+    /// hash-thing-ecmn (vqke.4.1): set the base-case scheduling
+    /// strategy. Bit-exact flattened cell content across all
+    /// strategies — verified by `tests/base_case_rayon_parity.rs`.
+    pub fn set_base_case_strategy(&mut self, strategy: BaseCaseStrategy) {
+        self.base_case_strategy = strategy;
+    }
+
+    /// hash-thing-ecmn: read the active strategy.
+    pub fn base_case_strategy(&self) -> BaseCaseStrategy {
+        self.base_case_strategy
+    }
+
+    /// Legacy bool wrapper (hash-thing-ftuu). Maps `true` to
+    /// `BaseCaseStrategy::RayonPerFanout`, `false` to `Serial`. Kept
+    /// so existing tests / benches that toggle this knob keep
+    /// compiling. Prefer [`Self::set_base_case_strategy`] in new code.
+    pub fn set_base_case_use_rayon(&mut self, enabled: bool) {
+        self.base_case_strategy = if enabled {
+            BaseCaseStrategy::RayonPerFanout
+        } else {
+            BaseCaseStrategy::Serial
+        };
     }
 
     pub fn side(&self) -> usize {
@@ -514,6 +739,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         self.block_rule_present = None;
     }
 
@@ -1517,6 +1748,121 @@ impl World {
         self.block_rule_present = None;
     }
 
+    /// Seed a stone chamber with lava embedded in the floor and water
+    /// embedded in the ceiling. Cold-start scene for the demo build —
+    /// the molten palette + ceiling-water-meets-floor-lava motion reads
+    /// as "volcanic" rather than "voxel landscape," which the demo's
+    /// first-impression contract requires (hash-thing-4eo8).
+    ///
+    /// **Origin invariance:** unlike `seed_demo_spectacle` (which writes
+    /// via `WorldCoord` and asserts `origin == [0,0,0]` at world.rs:1671),
+    /// this seeder uses `set_local` exclusively, so it is correct under
+    /// any `self.origin`. No origin assert needed here.
+    ///
+    /// Geometry:
+    /// - Walls/floor/ceiling: 1-cell-thick stone slabs at `lo` / `hi-1`
+    ///   with `margin = side/16`.
+    /// - Floor lava: 3×3 patches dotted on a `side/8` grid at `floor_y
+    ///   = lo+1`. Coarse spacing keeps cell-write cost ~O(side²).
+    /// - Ceiling water: 2×2 patches dotted on the same grid offset by
+    ///   `step/2` at `ceiling_y = hi-2`. Drips fall between lava pools
+    ///   so water-meets-lava produces visible steam from frame 1.
+    /// - Player platform: 7×7 stone pad at `(center, center +
+    ///   2*CELLS_PER_METER_INT - 1, center)`. `App::reset_scene_entities`
+    ///   places the player at `world_center + 2*CELLS_PER_METER` cells
+    ///   up; `App::recenter_player` (main.rs:1339-1378) only scans UP
+    ///   from that pose for grounded clearance, so the platform must
+    ///   sit directly under `blind_pos.y` — exactly mirrors the
+    ///   `seed_demo_spectacle` convention (world.rs above).
+    pub fn seed_pyroclastic_chamber(&mut self) {
+        let side = self.side() as u64;
+        let margin = (side / 16).max(1);
+        let lo = margin;
+        let hi = side - margin;
+
+        // Walls: four vertical slabs spanning the full chamber height.
+        for y in lo..hi {
+            for q in lo..hi {
+                self.set_local(LocalCoord(lo), LocalCoord(y), LocalCoord(q), STONE);
+                self.set_local(LocalCoord(hi - 1), LocalCoord(y), LocalCoord(q), STONE);
+                self.set_local(LocalCoord(q), LocalCoord(y), LocalCoord(lo), STONE);
+                self.set_local(LocalCoord(q), LocalCoord(y), LocalCoord(hi - 1), STONE);
+            }
+        }
+
+        // Floor + ceiling slabs (overwrite the wall corners; harmless).
+        for z in lo..hi {
+            for x in lo..hi {
+                self.set_local(LocalCoord(x), LocalCoord(lo), LocalCoord(z), STONE);
+                self.set_local(LocalCoord(x), LocalCoord(hi - 1), LocalCoord(z), STONE);
+            }
+        }
+
+        let step = (side / 8).max(4);
+        let floor_y = lo + 1;
+        let ceiling_y = hi - 2;
+
+        // Lava patches dotted into the floor surface (one cell above
+        // the stone slab). 3×3 per source — visible from across chamber.
+        let mut z = lo + step / 2;
+        while z + 2 < hi - 1 {
+            let mut x = lo + step / 2;
+            while x + 2 < hi - 1 {
+                for dz in 0..3 {
+                    for dx in 0..3 {
+                        self.set_local(
+                            LocalCoord(x + dx),
+                            LocalCoord(floor_y),
+                            LocalCoord(z + dz),
+                            LAVA,
+                        );
+                    }
+                }
+                x += step;
+            }
+            z += step;
+        }
+
+        // Water patches dotted into the ceiling surface (one cell
+        // below the stone slab), offset by `step/2` so drips land
+        // between lava pools and produce steam plumes on contact.
+        let mut z = lo + step;
+        while z + 1 < hi - 1 {
+            let mut x = lo + step;
+            while x + 1 < hi - 1 {
+                for dz in 0..2 {
+                    for dx in 0..2 {
+                        self.set_local(
+                            LocalCoord(x + dx),
+                            LocalCoord(ceiling_y),
+                            LocalCoord(z + dz),
+                            WATER,
+                        );
+                    }
+                }
+                x += step;
+            }
+            z += step;
+        }
+
+        // Player platform — see doc comment above for the Y-coord
+        // rationale (`recenter_player` upward-only scan contract).
+        let center = side / 2;
+        let platform_y = center + 2 * CELLS_PER_METER_INT as u64 - 1;
+        let pad: u64 = 3;
+        let plat_lo_x = center.saturating_sub(pad);
+        let plat_hi_x = (center + pad).min(hi - 1);
+        let plat_lo_z = center.saturating_sub(pad);
+        let plat_hi_z = (center + pad).min(hi - 1);
+        if platform_y < hi - 1 {
+            for z in plat_lo_z..=plat_hi_z {
+                for x in plat_lo_x..=plat_hi_x {
+                    self.set_local(LocalCoord(x), LocalCoord(platform_y), LocalCoord(z), STONE);
+                }
+            }
+        }
+    }
+
     /// Add water and sand to an existing terrain — water pools on a
     /// hilltop (so it cascades down) and sand dunes on one side.
     /// Call after `seed_terrain`.
@@ -1574,6 +1920,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         self.clone_sources.clear();
         let terrain_params = TerrainParams::for_level(self.level);
         let terrain = PrecomputedHeightmapField::new(terrain_params.to_heightmap(), self.level)
@@ -1607,6 +1959,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         self.clone_sources.clear();
         let field = GyroidField::for_world(self.level, 42);
         let (root, stats) = gen_region(&mut self.store, &field, [0, 0, 0], self.level);
@@ -2213,7 +2571,17 @@ impl World {
     ///
     /// Format: `memo_hit=<fraction> memo_churn=<signed-fraction>
     /// memo_tbl=<int> memo_mac=<int> memo_mac_bytes=<int>
-    /// p1=<ms>ms p2=<ms>ms`.
+    /// p1=<ms>ms p2=<ms>ms p3=<ms>ms p4=<ms>ms`.
+    ///
+    /// `p3` (hash-thing-vqke Phase 0) is the descent-and-intern overhead:
+    /// `step_node_wall_ns - phase1_ns - phase2_ns`. It captures the
+    /// recursive memo lookup, hash-cons interning, and intermediate-node
+    /// allocation cost between leaf evaluations.
+    ///
+    /// `p4` is `compact_ns` — the wall-clock spent in `maybe_compact()`
+    /// after `step_node`. Most steps are 0 (the 2× growth gate); compact
+    /// spikes are the cost spread across N steps where N depends on
+    /// churn.
     ///
     /// `memo_churn` is `window_hit_rate − lifetime_hit_rate` over the last
     /// `MemoWindow::CAPACITY` steps. Positive = recent steps cache better
@@ -2239,15 +2607,102 @@ impl World {
         let last_step = &self.hashlife_stats;
         let p1_ms = last_step.phase1_ns as f64 / 1_000_000.0;
         let p2_ms = last_step.phase2_ns as f64 / 1_000_000.0;
+        // hash-thing-vqke Phase 0: descent-and-intern overhead is
+        // step_node wall minus the per-cell + per-block leaf wall.
+        // saturating_sub keeps the number sane on the rare frame
+        // where leaf timers overlap with descent timers slightly
+        // (e.g. inner-loop measurement quantization).
+        let descent_ns = last_step
+            .step_node_wall_ns
+            .saturating_sub(last_step.phase1_ns)
+            .saturating_sub(last_step.phase2_ns);
+        let p3_ms = descent_ns as f64 / 1_000_000.0;
+        let p4_ms = last_step.compact_ns as f64 / 1_000_000.0;
+        // hash-thing-bjdl (vqke.2): diagnostic ratios for the
+        // memo_hit-rate hypotheses. Bounded-width ratio tokens (each
+        // ≤ 25 chars) so the HUD-overlay split test stays green even
+        // when the underlying counts are in the millions.
+        let memo_period = self.materials.memo_period();
+        let phase_aliased = if stats.cache_misses == 0 {
+            0.0
+        } else {
+            stats.cache_misses_phase_aliased as f64 / stats.cache_misses as f64
+        };
+        let compact_total = stats.compact_entries_kept + stats.compact_entries_dropped;
+        let compact_drop = if compact_total == 0 {
+            0.0
+        } else {
+            stats.compact_entries_dropped as f64 / compact_total as f64
+        };
+        // hash-thing-tk4j (vqke.3): expose the rates at which step_node's
+        // pre-cache fast paths fire. Denominator is total step_node calls
+        // (skips + cache_hits + cache_misses), so the three rates plus
+        // memo_hit_rate-relative shares partition leaf traffic. Used to
+        // diagnose whether the 47ms p1 cost on mostly-stable scenes is
+        // because skip detection is weak (low skip rate → CaRule runs on
+        // cells that should be recognised as stable) or because the
+        // remaining unskipped fraction is genuinely changing.
+        let total_calls =
+            stats.cache_hits + stats.cache_misses + stats.empty_skips + stats.fixed_point_skips;
+        let skip_empty_rate = if total_calls == 0 {
+            0.0
+        } else {
+            stats.empty_skips as f64 / total_calls as f64
+        };
+        let skip_fixed_rate = if total_calls == 0 {
+            0.0
+        } else {
+            stats.fixed_point_skips as f64 / total_calls as f64
+        };
+        // hash-thing-ecmn: BFS observability tokens. Per-step values
+        // come from the most-recent-step `hashlife_stats`, not the
+        // lifetime accumulator, so they reflect the active step's BFS
+        // shape. `bfs_l3=0 bfs_par=0` on Serial / RayonPerFanout
+        // strategies — those paths never set the counters.
+        let bfs_l3 = last_step.bfs_level3_unique_misses;
+        let bfs_par = last_step.bfs_batches_parallel;
+        let bfs_serial_fb = last_step.bfs_batches_serial_fallback;
+        let bfs_max = last_step.bfs_max_batch_len;
+        // hash-thing-aqq4 verdict: surface the work-elision factor as a
+        // primary line so future field readings give the real signal
+        // directly (instead of being confused by memo_hit, which only
+        // counts cache_hits/(hits+misses) and ignores empty/inert
+        // short-circuits + the multiplicative effect of upper-level
+        // hits eliding many base cases).
+        //
+        // elision = (level-3 nodes in the world) / max(L3 misses last step, 1)
+        //         = (side / 8)^3 / L3_misses
+        // A naive every-cell stepper would do (side/8)^3 base-case
+        // evaluations per step. Hashlife does only L3_misses. The ratio
+        // is the multiplier hashlife is buying us. >>1 means the engine
+        // is paying off; ~1 means it's degenerating to brute force.
+        // Floor on `max(_, 1)` so a fully-cached step (L3 misses = 0)
+        // doesn't divide by zero — that's the perfect-hit case where
+        // the elision factor is effectively unbounded.
+        let l3_nodes_in_world = (1u64 << (3 * self.level)).saturating_div(512);
+        let l3_misses_last = last_step.misses_by_level[0].max(1);
+        let elision_factor = l3_nodes_in_world as f64 / l3_misses_last as f64;
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_tbl={} memo_mac={} memo_mac_bytes={} p1={:.2}ms p2={:.2}ms",
+            "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
             hit_rate,
             churn,
+            elision_factor,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
             self.macro_cache_bytes_est(),
+            memo_period,
+            phase_aliased,
+            compact_drop,
+            skip_empty_rate,
+            skip_fixed_rate,
             p1_ms,
             p2_ms,
+            p3_ms,
+            p4_ms,
+            bfs_l3,
+            bfs_par,
+            bfs_serial_fb,
+            bfs_max,
         )
     }
 
@@ -2418,6 +2873,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
     }
 
     /// Replace the world with terrain generated from `params`. Uses
@@ -2440,6 +2901,12 @@ impl World {
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
+        // hash-thing-5ie4 (vqke.2.1): the slow-divisor predicate
+        // depends on the material registry's tick_divisor flags;
+        // any mutation that changes a divisor flips the answer. Same
+        // dxi4.2 invalidation-surface bug class as the other inert
+        // caches. Per Claude + Codex plan-review on 5ie4.
+        self.hashlife_slow_divisor_cache.clear();
         // New epoch: the renderer's cache holds entries keyed in the previous
         // epoch's NodeId namespace, which is meaningless against a brand-new
         // NodeStore. Publishing an *empty* remap drives `Svdag::apply_remap`
@@ -3361,6 +3828,101 @@ mod tests {
         assert!(
             grid.contains(&0),
             "gyroid must leave air voids to walk through"
+        );
+    }
+
+    /// hash-thing-4eo8: cold-start scene for the demo build. Lock in the
+    /// volcanic palette (must contain stone/lava/water; must NOT contain
+    /// dirt/grass/sand — those are the Minecraft-disqualifier cells the
+    /// bead acceptance forbids) AND the geometric contract that lava
+    /// sits at `floor_y` and water at `ceiling_y`. Geometry locking
+    /// catches the case where a future refactor accidentally swaps lava
+    /// to the ceiling, etc. — palette membership alone wouldn't.
+    #[test]
+    fn seed_pyroclastic_chamber_palette_is_volcanic_not_earthy() {
+        let mut w = World::new(6); // side 64
+        w.seed_pyroclastic_chamber();
+        assert!(w.population() > 0, "chamber must have stone/lava/water cells");
+        let grid = w.flatten();
+        assert!(grid.contains(&STONE), "chamber walls/floor/ceiling must be stone");
+        assert!(grid.contains(&LAVA), "chamber floor must have embedded lava");
+        assert!(grid.contains(&WATER), "chamber ceiling must have embedded water");
+        assert!(
+            !grid.contains(&DIRT),
+            "pyroclastic chamber must not contain DIRT (Minecraft-palette disqualifier)"
+        );
+        assert!(
+            !grid.contains(&GRASS),
+            "pyroclastic chamber must not contain GRASS (Minecraft-palette disqualifier)"
+        );
+        assert!(
+            !grid.contains(&SAND),
+            "pyroclastic chamber must not contain SAND (Minecraft-palette disqualifier)"
+        );
+
+        // Geometric contract: lava lives at floor_y, water lives at ceiling_y.
+        // Mirrors the in-fn margins (margin = side/16, floor_y = lo+1, ceiling_y = hi-2).
+        let side = w.side() as u64;
+        let margin = (side / 16).max(1);
+        let lo = margin;
+        let hi = side - margin;
+        let floor_y = (lo + 1) as i64;
+        let ceiling_y = (hi - 2) as i64;
+        let lava_count_at_floor = (lo as i64..hi as i64)
+            .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
+            .filter(|(x, z)| {
+                w.get(WorldCoord(*x), WorldCoord(floor_y), WorldCoord(*z)) == LAVA
+            })
+            .count();
+        let water_count_at_ceiling = (lo as i64..hi as i64)
+            .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
+            .filter(|(x, z)| {
+                w.get(WorldCoord(*x), WorldCoord(ceiling_y), WorldCoord(*z)) == WATER
+            })
+            .count();
+        assert!(
+            lava_count_at_floor > 0,
+            "lava must sit at floor_y={floor_y}, not just somewhere in the volume"
+        );
+        assert!(
+            water_count_at_ceiling > 0,
+            "water must sit at ceiling_y={ceiling_y}, not just somewhere in the volume"
+        );
+    }
+
+    /// hash-thing-4eo8: `App::recenter_player` (main.rs:1339-1378) only
+    /// scans UPWARD from `world_center + 2 * CELLS_PER_METER` for a
+    /// grounded clearance. The chamber's player platform must therefore
+    /// sit directly under that blind pose so `is_grounded(blind_pos)`
+    /// finds support on iteration 1 — this test locks that contract in
+    /// place against a future refactor that moves the platform.
+    #[test]
+    fn seed_pyroclastic_chamber_provides_grounded_spawn_at_blind_pose() {
+        let mut w = World::new(6); // side 64
+        w.seed_pyroclastic_chamber();
+
+        let center_cell = (w.side() as i64) / 2;
+        let platform_y = center_cell + 2 * CELLS_PER_METER_INT as i64 - 1;
+
+        // Platform stone must be present right under the blind pose.
+        assert_eq!(
+            w.get(
+                WorldCoord(center_cell),
+                WorldCoord(platform_y),
+                WorldCoord(center_cell)
+            ),
+            STONE,
+            "platform support cell at ({center_cell},{platform_y},{center_cell}) must be stone — recenter_player needs is_grounded to succeed at blind_pos"
+        );
+        // The cell at blind_pos itself must be air (player body fits).
+        assert_eq!(
+            w.get(
+                WorldCoord(center_cell),
+                WorldCoord(platform_y + 1),
+                WorldCoord(center_cell)
+            ),
+            AIR,
+            "blind_pos cell must be air so player_collides returns false"
         );
     }
 
@@ -5933,6 +6495,79 @@ mod tests {
     // hash-thing-stue.6: spatial-memo telemetry.
     // ---------------------------------------------------------------------
 
+    // hash-thing-ecmn (vqke.4.1) review-pass: pin the env-string ->
+    // BaseCaseStrategy parser so a future tweak doesn't silently change
+    // operator-visible behavior. Drives `parse_base_case_strategy` with
+    // injected Option<String> values rather than touching process env
+    // (which would race with the parallel test runner).
+
+    #[test]
+    fn parse_base_case_strategy_default_when_unset() {
+        // hash-thing-ite4 (2026-04-29): default flipped to RayonBfs
+        // after 5e3e churn bench showed BFS is 1.5× faster than
+        // per-fanout under churn AND 2× faster on warm static.
+        assert_eq!(
+            super::parse_base_case_strategy(None, None),
+            BaseCaseStrategy::RayonBfs
+        );
+    }
+
+    #[test]
+    fn parse_base_case_strategy_explicit_strategy_overrides_rayon_legacy() {
+        // Explicit STRATEGY beats legacy RAYON shim regardless of value.
+        assert_eq!(
+            super::parse_base_case_strategy(Some("bfs".into()), Some("1".into())),
+            BaseCaseStrategy::RayonBfs
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(Some("serial".into()), Some("1".into())),
+            BaseCaseStrategy::Serial
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(Some("per-fanout".into()), Some("0".into())),
+            BaseCaseStrategy::RayonPerFanout
+        );
+        // `rayon` is an accepted alias for per-fanout (ftuu wording).
+        assert_eq!(
+            super::parse_base_case_strategy(Some("rayon".into()), None),
+            BaseCaseStrategy::RayonPerFanout
+        );
+    }
+
+    #[test]
+    fn parse_base_case_strategy_legacy_rayon_shim() {
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("1".into())),
+            BaseCaseStrategy::RayonPerFanout
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("0".into())),
+            BaseCaseStrategy::Serial
+        );
+        // Unrecognised legacy value falls through to default — silent
+        // by design (legacy shim, documented as "1 to enable"). The
+        // fall-through value is BaseCaseStrategy::default() and tracks
+        // whatever the project's active default is — currently
+        // RayonBfs (hash-thing-ite4, 2026-04-29).
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("yes".into())),
+            BaseCaseStrategy::default()
+        );
+        assert_eq!(
+            super::parse_base_case_strategy(None, Some("".into())),
+            BaseCaseStrategy::default()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "HASH_THING_BASE_CASE_STRATEGY must be one of")]
+    fn parse_base_case_strategy_invalid_explicit_panics() {
+        // Operator-visible misconfig: hard panic with usage message,
+        // not silent fallback. (Adversarial-Codex-Dependencies plan
+        // review feedback — operators should get loud signal.)
+        let _ = super::parse_base_case_strategy(Some("turbo".into()), None);
+    }
+
     #[test]
     fn hashlife_stats_accumulate_sums_fields_and_levels_per_index() {
         let mut total = HashlifeStats::default();
@@ -5946,6 +6581,21 @@ mod tests {
         a.misses_by_level[0] = 1;
         a.misses_by_level[3] = 13;
         a.misses_by_level[7] = 17;
+        // hash-thing-bjdl (vqke.2): exercise the new accumulators
+        // alongside the existing scalar fields, so a future refactor
+        // that drops one of these from `accumulate` is caught.
+        a.cache_misses_phase_aliased = 2;
+        a.compact_entries_kept = 100;
+        a.compact_entries_dropped = 25;
+        // hash-thing-ecmn (vqke.4.1): exercise the BFS accumulators
+        // alongside the older fields. Sum-shape for most counters; max
+        // for `bfs_max_batch_len`.
+        a.bfs_level3_unique_misses = 50;
+        a.bfs_batches_parallel = 1;
+        a.bfs_batches_serial_fallback = 0;
+        a.bfs_max_batch_len = 50;
+        a.bfs_tasks_by_level[0] = 50;
+        a.bfs_tasks_by_level[2] = 9;
 
         b.cache_hits = 2;
         b.cache_misses = 4;
@@ -5954,6 +6604,15 @@ mod tests {
         b.misses_by_level[0] = 10;
         b.misses_by_level[3] = 100;
         b.misses_by_level[7] = 1000;
+        b.cache_misses_phase_aliased = 1;
+        b.compact_entries_kept = 50;
+        b.compact_entries_dropped = 0;
+        b.bfs_level3_unique_misses = 200;
+        b.bfs_batches_parallel = 1;
+        b.bfs_batches_serial_fallback = 1;
+        b.bfs_max_batch_len = 200; // larger; should win the running max
+        b.bfs_tasks_by_level[0] = 200;
+        b.bfs_tasks_by_level[2] = 17;
 
         total.accumulate(&a);
         total.accumulate(&b);
@@ -5965,11 +6624,28 @@ mod tests {
         assert_eq!(total.misses_by_level[0], 11);
         assert_eq!(total.misses_by_level[3], 113);
         assert_eq!(total.misses_by_level[7], 1017);
+        assert_eq!(total.cache_misses_phase_aliased, 3);
+        assert_eq!(total.compact_entries_kept, 150);
+        assert_eq!(total.compact_entries_dropped, 25);
+        // hash-thing-ecmn: BFS counters.
+        assert_eq!(total.bfs_level3_unique_misses, 250);
+        assert_eq!(total.bfs_batches_parallel, 2);
+        assert_eq!(total.bfs_batches_serial_fallback, 1);
+        // bfs_max_batch_len is a running MAX, not a sum: the larger of
+        // the two wins.
+        assert_eq!(total.bfs_max_batch_len, 200);
+        assert_eq!(total.bfs_tasks_by_level[0], 250);
+        assert_eq!(total.bfs_tasks_by_level[2], 26);
         // Untouched indices must remain zero — catches the "summed into
         // index 0" copy-paste bug.
         for (i, &v) in total.misses_by_level.iter().enumerate() {
             if !matches!(i, 0 | 3 | 7) {
                 assert_eq!(v, 0, "misses_by_level[{i}] bled from another index");
+            }
+        }
+        for (i, &v) in total.bfs_tasks_by_level.iter().enumerate() {
+            if !matches!(i, 0 | 2) {
+                assert_eq!(v, 0, "bfs_tasks_by_level[{i}] bled from another index");
             }
         }
     }
@@ -6067,8 +6743,13 @@ mod tests {
         );
         for line in &lines {
             assert!(
-                line.starts_with("memo_") || line.starts_with("p1=") || line.starts_with("p2="),
-                "field must use an approved HUD prefix (memo_ / p1 / p2), got {line:?}",
+                line.starts_with("memo_")
+                    || line.starts_with("p1=")
+                    || line.starts_with("p2=")
+                    || line.starts_with("p3=")
+                    || line.starts_with("p4=")
+                    || line.starts_with("bfs_"),
+                "field must use an approved HUD prefix (memo_ / p1 / p2 / p3 / p4 / bfs_), got {line:?}",
             );
             assert!(
                 line.len() <= 25,
@@ -6076,6 +6757,34 @@ mod tests {
                 line.len(),
             );
         }
+
+        // hash-thing-bjdl (vqke.2): the three new tokens must be
+        // present in the formatted line. Per Codex code-review §3:
+        // lock the bounded summary tokens into the output-contract
+        // tests so a future refactor that drops them is caught.
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_period=")),
+            "memo_summary must include memo_period= token, got {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_phase_aliased=")),
+            "memo_summary must include memo_phase_aliased= token, got {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_compact_drop=")),
+            "memo_summary must include memo_compact_drop= token, got {lines:?}",
+        );
+        // hash-thing-tk4j (vqke.3): the two skip-rate tokens must be
+        // present so the HUD overlay reflects whether step_node's
+        // pre-cache fast paths are firing on mostly-stable scenes.
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_skip_empty=")),
+            "memo_summary must include memo_skip_empty= token, got {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|f| f.starts_with("memo_skip_fixed=")),
+            "memo_summary must include memo_skip_fixed= token, got {lines:?}",
+        );
     }
 
     #[test]
@@ -6130,6 +6839,63 @@ mod tests {
             stats.phase2_ns > 0,
             "phase2_ns should accumulate across step_grid_once calls, got 0",
         );
+    }
+
+    #[test]
+    fn step_recursive_records_step_node_wall_and_compact_ns() {
+        // hash-thing-vqke Phase 0: step_node_wall_ns must be non-zero
+        // (always taken, every step). compact_ns is 0 on a fresh tiny
+        // world (the 2× growth gate hasn't tripped) — so we only assert
+        // it stays well-defined (saturating arithmetic, no panic) and
+        // that step_node_wall_ns >= phase1_ns + phase2_ns (descent
+        // always at least sees the leaves).
+        //
+        // hash-thing-ecmn (vqke.4.1) review-pass: pin the strategy to
+        // Serial. Under RayonPerFanout / RayonBfs, `phase1_ns` and
+        // `phase2_ns` sum across worker threads (per
+        // step_grid_once_pure return values) and can EXCEED the
+        // single-thread wall-clock `step_node_wall_ns`. The
+        // wall-vs-CPU-time invariant only holds for the serial path —
+        // gemini standard code review caught the mismatch when the
+        // default strategy flipped to RayonPerFanout.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+
+        let stats = &world.hashlife_stats;
+        assert!(
+            stats.step_node_wall_ns > 0,
+            "step_node_wall_ns should be set on every step, got 0",
+        );
+        // p1+p2 happen INSIDE step_node, so step_node_wall must be >= their sum.
+        // (Inequality is non-strict because the timers nest precisely.)
+        assert!(
+            stats.step_node_wall_ns >= stats.phase1_ns + stats.phase2_ns,
+            "step_node_wall_ns ({}) should be >= phase1_ns ({}) + phase2_ns ({})",
+            stats.step_node_wall_ns,
+            stats.phase1_ns,
+            stats.phase2_ns,
+        );
+        // compact_ns stays 0 unless the 2× growth gate fired — fine
+        // here, just confirm the field exists and didn't panic.
+        let _ = stats.compact_ns;
+    }
+
+    #[test]
+    fn memo_summary_includes_p3_and_p4_phase_breakdown() {
+        // hash-thing-vqke Phase 0: the perf summary must include p3
+        // (descent overhead) and p4 (compact wall) so the szyh-baseline
+        // unaccounted-94ms slice gets a phase-by-phase breakdown.
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.step_recursive();
+
+        let summary = world.memo_summary();
+        assert!(summary.contains("p3="), "missing p3 in summary: {summary}");
+        assert!(summary.contains("p4="), "missing p4 in summary: {summary}");
+        // The HUD-overlay tester (memo_summary_splits_cleanly_for_hud_overlay)
+        // independently asserts the field-prefix whitelist + width caps.
     }
 
     #[test]

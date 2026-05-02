@@ -18,6 +18,8 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 
 **Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper forces `bd` to use the repo-root shared `.beads` database/server from any worktree, preserves `BEADS_ACTOR` while hopping to main, and adds preflight checks on `bd close` so issues are only closed after the relevant commit is on `origin/main`.
 
+**Use `.bin/codex` instead of bare `codex` for any background invocation.** The wrapper emits a hang-warning preamble at the call site so the standard `~60s silence → TaskStop` mitigation is impossible to miss. See `hash-thing-27j9`.
+
 Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` under "Gate Tiers." Default sensitivity applies here; amend the line below if the bar should move project-wide.
 
 ```
@@ -36,6 +38,19 @@ Mac integrated GPU works — wgpu/Metal renders fine. Agents can launch the app,
 Default to dev. **Use `--profile perf` for perf work — not `--release`.** `perf` inherits release's `opt-level = 3` but drops LTO and keeps `debug = 1`, so it builds fast on iteration and stays representative for *relative* perf comparisons (which is all we measure). `--release` is reserved for distributable artifacts only. If you catch yourself typing `cargo build --release` while measuring latency, stop and switch to `--profile perf` — otherwise you wait on LTO for no measurement benefit.
 
 **Why `perf` not `bench`:** built-in `[profile.bench]` shares `target/release/` with release (cargo#6988, won't-fix), so it clobbers the demo binary. Custom `[profile.perf]` writes to `target/perf/`. Detail: hash-thing-xer4.
+
+## Build cache
+
+Each worktree has its own `target/` (no per-target-dir lock contention across concurrent crew builds — settled in `hash-thing-3sw`, 2026-04-12, after empirical observation of 10 cargo processes blocking on the lock under shared-target). `sccache` is the rustc-wrapper that shares **compiled artifacts** at the object-cache level across worktrees, so rebuilds stay fast even though target dirs are separate.
+
+**`incremental = false` (added in `hash-thing-a5mv`, 2026-04-30):** sccache silently no-ops on incremental rustc invocations, so pre-a5mv builds had zero cache hits even with the wrapper wired. Killing incremental costs a little first-edit rebuild latency (whole crate must re-codegen on a 1-line change) but unlocks sccache hit rates ≥ 80% on cold builds, and removes the ~2.4 GiB `target/debug/incremental/` per worktree (the single biggest disk hog).
+
+**Operational rules:**
+
+- **Bump the sccache cap** to `30G`: `export SCCACHE_CACHE_SIZE=30G` in your shell rc, then `sccache --stop-server` (it autorestarts on next call). Default 10 GiB is too small for the multi-crew working set.
+- **Don't run plain `cargo clean`** in a worktree expecting it to free disk fast — it just nukes that one worktree's target. The shared dep cost is in `~/Library/Caches/Mozilla.sccache` (sccache's storage). For real disk recovery, `rm -rf <worktree>/target` for idle worktrees.
+- **CI override:** `RUSTC_WRAPPER=""` in CI env block to skip sccache when the build is sandboxed and won't benefit.
+- **Reap stale worktree targets** (hash-thing-kqw0). Closed-bead worktrees keep their `target/` until reaped — that's where the project's actual disk pressure comes from, not active build cost. Run `scripts/reap-worktrees.sh` (dry-run by default) to see the action plan, then `--apply` to actually delete. The reaper only touches `target/` for worktrees whose seat-branch resolves to a CLOSED bead; codex pool, `worktree-*` cruft, and active builds are skipped. Wire it into a launchd plist with the absolute path for a daily cadence.
 
 ## Agent surface — where project skills and commands live
 
@@ -162,6 +177,41 @@ Mayor should sweep for drift-parked beads during any invocation. Workers may unp
 **Agent-initiated edits** to project `CLAUDE.md` or `~/.claude/CLAUDE.md` are queued, not direct-committed and not gated on edward. File a bead labeled `claude-md-edit`, status `blocked`, with the proposed diff + a one-line rationale in the description. Also spawn a mayor background session via `Agent(subagent_type=general-purpose, prompt="act as mayor — process claude-md-edit queue")` so the queue doesn't stall. Continue other work; do not wait.
 
 **Human-initiated edits** (edward says "change CLAUDE.md, do X") are direct — any agent executes without queueing.
+
+## Sweep tiebreak — navigation epic wins ties, not priority bumps
+
+When picking from `bd ready` during sweep, **at the SAME priority** prefer
+descendants of `hash-thing-8ppq` (autonomous game-direction navigation
+epic) over unrelated work. **Never override an explicit higher priority.**
+
+Specifically:
+- Two P1s, one is an `8ppq` descendant: pick the descendant.
+- A P0 unrelated bead vs a P1 `8ppq` descendant: pick the P0.
+- A P0 `8ppq` descendant vs a P0 unrelated bead: prefer the descendant if
+  both have the same urgency profile; pick the unrelated one if it's a
+  jump-the-queue (mayor/edward-filed) P0 or production-blocking breakage.
+
+Rationale: per project policy "P0 is reserved for mayor/edward — moving
+a bead to P0 is a deliberate jump-the-queue signal." The v1 nav-epic
+filing tried to override this with "P1 child beats unrelated P0," which
+adversarial code review caught as a one-way door demoting legitimate P0s
+(non-build-breaking perf regressions, mayor cleanups, etc.). v2 narrows
+to "tiebreak only at equal priority" so the sweep still naturally pulls
+toward the navigation epic without silently overriding the priority
+system.
+
+When in doubt at sweep time: respect explicit priority first; prefer
+8ppq descendants only when priorities tie.
+
+## Perf claims cite regime coordinates
+
+Every perf number quoted in a comment/bead/message gets a coordinate
+prefix from `docs/perf/regimes.md`: `world · scene · intensity · regime`.
+
+Example: "At `demo·default-demo·cascade·churning`, step p95 = 67 ms."
+
+Unknown coordinate → say "regime unmeasured" instead of skipping. A
+number without coordinates is cherry-picked; reviewers should push back.
 
 ## Commit cadence
 

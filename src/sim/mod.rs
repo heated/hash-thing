@@ -13,5 +13,6 @@ pub use entity::{
 pub use mutation::{MutationQueue, WorldMutation};
 pub use rule::GameOfLife3D;
 pub use world::{
-    CollisionSnapshot, DemoLayout, HashlifeStats, LocalCoord, RealizedRegion, World, WorldCoord,
+    BaseCaseStrategy, CollisionSnapshot, DemoLayout, HashlifeStats, LocalCoord, RealizedRegion,
+    World, WorldCoord,
 };

@@ -7,13 +7,50 @@ use hash_thing::terrain;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::thread::JoinHandle;
+
+/// hash-thing-imvg (vqke.1): timing data the sim thread returns alongside
+/// the World so the main thread can attribute the non-Hashlife portion of
+/// the `step` perf metric to the right wrapper phase.
+///
+/// `sim_finished_at` is captured immediately before the thread closure
+/// returns. The main thread compares against `Instant::now()` at the
+/// moment it ingests the sim result (via `apply_step_result`) to measure
+/// the polling lag — i.e. the wall-clock between the sim thread actually
+/// finishing and the main loop noticing.
+#[derive(Debug)]
+struct SimThreadTimings {
+    apply_mutations_ns: u64,
+    spawn_clones_ns: u64,
+    step_recursive_ns: u64,
+    sim_finished_at: std::time::Instant,
+}
+
+/// hash-thing-dbv3 (vqke.1.1): user-event payload used to wake the main
+/// loop the moment the sim worker finishes. Replaces the previous
+/// once-per-RedrawRequested `JoinHandle::is_finished` poll. The payload
+/// rides on the user-event itself (no separate channel) — winit's
+/// `EventLoopProxy::send_event(T)` already moves `T` cross-thread, and
+/// inlining the payload eliminates the channel-vs-event ordering race
+/// the multi-step design would have exposed.
+///
+/// No `Debug` derive: `sim::World` doesn't implement `Debug`, and
+/// `EventLoopProxy::send_event` only requires `T: Send + 'static`.
+enum AppUserEvent {
+    /// The sim worker finished. The payload is `Ok((world, timings))` on
+    /// a clean step or `Err(panic_msg)` if the worker's
+    /// `catch_unwind`-wrapped body panicked. The receiving handler
+    /// (`App::user_event`) clears `step_pending`, restores `self.world`,
+    /// records the wrapper / poll-lag perf samples, and calls
+    /// `request_redraw()` so the next frame uses the fresh world.
+    SimDone(Result<(sim::World, SimThreadTimings), String>),
+}
+
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
-    event_loop::EventLoop,
+    event_loop::{EventLoop, EventLoopProxy},
     keyboard::KeyCode,
     window::{CursorGrabMode, Window, WindowAttributes},
 };
@@ -540,6 +577,13 @@ struct App {
     jump_was_held: bool,
     /// Pause redraw-driven rendering when the window loses focus.
     focused: bool,
+    /// hash-thing-qny5: when `HASH_THING_PERF_CAPTURE=1`, keep rendering
+    /// even when the window is unfocused. Long-form perf captures (e.g.
+    /// szyh / 9k4w-style 120s steady-state runs) can then proceed without
+    /// stealing focus from the user. Cached at startup; the env var is
+    /// read once. The `occluded` short-circuit is unaffected — a hidden
+    /// surface still pauses (8jp), since there's no point rendering it.
+    render_when_unfocused: bool,
     /// Camera mode: orbit (debug) or first-person (gameplay).
     camera_mode: CameraMode,
     /// The player entity, if spawned.
@@ -594,18 +638,48 @@ struct App {
     /// existing `App::new(N)` test callers default this to `None`).
     /// Threaded through to `Renderer::new`.
     target_pixels_override: Option<u64>,
+    /// hash-thing-kh9l: focus the window on launch. Set in `main()` from
+    /// `--demo` (kh9l) or `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults
+    /// to `false` so the 40+ test callers stay in the no-focus regime.
+    /// Mirrored into the macOS event_loop_builder's
+    /// `with_activate_ignoring_other_apps` flag so both gates fire from
+    /// the same input.
+    want_focus_on_launch: bool,
     /// hash-thing-hc0g: when `Some(path)`, render exactly one frame to
     /// off-surface, write a PNG to `path`, then exit. The window stays
     /// hidden so there is no foreground-window contamination. Set from
     /// `main()` after construction; default `None` for the 40+ existing
     /// `App::new(N)` test callers.
     dump_frame_path: Option<std::path::PathBuf>,
-    /// Background sim step thread (x5w). While `Some`, `self.world` is a
-    /// tiny placeholder — all world reads must use `render_origin` /
+    /// hash-thing-j1mg: when `Some(scene)` (only valid alongside
+    /// `dump_frame_path`), dispatch the matching `PendingSceneSwap` in
+    /// `resumed()` so the captured frame shows that scene at its default
+    /// pose instead of the App-default terrain. `None` keeps the previous
+    /// hc0g default-terrain behavior unchanged.
+    dump_scene: Option<DumpScene>,
+    /// Background sim step liveness flag (x5w). While `true`, `self.world`
+    /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
-    step_handle: Option<JoinHandle<Result<sim::World, String>>>,
+    ///
+    /// hash-thing-dbv3 (vqke.1.1): replaces the previous
+    /// `Option<JoinHandle<...>>` shape. The result no longer travels via
+    /// the `JoinHandle`; it's delivered directly as the
+    /// `AppUserEvent::SimDone` payload. `step_pending` is the single
+    /// liveness signal: set to `true` when `maybe_start_background_step`
+    /// kicks the worker, cleared in `apply_step_result` when the user
+    /// event arrives. The detached worker thread cleans itself up.
+    step_pending: bool,
     /// When the background step was spawned, for perf timing.
     step_start: std::time::Instant,
+    /// hash-thing-dbv3 (vqke.1.1): proxy used by the sim worker thread
+    /// to wake the main loop the moment the step finishes
+    /// (`proxy.send_event(AppUserEvent::SimDone(_))`). `None` until
+    /// `main()` assigns `app.event_proxy = Some(event_loop.create_proxy())`
+    /// after the EventLoop builds and before `event_loop.run_app(&mut app)`.
+    /// `App::new()` test callers leave it `None` and the worker silently
+    /// no-ops the wake call (the worker still runs to completion; tests
+    /// that need the result should bypass the kick-off path).
+    event_proxy: Option<EventLoopProxy<AppUserEvent>>,
     /// Cached world origin for rendering during background step.
     render_origin: [i64; 3],
     /// Cached 1/side for coordinate normalization during background step.
@@ -728,6 +802,38 @@ fn smooth_fps(prev: f64, instant: f64, alpha: f64) -> f64 {
     }
 }
 
+/// Render-scale presets the +/- keys snap between (hash-thing-sezr).
+/// Sorted ascending. Edward 2026-04-29: floor raised from 0.125 to
+/// 0.25 (12.5% looked unusably blurry on the demo target display, and
+/// the macOS-compositor bilinear-upscale issue at very low scales is a
+/// separate bug — xqva). Added 0.35 step between 0.25 and 0.5: at
+/// 256³ the M2 perf cliff sits between those two scales (25% pegs at
+/// 60 FPS, 50% drops to ~17 FPS), so an intermediate snap matters.
+/// Renderer's hard clamp at 0.125 still applies for env-var overrides
+/// — only the in-game +/- key ladder uses these presets.
+const RENDER_SCALE_PRESETS: &[f32] = &[0.25, 0.35, 0.5, 0.75, 1.0];
+
+/// Next preset strictly greater than `current`; saturates at the top.
+/// Off-grid values snap to the next preset above (e.g. 0.629 → 0.75).
+fn next_render_scale_up(current: f32) -> f32 {
+    RENDER_SCALE_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or_else(|| *RENDER_SCALE_PRESETS.last().unwrap())
+}
+
+/// Next preset strictly less than `current`; saturates at the floor.
+/// Off-grid values snap to the next preset below (e.g. 0.629 → 0.5).
+fn next_render_scale_down(current: f32) -> f32 {
+    RENDER_SCALE_PRESETS
+        .iter()
+        .copied()
+        .rev()
+        .find(|&p| p < current)
+        .unwrap_or_else(|| *RENDER_SCALE_PRESETS.first().unwrap())
+}
+
 /// Split the per-frame elapsed time into `(dt_wall, dt_clamped)`.
 ///
 /// The clamped value keeps xa7 player movement bounded under a hiccup
@@ -823,6 +929,8 @@ impl App {
             keys_held: HashSet::new(),
             jump_was_held: false,
             focused: true,
+            render_when_unfocused: std::env::var("HASH_THING_PERF_CAPTURE").ok().as_deref()
+                == Some("1"),
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
@@ -840,9 +948,12 @@ impl App {
             entities: sim::EntityStore::new(),
             volume_size,
             target_pixels_override: None,
+            want_focus_on_launch: false,
             dump_frame_path: None,
-            step_handle: None,
+            dump_scene: None,
+            step_pending: false,
             step_start: std::time::Instant::now(),
+            event_proxy: None,
             render_origin,
             render_inv_size,
             warned_dev_profile_perf: false,
@@ -885,6 +996,11 @@ impl App {
         };
         if app.freeze_sim {
             log::info!("HASH_THING_FREEZE_SIM=1: sim step disabled (stue.7 diagnostic)");
+        }
+        if app.render_when_unfocused {
+            log::info!(
+                "HASH_THING_PERF_CAPTURE=1: rendering will continue while window is unfocused (qny5)"
+            );
         }
         if let Some(qos) = app.sim_qos {
             log::info!(
@@ -1169,16 +1285,18 @@ impl App {
         }
     }
 
+    /// hash-thing-4eo8: cold-start scene for the demo build is the
+    /// Pyroclastic chamber — stone box, lava embedded in the floor,
+    /// water embedded in the ceiling. The molten palette + visible
+    /// motion (water drips → steam on lava + volcano emitters) reads
+    /// as "volcanic / sim-rich" rather than "voxel landscape" on
+    /// first impression. The terrain heightmap scene is still
+    /// reachable via the `r` scene-swap key (PendingSceneSwap::ResetTerrain).
     fn load_initial_scene(&mut self) {
-        let terrain_params = terrain::TerrainParams::for_level(self.volume_size.trailing_zeros());
-        let stats = self
-            .world
-            .seed_terrain(&terrain_params)
-            .expect("level-derived terrain params must validate");
-        self.world.seed_water_and_sand();
-        self.noise_ns_per_sample = terrain::probe_sample_ns(&terrain_params.to_heightmap(), 10_000);
+        self.world.seed_pyroclastic_chamber();
+        self.noise_ns_per_sample = 0.0;
         self.reset_scene_entities();
-        self.spawn_demo_entities();
+        self.spawn_pyroclastic_entities();
         self.paused = false;
         self.reset_scene_perf_state();
         if let Some(renderer) = &mut self.renderer {
@@ -1200,10 +1318,9 @@ impl App {
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
         log::info!(
-            "Initial scene: terrain pop={} nodes={} gen={}µs",
+            "Initial scene (pyroclastic): pop={} nodes={}",
             self.world.population(),
             self.world.store.stats(),
-            stats.gen_region_us,
         );
         log::debug!(
             "Material registry palette slots={}",
@@ -1332,6 +1449,54 @@ impl App {
         log::info!("Spawned environmental demo entities: geyser, volcano, whirlpool, critters");
     }
 
+    /// hash-thing-4eo8: emitters tuned for the pyroclastic chamber
+    /// (cold-start demo scene). Volcano emitters dot the chamber floor
+    /// for orange/red bursts; two geysers add water-plume contrast that
+    /// flashes to steam on contact with lava. No critters (vine-green
+    /// fights the molten palette — acceptance forbids the green-on-dirt
+    /// Minecraft cue) and no whirlpool (no water surface for the orbit
+    /// to read against in this scene).
+    fn spawn_pyroclastic_entities(&mut self) {
+        let center = self.world_center();
+        // Place emitters one cell above the lava floor layer so their
+        // bursts come UP from the floor. The chamber is seeded with
+        // origin=[0,0,0] (fresh `World::new`), so world Y == local Y;
+        // floor stone is at `(side/16).max(1)` and lava at `+1`, so
+        // emitters at `+2` sit in air just above the lava surface.
+        let side = self.world.side() as f64;
+        let floor_local_y = (side / 16.0).max(1.0) + 1.0;
+        let emitter_y = self.world.origin[1] as f64 + floor_local_y + 1.0;
+        for (dx, dz) in [
+            (-12.0, -8.0),
+            (10.0, -10.0),
+            (0.0, 0.0),
+            (-8.0, 12.0),
+            (12.0, 8.0),
+        ] {
+            self.entities.add(
+                [
+                    center[0] + dx * CELLS_PER_METER,
+                    emitter_y,
+                    center[2] + dz * CELLS_PER_METER,
+                ],
+                [0.0; 3],
+                sim::EntityKind::Emitter(sim::EmitterState::volcano()),
+            );
+        }
+        for (dx, dz) in [(-14.0, 6.0), (14.0, -6.0)] {
+            self.entities.add(
+                [
+                    center[0] + dx * CELLS_PER_METER,
+                    emitter_y,
+                    center[2] + dz * CELLS_PER_METER,
+                ],
+                [0.0; 3],
+                sim::EntityKind::Emitter(sim::EmitterState::geyser()),
+            );
+        }
+        log::info!("Spawned pyroclastic entities: 5 volcanoes, 2 geysers");
+    }
+
     fn renderer_camera_world_pos(&self, renderer: &render::Renderer) -> [f64; 3] {
         let target = [
             self.render_origin[0] as f64
@@ -1381,7 +1546,7 @@ impl App {
 
     /// True while the sim step is running on a background thread.
     fn is_stepping(&self) -> bool {
-        self.step_handle.is_some()
+        self.step_pending
     }
 
     fn maybe_start_background_step(&mut self) {
@@ -1395,10 +1560,10 @@ impl App {
         // (hash-thing-0s9v). Timed so we can validate the clone-cost
         // estimate against live sweeps.
         //
-        // Ordering invariant: the snapshot MUST be set before `step_handle`
-        // becomes `Some(...)`. `is_stepping()` ⟺ `step_handle.is_some()`, and
-        // grounded movement unwraps `collision_snapshot` via `expect` when
-        // stepping; inverting these lines would expose that expect.
+        // Ordering invariant: the snapshot MUST be set before `step_pending`
+        // becomes `true`. `is_stepping()` ⟺ `step_pending`, and grounded
+        // movement unwraps `collision_snapshot` via `expect` when stepping;
+        // inverting these lines would expose that expect.
         {
             let _t = self.perf.start("collision_snapshot_refresh");
             self.collision_snapshot = Some(self.world.collision_snapshot());
@@ -1407,15 +1572,58 @@ impl App {
         // consumed the live snapshot for movement, interaction, and render.
         let mut world = std::mem::replace(&mut self.world, sim::World::placeholder());
         let sim_qos = self.sim_qos;
-        self.step_handle = Some(std::thread::spawn(move || {
-            if let Some(qos) = sim_qos {
-                thread_qos::apply(qos);
-            }
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // hash-thing-dbv3 (vqke.1.1): clone the wake handles into the
+        // worker. The worker uses `proxy.send_event` to deliver the
+        // payload + wake the main loop (low-lag path); it ALSO calls
+        // `window.request_redraw` as a defense-in-depth wake (covers
+        // paths where user-event dispatch is delayed behind a queued
+        // WindowEvent). Either may be `None` in the test path
+        // (`App::new` callers without an EventLoop / Window): the worker
+        // silently no-ops the missing wake side and the result is
+        // dropped on worker exit — tests that need the result should
+        // not rely on the kick-off path.
+        let proxy = self.event_proxy.clone();
+        let window = self.window.clone();
+        self.step_pending = true;
+        std::thread::spawn(move || {
+            // Wrap the ENTIRE worker body in `catch_unwind`, including
+            // `thread_qos::apply` — a panic before the sim work starts
+            // (e.g. invalid QoS class on an OS that rejected it) must
+            // still produce an `Err(...)` payload so the main loop's
+            // `step_pending` flag can clear. Without the broader catch,
+            // a pre-sim panic would strand the flag and freeze the sim
+            // (every subsequent `maybe_start_background_step` call
+            // would early-return on `is_stepping()`). Codex
+            // standard-review feedback (notes/PR-dbv3-Codex-Standard-*).
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(qos) = sim_qos {
+                    thread_qos::apply(qos);
+                }
+                // hash-thing-imvg (vqke.1): bracket each wrapper phase
+                // separately. Phase 0 evidence showed step ≈ 140 ms with
+                // step_recursive ≈ 73 ms — leaving ~67 ms in this
+                // wrapper. Splitting it three ways (apply_mutations,
+                // spawn_clones, step_recursive itself) tells us which
+                // is the dominant carrier.
+                let t_apply = std::time::Instant::now();
                 world.apply_mutations();
+                let apply_mutations_ns = t_apply.elapsed().as_nanos() as u64;
+
+                let t_spawn = std::time::Instant::now();
                 world.spawn_clones();
+                let spawn_clones_ns = t_spawn.elapsed().as_nanos() as u64;
+
+                let t_step = std::time::Instant::now();
                 world.step_recursive();
-                world
+                let step_recursive_ns = t_step.elapsed().as_nanos() as u64;
+
+                let timings = SimThreadTimings {
+                    apply_mutations_ns,
+                    spawn_clones_ns,
+                    step_recursive_ns,
+                    sim_finished_at: std::time::Instant::now(),
+                };
+                (world, timings)
             }))
             .map_err(|e| {
                 if let Some(s) = e.downcast_ref::<&str>() {
@@ -1425,8 +1633,134 @@ impl App {
                 } else {
                     "unknown panic".to_string()
                 }
-            })
-        }));
+            });
+
+            // Wake the main loop. send_event returns Err(EventLoopClosed)
+            // if the loop already exited (process shutting down) — drop
+            // it; nothing useful to do. request_redraw is fire-and-forget.
+            if let Some(p) = proxy {
+                let _ = p.send_event(AppUserEvent::SimDone(payload));
+            }
+            if let Some(w) = window {
+                w.request_redraw();
+            }
+        });
+    }
+
+    /// hash-thing-dbv3 (vqke.1.1): ingest the sim worker's result. Called
+    /// from `fn user_event(SimDone(payload))` the moment winit dispatches
+    /// the wake event — which is "as soon as the current event handler
+    /// returns" on the main thread. Replaces the previous once-per-
+    /// RedrawRequested `step_handle.is_finished()` poll path.
+    ///
+    /// Restores `self.world`, records the wrapper / poll-lag perf
+    /// samples, refreshes the collision snapshot from the post-step
+    /// world, runs the entity update, syncs the render cache, and
+    /// uploads the new SVDAG.
+    ///
+    /// `detect_at` is `Instant::now()` captured by the caller at the
+    /// moment of dispatch, so `step_poll_lag` measures wake-dispatch
+    /// latency rather than ingest-block-internal time.
+    fn apply_step_result(
+        &mut self,
+        payload: Result<(sim::World, SimThreadTimings), String>,
+        detect_at: std::time::Instant,
+    ) {
+        if !self.step_pending {
+            // Stale event — already ingested, or never kicked. Defensive;
+            // shouldn't happen with single-event delivery and a 1-bit
+            // pending flag, but a no-op keeps double-deliveries safe.
+            return;
+        }
+        self.step_pending = false;
+
+        let step_elapsed = self.step_start.elapsed();
+        self.perf.record("step", step_elapsed);
+        if !self.warned_dev_profile_perf
+            && should_warn_about_slow_dev_step(
+                cfg!(debug_assertions),
+                self.volume_size,
+                step_elapsed,
+            )
+        {
+            log::warn!(
+                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile perf -- {}` for interactive playtesting.",
+                step_elapsed.as_secs_f64() * 1000.0,
+                self.volume_size,
+                self.volume_size,
+            );
+            self.warned_dev_profile_perf = true;
+        }
+
+        match payload {
+            Ok((world, sim_timings)) => {
+                self.world = world;
+                // hash-thing-imvg (vqke.1): record the wrapper-and-polling
+                // breakdown into perf so the periodic summary line shows
+                // apply / spawn / step_recursive / poll-lag separately.
+                // Together they should sum to approximately `step` (modulo
+                // timer granularity).
+                self.perf.record(
+                    "step_apply_mut",
+                    std::time::Duration::from_nanos(sim_timings.apply_mutations_ns),
+                );
+                self.perf.record(
+                    "step_spawn_clones",
+                    std::time::Duration::from_nanos(sim_timings.spawn_clones_ns),
+                );
+                self.perf.record(
+                    "step_recursive",
+                    std::time::Duration::from_nanos(sim_timings.step_recursive_ns),
+                );
+                let poll_lag = detect_at.saturating_duration_since(sim_timings.sim_finished_at);
+                self.perf.record("step_poll_lag", poll_lag);
+                // Refresh the collision snapshot from the just-returned
+                // world so the next frame's player physics reads
+                // post-step geometry (hash-thing-0s9v). Same clone-cost
+                // surface as the step-start refresh; timed under the same
+                // metric so sweeps see both samples.
+                {
+                    let _t = self.perf.start("collision_snapshot_refresh");
+                    self.collision_snapshot = Some(self.world.collision_snapshot());
+                }
+                // Refresh cached memo-health summary while the real world
+                // is in hand (hash-thing-stue.6): the (stepping) log
+                // branch below cannot read self.world (it's about to be
+                // replaced by a placeholder again on the next step).
+                self.last_memo_summary = self.world.memo_summary();
+                self.memo_hud_dirty = true;
+                // Entity update on main thread (needs both &World and
+                // &mut EntityStore).
+                let mut queue = std::mem::take(&mut self.world.queue);
+                self.entities.update(&self.world, &mut queue);
+                self.world.queue = queue;
+                self.sync_render_cache();
+                // SVDAG rebuild + GPU upload.
+                {
+                    let player_pos = self.player_world_pos();
+                    let _t = self.perf.start("upload_cpu");
+                    Self::upload_volume(
+                        &mut self.renderer,
+                        &mut self.world,
+                        &mut self.svdag,
+                        &mut self.last_svdag_stats,
+                        LodUploadCtx {
+                            policy: &mut self.lod_policy,
+                            player_pos,
+                            last_histogram: &mut self.last_lod_histogram,
+                            last_growth_ratio: &mut self.last_lod_growth_ratio,
+                        },
+                    );
+                }
+            }
+            Err(msg) => {
+                // Step panicked — log and pause sim. The placeholder
+                // world stays in place; render continues with the stale
+                // SVDAG (4lp).
+                log::error!("Sim step panicked: {msg}");
+                self.paused = true;
+            }
+        }
     }
 
     fn run_pending_player_action(&mut self) {
@@ -2254,7 +2588,31 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppUserEvent> for App {
+    /// hash-thing-dbv3 (vqke.1.1): wake-up hook for the sim worker. The
+    /// worker calls `proxy.send_event(AppUserEvent::SimDone(payload))`
+    /// the moment its `catch_unwind`-wrapped body finishes. winit
+    /// dispatches the event on the main thread the moment the current
+    /// event handler returns — well before the next RedrawRequested
+    /// would have fired. `apply_step_result` does the world swap +
+    /// upload; `request_redraw` schedules a render so the next frame
+    /// shows the fresh world.
+    fn user_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        event: AppUserEvent,
+    ) {
+        match event {
+            AppUserEvent::SimDone(payload) => {
+                let detect_at = std::time::Instant::now();
+                self.apply_step_result(payload, detect_at);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.window.is_none() {
             let dump_frame = self.dump_frame_path.is_some();
@@ -2272,12 +2630,17 @@ impl ApplicationHandler for App {
             );
             // Do NOT focus-on-launch by default (edward 2026-04-21): the
             // game stealing focus mid-dev-loop blocks keyboard input to the
-            // terminal/agent surface. Opt in with HASH_THING_FOCUS=1.
-            // hash-thing-hc0g: dump-frame mode never focuses (window is
-            // hidden anyway).
+            // terminal/agent surface. Opt in with `HASH_THING_FOCUS=1` (sgcv)
+            // or `--demo` (kh9l). Both feed `App::want_focus_on_launch` via
+            // `main()`. The macOS event_loop_builder's
+            // `with_activate_ignoring_other_apps` is set from the same
+            // signal, so both gates fire together.
+            // hash-thing-hc0g: dump-frame mode skips both visibility and
+            // focus — the window stays hidden so there is no foreground
+            // contamination.
             if !dump_frame {
                 window.set_visible(true);
-                if std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1") {
+                if self.want_focus_on_launch {
                     window.focus_window();
                 }
             }
@@ -2299,6 +2662,21 @@ impl ApplicationHandler for App {
                 renderer.enable_off_surface();
             }
             self.renderer = Some(renderer);
+            // hash-thing-j1mg: in dump-frame mode, optionally swap scenes
+            // before the first render so the captured frame shows e.g. the
+            // lattice intro beat instead of the App-default terrain. The
+            // scene loader runs synchronously here (we're not stepping yet)
+            // and uploads its own world to the renderer.
+            //
+            // We must also clear `startup_scene_pending` — otherwise the
+            // first RedrawRequested calls `load_initial_scene` which
+            // re-seeds terrain on top of the lattice/spectacle/etc. world
+            // we just loaded.
+            if let Some(scene) = self.dump_scene {
+                log::info!("--dump-scene: dispatching {} before first frame", scene.label());
+                self.dispatch_scene_swap(scene.to_swap());
+                self.startup_scene_pending = false;
+            }
             // Initial upload — untimed; we haven't started the render
             // loop yet and there's no perf summary to feed.
             let player_pos = self.player_world_pos();
@@ -2663,7 +3041,7 @@ impl ApplicationHandler for App {
                             if let Some(renderer) = &mut self.renderer {
                                 let w = self.window.as_ref().unwrap();
                                 let size = w.inner_size();
-                                renderer.render_scale = (renderer.render_scale + 0.25).min(1.0);
+                                renderer.render_scale = next_render_scale_up(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
@@ -2673,7 +3051,7 @@ impl ApplicationHandler for App {
                             if let Some(renderer) = &mut self.renderer {
                                 let w = self.window.as_ref().unwrap();
                                 let size = w.inner_size();
-                                renderer.render_scale = (renderer.render_scale - 0.25).max(0.25);
+                                renderer.render_scale = next_render_scale_down(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
@@ -2794,7 +3172,9 @@ impl ApplicationHandler for App {
                 // (which already defaults true, but defense-in-depth: also
                 // skip the `occluded` short-circuit so an Occluded surface
                 // never strands a one-shot dump).
-                if self.dump_frame_path.is_none() && (self.occluded || !self.focused) {
+                if self.dump_frame_path.is_none()
+                    && (self.occluded || (!self.focused && !self.render_when_unfocused))
+                {
                     return;
                 }
 
@@ -2851,81 +3231,16 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // --- Background step: collect completed result (x5w) ---
-                if let Some(ref handle) = self.step_handle {
-                    if handle.is_finished() {
-                        let handle = self.step_handle.take().unwrap();
-                        let step_elapsed = self.step_start.elapsed();
-                        self.perf.record("step", step_elapsed);
-                        if !self.warned_dev_profile_perf
-                            && should_warn_about_slow_dev_step(
-                                cfg!(debug_assertions),
-                                self.volume_size,
-                                step_elapsed,
-                            )
-                        {
-                            log::warn!(
-                                "Sim step took {:.1}ms at {}^3 in a debug build; use `cargo run --profile perf -- {}` for interactive playtesting.",
-                                step_elapsed.as_secs_f64() * 1000.0,
-                                self.volume_size,
-                                self.volume_size,
-                            );
-                            self.warned_dev_profile_perf = true;
-                        }
-                        match handle.join().expect("step thread aborted") {
-                            Ok(world) => {
-                                self.world = world;
-                                // Refresh the collision snapshot from the
-                                // just-returned world so the next frame's
-                                // player physics reads post-step geometry
-                                // (hash-thing-0s9v). Same clone-cost surface
-                                // as the step-start refresh; timed under the
-                                // same metric so sweeps see both samples.
-                                {
-                                    let _t = self.perf.start("collision_snapshot_refresh");
-                                    self.collision_snapshot = Some(self.world.collision_snapshot());
-                                }
-                                // Refresh cached memo-health summary while the
-                                // real world is in hand (hash-thing-stue.6):
-                                // the (stepping) log branch below cannot read
-                                // self.world (it's about to be replaced by a
-                                // placeholder again on the next step).
-                                self.last_memo_summary = self.world.memo_summary();
-                                self.memo_hud_dirty = true;
-                                // Entity update on main thread (needs both
-                                // &World and &mut EntityStore).
-                                let mut queue = std::mem::take(&mut self.world.queue);
-                                self.entities.update(&self.world, &mut queue);
-                                self.world.queue = queue;
-                                self.sync_render_cache();
-                                // SVDAG rebuild + GPU upload.
-                                {
-                                    let player_pos = self.player_world_pos();
-                                    let _t = self.perf.start("upload_cpu");
-                                    Self::upload_volume(
-                                        &mut self.renderer,
-                                        &mut self.world,
-                                        &mut self.svdag,
-                                        &mut self.last_svdag_stats,
-                                        LodUploadCtx {
-                                            policy: &mut self.lod_policy,
-                                            player_pos,
-                                            last_histogram: &mut self.last_lod_histogram,
-                                            last_growth_ratio: &mut self.last_lod_growth_ratio,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(msg) => {
-                                // Step panicked — log and pause sim. The
-                                // placeholder world stays in place; render
-                                // continues with the stale SVDAG (4lp).
-                                log::error!("Sim step panicked: {msg}");
-                                self.paused = true;
-                            }
-                        }
-                    }
-                }
+                // hash-thing-dbv3 (vqke.1.1): the once-per-RedrawRequested
+                // `step_handle.is_finished()` poll moved out of this arm.
+                // The sim worker now wakes the main loop directly via
+                // `AppUserEvent::SimDone` (see fn user_event below); that
+                // path runs `apply_step_result` the moment winit
+                // dispatches the event — typically before the next
+                // RedrawRequested fires. This arm proceeds with whatever
+                // world state was in place at the start of the frame
+                // (real post-ingest world, or sim::World::placeholder
+                // while a step is mid-flight, gated by `is_stepping()`).
 
                 if !self.is_stepping() {
                     // a9jd: drain a queued scene swap FIRST. If one is set and
@@ -3403,14 +3718,76 @@ fn write_dump_frame_png(
     Ok(())
 }
 
+/// hash-thing-j1mg: which scene to dispatch via `PendingSceneSwap` before
+/// the dump-frame render. `None` keeps the default (terrain heightmap, the
+/// scene `App::new` seeds). Each variant maps 1:1 to a scene-loader the user
+/// would otherwise reach by pressing a key (R/G/B/M/N + U/I/O lattice jumps).
+///
+/// The `LatticeBeat` variants reseed the lattice demo and then jump the
+/// camera to the matching beat pose — same semantics as the `U`/`I`/`O`
+/// debug-jump keys in orbit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpScene {
+    Terrain,
+    GolSmoke,
+    Spectacle,
+    Gyroid,
+    LatticeBeat(LatticeDemoBeat),
+}
+
+impl DumpScene {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "terrain" => Some(Self::Terrain),
+            "gol" => Some(Self::GolSmoke),
+            "spectacle" => Some(Self::Spectacle),
+            "gyroid" => Some(Self::Gyroid),
+            "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
+            "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
+            "lattice-panorama" => Some(Self::LatticeBeat(LatticeDemoBeat::Panorama)),
+            _ => None,
+        }
+    }
+
+    fn to_swap(self) -> PendingSceneSwap {
+        match self {
+            Self::Terrain => PendingSceneSwap::ResetTerrain,
+            Self::GolSmoke => PendingSceneSwap::ResetGolSmoke,
+            Self::Spectacle => PendingSceneSwap::LoadDemoSpectacle,
+            Self::Gyroid => PendingSceneSwap::LoadGyroid,
+            Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terrain => "terrain",
+            Self::GolSmoke => "gol",
+            Self::Spectacle => "spectacle",
+            Self::Gyroid => "gyroid",
+            Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
+            Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
+            Self::LatticeBeat(LatticeDemoBeat::Panorama) => "lattice-panorama",
+        }
+    }
+}
+
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
-/// caller's destructure (hash-thing-hc0g added `dump_frame`).
+/// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
+/// `demo`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedArgs {
     volume_size: u32,
     target_pixels: Option<u64>,
+    /// hash-thing-kh9l: `--demo` was passed (independent of target_pixels,
+    /// since `--res 1080p` produces the same pixel budget). Drives
+    /// window focus-on-launch in main().
+    demo: bool,
     /// `--dump-frame PATH`: render one frame to PNG at `PATH`, then exit.
     dump_frame: Option<std::path::PathBuf>,
+    /// `--dump-scene KIND`: hash-thing-j1mg, only meaningful with
+    /// `--dump-frame`. Selects which scene to dispatch before the dump.
+    dump_scene: Option<DumpScene>,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -3431,12 +3808,14 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    const USAGE: &str =
-        "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] [--dump-frame PATH]";
+    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
+                         [--dump-frame PATH] \
+                         [--dump-scene terrain|gol|spectacle|gyroid|lattice-intro|lattice-interior|lattice-panorama]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
     let mut dump_frame: Option<std::path::PathBuf> = None;
+    let mut dump_scene: Option<DumpScene> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -3477,6 +3856,21 @@ where
                 }
                 dump_frame = Some(std::path::PathBuf::from(v_str));
             }
+            "--dump-scene" => {
+                if dump_scene.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-scene");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene requires a KIND"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-scene requires a KIND; saw '{v_str}'");
+                }
+                let parsed = DumpScene::parse(v_str)
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene KIND: unrecognised '{v_str}'"));
+                dump_scene = Some(parsed);
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -3495,6 +3889,9 @@ where
     if demo && res_target.is_some() {
         panic!("{USAGE}\n--demo and --res are mutually exclusive");
     }
+    if dump_scene.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-scene requires --dump-frame");
+    }
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
@@ -3503,7 +3900,9 @@ where
     ParsedArgs {
         volume_size: volume_size.unwrap_or(DEFAULT_VOLUME_SIZE),
         target_pixels,
+        demo,
         dump_frame,
+        dump_scene,
     }
 }
 
@@ -3541,10 +3940,13 @@ fn main() {
     log::info!("  ;/' : decrease/increase chunk-LOD bias by 0.25 (clamped 0.25..4.0)");
     log::info!("  Esc: quit");
 
-    let parsed = parse_args_from(std::env::args().skip(1));
-    let volume_size = parsed.volume_size;
-    let target_pixels_override = parsed.target_pixels;
-    let dump_frame_path = parsed.dump_frame;
+    let ParsedArgs {
+        volume_size,
+        target_pixels: target_pixels_override,
+        demo,
+        dump_frame: dump_frame_path,
+        dump_scene,
+    } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
         volume_size.trailing_zeros()
@@ -3558,25 +3960,43 @@ fn main() {
             path.display()
         );
     }
+    if let Some(scene) = dump_scene {
+        log::info!("--dump-scene: {} (will dispatch before dump-frame render)", scene.label());
+    }
 
-    let mut event_loop_builder = EventLoop::builder();
+    // Single source of truth for focus-on-launch. Two downstream sites
+    // both consume this: the macOS event-loop builder (must be set BEFORE
+    // event_loop.build()) and `App.want_focus_on_launch` (consumed at
+    // window-creation time after winit resumes the app). hash-thing-kh9l
+    // routes `--demo` into this gate so the wrapper-less invocation
+    // `cargo run -- --demo` activates the window the same way that
+    // `HASH_THING_FOCUS=1 cargo run` does today.
+    let want_focus_on_launch =
+        demo || std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
+
+    // hash-thing-dbv3 (vqke.1.1): use `EventLoop::<AppUserEvent>::with_user_event()`
+    // so the sim worker can wake the main loop via
+    // `EventLoopProxy::send_event(AppUserEvent::SimDone(...))`. The proxy
+    // is cloned into each spawned worker by `maybe_start_background_step`.
+    let mut event_loop_builder = EventLoop::<AppUserEvent>::with_user_event();
     #[cfg(target_os = "macos")]
     {
         // Make launch behavior explicit instead of depending on bundle/agent defaults.
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
-        // hash-thing-sgcv: gate the activate-ignoring-other-apps flag
-        // behind the same HASH_THING_FOCUS=1 env var that gates
-        // window.focus_window() at src/main.rs:1985. winit's default
-        // for this flag is `true` (PlatformSpecificEventLoopAttributes
-        // in winit/platform_impl/macos/event_loop.rs), so we MUST set
-        // it explicitly in both branches — omitting the setter would
+        // hash-thing-sgcv + kh9l: gate the activate-ignoring-other-apps
+        // flag behind the same `want_focus_on_launch` derived above
+        // (HASH_THING_FOCUS=1 env or `--demo` flag). Mirrors the
+        // window.focus_window() gate around src/main.rs:2277. winit's
+        // default for this flag is `true`
+        // (PlatformSpecificEventLoopAttributes in
+        // winit/platform_impl/macos/event_loop.rs), so we MUST set it
+        // explicitly in both branches — omitting the setter would
         // silently inherit the focus-stealing default and the gate
         // would be a no-op. Default is to NOT steal focus, so the
         // agent surface keeps keyboard input.
         // ActivationPolicy::Regular stays unconditional — it controls
         // dock/Cmd-Tab presence, not activation.
-        let want_focus = std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
-        event_loop_builder.with_activate_ignoring_other_apps(want_focus);
+        event_loop_builder.with_activate_ignoring_other_apps(want_focus_on_launch);
     }
     let event_loop = event_loop_builder
         .build()
@@ -3584,7 +4004,20 @@ fn main() {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
     app.target_pixels_override = target_pixels_override;
+    app.want_focus_on_launch = want_focus_on_launch;
     app.dump_frame_path = dump_frame_path;
+    app.dump_scene = dump_scene;
+    // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
+    // worker (spawned later by `maybe_start_background_step`) can wake
+    // the main loop. Cloning the proxy into the worker is the correct
+    // pattern — `EventLoopProxy<T>: Send + Clone` for any `T: Send`
+    // is what this code relies on (the worker moves a clone in and
+    // calls `send_event` on it). The macOS impl additionally declares
+    // `Sync` (winit-0.30.13/src/platform_impl/macos/event_loop.rs:467),
+    // but the Windows impl only declares `Send` (event_loop.rs:820);
+    // we don't share references across threads, so `Send + Clone` is
+    // the portable surface this depends on.
+    app.event_proxy = Some(event_loop.create_proxy());
     event_loop
         .run_app(&mut app)
         .expect("event loop terminated with error");
@@ -3602,6 +4035,58 @@ mod tests {
         // Negative prev (shouldn't occur in practice) hits the same
         // sentinel branch rather than producing a nonsense blend.
         assert_eq!(smooth_fps(-1.0, 20.0, 0.1), 20.0);
+    }
+
+    // --- hash-thing-sezr: render-scale preset snap ---
+
+    #[test]
+    fn render_scale_up_steps_through_presets() {
+        // Below-floor values still snap to the lowest preset (0.25)
+        // even though the +/- ladder no longer includes 0.125 directly.
+        assert_eq!(next_render_scale_up(0.125), 0.25);
+        assert_eq!(next_render_scale_up(0.25), 0.35);
+        assert_eq!(next_render_scale_up(0.35), 0.5);
+        assert_eq!(next_render_scale_up(0.5), 0.75);
+        assert_eq!(next_render_scale_up(0.75), 1.0);
+    }
+
+    #[test]
+    fn render_scale_up_saturates_at_ceiling() {
+        assert_eq!(next_render_scale_up(1.0), 1.0);
+        assert_eq!(next_render_scale_up(2.0), 1.0);
+    }
+
+    #[test]
+    fn render_scale_down_steps_through_presets() {
+        assert_eq!(next_render_scale_down(1.0), 0.75);
+        assert_eq!(next_render_scale_down(0.75), 0.5);
+        assert_eq!(next_render_scale_down(0.5), 0.35);
+        assert_eq!(next_render_scale_down(0.35), 0.25);
+        // Floor is 0.25 — saturates there, no longer drops to 0.125.
+        assert_eq!(next_render_scale_down(0.25), 0.25);
+        // Below-floor values still snap to the lowest preset (0.25).
+        assert_eq!(next_render_scale_down(0.20), 0.25);
+    }
+
+    #[test]
+    fn render_scale_down_saturates_at_floor() {
+        // Floor is now 0.25 (was 0.125 pre-edward-2026-04-29).
+        assert_eq!(next_render_scale_down(0.25), 0.25);
+        assert_eq!(next_render_scale_down(0.0), 0.25);
+    }
+
+    #[test]
+    fn render_scale_off_grid_snaps_to_next_preset_in_direction() {
+        // 0.629 from --demo at 720p, or env override 0.6
+        assert_eq!(next_render_scale_up(0.629), 0.75);
+        assert_eq!(next_render_scale_down(0.629), 0.5);
+        // Just above the new floor → next up is 0.25 (since 0.25 > 0.20),
+        // next down snaps to 0.25 (the lowest preset).
+        assert_eq!(next_render_scale_up(0.2), 0.25);
+        assert_eq!(next_render_scale_down(0.2), 0.25);
+        // Around the new 0.35 step.
+        assert_eq!(next_render_scale_up(0.30), 0.35);
+        assert_eq!(next_render_scale_down(0.40), 0.35);
     }
 
     // --- hash-thing-06so: --demo / --res CLI flag parsing ---
@@ -3651,6 +4136,7 @@ mod tests {
         let r = parse_args_from(["256"]);
         assert_eq!(r.volume_size, 256);
         assert_eq!(r.target_pixels, None);
+        assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
     }
 
@@ -3659,6 +4145,7 @@ mod tests {
         let r = parse_args_from(std::iter::empty::<&str>());
         assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
         assert_eq!(r.target_pixels, None);
+        assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
     }
 
@@ -3667,6 +4154,7 @@ mod tests {
         let r = parse_args_from(["--demo"]);
         assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(r.demo, "kh9l: --demo must surface as demo=true");
     }
 
     #[test]
@@ -3674,7 +4162,9 @@ mod tests {
         let r1 = parse_args_from(["--demo", "256"]);
         let r2 = parse_args_from(["256", "--demo"]);
         assert_eq!((r1.volume_size, r1.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r1.demo);
         assert_eq!((r2.volume_size, r2.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r2.demo);
     }
 
     #[test]
@@ -3682,6 +4172,10 @@ mod tests {
         let r = parse_args_from(["--res", "1440p", "512"]);
         assert_eq!(r.volume_size, 512);
         assert_eq!(r.target_pixels, Some(2560 * 1440));
+        assert!(
+            !r.demo,
+            "kh9l: --res 1440p is NOT --demo, even with same pixel budget"
+        );
     }
 
     #[test]
@@ -3689,6 +4183,20 @@ mod tests {
         let r = parse_args_from(["--res", "1920x1080"]);
         assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(
+            !r.demo,
+            "kh9l: --res 1920x1080 has same target as --demo but demo=false"
+        );
+    }
+
+    #[test]
+    fn parse_args_from_res_1080p_is_not_demo() {
+        // kh9l regression guard: --res 1080p produces the same target
+        // pixel budget as --demo, but `demo` is false. This bit drives
+        // focus-on-launch and must not fire for --res 1080p.
+        let r = parse_args_from(["--res", "1080p"]);
+        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(!r.demo);
     }
 
     // --- hash-thing-hc0g: --dump-frame CLI flag parsing ---
@@ -3707,6 +4215,7 @@ mod tests {
         let r = parse_args_from(["64", "--demo", "--dump-frame", "/tmp/foo.png"]);
         assert_eq!(r.volume_size, 64);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert!(r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
     }
 
@@ -3715,6 +4224,7 @@ mod tests {
         let r = parse_args_from(["--res", "720p", "--dump-frame", "out.png", "256"]);
         assert_eq!(r.volume_size, 256);
         assert_eq!(r.target_pixels, Some(1280 * 720));
+        assert!(!r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("out.png")));
     }
 
@@ -3740,6 +4250,71 @@ mod tests {
     #[should_panic(expected = "--dump-frame requires a non-empty PATH")]
     fn parse_args_from_dump_frame_empty_path_panics() {
         let _ = parse_args_from(["--dump-frame", ""]);
+    }
+
+    // --- hash-thing-j1mg: --dump-scene CLI flag parsing ---
+
+    #[test]
+    fn parse_args_from_dump_scene_lattice_intro() {
+        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "lattice-intro"]);
+        assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/x.png")));
+        assert_eq!(
+            r.dump_scene,
+            Some(DumpScene::LatticeBeat(LatticeDemoBeat::Intro))
+        );
+    }
+
+    #[test]
+    fn parse_args_from_dump_scene_all_kinds() {
+        for (raw, expected) in [
+            ("terrain", DumpScene::Terrain),
+            ("gol", DumpScene::GolSmoke),
+            ("spectacle", DumpScene::Spectacle),
+            ("gyroid", DumpScene::Gyroid),
+            ("lattice-intro", DumpScene::LatticeBeat(LatticeDemoBeat::Intro)),
+            ("lattice-interior", DumpScene::LatticeBeat(LatticeDemoBeat::Interior)),
+            ("lattice-panorama", DumpScene::LatticeBeat(LatticeDemoBeat::Panorama)),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", raw]);
+            assert_eq!(r.dump_scene, Some(expected), "kind={raw}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires --dump-frame")]
+    fn parse_args_from_dump_scene_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-scene", "lattice-intro"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires a KIND")]
+    fn parse_args_from_dump_scene_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-scene requires a KIND; saw '--demo'")]
+    fn parse_args_from_dump_scene_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognised 'bogus'")]
+    fn parse_args_from_dump_scene_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-scene")]
+    fn parse_args_from_two_dump_scene_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "lattice-intro",
+            "--dump-scene",
+            "gol",
+        ]);
     }
 
     #[test]
@@ -4573,11 +5148,88 @@ mod tests {
         assert_eq!(player.pos[2], expected_z);
         assert!(app.is_stepping(), "step should start after player update");
 
-        let handle = app.step_handle.take().expect("step handle should exist");
-        app.world = handle
-            .join()
-            .expect("step thread should not panic")
-            .expect("step thread should return a world");
+        // hash-thing-dbv3 (vqke.1.1): `step_handle: Option<JoinHandle<...>>`
+        // is gone — the worker now delivers its result via the
+        // `AppUserEvent::SimDone` user event, which only fires inside
+        // an active winit event loop. This test runs without a loop, so
+        // the worker can't deliver: it spins up, runs to completion
+        // (with `event_proxy = None` and `window = None` it silently
+        // no-ops the wake), and the result is dropped on worker exit.
+        // The detached worker holds the moved `world` for ~one step's
+        // worth of wall time before drop. That's fine for the test:
+        // we've already asserted the kick-off behaviour
+        // (`is_stepping()` true after `maybe_start_background_step`),
+        // which is the contract the test is named for.
+    }
+
+    /// hash-thing-dbv3 (vqke.1.1): cover the `apply_step_result` seam
+    /// directly. The `background_step_starts_after_live_world_player_update`
+    /// test above asserts only the kickoff contract; these tests
+    /// validate the post-step ingest path that the worker now reaches
+    /// via `AppUserEvent::SimDone` on the main thread. Per Codex
+    /// standard-review (notes/CR-dbv3-Codex-Standard-*), the seam is
+    /// otherwise untested without faking `ActiveEventLoop`.
+    #[test]
+    fn apply_step_result_ok_clears_pending_and_swaps_world() {
+        let mut app = App::new(32);
+        // Simulate "step in flight": move app.world out into a
+        // payload (mimicking `maybe_start_background_step`'s
+        // placeholder swap), set step_pending true.
+        let payload_world = std::mem::replace(&mut app.world, sim::World::placeholder());
+        let payload_world_gen = payload_world.generation;
+        app.step_pending = true;
+        app.step_start = std::time::Instant::now();
+
+        let timings = SimThreadTimings {
+            apply_mutations_ns: 1_000_000,
+            spawn_clones_ns: 2_000_000,
+            step_recursive_ns: 3_000_000,
+            sim_finished_at: std::time::Instant::now(),
+        };
+        let detect_at = std::time::Instant::now();
+        app.apply_step_result(Ok((payload_world, timings)), detect_at);
+
+        assert!(!app.step_pending, "step_pending must clear after Ok");
+        assert_eq!(
+            app.world.generation, payload_world_gen,
+            "world must be swapped back from the payload"
+        );
+        assert!(
+            !app.paused,
+            "Ok payload must not pause the sim"
+        );
+    }
+
+    #[test]
+    fn apply_step_result_err_pauses_and_clears_pending() {
+        let mut app = App::new(32);
+        app.step_pending = true;
+        app.step_start = std::time::Instant::now();
+        let was_paused = app.paused;
+        assert!(!was_paused, "App::new should default to unpaused");
+        let detect_at = std::time::Instant::now();
+        app.apply_step_result(Err("simulated worker panic".to_string()), detect_at);
+
+        assert!(!app.step_pending, "step_pending must clear after Err");
+        assert!(app.paused, "Err payload must pause the sim (4lp behaviour)");
+    }
+
+    #[test]
+    fn apply_step_result_no_op_when_step_pending_false() {
+        // Defensive double-delivery guard: with the user-event +
+        // request_redraw fallback both potentially running, the ingest
+        // helper must be a no-op once the flag is already cleared.
+        let mut app = App::new(32);
+        app.step_pending = false;
+        let was_paused = app.paused;
+        let detect_at = std::time::Instant::now();
+        app.apply_step_result(Err("ignored".to_string()), detect_at);
+
+        assert!(!app.step_pending);
+        assert_eq!(
+            app.paused, was_paused,
+            "stale event must not flip paused state"
+        );
     }
 
     #[test]

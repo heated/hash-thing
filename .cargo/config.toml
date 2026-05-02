@@ -4,6 +4,17 @@ rustflags = ["-C", "link-arg=-fuse-ld=/usr/bin/ld"]
 
 # sccache: cross-worktree compile caching. Each worktree has its own
 # target/ dir (no lock contention); sccache shares compiled artifacts.
+#
+# hash-thing-a5mv (2026-04-30 partial revert of the shared-target-dir
+# experiment): the shared `target-dir` approach was already empirically
+# rejected in hash-thing-3sw (2026-04-12) — 10 concurrent `cargo build`
+# processes serialized on cargo's per-target-dir lockfile. Per-worktree
+# target/ + sccache is the post-3sw consensus. The new bit a5mv adds on
+# top: `incremental = false` so sccache can actually cache rustc
+# invocations (sccache silently no-ops on incremental builds —
+# pre-a5mv stats showed 0 hits even though the wrapper was wired).
+#
 # CI overrides with RUSTC_WRAPPER="" in its env block.
 [build]
 rustc-wrapper = "sccache"
+incremental = false

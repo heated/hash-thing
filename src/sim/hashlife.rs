@@ -41,6 +41,90 @@ use super::world::World;
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// hash-thing-bjdl (vqke.2): process-wide gate for the memo-hit-rate
+/// diagnostic probes inside `step_node`. Lazily initialised from
+/// `HASH_THING_MEMO_DIAG=1` on first read; `false` (= probes off) by
+/// default. Always-on probes were estimated at single-digit ms/step
+/// at observed miss volumes (per Claude + Codex plan review of this
+/// bead at notes/PR-bjdl-*-Standard-*.md); vqke is trying to make
+/// `step_recursive` *faster*, not pay 5-10 ms for a diagnostic. Set
+/// the env var to reproduce the diagnostic run described in the
+/// bead and read the new tokens in `memo_summary`.
+///
+/// State encoding (AtomicU8 instead of bool so tests can still get a
+/// "not yet read" sentinel and override before the first hot-path
+/// load): 0 = uninitialised, 1 = enabled, 2 = disabled.
+static MEMO_DIAG_STATE: AtomicU8 = AtomicU8::new(0);
+
+// MEMO_DIAG_UNINIT (= 0) is the AtomicU8 default; the discriminant
+// is checked inline via the `_` arm in `memo_diag_enabled` rather
+// than via a named constant, so no `MEMO_DIAG_UNINIT` is exposed.
+const MEMO_DIAG_ON: u8 = 1;
+const MEMO_DIAG_OFF: u8 = 2;
+
+// hash-thing-bjdl (vqke.2): test-only override for the diag gate,
+// kept on the test thread's local storage so a parallel sibling
+// test running on a different worker thread continues to observe
+// the production global state (per Codex code-review §1 on the
+// landed diagnostic — a process-wide override leaks the diag-ON
+// signal to whichever sibling happens to call `step_node` during
+// the override window). Each test thread reads its own override
+// (default `None` = "no override, use the global atomic"); tests
+// that need to set it write their value here. Cleared per-thread,
+// not per-process.
+#[cfg(test)]
+thread_local! {
+    static MEMO_DIAG_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Read-only accessor for the memo-diag flag. After the first call
+/// the env-var lookup is cached as an atomic load on the hot path.
+/// In test builds, a thread-local override (`force_memo_diag_for_test`)
+/// takes precedence so unit tests can exercise the probe without
+/// affecting parallel sibling tests.
+fn memo_diag_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(override_val) = MEMO_DIAG_OVERRIDE.with(|c| c.get()) {
+            return override_val;
+        }
+    }
+    match MEMO_DIAG_STATE.load(Ordering::Relaxed) {
+        MEMO_DIAG_ON => true,
+        MEMO_DIAG_OFF => false,
+        _ => {
+            let v = std::env::var("HASH_THING_MEMO_DIAG").ok().as_deref() == Some("1");
+            MEMO_DIAG_STATE.store(
+                if v { MEMO_DIAG_ON } else { MEMO_DIAG_OFF },
+                Ordering::Relaxed,
+            );
+            v
+        }
+    }
+}
+
+/// Test-only override for the memo-diag gate. Sets a thread-local
+/// flag that takes precedence over the process-wide atomic for the
+/// calling thread only — sibling tests running on other worker
+/// threads continue to see the production-default value (OFF unless
+/// the env var was set at process start). Pair with
+/// `clear_memo_diag_test_override()` at scope exit if a downstream
+/// helper on the same thread should resume reading the global gate.
+#[cfg(test)]
+pub(crate) fn force_memo_diag_for_test(enabled: bool) {
+    MEMO_DIAG_OVERRIDE.with(|c| c.set(Some(enabled)));
+}
+
+/// Clear the test-thread's override, so subsequent
+/// `memo_diag_enabled()` calls on this thread fall through to the
+/// process-wide atomic (production default).
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn clear_memo_diag_test_override() {
+    MEMO_DIAG_OVERRIDE.with(|c| c.set(None));
+}
 
 /// Per-phase micro-timing of one [`World::step_recursive_profiled`] invocation
 /// (hash-thing-jw3k diagnostic harness). All `_us` fields are microseconds.
@@ -79,6 +163,30 @@ const CENTER_LEVEL3_SIDE: usize = 4;
 const CENTER_LEVEL3_CELL_COUNT: usize =
     CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE;
 
+/// hash-thing-ecmn (vqke.4.1): one node-step entry in the BFS frontier.
+/// `node` is the input at level n; `result` is filled at level-(n-1)
+/// time during Phase 2 (level-3 batch) or Phase 3 (ascend).
+/// `children[i]` resolves to the i-th sub-cube's stepped result at
+/// level (n-2): either Direct (short-circuit / cache hit at descent
+/// time) or Pending(idx) (lookup into `tasks[level - 1][idx].result`
+/// after the lower level resolves).
+#[derive(Clone)]
+struct BfsTask {
+    node: NodeId,
+    effective_phase: u64,
+    children: [BfsChildSlot; 8],
+    result: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BfsChildSlot {
+    /// Resolved at descent time — short-circuit or cache hit.
+    Direct(NodeId),
+    /// Pending until the lower-level task resolves; `usize` is an index
+    /// into the next level's `tasks` vec.
+    Pending(usize),
+}
+
 impl World {
     /// Step the world forward one generation using the recursive Hashlife path.
     pub fn step_recursive(&mut self) {
@@ -97,12 +205,14 @@ impl World {
         // phase always produce identical outputs (iowh).
         let period = self.materials.memo_period();
         let phase = self.generation % period;
-        let result = self.step_node(padded_root, padded_level, phase);
+        // hash-thing-vqke Phase 0: bracket step_node (recursive descent
+        // + leaf evaluation) and maybe_compact separately so the perf
+        // log decomposes the previously-unaccounted slice of `step`.
+        let t_step_node = std::time::Instant::now();
+        let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
+        self.hashlife_stats.step_node_wall_ns = t_step_node.elapsed().as_nanos() as u64;
         self.root = result;
-        let step_stats = self.hashlife_stats;
-        self.hashlife_stats_total.accumulate(&step_stats);
-        self.memo_window
-            .push(step_stats.cache_hits, step_stats.cache_misses);
+        let step_stats_pre_compact = self.hashlife_stats;
 
         // No post-pass gap-fill: qy4g option G (2026-04-26) — static
         // internal gaps close in 1-2 ticks via parity-flip; falling
@@ -110,7 +220,21 @@ impl World {
         // World::step and SPEC.md for the visible-artifact tradeoff.
         self.generation += 1;
 
+        let t_compact = std::time::Instant::now();
         self.maybe_compact();
+        self.hashlife_stats.compact_ns = t_compact.elapsed().as_nanos() as u64;
+
+        // hash-thing-vqke: accumulate AFTER compact so the lifetime
+        // accumulator includes p4 (compact) and p3 (step_node wall).
+        // memo_window only tracks hit/miss counts, so it stays based
+        // on the pre-compact stats snapshot (compact doesn't change
+        // those counters).
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window.push(
+            step_stats_pre_compact.cache_hits,
+            step_stats_pre_compact.cache_misses,
+        );
     }
 
     /// Per-column gap-fill path. Retained `#[cfg(test)]` after qy4g option G
@@ -154,7 +278,7 @@ impl World {
         let padded_level = self.level + 1;
         let period = self.materials.memo_period();
         let phase = self.generation % period;
-        let result = self.step_node(padded_root, padded_level, phase);
+        let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
         self.root = result;
         let step_stats = self.hashlife_stats;
         self.hashlife_stats_total.accumulate(&step_stats);
@@ -186,7 +310,7 @@ impl World {
         let period = self.materials.memo_period();
         let phase = self.generation % period;
         let t_step = std::time::Instant::now();
-        let result = self.step_node(padded_root, padded_level, phase);
+        let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
         let step_node_us = t_step.elapsed().as_micros() as u64;
         self.root = result;
         let step_stats = self.hashlife_stats;
@@ -380,6 +504,46 @@ impl World {
         result
     }
 
+    /// hash-thing-5ie4 (vqke.2.1): does the subtree contain any cell
+    /// whose material has `tick_divisor > 1`? Drives the phase-fold
+    /// in `step_node`: when this returns `false` for a node, its
+    /// step result depends only on `(node, generation % 2)`, so the
+    /// memo key collapses from the registry's full `memo_period` to
+    /// Margolus parity.
+    ///
+    /// Cached per NodeId on `self.hashlife_slow_divisor_cache`. The
+    /// answer is content-determined (NodeIds are content-addressed),
+    /// so cell-edit paths produce a fresh NodeId and hit the cache
+    /// cold — only material-registry mutation invalidates existing
+    /// entries (`World::invalidate_material_caches`).
+    ///
+    /// Implementation note (per Codex plan-review §1): the
+    /// `tick_divisor_flags()` slice is queried INSIDE the `Leaf`
+    /// arm, not before the `match`. Holding the slice across the
+    /// recursive `Interior` call would conflict with the recursive
+    /// `&mut self` borrow.
+    fn subtree_has_slow_divisor(&mut self, node: NodeId) -> bool {
+        if node == NodeId::EMPTY {
+            return false;
+        }
+        if let Some(&cached) = self.hashlife_slow_divisor_cache.get(&node) {
+            return cached;
+        }
+        let result = match self.store.get(node).clone() {
+            Node::Leaf(state) => {
+                let cell = Cell::from_raw(state);
+                let mat = cell.material() as usize;
+                let divisors = self.materials.tick_divisor_flags();
+                divisors.get(mat).copied().unwrap_or(1) > 1
+            }
+            Node::Interior { children, .. } => children
+                .into_iter()
+                .any(|c| self.subtree_has_slow_divisor(c)),
+        };
+        self.hashlife_slow_divisor_cache.insert(node, result);
+        result
+    }
+
     /// Check if a subtree is uniformly one inert material.
     /// Returns Some(state) if all leaves are the same inert state.
     fn inert_uniform_state(&mut self, node: NodeId) -> Option<CellState> {
@@ -411,12 +575,22 @@ impl World {
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
         // Remap hashlife_cache: (NodeId, schedule_phase) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
+        let before = old_cache.len() as u64;
         self.hashlife_cache.reserve(old_cache.len());
+        // hash-thing-bjdl (vqke.2): count kept entries directly in the
+        // success branch (rather than reading the final map length)
+        // so the metric isn't conflated with any future key-coalescing
+        // change in this loop. Dropped is `before - kept` — exact.
+        // Per Codex plan-review §3.
+        let mut kept: u64 = 0;
         for ((node, phase), result) in old_cache {
             if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
                 self.hashlife_cache.insert((new_node, phase), new_result);
+                kept += 1;
             }
         }
+        self.hashlife_stats.compact_entries_kept += kept;
+        self.hashlife_stats.compact_entries_dropped += before - kept;
 
         // Remap hashlife_macro_cache: (NodeId, generation) → NodeId
         let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
@@ -445,6 +619,18 @@ impl World {
                 self.hashlife_all_inert_cache.insert(new_node, inert);
             }
         }
+
+        // hash-thing-5ie4 (vqke.2.1): remap hashlife_slow_divisor_cache:
+        // NodeId → bool. Same lifecycle as the inert / all-inert
+        // caches above. Entries whose NodeId is unreachable in the
+        // post-compact namespace are dropped on the same principle.
+        let old_slow_div = std::mem::take(&mut self.hashlife_slow_divisor_cache);
+        self.hashlife_slow_divisor_cache.reserve(old_slow_div.len());
+        for (node, has_slow) in old_slow_div {
+            if let Some(&new_node) = remap.get(&node) {
+                self.hashlife_slow_divisor_cache.insert(new_node, has_slow);
+            }
+        }
     }
 
     /// Wrap the current root in a one-level-larger node, padding with empty.
@@ -470,7 +656,19 @@ impl World {
     /// memo_period()` where memo_period = LCM over materials of 2*divisor
     /// (iowh). Identical subtrees at the same schedule_phase always produce
     /// identical outputs (9ww + iowh).
-    fn step_node(&mut self, node: NodeId, level: u32, schedule_phase: u64) -> NodeId {
+    ///
+    /// `memo_period` is the period passed by `step_recursive`'s top-level
+    /// call (computed once from `self.materials.memo_period()` at line
+    /// 98). It's threaded through so `step_node` can run the
+    /// hash-thing-bjdl phase-alias diagnostic probe at miss sites without
+    /// re-querying the registry on every miss.
+    fn step_node(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> NodeId {
         assert!(level >= 3, "step_node requires level >= 3, got {level}");
 
         // Empty nodes step to empty: any rule applied to 26 air neighbors produces air
@@ -494,7 +692,37 @@ impl World {
             return self.center_node(node, level);
         }
 
-        let key = (node, schedule_phase);
+        // hash-thing-5ie4 (vqke.2.1): phase-fold for fast subtrees.
+        // When `memo_period > 2` the registry has at least one
+        // material with `tick_divisor > 1`, so the cache key uses
+        // `gen % LCM(2 * d_i) > 2`. But for a subtree containing no
+        // slow-divisor cells, the step result depends only on
+        // `(node, gen % 2)` — the divisor gates in
+        // `step_grid_once` are dead code (all divisors = 1) and the
+        // BlockRule offset is `(gen / 1) % 2 = gen % 2`. Fold the
+        // key for those subtrees so cache reuse extends across
+        // every-other-generation pairs.
+        //
+        // The check is gated on `memo_period > 2` so the only-Margolus
+        // (period=2) world does not pay for the predicate: the fold
+        // would be a no-op there anyway (`schedule_phase % 2 ==
+        // schedule_phase`). The predicate cache is hot in steady
+        // state (one map lookup per call); first-population cost
+        // amortises across the recursive descent.
+        //
+        // Correctness note (per Claude plan-review §1): this fold
+        // is sound because `step_recursive_case` builds intermediate
+        // nodes from grandchildren of `node`, and the content-addressed
+        // `store.interior` returns the same NodeId for the same
+        // content. A fast subtree's descendants are by induction
+        // also fast, so every recursive call inside the fast branch
+        // sees the same predicate value and the same fold.
+        let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
+            schedule_phase % 2
+        } else {
+            schedule_phase
+        };
+        let key = (node, effective_phase);
         if let Some(&cached) = self.hashlife_cache.get(&key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
@@ -503,11 +731,40 @@ impl World {
         if (level as usize) >= 3 {
             self.hashlife_stats.misses_by_level[(level - 3) as usize] += 1;
         }
+        // hash-thing-bjdl (vqke.2): hypothesis-3 probe, env-gated.
+        // Mass-zero in production (the LazyLock check is a single
+        // atomic load); only fires when HASH_THING_MEMO_DIAG=1 is set
+        // at process start. At default-scene period=4 the inner loop
+        // is at most 3 hashmap lookups per miss; on a 256³ default
+        // scene at ~6-50k misses/step that's 18-150k extra lookups
+        // per step (5-10 ms) which the rest of vqke is trying to
+        // speed up — hence the gate. Boolean-per-miss semantics: a
+        // node aliased at three other phases counts ONCE.
+        //
+        // Probe is anchored on `effective_phase` (post-fold), so a
+        // miss whose fast-subtree fold already collapsed it to
+        // phase=0/1 only flags as aliased when the *folded* key has
+        // an alternate-phase sibling — which after vqke.2.1 should
+        // be rare. The pre-fold raw `schedule_phase` could expose a
+        // higher alias rate, but post-fold is the relevant signal
+        // for whether further key-shape changes (vqke.2.2) would
+        // recoup more.
+        if memo_diag_enabled() && memo_period > 1 {
+            for p in 0..memo_period {
+                if p == effective_phase {
+                    continue;
+                }
+                if self.hashlife_cache.contains_key(&(node, p)) {
+                    self.hashlife_stats.cache_misses_phase_aliased += 1;
+                    break;
+                }
+            }
+        }
 
         let result = if level == 3 {
-            self.step_base_case(node, schedule_phase)
+            self.step_base_case(node, effective_phase)
         } else {
-            self.step_recursive_case(node, level, schedule_phase)
+            self.step_recursive_case(node, level, effective_phase, memo_period)
         };
 
         self.hashlife_cache.insert(key, result);
@@ -591,126 +848,7 @@ impl World {
         grid: &[CellState],
         generation: u64,
     ) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
-        let side = LEVEL3_SIDE;
-        // Phase 1: CaRule on interior cells (1..side-1 on each axis).
-        // The outermost ring cannot be evolved correctly because its neighbors
-        // would wrap outside the padded region. Callers only extract the center
-        // that remains valid after the requested number of steps.
-        let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
-        // Phase 1 timer covers both the per-call setup (noop_flags,
-        // tick_divisor_flags) AND the cell loop. Both caches are now slice
-        // reads into MaterialRegistry (tick_divisor_flags by hash-thing-5yxk,
-        // noop_flags by hash-thing-2z3g). Attributing setup to p1 keeps
-        // p1+p2 close to the full step_grid_once wall time — if a future
-        // investigator sees p1+p2 ≪ observed step time, the missing cost is
-        // memo lookup/insert or `next`-array zeroing, not hidden setup.
-        let phase1_start = std::time::Instant::now();
-        // Precompute per-material noop flag to avoid vtable dispatch per cell.
-        // Index 0 = air/empty. If air's CaRule is noop, empty cells can be skipped
-        // entirely (next is zero-initialized). For GoL, air participates in birth
-        // rules and must NOT be skipped.
-        let noop_by_material = self.materials.noop_flags();
-        let divisor_by_material = self.materials.tick_divisor_flags();
-        let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
-        for z in 1..side - 1 {
-            for y in 1..side - 1 {
-                for x in 1..side - 1 {
-                    let idx = x + y * side + z * side * side;
-                    let raw = grid[idx];
-                    if raw == 0 && air_is_noop {
-                        continue;
-                    }
-                    let cell = Cell::from_raw(raw);
-                    let mat = cell.material() as usize;
-                    if mat < noop_by_material.len() && noop_by_material[mat] {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    // tick_divisor gate: rule fires only when generation is a
-                    // multiple of this material's divisor (iowh). Skipped ticks
-                    // keep the cell unchanged. Divisor=1 (default) reduces to
-                    // "every tick", identical to pre-iowh behavior.
-                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
-                    if divisor > 1 && !generation.is_multiple_of(divisor) {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    let rule = self.materials.rule_for_cell(cell).unwrap_or_else(|| {
-                        panic!("missing CaRule for material {}", cell.material())
-                    });
-                    let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
-                    next[idx] = rule.step_cell(cell, &neighbors).raw();
-                }
-            }
-        }
-
-        let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
-
-        // Phase 2: BlockRule on all aligned 2×2×2 blocks within the interior.
-        // Node-local alignment (9ww): partition is determined by grid-local
-        // coordinates, not world-space origin. With per-rule tick_divisors
-        // (iowh), each BlockRule has its own offset `(generation / divisor) % 2`
-        // derived from its slowed-down tick schedule — this preserves Margolus
-        // mass-conservation alternation for slowed rules. Default d=1 reduces
-        // to `generation % 2`, identical to pre-iowh behavior.
-        //
-        // Phase 2 timer covers the block_rule_tick_divisors cache read and
-        // the per-block loop, symmetric with Phase 1 covering its setup.
-        let phase2_start = std::time::Instant::now();
-        let block_rule_divisors = self.materials.block_rule_tick_divisors();
-
-        // Fast path: when all divisors are 1 (period 2), every rule uses the
-        // same offset = generation % 2. Keep the old single-offset loop to
-        // avoid extra iteration on the default hot path.
-        let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1)
-            && divisor_by_material.iter().all(|&d| d == 1);
-        if all_divisors_one {
-            let offset = (generation % 2) as usize;
-            let mut bz = offset;
-            while bz + 1 < side - 1 {
-                let mut by = offset;
-                while by + 1 < side - 1 {
-                    let mut bx = offset;
-                    while bx + 1 < side - 1 {
-                        self.apply_block_in_grid(&mut next, side, bx, by, bz);
-                        bx += 2;
-                    }
-                    by += 2;
-                }
-                bz += 2;
-            }
-        } else {
-            // Slow path: iterate both offsets, decide per-block based on the
-            // dominant rule's own slowed-down tick schedule. Empty blocks and
-            // mismatched-offset blocks early-exit cheaply.
-            for pass_offset in 0..2usize {
-                let mut bz = pass_offset;
-                while bz + 1 < side - 1 {
-                    let mut by = pass_offset;
-                    while by + 1 < side - 1 {
-                        let mut bx = pass_offset;
-                        while bx + 1 < side - 1 {
-                            self.apply_block_in_grid_with_schedule(
-                                &mut next,
-                                side,
-                                bx,
-                                by,
-                                bz,
-                                pass_offset,
-                                generation,
-                                block_rule_divisors,
-                            );
-                            bx += 2;
-                        }
-                        by += 2;
-                    }
-                    bz += 2;
-                }
-            }
-        }
-        let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
-
-        (next, phase1_ns, phase2_ns)
+        step_grid_once_pure(grid, generation, &self.materials)
     }
 
     fn center_level3_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
@@ -728,139 +866,14 @@ impl World {
         self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
     }
 
-    /// Slow-path variant of `apply_block_in_grid` used when any BlockRule has
-    /// `tick_divisor > 1`. Only applies the block's dominant rule when the
-    /// current pass_offset matches that rule's Margolus offset for this tick
-    /// and the rule is active this tick (`generation % divisor == 0`). No-op
-    /// otherwise.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_block_in_grid_with_schedule(
-        &self,
-        grid: &mut [CellState],
-        side: usize,
-        bx: usize,
-        by: usize,
-        bz: usize,
-        pass_offset: usize,
-        generation: u64,
-        block_rule_divisors: &[u16],
-    ) {
-        let mut block = [Cell::EMPTY; 8];
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    block[octant_index(dx as u32, dy as u32, dz as u32)] =
-                        Cell::from_raw(grid[idx]);
-                }
-            }
-        }
-
-        if block.iter().all(|c| c.is_empty()) {
-            return;
-        }
-
-        let rule_id = match self.unique_block_rule(&block) {
-            Some(id) => id,
-            None => return,
-        };
-
-        let divisor = block_rule_divisors
-            .get(rule_id.0)
-            .copied()
-            .unwrap_or(1)
-            .max(1) as u64;
-        if !generation.is_multiple_of(divisor) {
-            return;
-        }
-        let rule_offset = ((generation / divisor) & 1) as usize;
-        if rule_offset != pass_offset {
-            return;
-        }
-
-        let movable: [bool; 8] = std::array::from_fn(|i| {
-            let c = block[i];
-            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
-        });
-
-        let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block, &movable);
-
-        debug_assert!(
-            (0..8).all(|i| movable[i] || result[i] == block[i]),
-            "block rule moved an immovable cell"
-        );
-
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if movable[i] {
-                        grid[idx] = result[i].raw();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Apply a single block rule within a flat grid.
-    fn apply_block_in_grid(
-        &self,
-        grid: &mut [CellState],
-        side: usize,
-        bx: usize,
-        by: usize,
-        bz: usize,
-    ) {
-        let mut block = [Cell::EMPTY; 8];
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    block[octant_index(dx as u32, dy as u32, dz as u32)] =
-                        Cell::from_raw(grid[idx]);
-                }
-            }
-        }
-
-        if block.iter().all(|c| c.is_empty()) {
-            return;
-        }
-
-        let rule_id = match self.unique_block_rule(&block) {
-            Some(id) => id,
-            None => return,
-        };
-
-        let movable: [bool; 8] = std::array::from_fn(|i| {
-            let c = block[i];
-            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
-        });
-
-        let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block, &movable);
-
-        debug_assert!(
-            (0..8).all(|i| movable[i] || result[i] == block[i]),
-            "block rule moved an immovable cell"
-        );
-
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let i = octant_index(dx as u32, dy as u32, dz as u32);
-                    let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
-                    if movable[i] {
-                        grid[idx] = result[i].raw();
-                    }
-                }
-            }
-        }
-    }
-
     /// Recursive case: level ≥ 3.
-    fn step_recursive_case(&mut self, node: NodeId, level: u32, schedule_phase: u64) -> NodeId {
+    fn step_recursive_case(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> NodeId {
         let children = self.store.children(node);
         let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
 
@@ -896,8 +909,11 @@ impl World {
             centered[i] = self.center_node(inter[i], level - 1);
         }
 
-        // Group into 8 overlapping sub-cubes (level n-1) and recurse.
-        let mut result_children = [NodeId::EMPTY; 8];
+        // Group into 8 overlapping sub-cubes (level n-1) and assemble their
+        // sub_roots up-front. The 8 step_node calls follow — at level==4
+        // (i.e. each sub-cube is a level-3 base case) the calls may be
+        // batched through rayon if `base_case_strategy == RayonPerFanout`.
+        let mut sub_roots = [NodeId::EMPTY; 8];
         for oz in 0..2usize {
             for oy in 0..2usize {
                 for ox in 0..2usize {
@@ -910,14 +926,632 @@ impl World {
                             }
                         }
                     }
-                    let sub_root = self.store.interior(level - 1, sub_cube);
-                    result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.step_node(sub_root, level - 1, schedule_phase);
+                    sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
+                        self.store.interior(level - 1, sub_cube);
                 }
             }
         }
 
+        let mut result_children = [NodeId::EMPTY; 8];
+        if level == 4
+            && matches!(
+                self.base_case_strategy,
+                super::world::BaseCaseStrategy::RayonPerFanout
+            )
+        {
+            // hash-thing-ftuu (vqke.4): batch the 8 level-3 base cases through
+            // rayon. Replicates the prelude of `step_node` (empty / inert /
+            // cache lookup) inline so the parallel work is restricted to the
+            // pure `step_grid_once_pure` calls — the only non-trivial
+            // computation that can run without `&mut self`.
+            self.step_level4_fanout_rayon(
+                &sub_roots,
+                schedule_phase,
+                memo_period,
+                &mut result_children,
+            );
+        } else {
+            for i in 0..8 {
+                result_children[i] =
+                    self.step_node(sub_roots[i], level - 1, schedule_phase, memo_period);
+            }
+        }
+
         self.store.interior(level - 1, result_children)
+    }
+
+    /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 level-3
+    /// base cases under a level-4 fanout. Replaces the serial loop over
+    /// `step_node(sub_root, 3, ...)` calls when
+    /// `base_case_strategy == RayonPerFanout`.
+    ///
+    /// Phase A (sequential, mutates stats + reads store/cache): mirrors the
+    /// `step_node` prelude — empty-skip, fixed-point-skip, all-inert-skip,
+    /// fast-subtree phase fold, cache lookup. Sub-cubes that short-circuit
+    /// or hit the cache are recorded directly into `result_children`.
+    /// Sub-cubes that miss are recorded into a queue alongside their
+    /// flattened 8³ grid (read-only on store).
+    ///
+    /// Phase B (parallel, no `&self`): rayon `par_iter` over the queued
+    /// flat grids invokes `step_grid_once_pure` to compute each output
+    /// grid. The threshold below `4` falls back to serial `iter` because
+    /// rayon's per-task overhead exceeds the win at very small batch sizes
+    /// (a level-4 fanout caps at 8 base cases, and most steady-state
+    /// fanouts have fewer than 8 misses).
+    ///
+    /// Phase C (sequential, mutates store + cache + stats): commits each
+    /// output grid via `from_flat` + `center_level3_grid_to_node`, inserts
+    /// the result into `hashlife_cache` under the same `(sub_root,
+    /// effective_phase)` key the next `step_node` lookup would use, and
+    /// folds `phase1_ns` / `phase2_ns` into stats so observability stays
+    /// identical to the serial path.
+    ///
+    /// Bit-exact with the serial path — verified by
+    /// `tests/base_case_rayon_parity.rs`.
+    fn step_level4_fanout_rayon(
+        &mut self,
+        sub_roots: &[NodeId; 8],
+        schedule_phase: u64,
+        memo_period: u64,
+        result_children: &mut [NodeId; 8],
+    ) {
+        use rayon::prelude::*;
+
+        // Per-sub_root classification: either resolved (short-circuit or
+        // cache hit) or pending (miss, needs base-case compute).
+        //
+        // Dedupe at queue time so two equal `sub_roots[i] == sub_roots[j]`
+        // entries don't both run `step_grid_once_pure`: the second
+        // occurrence is recorded as a deferred dupe pointing at the
+        // unique miss's pending index, then resolves from the rayon
+        // output post-batch. This both saves recompute (worst case 8×
+        // for a fully-aliased fanout) AND makes the (cache_hits,
+        // cache_misses) accounting match the serial path's
+        // (1 miss + N-1 hits) exactly.
+        let mut resolved: [Option<NodeId>; 8] = [None; 8];
+        let mut pending: Vec<(usize, u64)> = Vec::with_capacity(8); // (sub_root_index, effective_phase) for unique misses
+        let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> = Vec::with_capacity(8);
+        let mut deferred_dupes: Vec<(usize, usize)> = Vec::new(); // (sub_root_index, pending_index) for duplicate misses
+
+        for i in 0..8 {
+            let nid = sub_roots[i];
+
+            // Mirrors `step_node` lines 650-666: empty / uniform-inert /
+            // all-inert short-circuits.
+            if self.store.population(nid) == 0 {
+                self.hashlife_stats.empty_skips += 1;
+                resolved[i] = Some(self.store.empty(2));
+                continue;
+            }
+            if let Some(state) = self.inert_uniform_state(nid) {
+                self.hashlife_stats.fixed_point_skips += 1;
+                resolved[i] = Some(self.store.uniform(2, state));
+                continue;
+            }
+            if self.is_all_inert(nid) {
+                self.hashlife_stats.fixed_point_skips += 1;
+                resolved[i] = Some(self.center_node(nid, 3));
+                continue;
+            }
+
+            // Mirrors `step_node` lines 694-703: fast-subtree phase fold +
+            // cache lookup.
+            let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(nid) {
+                schedule_phase % 2
+            } else {
+                schedule_phase
+            };
+            let key = (nid, effective_phase);
+            if let Some(&cached) = self.hashlife_cache.get(&key) {
+                self.hashlife_stats.cache_hits += 1;
+                resolved[i] = Some(cached);
+                continue;
+            }
+
+            // Dedupe: if (nid, effective_phase) is already pending from a
+            // prior sub_root in this fanout, the serial path would have
+            // hit the cache after the first compute. Match that: count
+            // as a cache_hit and defer resolution until Phase C.
+            if let Some(pending_idx) = pending
+                .iter()
+                .position(|&(j, p)| sub_roots[j] == nid && p == effective_phase)
+            {
+                self.hashlife_stats.cache_hits += 1;
+                deferred_dupes.push((i, pending_idx));
+                continue;
+            }
+
+            // Unique miss — record cache_misses now (matches `step_node`
+            // line 704 which counts the miss before evaluation).
+            self.hashlife_stats.cache_misses += 1;
+            self.hashlife_stats.misses_by_level[0] += 1; // level 3 = misses_by_level[0]
+
+            // hash-thing-bjdl phase-aliasing diag probe (env-gated).
+            if memo_diag_enabled() && memo_period > 1 {
+                for p in 0..memo_period {
+                    if p == effective_phase {
+                        continue;
+                    }
+                    if self.hashlife_cache.contains_key(&(nid, p)) {
+                        self.hashlife_stats.cache_misses_phase_aliased += 1;
+                        break;
+                    }
+                }
+            }
+
+            let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+            self.store.flatten_buf(nid, &mut grid, LEVEL3_SIDE);
+            pending.push((i, effective_phase));
+            pending_grids.push(grid);
+        }
+
+        // Phase B: parallel step_grid_once_pure over the pending grids.
+        // Below the rayon threshold, fall back to serial iter — at very
+        // small batch sizes rayon's per-task overhead dominates the
+        // ~14 µs of step_grid_once work.
+        const RAYON_BATCH_THRESHOLD: usize = 4;
+        let generation = self.generation;
+        let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
+        let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> = if pending_grids.is_empty() {
+            Vec::new()
+        } else if pending_grids.len() < RAYON_BATCH_THRESHOLD {
+            pending_grids
+                .iter()
+                .map(|grid| step_grid_once_pure(grid, generation, materials))
+                .collect()
+        } else {
+            pending_grids
+                .par_iter()
+                .map(|grid| step_grid_once_pure(grid, generation, materials))
+                .collect()
+        };
+
+        // Phase C: commit outputs into store + cache + stats.
+        for (out_idx, &(sub_idx, effective_phase)) in pending.iter().enumerate() {
+            let (output_grid, p1ns, p2ns) = &outputs[out_idx];
+            self.hashlife_stats.phase1_ns += p1ns;
+            self.hashlife_stats.phase2_ns += p2ns;
+            let centered = self.center_level3_grid_to_node(output_grid);
+            self.hashlife_cache
+                .insert((sub_roots[sub_idx], effective_phase), centered);
+            resolved[sub_idx] = Some(centered);
+        }
+
+        // Resolve duplicate-miss sub_roots from their twin's freshly-
+        // committed entry. Each dupe stored its `pending_index`; the
+        // corresponding pending sub_root's `resolved[...]` is set by
+        // Phase C above, so we copy the same NodeId across.
+        for &(sub_idx, pending_idx) in &deferred_dupes {
+            let original_sub = pending[pending_idx].0;
+            resolved[sub_idx] = resolved[original_sub];
+        }
+
+        for i in 0..8 {
+            result_children[i] =
+                resolved[i].expect("step_level4_fanout_rayon: every sub_root must be resolved");
+        }
+    }
+
+    /// hash-thing-ecmn (vqke.4.1): top-level dispatch picking the active
+    /// `BaseCaseStrategy`. Used by `step_recursive`,
+    /// `step_recursive_profiled`, and `step_margolus_only` so all three
+    /// entry points honor the strategy uniformly. Reviewer feedback
+    /// (Standard-Codex, Standard-Codex-Execution, Adversarial-Codex)
+    /// flagged that the absence of a shared dispatcher would let the
+    /// profiled path silently bypass `RayonBfs`.
+    fn step_root_dispatch(
+        &mut self,
+        padded_root: NodeId,
+        padded_level: u32,
+        phase: u64,
+        period: u64,
+    ) -> NodeId {
+        match self.base_case_strategy {
+            super::world::BaseCaseStrategy::Serial
+            | super::world::BaseCaseStrategy::RayonPerFanout => {
+                self.step_node(padded_root, padded_level, phase, period)
+            }
+            super::world::BaseCaseStrategy::RayonBfs => {
+                self.step_root_bfs(padded_root, padded_level, phase, period)
+            }
+        }
+    }
+
+    /// hash-thing-ecmn (vqke.4.1): try the short-circuit prelude that
+    /// `step_node` runs at lines 650-668. Mirrors that order exactly:
+    /// empty -> uniform-inert -> all-inert. Returns the resolved
+    /// level-(n-1) node if any short-circuit fires, plus increments the
+    /// matching skip counter; returns `None` if the caller should
+    /// proceed to cache lookup. `result_level` is the level the result
+    /// will live at (= input level - 1 in step_node terms).
+    ///
+    /// Extracted from step_node + step_level4_fanout_rayon so all three
+    /// callers (step_node, the per-fanout rayon path, and step_root_bfs)
+    /// share one implementation. Standard-Codex review specifically
+    /// asked for this consolidation.
+    fn try_resolve_short_circuit(
+        &mut self,
+        node: NodeId,
+        result_level: u32,
+    ) -> Option<NodeId> {
+        if self.store.population(node) == 0 {
+            self.hashlife_stats.empty_skips += 1;
+            return Some(self.store.empty(result_level));
+        }
+        if let Some(state) = self.inert_uniform_state(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return Some(self.store.uniform(result_level, state));
+        }
+        if self.is_all_inert(node) {
+            self.hashlife_stats.fixed_point_skips += 1;
+            return Some(self.center_node(node, result_level + 1));
+        }
+        None
+    }
+
+    /// hash-thing-ecmn: shared fast-subtree phase fold (mirror of
+    /// `step_node` lines 696-700). When the registry has slow divisors
+    /// (memo_period > 2) but the subtree at `node` contains no
+    /// slow-divisor cells, fold the schedule phase to `phase % 2` so
+    /// fast subtrees alias across every-other-generation pairs.
+    fn effective_phase_for(
+        &mut self,
+        node: NodeId,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> u64 {
+        if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
+            schedule_phase % 2
+        } else {
+            schedule_phase
+        }
+    }
+
+    /// hash-thing-ecmn: the env-gated phase-aliasing diagnostic probe
+    /// (mirror of `step_node` lines 728-738). Always-on cost was
+    /// estimated at single-digit ms/step at observed miss volumes, so
+    /// the probe is gated behind `HASH_THING_MEMO_DIAG=1`.
+    fn memo_diag_probe_alias(&mut self, node: NodeId, effective_phase: u64, memo_period: u64) {
+        if memo_diag_enabled() && memo_period > 1 {
+            for p in 0..memo_period {
+                if p == effective_phase {
+                    continue;
+                }
+                if self.hashlife_cache.contains_key(&(node, p)) {
+                    self.hashlife_stats.cache_misses_phase_aliased += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// hash-thing-ecmn: build the 27 intermediate nodes + 8 sub-cube
+    /// sub_roots at level (n-1) for a level-n parent. Mirrors
+    /// `step_recursive_case` lines 853-909 exactly. Extracted so the
+    /// BFS descent shares one source of truth with the DFS recursive
+    /// case (a future cleanup bead can refactor `step_recursive_case`
+    /// to call this helper too).
+    fn build_subroots(&mut self, node: NodeId, level: u32) -> [NodeId; 8] {
+        let children = self.store.children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+
+        let mut inter = [NodeId::EMPTY; 27];
+        for pz in 0..3usize {
+            for py in 0..3usize {
+                for px in 0..3usize {
+                    let mut octants = [NodeId::EMPTY; 8];
+                    for sz in 0..2usize {
+                        for sy in 0..2usize {
+                            for sx in 0..2usize {
+                                let (parent_x, sub_x) = source_index(px, sx);
+                                let (parent_y, sub_y) = source_index(py, sy);
+                                let (parent_z, sub_z) = source_index(pz, sz);
+                                let parent_oct =
+                                    octant_index(parent_x as u32, parent_y as u32, parent_z as u32);
+                                let sub_oct =
+                                    octant_index(sub_x as u32, sub_y as u32, sub_z as u32);
+                                octants[octant_index(sx as u32, sy as u32, sz as u32)] =
+                                    sub[parent_oct][sub_oct];
+                            }
+                        }
+                    }
+                    inter[px + py * 3 + pz * 9] = self.store.interior(level - 1, octants);
+                }
+            }
+        }
+
+        let mut centered = [NodeId::EMPTY; 27];
+        for i in 0..27 {
+            centered[i] = self.center_node(inter[i], level - 1);
+        }
+
+        let mut sub_roots = [NodeId::EMPTY; 8];
+        for oz in 0..2usize {
+            for oy in 0..2usize {
+                for ox in 0..2usize {
+                    let mut sub_cube = [NodeId::EMPTY; 8];
+                    for dz in 0..2usize {
+                        for dy in 0..2usize {
+                            for dx in 0..2usize {
+                                sub_cube[octant_index(dx as u32, dy as u32, dz as u32)] =
+                                    centered[(ox + dx) + (oy + dy) * 3 + (oz + dz) * 9];
+                            }
+                        }
+                    }
+                    sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
+                        self.store.interior(level - 1, sub_cube);
+                }
+            }
+        }
+        sub_roots
+    }
+
+    /// hash-thing-ecmn (vqke.4.1): breadth-first whole-step level
+    /// dispatcher. Walks `step_node` level-by-level instead of
+    /// depth-first, collecting all level-3 base-case misses across
+    /// the entire step into one large rayon batch.
+    ///
+    /// Three phases per call:
+    ///
+    /// 1. **Descending pass** (sequential, mutates store + cache):
+    ///    Process the root and each level n ∈ (root_level..=4) by
+    ///    building each task's 27 intermediates + 8 sub_roots, then
+    ///    classifying each sub_root via the `step_node` prelude
+    ///    (short-circuit / cache hit / pending miss). Pending unique
+    ///    misses queue as new tasks at level (n-1); duplicates dedupe
+    ///    against the per-level seen map and count as cache_hits.
+    ///
+    /// 2. **Level-3 batch** (parallel, pure): for every unique level-3
+    ///    task, flatten the 8³ grid (sequential read), then rayon
+    ///    par_iter over `step_grid_once_pure`. Below
+    ///    `RAYON_BATCH_THRESHOLD` (=4) fall back to serial iter — same
+    ///    threshold as ftuu's per-fanout path. Each output centers
+    ///    back into a level-2 NodeId, which becomes the task's result.
+    ///
+    /// 3. **Ascending pass** (sequential, mutates store + cache): for n
+    ///    ∈ 4..=root_level, each task at level n composes its 8 child
+    ///    results (level n-2) via `store.interior(n-1, ...)` and
+    ///    inserts the result into `hashlife_cache` under the same
+    ///    `(node, effective_phase)` key step_node would use.
+    ///
+    /// Bit-exact flattened-cell parity with the serial / per-fanout
+    /// paths (verified by `tests/base_case_rayon_parity.rs`). NodeIds
+    /// across `World` instances may differ due to intern allocation
+    /// order; the parity test compares `flatten()`, not NodeIds.
+    ///
+    /// `step_grid_once_pure` receives the raw `self.generation`, NOT
+    /// `effective_phase` — the compute path is generation-based and
+    /// only the cache key uses effective_phase. (Per Adversarial-Codex
+    /// plan-review feedback.)
+    ///
+    /// Stats accounting matches the serial path for cache_hits /
+    /// cache_misses / empty_skips / fixed_point_skips / misses_by_level
+    /// counts (modulo per-event ordering, which is intentionally not
+    /// part of the contract). Adds new BFS-specific counters
+    /// (`bfs_tasks_by_level`, `bfs_level3_unique_misses`,
+    /// `bfs_batches_parallel`, `bfs_batches_serial_fallback`,
+    /// `bfs_max_batch_len`) wired through `memo_summary()`.
+    fn step_root_bfs(
+        &mut self,
+        root: NodeId,
+        root_level: u32,
+        schedule_phase: u64,
+        memo_period: u64,
+    ) -> NodeId {
+        debug_assert!(root_level >= 3, "step_root_bfs requires level >= 3");
+
+        // Root prelude — mirrors step_node lines 650-738.
+        if let Some(short) = self.try_resolve_short_circuit(root, root_level - 1) {
+            return short;
+        }
+        let root_eff = self.effective_phase_for(root, schedule_phase, memo_period);
+        let root_key = (root, root_eff);
+        if let Some(&cached) = self.hashlife_cache.get(&root_key) {
+            self.hashlife_stats.cache_hits += 1;
+            return cached;
+        }
+        self.hashlife_stats.cache_misses += 1;
+        self.hashlife_stats.misses_by_level[(root_level - 3) as usize] += 1;
+        self.memo_diag_probe_alias(root, root_eff, memo_period);
+
+        // Level-3 root: no BFS frontier needed — step the base case directly.
+        if root_level == 3 {
+            let result = self.step_base_case(root, root_eff);
+            self.hashlife_cache.insert(root_key, result);
+            return result;
+        }
+
+        // Per-level frontier. tasks[idx] holds the unique tasks at level
+        // `(idx + 3)`. seen[idx] is the dedupe map keyed by
+        // (NodeId, effective_phase) -> task index in tasks[idx].
+        //
+        // Cross-level dedupe is unnecessary because `Node::Interior`
+        // carries its level — identical content at different levels gets
+        // different NodeIds. NodeId::EMPTY-style sentinels are handled
+        // by the empty short-circuit BEFORE reaching the seen/resolved
+        // path.
+        let max_level_idx = (root_level - 3) as usize;
+        let mut tasks: Vec<Vec<BfsTask>> = (0..=max_level_idx).map(|_| Vec::new()).collect();
+        let mut seen: Vec<FxHashMap<(NodeId, u64), usize>> =
+            (0..=max_level_idx).map(|_| FxHashMap::default()).collect();
+
+        // Seed root.
+        tasks[max_level_idx].push(BfsTask {
+            node: root,
+            effective_phase: root_eff,
+            children: [BfsChildSlot::Direct(NodeId::EMPTY); 8],
+            result: None,
+        });
+        seen[max_level_idx].insert(root_key, 0);
+
+        // Phase 1: descending pass. Walk levels root_level..=4 (level-3
+        // tasks are pure leaves; they don't need sub_roots built).
+        for n in (4..=root_level).rev() {
+            let level_idx = (n - 3) as usize;
+            let lower_idx = level_idx - 1;
+            // Snapshot the count: tasks[level_idx] doesn't grow during
+            // this loop (we only append to tasks[lower_idx]), so an
+            // index-based loop is safe.
+            let n_tasks_count = tasks[level_idx].len();
+            for task_idx in 0..n_tasks_count {
+                let task_node = tasks[level_idx][task_idx].node;
+                let sub_roots = self.build_subroots(task_node, n);
+                let lower_level = n - 1;
+                let mut child_slots = [BfsChildSlot::Direct(NodeId::EMPTY); 8];
+                for i in 0..8 {
+                    let sub_nid = sub_roots[i];
+
+                    // Mirror step_node prelude order: short-circuit FIRST.
+                    if let Some(short) =
+                        self.try_resolve_short_circuit(sub_nid, lower_level - 1)
+                    {
+                        child_slots[i] = BfsChildSlot::Direct(short);
+                        continue;
+                    }
+                    let sub_eff =
+                        self.effective_phase_for(sub_nid, schedule_phase, memo_period);
+                    let sub_key = (sub_nid, sub_eff);
+
+                    if let Some(&cached) = self.hashlife_cache.get(&sub_key) {
+                        self.hashlife_stats.cache_hits += 1;
+                        child_slots[i] = BfsChildSlot::Direct(cached);
+                        continue;
+                    }
+
+                    // Dedupe against the lower-level seen map. A second
+                    // sibling pointing at the same (node, eff) counts as
+                    // a cache_hit (matches the per-fanout path's
+                    // accounting: the serial path would have hit-cache
+                    // after the first compute).
+                    if let Some(&pending_idx) = seen[lower_idx].get(&sub_key) {
+                        self.hashlife_stats.cache_hits += 1;
+                        child_slots[i] = BfsChildSlot::Pending(pending_idx);
+                        continue;
+                    }
+
+                    // Unique miss — count and queue.
+                    self.hashlife_stats.cache_misses += 1;
+                    self.hashlife_stats.misses_by_level[(lower_level - 3) as usize] += 1;
+                    self.memo_diag_probe_alias(sub_nid, sub_eff, memo_period);
+
+                    let new_idx = tasks[lower_idx].len();
+                    tasks[lower_idx].push(BfsTask {
+                        node: sub_nid,
+                        effective_phase: sub_eff,
+                        children: [BfsChildSlot::Direct(NodeId::EMPTY); 8],
+                        result: None,
+                    });
+                    seen[lower_idx].insert(sub_key, new_idx);
+                    child_slots[i] = BfsChildSlot::Pending(new_idx);
+                }
+                tasks[level_idx][task_idx].children = child_slots;
+            }
+        }
+
+        // Stats: bfs_tasks_by_level (per-step, not lifetime — accumulated
+        // by HashlifeStats::accumulate at the call-site of step_recursive).
+        for (idx, level_tasks) in tasks.iter().enumerate() {
+            self.hashlife_stats.bfs_tasks_by_level[idx] = level_tasks.len() as u64;
+        }
+
+        // Phase 2: level-3 parallel batch.
+        let level3_count = tasks[0].len();
+        self.hashlife_stats.bfs_level3_unique_misses = level3_count as u64;
+        self.hashlife_stats.bfs_max_batch_len = level3_count as u64;
+
+        // hash-thing-ecmn (review-pass): soft warning when the
+        // unbounded BFS frontier crosses a soft sanity threshold. Plan
+        // §11 documented "no cap, but soft warning if
+        // bfs_level3_unique_misses > 16384". At ~1 KiB grid + ~1 KiB
+        // output per task, 16384 tasks ≈ 32 MiB peak — still safe but
+        // the doubling beyond that gets dangerous fast (262K tasks ≈
+        // 520 MiB at 256³ worst case, multi-GiB at 1024³). When this
+        // warning fires, file a chunked-wavefront follow-up bead. The
+        // log only fires on the BFS path — Serial/RayonPerFanout never
+        // reach this path. (BFS is the default since ite4; operators
+        // who want to revert can set HASH_THING_BASE_CASE_STRATEGY=
+        // per-fanout or serial.)
+        const BFS_FRONTIER_SOFT_LIMIT: usize = 16_384;
+        if level3_count > BFS_FRONTIER_SOFT_LIMIT {
+            log::warn!(
+                target: "hash_thing::hashlife::bfs",
+                "BFS level-3 frontier exceeded soft limit: {level3_count} unique tasks \
+                 (limit {BFS_FRONTIER_SOFT_LIMIT}). Memory peak ~{} MiB pending+output. \
+                 Consider chunked wavefront follow-up.",
+                (level3_count * (LEVEL3_CELL_COUNT * std::mem::size_of::<CellState>() * 2))
+                    / (1024 * 1024),
+            );
+        }
+
+        if !tasks[0].is_empty() {
+            let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> =
+                Vec::with_capacity(level3_count);
+            for task in &tasks[0] {
+                let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+                self.store.flatten_buf(task.node, &mut grid, LEVEL3_SIDE);
+                pending_grids.push(grid);
+            }
+
+            const RAYON_BATCH_THRESHOLD: usize = 4;
+            // step_grid_once_pure receives raw self.generation, NOT
+            // effective_phase — the rule schedule (CaRule per-cell gates,
+            // BlockRule offset parity) is generation-driven; only the
+            // cache key uses effective_phase. (Per Adversarial-Codex
+            // plan-review feedback — restating the invariant for future
+            // readers.)
+            let generation = self.generation;
+            let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
+            let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> =
+                if level3_count < RAYON_BATCH_THRESHOLD {
+                    self.hashlife_stats.bfs_batches_serial_fallback += 1;
+                    pending_grids
+                        .iter()
+                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .collect()
+                } else {
+                    use rayon::prelude::*;
+                    self.hashlife_stats.bfs_batches_parallel += 1;
+                    pending_grids
+                        .par_iter()
+                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .collect()
+                };
+
+            for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
+                self.hashlife_stats.phase1_ns += p1ns;
+                self.hashlife_stats.phase2_ns += p2ns;
+                let centered = self.center_level3_grid_to_node(&output_grid);
+                let task = &mut tasks[0][out_idx];
+                self.hashlife_cache
+                    .insert((task.node, task.effective_phase), centered);
+                task.result = Some(centered);
+            }
+        }
+
+        // Phase 3: ascend levels 4..=root_level.
+        for n in 4..=root_level {
+            let level_idx = (n - 3) as usize;
+            let lower_idx = level_idx - 1;
+            let n_tasks_count = tasks[level_idx].len();
+            for task_idx in 0..n_tasks_count {
+                let result_children: [NodeId; 8] =
+                    std::array::from_fn(|i| match tasks[level_idx][task_idx].children[i] {
+                        BfsChildSlot::Direct(id) => id,
+                        BfsChildSlot::Pending(idx) => tasks[lower_idx][idx]
+                            .result
+                            .expect("BFS ascend: lower-level task must be resolved"),
+                    });
+                let composed = self.store.interior(n - 1, result_children);
+                let task = &mut tasks[level_idx][task_idx];
+                self.hashlife_cache
+                    .insert((task.node, task.effective_phase), composed);
+                task.result = Some(composed);
+            }
+        }
+
+        tasks[max_level_idx][0]
+            .result
+            .expect("BFS root must be resolved after ascend")
     }
 
     fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
@@ -1039,6 +1673,252 @@ fn get_neighbors_from_grid_unchecked(
         }
     }
     neighbors
+}
+
+// hash-thing-ftuu (vqke.4): pure free-function form of the level-3 base case
+// step. Takes `&MaterialRegistry` instead of `&self` so it can be invoked
+// concurrently from rayon worker threads without aliasing `&mut World`.
+//
+// Bit-exact with the prior `World::step_grid_once` body. The wrapper at
+// `World::step_grid_once` forwards here unchanged so existing callers and
+// timer attribution (`phase1_ns` / `phase2_ns`) stay identical.
+//
+// Not part of the public API — only `super::World` and the level-4 rayon
+// path call into this module.
+pub(super) fn step_grid_once_pure(
+    grid: &[CellState],
+    generation: u64,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
+    let side = LEVEL3_SIDE;
+    // Phase 1: CaRule on interior cells (1..side-1 on each axis).
+    // The outermost ring cannot be evolved correctly because its neighbors
+    // would wrap outside the padded region. Callers only extract the center
+    // that remains valid after the requested number of steps.
+    let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+    let phase1_start = std::time::Instant::now();
+    let noop_by_material = materials.noop_flags();
+    let divisor_by_material = materials.tick_divisor_flags();
+    let air_is_noop = noop_by_material.first().copied().unwrap_or(false);
+    for z in 1..side - 1 {
+        for y in 1..side - 1 {
+            for x in 1..side - 1 {
+                let idx = x + y * side + z * side * side;
+                let raw = grid[idx];
+                if raw == 0 && air_is_noop {
+                    continue;
+                }
+                let cell = Cell::from_raw(raw);
+                let mat = cell.material() as usize;
+                if mat < noop_by_material.len() && noop_by_material[mat] {
+                    next[idx] = raw;
+                    continue;
+                }
+                let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                if divisor > 1 && !generation.is_multiple_of(divisor) {
+                    next[idx] = raw;
+                    continue;
+                }
+                let rule = materials
+                    .rule_for_cell(cell)
+                    .unwrap_or_else(|| panic!("missing CaRule for material {}", cell.material()));
+                let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
+                next[idx] = rule.step_cell(cell, &neighbors).raw();
+            }
+        }
+    }
+    let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
+
+    // Phase 2: BlockRule on aligned 2×2×2 blocks. See the comment at the
+    // wrapper site for the parity / divisor schedule details.
+    let phase2_start = std::time::Instant::now();
+    let block_rule_divisors = materials.block_rule_tick_divisors();
+    let all_divisors_one =
+        block_rule_divisors.iter().all(|&d| d == 1) && divisor_by_material.iter().all(|&d| d == 1);
+    if all_divisors_one {
+        let offset = (generation % 2) as usize;
+        let mut bz = offset;
+        while bz + 1 < side - 1 {
+            let mut by = offset;
+            while by + 1 < side - 1 {
+                let mut bx = offset;
+                while bx + 1 < side - 1 {
+                    apply_block_in_grid_pure(&mut next, side, bx, by, bz, materials);
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+    } else {
+        for pass_offset in 0..2usize {
+            let mut bz = pass_offset;
+            while bz + 1 < side - 1 {
+                let mut by = pass_offset;
+                while by + 1 < side - 1 {
+                    let mut bx = pass_offset;
+                    while bx + 1 < side - 1 {
+                        apply_block_in_grid_with_schedule_pure(
+                            &mut next,
+                            side,
+                            bx,
+                            by,
+                            bz,
+                            pass_offset,
+                            generation,
+                            block_rule_divisors,
+                            materials,
+                        );
+                        bx += 2;
+                    }
+                    by += 2;
+                }
+                bz += 2;
+            }
+        }
+    }
+    let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
+    (next, phase1_ns, phase2_ns)
+}
+
+fn apply_block_in_grid_pure(
+    grid: &mut [CellState],
+    side: usize,
+    bx: usize,
+    by: usize,
+    bz: usize,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) {
+    let mut block = [Cell::EMPTY; 8];
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                block[octant_index(dx as u32, dy as u32, dz as u32)] = Cell::from_raw(grid[idx]);
+            }
+        }
+    }
+
+    if block.iter().all(|c| c.is_empty()) {
+        return;
+    }
+
+    let rule_id = match unique_block_rule_pure(materials, &block) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let movable: [bool; 8] = std::array::from_fn(|i| {
+        let c = block[i];
+        c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
+    });
+
+    let rule = materials.block_rule(rule_id);
+    let result = rule.step_block(&block, &movable);
+
+    debug_assert!(
+        (0..8).all(|i| movable[i] || result[i] == block[i]),
+        "block rule moved an immovable cell"
+    );
+
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let i = octant_index(dx as u32, dy as u32, dz as u32);
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                if movable[i] {
+                    grid[idx] = result[i].raw();
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_block_in_grid_with_schedule_pure(
+    grid: &mut [CellState],
+    side: usize,
+    bx: usize,
+    by: usize,
+    bz: usize,
+    pass_offset: usize,
+    generation: u64,
+    block_rule_divisors: &[u16],
+    materials: &crate::terrain::materials::MaterialRegistry,
+) {
+    let mut block = [Cell::EMPTY; 8];
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                block[octant_index(dx as u32, dy as u32, dz as u32)] = Cell::from_raw(grid[idx]);
+            }
+        }
+    }
+
+    if block.iter().all(|c| c.is_empty()) {
+        return;
+    }
+
+    let rule_id = match unique_block_rule_pure(materials, &block) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let divisor = block_rule_divisors
+        .get(rule_id.0)
+        .copied()
+        .unwrap_or(1)
+        .max(1) as u64;
+    if !generation.is_multiple_of(divisor) {
+        return;
+    }
+    let rule_offset = ((generation / divisor) & 1) as usize;
+    if rule_offset != pass_offset {
+        return;
+    }
+
+    let movable: [bool; 8] = std::array::from_fn(|i| {
+        let c = block[i];
+        c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
+    });
+
+    let rule = materials.block_rule(rule_id);
+    let result = rule.step_block(&block, &movable);
+
+    debug_assert!(
+        (0..8).all(|i| movable[i] || result[i] == block[i]),
+        "block rule moved an immovable cell"
+    );
+
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let i = octant_index(dx as u32, dy as u32, dz as u32);
+                let idx = (bx + dx) + (by + dy) * side + (bz + dz) * side * side;
+                if movable[i] {
+                    grid[idx] = result[i].raw();
+                }
+            }
+        }
+    }
+}
+
+fn unique_block_rule_pure(
+    materials: &crate::terrain::materials::MaterialRegistry,
+    block: &[Cell; 8],
+) -> Option<crate::terrain::materials::BlockRuleId> {
+    let mut found: Option<crate::terrain::materials::BlockRuleId> = None;
+    for cell in block {
+        if let Some(id) = materials.block_rule_id_for_cell(*cell) {
+            match found {
+                None => found = Some(id),
+                Some(existing) if existing == id => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -2334,9 +3214,7 @@ mod tests {
 
             // Find every divergent cell.
             let mut diverged: Vec<(usize, usize, usize, u16, u16)> = Vec::new();
-            let idx = |x: usize, y: usize, z: usize| {
-                x + y * side_u + z * side_u * side_u
-            };
+            let idx = |x: usize, y: usize, z: usize| x + y * side_u + z * side_u * side_u;
             for z in 0..side_u {
                 for y in 0..side_u {
                     for x in 0..side_u {
@@ -2391,15 +3269,9 @@ mod tests {
                 let wx = (fx / 8) * 8;
                 let wy = (fy / 8) * 8;
                 let wz = (fz / 8) * 8;
-                eprintln!(
-                    "\n  first divergent cell: (x={fx}, y={fy}, z={fz})"
-                );
-                eprintln!(
-                    "  dumping 8³ window starting at (wx={wx}, wy={wy}, wz={wz})"
-                );
-                eprintln!(
-                    "  window y/z slabs: pre | post-brute | post-recur (cell.material())"
-                );
+                eprintln!("\n  first divergent cell: (x={fx}, y={fy}, z={fz})");
+                eprintln!("  dumping 8³ window starting at (wx={wx}, wy={wy}, wz={wz})");
+                eprintln!("  window y/z slabs: pre | post-brute | post-recur (cell.material())");
                 let dump_window = |grid: &[u16], label: &str| {
                     eprintln!("  {label}:");
                     for dy in 0..8 {
@@ -2440,5 +3312,279 @@ mod tests {
             Some(g) => eprintln!("\n=== first divergence at gen {g} (window dumped above) ==="),
             None => eprintln!("\n=== no divergence in 80 gens ==="),
         }
+    }
+
+    // ============================================================
+    // hash-thing-bjdl (vqke.2): targeted unit tests for the new
+    // memo-hit-rate diagnostic counters. Per Codex plan-review §5,
+    // a "step once on a real scene" test is too non-deterministic;
+    // these inject the exact precondition the counters care about.
+    // ============================================================
+
+    /// `cache_misses_phase_aliased` covers both contracts:
+    /// (a) when `HASH_THING_MEMO_DIAG` is on (forced via the test
+    ///     hook), a miss whose NodeId is already cached at another
+    ///     phase MUST increment the counter; and
+    /// (b) when the gate is off (production default), the same
+    ///     precondition MUST NOT increment — the always-zero-in-prod
+    ///     contract that justifies the env-var gate at all.
+    ///
+    /// Both arms run inline in the SAME test function so the gate
+    /// flag toggle can't race with a sibling test running in parallel
+    /// (cargo test runs tests on multiple threads by default; the
+    /// gate is process-wide). We use a GoL world with a populated
+    /// 4×4×4 region so step_node's inert/all-inert short-circuits
+    /// don't fire before the miss path.
+    #[test]
+    fn cache_misses_phase_aliased_obeys_diag_gate() {
+        // Helper: build the same GoL world + alias precondition
+        // twice (once per arm), so each arm starts from a clean
+        // counter without aliasing across them.
+        fn fresh_world_with_alias_precondition() -> (World, NodeId) {
+            let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+            for x in 2..6 {
+                for y in 2..6 {
+                    for z in 2..6 {
+                        world.set(wc(x), wc(y), wc(z), ALIVE.into());
+                    }
+                }
+            }
+            let any_node = world.root;
+            world.hashlife_cache.insert((any_node, 0), any_node);
+            (world, any_node)
+        }
+
+        // Arm A: gate ON → counter must increment.
+        force_memo_diag_for_test(true);
+        let (mut world_on, node_on) = fresh_world_with_alias_precondition();
+        let before_on = world_on.hashlife_stats.cache_misses_phase_aliased;
+        world_on.step_node(
+            node_on, 3, /*schedule_phase*/ 1, /*memo_period*/ 4,
+        );
+        let after_on = world_on.hashlife_stats.cache_misses_phase_aliased;
+        assert!(
+            after_on > before_on,
+            "with diag ON the alias precondition must fire the counter (before={before_on} after={after_on})"
+        );
+
+        // Arm B: gate OFF → counter must stay at 0.
+        force_memo_diag_for_test(false);
+        let (mut world_off, node_off) = fresh_world_with_alias_precondition();
+        world_off.step_node(node_off, 3, 1, 4);
+        assert_eq!(
+            world_off.hashlife_stats.cache_misses_phase_aliased, 0,
+            "with diag OFF the probe must not fire even when the alias precondition is satisfied"
+        );
+
+        // Reset the gate so any later (parallel) test sees the
+        // production default.
+        force_memo_diag_for_test(false);
+    }
+
+    /// `remap_caches` must split its outcome into kept (entries whose
+    /// node + result both survived the remap) and dropped (everything
+    /// else). Three entries in, two survive, one dropped: counters
+    /// land at 2/1.
+    #[test]
+    fn remap_caches_counts_kept_and_dropped() {
+        let mut world = World::new(4);
+        let n1 = world.store.empty(2);
+        let n2 = world.store.empty(3);
+        let n3 = world.store.empty(4);
+        // Three cache entries: n1→n2, n2→n3, n3→n1. Two survive
+        // remap, one drops.
+        world.hashlife_cache.insert((n1, 0), n2);
+        world.hashlife_cache.insert((n2, 1), n3);
+        world.hashlife_cache.insert((n3, 0), n1);
+
+        let mut remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        remap.insert(n1, n1);
+        remap.insert(n2, n2);
+        // n3 is intentionally NOT in the remap → both keys/values
+        // touching n3 should be dropped.
+
+        world.hashlife_stats = super::super::world::HashlifeStats::default();
+        world.remap_caches(&remap);
+
+        // Survivors: only the (n1, 0) → n2 entry (both endpoints in
+        // the remap). The (n2, 1) → n3 entry drops on the value side
+        // (n3 not in remap), and (n3, 0) → n1 drops on the key side.
+        assert_eq!(
+            world.hashlife_stats.compact_entries_kept, 1,
+            "exactly the (n1, 0) → n2 entry should survive"
+        );
+        assert_eq!(
+            world.hashlife_stats.compact_entries_dropped, 2,
+            "two entries reference the unmapped n3 and must be dropped"
+        );
+        assert_eq!(
+            world.hashlife_stats.compact_entries_kept
+                + world.hashlife_stats.compact_entries_dropped,
+            3,
+            "kept + dropped must equal the pre-remap cache size (3)"
+        );
+    }
+
+    /// `remap_caches` on an empty cache must report 0/0 — no
+    /// underflow on the `before - kept` subtraction (the dropped
+    /// counter is computed as `usize - usize` cast to `u64`).
+    #[test]
+    fn remap_caches_handles_empty_cache_with_zero_counters() {
+        let mut world = World::new(4);
+        world.hashlife_stats = super::super::world::HashlifeStats::default();
+        // hashlife_cache is empty by default.
+        let remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        world.remap_caches(&remap);
+        assert_eq!(world.hashlife_stats.compact_entries_kept, 0);
+        assert_eq!(world.hashlife_stats.compact_entries_dropped, 0);
+    }
+
+    // ============================================================
+    // hash-thing-5ie4 (vqke.2.1): phase-fold tests for the
+    // memo cache key. The fold collapses (NodeId, schedule_phase)
+    // to (NodeId, schedule_phase % 2) for subtrees containing no
+    // slow-divisor materials.
+    // ============================================================
+
+    /// `subtree_has_slow_divisor` correctly classifies a leaf containing
+    /// water (tick_divisor=2 in terrain_defaults) as slow, and an empty
+    /// or stone-only subtree as fast.
+    #[test]
+    fn subtree_has_slow_divisor_classifies_water_vs_stone() {
+        use crate::terrain::materials::{STONE, WATER};
+        let mut world = World::new(4);
+
+        // Empty world root: predicate must be false.
+        assert!(
+            !world.subtree_has_slow_divisor(world.root),
+            "empty subtree must be fast"
+        );
+
+        // Stone-only subtree: stone has tick_divisor=1, predicate false.
+        world.set(wc(1), wc(1), wc(1), STONE);
+        let stone_root = world.root;
+        assert!(
+            !world.subtree_has_slow_divisor(stone_root),
+            "stone-only subtree must be fast (tick_divisor=1)"
+        );
+
+        // Insert one water cell anywhere — predicate flips to true.
+        world.set(wc(8), wc(8), wc(8), WATER);
+        let mixed_root = world.root;
+        assert!(
+            world.subtree_has_slow_divisor(mixed_root),
+            "subtree containing water (tick_divisor=2) must be slow"
+        );
+    }
+
+    /// hash-thing-5ie4 / Codex plan-review §5: stale-cache regression.
+    /// After `mutate_materials` raises a divisor on a material that
+    /// was previously fast, the predicate must reflect the new value
+    /// for previously-cached nodes. Without invalidation in
+    /// `invalidate_material_caches`, the predicate would silently
+    /// return the stale `false` and corrupt the fold.
+    #[test]
+    fn subtree_has_slow_divisor_invalidates_on_material_mutation() {
+        use crate::terrain::materials::{STONE, STONE_MATERIAL_ID};
+        let mut world = World::new(4);
+        world.set(wc(2), wc(2), wc(2), STONE);
+        let stone_root = world.root;
+
+        // Initially fast (stone tick_divisor=1).
+        assert!(
+            !world.subtree_has_slow_divisor(stone_root),
+            "stone subtree starts fast"
+        );
+
+        // Mutate registry: bump stone's divisor to 4.
+        world.set_material_tick_divisor(STONE_MATERIAL_ID, 4);
+
+        // After invalidation, the predicate cache must be cleared
+        // so the fresh query reflects the updated divisor.
+        assert!(
+            world.subtree_has_slow_divisor(stone_root),
+            "after raising stone's tick_divisor, the previously-fast subtree must reclassify as slow — otherwise the fold corrupts the memo"
+        );
+    }
+
+    /// Semantic correctness of the fold: for a fast subtree at a
+    /// period-4 world, `step_recursive` at gen=0 and gen=2 must
+    /// produce identical world.root values when the world's content
+    /// is reset between runs (i.e. without cache reuse). Per Codex
+    /// plan-review §5 this is the test that proves the fold is
+    /// computationally sound, not just that it caches correctly.
+    ///
+    /// Per Claude code-review IMPORTANT: stone+air is self-inert
+    /// (stone has `CaRule::Noop` and no BlockRule), so a stone-only
+    /// world hits the `is_all_inert` short-circuit at the top of
+    /// `step_node` and never enters the fold path. **Use SAND** —
+    /// it has `tick_divisor=1` (so the predicate returns false →
+    /// fold applies) AND a non-trivial `block_rule_id`
+    /// (gravity_block_rule) so the world is not all-inert and
+    /// step_node descends through the cache + base case.
+    #[test]
+    fn fast_subtree_step_result_invariant_under_gen_plus_two() {
+        use crate::terrain::materials::SAND;
+
+        // Build the same fast world twice (sand has tick_divisor=1
+        // → predicate=false → fold applies; gravity block rule →
+        // not inert → recursion + base case actually run); step
+        // once each at gen=0 and gen=2. Result roots must match.
+        fn make_fast_world() -> World {
+            let mut world = World::new(4);
+            // 4×4×4 sand floating in air. Gravity block rule will
+            // step it down, exercising the BlockRule path (which is
+            // where Margolus parity lives). The result must be the
+            // same at gen=0 and gen=2 because both have parity 0.
+            for x in 1..5 {
+                for y in 5..9 {
+                    for z in 1..5 {
+                        world.set(wc(x), wc(y), wc(z), SAND);
+                    }
+                }
+            }
+            world
+        }
+
+        // Run A: gen=0.
+        let mut world_a = make_fast_world();
+        let memo_period_a = world_a.materials.memo_period();
+        // Sanity: terrain_defaults has water (divisor=2) → period=4.
+        assert_eq!(
+            memo_period_a, 4,
+            "this test relies on memo_period=4 from terrain_defaults"
+        );
+        world_a.step_recursive();
+        let root_a_after_gen0 = world_a.root;
+
+        // Run B: gen=2 (skip ahead by 2 BEFORE stepping). Without
+        // the fold this would run with `schedule_phase=2` and
+        // (without our cache fold logic) could produce a different
+        // root if the implementation accidentally referenced the
+        // generation as anything other than `gen % 2`.
+        let mut world_b = make_fast_world();
+        world_b.generation = 2;
+        world_b.step_recursive();
+        let root_b_after_gen2 = world_b.root;
+
+        // Sanity: the step actually moved cells (gravity dropped
+        // sand by one row). If both roots are unchanged from the
+        // pre-step state, the test isn't exercising anything.
+        let world_static = make_fast_world();
+        let static_root = world_static.root;
+        assert_ne!(
+            root_a_after_gen0, static_root,
+            "step_recursive on a sand world should change the root (gravity); test would be a no-op otherwise"
+        );
+
+        // Both worlds did one step on identical content. World A
+        // stepped at gen=0 (phase=0), World B at gen=2 (phase=2 in
+        // raw period; effective_phase=0 after fold). For a fast
+        // subtree the result must be identical — that's the
+        // theorem the fold relies on.
+        assert_eq!(
+            root_a_after_gen0, root_b_after_gen2,
+            "fast subtree must produce identical step result at gen=0 and gen=2 (proves the fold's correctness independent of cache reuse)"
+        );
     }
 }

@@ -90,6 +90,20 @@ if [[ "$CURRENT_BRANCH" != worktree-* ]]; then
     exit 0
 fi
 
+# --- Step 0.5: nuke any inherited target/ ------------------------------------
+# A recycled worktree directory (or one that survived a `git worktree remove`
+# + `git worktree add` cycle) can inherit a `target/` from a prior life. Under
+# the post-a5mv `.cargo/config.toml` (incremental = false), that stale target
+# is wrong-fingerprint AND wasteful — cargo will rebuild from scratch anyway,
+# but the old artifacts sit on disk until the next reap. Wipe pre-emptively.
+# Idempotent: no-op if the directory doesn't exist. Only fires on fresh
+# worktrees because the "Fast path: seat already assigned" early exit
+# above guards every other call. hash-thing-kqw0.
+if [[ -d target ]]; then
+    rm -rf target
+    echo "init-worktree-seat: wiped inherited target/ (fresh-worktree hygiene)" >&2
+fi
+
 # --- Step 1: fetch + reset to origin/main. -----------------------------------
 # `git fetch` is best-effort — offline work shouldn't fail the session start.
 # `git reset --hard` happens regardless, against whatever origin/main we have

@@ -17,7 +17,7 @@ impl BlockRule for IdentityBlockRule {
         *block
     }
 
-    fn clone_box(&self) -> Box<dyn BlockRule + Send> {
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(IdentityBlockRule)
     }
 }
@@ -53,7 +53,7 @@ impl FluidBlockRule {
 }
 
 impl BlockRule for FluidBlockRule {
-    fn clone_box(&self) -> Box<dyn BlockRule + Send> {
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(FluidBlockRule {
             density_fn: self.density_fn,
             phase_fn: self.phase_fn,
@@ -181,7 +181,7 @@ impl GravityBlockRule {
 }
 
 impl BlockRule for GravityBlockRule {
-    fn clone_box(&self) -> Box<dyn BlockRule + Send> {
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(GravityBlockRule {
             density_fn: self.density_fn,
             phase_fn: self.phase_fn,
