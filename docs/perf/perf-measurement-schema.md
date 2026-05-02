@@ -35,7 +35,7 @@ If you're authoring a perf claim, read `regimes.md` first. If you're writing a r
   "rule_set": "default-ca",              // see "Metadata enums" below
   "backend": "hashlife-recursive",
   "hardware": "m2-pro-mbp",
-  "scenario_hash": "sha256:7c3f...",     // or "none" / "unknown"
+  "scenario_hash": "sha256:81aa21c5a72712b2",     // or "none" / "unknown"
   "confidence": { /* see Confidence section */ },
   // schema_version is the 6th metadata field; declared up top.
 
@@ -78,7 +78,7 @@ If you're authoring a perf claim, read `regimes.md` first. If you're writing a r
 
   // These MUST agree with both referenced measurements (defensive copy
   // for record-shape sanity, since the JSONL stream may be filtered).
-  "scenario_hash": "sha256:7c3f...",
+  "scenario_hash": "sha256:81aa21c5a72712b2",
   "rule_set": "default-ca",
 
   "notes": "free-text"
@@ -121,6 +121,37 @@ A comparison is *not* a measurement. The `ratio_metric` must be a key from one o
 | `ci-runner-x86`        | x86_64 GitHub Actions runner.                                  |
 | `unknown`              | Genuinely unrecoverable. Do not use for new claims; archeology rule lets v1 audit rows back-fill. |
 
+### `rule_set` is a code-program axis, not a content axis
+
+Two scenes seeded with the same `rule_set=default-ca` but different live materials (one with fire+water, one with only stone) will have very different measured costs because the rule branches that fire are content-conditioned. That's a `scene` / `scenario_hash` distinction, not a `rule_set` distinction. `rule_set` names which CA + Margolus + block-rule program is loaded; what runs inside it depends on what cells are present.
+
+If a future bench needs to compare runs that share `rule_set` but have very different content, the comparison record should also gate on `scene` (not just `scenario_hash`). Document the concern in `confidence.notes` if this matters for the measurement at hand.
+
+### `scenario_hash` algorithm (v2-A)
+
+The hash is computed over a canonical UTF-8 byte sequence that names the deterministic inputs to the scenario. Two records that share `scenario_hash` MUST produce the same seeded scene; two records that legitimately compare against each other MUST agree on it.
+
+**v2-A recipe** (used until 8ppq.2 lands a RON-driven scenario format that supersedes it):
+
+```
+v2-A canonical input: "v2-A|" + rule_set + "|" + scene + "|" + intensity + "|"
+                      + level + "|" + generations + "|" + terrain_params_json
+```
+
+where `terrain_params_json` is `serde_json::to_string(&TerrainParams)` rendered with sorted keys (or the closest canonical form). `scenario_hash` = `"sha256:" + first 16 hex chars of sha256(canonical_input)`.
+
+**Why `bench_fn` is NOT in the hash:** two records that ran the same scenario via different bench functions are still measuring the same scenario. `bench_fn` is provenance metadata in the measurement record, not a scenario distinguisher. (Same logic applies to `backend` below.)
+
+**v2-B recipe** (active once 8ppq.2 lands):
+
+```
+v2-B canonical input: "v2-B|" + sha256(scenario.ron file bytes) + "|" + seed_int
+```
+
+The version prefix (`v2-A|` / `v2-B|`) lets tooling tell pre-8ppq.2 records from RON-driven ones without breaking the comparison-match contract.
+
+**Why `backend` is NOT in the hash:** the same scenario should produce the same hash regardless of which engine measures it — that's exactly what makes paired-run comparisons valid (chunk-array vs hashlife on the same scene). Engine identity goes in `backend`, not `scenario_hash`.
+
 ### `regime` × `backend` constraint table
 
 A single, hard cross-axis constraint:
@@ -130,9 +161,23 @@ A single, hard cross-axis constraint:
 | `hashlife-recursive`| `cold / warming / saturated / churning / compacted` (see regimes.md) |
 | `chunk-array`       | `n/a` only                                                       |
 | `gpu-compute`       | `n/a` (until a GPU memo design lands; then revisit this table)   |
-| `hybrid`            | `n/a` (caller must choose one of the above per-component or document) |
+| `hybrid`            | the regime of the engine that holds the load-bearing memo cache; if the hybrid has multiple memo layers, `n/a` and use the optional `regime_components` field. |
 
 Records that violate this constraint are malformed.
+
+### Hybrid escape hatch: `regime_components`
+
+For `backend = hybrid`, the top-level `regime` field can either name the load-bearing engine's regime (most common — e.g., a hashlife-on-CPU + GPU-precompute hybrid uses the hashlife regime), or be `n/a` with a sibling `regime_components` object describing each engine separately:
+
+```json
+"regime": "n/a",
+"regime_components": {
+  "cpu_hashlife": "saturated",
+  "gpu_compute": "n/a"
+}
+```
+
+Use `regime_components` when comparison-record `regime` matching is too coarse to be honest about the hybrid's mixed cache state.
 
 ---
 
@@ -168,6 +213,7 @@ Units in the name. Mixing units across records breaks downstream tooling.
 
 | name                  | unit          | semantics                                     |
 |-----------------------|---------------|-----------------------------------------------|
+| `step_us`             | µs            | Per-generation wall-time inside `generations[].step_us`. Aggregate metrics use ms; per-gen detail uses µs because sub-ms generations are common at small worlds. |
 | `step_mean_ms`        | ms            | Arithmetic mean of per-step wall time.        |
 | `step_median_ms`      | ms            | Median per-step wall time.                    |
 | `step_p95_ms`         | ms            | 95th percentile per-step wall time.           |
@@ -175,11 +221,27 @@ Units in the name. Mixing units across records breaks downstream tooling.
 | `wall_total_ms`       | ms            | Sum of per-step wall over the run.            |
 | `pop_count`           | int           | Live cell count at end-of-run.                |
 | `memo_hit_ratio`      | 0.0–1.0       | Hashlife memo hit rate (post-warmup).         |
-| `elision_factor_x`    | × multiplier  | Hashlife elision factor (memo hits ÷ misses+1). |
+| `elision_factor_x`    | × multiplier  | See "elision_factor_x formula" below.         |
 | `seed_ms`             | ms            | Wall-time of the seed step.                   |
 | `compaction_ns`       | ns            | Last `maybe_compact` wall.                    |
 
 New metric names: pick one with the unit suffix; document here in the same PR.
+
+### Numerical precision
+
+- All metric values stored at f64 full precision (no pre-rounding at write-time).
+- Audit-table renderings in `regimes.md` may round to 2 decimals for readability; the canonical record is the JSONL file. Tooling that dedupes or compares MUST read the JSONL value, not the table.
+- Comparison `ratio` values are stored at full f64 precision and rounded only at display time.
+
+### `elision_factor_x` formula
+
+```
+elision_factor_x = (memo_hits + memo_misses) / (memo_misses + 1)
+```
+
+- Counts are **post-warmup**, gated by the same `confidence.warm_frame_policy` that gates `step_p95_ms`. If `warm_frame_policy` is `skip-first-5`, the `memo_hits` / `memo_misses` totals come from generations 5..end.
+- The `+1` in the denominator is Laplace smoothing — guarantees a finite value on a fully-cold or zero-miss run rather than dividing by zero.
+- `memo_evictions` are NOT in this formula. A high-eviction cache still has `elision_factor_x` ≥ 1; eviction pressure is a separate metric (`memo_evict_ratio`, file follow-up if useful).
 
 ---
 
@@ -189,8 +251,28 @@ Every record carries `schema_version: <integer>`. This rev is `2`.
 
 ### Migration policy
 
-- **Additive change** (new optional metadata field, new metric name, new enum value): minor — bump only if downstream tooling needs it. v2 records remain valid.
-- **Coordinate semantics change or rename, or breaking change to record shape**: major bump (v3, v4). Schema doc gains a "v3 changes vs v2" section. Tooling carries a parallel-record-window where it reads both v2 and v3 for ≥1 month while old runs are migrated or aged out.
+- **Additive change**: new OPTIONAL metadata field with a documented default; new metric name; new enum value. Minor — bump only if downstream tooling needs it. v2 records remain valid.
+- **Breaking change**: making a previously-optional field required; renaming a field or enum value; removing a field; changing the meaning of an existing field; tightening a constraint that existing records may violate. Major bump (v3, v4). Schema doc gains a "v3 changes vs v2" section.
+
+### Migration tooling contract
+
+When v3 lands, the same PR MUST land a `scripts/migrate-perf-records.py` (or equivalent) that takes a v2 JSONL file and emits a v3 JSONL file. The script is the migration contract; the prose section is the rationale. Without an executable migrator the schema bump is incomplete.
+
+JSONL is append-only — already-emitted v2 records are NOT rewritten. The migrator produces a v3-shaped *copy* that downstream tools consume; v2 records remain canonical for their write window. Consumer tools either read both shapes (parallel-record-window, ≥1 month) or read only the migrated v3 copy.
+
+### Enum-extension policy
+
+Applies to `rule_set`, `backend`, `hardware`, and any other enum metadata field.
+
+- **Adding a value** is additive (minor bump). Past records that had no occasion to use the new value remain valid.
+- **Renaming or splitting a value** is breaking (major bump). Example: if `m2-pro-mbp` ever splits into `m2-pro-mbp-2023` vs `m2-pro-mbp-2024` for thermal-class differences, that's a v3 change with a migrator.
+- **Cross-machine compatibility classes** (e.g., "all M-series MBPs are roughly comparable") are NOT a coordinate property — they're a consumer-side opt-in: the consumer documents a compatibility table and explicitly compares across the table. Records always store the exact enum value.
+
+### Headline-archetype contract freeze
+
+The 4 headline coordinates (`world / scene / intensity / regime`) and their enum values are part of the v2 contract. The v1 "Open questions" in `regimes.md` (whether intensity is granular enough, whether the archetypes are right) remain open, but resolutions that **add** archetype values are additive (minor); resolutions that **rename or split** existing values are breaking (major).
+
+If a future bead wants to split `cascade` into `cascade-edit` vs `cascade-physics`, that's a v3 schema bump with the migrator path documented above. Same for renaming `passive-active` to `light-traffic`. Don't sneak the change in as additive.
 
 ### Versioning of the schema doc itself
 
@@ -203,9 +285,9 @@ When the schema bumps to v3, the schema-doc filename stays `perf-measurement-sch
 The 8ppq.1.1 MVP comparator landed two measurements at level 5 idle, default-terrain. Per the cherry-pick discipline, both are `easy_only` with the hard regime pointed at 8ppq.1.4 (cascade).
 
 ```jsonl
-{"schema_version":2,"record_kind":"measurement","measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-chunk-array","world":"demo","scene":"default-terrain","intensity":"idle","regime":"n/a","rule_set":"default-ca","backend":"chunk-array","hardware":"m2-pro-mbp","scenario_hash":"unknown","confidence":{"n":30,"warm_frame_policy":"all-frames","source":"bench","cherry_pick_audit":"easy_only","hard_followup_bead":"hash-thing-8ppq.1.4","notes":"32^3 default-terrain idle. CA kernel only, skips commit_step rebuild that a chunk-array-native engine wouldn't pay."},"level":5,"side":32,"git_commit":"a9f65c8","bench_fn":"bench_chunk_array_baseline_32","metrics":{"step_mean_ms":2.097,"step_median_ms":2.081,"step_p95_ms":2.294,"wall_total_ms":62.9},"generations":[]}
-{"schema_version":2,"record_kind":"measurement","measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-hashlife","world":"demo","scene":"default-terrain","intensity":"idle","regime":"saturated","rule_set":"default-ca","backend":"hashlife-recursive","hardware":"m2-pro-mbp","scenario_hash":"unknown","confidence":{"n":30,"warm_frame_policy":"all-frames","source":"bench","cherry_pick_audit":"easy_only","hard_followup_bead":"hash-thing-8ppq.1.4","notes":"32^3 default-terrain idle. step_recursive (full step including maybe_compact + generation advance). Idle reaches near-fixed-point by gen 2; memo_elision=64x."},"level":5,"side":32,"git_commit":"a9f65c8","bench_fn":"bench_hashlife_32","metrics":{"step_mean_ms":0.10,"step_median_ms":0.0,"step_p95_ms":1.20,"wall_total_ms":3.0,"memo_hit_ratio":1.0,"elision_factor_x":64.0},"generations":[]}
-{"schema_version":2,"record_kind":"comparison","comparison_id":"8ppq.1.1-ember-2026-05-02-32idle-pair","subject_measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-chunk-array","baseline_measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-hashlife","ratio":1.91,"ratio_metric":"step_p95_ms","scenario_hash":"unknown","rule_set":"default-ca","notes":"chunk-array p95=2.29ms vs hashlife p95=1.20ms. Engine-cost framing (chunk-array kernel-only, hashlife full step). NOT a closure-grade comparator until 8ppq.1.4 cascade lands."}
+{"schema_version":2,"record_kind":"measurement","measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-chunk-array","world":"tiny","scene":"default-terrain","intensity":"idle","regime":"n/a","rule_set":"default-ca","backend":"chunk-array","hardware":"m2-pro-mbp","scenario_hash":"sha256:81aa21c5a72712b2","confidence":{"n":30,"warm_frame_policy":"all-frames","source":"bench","cherry_pick_audit":"easy_only","hard_followup_bead":"hash-thing-8ppq.1.4","notes":"32^3 default-terrain idle. CA kernel only, skips commit_step rebuild that a chunk-array-native engine wouldn't pay."},"level":5,"side":32,"git_commit":"a9f65c8","bench_fn":"bench_chunk_array_baseline_32","metrics":{"step_mean_ms":2.097,"step_median_ms":2.081,"step_p95_ms":2.294,"wall_total_ms":62.9},"generations":[]}
+{"schema_version":2,"record_kind":"measurement","measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-hashlife","world":"tiny","scene":"default-terrain","intensity":"idle","regime":"saturated","rule_set":"default-ca","backend":"hashlife-recursive","hardware":"m2-pro-mbp","scenario_hash":"sha256:81aa21c5a72712b2","confidence":{"n":30,"warm_frame_policy":"all-frames","source":"bench","cherry_pick_audit":"easy_only","hard_followup_bead":"hash-thing-8ppq.1.4","notes":"32^3 default-terrain idle. step_recursive (full step including maybe_compact + generation advance). Idle reaches near-fixed-point by gen 2; memo_elision=64x."},"level":5,"side":32,"git_commit":"a9f65c8","bench_fn":"bench_hashlife_32","metrics":{"step_mean_ms":0.10,"step_median_ms":0.0,"step_p95_ms":1.20,"wall_total_ms":3.0,"memo_hit_ratio":1.0,"elision_factor_x":64.0},"generations":[]}
+{"schema_version":2,"record_kind":"comparison","comparison_id":"8ppq.1.1-ember-2026-05-02-32idle-pair","subject_measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-chunk-array","baseline_measurement_id":"8ppq.1.1-ember-2026-05-02-32idle-hashlife","ratio":1.91,"ratio_metric":"step_p95_ms","scenario_hash":"sha256:81aa21c5a72712b2","rule_set":"default-ca","notes":"chunk-array p95=2.29ms vs hashlife p95=1.20ms. Engine-cost framing (chunk-array kernel-only, hashlife full step). Both records share scenario_hash, so the comparison-record honesty constraint passes — they are measuring the same scenario, differing only in backend. NOT a closure-grade comparator until 8ppq.1.4 cascade lands."}
 ```
 
 Reading this: the 32³ idle comparison shows hashlife is 1.91× faster on `step_p95_ms`, but BOTH records self-disclose that idle is the easy regime; the load-bearing measurement is 8ppq.1.4's cascade pair, due once that lands.

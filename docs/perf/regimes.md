@@ -30,7 +30,7 @@ The cube the sim runs in. Level + side length.
 
 | name        | level | side  | aliases                               |
 |-------------|-------|-------|---------------------------------------|
-| `tiny`      | 4     | 16³   | unit-test scale, parity sandbox       |
+| `tiny`      | 4-5   | 16³-32³ | unit-test / parity-sandbox scale (8ppq.1.1's 32³ MVP comparator lives here) |
 | `small`     | 6     | 64³   | property-test scale                   |
 | `medium`    | 7     | 128³  | thesis-probe scale                    |
 | `demo`      | 8     | 256³  | the live demo default                 |
@@ -127,8 +127,8 @@ Honest inventory of historical numbers, retrofitted to v2 coordinates with hardw
 | "step 36 ms / 67 p95"         | demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 67         | demo (n=1)   | hard_included     |
 | "elision 5.6× at cascade peak"| demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | elision_factor   | 5.6×       | demo (n=1)   | hard_included     |
 | "memo_hit 0.41 → 0.72"        | demo · default-terrain · unknown · saturated         | hashlife-recursive  | default-ca  | m2-pro-mbp   | memo_hit_ratio   | 0.41-0.72  | mixed        | mixed             |
-| "chunk-array p95=2.29ms"      | demo · default-terrain · idle · n/a                  | chunk-array         | default-ca  | m2-pro-mbp   | step_p95_ms      | 2.29       | bench (n=30) | easy_only (8ppq.1.4) |
-| "hashlife p95=1.20ms"         | demo · default-terrain · idle · saturated            | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 1.20       | bench (n=30) | easy_only (8ppq.1.4) |
+| "chunk-array p95=2.29ms"      | tiny (l=5) · default-terrain · idle · n/a            | chunk-array         | default-ca  | m2-pro-mbp   | step_p95_ms      | 2.29       | bench (n=30) | easy_only (8ppq.1.4) |
+| "hashlife p95=1.20ms"         | tiny (l=5) · default-terrain · idle · saturated      | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 1.20       | bench (n=30) | easy_only (8ppq.1.4) |
 
 The cherry-pick problem is now structurally visible: the rosier numbers are flagged `easy_only` and carry their `hard_followup_bead` (8ppq.1.4 cascade-regime measurement); the cascade-peak rows are `hard_included`. New claims that flag `easy_only` MUST cite a follow-up bead per the schema's `confidence.cherry_pick_audit` constraint — see [`perf-measurement-schema.md`](./perf-measurement-schema.md).
 
