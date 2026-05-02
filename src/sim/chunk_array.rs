@@ -91,25 +91,43 @@ impl ChunkArrayWorld {
 
     /// Advance one generation. Mirrors `World::step` minus `commit_step`
     /// (no octree to commit to). Both paths route through
-    /// `brute_step_grid`, so divergence between the two engines is
-    /// by-construction impossible.
+    /// `brute_step_grid`, so divergence in the brute-force kernel
+    /// itself is by-construction impossible — see the parity-test
+    /// commentary in this file's `tests` module for what the parity
+    /// test actually catches.
     ///
     /// Generation timing matches `World::step`: the call reads
     /// `self.generation`, computes the next grid, then bumps —
-    /// equivalent to `World::step` reading generation at world.rs:1260
-    /// and bumping inside `commit_step` at world.rs:2873-2875.
+    /// equivalent to `World::step` reading generation, calling
+    /// `step_grid`, then `commit_step` bumping inside the octree
+    /// commit at the `self.generation += 1` line in `commit_step`.
     pub(crate) fn step(&mut self) {
         let next = brute_step_grid(&self.grid, self.side, &self.materials, self.generation);
         self.grid = next;
         self.generation += 1;
     }
 
-    /// Direct cell write — mirror of `World::set` for the chunk-array
-    /// path. Used by microchurn parity tests to drop sand identically
-    /// into both engines. OOB writes silently dropped (absorbing
-    /// boundary; matches `World::apply_mutations` semantics for OOB
-    /// `SetCell` mutations).
+    /// Direct cell write — used by microchurn parity tests to drop sand
+    /// identically into both engines. **OOB semantics deviate from
+    /// `World::set`:** this method silently drops out-of-bounds writes
+    /// (absorbing boundary, matching `World::apply_mutations`'s queue
+    /// path for OOB `SetCell`), whereas `World::set` panics on negative
+    /// or beyond-side coords. Microchurn tests stay in-bounds by
+    /// construction; the `debug_assert!` below catches a future caller
+    /// who accidentally passes OOB and then can't reproduce the
+    /// hashlife-side panic.
     pub(crate) fn set(&mut self, x: i64, y: i64, z: i64, state: CellState) {
+        debug_assert!(
+            x >= 0
+                && y >= 0
+                && z >= 0
+                && (x as usize) < self.side
+                && (y as usize) < self.side
+                && (z as usize) < self.side,
+            "ChunkArrayWorld::set OOB at ({x}, {y}, {z}) for side={}; \
+             World::set would panic — both must use in-bounds coords",
+            self.side
+        );
         if x < 0 || y < 0 || z < 0 {
             return;
         }
@@ -235,6 +253,29 @@ mod tests {
     }
 
     // --- Tick parity (8ppq.1.3) -----------------------------------------
+    //
+    // Post-refactor `World::step` and `ChunkArrayWorld::step` both call
+    // the same `brute_step_grid` free function, so a "two-engine
+    // divergence" reading of the parity claim is structurally
+    // tautological — the kernels agree by construction. What these
+    // tests actually catch:
+    //
+    // - `commit_step` round-trip integrity: hashlife flattens its
+    //   octree, the brute kernel produces a new flat grid, then
+    //   `commit_step` re-builds an octree via `from_flat`,
+    //   `compacted_with_remap`, and store swap. If that round-trip
+    //   ever perturbs cell values (octree compaction bug, store remap
+    //   off-by-one, etc.) the parity test fires.
+    // - `ChunkArrayWorld::set` ↔ `World::set` write-path agreement on
+    //   the microchurn variant.
+    // - Future regressions that bypass the shared `brute_step_grid`
+    //   (e.g. a hashlife-only fast path that diverges from brute).
+    //
+    // The "single source of truth" framing is intentional per
+    // 8ppq.1.3's plan-review #7. If a future bead introduces a
+    // chunk-array native step (path a, parallel to the SVDAG-rebuild
+    // skip in 8ppq.1.2.A's native seeder), the parity test gains its
+    // genuine cross-engine bite back.
 
     use crate::sim::WorldCoord;
     use crate::terrain::materials::SAND;
