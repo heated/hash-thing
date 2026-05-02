@@ -59,6 +59,7 @@ Each worktree has its own `target/` (no per-target-dir lock contention across co
 - **Bump the sccache cap** to `30G`: `export SCCACHE_CACHE_SIZE=30G` in your shell rc, then `sccache --stop-server` (it autorestarts on next call). Default 10 GiB is too small for the multi-crew working set.
 - **Don't run plain `cargo clean`** in a worktree expecting it to free disk fast — it just nukes that one worktree's target. The shared dep cost is in `~/Library/Caches/Mozilla.sccache` (sccache's storage). For real disk recovery, `rm -rf <worktree>/target` for idle worktrees.
 - **CI override:** `RUSTC_WRAPPER=""` in CI env block to skip sccache when the build is sandboxed and won't benefit.
+- **Reap stale worktree targets** (hash-thing-kqw0). Closed-bead worktrees keep their `target/` until reaped — that's where the project's actual disk pressure comes from, not active build cost. Run `scripts/reap-worktrees.sh` (dry-run by default) to see the action plan, then `--apply` to actually delete. The reaper only touches `target/` for worktrees whose seat-branch resolves to a CLOSED bead; codex pool, `worktree-*` cruft, and active builds are skipped. Wire it into a launchd plist with the absolute path for a daily cadence.
 
 ## Agent surface — where project skills and commands live
 
