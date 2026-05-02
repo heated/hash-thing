@@ -29,6 +29,8 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 
 **Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper forces `bd` to use the repo-root shared `.beads` database/server from any worktree, preserves `BEADS_ACTOR` while hopping to main, and adds preflight checks on `bd close` so issues are only closed after the relevant commit is on `origin/main`.
 
+**Use `.bin/codex` instead of bare `codex` for any background invocation.** The wrapper emits a hang-warning preamble at the call site so the standard `~60s silence → TaskStop` mitigation is impossible to miss. See `hash-thing-27j9`.
+
 Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` under "Gate Tiers." Default sensitivity applies here; amend the line below if the bar should move project-wide.
 
 ```
