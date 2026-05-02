@@ -1260,6 +1260,20 @@ impl World {
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
+        let next = self.step_grid(&grid);
+        self.commit_step(&next, side);
+    }
+
+    /// Brute-force step on a flat grid; returns the new grid.
+    ///
+    /// Bench seam for the chunk-array baseline (8ppq.1.1) — keeps the flat
+    /// `Vec<CellState>` canonical so the comparator can skip the octree
+    /// rebuild that `commit_step` performs. Does not mutate the octree and
+    /// does not advance `generation`; callers that want full-step semantics
+    /// (`step`) commit to the octree and bump `generation` themselves.
+    #[doc(hidden)]
+    pub fn step_grid(&self, grid: &[CellState]) -> Vec<CellState> {
+        let side = self.side();
         let mut next = vec![0 as CellState; side * side * side];
         let divisor_by_material = self.materials.tick_divisor_flags();
         let generation = self.generation;
@@ -1279,7 +1293,7 @@ impl World {
                         next[idx] = raw;
                         continue;
                     }
-                    let neighbors = get_neighbors(&grid, side, x, y, z);
+                    let neighbors = get_neighbors(grid, side, x, y, z);
                     let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
                         panic!("missing CaRule for material {}", center.material())
                     });
@@ -1297,8 +1311,7 @@ impl World {
         // visible-artifact tradeoff and fallbacks A/F. No post-pass
         // gap-fill runs in production.
         self.step_blocks(&mut next, side);
-
-        self.commit_step(&next, side);
+        next
     }
 
     /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.

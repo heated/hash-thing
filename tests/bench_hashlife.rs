@@ -116,6 +116,17 @@ fn bench_hashlife_512() {
     bench_step("512³", 9, 20);
 }
 
+/// hash-thing-8ppq.1.1: small-scene comparator pair against
+/// `bench_chunk_array_baseline_32`. At level=5 (32³) hashlife is not
+/// expected to dominate brute-force chunk-array — memos at this scale
+/// are mostly trivial — and that *is* the data point: it shows where
+/// hashlife's content folding does and does not pay off.
+#[test]
+#[ignore]
+fn bench_hashlife_32() {
+    bench_step("32³ (8ppq.1.1 comparator)", 5, 30);
+}
+
 /// hash-thing-tk4j (vqke.3): 256³ matches the szyh baseline scale that
 /// surfaced p1=47ms / step=172ms. Used to read the new memo_skip_empty /
 /// memo_skip_fixed tokens against representative terrain so the bead can
