@@ -2,19 +2,18 @@
 //! no hashlife memo. Used by the chunk-array baseline comparator for
 //! the navigation epic.
 //!
-//! ## Storage round-trip only — not a parallel seeder
+//! ## Flat storage with native seed parity
 //!
-//! `ChunkArrayWorld` is a snapshot of a hashlife `World`'s flatten +
-//! materials clone. It is **not** a parallel implementation of the
-//! terrain seeder. Per-cell agreement with hashlife is by-construction
-//! (we copy hashlife's flatten output); detecting independent-engine
-//! seed drift requires a path-(a) native seeder, which is filed as a
-//! follow-up.
+//! `ChunkArrayWorld` can either snapshot a hashlife `World`'s flatten +
+//! materials clone or seed directly into its flat storage. The snapshot
+//! path is useful for iteration parity; the native seeder is the
+//! cross-engine seed check that bypasses `World::seed_terrain` and the
+//! SVDAG build.
 //!
 //! Concretely, when future bench code times
 //! [`ChunkArrayWorld::seeded`] the timing is **hashlife's** SVDAG build
-//! cost, not a chunk-array engine's seed cost. A native chunk-array
-//! engine would skip leaf-coalescing entirely.
+//! cost, not a chunk-array engine's seed cost. Use
+//! [`ChunkArrayWorld::seeded_native`] to skip leaf-coalescing entirely.
 //!
 //! Both points are intentional limits of the MVP comparator harness;
 //! they exist to unblock L1 navigation-epic leads with matched scenes
@@ -23,6 +22,7 @@
 use crate::octree::{Cell, CellState};
 use crate::sim::world::brute_step_grid;
 use crate::sim::World;
+use crate::terrain::field::{PrecomputedHeightmapField, WorldGen};
 use crate::terrain::materials::MaterialRegistry;
 use crate::terrain::TerrainParams;
 
@@ -63,6 +63,34 @@ impl ChunkArrayWorld {
             .seed_terrain(params)
             .expect("level-derived TerrainParams must validate");
         Self::from_world(&world)
+    }
+
+    /// Seed directly into flat storage. This intentionally shares the
+    /// terrain field's leaf sampler with `World::seed_terrain`, but it
+    /// does not route through `World`, `gen_region`, SVDAG construction,
+    /// or hashlife caches.
+    pub(crate) fn seeded_native(level: u32, params: &TerrainParams) -> Self {
+        params
+            .validate()
+            .expect("level-derived TerrainParams must validate");
+        let field = PrecomputedHeightmapField::new(params.to_heightmap(), level)
+            .expect("validated TerrainParams must yield a valid heightmap field");
+        let side = 1usize << level;
+        let mut grid = Vec::with_capacity(side * side * side);
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    grid.push(field.sample([x as i64, y as i64, z as i64]));
+                }
+            }
+        }
+        Self {
+            level,
+            side,
+            grid,
+            materials: MaterialRegistry::terrain_defaults(),
+            generation: 0,
+        }
     }
 
     pub(crate) fn level(&self) -> u32 {
@@ -249,6 +277,33 @@ mod tests {
         assert_eq!(
             convenience.population_by_material(),
             explicit.population_by_material()
+        );
+    }
+
+    #[test]
+    fn seeded_native_matches_hashlife_seeded_level_5() {
+        let level = 5;
+        let params = TerrainParams::for_level(level);
+        let native = ChunkArrayWorld::seeded_native(level, &params);
+
+        let mut hashlife = World::new(level);
+        hashlife
+            .seed_terrain(&params)
+            .expect("validated params must seed");
+        let seeded = ChunkArrayWorld::from_world(&hashlife);
+
+        assert_eq!(native.level(), seeded.level());
+        assert_eq!(native.side(), seeded.side());
+        assert_eq!(native.generation(), seeded.generation());
+        assert_eq!(native.grid(), seeded.grid());
+        assert_eq!(native.population(), seeded.population());
+        assert_eq!(
+            native.population_by_material(),
+            seeded.population_by_material()
+        );
+        assert_eq!(
+            native.materials().tick_divisor_flags(),
+            seeded.materials().tick_divisor_flags()
         );
     }
 
