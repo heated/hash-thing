@@ -3302,6 +3302,104 @@ mod tests {
         }
     }
 
+    /// hash-thing-neql: DefaultDemo cascade comparator drift localizer.
+    ///
+    /// Reproduces the 8ppq.1.4 comparator caveat at a smaller level than the
+    /// recorded `medium · default-demo · cascade · churning` level-7 run. The
+    /// chunk-array baseline calls `brute_step_grid`; `World::step()` is the
+    /// same brute kernel with octree commit, so a brute-vs-recursive mismatch
+    /// here means the drift is in recursive semantics rather than the
+    /// scenario-runner comparator wrapper.
+    #[test]
+    #[ignore]
+    fn repro_neql_default_demo_cascade_brute_vs_recursive_drift() {
+        use crate::terrain::TerrainParams;
+        use std::collections::BTreeMap;
+
+        let level = 6u32;
+        let side = 1usize << level;
+
+        let make_world = || -> World {
+            let mut w = World::new(level);
+            let params = TerrainParams::for_level(level);
+            w.seed_terrain(&params).expect("terrain");
+            w.seed_water_and_sand();
+            w.seed_demo_spectacle();
+            w
+        };
+
+        let mut brute = make_world();
+        let mut recur = make_world();
+        assert_eq!(brute.flatten(), recur.flatten(), "initial state mismatch");
+
+        let idx = |x: usize, y: usize, z: usize| x + y * side + z * side * side;
+        let material_counts = |grid: &[CellState]| -> BTreeMap<u16, usize> {
+            let mut counts = BTreeMap::new();
+            for raw in grid {
+                let material = Cell::from_raw(*raw).material();
+                if material != 0 {
+                    *counts.entry(material).or_insert(0) += 1;
+                }
+            }
+            counts
+        };
+
+        for gen in 0..20u32 {
+            let pre = brute.flatten();
+            brute.step();
+            recur.step_margolus_only();
+
+            let brute_post = brute.flatten();
+            let recur_mid = recur.flatten();
+
+            if brute_post != recur_mid {
+                let mut pair_counts: BTreeMap<(u16, u16), usize> = BTreeMap::new();
+                let mut first = None;
+                for z in 0..side {
+                    for y in 0..side {
+                        for x in 0..side {
+                            let i = idx(x, y, z);
+                            let b = Cell::from_raw(brute_post[i]).material();
+                            let r = Cell::from_raw(recur_mid[i]).material();
+                            if b != r {
+                                first.get_or_insert((x, y, z, b, r));
+                                *pair_counts.entry((b, r)).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+
+                eprintln!("=== neql first drift at pre-step gen {gen} ===");
+                eprintln!("first divergent cell: {first:?}");
+                eprintln!("material pair counts brute->recursive: {pair_counts:?}");
+                eprintln!("pre non-air material counts: {:?}", material_counts(&pre));
+                eprintln!(
+                    "brute non-air material counts: {:?}",
+                    material_counts(&brute_post)
+                );
+                eprintln!(
+                    "recursive non-air material counts: {:?}",
+                    material_counts(&recur_mid)
+                );
+
+                recur.finalize_step_after_external_gap_fill();
+                assert_eq!(
+                    brute.generation, recur.generation,
+                    "generation counters must stay aligned after split finalize"
+                );
+                return;
+            }
+
+            recur.finalize_step_after_external_gap_fill();
+            assert_eq!(
+                brute.generation, recur.generation,
+                "generation counters diverged after gen {gen}"
+            );
+        }
+
+        panic!("DefaultDemo cascade stayed byte-identical for 20 generations");
+    }
+
     // ============================================================
     // hash-thing-bjdl (vqke.2): targeted unit tests for the new
     // memo-hit-rate diagnostic counters. Per Codex plan-review §5,
