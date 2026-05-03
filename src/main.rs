@@ -43,6 +43,10 @@ enum AppUserEvent {
     /// records the wrapper / poll-lag perf samples, and calls
     /// `request_redraw()` so the next frame uses the fresh world.
     SimDone(Result<(sim::World, SimThreadTimings), String>),
+    /// The background world-growth worker finished. Rendering continues from
+    /// the previous SVDAG while this is in flight; the main thread restores
+    /// and uploads the grown world when the event arrives.
+    WorldGrowDone(Result<sim::World, String>),
 }
 
 #[cfg(target_os = "macos")]
@@ -62,6 +66,7 @@ use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_S
 /// or stepping slowly — see hash-thing-q63.
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
+const WORLD_PREFETCH_MARGIN_METERS: f64 = 64.0;
 
 /// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
 /// the threshold at which a human reads a changing number without
@@ -78,6 +83,56 @@ fn record_gpu_timing_sample(
     if let Some(lag) = sample.lag_frames {
         perf.record_scalar(lag_metric, lag as f64);
     }
+}
+
+fn world_prefetch_region_for_player(
+    origin: [i64; 3],
+    side: i64,
+    pos: [f64; 3],
+    player_height: f64,
+) -> Option<([sim::WorldCoord; 3], [sim::WorldCoord; 3])> {
+    let horizontal_margin =
+        (WORLD_PREFETCH_MARGIN_METERS * CELLS_PER_METER).max(GROWTH_MARGIN) as i64;
+    let vertical_margin = GROWTH_MARGIN as i64;
+    let margins = [horizontal_margin, vertical_margin, horizontal_margin];
+    let player_max = [pos[0], pos[1] + player_height, pos[2]];
+    let near_pos_edge =
+        (0..3).any(|i| player_max[i] > origin[i] as f64 + side as f64 - margins[i] as f64);
+    let near_neg_edge = (0..3).any(|i| pos[i] < origin[i] as f64 + margins[i] as f64);
+    if !near_pos_edge && !near_neg_edge {
+        return None;
+    }
+
+    Some((
+        [
+            sim::WorldCoord(pos[0] as i64 - horizontal_margin),
+            sim::WorldCoord(pos[1] as i64 - vertical_margin),
+            sim::WorldCoord(pos[2] as i64 - horizontal_margin),
+        ],
+        [
+            sim::WorldCoord(pos[0] as i64 + horizontal_margin),
+            sim::WorldCoord((pos[1] + player_height) as i64 + vertical_margin),
+            sim::WorldCoord(pos[2] as i64 + horizontal_margin),
+        ],
+    ))
+}
+
+fn clamp_player_pos_to_loaded_world(
+    origin: [i64; 3],
+    side: i64,
+    mut pos: [f64; 3],
+    player_height: f64,
+) -> [f64; 3] {
+    let min = [origin[0] as f64, origin[1] as f64, origin[2] as f64];
+    let max = [
+        (origin[0] + side - 1) as f64,
+        (origin[1] + side - 1) as f64 - player_height,
+        (origin[2] + side - 1) as f64,
+    ];
+    for i in 0..3 {
+        pos[i] = pos[i].clamp(min[i], max[i]);
+    }
+    pos
 }
 
 /// Bound on consecutive failed FPS cursor-grab attempts before the
@@ -726,6 +781,10 @@ struct App {
     /// kicks the worker, cleared in `apply_step_result` when the user
     /// event arrives. The detached worker thread cleans itself up.
     step_pending: bool,
+    /// Background world-prefetch liveness flag (hash-thing-n8hy). Unlike
+    /// `step_pending`, this keeps `self.world` live on the main thread:
+    /// the worker grows a clone and swaps it in only on success.
+    world_prefetch_pending: bool,
     /// When the background step was spawned, for perf timing.
     step_start: std::time::Instant,
     /// hash-thing-dbv3 (vqke.1.1): proxy used by the sim worker thread
@@ -1057,6 +1116,7 @@ impl App {
             dump_frame_path: None,
             dump_scene: None,
             step_pending: false,
+            world_prefetch_pending: false,
             step_start: std::time::Instant::now(),
             event_proxy: None,
             render_origin,
@@ -1656,7 +1716,7 @@ impl App {
     }
 
     fn maybe_start_background_step(&mut self) {
-        if self.paused || self.is_stepping() || self.freeze_sim {
+        if self.paused || self.is_stepping() || self.world_prefetch_pending || self.freeze_sim {
             return;
         }
         self.step_start = std::time::Instant::now();
@@ -1751,6 +1811,90 @@ impl App {
                 w.request_redraw();
             }
         });
+    }
+
+    fn maybe_start_world_prefetch(&mut self, min: [sim::WorldCoord; 3], max: [sim::WorldCoord; 3]) {
+        if self.is_stepping() || self.world_prefetch_pending {
+            return;
+        }
+        let old_level = self.world.level;
+        let mut world = self.world.clone();
+        let proxy = self.event_proxy.clone();
+        let window = self.window.clone();
+        self.world_prefetch_pending = true;
+        std::thread::spawn(move || {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                world.ensure_region(min, max);
+                world
+            }))
+            .map_err(|e| {
+                if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                }
+            });
+
+            if let Some(proxy) = proxy {
+                let _ = proxy.send_event(AppUserEvent::WorldGrowDone(payload));
+            }
+            if let Some(window) = window {
+                window.request_redraw();
+            }
+        });
+        log::info!(
+            "World prefetch queued from level {old_level} for region {:?}..{:?}",
+            min,
+            max,
+        );
+    }
+
+    fn apply_world_grow_result(&mut self, payload: Result<sim::World, String>) {
+        if !self.world_prefetch_pending {
+            return;
+        }
+        self.world_prefetch_pending = false;
+
+        match payload {
+            Ok(world) => {
+                let old_origin = self.render_origin;
+                self.world = world;
+                {
+                    let _t = self.perf.start("collision_snapshot_refresh");
+                    self.collision_snapshot = Some(self.world.collision_snapshot());
+                }
+                self.last_memo_summary = self.world.memo_summary();
+                self.memo_hud_dirty = true;
+                self.sync_render_cache();
+                {
+                    let player_pos = self.player_world_pos();
+                    let _t = self.perf.start("upload_cpu");
+                    Self::upload_volume(
+                        &mut self.renderer,
+                        &mut self.world,
+                        &mut self.svdag,
+                        &mut self.last_svdag_stats,
+                        LodUploadCtx {
+                            policy: &mut self.lod_policy,
+                            player_pos,
+                            last_histogram: &mut self.last_lod_histogram,
+                            last_growth_ratio: &mut self.last_lod_growth_ratio,
+                        },
+                    );
+                }
+                log::info!(
+                    "World prefetch finished: side {} origin {:?} (was {:?})",
+                    self.world.side(),
+                    self.world.origin,
+                    old_origin,
+                );
+            }
+            Err(msg) => {
+                log::error!("World prefetch panicked: {msg}");
+            }
+        }
     }
 
     /// hash-thing-dbv3 (vqke.1.1): ingest the sim worker's result. Called
@@ -2878,6 +3022,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                     window.request_redraw();
                 }
             }
+            AppUserEvent::WorldGrowDone(payload) => {
+                self.apply_world_grow_result(payload);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
@@ -3679,6 +3829,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                         } else {
                             &self.world
                         };
+                        let loaded_world_bounds = self
+                            .world_prefetch_pending
+                            .then(|| (self.world.origin, self.world.side() as i64));
                         if let Some(p) = self.entities.get_mut(pid) {
                             let step = player::step_grounded_movement(
                                 grid,
@@ -3693,77 +3846,36 @@ impl ApplicationHandler<AppUserEvent> for App {
                                 },
                             );
                             p.pos = step.pos;
+                            if let Some((origin, side)) = loaded_world_bounds {
+                                p.pos = clamp_player_pos_to_loaded_world(
+                                    origin,
+                                    side,
+                                    p.pos,
+                                    PLAYER_HEIGHT,
+                                );
+                            }
                             p.vel[1] = step.vertical_velocity;
                         }
                         if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
                             camera_grounded = player::is_grounded(grid, &p.pos);
                         }
                         let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
-                        // hash-thing-m1f.4 / 37r: grow the world when the
-                        // player approaches any boundary (positive or negative).
-                        // Skipped during background step — world is placeholder.
+                        // hash-thing-n8hy: prefetch world growth before the
+                        // player can see the realized root boundary. Generation
+                        // runs on a background worker; render keeps drawing the
+                        // previous SVDAG until the grown world returns.
                         if !self.is_stepping() {
                             if let Some(p) = self.entities.get_mut(pid) {
                                 let origin = self.world.origin;
-                                let side = self.world.side() as f64;
+                                let side = self.world.side() as i64;
                                 let pos = p.pos;
-                                let margin = GROWTH_MARGIN as i64;
-                                let near_pos_edge = pos
-                                    .iter()
-                                    .enumerate()
-                                    .any(|(i, &c)| c > origin[i] as f64 + side - GROWTH_MARGIN);
-                                let near_neg_edge = pos
-                                    .iter()
-                                    .enumerate()
-                                    .any(|(i, &c)| c < origin[i] as f64 + GROWTH_MARGIN);
-                                if near_pos_edge || near_neg_edge {
-                                    let min = [
-                                        sim::WorldCoord(pos[0] as i64 - margin),
-                                        sim::WorldCoord(pos[1] as i64 - margin),
-                                        sim::WorldCoord(pos[2] as i64 - margin),
-                                    ];
-                                    let max = [
-                                        sim::WorldCoord(pos[0] as i64 + margin),
-                                        sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
-                                        sim::WorldCoord(pos[2] as i64 + margin),
-                                    ];
-                                    let old_level = self.world.level;
-                                    self.world.ensure_region(min, max);
-                                    // 0s9v: ensure_region may grow the
-                                    // world; refresh the collision snapshot
-                                    // so the next background step starts
-                                    // from the grown state. Timed under the
-                                    // same metric as the other two refresh
-                                    // sites so sweeps observe the full
-                                    // clone-cost distribution.
-                                    {
-                                        let _t = self.perf.start("collision_snapshot_refresh");
-                                        self.collision_snapshot =
-                                            Some(self.world.collision_snapshot());
-                                    }
-                                    if self.world.level != old_level {
-                                        log::info!(
-                                            "World grew: level {} → {} (side {}, origin {:?})",
-                                            old_level,
-                                            self.world.level,
-                                            self.world.side(),
-                                            self.world.origin,
-                                        );
-                                        let player_pos = self.player_world_pos();
-                                        Self::upload_volume(
-                                            &mut self.renderer,
-                                            &mut self.world,
-                                            &mut self.svdag,
-                                            &mut self.last_svdag_stats,
-                                            LodUploadCtx {
-                                                policy: &mut self.lod_policy,
-                                                player_pos,
-                                                last_histogram: &mut self.last_lod_histogram,
-                                                last_growth_ratio: &mut self.last_lod_growth_ratio,
-                                            },
-                                        );
-                                        self.sync_render_cache();
-                                    }
+                                if let Some((min, max)) = world_prefetch_region_for_player(
+                                    origin,
+                                    side,
+                                    pos,
+                                    PLAYER_HEIGHT,
+                                ) {
+                                    self.maybe_start_world_prefetch(min, max);
                                 }
                             }
                         }
@@ -4371,6 +4483,62 @@ mod tests {
             },
         );
         assert_eq!(perf.summary(), "render_pass_gpu=4.00/4.00ms");
+    }
+
+    #[test]
+    fn world_prefetch_region_none_in_middle() {
+        assert!(
+            world_prefetch_region_for_player([0, 0, 0], 1024, [512.0, 64.0, 512.0], PLAYER_HEIGHT)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_positive_edge() {
+        let (min, max) =
+            world_prefetch_region_for_player([0, 0, 0], 1024, [900.0, 64.0, 512.0], PLAYER_HEIGHT)
+                .expect("player should be inside prefetch band");
+        assert!(max[0].0 >= 1024, "prefetch region must cross +x edge");
+        assert!(min[0].0 < 900);
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_negative_edge() {
+        let (min, max) =
+            world_prefetch_region_for_player([0, 0, 0], 1024, [120.0, 64.0, 512.0], PLAYER_HEIGHT)
+                .expect("player should be inside prefetch band");
+        assert!(min[0].0 < 0, "prefetch region must cross -x edge");
+        assert!(max[0].0 > 120);
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_positive_vertical_edge() {
+        let (min, max) = world_prefetch_region_for_player(
+            [0, 0, 0],
+            1024,
+            [512.0, 1018.0, 512.0],
+            PLAYER_HEIGHT,
+        )
+        .expect("player should be inside vertical prefetch band");
+        assert!(max[1].0 >= 1024, "prefetch region must cross +y edge");
+        assert!(min[1].0 < 1018);
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_negative_vertical_edge() {
+        let (min, max) =
+            world_prefetch_region_for_player([0, 0, 0], 1024, [512.0, 4.0, 512.0], PLAYER_HEIGHT)
+                .expect("player should be inside vertical prefetch band");
+        assert!(min[1].0 < 0, "prefetch region must cross -y edge");
+        assert!(max[1].0 > 4);
+    }
+
+    #[test]
+    fn clamp_player_pos_to_loaded_world_blocks_unrealized_space() {
+        assert_eq!(
+            clamp_player_pos_to_loaded_world([0, 0, 0], 32, [-4.0, 40.0, 99.0], PLAYER_HEIGHT),
+            [0.0, 31.0 - PLAYER_HEIGHT, 31.0]
+        );
     }
 
     #[test]
@@ -5585,6 +5753,61 @@ mod tests {
         // we've already asserted the kick-off behaviour
         // (`is_stepping()` true after `maybe_start_background_step`),
         // which is the contract the test is named for.
+    }
+
+    #[test]
+    fn background_step_does_not_start_during_world_prefetch() {
+        let mut app = App::new(32);
+        app.world_prefetch_pending = true;
+        app.maybe_start_background_step();
+
+        assert!(
+            !app.step_pending,
+            "sim step must not race a world clone being grown for prefetch"
+        );
+        assert_eq!(
+            app.world.side(),
+            32,
+            "live world must remain available while prefetch is pending"
+        );
+    }
+
+    #[test]
+    fn apply_world_grow_result_ok_clears_pending_and_swaps_world() {
+        let mut app = App::new(32);
+        let mut grown = app.world.clone();
+        grown.ensure_region(
+            [sim::WorldCoord(-1), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+            ],
+        );
+        let grown_side = grown.side();
+
+        app.world_prefetch_pending = true;
+        app.apply_world_grow_result(Ok(grown));
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.world.side(), grown_side);
+        assert!(app.world.side() > 32, "grown world should be installed");
+        assert!(!app.paused, "successful prefetch must not pause the sim");
+    }
+
+    #[test]
+    fn apply_world_grow_result_err_keeps_live_world_and_clears_pending() {
+        let mut app = App::new(32);
+        let original_side = app.world.side();
+        let original_origin = app.world.origin;
+
+        app.world_prefetch_pending = true;
+        app.apply_world_grow_result(Err("simulated prefetch panic".to_string()));
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.world.side(), original_side);
+        assert_eq!(app.world.origin, original_origin);
+        assert!(!app.paused, "prefetch failure must not pause the sim");
     }
 
     /// hash-thing-dbv3 (vqke.1.1): cover the `apply_step_result` seam
