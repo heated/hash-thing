@@ -1,0 +1,13 @@
+(
+    name: "cascade-peak",
+    world: Small,
+    level: Some(6),
+    scene: DefaultDemo,
+    rule_set: DefaultCa,
+    intensity: Cascade,
+    regime: Churning,
+    backend: HashlifeRecursive,
+    generations: 3,
+    seed: 1,
+    comparator: Some("chunk-array@same-scenario"),
+)

@@ -1,0 +1,13 @@
+(
+    name: "factory-conveyor-toy",
+    world: Tiny,
+    level: Some(5),
+    scene: FactoryConveyor,
+    rule_set: DefaultCa,
+    intensity: PassiveActive,
+    regime: Saturated,
+    backend: HashlifeRecursive,
+    generations: 3,
+    seed: 7,
+    comparator: Some("chunk-array@same-scenario"),
+)
