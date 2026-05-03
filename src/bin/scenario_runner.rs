@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,7 +189,7 @@ struct MeasurementRecord {
     generations: Vec<GenerationRecord>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ComparisonRecord {
     schema_version: u32,
     record_kind: &'static str,
@@ -259,7 +259,7 @@ fn parse_args() -> Result<Args, String> {
     let mut raw = std::env::args_os().skip(1);
     let first = raw.next().ok_or_else(usage)?;
     let mut append = None;
-    let mut hardware = "m2-pro-mbp".to_string();
+    let mut hardware = "unknown".to_string();
     let mode = if first == "--compare" {
         let jsonl = raw
             .next()
@@ -356,6 +356,7 @@ fn compare_records(
     metric: &str,
 ) -> Result<ComparisonRecord, String> {
     let text = read_utf8(jsonl)?;
+    let mut seen_measurement_ids = std::collections::HashSet::new();
     let mut subject = None;
     let mut baseline = None;
     for (i, line) in text.lines().enumerate() {
@@ -374,6 +375,13 @@ fn compare_records(
                 i + 1
             )
         })?;
+        if !seen_measurement_ids.insert(record.measurement_id.clone()) {
+            return Err(format!(
+                "duplicate measurement_id in {}: {}",
+                jsonl.display(),
+                record.measurement_id
+            ));
+        }
         if record.measurement_id == subject_id {
             subject = Some(record);
         } else if record.measurement_id == baseline_id {
@@ -390,6 +398,9 @@ fn compare_records(
         return Err(format!("baseline metric {metric} is zero"));
     }
     let ratio = subject_value / baseline_value;
+    let drift = generation_drift_note(&subject, &baseline)
+        .map(|note| format!("; {note}"))
+        .unwrap_or_default();
     Ok(ComparisonRecord {
         schema_version: 2,
         record_kind: "comparison",
@@ -409,8 +420,25 @@ fn compare_records(
             metric,
             baseline_value,
             ratio
-        ),
+        ) + &drift,
     })
+}
+
+fn generation_drift_note(
+    subject: &MeasurementRecord,
+    baseline: &MeasurementRecord,
+) -> Option<String> {
+    let last_subject = subject.generations.last()?;
+    let last_baseline = baseline.generations.last()?;
+    if last_subject.pop_count == last_baseline.pop_count
+        && last_subject.mat_distribution == last_baseline.mat_distribution
+    {
+        return None;
+    }
+    Some(format!(
+        "trajectory caveat: final measured pop/material distribution differ (subject pop={}, baseline pop={}); see hash-thing-neql",
+        last_subject.pop_count, last_baseline.pop_count
+    ))
 }
 
 fn validate_comparable(
@@ -418,29 +446,97 @@ fn validate_comparable(
     baseline: &MeasurementRecord,
     metric: &str,
 ) -> Result<(), String> {
-    let checks = [
-        (
-            "scenario_hash",
-            &subject.scenario_hash,
-            &baseline.scenario_hash,
-        ),
-        ("rule_set", &subject.rule_set, &baseline.rule_set),
-        ("hardware", &subject.hardware, &baseline.hardware),
-    ];
-    for (name, a, b) in checks {
-        if a != b {
-            return Err(format!("comparison mismatch on {name}: {a:?} vs {b:?}"));
-        }
-    }
-    if subject.level != baseline.level || subject.side != baseline.side {
+    validate_measurement_record(subject)?;
+    validate_measurement_record(baseline)?;
+    compare_u32(
+        "schema_version",
+        subject.schema_version,
+        baseline.schema_version,
+    )?;
+    compare_str(
+        "scenario_hash",
+        &subject.scenario_hash,
+        &baseline.scenario_hash,
+    )?;
+    compare_str("rule_set", &subject.rule_set, &baseline.rule_set)?;
+    compare_str("hardware", &subject.hardware, &baseline.hardware)?;
+    compare_str("world", &subject.world, &baseline.world)?;
+    compare_str("scene", &subject.scene, &baseline.scene)?;
+    compare_str("intensity", &subject.intensity, &baseline.intensity)?;
+    compare_usize("confidence.n", subject.confidence.n, baseline.confidence.n)?;
+    compare_str(
+        "confidence.warm_frame_policy",
+        &subject.confidence.warm_frame_policy,
+        &baseline.confidence.warm_frame_policy,
+    )?;
+    compare_u32("level", subject.level, baseline.level)?;
+    compare_u64("side", subject.side, baseline.side)?;
+    if subject.backend == baseline.backend {
         return Err(format!(
-            "comparison mismatch on level/side: l{} {}³ vs l{} {}³",
-            subject.level, subject.side, baseline.level, baseline.side
+            "comparison requires distinct backends, got {:?}",
+            subject.backend
         ));
     }
     metric_value(&subject.metrics, metric)?;
     metric_value(&baseline.metrics, metric)?;
     Ok(())
+}
+
+fn validate_measurement_record(record: &MeasurementRecord) -> Result<(), String> {
+    if record.schema_version != 2 {
+        return Err(format!(
+            "unsupported measurement schema_version {} for {}",
+            record.schema_version, record.measurement_id
+        ));
+    }
+    if record.record_kind != "measurement" {
+        return Err(format!(
+            "record_kind is not measurement: {}",
+            record.record_kind
+        ));
+    }
+    if !matches!(
+        record.confidence.source.as_str(),
+        "bench" | "demo" | "manual" | "spec"
+    ) {
+        return Err(format!(
+            "invalid confidence.source {:?} for {}",
+            record.confidence.source, record.measurement_id
+        ));
+    }
+    Ok(())
+}
+
+fn compare_str(name: &str, a: &str, b: &str) -> Result<(), String> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(format!("comparison mismatch on {name}: {a:?} vs {b:?}"))
+    }
+}
+
+fn compare_usize(name: &str, a: usize, b: usize) -> Result<(), String> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(format!("comparison mismatch on {name}: {a} vs {b}"))
+    }
+}
+
+fn compare_u32(name: &str, a: u32, b: u32) -> Result<(), String> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(format!("comparison mismatch on {name}: {a} vs {b}"))
+    }
+}
+
+fn compare_u64(name: &str, a: u64, b: u64) -> Result<(), String> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(format!("comparison mismatch on {name}: {a} vs {b}"))
+    }
 }
 
 fn metric_value(metrics: &MetricsRecord, metric: &str) -> Result<f64, String> {
@@ -488,10 +584,12 @@ fn run_scenario(
         schema_version: 2,
         record_kind: "measurement".to_string(),
         measurement_id: format!(
-            "{}-{}-{}",
+            "{}-{}-{}-{}-{}",
             scenario.name,
             scenario.backend.as_str(),
-            hash_suffix
+            hash_suffix,
+            git_commit(),
+            run_epoch_millis()
         ),
         world: scenario.world.as_str().to_string(),
         scene: scenario.scene.as_str().to_string(),
@@ -504,7 +602,7 @@ fn run_scenario(
         confidence: ConfidenceRecord {
             n: scenario.generations,
             warm_frame_policy: warm_frame_policy(warmup_generations),
-            source: "scenario-runner".to_string(),
+            source: "bench".to_string(),
             cherry_pick_audit: cherry_pick_audit(scenario).to_string(),
             hard_followup_bead: hard_followup_bead(scenario),
             notes: confidence_notes(scenario, path, warmup_generations),
@@ -531,6 +629,13 @@ fn git_commit() -> String {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn run_epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn validate_backend_regime(scenario: &Scenario) -> Result<(), String> {
@@ -602,13 +707,20 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
         }
         Backend::HashlifeRecursive => "hashlife path times step_recursive",
     };
+    let drift_note = if matches!(scenario.scene, Scene::DefaultDemo)
+        && matches!(scenario.intensity, Intensity::Cascade)
+    {
+        "; same-seed comparator does not by itself prove byte-identical trajectory; inspect mat_distribution/pop_count and hash-thing-neql"
+    } else {
+        ""
+    };
     format!(
         "scenario={}, path={}, warmup_generations={}, {}",
         scenario.name,
         path.display(),
         warmup_generations,
         seed_note
-    )
+    ) + drift_note
 }
 
 fn run_hashlife(
@@ -724,17 +836,21 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
 }
 
 fn scenario_hash(scenario: &Scenario, level: u32) -> String {
-    let canonical = format!(
-        "v2-B-canonical|world={}|level={level}|scene={}|rule_set={}|intensity={}|generations={}|warmup_generations={}|seed={}",
+    format!(
+        "sha256:{}",
+        hex16(scenario_hash_canonical_input(scenario, level).as_bytes())
+    )
+}
+
+fn scenario_hash_canonical_input(scenario: &Scenario, level: u32) -> String {
+    format!(
+        "v2-B-canonical|world={}|level={level}|scene={}|rule_set={}|intensity={}|seed={}",
         scenario.world.as_str(),
         scenario.scene.as_str(),
         scenario.rule_set.as_str(),
         scenario.intensity.as_str(),
-        scenario.generations,
-        scenario.warmup_generations.unwrap_or(0),
         scenario.seed
-    );
-    format!("sha256:{}", hex16(canonical.as_bytes()))
+    )
 }
 
 fn hex16(bytes: &[u8]) -> String {
@@ -756,6 +872,9 @@ fn cherry_pick_audit(scenario: &Scenario) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn scenario_hash_changes_with_seed() {
@@ -775,6 +894,39 @@ mod tests {
         assert!(validate_backend_regime(&scenario).is_err());
     }
 
+    #[test]
+    fn compare_records_rejects_duplicate_measurement_ids() {
+        let a = test_measurement("same-id", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("same-id", "hashlife-recursive", "saturated", 1.0);
+        let path = write_jsonl(&[&a, &b]);
+        let err = compare_records(&path, "same-id", "missing", "step_p95_ms").unwrap_err();
+        assert!(err.contains("duplicate measurement_id"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_emits_ratio_and_drift_caveat() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        let path = write_jsonl(&[&a, &b]);
+        let comparison =
+            compare_records(&path, "chunk", "hashlife", "step_p95_ms").expect("comparison");
+        assert_eq!(comparison.ratio, 5.0);
+        assert!(comparison.notes.contains("trajectory caveat"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_rejects_mismatched_hardware() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        b.hardware = "m2-ultra-mac-pro".to_string();
+        let path = write_jsonl(&[&a, &b]);
+        let err = compare_records(&path, "chunk", "hashlife", "step_p95_ms").unwrap_err();
+        assert!(err.contains("hardware"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
     fn test_scenario(backend: Backend, regime: Regime) -> Scenario {
         Scenario {
             name: "test".to_string(),
@@ -790,5 +942,69 @@ mod tests {
             seed: 1,
             comparator: None,
         }
+    }
+
+    fn test_measurement(
+        measurement_id: &str,
+        backend: &str,
+        regime: &str,
+        step_p95_ms: f64,
+    ) -> MeasurementRecord {
+        MeasurementRecord {
+            schema_version: 2,
+            record_kind: "measurement".to_string(),
+            measurement_id: measurement_id.to_string(),
+            world: "medium".to_string(),
+            scene: "default-demo".to_string(),
+            intensity: "cascade".to_string(),
+            regime: regime.to_string(),
+            rule_set: "default-ca".to_string(),
+            backend: backend.to_string(),
+            hardware: "m2-pro-mbp".to_string(),
+            scenario_hash: "sha256:test".to_string(),
+            confidence: ConfidenceRecord {
+                n: 2,
+                warm_frame_policy: "skip-first-1".to_string(),
+                source: "bench".to_string(),
+                cherry_pick_audit: "hard_included".to_string(),
+                hard_followup_bead: None,
+                notes: "test".to_string(),
+            },
+            level: 7,
+            side: 128,
+            git_commit: "test".to_string(),
+            bench_fn: "scenario-runner".to_string(),
+            comparator: None,
+            metrics: MetricsRecord {
+                step_mean_ms: step_p95_ms,
+                step_median_ms: step_p95_ms,
+                step_p95_ms,
+                wall_total_ms: step_p95_ms * 2.0,
+                memo_hit_ratio: None,
+                elision_factor_x: None,
+            },
+            generations: vec![GenerationRecord {
+                gen: 0,
+                step_us: (step_p95_ms * 1000.0) as u128,
+                pop_count: if backend == "chunk-array" { 11 } else { 10 },
+                drops: 0,
+                mat_distribution: Some(serde_json::json!({"1": 10})),
+            }],
+        }
+    }
+
+    fn write_jsonl(records: &[&MeasurementRecord]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-scenario-runner-test-{}-{}.jsonl",
+            std::process::id(),
+            TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let body = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize test record"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{body}\n")).expect("write test jsonl");
+        path
     }
 }
