@@ -4576,7 +4576,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hash_thing::sim::world::QuarantineAtlasLayout;
     use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
+    use ht_octree::CellState;
     use std::time::Duration;
 
     #[test]
@@ -5468,6 +5470,109 @@ mod tests {
         assert!(
             !app.apply_quarantine_atlas_pattern_at([66, 27, 64]),
             "budget exhaustion must block pattern spam"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct QuarantineThreatMetrics {
+        fire_or_lava_in_lane: usize,
+        intact_settlement_grass: usize,
+    }
+
+    fn count_materials_in_box(
+        world: &sim::World,
+        min: [i64; 3],
+        max: [i64; 3],
+        materials: &[CellState],
+    ) -> usize {
+        let mut count = 0;
+        for z in min[2]..=max[2] {
+            for y in min[1]..=max[1] {
+                for x in min[0]..=max[0] {
+                    let cell =
+                        world.get(sim::WorldCoord(x), sim::WorldCoord(y), sim::WorldCoord(z));
+                    if materials.contains(&cell) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn quarantine_threat_metrics(
+        world: &sim::World,
+        layout: QuarantineAtlasLayout,
+    ) -> QuarantineThreatMetrics {
+        use hash_thing::terrain::materials::{FIRE, GRASS, LAVA};
+
+        let lane_min = [
+            layout.hazard_center[0] + 7,
+            layout.floor_y + 1,
+            layout.hazard_center[2] - 4,
+        ];
+        let lane_max = [
+            layout.settlements[1][0] - 5,
+            layout.floor_y + 2,
+            layout.hazard_center[2] + 4,
+        ];
+        let settlement = layout.settlements[1];
+        let settlement_min = [settlement[0] - 3, settlement[1], settlement[2] - 3];
+        let settlement_max = [settlement[0] + 3, settlement[1] + 3, settlement[2] + 3];
+
+        QuarantineThreatMetrics {
+            fire_or_lava_in_lane: count_materials_in_box(world, lane_min, lane_max, &[FIRE, LAVA]),
+            intact_settlement_grass: count_materials_in_box(
+                world,
+                settlement_min,
+                settlement_max,
+                &[GRASS],
+            ),
+        }
+    }
+
+    fn run_quarantine_plan(plan: &[(QuarantineAtlasPattern, [i64; 3])]) -> QuarantineThreatMetrics {
+        let mut world = sim::World::new(7);
+        let layout = world.seed_quarantine_atlas_demo();
+        for &(pattern, center) in plan {
+            stamp_quarantine_atlas_pattern(&mut world, pattern, center);
+        }
+        for _ in 0..16 {
+            world.step_recursive();
+        }
+        quarantine_threat_metrics(&world, layout)
+    }
+
+    #[test]
+    fn quarantine_atlas_mixed_plan_beats_barrier_only_on_wide_lane() {
+        let mut seeded = sim::World::new(7);
+        let layout = seeded.seed_quarantine_atlas_demo();
+        let y = layout.floor_y + 1;
+        let z = layout.hazard_center[2];
+        let xs = [40, 50, 60, 70, 80, 90];
+        let barrier_only = xs.map(|x| (QuarantineAtlasPattern::Barrier, [x, y, z]));
+        let mixed = [
+            (QuarantineAtlasPattern::Firebreak, [40, y, z]),
+            (QuarantineAtlasPattern::CoolingTrench, [50, y, z]),
+            (QuarantineAtlasPattern::Firebreak, [60, y, z]),
+            (QuarantineAtlasPattern::CoolingTrench, [70, y, z]),
+            (QuarantineAtlasPattern::Barrier, [80, y, z]),
+            (QuarantineAtlasPattern::Barrier, [90, y, z]),
+        ];
+
+        let barrier_metrics = run_quarantine_plan(&barrier_only);
+        let mixed_metrics = run_quarantine_plan(&mixed);
+        eprintln!(
+            "Quarantine Atlas comparison: barrier={barrier_metrics:?}, mixed={mixed_metrics:?}"
+        );
+
+        assert!(
+            mixed_metrics.fire_or_lava_in_lane < barrier_metrics.fire_or_lava_in_lane,
+            "mixed plan should leave fewer active hazard cells in the wide lane: barrier={barrier_metrics:?}, mixed={mixed_metrics:?}"
+        );
+        assert!(
+            mixed_metrics.intact_settlement_grass >= barrier_metrics.intact_settlement_grass,
+            "mixed plan should not protect the middle settlement worse: barrier={barrier_metrics:?}, mixed={mixed_metrics:?}"
         );
     }
 
