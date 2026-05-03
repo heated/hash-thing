@@ -30,7 +30,8 @@ struct Uniforms {
     camera_right: vec4<f32>,
     // x: root_side_cells (2^root_level), y: aspect, z: fov_tan, w: screen_height
     params: vec4<f32>,
-    // x: debug_mode (0=normal, 1=step-count heatmap), y: lod_bias, z: output_width, w: output_height
+    // x: debug_mode (0=normal, 1=step-count heatmap, 2=normal-axis,
+    //    3=hit-kind, 4=raw material), y: lod_bias, z: output_width, w: output_height
     debug: vec4<f32>,
 };
 
@@ -295,6 +296,16 @@ fn heatmap_color(ratio: f32) -> vec3<f32> {
     return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
 }
 
+fn normal_axis_debug(normal: vec3<f32>) -> vec3<f32> {
+    if abs(normal.x) > 0.5 {
+        return select(vec3<f32>(0.45, 0.0, 0.0), vec3<f32>(1.0, 0.15, 0.15), normal.x > 0.0);
+    }
+    if abs(normal.y) > 0.5 {
+        return select(vec3<f32>(0.0, 0.35, 0.0), vec3<f32>(0.25, 1.0, 0.25), normal.y > 0.0);
+    }
+    return select(vec3<f32>(0.0, 0.0, 0.45), vec3<f32>(0.25, 0.45, 1.0), normal.z > 0.0);
+}
+
 // Iterative DAG descent.
 //
 // Strategy: for each ray, start at root. At each level, compute which octant
@@ -462,6 +473,28 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     let lod_hit_pos =
                         ro_local + rd * max(lod_hit_t, 0.0) - normal * (INV_RES * 0.25);
                     let lod_time = u.camera_pos.w;
+                    let debug_mode = u32(u.debug.x);
+                    if debug_mode == 2u {
+                        return RayResult(
+                            vec4<f32>(normal_axis_debug(normal), max(entry + max(lod_hit_t, 0.0), 1e-4)),
+                            step,
+                            max_steps,
+                        );
+                    }
+                    if debug_mode == 3u {
+                        return RayResult(
+                            vec4<f32>(1.0, 0.25, 1.0, max(entry + max(lod_hit_t, 0.0), 1e-4)),
+                            step,
+                            max_steps,
+                        );
+                    }
+                    if debug_mode == 4u {
+                        return RayResult(
+                            vec4<f32>(material_color(lod_mat), max(entry + max(lod_hit_t, 0.0), 1e-4)),
+                            step,
+                            max_steps,
+                        );
+                    }
                     let lod_props = material_shade(lod_mat, lod_hit_pos, normal, lod_time);
                     let lit = shade_surface(lod_props, normal, rd);
                     return RayResult(
@@ -558,6 +591,28 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                     let hit_pos =
                         ro_local + rd * max(hit_t, 0.0) - normal * (INV_RES * 0.25);
                     let hit_time = u.camera_pos.w;
+                    let debug_mode = u32(u.debug.x);
+                    if debug_mode == 2u {
+                        return RayResult(
+                            vec4<f32>(normal_axis_debug(normal), max(entry + max(hit_t, 0.0), 1e-4)),
+                            step,
+                            max_steps,
+                        );
+                    }
+                    if debug_mode == 3u {
+                        return RayResult(
+                            vec4<f32>(0.15, 1.0, 0.35, max(entry + max(hit_t, 0.0), 1e-4)),
+                            step,
+                            max_steps,
+                        );
+                    }
+                    if debug_mode == 4u {
+                        return RayResult(
+                            vec4<f32>(material_color(mat), max(entry + max(hit_t, 0.0), 1e-4)),
+                            step,
+                            max_steps,
+                        );
+                    }
                     let surf = material_shade(mat, hit_pos, normal, hit_time);
                     let lit = shade_surface(surf, normal, rd);
                     return RayResult(

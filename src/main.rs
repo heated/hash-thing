@@ -755,6 +755,8 @@ struct App {
     /// hash-thing-jszv: deterministic diagnostic camera pose for
     /// `--dump-frame`, applied after any dump scene setup and before capture.
     dump_pose: Option<DumpPose>,
+    /// hash-thing-nznv: diagnostic shader mode for one-shot dump frames.
+    dump_debug: Option<DumpDebugMode>,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -1063,6 +1065,7 @@ impl App {
             dump_frame_path: None,
             dump_scene: None,
             dump_pose: None,
+            dump_debug: None,
             step_pending: false,
             world_prefetch_pending: false,
             next_world_prefetch_generation: 0,
@@ -3115,6 +3118,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                 self.volume_size,
                 self.target_pixels_override,
             ));
+            if let Some(mode) = self.dump_debug {
+                renderer.debug_mode = mode.renderer_debug_mode();
+            }
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
             // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
             // `surface.get_current_texture()` + `present()`; pairs with the
@@ -4274,6 +4280,40 @@ impl DumpPose {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpDebugMode {
+    NormalAxis,
+    HitKind,
+    Material,
+}
+
+impl DumpDebugMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "normal-axis" => Some(Self::NormalAxis),
+            "hit-kind" => Some(Self::HitKind),
+            "material" => Some(Self::Material),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NormalAxis => "normal-axis",
+            Self::HitKind => "hit-kind",
+            Self::Material => "material",
+        }
+    }
+
+    fn renderer_debug_mode(self) -> u32 {
+        match self {
+            Self::NormalAxis => 2,
+            Self::HitKind => 3,
+            Self::Material => 4,
+        }
+    }
+}
+
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
 /// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
 /// `demo`).
@@ -4293,6 +4333,9 @@ struct ParsedArgs {
     /// `--dump-pose NAME`: hash-thing-jszv, only meaningful with
     /// `--dump-frame`. Selects a deterministic camera pose before capture.
     dump_pose: Option<DumpPose>,
+    /// `--dump-debug MODE`: hash-thing-nznv, only meaningful with
+    /// `--dump-frame`. Selects a diagnostic shader mode before capture.
+    dump_debug: Option<DumpDebugMode>,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -4316,13 +4359,15 @@ where
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
                          [--dump-frame PATH] \
                          [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|lattice-intro|lattice-interior|lattice-panorama] \
-                         [--dump-pose wall|blocks|terrain-wide]";
+                         [--dump-pose wall|blocks|terrain-wide] \
+                         [--dump-debug normal-axis|hit-kind|material]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
     let mut dump_frame: Option<std::path::PathBuf> = None;
     let mut dump_scene: Option<DumpScene> = None;
     let mut dump_pose: Option<DumpPose> = None;
+    let mut dump_debug: Option<DumpDebugMode> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -4394,6 +4439,22 @@ where
                     .unwrap_or_else(|| panic!("{USAGE}\n--dump-pose NAME: unrecognised '{v_str}'"));
                 dump_pose = Some(parsed);
             }
+            "--dump-debug" => {
+                if dump_debug.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-debug");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-debug requires a MODE"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-debug requires a MODE; saw '{v_str}'");
+                }
+                let parsed = DumpDebugMode::parse(v_str).unwrap_or_else(|| {
+                    panic!("{USAGE}\n--dump-debug MODE: unrecognised '{v_str}'")
+                });
+                dump_debug = Some(parsed);
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -4418,6 +4479,9 @@ where
     if dump_pose.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-pose requires --dump-frame");
     }
+    if dump_debug.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-debug requires --dump-frame");
+    }
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
@@ -4430,6 +4494,7 @@ where
         dump_frame,
         dump_scene,
         dump_pose,
+        dump_debug,
     }
 }
 
@@ -4474,6 +4539,7 @@ fn main() {
         dump_frame: dump_frame_path,
         dump_scene,
         dump_pose,
+        dump_debug,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -4498,6 +4564,12 @@ fn main() {
         log::info!(
             "--dump-pose: {} (will apply before dump-frame render)",
             pose.label()
+        );
+    }
+    if let Some(mode) = dump_debug {
+        log::info!(
+            "--dump-debug: {} (will apply before dump-frame render)",
+            mode.label()
         );
     }
 
@@ -4545,6 +4617,7 @@ fn main() {
     app.dump_frame_path = dump_frame_path;
     app.dump_scene = dump_scene;
     app.dump_pose = dump_pose;
+    app.dump_debug = dump_debug;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -4937,6 +5010,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_from_dump_debug_all_kinds() {
+        for (raw, expected, debug_mode) in [
+            ("normal-axis", DumpDebugMode::NormalAxis, 2),
+            ("hit-kind", DumpDebugMode::HitKind, 3),
+            ("material", DumpDebugMode::Material, 4),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-debug", raw]);
+            assert_eq!(r.dump_debug, Some(expected), "kind={raw}");
+            assert_eq!(expected.renderer_debug_mode(), debug_mode, "kind={raw}");
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "--dump-scene requires --dump-frame")]
     fn parse_args_from_dump_scene_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-scene", "lattice-intro"]);
@@ -4946,6 +5032,12 @@ mod tests {
     #[should_panic(expected = "--dump-pose requires --dump-frame")]
     fn parse_args_from_dump_pose_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-pose", "blocks"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-debug requires --dump-frame")]
+    fn parse_args_from_dump_debug_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-debug", "normal-axis"]);
     }
 
     #[test]
@@ -4973,6 +5065,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "--dump-debug MODE: unrecognised 'bogus'")]
+    fn parse_args_from_dump_debug_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-debug", "bogus"]);
+    }
+
+    #[test]
     #[should_panic(expected = "more than one --dump-scene")]
     fn parse_args_from_two_dump_scene_panics() {
         let _ = parse_args_from([
@@ -4995,6 +5093,19 @@ mod tests {
             "wall",
             "--dump-pose",
             "blocks",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-debug")]
+    fn parse_args_from_two_dump_debug_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-debug",
+            "normal-axis",
+            "--dump-debug",
+            "hit-kind",
         ]);
     }
 

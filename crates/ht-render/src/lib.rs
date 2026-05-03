@@ -132,6 +132,29 @@ mod wgsl_drift_guard {
     }
 
     #[test]
+    fn wgsl_dump_debug_modes_cover_7m63_axes() {
+        let expected_lines = [
+            "fn normal_axis_debug(normal: vec3<f32>) -> vec3<f32>",
+            "if debug_mode == 2u",
+            "normal_axis_debug(normal)",
+            "if debug_mode == 3u",
+            "vec4<f32>(1.0, 0.25, 1.0",
+            "vec4<f32>(0.15, 1.0, 0.35",
+            "if debug_mode == 4u",
+            "vec4<f32>(material_color(lod_mat)",
+            "vec4<f32>(material_color(mat)",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` — dump-frame \
+                 diagnostics need normal-axis, LOD-vs-leaf, and raw-material \
+                 modes for hash-thing-nznv / 7m63."
+            );
+        }
+    }
+
+    #[test]
     fn wgsl_hit_alpha_tracks_scene_distance() {
         let expected_lines = [
             "vec4<f32>(lit, max(entry + max(lod_hit_t, 0.0), 1e-4))",

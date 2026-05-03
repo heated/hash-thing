@@ -83,7 +83,8 @@ struct Uniforms {
     camera_right: [f32; 4],
     /// x: volume_size, y: aspect_ratio, z: fov_tan, w: screen_height
     params: [f32; 4],
-    /// x: debug_mode (0=normal, 1=step-count heatmap), y/z/w: reserved
+    /// x: debug_mode (0=normal, 1=step-count heatmap, 2+=dump diagnostics),
+    /// y/z/w: reserved
     debug: [f32; 4],
 }
 
@@ -529,7 +530,7 @@ pub struct Renderer {
     pub camera_dist: f32,
     pub camera_target: [f32; 3],
 
-    /// Debug render mode. 0 = normal, 1 = step-count heatmap.
+    /// Debug render mode. 0 = normal, 1 = step-count heatmap, 2+=dump diagnostics.
     pub debug_mode: u32,
     /// LOD bias multiplier. 1.0 = default, higher = more aggressive LOD.
     pub lod_bias: f32,
