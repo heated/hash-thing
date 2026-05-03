@@ -59,10 +59,10 @@ After all 6 complete, launch 2 synthesis agents (standard + critical), then open
 |-------|------|------|---------|
 | Claude | Agent | Standard | Agent tool with standard prompt |
 | Claude | Agent | Critical | Agent tool with critical prompt |
-| Codex | Bash | Standard | `env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read {prompt_file}..." < /dev/null 2>&1 \| tee {log}` |
+| Codex | Bash | Standard | `env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read {prompt_file}..." < /dev/null 2>&1 \| tee {log}` |
 | Codex | Bash | Critical | same pattern |
 | Codex | Bash | Evolutionary | same pattern |
-| Gemini | Bash | Standard | `gemini -m gemini-3-pro-preview --yolo "Read {prompt_file}..." 2>&1 \| tee {log}` |
+| Gemini | Bash | Standard | `.bin/gemini -m gemini-3-pro-preview --yolo "Read {prompt_file}..." 2>&1 \| tee {log}` |
 
 **IMPORTANT:** All prompt files MUST be written inside the workspace (e.g., `notes/.tmp/`) — NOT `/tmp/`. Gemini CLI sandboxes file reads to workspace directories only.
 
@@ -278,11 +278,11 @@ mkdir -p /tmp/trident-{REVIEW_ID}
 Always redirect stdin to `/dev/null` — codex waits on stdin for EOF before running and hangs indefinitely if bash leaves stdin open (pc95):
 
 ```bash
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-critical-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-critical.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-critical-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-critical.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
 ```
 
 ---
@@ -292,7 +292,7 @@ env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-c
 Each agent reads its prompt from the file written in Phase 4:
 
 ```bash
-gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
+.bin/gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
 ```
 
 ---

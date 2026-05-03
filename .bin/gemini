@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Wrapper for `gemini` that runs the CLI with the Node binary adjacent to the
+# installed Gemini shim when available.
+#
+# Why: the user's shell can resolve `node` to an older Homebrew install even
+# when `gemini` itself comes from an nvm Node tree. Gemini CLI bundles currently
+# use regex `v` flags, so running them under Node 16 fails before the CLI starts.
+# Prepending the real Gemini shim's directory lets `/usr/bin/env node` choose
+# the matching nvm Node without mutating the global shell.
+#
+# Override: GEMINI_REAL=/path/to/gemini .bin/gemini ...
+#
+# hash-thing-nda9.
+
+set -euo pipefail
+
+self_dir=$(cd "$(dirname "$0")" && pwd)
+real_gemini=""
+IFS=':' read -ra _path_dirs <<<"$PATH"
+for _d in "${_path_dirs[@]}"; do
+    [ -z "$_d" ] && continue
+    cand_dir=$(cd "$_d" 2>/dev/null && pwd -P || true)
+    [ -z "$cand_dir" ] && continue
+    [ "$cand_dir" = "$self_dir" ] && continue
+    if [ -x "$cand_dir/gemini" ]; then
+        real_gemini="$cand_dir/gemini"
+        break
+    fi
+done
+
+real_gemini="${GEMINI_REAL:-$real_gemini}"
+if [ -z "$real_gemini" ]; then
+    echo "[.bin/gemini] cannot locate real gemini binary on PATH (excluding $self_dir). Set GEMINI_REAL=/path/to/gemini to override." >&2
+    exit 127
+fi
+
+real_dir=$(cd "$(dirname "$real_gemini")" && pwd)
+if [ -x "$real_dir/node" ]; then
+    export PATH="$real_dir:$PATH"
+fi
+case ":$PATH:" in
+    *:/usr/sbin:*) ;;
+    *) export PATH="$PATH:/usr/sbin" ;;
+esac
+case ":$PATH:" in
+    *:/sbin:*) ;;
+    *) export PATH="$PATH:/sbin" ;;
+esac
+
+exec "$real_gemini" "$@"

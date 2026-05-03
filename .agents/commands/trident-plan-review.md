@@ -230,15 +230,15 @@ Launch two Agent tool calls in a single message with the launch template, substi
 Each agent reads its prompt from the **workspace-local** staging dir (not the absolute INPUT_DIR path). Log files also go to `/tmp/` to avoid tee failures:
 
 ```bash
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex-execution.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard-execution.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-codex-execution.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-standard-execution.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex-dependencies.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial-dependencies.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-adversarial-codex-dependencies.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-adversarial-dependencies.log
 
-env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
+env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-repo-check "Read notes/.tmp/trident-{REVIEW_ID}/prompt-evolutionary-codex.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/codex-evolutionary.log
 ```
 
 ---
@@ -248,7 +248,7 @@ env -u CLAUDECODE codex exec --full-auto -s danger-full-access --skip-git-repo-c
 Each agent reads its prompt from the file written in Phase 3:
 
 ```bash
-gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
+.bin/gemini -m gemini-3-pro-preview --yolo "Read notes/.tmp/trident-{REVIEW_ID}/prompt-standard-gemini.md and follow the instructions exactly." < /dev/null 2>&1 | tee /tmp/trident-{REVIEW_ID}/gemini-standard.log
 ```
 
 ---
