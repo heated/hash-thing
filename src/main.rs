@@ -49,7 +49,13 @@ enum AppUserEvent {
     /// The background world-growth worker finished. Rendering continues from
     /// the previous SVDAG while this is in flight; the main thread restores
     /// and uploads the grown world when the event arrives.
-    WorldGrowDone(Result<sim::World, String>),
+    WorldGrowDone(WorldGrowResult),
+}
+
+struct WorldGrowResult {
+    generation: u64,
+    base_world_revision: u64,
+    payload: Result<sim::World, String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -765,6 +771,14 @@ struct App {
     /// `step_pending`, this keeps `self.world` live on the main thread:
     /// the worker grows a clone and swaps it in only on success.
     world_prefetch_pending: bool,
+    /// Monotonic generation for background world-prefetch results. The event
+    /// carries this back so stale worker completions cannot clear a newer
+    /// pending prefetch.
+    next_world_prefetch_generation: u64,
+    current_world_prefetch_generation: Option<u64>,
+    /// Monotonic revision of the live main-thread world. Any mutation after a
+    /// prefetch clone invalidates that clone's eventual result.
+    world_revision: u64,
     /// When the background step was spawned, for perf timing.
     step_start: std::time::Instant,
     /// hash-thing-dbv3 (vqke.1.1): proxy used by the sim worker thread
@@ -1051,6 +1065,9 @@ impl App {
             dump_pose: None,
             step_pending: false,
             world_prefetch_pending: false,
+            next_world_prefetch_generation: 0,
+            current_world_prefetch_generation: None,
+            world_revision: 0,
             step_start: std::time::Instant::now(),
             event_proxy: None,
             render_origin,
@@ -1393,6 +1410,7 @@ impl App {
     /// reachable via the `r` scene-swap key (PendingSceneSwap::ResetTerrain).
     fn load_initial_scene(&mut self) {
         self.world.seed_pyroclastic_chamber();
+        self.mark_world_changed();
         self.noise_ns_per_sample = 0.0;
         self.reset_scene_entities();
         self.spawn_pyroclastic_entities();
@@ -1752,10 +1770,14 @@ impl App {
             return;
         }
         let old_level = self.world.level;
+        self.next_world_prefetch_generation = self.next_world_prefetch_generation.wrapping_add(1);
+        let generation = self.next_world_prefetch_generation;
+        let base_world_revision = self.world_revision;
         let mut world = self.world.clone();
         let proxy = self.event_proxy.clone();
         let window = self.window.clone();
         self.world_prefetch_pending = true;
+        self.current_world_prefetch_generation = Some(generation);
         std::thread::spawn(move || {
             let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 world.ensure_region(min, max);
@@ -1772,7 +1794,11 @@ impl App {
             });
 
             if let Some(proxy) = proxy {
-                let _ = proxy.send_event(AppUserEvent::WorldGrowDone(payload));
+                let _ = proxy.send_event(AppUserEvent::WorldGrowDone(WorldGrowResult {
+                    generation,
+                    base_world_revision,
+                    payload,
+                }));
             }
             if let Some(window) = window {
                 window.request_redraw();
@@ -1785,16 +1811,37 @@ impl App {
         );
     }
 
-    fn apply_world_grow_result(&mut self, payload: Result<sim::World, String>) {
-        if !self.world_prefetch_pending {
+    fn invalidate_world_prefetch(&mut self) {
+        self.world_prefetch_pending = false;
+        self.current_world_prefetch_generation = None;
+    }
+
+    fn mark_world_changed(&mut self) {
+        self.world_revision = self.world_revision.wrapping_add(1);
+        self.invalidate_world_prefetch();
+    }
+
+    fn apply_world_grow_result(&mut self, result: WorldGrowResult) {
+        if self.current_world_prefetch_generation != Some(result.generation) {
             return;
         }
-        self.world_prefetch_pending = false;
+        if !self.world_prefetch_pending {
+            self.current_world_prefetch_generation = None;
+            return;
+        }
+        if result.base_world_revision != self.world_revision {
+            self.invalidate_world_prefetch();
+            return;
+        }
 
-        match payload {
+        self.world_prefetch_pending = false;
+        self.current_world_prefetch_generation = None;
+
+        match result.payload {
             Ok(world) => {
                 let old_origin = self.render_origin;
                 self.world = world;
+                self.world_revision = self.world_revision.wrapping_add(1);
                 {
                     let _t = self.perf.start("collision_snapshot_refresh");
                     self.collision_snapshot = Some(self.world.collision_snapshot());
@@ -1879,6 +1926,7 @@ impl App {
         match payload {
             Ok((world, sim_timings)) => {
                 self.world = world;
+                self.mark_world_changed();
                 // hash-thing-imvg (vqke.1): record the wrapper-and-polling
                 // breakdown into perf so the periodic summary line shows
                 // apply / spawn / step_recursive / poll-lag separately.
@@ -2001,6 +2049,7 @@ impl App {
         // no caches to invalidate either.
         if self.gol_smoke_scene {
             self.world.set_gol_smoke_rule(rule);
+            self.mark_world_changed();
             if let Some(renderer) = &mut self.renderer {
                 renderer.upload_palette(&self.world.materials().color_palette_rgba());
             }
@@ -2293,6 +2342,7 @@ impl App {
                 sim::WorldCoord(hit[2]),
                 hash_thing::octree::Cell::EMPTY.raw(),
             );
+            self.mark_world_changed();
             // Re-upload volume since we modified the world directly.
             let player_pos = self.player_world_pos();
             Self::upload_volume(
@@ -2347,6 +2397,7 @@ impl App {
                 sim::WorldCoord(prev[2]),
                 state,
             );
+            self.mark_world_changed();
             let player_pos = self.player_world_pos();
             Self::upload_volume(
                 &mut self.renderer,
@@ -2419,12 +2470,14 @@ impl App {
         }
         state.interventions_remaining -= 1;
         let pattern = state.selected_pattern;
+        let interventions_remaining = state.interventions_remaining;
         self.world.apply_quarantine_atlas_pattern(pattern, center);
+        self.mark_world_changed();
         log::info!(
             "Deployed {} at {:?}; budget {}",
             pattern.label(),
             center,
-            state.interventions_remaining
+            interventions_remaining
         );
         true
     }
@@ -2521,6 +2574,7 @@ impl App {
     /// where no sim-step would otherwise trigger an upload (cswp.8.3
     /// review fix — Codex-standard "important" finding).
     fn refresh_view_after_lod_change(&mut self) {
+        self.mark_world_changed();
         let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
@@ -2577,6 +2631,7 @@ impl App {
         }
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.seed_demo_spectacle();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
@@ -2670,6 +2725,7 @@ impl App {
                 state,
             );
             self.world.clone_sources.push(pos);
+            self.mark_world_changed();
             log::info!(
                 "Placed clone block (spawns material {held_material}) at {:?}",
                 pos
@@ -2714,6 +2770,7 @@ impl App {
         }
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.seed_burning_room();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
@@ -2762,6 +2819,7 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let stats = self.world.seed_gyroid_megastructure();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
         let elapsed = start.elapsed();
@@ -2811,6 +2869,7 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let layout = self.world.seed_quarantine_atlas_demo();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
         self.reset_player_pose(layout.player_pos, layout.player_yaw, layout.player_pitch);
@@ -2859,6 +2918,7 @@ impl App {
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.set_gol_smoke_rule(self.gol_smoke_rule);
         self.world.seed_center(12, 0.35);
+        self.mark_world_changed();
         self.gol_smoke_scene = true;
         self.paused = true;
         self.reset_scene_perf_state();
@@ -2895,6 +2955,7 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let layout = self.world.seed_lattice_progression_demo();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
         self.reset_player_pose(layout.player_pos, layout.player_yaw, layout.player_pitch);
@@ -2946,6 +3007,7 @@ impl App {
             .world
             .seed_terrain(&params)
             .expect("UI-generated terrain params must validate");
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
         let elapsed = start.elapsed();
@@ -3276,6 +3338,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                                 self.entities.update(&self.world, &mut queue);
                                 self.world.queue = queue;
                             }
+                            self.mark_world_changed();
                             self.last_memo_summary = self.world.memo_summary();
                             self.memo_hud_dirty = true;
                             let player_pos = self.player_world_pos();
@@ -5959,6 +6022,25 @@ mod tests {
         );
     }
 
+    fn set_test_prefetch(app: &mut App, generation: u64, base_world_revision: u64) {
+        app.world_prefetch_pending = true;
+        app.next_world_prefetch_generation = app.next_world_prefetch_generation.max(generation);
+        app.current_world_prefetch_generation = Some(generation);
+        app.world_revision = base_world_revision;
+    }
+
+    fn test_world_grow_result(
+        generation: u64,
+        base_world_revision: u64,
+        payload: Result<sim::World, String>,
+    ) -> WorldGrowResult {
+        WorldGrowResult {
+            generation,
+            base_world_revision,
+            payload,
+        }
+    }
+
     #[test]
     fn apply_world_grow_result_ok_clears_pending_and_swaps_world() {
         let mut app = App::new(32);
@@ -5972,13 +6054,16 @@ mod tests {
             ],
         );
         let grown_side = grown.side();
+        let base_revision = app.world_revision;
 
-        app.world_prefetch_pending = true;
-        app.apply_world_grow_result(Ok(grown));
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.apply_world_grow_result(test_world_grow_result(1, base_revision, Ok(grown)));
 
         assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
         assert_eq!(app.world.side(), grown_side);
         assert!(app.world.side() > 32, "grown world should be installed");
+        assert_eq!(app.world_revision, base_revision.wrapping_add(1));
         assert!(!app.paused, "successful prefetch must not pause the sim");
     }
 
@@ -5987,14 +6072,113 @@ mod tests {
         let mut app = App::new(32);
         let original_side = app.world.side();
         let original_origin = app.world.origin;
+        let base_revision = app.world_revision;
 
-        app.world_prefetch_pending = true;
-        app.apply_world_grow_result(Err("simulated prefetch panic".to_string()));
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.apply_world_grow_result(test_world_grow_result(
+            1,
+            base_revision,
+            Err("simulated prefetch panic".to_string()),
+        ));
 
         assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
         assert_eq!(app.world.side(), original_side);
         assert_eq!(app.world.origin, original_origin);
+        assert_eq!(app.world_revision, base_revision);
         assert!(!app.paused, "prefetch failure must not pause the sim");
+    }
+
+    #[test]
+    fn stale_world_grow_after_scene_swap_is_ignored() {
+        let mut app = App::new(32);
+        let mut grown = app.world.clone();
+        grown.ensure_region(
+            [sim::WorldCoord(-1), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+            ],
+        );
+        let grown_side = grown.side();
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.request_scene_swap(PendingSceneSwap::ResetTerrain);
+        let scene_revision = app.world_revision;
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert!(scene_revision > base_revision);
+
+        app.apply_world_grow_result(test_world_grow_result(1, base_revision, Ok(grown)));
+
+        assert_ne!(app.world.side(), grown_side);
+        assert_eq!(app.world_revision, scene_revision);
+    }
+
+    #[test]
+    fn stale_world_grow_does_not_clear_newer_pending_prefetch() {
+        let mut app = App::new(32);
+        let base_revision = app.world_revision;
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.mark_world_changed();
+
+        let newer_revision = app.world_revision;
+        set_test_prefetch(&mut app, 2, newer_revision);
+        app.apply_world_grow_result(test_world_grow_result(
+            1,
+            base_revision,
+            Err("old worker finished late".to_string()),
+        ));
+
+        assert!(app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, Some(2));
+        assert_eq!(app.world_revision, newer_revision);
+    }
+
+    #[test]
+    fn stale_world_grow_after_rule_world_mutation_is_ignored() {
+        let mut app = App::new(32);
+        app.gol_smoke_scene = true;
+        let mut grown = app.world.clone();
+        grown.ensure_region(
+            [sim::WorldCoord(-1), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+            ],
+        );
+        let grown_side = grown.side();
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.select_rule(sim::GameOfLife3D::rule445(), "445");
+        let rule_revision = app.world_revision;
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert!(rule_revision > base_revision);
+
+        app.apply_world_grow_result(test_world_grow_result(1, base_revision, Ok(grown)));
+
+        assert_ne!(app.world.side(), grown_side);
+        assert_eq!(app.world_revision, rule_revision);
+    }
+
+    #[test]
+    fn lod_refresh_invalidates_pending_world_grow() {
+        let mut app = App::new(32);
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.refresh_view_after_lod_change();
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert!(app.world_revision > base_revision);
     }
 
     /// hash-thing-dbv3 (vqke.1.1): cover the `apply_step_result` seam
