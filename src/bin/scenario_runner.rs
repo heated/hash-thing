@@ -1,4 +1,7 @@
 use hash_thing::octree::CellState;
+use hash_thing::sim::world::{
+    quarantine_atlas_mixed_containment_plan, QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
+};
 use hash_thing::sim::{World, WorldCoord};
 use hash_thing::terrain::materials::{SAND, STONE, WATER};
 use hash_thing::terrain::TerrainParams;
@@ -24,6 +27,7 @@ struct Scenario {
     generations: usize,
     warmup_generations: Option<usize>,
     seed: u64,
+    setup: Option<ScenarioSetup>,
     comparator: Option<String>,
 }
 
@@ -60,6 +64,7 @@ enum Scene {
     DefaultTerrain,
     DefaultDemo,
     FactoryConveyor,
+    QuarantineAtlas,
 }
 
 impl Scene {
@@ -68,6 +73,20 @@ impl Scene {
             Self::DefaultTerrain => "default-terrain",
             Self::DefaultDemo => "default-demo",
             Self::FactoryConveyor => "factory-conveyor",
+            Self::QuarantineAtlas => "quarantine-atlas",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+enum ScenarioSetup {
+    QuarantineAtlasMixedContainmentV1,
+}
+
+impl ScenarioSetup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::QuarantineAtlasMixedContainmentV1 => QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
         }
     }
 }
@@ -181,6 +200,8 @@ struct MeasurementRecord {
     backend: String,
     hardware: String,
     scenario_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup: Option<String>,
     confidence: ConfidenceRecord,
     level: u32,
     side: u64,
@@ -201,6 +222,8 @@ struct ComparisonRecord {
     ratio: f64,
     ratio_metric: String,
     scenario_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup: Option<String>,
     rule_set: String,
     notes: String,
 }
@@ -412,6 +435,7 @@ fn compare_records(
         ratio,
         ratio_metric: metric.to_string(),
         scenario_hash: subject.scenario_hash.clone(),
+        setup: subject.setup.clone(),
         rule_set: subject.rule_set.clone(),
         notes: format!(
             "{} {}={:.3} vs {} {}={:.3}; ratio={:.3}",
@@ -465,6 +489,12 @@ fn validate_comparable(
     compare_str("world", &subject.world, &baseline.world)?;
     compare_str("scene", &subject.scene, &baseline.scene)?;
     compare_str("intensity", &subject.intensity, &baseline.intensity)?;
+    if subject.setup != baseline.setup {
+        return Err(format!(
+            "comparison mismatch on setup: {:?} vs {:?}",
+            subject.setup, baseline.setup
+        ));
+    }
     compare_usize("confidence.n", subject.confidence.n, baseline.confidence.n)?;
     compare_str(
         "confidence.warm_frame_policy",
@@ -614,6 +644,7 @@ fn run_scenario(
         backend: scenario.backend.as_str().to_string(),
         hardware: hardware.to_string(),
         scenario_hash,
+        setup: scenario.setup.map(|setup| setup.as_str().to_string()),
         confidence: ConfidenceRecord {
             n: scenario.generations,
             warm_frame_policy: warm_frame_policy(warmup_generations),
@@ -680,6 +711,24 @@ fn seed_scene(world: &mut World, scenario: &Scenario) -> Result<(), String> {
             }
         }
         Scene::FactoryConveyor => seed_factory_conveyor_toy(world, scenario.seed),
+        Scene::QuarantineAtlas => seed_quarantine_atlas(world, scenario)?,
+    }
+    Ok(())
+}
+
+fn seed_quarantine_atlas(world: &mut World, scenario: &Scenario) -> Result<(), String> {
+    if world.side() < 64 {
+        return Err("quarantine-atlas scene requires side >= 64".to_string());
+    }
+    let layout = world.seed_quarantine_atlas_demo();
+    match scenario.setup {
+        Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1) => {
+            let plan = quarantine_atlas_mixed_containment_plan(layout);
+            for (pattern, center) in plan {
+                world.apply_quarantine_atlas_pattern(pattern, center);
+            }
+        }
+        None => {}
     }
     Ok(())
 }
@@ -791,6 +840,15 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
     } else {
         ""
     };
+    let setup_note = scenario
+        .setup
+        .map(|setup| {
+            format!(
+                "; setup={} (scripted pre-measurement intervention setup; excludes interactive placement/raycast/cache-invalidation cost)",
+                setup.as_str()
+            )
+        })
+        .unwrap_or_default();
     format!(
         "scenario={}, path={}, warmup_generations={}, {}",
         scenario.name,
@@ -798,6 +856,7 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
         warmup_generations,
         seed_note
     ) + &microchurn_note(microchurn, warmup_generations)
+        + &setup_note
         + drift_note
 }
 
@@ -943,12 +1002,17 @@ fn scenario_hash(scenario: &Scenario, level: u32) -> String {
 }
 
 fn scenario_hash_canonical_input(scenario: &Scenario, level: u32) -> String {
+    let setup = scenario
+        .setup
+        .map(|setup| format!("|setup={}", setup.as_str()))
+        .unwrap_or_default();
     format!(
-        "v2-B-canonical|world={}|level={level}|scene={}|rule_set={}|intensity={}|seed={}",
+        "v2-B-canonical|world={}|level={level}|scene={}|rule_set={}|intensity={}{}|seed={}",
         scenario.world.as_str(),
         scenario.scene.as_str(),
         scenario.rule_set.as_str(),
         scenario.intensity.as_str(),
+        setup,
         scenario.seed
     )
 }
@@ -987,6 +1051,39 @@ mod tests {
         a.regime = Regime::NotApplicable;
         b = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
         assert_eq!(scenario_hash(&a, 5), scenario_hash(&b, 5));
+    }
+
+    #[test]
+    fn scenario_hash_changes_with_setup() {
+        let mut raw = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        raw.scene = Scene::QuarantineAtlas;
+        raw.intensity = Intensity::Cascade;
+        raw.level = Some(7);
+        let mut mixed = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        mixed.scene = Scene::QuarantineAtlas;
+        mixed.intensity = Intensity::Cascade;
+        mixed.level = Some(7);
+        mixed.setup = Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1);
+
+        assert_ne!(scenario_hash(&raw, 7), scenario_hash(&mixed, 7));
+    }
+
+    #[test]
+    fn scenario_hash_preserves_no_setup_v2b_inputs() {
+        let mut cascade = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        cascade.name = "cascade-peak".to_string();
+        cascade.world = WorldCoordName::Medium;
+        cascade.level = Some(7);
+        cascade.scene = Scene::DefaultDemo;
+        cascade.intensity = Intensity::Cascade;
+        cascade.generations = 30;
+        cascade.warmup_generations = Some(5);
+
+        assert_eq!(
+            scenario_hash(&cascade, 7),
+            "sha256:d8ba69a0e324d707",
+            "no-setup scenarios must keep historical v2-B hashes"
+        );
     }
 
     #[test]
@@ -1061,6 +1158,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quarantine_atlas_mixed_setup_keeps_backends_on_same_trajectory() {
+        let level = 7;
+        let mut hashlife_world = World::new(level);
+        let layout = hashlife_world.seed_quarantine_atlas_demo();
+        for (pattern, center) in quarantine_atlas_mixed_containment_plan(layout) {
+            hashlife_world.apply_quarantine_atlas_pattern(pattern, center);
+        }
+
+        let mut chunk_world = World::new(level);
+        let layout = chunk_world.seed_quarantine_atlas_demo();
+        for (pattern, center) in quarantine_atlas_mixed_containment_plan(layout) {
+            chunk_world.apply_quarantine_atlas_pattern(pattern, center);
+        }
+
+        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, None, 1);
+        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, None, 1);
+
+        assert_eq!(hashlife.len(), chunk.len());
+        for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
+            assert_eq!(h.pop_count, c.pop_count, "pop drift at gen {gen}");
+            assert_eq!(
+                h.mat_distribution, c.mat_distribution,
+                "material drift at gen {gen}"
+            );
+        }
+    }
+
     fn test_scenario(backend: Backend, regime: Regime) -> Scenario {
         Scenario {
             name: "test".to_string(),
@@ -1074,6 +1199,7 @@ mod tests {
             generations: 1,
             warmup_generations: None,
             seed: 1,
+            setup: None,
             comparator: None,
         }
     }
@@ -1096,6 +1222,7 @@ mod tests {
             backend: backend.to_string(),
             hardware: "m2-pro-mbp".to_string(),
             scenario_hash: "sha256:test".to_string(),
+            setup: None,
             confidence: ConfidenceRecord {
                 n: 2,
                 warm_frame_policy: "skip-first-1".to_string(),

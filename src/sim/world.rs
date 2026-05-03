@@ -224,6 +224,49 @@ pub struct QuarantineAtlasLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantineAtlasPattern {
+    Barrier,
+    CoolingTrench,
+    Firebreak,
+}
+
+impl QuarantineAtlasPattern {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Barrier => "barrier",
+            Self::CoolingTrench => "cooling trench",
+            Self::Firebreak => "firebreak",
+        }
+    }
+
+    pub fn from_digit(digit: u16) -> Option<Self> {
+        match digit {
+            1 => Some(Self::Barrier),
+            2 => Some(Self::CoolingTrench),
+            3 => Some(Self::Firebreak),
+            _ => None,
+        }
+    }
+}
+
+pub const QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP: &str = "QuarantineAtlasMixedContainmentV1";
+
+pub fn quarantine_atlas_mixed_containment_plan(
+    layout: QuarantineAtlasLayout,
+) -> [(QuarantineAtlasPattern, [i64; 3]); 6] {
+    let y = layout.floor_y + 1;
+    let z = layout.hazard_center[2];
+    [
+        (QuarantineAtlasPattern::Firebreak, [40, y, z]),
+        (QuarantineAtlasPattern::CoolingTrench, [50, y, z]),
+        (QuarantineAtlasPattern::Firebreak, [60, y, z]),
+        (QuarantineAtlasPattern::CoolingTrench, [70, y, z]),
+        (QuarantineAtlasPattern::Barrier, [80, y, z]),
+        (QuarantineAtlasPattern::Barrier, [90, y, z]),
+    ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Box3 {
     min: [i64; 3],
     max: [i64; 3],
@@ -1767,9 +1810,12 @@ impl World {
             [center, floor_y + 1, center + side / 5],
             [center + side / 9, floor_y + 1, center],
         ];
-        self.seed_quarantine_barrier(counter_patterns[0]);
-        self.seed_quarantine_cooling_trench(counter_patterns[1]);
-        self.seed_quarantine_firebreak(counter_patterns[2]);
+        self.apply_quarantine_atlas_pattern(QuarantineAtlasPattern::Barrier, counter_patterns[0]);
+        self.apply_quarantine_atlas_pattern(
+            QuarantineAtlasPattern::CoolingTrench,
+            counter_patterns[1],
+        );
+        self.apply_quarantine_atlas_pattern(QuarantineAtlasPattern::Firebreak, counter_patterns[2]);
 
         QuarantineAtlasLayout {
             player_pos: [
@@ -1802,23 +1848,27 @@ impl World {
         );
     }
 
-    fn seed_quarantine_barrier(&mut self, center: [i64; 3]) {
+    pub fn apply_quarantine_atlas_pattern(
+        &mut self,
+        pattern: QuarantineAtlasPattern,
+        center: [i64; 3],
+    ) {
         let [cx, cy, cz] = center;
-        self.fill_box(Box3::new([cx - 5, cy, cz], [cx + 5, cy + 3, cz]), STONE);
-        self.fill_box(Box3::new([cx, cy, cz - 2], [cx, cy + 2, cz + 2]), METAL);
-    }
-
-    fn seed_quarantine_cooling_trench(&mut self, center: [i64; 3]) {
-        let [cx, cy, cz] = center;
-        self.fill_box(Box3::new([cx - 4, cy, cz - 1], [cx + 4, cy, cz + 1]), WATER);
-        self.fill_box(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz - 2]), STONE);
-        self.fill_box(Box3::new([cx - 5, cy, cz + 2], [cx + 5, cy, cz + 2]), STONE);
-    }
-
-    fn seed_quarantine_firebreak(&mut self, center: [i64; 3]) {
-        let [cx, cy, cz] = center;
-        self.fill_box(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz + 2]), SAND);
-        self.fill_box(Box3::new([cx - 4, cy + 1, cz], [cx + 4, cy + 1, cz]), AIR);
+        match pattern {
+            QuarantineAtlasPattern::Barrier => {
+                self.fill_box_clipped(Box3::new([cx - 4, cy, cz], [cx + 4, cy + 3, cz]), STONE);
+                self.fill_box_clipped(Box3::new([cx, cy + 1, cz - 1], [cx, cy + 1, cz + 1]), METAL);
+            }
+            QuarantineAtlasPattern::CoolingTrench => {
+                self.fill_box_clipped(Box3::new([cx - 4, cy, cz - 1], [cx + 4, cy, cz + 1]), WATER);
+                self.fill_box_clipped(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz - 2]), STONE);
+                self.fill_box_clipped(Box3::new([cx - 5, cy, cz + 2], [cx + 5, cy, cz + 2]), STONE);
+            }
+            QuarantineAtlasPattern::Firebreak => {
+                self.fill_box_clipped(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz + 2]), SAND);
+                self.fill_box_clipped(Box3::new([cx - 4, cy + 1, cz], [cx + 4, cy + 1, cz]), AIR);
+            }
+        }
     }
 
     /// Add water and sand to an existing terrain — water pools on a
@@ -1937,6 +1987,19 @@ impl World {
             for y in volume.min[1]..=volume.max[1] {
                 for x in volume.min[0]..=volume.max[0] {
                     self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                }
+            }
+        }
+    }
+
+    fn fill_box_clipped(&mut self, volume: Box3, state: CellState) {
+        let region = self.region();
+        for z in volume.min[2]..=volume.max[2] {
+            for y in volume.min[1]..=volume.max[1] {
+                for x in volume.min[0]..=volume.max[0] {
+                    if region.contains(x, y, z) {
+                        self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
+                    }
                 }
             }
         }

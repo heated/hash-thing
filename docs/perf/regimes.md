@@ -50,6 +50,7 @@ to one of these (or you say "any" if the scene doesn't matter).
 | `lattice`         | Sparse identical sub-cubes (e.g. 1 stone every 8³). Tests hash-cons folding.                         |
 | `default-terrain` | The demo's terrain seed (heightmap + materials). Mostly stable post-warmup.                          |
 | `default-demo`    | Default terrain + volcano + water sheet + critters. The current demo.                                |
+| `quarantine-atlas`| Quarantine Atlas playtest scene: hazard lane, settlements, and budgeted counter-pattern stamps.       |
 | `random-mix`      | Synthetic random material per cell. Tests upper levels of cache pressure.                            |
 | `factory-conveyor`| Conveyor-rule scene: 1-material moves in fixed direction. Tests hash-cons + repetition. (8ppq.6 family.) |
 | `puzzle-circuit`  | Wire/signal-propagation scene. Tests sparse-pattern memo + signal cascades.                          |
@@ -71,6 +72,12 @@ levels; "any" if not relevant.
 | `cascade`  | Large-volume fluid / particle propagation per step        | demo's water sheet hitting terrain   |
 | `edit-active` | User input mid-play (placing/breaking)                  | real demo session                    |
 | `adversarial` | Inputs designed to break hashlife (every-cell-different)  | research only                        |
+
+Scenario runners may also carry a setup identity outside the four headline
+coordinates. For Quarantine Atlas, `QuarantineAtlasMixedContainmentV1` means
+the deterministic six-stamp mixed firebreak/cooling/barrier plan from
+`hash-thing-oym4` is applied before warmup and measured stepping. Keep this in
+`setup`, not `intensity`; the intensity still describes the measured dynamics.
 
 ### 4. `regime` — what the cache looks like
 

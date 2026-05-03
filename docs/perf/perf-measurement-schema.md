@@ -36,6 +36,7 @@ If you're authoring a perf claim, read `regimes.md` first. If you're writing a r
   "backend": "hashlife-recursive",
   "hardware": "m2-pro-mbp",
   "scenario_hash": "sha256:81aa21c5a72712b2",     // or "none" / "unknown"
+  "setup": "QuarantineAtlasMixedContainmentV1",    // optional deterministic setup identity; omit/null for none
   "confidence": { /* see Confidence section */ },
   // schema_version is the 6th metadata field; declared up top.
 
@@ -79,13 +80,14 @@ If you're authoring a perf claim, read `regimes.md` first. If you're writing a r
   // These MUST agree with both referenced measurements (defensive copy
   // for record-shape sanity, since the JSONL stream may be filtered).
   "scenario_hash": "sha256:81aa21c5a72712b2",
+  "setup": "QuarantineAtlasMixedContainmentV1",    // optional; omit/null for none
   "rule_set": "default-ca",
 
   "notes": "free-text"
 }
 ```
 
-A comparison is *not* a measurement. The `ratio_metric` must be a key from one of the referenced measurements' `metrics` objects. The `scenario_hash` and `rule_set` MUST match across `subject` and `baseline` for the comparison to be honest — different scenarios produce non-comparable numbers.
+A comparison is *not* a measurement. The `ratio_metric` must be a key from one of the referenced measurements' `metrics` objects. The `scenario_hash`, `rule_set`, and optional `setup` MUST match across `subject` and `baseline` for the comparison to be honest — different scenarios produce non-comparable numbers.
 
 ---
 
@@ -146,10 +148,11 @@ where `terrain_params_json` is `serde_json::to_string(&TerrainParams)` rendered 
 
 ```
 v2-B canonical input: "v2-B-canonical|world=<world>|level=<level>|scene=<scene>|"
-                      + "rule_set=<rule_set>|intensity=<intensity>|seed=<seed>"
+                      + "rule_set=<rule_set>|intensity=<intensity>"
+                      + optional("|setup=<setup>") + "|seed=<seed>"
 ```
 
-The version prefix (`v2-A|` / `v2-B-canonical|`) lets tooling tell pre-8ppq.2 records from RON-driven ones without breaking the comparison-match contract. The RON file's `backend`, `regime`, `comparator`, display `name`, sample count, and warmup policy are deliberately excluded: they change the measurement record, not the deterministic seeded scene.
+The version prefix (`v2-A|` / `v2-B-canonical|`) lets tooling tell pre-8ppq.2 records from RON-driven ones without breaking the comparison-match contract. Omit the setup component entirely when no explicit deterministic setup is applied; this preserves historical no-setup v2-B hashes. The RON file's `backend`, `regime`, `comparator`, display `name`, sample count, and warmup policy are deliberately excluded: they change the measurement record, not the deterministic seeded scene.
 
 **Why `backend` is NOT in the hash:** the same scenario should produce the same hash regardless of which engine measures it — that's exactly what makes paired-run comparisons valid (chunk-array vs hashlife on the same scene). Engine identity goes in `backend`, not `scenario_hash`.
 
@@ -309,7 +312,7 @@ Reading this: the 32³ idle comparison shows hashlife is 1.91× faster on `step_
 | `frames` (or generations) | `generations[]` length                            |
 | `comparator`          | comparison record's `baseline_measurement_id`         |
 
-`bench_fn` and `scenario_hash` are runner outputs (the runner computes the hash of the scenario file's content + seed and writes it back into the measurement record). 8ppq.2 doesn't need to enumerate them; it only needs to emit the runner that fills them.
+`bench_fn` and `scenario_hash` are runner outputs (the runner computes the v2-B canonical field hash and writes it back into the measurement record). 8ppq.2 doesn't need to enumerate them; it only needs to emit the runner that fills them.
 
 If 8ppq.2 lands a scenario shape that v2 doesn't cover, file an additive-change bead and bump the schema (minor or major per migration policy above). Until then, v2 is the contract.
 

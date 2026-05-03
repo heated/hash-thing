@@ -3,6 +3,7 @@ use hash_thing::player;
 use hash_thing::render;
 use hash_thing::scale::{CELLS_PER_METER, DEFAULT_VOLUME_SIZE, GROWTH_MARGIN};
 use hash_thing::sim;
+use hash_thing::sim::world::{quarantine_atlas_mixed_containment_plan, QuarantineAtlasPattern};
 use hash_thing::terrain;
 
 use std::collections::HashSet;
@@ -625,32 +626,6 @@ struct LodUploadCtx<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QuarantineAtlasPattern {
-    Barrier,
-    CoolingTrench,
-    Firebreak,
-}
-
-impl QuarantineAtlasPattern {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Barrier => "barrier",
-            Self::CoolingTrench => "cooling trench",
-            Self::Firebreak => "firebreak",
-        }
-    }
-
-    fn from_digit(digit: u16) -> Option<Self> {
-        match digit {
-            1 => Some(Self::Barrier),
-            2 => Some(Self::CoolingTrench),
-            3 => Some(Self::Firebreak),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QuarantineAtlasState {
     interventions_remaining: u8,
     selected_pattern: QuarantineAtlasPattern,
@@ -1023,58 +998,6 @@ fn reconcile_modifier_keys(
         }
     }
     removed
-}
-
-fn stamp_quarantine_atlas_pattern(
-    world: &mut sim::World,
-    pattern: QuarantineAtlasPattern,
-    center: [i64; 3],
-) {
-    use hash_thing::terrain::materials::{AIR, METAL, SAND, STONE, WATER};
-
-    let region = world.region();
-    let mut set = |x: i64, y: i64, z: i64, state| {
-        if region.contains(x, y, z) {
-            world.set(
-                sim::WorldCoord(x),
-                sim::WorldCoord(y),
-                sim::WorldCoord(z),
-                state,
-            );
-        }
-    };
-    let [cx, cy, cz] = center;
-    match pattern {
-        QuarantineAtlasPattern::Barrier => {
-            for dx in -4..=4 {
-                for dy in 0..=3 {
-                    set(cx + dx, cy + dy, cz, STONE);
-                }
-            }
-            for dz in -1..=1 {
-                set(cx, cy + 1, cz + dz, METAL);
-            }
-        }
-        QuarantineAtlasPattern::CoolingTrench => {
-            for dx in -4..=4 {
-                for dz in -1..=1 {
-                    set(cx + dx, cy, cz + dz, WATER);
-                }
-            }
-            for dx in -5..=5 {
-                set(cx + dx, cy, cz - 2, STONE);
-                set(cx + dx, cy, cz + 2, STONE);
-            }
-        }
-        QuarantineAtlasPattern::Firebreak => {
-            for dx in -5..=5 {
-                for dz in -2..=2 {
-                    set(cx + dx, cy, cz + dz, SAND);
-                    set(cx + dx, cy + 1, cz + dz, AIR);
-                }
-            }
-        }
-    }
 }
 
 impl App {
@@ -2494,7 +2417,7 @@ impl App {
         }
         state.interventions_remaining -= 1;
         let pattern = state.selected_pattern;
-        stamp_quarantine_atlas_pattern(&mut self.world, pattern, center);
+        self.world.apply_quarantine_atlas_pattern(pattern, center);
         log::info!(
             "Deployed {} at {:?}; budget {}",
             pattern.label(),
@@ -5535,7 +5458,7 @@ mod tests {
         let mut world = sim::World::new(7);
         let layout = world.seed_quarantine_atlas_demo();
         for &(pattern, center) in plan {
-            stamp_quarantine_atlas_pattern(&mut world, pattern, center);
+            world.apply_quarantine_atlas_pattern(pattern, center);
         }
         for _ in 0..16 {
             world.step_recursive();
@@ -5551,14 +5474,7 @@ mod tests {
         let z = layout.hazard_center[2];
         let xs = [40, 50, 60, 70, 80, 90];
         let barrier_only = xs.map(|x| (QuarantineAtlasPattern::Barrier, [x, y, z]));
-        let mixed = [
-            (QuarantineAtlasPattern::Firebreak, [40, y, z]),
-            (QuarantineAtlasPattern::CoolingTrench, [50, y, z]),
-            (QuarantineAtlasPattern::Firebreak, [60, y, z]),
-            (QuarantineAtlasPattern::CoolingTrench, [70, y, z]),
-            (QuarantineAtlasPattern::Barrier, [80, y, z]),
-            (QuarantineAtlasPattern::Barrier, [90, y, z]),
-        ];
+        let mixed = quarantine_atlas_mixed_containment_plan(layout);
 
         let barrier_metrics = run_quarantine_plan(&barrier_only);
         let mixed_metrics = run_quarantine_plan(&mixed);

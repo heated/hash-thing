@@ -1,0 +1,15 @@
+(
+    name: "quarantine-atlas-mixed-containment",
+    world: Medium,
+    level: Some(7),
+    scene: QuarantineAtlas,
+    rule_set: DefaultCa,
+    intensity: Cascade,
+    regime: NotApplicable,
+    backend: ChunkArray,
+    generations: 30,
+    warmup_generations: Some(5),
+    seed: 1,
+    setup: Some(QuarantineAtlasMixedContainmentV1),
+    comparator: Some("hashlife-recursive@same-scenario"),
+)
