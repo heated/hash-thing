@@ -17,9 +17,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SOUP_SEARCH_SETUP_V1: &str =
     "SoupSearchV1(tile=16,soup_side=8,density_per_1000=180,rule=445)";
-const SOUP_SEARCH_TILE: i64 = 16;
-const SOUP_SEARCH_SIDE: i64 = 8;
-const SOUP_SEARCH_DENSITY_PER_1000: u64 = 180;
+const SOUP_SEARCH_SPARSE_V1: &str =
+    "SoupSearchSparseV1(tile=16,soup_side=8,density_per_1000=45,rule=445)";
 const SOUP_SEARCH_ALIVE: CellState = Cell::pack(1, 0).raw();
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,6 +93,7 @@ enum ScenarioSetup {
     QuarantineAtlasMixedContainmentV1,
     FactoryConveyorRuleV1,
     SoupSearchV1,
+    SoupSearchSparseV1,
 }
 
 impl ScenarioSetup {
@@ -102,8 +102,17 @@ impl ScenarioSetup {
             Self::QuarantineAtlasMixedContainmentV1 => QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
             Self::FactoryConveyorRuleV1 => "FactoryConveyorRuleV1",
             Self::SoupSearchV1 => SOUP_SEARCH_SETUP_V1,
+            Self::SoupSearchSparseV1 => SOUP_SEARCH_SPARSE_V1,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct SoupSearchParams {
+    setup: &'static str,
+    tile: i64,
+    soup_side: i64,
+    density_per_1000: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -1000,10 +1009,12 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
             "setup=FactoryConveyorRuleV1 is invalid for scene={} in {}",
             record.scene, record.measurement_id
         )),
-        Some(SOUP_SEARCH_SETUP_V1) if record.scene != "soup-search" => Err(format!(
-            "setup=SoupSearchV1 is invalid for scene={} in {}",
-            record.scene, record.measurement_id
-        )),
+        Some(SOUP_SEARCH_SETUP_V1 | SOUP_SEARCH_SPARSE_V1) if record.scene != "soup-search" => {
+            Err(format!(
+                "setup=SoupSearchV1 is invalid for scene={} in {}",
+                record.scene, record.measurement_id
+            ))
+        }
         Some(QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP) if record.rule_set != "default-ca" => {
             Err(format!(
                 "setup={} requires matching rule_set (got {}) in {}",
@@ -1016,22 +1027,27 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
                 record.rule_set, record.measurement_id
             ))
         }
-        Some(SOUP_SEARCH_SETUP_V1) if record.rule_set != "custom:soup-search-v1" => Err(format!(
-            "setup=SoupSearchV1 requires matching rule_set (got {}) in {}",
-            record.rule_set, record.measurement_id
-        )),
+        Some(SOUP_SEARCH_SETUP_V1 | SOUP_SEARCH_SPARSE_V1)
+            if record.rule_set != "custom:soup-search-v1" =>
+        {
+            Err(format!(
+                "setup=SoupSearchV1 requires matching rule_set (got {}) in {}",
+                record.rule_set, record.measurement_id
+            ))
+        }
         Some(
             QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
             | "FactoryConveyorRuleV1"
-            | SOUP_SEARCH_SETUP_V1,
+            | SOUP_SEARCH_SETUP_V1
+            | SOUP_SEARCH_SPARSE_V1,
         ) => Ok(()),
         Some(other) => Err(format!(
             "invalid setup {:?} for {}",
             other, record.measurement_id
         )),
         None if record.scene == "soup-search" => Err(format!(
-            "scene=soup-search requires setup={} in {}",
-            SOUP_SEARCH_SETUP_V1, record.measurement_id
+            "scene=soup-search requires a soup setup in {}",
+            record.measurement_id
         )),
         None if record.rule_set == "default-ca" => Ok(()),
         None => Err(format!(
@@ -1237,7 +1253,7 @@ fn validate_soup_search_summary(record: &MeasurementRecord) -> Result<(), String
             record.measurement_id
         ));
     }
-    if summary.setup != SOUP_SEARCH_SETUP_V1 {
+    if summary.setup != SOUP_SEARCH_SETUP_V1 && summary.setup != SOUP_SEARCH_SPARSE_V1 {
         return Err(format!(
             "invalid soup_search setup {:?} for {}",
             summary.setup, record.measurement_id
@@ -1523,6 +1539,7 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
         (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), Scene::QuarantineAtlas)
         | (Some(ScenarioSetup::FactoryConveyorRuleV1), Scene::FactoryConveyor)
         | (Some(ScenarioSetup::SoupSearchV1), Scene::SoupSearch)
+        | (Some(ScenarioSetup::SoupSearchSparseV1), Scene::SoupSearch)
         | (None, _) => Ok(()),
         (Some(setup), scene) => Err(format!(
             "setup={} is invalid for scene={}",
@@ -1540,6 +1557,7 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
         (Some(ScenarioSetup::FactoryConveyorRuleV1), RuleSet::FactoryConveyorV1)
         | (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), RuleSet::DefaultCa)
         | (Some(ScenarioSetup::SoupSearchV1), RuleSet::SoupSearchV1)
+        | (Some(ScenarioSetup::SoupSearchSparseV1), RuleSet::SoupSearchV1)
         | (None, RuleSet::DefaultCa) => Ok(()),
         (Some(setup), rule_set) => Err(format!(
             "setup={} requires matching rule_set (got {})",
@@ -1576,7 +1594,7 @@ fn seed_scene(world: &mut World, scenario: &Scenario) -> Result<(), String> {
 
 fn seed_soup_search(world: &mut World, scenario: &Scenario) -> Result<(), String> {
     match scenario.setup {
-        Some(ScenarioSetup::SoupSearchV1) => {}
+        Some(ScenarioSetup::SoupSearchV1 | ScenarioSetup::SoupSearchSparseV1) => {}
         None => {
             return Err("soup-search scene requires setup=SoupSearchV1".to_string());
         }
@@ -1593,20 +1611,21 @@ fn seed_soup_search(world: &mut World, scenario: &Scenario) -> Result<(), String
 
     world.set_gol_smoke_rule(GameOfLife3D::rule445());
     let side = world.side() as i64;
-    let margin = (SOUP_SEARCH_TILE - SOUP_SEARCH_SIDE) / 2;
+    let params = soup_search_params(scenario.setup.expect("validated soup setup"));
+    let margin = (params.tile - params.soup_side) / 2;
     let mut rng = SoupSearchRng::new(scenario.seed);
-    for tile_z in 0..side / SOUP_SEARCH_TILE {
-        for tile_y in 0..side / SOUP_SEARCH_TILE {
-            for tile_x in 0..side / SOUP_SEARCH_TILE {
+    for tile_z in 0..side / params.tile {
+        for tile_y in 0..side / params.tile {
+            for tile_x in 0..side / params.tile {
                 let origin = [
-                    tile_x * SOUP_SEARCH_TILE + margin,
-                    tile_y * SOUP_SEARCH_TILE + margin,
-                    tile_z * SOUP_SEARCH_TILE + margin,
+                    tile_x * params.tile + margin,
+                    tile_y * params.tile + margin,
+                    tile_z * params.tile + margin,
                 ];
-                for dz in 0..SOUP_SEARCH_SIDE {
-                    for dy in 0..SOUP_SEARCH_SIDE {
-                        for dx in 0..SOUP_SEARCH_SIDE {
-                            if rng.next_mod(1000) < SOUP_SEARCH_DENSITY_PER_1000 {
+                for dz in 0..params.soup_side {
+                    for dy in 0..params.soup_side {
+                        for dx in 0..params.soup_side {
+                            if rng.next_mod(1000) < params.density_per_1000 {
                                 world.set(
                                     WorldCoord(origin[0] + dx),
                                     WorldCoord(origin[1] + dy),
@@ -1621,6 +1640,24 @@ fn seed_soup_search(world: &mut World, scenario: &Scenario) -> Result<(), String
         }
     }
     Ok(())
+}
+
+fn soup_search_params(setup: ScenarioSetup) -> SoupSearchParams {
+    match setup {
+        ScenarioSetup::SoupSearchV1 => SoupSearchParams {
+            setup: SOUP_SEARCH_SETUP_V1,
+            tile: 16,
+            soup_side: 8,
+            density_per_1000: 180,
+        },
+        ScenarioSetup::SoupSearchSparseV1 => SoupSearchParams {
+            setup: SOUP_SEARCH_SPARSE_V1,
+            tile: 16,
+            soup_side: 8,
+            density_per_1000: 45,
+        },
+        other => panic!("invalid soup-search setup: {}", other.as_str()),
+    }
 }
 
 struct SoupSearchRng {
@@ -2091,12 +2128,20 @@ fn soup_search_summary_for(
     generations: &[GenerationRecord],
     side: usize,
 ) -> Option<SoupSearchSummary> {
-    matches!(scenario.setup, Some(ScenarioSetup::SoupSearchV1))
-        .then(|| soup_search_summary(generations, side))
+    scenario.setup.and_then(|setup| match setup {
+        ScenarioSetup::SoupSearchV1 | ScenarioSetup::SoupSearchSparseV1 => Some(
+            soup_search_summary(generations, side, soup_search_params(setup)),
+        ),
+        _ => None,
+    })
 }
 
-fn soup_search_summary(generations: &[GenerationRecord], side: usize) -> SoupSearchSummary {
-    let tiles_per_axis = side as i64 / SOUP_SEARCH_TILE;
+fn soup_search_summary(
+    generations: &[GenerationRecord],
+    side: usize,
+    params: SoupSearchParams,
+) -> SoupSearchSummary {
+    let tiles_per_axis = side as i64 / params.tile;
     let mut tiles = Vec::with_capacity((tiles_per_axis * tiles_per_axis * tiles_per_axis) as usize);
     for tile_z in 0..tiles_per_axis {
         for tile_y in 0..tiles_per_axis {
@@ -2104,7 +2149,7 @@ fn soup_search_summary(generations: &[GenerationRecord], side: usize) -> SoupSea
                 let tile = [tile_x, tile_y, tile_z];
                 let pop_history = generations
                     .iter()
-                    .map(|gen| soup_tile_pop(gen, side, tile))
+                    .map(|gen| soup_tile_pop(gen, side, tile, params))
                     .collect::<Vec<_>>();
                 let final_pop = *pop_history.last().unwrap_or(&0);
                 let max_pop = pop_history.iter().copied().max().unwrap_or(0);
@@ -2124,7 +2169,7 @@ fn soup_search_summary(generations: &[GenerationRecord], side: usize) -> SoupSea
                     candidate_stable,
                     final_state_hash: generations
                         .last()
-                        .map(|gen| soup_tile_hash(gen, side, tile))
+                        .map(|gen| soup_tile_hash(gen, side, tile, params))
                         .unwrap_or_else(|| "sha256:e3b0c44298fc1c14".to_string()),
                     pop_history,
                 });
@@ -2135,7 +2180,7 @@ fn soup_search_summary(generations: &[GenerationRecord], side: usize) -> SoupSea
     let candidate_stable_count = tiles.iter().filter(|tile| tile.candidate_stable).count();
     let extinct_count = tiles.iter().filter(|tile| tile.final_pop == 0).count();
     SoupSearchSummary {
-        setup: SOUP_SEARCH_SETUP_V1.to_string(),
+        setup: params.setup.to_string(),
         tile_count: tiles.len(),
         survivor_count,
         candidate_stable_count,
@@ -2144,15 +2189,25 @@ fn soup_search_summary(generations: &[GenerationRecord], side: usize) -> SoupSea
     }
 }
 
-fn soup_tile_pop(gen: &GenerationRecord, side: usize, tile: [i64; 3]) -> usize {
-    soup_tile_cells(gen, side, tile)
+fn soup_tile_pop(
+    gen: &GenerationRecord,
+    side: usize,
+    tile: [i64; 3],
+    params: SoupSearchParams,
+) -> usize {
+    soup_tile_cells(gen, side, tile, params)
         .filter(|&cell| cell != 0)
         .count()
 }
 
-fn soup_tile_hash(gen: &GenerationRecord, side: usize, tile: [i64; 3]) -> String {
-    let mut bytes = Vec::with_capacity((SOUP_SEARCH_TILE as usize).pow(3) * 2);
-    for cell in soup_tile_cells(gen, side, tile) {
+fn soup_tile_hash(
+    gen: &GenerationRecord,
+    side: usize,
+    tile: [i64; 3],
+    params: SoupSearchParams,
+) -> String {
+    let mut bytes = Vec::with_capacity((params.tile as usize).pow(3) * 2);
+    for cell in soup_tile_cells(gen, side, tile, params) {
         bytes.extend_from_slice(&cell.to_le_bytes());
     }
     format!("sha256:{}", hex16(&bytes))
@@ -2162,16 +2217,17 @@ fn soup_tile_cells<'a>(
     gen: &'a GenerationRecord,
     side: usize,
     tile: [i64; 3],
+    params: SoupSearchParams,
 ) -> impl Iterator<Item = CellState> + 'a {
     let grid = gen.grid.as_deref().unwrap_or(&[]);
     let origin = [
-        tile[0] * SOUP_SEARCH_TILE,
-        tile[1] * SOUP_SEARCH_TILE,
-        tile[2] * SOUP_SEARCH_TILE,
+        tile[0] * params.tile,
+        tile[1] * params.tile,
+        tile[2] * params.tile,
     ];
-    (0..SOUP_SEARCH_TILE).flat_map(move |dz| {
-        (0..SOUP_SEARCH_TILE).flat_map(move |dy| {
-            (0..SOUP_SEARCH_TILE).map(move |dx| {
+    (0..params.tile).flat_map(move |dz| {
+        (0..params.tile).flat_map(move |dy| {
+            (0..params.tile).map(move |dx| {
                 let x = (origin[0] + dx) as usize;
                 let y = (origin[1] + dy) as usize;
                 let z = (origin[2] + dz) as usize;
@@ -2394,6 +2450,14 @@ mod tests {
         missing_setup.setup = None;
         missing_setup.rule_set = RuleSet::DefaultCa;
         assert!(validate_backend_regime(&missing_setup).is_err());
+
+        let mut sparse = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        sparse.scene = Scene::SoupSearch;
+        sparse.rule_set = RuleSet::SoupSearchV1;
+        sparse.intensity = Intensity::PassiveActive;
+        sparse.setup = Some(ScenarioSetup::SoupSearchSparseV1);
+        assert!(validate_backend_regime(&sparse).is_ok());
+        assert_ne!(scenario_hash(&sparse, 6), scenario_hash(&bad_rule, 6));
     }
 
     #[test]
@@ -2686,7 +2750,10 @@ mod tests {
 
         let err = compare_error(&a, &b);
 
-        assert!(err.contains("scene=soup-search requires setup"), "{err}");
+        assert!(
+            err.contains("scene=soup-search requires a soup setup"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3134,7 +3201,11 @@ mod tests {
             grid: Some(grid.clone()),
         };
 
-        let summary = soup_search_summary(&[gen(0), gen(1), gen(2)], side);
+        let summary = soup_search_summary(
+            &[gen(0), gen(1), gen(2)],
+            side,
+            soup_search_params(ScenarioSetup::SoupSearchV1),
+        );
 
         assert_eq!(summary.tile_count, 8);
         assert_eq!(summary.survivor_count, 1);
@@ -3169,8 +3240,13 @@ mod tests {
             );
             assert_eq!(h.state_hash, c.state_hash, "state hash drift at gen {gen}");
         }
-        let hashlife_summary = soup_search_summary(&hashlife, 64);
-        let chunk_summary = soup_search_summary(&chunk, 64);
+        let hashlife_summary = soup_search_summary(
+            &hashlife,
+            64,
+            soup_search_params(ScenarioSetup::SoupSearchV1),
+        );
+        let chunk_summary =
+            soup_search_summary(&chunk, 64, soup_search_params(ScenarioSetup::SoupSearchV1));
         assert_eq!(hashlife_summary, chunk_summary);
         assert_eq!(hashlife_summary.tile_count, 64);
         assert!(hashlife_summary.survivor_count > 0);

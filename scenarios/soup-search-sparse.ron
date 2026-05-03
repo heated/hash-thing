@@ -1,0 +1,15 @@
+(
+    name: "soup-search-sparse",
+    world: Small,
+    level: Some(6),
+    scene: SoupSearch,
+    rule_set: SoupSearchV1,
+    intensity: PassiveActive,
+    regime: Churning,
+    backend: HashlifeRecursive,
+    generations: 32,
+    warmup_generations: Some(8),
+    seed: 19,
+    setup: Some(SoupSearchSparseV1),
+    comparator: Some("chunk-array@same-scenario"),
+)
