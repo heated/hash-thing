@@ -45,6 +45,7 @@ use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
 
 /// hash-thing-bjdl (vqke.2): process-wide gate for the memo-hit-rate
 /// diagnostic probes inside `step_node`. Lazily initialised from
@@ -220,6 +221,75 @@ enum BfsChildSlot {
 impl World {
     pub fn memo_miss_diag_enabled(&self) -> bool {
         memo_diag_enabled()
+    }
+
+    fn stat_store_children(&mut self, node: NodeId) -> [NodeId; 8] {
+        let start = Instant::now();
+        let children = self.store.children(node);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        children
+    }
+
+    fn stat_store_interior(&mut self, level: u32, children: [NodeId; 8]) -> NodeId {
+        let start = Instant::now();
+        let node = self.store.interior(level, children);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        node
+    }
+
+    fn stat_store_child(&mut self, node: NodeId, octant: usize) -> NodeId {
+        let start = Instant::now();
+        let child = self.store.child(node, octant);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        child
+    }
+
+    fn stat_store_from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
+        let start = Instant::now();
+        let node = self.store.from_flat(grid, side);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        node
+    }
+
+    fn stat_cache_get(&mut self, key: (NodeId, u64)) -> Option<NodeId> {
+        let start = Instant::now();
+        let value = self.hashlife_cache.get(&key).copied();
+        self.hashlife_stats.p3_cache_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
+        value
+    }
+
+    fn stat_cache_insert(&mut self, key: (NodeId, u64), value: NodeId) {
+        let start = Instant::now();
+        self.hashlife_cache.insert(key, value);
+        self.hashlife_stats.p3_cache_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
+    }
+
+    fn record_p3_reindex(
+        &mut self,
+        start: Instant,
+        store_start_ns: u64,
+        cache_start_ns: u64,
+        slow_start_ns: u64,
+    ) {
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let nested_ns = self
+            .hashlife_stats
+            .p3_store_ns
+            .saturating_sub(store_start_ns)
+            .saturating_add(
+                self.hashlife_stats
+                    .p3_cache_ns
+                    .saturating_sub(cache_start_ns),
+            )
+            .saturating_add(self.hashlife_stats.p3_slow_ns.saturating_sub(slow_start_ns));
+        self.hashlife_stats.p3_reindex_ns += elapsed_ns.saturating_sub(nested_ns);
+        self.hashlife_stats.p3_reindex_calls += 1;
     }
 
     /// Step the world forward one generation using the recursive Hashlife path.
@@ -819,13 +889,9 @@ impl World {
         // content. A fast subtree's descendants are by induction
         // also fast, so every recursive call inside the fast branch
         // sees the same predicate value and the same fold.
-        let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
-            schedule_phase % 2
-        } else {
-            schedule_phase
-        };
+        let effective_phase = self.effective_phase_for(node, schedule_phase, memo_period);
         let key = (node, effective_phase);
-        if let Some(&cached) = self.hashlife_cache.get(&key) {
+        if let Some(cached) = self.stat_cache_get(key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
         }
@@ -861,7 +927,7 @@ impl World {
             self.step_recursive_case(node, level, effective_phase, memo_period)
         };
 
-        self.hashlife_cache.insert(key, result);
+        self.stat_cache_insert(key, result);
         result
     }
 
@@ -986,7 +1052,11 @@ impl World {
         }
 
         let key = (node, generation);
-        if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
+        let cache_start = Instant::now();
+        let cached = self.hashlife_macro_cache.get(&key).copied();
+        self.hashlife_stats.p3_cache_ns += cache_start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
+        if let Some(cached) = cached {
             self.hashlife_stats.cache_hits += 1;
             return cached;
         }
@@ -1001,7 +1071,10 @@ impl World {
             self.step_recursive_case_macro(node, level, generation)
         };
 
+        let cache_start = Instant::now();
         self.hashlife_macro_cache.insert(key, result);
+        self.hashlife_stats.p3_cache_ns += cache_start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
         result
     }
 
@@ -1042,7 +1115,7 @@ impl World {
                 }
             }
         }
-        self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
+        self.stat_store_from_flat(&center_grid, CENTER_LEVEL3_SIDE)
     }
 
     fn center_level4_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
@@ -1057,7 +1130,7 @@ impl World {
                 }
             }
         }
-        self.store.from_flat(&center_grid, CENTER_LEVEL4_SIDE)
+        self.stat_store_from_flat(&center_grid, CENTER_LEVEL4_SIDE)
     }
 
     /// Recursive case: level ≥ 3.
@@ -1068,8 +1141,12 @@ impl World {
         schedule_phase: u64,
         memo_period: u64,
     ) -> NodeId {
-        let children = self.store.children(node);
-        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+        let reindex_start = Instant::now();
+        let reindex_store_start = self.hashlife_stats.p3_store_ns;
+        let reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+        let reindex_slow_start = self.hashlife_stats.p3_slow_ns;
+        let children = self.stat_store_children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.stat_store_children(children[i]));
 
         // Build 3×3×3 = 27 intermediate nodes at level (n-1).
         let mut inter = [NodeId::EMPTY; 27];
@@ -1092,7 +1169,7 @@ impl World {
                             }
                         }
                     }
-                    inter[px + py * 3 + pz * 9] = self.store.interior(level - 1, octants);
+                    inter[px + py * 3 + pz * 9] = self.stat_store_interior(level - 1, octants);
                 }
             }
         }
@@ -1121,10 +1198,16 @@ impl World {
                         }
                     }
                     sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.store.interior(level - 1, sub_cube);
+                        self.stat_store_interior(level - 1, sub_cube);
                 }
             }
         }
+        self.record_p3_reindex(
+            reindex_start,
+            reindex_store_start,
+            reindex_cache_start,
+            reindex_slow_start,
+        );
 
         let mut result_children = [NodeId::EMPTY; 8];
         let leaf_level = if self.requires_wide_block_base_case() {
@@ -1155,7 +1238,7 @@ impl World {
             }
         }
 
-        self.store.interior(level - 1, result_children)
+        self.stat_store_interior(level - 1, result_children)
     }
 
     /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 active
@@ -1247,13 +1330,9 @@ impl World {
 
             // Mirrors `step_node` lines 694-703: fast-subtree phase fold +
             // cache lookup.
-            let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(nid) {
-                schedule_phase % 2
-            } else {
-                schedule_phase
-            };
+            let effective_phase = self.effective_phase_for(nid, schedule_phase, memo_period);
             let key = (nid, effective_phase);
-            if let Some(&cached) = self.hashlife_cache.get(&key) {
+            if let Some(cached) = self.stat_cache_get(key) {
                 self.hashlife_stats.cache_hits += 1;
                 resolved[i] = Some(cached);
                 continue;
@@ -1318,8 +1397,7 @@ impl World {
             } else {
                 self.center_level3_grid_to_node(output_grid)
             };
-            self.hashlife_cache
-                .insert((sub_roots[sub_idx], effective_phase), centered);
+            self.stat_cache_insert((sub_roots[sub_idx], effective_phase), centered);
             resolved[sub_idx] = Some(centered);
         }
 
@@ -1397,10 +1475,17 @@ impl World {
     /// slow-divisor cells, fold the schedule phase to `phase % 2` so
     /// fast subtrees alias across every-other-generation pairs.
     fn effective_phase_for(&mut self, node: NodeId, schedule_phase: u64, memo_period: u64) -> u64 {
-        if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
-            schedule_phase % 2
-        } else {
+        if memo_period <= 2 {
+            return schedule_phase;
+        }
+        let start = Instant::now();
+        let has_slow = self.subtree_has_slow_divisor(node);
+        self.hashlife_stats.p3_slow_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_slow_calls += 1;
+        if has_slow {
             schedule_phase
+        } else {
+            schedule_phase % 2
         }
     }
 
@@ -1421,8 +1506,12 @@ impl World {
     /// case (a future cleanup bead can refactor `step_recursive_case`
     /// to call this helper too).
     fn build_subroots(&mut self, node: NodeId, level: u32) -> [NodeId; 8] {
-        let children = self.store.children(node);
-        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+        let reindex_start = Instant::now();
+        let reindex_store_start = self.hashlife_stats.p3_store_ns;
+        let reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+        let reindex_slow_start = self.hashlife_stats.p3_slow_ns;
+        let children = self.stat_store_children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.stat_store_children(children[i]));
 
         let mut inter = [NodeId::EMPTY; 27];
         for pz in 0..3usize {
@@ -1444,7 +1533,7 @@ impl World {
                             }
                         }
                     }
-                    inter[px + py * 3 + pz * 9] = self.store.interior(level - 1, octants);
+                    inter[px + py * 3 + pz * 9] = self.stat_store_interior(level - 1, octants);
                 }
             }
         }
@@ -1468,10 +1557,16 @@ impl World {
                         }
                     }
                     sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.store.interior(level - 1, sub_cube);
+                        self.stat_store_interior(level - 1, sub_cube);
                 }
             }
         }
+        self.record_p3_reindex(
+            reindex_start,
+            reindex_store_start,
+            reindex_cache_start,
+            reindex_slow_start,
+        );
         sub_roots
     }
 
@@ -1536,7 +1631,7 @@ impl World {
         }
         let root_eff = self.effective_phase_for(root, schedule_phase, memo_period);
         let root_key = (root, root_eff);
-        if let Some(&cached) = self.hashlife_cache.get(&root_key) {
+        if let Some(cached) = self.stat_cache_get(root_key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
         }
@@ -1558,7 +1653,7 @@ impl World {
             } else {
                 self.step_base_case(root, root_eff)
             };
-            self.hashlife_cache.insert(root_key, result);
+            self.stat_cache_insert(root_key, result);
             return result;
         }
 
@@ -1610,7 +1705,7 @@ impl World {
                     let sub_eff = self.effective_phase_for(sub_nid, schedule_phase, memo_period);
                     let sub_key = (sub_nid, sub_eff);
 
-                    if let Some(&cached) = self.hashlife_cache.get(&sub_key) {
+                    if let Some(cached) = self.stat_cache_get(sub_key) {
                         self.hashlife_stats.cache_hits += 1;
                         child_slots[i] = BfsChildSlot::Direct(cached);
                         continue;
@@ -1723,9 +1818,12 @@ impl World {
                     self.hashlife_stats.phase2_ns += p2ns;
                     self.hashlife_stats.rule_miss_diag.accumulate(&diag);
                     let centered = self.center_level4_grid_to_node(&output_grid);
+                    let key = {
+                        let task = &tasks[0][out_idx];
+                        (task.node, task.effective_phase)
+                    };
+                    self.stat_cache_insert(key, centered);
                     let task = &mut tasks[0][out_idx];
-                    self.hashlife_cache
-                        .insert((task.node, task.effective_phase), centered);
                     task.result = Some(centered);
                 }
             } else {
@@ -1761,9 +1859,12 @@ impl World {
                     self.hashlife_stats.phase2_ns += p2ns;
                     self.hashlife_stats.rule_miss_diag.accumulate(&diag);
                     let centered = self.center_level3_grid_to_node(&output_grid);
+                    let key = {
+                        let task = &tasks[0][out_idx];
+                        (task.node, task.effective_phase)
+                    };
+                    self.stat_cache_insert(key, centered);
                     let task = &mut tasks[0][out_idx];
-                    self.hashlife_cache
-                        .insert((task.node, task.effective_phase), centered);
                     task.result = Some(centered);
                 }
             }
@@ -1782,10 +1883,13 @@ impl World {
                             .result
                             .expect("BFS ascend: lower-level task must be resolved"),
                     });
-                let composed = self.store.interior(n - 1, result_children);
+                let composed = self.stat_store_interior(n - 1, result_children);
+                let key = {
+                    let task = &tasks[level_idx][task_idx];
+                    (task.node, task.effective_phase)
+                };
+                self.stat_cache_insert(key, composed);
                 let task = &mut tasks[level_idx][task_idx];
-                self.hashlife_cache
-                    .insert((task.node, task.effective_phase), composed);
                 task.result = Some(composed);
             }
         }
@@ -1820,8 +1924,12 @@ impl World {
 
     fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
         debug_assert!(level > 3, "macro recursive case requires level > 3");
-        let children = self.store.children(node);
-        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+        let mut reindex_start = Instant::now();
+        let mut reindex_store_start = self.hashlife_stats.p3_store_ns;
+        let mut reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+        let mut reindex_slow_start = self.hashlife_stats.p3_slow_ns;
+        let children = self.stat_store_children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.stat_store_children(children[i]));
 
         let half_skip = 1u64 << (level - 3);
 
@@ -1847,9 +1955,19 @@ impl World {
                             }
                         }
                     }
-                    let inter = self.store.interior(level - 1, octants);
+                    let inter = self.stat_store_interior(level - 1, octants);
+                    self.record_p3_reindex(
+                        reindex_start,
+                        reindex_store_start,
+                        reindex_cache_start,
+                        reindex_slow_start,
+                    );
                     phased[px + py * 3 + pz * 9] =
                         self.step_node_macro(inter, level - 1, generation);
+                    reindex_start = Instant::now();
+                    reindex_store_start = self.hashlife_stats.p3_store_ns;
+                    reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+                    reindex_slow_start = self.hashlife_stats.p3_slow_ns;
                 }
             }
         }
@@ -1870,26 +1988,36 @@ impl World {
                             }
                         }
                     }
-                    let sub_root = self.store.interior(level - 1, sub_cube);
+                    let sub_root = self.stat_store_interior(level - 1, sub_cube);
+                    self.record_p3_reindex(
+                        reindex_start,
+                        reindex_store_start,
+                        reindex_cache_start,
+                        reindex_slow_start,
+                    );
                     result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
                         self.step_node_macro(sub_root, level - 1, generation + half_skip);
+                    reindex_start = Instant::now();
+                    reindex_store_start = self.hashlife_stats.p3_store_ns;
+                    reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+                    reindex_slow_start = self.hashlife_stats.p3_slow_ns;
                 }
             }
         }
 
-        self.store.interior(level - 1, result_children)
+        self.stat_store_interior(level - 1, result_children)
     }
 
     /// Extract the center (level n-1) of a level-n node.
     fn center_node(&mut self, node: NodeId, level: u32) -> NodeId {
         assert!(level >= 2, "center_node requires level >= 2");
-        let children = self.store.children(node);
+        let children = self.stat_store_children(node);
         let mut center_children = [NodeId::EMPTY; 8];
         for oct in 0..8usize {
             let inner = 7 - oct;
-            center_children[oct] = self.store.child(children[oct], inner);
+            center_children[oct] = self.stat_store_child(children[oct], inner);
         }
-        self.store.interior(level - 1, center_children)
+        self.stat_store_interior(level - 1, center_children)
     }
 }
 

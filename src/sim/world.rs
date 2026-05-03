@@ -459,6 +459,14 @@ pub struct HashlifeStats {
     /// shape so the `memo_summary` line gives a self-consistent
     /// breakdown.
     pub step_node_wall_ns: u64,
+    pub p3_store_ns: u64,
+    pub p3_store_calls: u64,
+    pub p3_cache_ns: u64,
+    pub p3_cache_calls: u64,
+    pub p3_slow_ns: u64,
+    pub p3_slow_calls: u64,
+    pub p3_reindex_ns: u64,
+    pub p3_reindex_calls: u64,
     /// hash-thing-vqke Phase 0: wall-clock nanoseconds spent in
     /// `maybe_compact()` after `step_node` completes. Most steps are
     /// 0 (the 2× growth threshold gates compaction); the spikes show
@@ -645,6 +653,14 @@ impl HashlifeStats {
         // wall-clock decompositions. Useful for long-run averages
         // (the per-step values fluctuate with churn / compact cadence).
         self.step_node_wall_ns += step.step_node_wall_ns;
+        self.p3_store_ns += step.p3_store_ns;
+        self.p3_store_calls += step.p3_store_calls;
+        self.p3_cache_ns += step.p3_cache_ns;
+        self.p3_cache_calls += step.p3_cache_calls;
+        self.p3_slow_ns += step.p3_slow_ns;
+        self.p3_slow_calls += step.p3_slow_calls;
+        self.p3_reindex_ns += step.p3_reindex_ns;
+        self.p3_reindex_calls += step.p3_reindex_calls;
         self.compact_ns += step.compact_ns;
         // hash-thing-bjdl (vqke.2): lifetime accumulators for the
         // memo-hit-rate diagnostic counters. Same per-step → lifetime
@@ -2801,16 +2817,27 @@ impl World {
         let last_step = &self.hashlife_stats;
         let p1_ms = last_step.phase1_ns as f64 / 1_000_000.0;
         let p2_ms = last_step.phase2_ns as f64 / 1_000_000.0;
-        // hash-thing-vqke Phase 0: descent-and-intern overhead is
-        // step_node wall minus the per-cell + per-block leaf wall.
-        // saturating_sub keeps the number sane on the rare frame
-        // where leaf timers overlap with descent timers slightly
-        // (e.g. inner-loop measurement quantization).
+        // hash-thing-vqke Phase 0: descent-and-intern overhead is usually
+        // step_node wall minus per-cell + per-block leaf wall. Parallel base
+        // cases sum worker CPU timers, so p1+p2 may exceed wall; keep p3 at
+        // least as large as its directly measured subphase timers so the
+        // public breakdown remains self-consistent.
         let descent_ns = last_step
             .step_node_wall_ns
             .saturating_sub(last_step.phase1_ns)
             .saturating_sub(last_step.phase2_ns);
-        let p3_ms = descent_ns as f64 / 1_000_000.0;
+        let p3_store_ms = last_step.p3_store_ns as f64 / 1_000_000.0;
+        let p3_cache_ms = last_step.p3_cache_ns as f64 / 1_000_000.0;
+        let p3_slow_ms = last_step.p3_slow_ns as f64 / 1_000_000.0;
+        let p3_reindex_ms = last_step.p3_reindex_ns as f64 / 1_000_000.0;
+        let p3_known_ns = last_step
+            .p3_store_ns
+            .saturating_add(last_step.p3_cache_ns)
+            .saturating_add(last_step.p3_slow_ns)
+            .saturating_add(last_step.p3_reindex_ns);
+        let p3_ns = descent_ns.max(p3_known_ns);
+        let p3_ms = p3_ns as f64 / 1_000_000.0;
+        let p3_residual_ms = p3_ns.saturating_sub(p3_known_ns) as f64 / 1_000_000.0;
         let p4_ms = last_step.compact_ns as f64 / 1_000_000.0;
         // hash-thing-bjdl (vqke.2): diagnostic ratios for the
         // memo_hit-rate hypotheses. Bounded-width ratio tokens (each
@@ -2880,7 +2907,7 @@ impl World {
         // the elision factor is effectively unbounded.
         let work_elision = self.work_elision_stats();
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
+            "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p3a_store={:.2}/{} p3b_cache={:.2}/{} p3c_slow={:.2}/{} p3d_reindex={:.2}/{} p3e_resid={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
             hit_rate,
             churn,
             work_elision.factor_x,
@@ -2895,6 +2922,15 @@ impl World {
             p1_ms,
             p2_ms,
             p3_ms,
+            p3_store_ms,
+            last_step.p3_store_calls,
+            p3_cache_ms,
+            last_step.p3_cache_calls,
+            p3_slow_ms,
+            last_step.p3_slow_calls,
+            p3_reindex_ms,
+            last_step.p3_reindex_calls,
+            p3_residual_ms,
             p4_ms,
             bfs_l3,
             bfs_par,
@@ -7307,6 +7343,14 @@ mod tests {
         a.bfs_max_batch_len = 50;
         a.bfs_tasks_by_level[0] = 50;
         a.bfs_tasks_by_level[2] = 9;
+        a.p3_store_ns = 10;
+        a.p3_store_calls = 1;
+        a.p3_cache_ns = 20;
+        a.p3_cache_calls = 2;
+        a.p3_slow_ns = 30;
+        a.p3_slow_calls = 3;
+        a.p3_reindex_ns = 40;
+        a.p3_reindex_calls = 4;
 
         b.cache_hits = 2;
         b.cache_misses = 4;
@@ -7324,6 +7368,14 @@ mod tests {
         b.bfs_max_batch_len = 200; // larger; should win the running max
         b.bfs_tasks_by_level[0] = 200;
         b.bfs_tasks_by_level[2] = 17;
+        b.p3_store_ns = 100;
+        b.p3_store_calls = 10;
+        b.p3_cache_ns = 200;
+        b.p3_cache_calls = 20;
+        b.p3_slow_ns = 300;
+        b.p3_slow_calls = 30;
+        b.p3_reindex_ns = 400;
+        b.p3_reindex_calls = 40;
 
         total.accumulate(&a);
         total.accumulate(&b);
@@ -7347,6 +7399,14 @@ mod tests {
         assert_eq!(total.bfs_max_batch_len, 200);
         assert_eq!(total.bfs_tasks_by_level[0], 250);
         assert_eq!(total.bfs_tasks_by_level[2], 26);
+        assert_eq!(total.p3_store_ns, 110);
+        assert_eq!(total.p3_store_calls, 11);
+        assert_eq!(total.p3_cache_ns, 220);
+        assert_eq!(total.p3_cache_calls, 22);
+        assert_eq!(total.p3_slow_ns, 330);
+        assert_eq!(total.p3_slow_calls, 33);
+        assert_eq!(total.p3_reindex_ns, 440);
+        assert_eq!(total.p3_reindex_calls, 44);
         // Untouched indices must remain zero — catches the "summed into
         // index 0" copy-paste bug.
         for (i, &v) in total.misses_by_level.iter().enumerate() {
@@ -7435,9 +7495,8 @@ mod tests {
     /// `memo_tbl=1 234`) which would silently break the HUD layout, and
     /// against per-field widths that overflow the compact HUD panel.
     ///
-    /// Prefix allow-list covers `memo_` (cache fields) and `p1` / `p2`
-    /// (per-step phase timings from hash-thing-71mp, which are part of
-    /// the same HUD block but semantically not memo state).
+    /// Prefix allow-list covers `memo_` (cache fields), per-step phase
+    /// timings, and p3 subphase timings that share the same HUD block.
     #[test]
     fn memo_summary_splits_cleanly_for_hud_overlay() {
         let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
@@ -7458,6 +7517,11 @@ mod tests {
                     || line.starts_with("p1=")
                     || line.starts_with("p2=")
                     || line.starts_with("p3=")
+                    || line.starts_with("p3a_")
+                    || line.starts_with("p3b_")
+                    || line.starts_with("p3c_")
+                    || line.starts_with("p3d_")
+                    || line.starts_with("p3e_")
                     || line.starts_with("p4=")
                     || line.starts_with("bfs_"),
                 "field must use an approved HUD prefix (memo_ / p1 / p2 / p3 / p4 / bfs_), got {line:?}",
@@ -7496,6 +7560,18 @@ mod tests {
             lines.iter().any(|f| f.starts_with("memo_skip_fixed=")),
             "memo_summary must include memo_skip_fixed= token, got {lines:?}",
         );
+        for token in [
+            "p3a_store=",
+            "p3b_cache=",
+            "p3c_slow=",
+            "p3d_reindex=",
+            "p3e_resid=",
+        ] {
+            assert!(
+                lines.iter().any(|f| f.starts_with(token)),
+                "memo_summary must include {token} token, got {lines:?}",
+            );
+        }
     }
 
     #[test]
@@ -7645,6 +7721,71 @@ mod tests {
         assert!(summary.contains("p4="), "missing p4 in summary: {summary}");
         // The HUD-overlay tester (memo_summary_splits_cleanly_for_hud_overlay)
         // independently asserts the field-prefix whitelist + width caps.
+    }
+
+    fn parse_summary_ms(summary: &str, token: &str) -> f64 {
+        let value = summary
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(token))
+            .unwrap_or_else(|| panic!("missing {token} in summary: {summary}"));
+        value
+            .split('/')
+            .next()
+            .unwrap_or(value)
+            .strip_suffix("ms")
+            .unwrap_or(value.split('/').next().unwrap_or(value))
+            .parse::<f64>()
+            .unwrap_or_else(|err| panic!("invalid {token} value in {summary}: {err}"))
+    }
+
+    #[test]
+    fn memo_summary_p3_subphase_breakdown_is_self_consistent() {
+        let mut world = World::new(6);
+        world.set_gol_smoke_rule(GameOfLife3D::new(0, 6, 1, 3));
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
+        world.set(wc(32), wc(32), wc(32), ALIVE.raw());
+        world.step_recursive();
+
+        let stats = &world.hashlife_stats;
+        assert!(stats.p3_store_calls > 0, "expected store calls: {stats:?}");
+        assert!(
+            stats.p3_reindex_calls > 0,
+            "expected reindex calls: {stats:?}"
+        );
+
+        let summary = world.memo_summary();
+        let p3 = parse_summary_ms(&summary, "p3=");
+        let known = parse_summary_ms(&summary, "p3a_store=")
+            + parse_summary_ms(&summary, "p3b_cache=")
+            + parse_summary_ms(&summary, "p3c_slow=")
+            + parse_summary_ms(&summary, "p3d_reindex=")
+            + parse_summary_ms(&summary, "p3e_resid=");
+        assert!(
+            p3 + 0.02 >= known,
+            "p3 must cover known subphases without double-counting: p3={p3}, known={known}, summary={summary}",
+        );
+    }
+
+    #[test]
+    fn memo_summary_p3_slow_probe_counts_slow_divisor_checks() {
+        let mut world = World::new(6);
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
+        world.set(wc(32), wc(32), wc(32), WATER);
+        world.step_recursive();
+
+        assert!(
+            world.materials.memo_period() > 2,
+            "test precondition: terrain registry should include a slow divisor"
+        );
+        assert!(
+            world.hashlife_stats.p3_slow_calls > 0,
+            "slow-divisor phase probe should be counted: {:?}",
+            world.hashlife_stats
+        );
+        assert!(
+            world.memo_summary().contains("p3c_slow="),
+            "summary should expose slow-divisor probe timing"
+        );
     }
 
     #[test]
