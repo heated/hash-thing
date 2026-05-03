@@ -55,9 +55,9 @@ fn vs_main(
     let material = bitcast<u32>(p.pos_mat.w);
     let center_ray_t = length(world_pos - u.camera_pos.xyz);
 
-    // Billboard size in world units. Particles are small — 1/64 of the
-    // volume (one voxel-ish). Scale slightly larger so they're visible.
-    let size = 1.5 / u.params.x;
+    // Billboard half-size in world units. Keep the rendered diameter at one
+    // voxel so a particle does not visibly shrink when it deposits a cell.
+    let size = 0.5 / u.params.x;
 
     // Expand quad in camera space.
     let right = u.camera_right.xyz;

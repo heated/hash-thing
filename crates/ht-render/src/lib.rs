@@ -177,6 +177,7 @@ mod wgsl_drift_guard {
             "@group(0) @binding(3) var t_scene: texture_2d<f32>;",
             "let scene = textureSample(t_scene, s_scene, in.screen_uv);",
             "if scene.a > 0.0 && scene.a + depth_epsilon < in.ray_t {",
+            "let size = 0.5 / u.params.x;",
         ];
         for expected in expected_lines {
             assert!(

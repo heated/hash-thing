@@ -759,6 +759,8 @@ struct App {
     dump_debug: Option<DumpDebugMode>,
     /// hash-thing-u8m4: dump-frame-only render LOD bias override.
     dump_lod_bias: Option<f32>,
+    /// hash-thing-7aqo: dump-frame-only synchronous sim steps before capture.
+    dump_steps_remaining: u32,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -1069,6 +1071,7 @@ impl App {
             dump_pose: None,
             dump_debug: None,
             dump_lod_bias: None,
+            dump_steps_remaining: 0,
             step_pending: false,
             world_prefetch_pending: false,
             next_world_prefetch_generation: 0,
@@ -1769,6 +1772,18 @@ impl App {
                 w.request_redraw();
             }
         });
+    }
+
+    fn run_sync_dump_step(&mut self) {
+        self.world.apply_mutations();
+        self.world.spawn_clones();
+        self.world.step_recursive();
+        let mut queue = std::mem::take(&mut self.world.queue);
+        self.entities.update(&self.world, &mut queue);
+        self.world.queue = queue;
+        self.mark_world_changed();
+        self.last_memo_summary = self.world.memo_summary();
+        self.memo_hud_dirty = true;
     }
 
     fn maybe_start_world_prefetch(&mut self, min: [sim::WorldCoord; 3], max: [sim::WorldCoord; 3]) {
@@ -3708,6 +3723,30 @@ impl ApplicationHandler<AppUserEvent> for App {
                     // + suppress). See hash-thing-v79j / hash-thing-6e4a.
                     self.mark_resume_edge();
                 }
+                if self.dump_frame_path.is_some() && self.dump_steps_remaining > 0 {
+                    let steps = self.dump_steps_remaining;
+                    log::info!(
+                        "--dump-steps: advancing scene by {steps} sync steps before capture"
+                    );
+                    for _ in 0..steps {
+                        self.run_sync_dump_step();
+                    }
+                    self.dump_steps_remaining = 0;
+                    let player_pos = self.player_world_pos();
+                    Self::upload_volume(
+                        &mut self.renderer,
+                        &mut self.world,
+                        &mut self.svdag,
+                        &mut self.last_svdag_stats,
+                        LodUploadCtx {
+                            policy: &mut self.lod_policy,
+                            player_pos,
+                            last_histogram: &mut self.last_lod_histogram,
+                            last_growth_ratio: &mut self.last_lod_growth_ratio,
+                        },
+                    );
+                    self.mark_resume_edge();
+                }
                 if let Some(pose) = self.dump_pose.take() {
                     self.apply_dump_pose(pose);
                     self.mark_resume_edge();
@@ -4354,6 +4393,9 @@ struct ParsedArgs {
     /// `--dump-lod-bias VALUE`: hash-thing-u8m4, only meaningful with
     /// `--dump-frame`. Overrides renderer LOD bias before capture.
     dump_lod_bias: Option<f32>,
+    /// `--dump-steps N`: hash-thing-7aqo, only meaningful with `--dump-frame`.
+    /// Advances the loaded scene synchronously before capture.
+    dump_steps: u32,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -4379,7 +4421,8 @@ where
                          [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|lattice-intro|lattice-interior|lattice-panorama] \
                          [--dump-pose wall|blocks|terrain-wide|geyser] \
                          [--dump-debug normal-axis|hit-kind|material] \
-                         [--dump-lod-bias VALUE]";
+                         [--dump-lod-bias VALUE] \
+                         [--dump-steps N]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
@@ -4388,6 +4431,7 @@ where
     let mut dump_pose: Option<DumpPose> = None;
     let mut dump_debug: Option<DumpDebugMode> = None;
     let mut dump_lod_bias: Option<f32> = None;
+    let mut dump_steps: Option<u32> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -4494,6 +4538,22 @@ where
                 }
                 dump_lod_bias = Some(parsed);
             }
+            "--dump-steps" => {
+                if dump_steps.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-steps");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-steps requires a COUNT"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-steps requires a COUNT; saw '{v_str}'");
+                }
+                let parsed: u32 = v_str
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{USAGE}\n--dump-steps COUNT: invalid '{v_str}'"));
+                dump_steps = Some(parsed);
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -4524,6 +4584,9 @@ where
     if dump_lod_bias.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-lod-bias requires --dump-frame");
     }
+    if dump_steps.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-steps requires --dump-frame");
+    }
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
@@ -4538,6 +4601,7 @@ where
         dump_pose,
         dump_debug,
         dump_lod_bias,
+        dump_steps: dump_steps.unwrap_or(0),
     }
 }
 
@@ -4584,6 +4648,7 @@ fn main() {
         dump_pose,
         dump_debug,
         dump_lod_bias,
+        dump_steps,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -4618,6 +4683,9 @@ fn main() {
     }
     if let Some(bias) = dump_lod_bias {
         log::info!("--dump-lod-bias: {bias}x (will apply before dump-frame render)");
+    }
+    if dump_steps > 0 {
+        log::info!("--dump-steps: {dump_steps} sync steps before dump-frame render");
     }
 
     // Single source of truth for focus-on-launch. Two downstream sites
@@ -4666,6 +4734,7 @@ fn main() {
     app.dump_pose = dump_pose;
     app.dump_debug = dump_debug;
     app.dump_lod_bias = dump_lod_bias;
+    app.dump_steps_remaining = dump_steps;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -5065,6 +5134,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_from_dump_steps() {
+        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps", "24"]);
+        assert_eq!(r.dump_steps, 24);
+    }
+
+    #[test]
     fn parse_args_from_dump_debug_all_kinds() {
         for (raw, expected, debug_mode) in [
             ("normal-axis", DumpDebugMode::NormalAxis, 2),
@@ -5099,6 +5174,12 @@ mod tests {
     #[should_panic(expected = "--dump-lod-bias requires --dump-frame")]
     fn parse_args_from_dump_lod_bias_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-lod-bias", "2"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps requires --dump-frame")]
+    fn parse_args_from_dump_steps_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-steps", "24"]);
     }
 
     #[test]
@@ -5141,6 +5222,24 @@ mod tests {
     #[should_panic(expected = "--dump-lod-bias VALUE must be finite and >= 1.0")]
     fn parse_args_from_dump_lod_bias_too_low_panics() {
         let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "0.5"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps requires a COUNT")]
+    fn parse_args_from_dump_steps_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps requires a COUNT; saw '--demo'")]
+    fn parse_args_from_dump_steps_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps COUNT: invalid 'bogus'")]
+    fn parse_args_from_dump_steps_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps", "bogus"]);
     }
 
     #[test]
@@ -5203,6 +5302,19 @@ mod tests {
             "--dump-lod-bias",
             "2",
             "--dump-lod-bias",
+            "4",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-steps")]
+    fn parse_args_from_two_dump_steps_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-steps",
+            "2",
+            "--dump-steps",
             "4",
         ]);
     }
