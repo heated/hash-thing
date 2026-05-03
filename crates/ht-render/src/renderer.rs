@@ -18,6 +18,8 @@ const GT_READY: u8 = 2;
 /// `resolve_query_set` only requires the buffer to hold `query_count * 8`
 /// bytes (per wgpu-core/src/command/query.rs:475). 16 bytes is exactly that.
 const TIMESTAMP_BYTES: u64 = 16;
+const SVDAG_BUFFER_MIN_CAP: u64 = 65_536;
+const SVDAG_BUFFER_SHRINK_DIVISOR: u64 = 4;
 
 /// Convert raw GPU timestamp ticks to a `Duration`, using the
 /// adapter-reported `timestamp_period` (nanoseconds per tick). Pure
@@ -35,6 +37,23 @@ fn ticks_to_duration(start_ticks: u64, end_ticks: u64, period_ns: f32) -> Durati
     // stable. Ceiling it at u64::MAX is fine; such a value would be
     // "absurdly large" per the test rubric and we'd catch it upstream.
     Duration::from_nanos(ns as u64)
+}
+
+fn svdag_buffer_cap_for_needed(needed: u64) -> u64 {
+    let mut cap = SVDAG_BUFFER_MIN_CAP;
+    while cap < needed {
+        cap *= 2;
+    }
+    cap
+}
+
+fn should_reallocate_svdag_buffer(current_cap: u64, needed: u64) -> bool {
+    if current_cap == 0 || needed > current_cap {
+        return true;
+    }
+    current_cap > SVDAG_BUFFER_MIN_CAP
+        && needed <= current_cap / SVDAG_BUFFER_SHRINK_DIVISOR
+        && svdag_buffer_cap_for_needed(needed) < current_cap
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2173,11 +2192,10 @@ impl Renderer {
         // Grow the GPU buffer if needed. Resets the upload watermark — the
         // fresh buffer has nothing on it, so the next write must cover all.
         let mut require_full = false;
-        if self.svdag_buffer.is_none() || needed > self.svdag_buffer_cap {
-            let mut cap = self.svdag_buffer_cap.max(65536);
-            while cap < needed {
-                cap *= 2;
-            }
+        if self.svdag_buffer.is_none()
+            || should_reallocate_svdag_buffer(self.svdag_buffer_cap, needed)
+        {
+            let cap = svdag_buffer_cap_for_needed(needed);
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("svdag_buffer"),
                 size: cap,
@@ -2938,9 +2956,10 @@ impl Renderer {
 mod tests {
     use super::{
         auto_render_scale, classify_gpu, gpu_timing_lag_frames, parse_present_mode,
-        resolved_render_scale, scaled_render_extent, surface_and_raycast_extents,
-        target_pixels_for_volume, ticks_to_duration, FrameOutcome, GpuClass, GpuTiming,
-        RenderScaleSource, RendererLifecycleSnapshot, ResolvedGpuTimingSample, SubmitFenceState,
+        resolved_render_scale, scaled_render_extent, should_reallocate_svdag_buffer,
+        surface_and_raycast_extents, svdag_buffer_cap_for_needed, target_pixels_for_volume,
+        ticks_to_duration, FrameOutcome, GpuClass, GpuTiming, RenderScaleSource,
+        RendererLifecycleSnapshot, ResolvedGpuTimingSample, SubmitFenceState,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3493,6 +3512,25 @@ mod tests {
         // zero), which shows up in the `render_gpu` summary as a
         // suspiciously-low mean that the user can investigate.
         assert_eq!(ticks_to_duration(500, 100, 1.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn svdag_buffer_capacity_rounds_up_to_power_of_two_floor() {
+        assert_eq!(svdag_buffer_cap_for_needed(0), 65_536);
+        assert_eq!(svdag_buffer_cap_for_needed(1), 65_536);
+        assert_eq!(svdag_buffer_cap_for_needed(65_536), 65_536);
+        assert_eq!(svdag_buffer_cap_for_needed(65_537), 131_072);
+        assert_eq!(svdag_buffer_cap_for_needed(1_000_000), 1_048_576);
+    }
+
+    #[test]
+    fn svdag_buffer_reallocate_grows_and_shrinks_material_drops_only() {
+        assert!(should_reallocate_svdag_buffer(0, 1));
+        assert!(should_reallocate_svdag_buffer(65_536, 65_537));
+        assert!(!should_reallocate_svdag_buffer(65_536, 1));
+        assert!(!should_reallocate_svdag_buffer(1_048_576, 300_000));
+        assert!(should_reallocate_svdag_buffer(1_048_576, 262_144));
+        assert!(should_reallocate_svdag_buffer(1_048_576, 64_000));
     }
 
     #[test]
