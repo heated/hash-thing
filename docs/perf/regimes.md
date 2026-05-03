@@ -117,9 +117,9 @@ a cache-lookup ratio retained for backward compatibility.
 **Single number for thesis verification:** `work_elision_p05_x` at the
 **busiest gameplay regime that's part of the demo**. Today that's
 `(world=demo, scene=default-demo, intensity=cascade, regime=churning)`.
-The historical field reading at that coordinate was **5.6×**, but it pre-dates
-the structured `work_elision_*` JSON metric and must be regenerated before it
-can close a thesis lead. Saturated-idle readings are much higher.
+The historical field reading at that coordinate was **5.6×**, but it pre-dated
+the structured `work_elision_*` JSON metric. The first exact-coordinate
+structured run (`hash-thing-8ppq.3`) measured `work_elision_p05_x=79.15×`.
 The thesis is "viable" if this stays >>1 in gameplay regimes; it's "weak"
 if it collapses to single-digit when the player actually does something.
 
@@ -140,6 +140,9 @@ Honest inventory of historical numbers, retrofitted to v2 coordinates with hardw
 | "step 6.7 ms median post-ite4"| demo · default-terrain · microchurn · saturated      | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_median_ms   | 6.7        | bench        | mixed             |
 | "step 36 ms / 67 p95"         | demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 67         | demo (n=1)   | hard_included     |
 | "elision 5.6× at cascade peak"| demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | legacy field reading | 5.6×    | demo (n=1)   | hard_included     |
+| "work elision p05=79.15×"     | demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | work_elision_p05_x | 79.15×   | bench (n=30) | hard_included     |
+| "hashlife p95=20.40ms"        | demo · default-demo · cascade · churning             | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 20.40      | bench (n=30) | hard_included     |
+| "chunk-array p95=939.17ms"    | demo · default-demo · cascade · n/a                  | chunk-array         | default-ca  | m2-pro-mbp   | step_p95_ms      | 939.17     | bench (n=30) | hard_included     |
 | "memo_hit 0.41 → 0.72"        | demo · default-terrain · unknown · saturated         | hashlife-recursive  | default-ca  | m2-pro-mbp   | memo_hit_ratio   | 0.41-0.72  | mixed        | mixed             |
 | "chunk-array p95=2.29ms"      | tiny (l=5) · default-terrain · idle · n/a            | chunk-array         | default-ca  | m2-pro-mbp   | step_p95_ms      | 2.29       | bench (n=30) | easy_only (8ppq.1.4) |
 | "hashlife p95=1.20ms"         | tiny (l=5) · default-terrain · idle · saturated      | hashlife-recursive  | default-ca  | m2-pro-mbp   | step_p95_ms      | 1.20       | bench (n=30) | easy_only (8ppq.1.4) |
@@ -155,7 +158,7 @@ enables novel games" decomposes into:
 
 | sub-claim     | what it means in this DSL                                                                          | status         |
 |---------------|----------------------------------------------------------------------------------------------------|----------------|
-| **engine**    | `work_elision_p05_x ≥ 10×` for all `(demo, default-demo, *, *)` regimes                            | partial — fails at cascade peak (5.6×) |
+| **engine**    | `work_elision_p05_x ≥ 10×` for all `(demo, default-demo, *, *)` regimes                            | passes known cascade case — 79.15× at `demo · default-demo · cascade · churning` |
 | **interactive** | `frame_total_p95 ≤ 33 ms` for all `(demo, default-demo, edit-active, *)`                         | demo says no — render-bound at 50 ms |
 | **scale**     | `step_p95 ≤ 100 ms` extends to `(large, *, edit-active, *)` and ≤ 200 ms to `(huge, ...)`          | unknown        |
 | **novelty**   | A gameplay capability exists at `(demo, default-demo, edit-active, *)` that a chunk-array sim can't deliver | unmeasured |
