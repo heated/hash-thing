@@ -4,7 +4,7 @@
 
 ## Summary
 
-**Apple M1/M2 integrated sits below the 25th percentile of the active Steam GPU population.** The median Steam gamer has ~3.5–5× the FP32 throughput of M1/M2 base. macOS is 2.35% of Steam users, and within that slice M-series is now dominant. The implication for hash-thing: **set defensive Mac defaults (render_scale=0.5) and direct optimization budget at the median Steam GPU**, not at making the M1/M2 case faster.
+**Apple M1/M2 integrated sits below the 25th percentile of the active Steam GPU population.** The median Steam gamer has ~3.5–5× the FP32 throughput of M1/M2 base. macOS is 2.35% of Steam users, and within that slice M-series is now dominant. SPEC.md now chooses the low end deliberately: **Apple M1 base / GTX 1650-class is the spec floor, M2 is the daily measurement rig, and median Steam GPUs scale up through quality knobs rather than defining the minimum experience.**
 
 ## 1. Integrated vs discrete share
 
@@ -75,20 +75,20 @@ Sources:
 
 ## 5. Implication for hash-thing tuning priority
 
-> **STALE — superseded by SPEC.md "Hardware spec target" (edward 2026-04-27).** The recommendations below were built on a "tune for median Steam GPU, treat Mac as smoke test" frame. SPEC.md now sets the spec rig at **10th-percentile Steam ≈ M1 base**, with M2 as the dev measurement target. The per-bead re-prioritization in this section (9k4w.4 demoted, m59h deferred, adp-res promoted) likely flips under the new frame and needs a fresh pass — see follow-up bead `hash-thing-3q4a`. Treat the §1–§4 data and §6 caveats as still-canonical; treat the §5 conclusions below as historical.
+> **UPDATED by `hash-thing-3q4a` (2026-05-03).** SPEC.md now sets the spec rig at **10th-percentile Steam ≈ Apple M1 base**, with edward's M2 as the daily dev measurement target. The distribution data above still matters, but it no longer means "optimize for RTX 3060 first." It means the project has deliberately chosen the low end of the distribution as the contract.
 
-SPEC.md's minimum-spec target (8GB / 4-core / 2GB-VRAM / 1440p60) maps to roughly a **GTX 1650 / GTX 1060 3GB-class** discrete card (~3 TF). M1 base (2.6 TF, unified memory) is *just below* that line; M2 base (3.6 TF) is *just above*.
+SPEC.md's current hardware target maps to roughly a **GTX 1650 / Apple M1 base** floor: 8 GB RAM, 4 physical CPU cores, ~2.5-3 TFLOPS GPU throughput, 1080p with `render_scale <= 0.5` acceptable, and **50-60 FPS felt** on that tier. M2 base is one tier above the floor and is the practical day-to-day measurement rig the crew owns.
 
 **Recommendation:**
-- Keep M1/M2 at `render_scale = 0.5` default (tracked as `adp-res` Phase 3 per render-perf-direction.md).
-- **Do not over-spend the optimization budget chasing Mac perf.** ~98% of the audience is Windows/Linux on RTX 3060+ class hardware (3–5× M1 compute).
-- Tune to the **median Steam GPU first** (RTX 3060 / 4060). M1/M2 = "minimum-spec smoke test" — must run, doesn't have to look pretty.
+- Tune first for the **M1-class spec floor**, not the median Steam GPU. Median RTX 3060/4060-class machines get higher `render_scale`, draw distance, post-FX, and FPS through continuous quality knobs; they do not define the minimum viable experience.
+- Treat M1/M2 performance work as first-class when it moves the spec contract. Mac-only work is no longer low-value just because macOS is a small Steam slice; M1-class hardware is the chosen low-end proxy for the whole audience.
+- Keep the adaptive/default-resolution path central: `render_scale <= 0.5` on M1-class hardware is part of the contract, not a shame fallback.
 - Specific re-prioritization for `docs/perf/render-perf-direction.md`:
-  - `9k4w.4` (Apple-specific register-flatten): demoted from P2 to P3. Mac-only optimization at <2.5% of audience is low-leverage.
-  - `m59h` (async surface acquire, Mac-only): stays at P2 design-gated. Only revisit if `aud-hw`-derived render_scale=0.5 default still doesn't deliver acceptable feel on M1/M2.
-  - `9k4w-audit` (cheaper-rays already-landed audit): stays P1. The cheaper-rays optimizations already in the shader help all GPU classes, so confirming they're landed is high-value regardless of audience composition.
-  - `adp-res` (adaptive resolution): promoted from P2 to **P1**. With M1/M2 = bottom-25% and median = 5× faster, the per-GPU-class default IS the Mac perf strategy.
-  - `render-meas` (256^3+ steady-state captures): stays P1. We still need real numbers at edward's actual problem-scale, but those numbers will inform "when do we stop optimizing" rather than "how much harder to optimize."
+  - `9k4w.4` (Apple-specific register-flatten): **restore to P2 or higher**. If it improves M-series occupancy without non-Mac regression, it directly supports the spec rig.
+  - `m59h` (async surface acquire, Mac-only): **keep promoted / design-gated, not deferred as low audience leverage**. It remains gated because it is an architectural rewrite, but the gating question is mechanism evidence and design risk, not whether Mac matters.
+  - `9k4w-audit` (cheaper-rays already-landed audit): stays P1. It helps all GPU classes and keeps the render roadmap honest.
+  - `adp-res` / `pfpn` (adaptive resolution): stays **P1 and central**. Under the new frame it is the explicit path for meeting the M1-class 50-60 FPS contract, not merely a Mac workaround.
+  - `render-meas` (256^3+ steady-state captures): stays P1, and should report **M1 + M2** when possible. M2 is the daily rig; M1 is the contract cross-check.
 
 ## 6. Audience definition (hash-thing-specific caveat)
 
@@ -97,7 +97,7 @@ This research uses Steam's general gaming audience as a proxy. The hash-thing-sp
 - Linux users (slightly tech-y, ~5% of Steam)
 - Older hardware (long-tail of 4-year-old GPUs)
 
-A more conservative read: **median hash-thing player is probably GTX 1660 / RTX 3050-class**, not RTX 3060. That's still 1.5–2× M1/M2 perf; the qualitative recommendation stands.
+A more conservative read: **median hash-thing player is probably GTX 1660 / RTX 3050-class**, not RTX 3060. That reinforces the SPEC.md choice to make M1-class hardware the floor and scale richer visuals upward through quality knobs.
 
 If hash-thing ever ships demographically-targeted (e.g., explicit "runs on potato" indie marketing), the median may pull lower toward GTX 1650 / Iris Xe — closer to M1/M2 territory, raising the priority of M-series optimization. Worth re-running this analysis at distribution-launch or if early-access feedback shows unexpectedly low-end audience.
 
@@ -107,10 +107,10 @@ If hash-thing ever ships demographically-targeted (e.g., explicit "runs on potat
 - `adp-res` (Phase 3 adaptive resolution — primary consumer of this recommendation)
 - `2w1u` (parent perceived-FPS bead)
 - `9k4w.4` (Apple register flatten — re-prioritized per §5)
-- `m59h` (async surface acquire — confirmed deferred per §5)
+- `m59h` (async surface acquire — promoted/design-gated per §5)
 
 ## Cross-references
 
 - `docs/perf/render-perf-direction.md` — primary roadmap; re-prioritization recommendations land here.
-- `SPEC.md` minimum-spec line (8GB / 4-core / 2GB-VRAM / 1440p60) — referenced in §5.
+- `SPEC.md` hardware spec target (8 GB / 4-core / 4 GB discrete VRAM or 8 GB unified / 1080p with `render_scale <= 0.5` / 50-60 FPS felt) — referenced in §5.
 - `docs/perf/svdag-perf-paper.md` §3.9–§3.12 — empirical M2 numbers feeding into §2.
