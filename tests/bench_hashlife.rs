@@ -60,7 +60,7 @@ fn bench_step(label: &str, level: u32, generations: usize) {
 
         if gen < 3 || gen == generations - 1 {
             eprintln!(
-                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
+                "  gen {gen}: {:.3}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
                 us as f64 / 1000.0,
                 world.population(),
                 s.cache_hits,
@@ -96,7 +96,7 @@ fn bench_step(label: &str, level: u32, generations: usize) {
         let median_us = times_us[generations / 2];
         let p95_us = times_us[(generations as f64 * 0.95) as usize];
         eprintln!(
-            "  summary: {generations} gens, mean={:.1}ms, median={:.1}ms, p95={:.1}ms, total={:.1}s",
+            "  summary: {generations} gens, mean={:.3}ms, median={:.3}ms, p95={:.3}ms, total={:.1}s",
             mean_us as f64 / 1000.0,
             median_us as f64 / 1000.0,
             p95_us as f64 / 1000.0,

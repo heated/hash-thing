@@ -3030,6 +3030,11 @@ pub(crate) fn brute_step_grid(
     materials: &MaterialRegistry,
     generation: u64,
 ) -> Vec<CellState> {
+    assert_eq!(
+        grid.len(),
+        side * side * side,
+        "step_grid requires a whole-world flat grid"
+    );
     let mut next = vec![0 as CellState; side * side * side];
     let divisor_by_material = materials.tick_divisor_flags();
 
@@ -3422,6 +3427,16 @@ mod tests {
         let mut world = empty_world();
         world.set_gol_smoke_rule(rule);
         world
+    }
+
+    #[test]
+    #[should_panic(expected = "step_grid requires a whole-world flat grid")]
+    fn step_grid_rejects_partial_flat_grid() {
+        let world = empty_world();
+        let mut grid = world.flatten();
+        grid.pop();
+
+        let _ = world.step_grid(&grid);
     }
 
     fn feet(point: [i64; 3]) -> [f64; 3] {

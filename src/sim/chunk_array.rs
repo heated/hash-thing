@@ -167,14 +167,19 @@ impl ChunkArrayWorld {
         self.grid[idx] = state;
     }
 
-    /// Population indexed by material id. Length matches
+    /// Non-empty population indexed by material id. Length matches
     /// `MaterialRegistry::tick_divisor_flags().len()`. Material ids
     /// outside that range (sparse slots / post-mutation truncation) are
-    /// silently dropped rather than panicking — those slots read 0.
+    /// silently dropped rather than panicking — those slots read 0. Empty
+    /// cells are skipped so `population_by_material().iter().sum()` matches
+    /// `population()`, not the whole grid length.
     pub(crate) fn population_by_material(&self) -> Vec<u64> {
         let n = self.materials.tick_divisor_flags().len();
         let mut counts = vec![0u64; n];
         for &c in &self.grid {
+            if c == 0 {
+                continue;
+            }
             let mat = Cell::from_raw(c).material() as usize;
             if let Some(slot) = counts.get_mut(mat) {
                 *slot += 1;
@@ -191,6 +196,9 @@ mod tests {
     fn count_by_material(grid: &[CellState], n: usize) -> Vec<u64> {
         let mut counts = vec![0u64; n];
         for &c in grid {
+            if c == 0 {
+                continue;
+            }
             let mat = Cell::from_raw(c).material() as usize;
             if let Some(slot) = counts.get_mut(mat) {
                 *slot += 1;
@@ -220,6 +228,10 @@ mod tests {
         assert_eq!(
             chunk.population_by_material(),
             count_by_material(&hashlife_grid, n)
+        );
+        assert_eq!(
+            chunk.population_by_material().iter().sum::<u64>(),
+            chunk.population()
         );
 
         // Cached-predicate parity. `MaterialRegistry: Clone` deep-clones
