@@ -118,9 +118,7 @@ fn run_and_report(label: &str, mut world: World, n_steps: usize) {
         total_fixed as f64 / calls as f64
     };
 
-    eprintln!(
-        "  warm steps: {warm_count} (skipped {warmup} cold)",
-    );
+    eprintln!("  warm steps: {warm_count} (skipped {warmup} cold)",);
     eprintln!(
         "  per-step avg: hits={:>9} misses={:>9} empty={:>9} fixed={:>9}",
         total_hits / warm_count as u64,
@@ -141,15 +139,19 @@ fn run_and_report(label: &str, mut world: World, n_steps: usize) {
     }
     let total_lvl_misses: u64 = total_misses_by_level.iter().sum();
     if total_lvl_misses > 0 {
-        eprintln!("  level-3 (base case) miss share: {:.3}",
-            total_misses_by_level[0] as f64 / total_lvl_misses as f64);
+        eprintln!(
+            "  level-3 (base case) miss share: {:.3}",
+            total_misses_by_level[0] as f64 / total_lvl_misses as f64
+        );
     }
 }
 
 fn fresh_default_terrain(level: u32) -> World {
     let mut world = World::new(level);
     let params = TerrainParams::for_level(level);
-    let _stats = world.seed_terrain(&params).expect("terrain params validate");
+    let _stats = world
+        .seed_terrain(&params)
+        .expect("terrain params validate");
     world
 }
 
@@ -231,7 +233,9 @@ fn aqq4_thesis_probe_repeating_lattice() {
 /// XorShift64* seeded for reproducibility.
 struct Rng(u64);
 impl Rng {
-    fn new(seed: u64) -> Self { Self(seed) }
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
     fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -297,8 +301,16 @@ fn run_churn_and_report(label: &str, mut world: World, n_steps: usize, sand_per_
     } else {
         total_hits as f64 / (total_hits + total_misses) as f64
     };
-    let skip_empty_rate = if calls == 0 { 0.0 } else { total_empty as f64 / calls as f64 };
-    let skip_fixed_rate = if calls == 0 { 0.0 } else { total_fixed as f64 / calls as f64 };
+    let skip_empty_rate = if calls == 0 {
+        0.0
+    } else {
+        total_empty as f64 / calls as f64
+    };
+    let skip_fixed_rate = if calls == 0 {
+        0.0
+    } else {
+        total_fixed as f64 / calls as f64
+    };
     eprintln!("  warm steps: {warm_count} (skipped {warmup} cold)");
     eprintln!(
         "  per-step avg: hits={:>9} misses={:>9} empty={:>9} fixed={:>9}",

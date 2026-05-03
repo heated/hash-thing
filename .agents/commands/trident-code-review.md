@@ -1,3 +1,8 @@
+---
+name: trident-code-review
+description: "Trident Code Review: Six-Agent Code Review (2-3-1)"
+---
+
 # Trident Code Review: Six-Agent Code Review (2-3-1)
 
 Run parallel code reviews with a Codex-heavy six-review mix: Claude runs two lenses (standard / critical), Codex runs the three canonical lenses (standard / critical / evolutionary), and Gemini runs a single standard pass. Per hash-thing-2kkt, the evolutionary-Claude lens is dropped (Codex evolutionary covers the angle at lower cost) and the evolutionary synthesis step is skipped. Output lives in a review pack folder under `~/at/arch/notes/`.

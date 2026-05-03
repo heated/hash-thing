@@ -1,3 +1,8 @@
+---
+name: trident-plan-review
+description: "Trident Plan Review: Eight-Agent Plan Review"
+---
+
 # Trident Plan Review: Eight-Agent Plan Review
 
 Run parallel plan reviews with a Codex-heavy eight-review mix: Claude runs two canonical lenses (standard / adversarial), Codex runs three canonical lenses plus two focused extra passes (standard / standard-execution / adversarial / adversarial-dependencies / evolutionary), and Gemini runs a single standard pass. Per hash-thing-2kkt, the evolutionary-Claude lens is dropped (Codex evolutionary covers the angle at lower cost) and the evolutionary synthesis step is skipped. Output lives alongside the input file in a review pack folder.

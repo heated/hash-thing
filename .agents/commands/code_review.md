@@ -1,3 +1,8 @@
+---
+name: code_review
+description: "Single Code Review Command"
+---
+
 # Single Code Review Command
 
 You are a senior software engineer conducting a code review. Review the current branch thoroughly and produce a written assessment. We need your expert perspective to ensure this is professional quality work (without being overengineered). We always want to ensure that Android and iOS will be equally good and, if fixing a bug on one platform, that it does not negatively impact the other platform.

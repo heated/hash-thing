@@ -2897,10 +2897,10 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameOutcome, GpuClass, GpuTiming, RenderScaleSource, RendererLifecycleSnapshot,
-        ResolvedGpuTimingSample, SubmitFenceState, auto_render_scale, classify_gpu,
-        gpu_timing_lag_frames, parse_present_mode, resolved_render_scale, target_pixels_for_volume,
-        ticks_to_duration,
+        auto_render_scale, classify_gpu, gpu_timing_lag_frames, parse_present_mode,
+        resolved_render_scale, target_pixels_for_volume, ticks_to_duration, FrameOutcome, GpuClass,
+        GpuTiming, RenderScaleSource, RendererLifecycleSnapshot, ResolvedGpuTimingSample,
+        SubmitFenceState,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

@@ -3,7 +3,7 @@ mod renderer;
 mod svdag;
 
 pub use renderer::{FrameOutcome, OffSurfacePixels, Renderer, RendererGpuTimingSample};
-pub use svdag::{Svdag, cpu_trace};
+pub use svdag::{cpu_trace, Svdag};
 
 #[cfg(test)]
 mod wgsl_drift_guard {

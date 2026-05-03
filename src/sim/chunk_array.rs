@@ -283,11 +283,7 @@ mod tests {
     /// Failure-localization helper. On byte mismatch, prints the top
     /// 3 (chunk_material, hashlife_material) pairs that disagreed —
     /// per the bead's "material-class divergence map" verification ask.
-    fn assert_byte_parity_with_class_map(
-        chunk: &ChunkArrayWorld,
-        hashlife: &World,
-        gen: u64,
-    ) {
+    fn assert_byte_parity_with_class_map(chunk: &ChunkArrayWorld, hashlife: &World, gen: u64) {
         let h = hashlife.flatten();
         let c = chunk.grid();
         if c == &h[..] {

@@ -1710,31 +1710,15 @@ impl World {
         ];
         self.fill_box(
             Box3::new(
-                [
-                    hazard_center[0] - 2,
-                    floor_y + 1,
-                    hazard_center[2] - 7,
-                ],
-                [
-                    hazard_center[0] + 2,
-                    floor_y + 2,
-                    hazard_center[2] + 7,
-                ],
+                [hazard_center[0] - 2, floor_y + 1, hazard_center[2] - 7],
+                [hazard_center[0] + 2, floor_y + 2, hazard_center[2] + 7],
             ),
             LAVA,
         );
         self.fill_box(
             Box3::new(
-                [
-                    hazard_center[0] + 3,
-                    floor_y + 1,
-                    hazard_center[2] - 5,
-                ],
-                [
-                    hazard_center[0] + 6,
-                    floor_y + 1,
-                    hazard_center[2] + 5,
-                ],
+                [hazard_center[0] + 3, floor_y + 1, hazard_center[2] - 5],
+                [hazard_center[0] + 6, floor_y + 1, hazard_center[2] + 5],
             ),
             FIRE,
         );
@@ -1764,7 +1748,10 @@ impl World {
         );
         for x in (lane_x0 + 4..lane_x1).step_by(10) {
             self.fill_box(
-                Box3::new([x, floor_y + 1, center - 4], [x + 2, floor_y + 1, center + 4]),
+                Box3::new(
+                    [x, floor_y + 1, center - 4],
+                    [x + 2, floor_y + 1, center + 4],
+                ),
                 VINE,
             );
         }
@@ -1799,9 +1786,18 @@ impl World {
 
     fn seed_quarantine_settlement(&mut self, center: [i64; 3]) {
         let [cx, cy, cz] = center;
-        self.fill_box(Box3::new([cx - 3, cy, cz - 3], [cx + 3, cy + 2, cz + 3]), DIRT);
-        self.fill_box(Box3::new([cx - 2, cy + 1, cz - 2], [cx + 2, cy + 3, cz + 2]), GRASS);
-        self.fill_box(Box3::new([cx - 1, cy + 4, cz - 1], [cx + 1, cy + 4, cz + 1]), WATER);
+        self.fill_box(
+            Box3::new([cx - 3, cy, cz - 3], [cx + 3, cy + 2, cz + 3]),
+            DIRT,
+        );
+        self.fill_box(
+            Box3::new([cx - 2, cy + 1, cz - 2], [cx + 2, cy + 3, cz + 2]),
+            GRASS,
+        );
+        self.fill_box(
+            Box3::new([cx - 1, cy + 4, cz - 1], [cx + 1, cy + 4, cz + 1]),
+            WATER,
+        );
     }
 
     fn seed_quarantine_barrier(&mut self, center: [i64; 3]) {
@@ -2935,9 +2931,9 @@ pub(crate) fn brute_step_grid(
                     continue;
                 }
                 let neighbors = get_neighbors(grid, side, x, y, z);
-                let rule = materials.rule_for_cell(center).unwrap_or_else(|| {
-                    panic!("missing CaRule for material {}", center.material())
-                });
+                let rule = materials
+                    .rule_for_cell(center)
+                    .unwrap_or_else(|| panic!("missing CaRule for material {}", center.material()));
                 next[idx] = rule.step_cell(center, &neighbors).raw();
             }
         }
@@ -3134,10 +3130,7 @@ fn brute_apply_block(
 
 /// Find the unique BlockRuleId across all non-empty cells in a block.
 /// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
-fn brute_unique_block_rule(
-    block: &[Cell; 8],
-    materials: &MaterialRegistry,
-) -> Option<BlockRuleId> {
+fn brute_unique_block_rule(block: &[Cell; 8], materials: &MaterialRegistry) -> Option<BlockRuleId> {
     let mut found: Option<BlockRuleId> = None;
     for cell in block {
         if let Some(id) = materials.block_rule_id_for_cell(*cell) {
@@ -4059,11 +4052,23 @@ mod tests {
     fn seed_pyroclastic_chamber_palette_is_volcanic_not_earthy() {
         let mut w = World::new(6); // side 64
         w.seed_pyroclastic_chamber();
-        assert!(w.population() > 0, "chamber must have stone/lava/water cells");
+        assert!(
+            w.population() > 0,
+            "chamber must have stone/lava/water cells"
+        );
         let grid = w.flatten();
-        assert!(grid.contains(&STONE), "chamber walls/floor/ceiling must be stone");
-        assert!(grid.contains(&LAVA), "chamber floor must have embedded lava");
-        assert!(grid.contains(&WATER), "chamber ceiling must have embedded water");
+        assert!(
+            grid.contains(&STONE),
+            "chamber walls/floor/ceiling must be stone"
+        );
+        assert!(
+            grid.contains(&LAVA),
+            "chamber floor must have embedded lava"
+        );
+        assert!(
+            grid.contains(&WATER),
+            "chamber ceiling must have embedded water"
+        );
         assert!(
             !grid.contains(&DIRT),
             "pyroclastic chamber must not contain DIRT (Minecraft-palette disqualifier)"
@@ -4087,15 +4092,11 @@ mod tests {
         let ceiling_y = (hi - 2) as i64;
         let lava_count_at_floor = (lo as i64..hi as i64)
             .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
-            .filter(|(x, z)| {
-                w.get(WorldCoord(*x), WorldCoord(floor_y), WorldCoord(*z)) == LAVA
-            })
+            .filter(|(x, z)| w.get(WorldCoord(*x), WorldCoord(floor_y), WorldCoord(*z)) == LAVA)
             .count();
         let water_count_at_ceiling = (lo as i64..hi as i64)
             .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
-            .filter(|(x, z)| {
-                w.get(WorldCoord(*x), WorldCoord(ceiling_y), WorldCoord(*z)) == WATER
-            })
+            .filter(|(x, z)| w.get(WorldCoord(*x), WorldCoord(ceiling_y), WorldCoord(*z)) == WATER)
             .count();
         assert!(
             lava_count_at_floor > 0,
@@ -4151,9 +4152,18 @@ mod tests {
 
         assert!(grid.contains(&LAVA), "hazard front must include lava");
         assert!(grid.contains(&FIRE), "hazard front must include fire");
-        assert!(grid.contains(&GRASS), "settlements must include vulnerable grass");
-        assert!(grid.contains(&METAL), "counter-patterns/spawn pad must include metal");
-        assert!(grid.contains(&WATER), "counter-patterns/settlements must include water");
+        assert!(
+            grid.contains(&GRASS),
+            "settlements must include vulnerable grass"
+        );
+        assert!(
+            grid.contains(&METAL),
+            "counter-patterns/spawn pad must include metal"
+        );
+        assert!(
+            grid.contains(&WATER),
+            "counter-patterns/settlements must include water"
+        );
         assert_eq!(
             w.get(
                 WorldCoord(layout.player_pos[0].floor() as i64),

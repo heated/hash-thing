@@ -180,8 +180,7 @@ fn bench_hashlife_256_ftuu_rayon_compare() {
         30,
         BaseCaseStrategy::RayonPerFanout,
     );
-    let bfs =
-        bench_step_with_strategy("256³ ecmn rayon (bfs)", 8, 30, BaseCaseStrategy::RayonBfs);
+    let bfs = bench_step_with_strategy("256³ ecmn rayon (bfs)", 8, 30, BaseCaseStrategy::RayonBfs);
 
     eprintln!("--- ecmn slack check ---");
     eprintln!(
@@ -189,9 +188,7 @@ fn bench_hashlife_256_ftuu_rayon_compare() {
         serial.step_us_median, per_fanout.step_us_median, bfs.step_us_median,
     );
     let slack_ratio = bfs.step_us_median as f64 / per_fanout.step_us_median.max(1) as f64;
-    eprintln!(
-        "  bfs/per-fanout ratio: {slack_ratio:.3} (slack target: ≤ 1.10 on default terrain)",
-    );
+    eprintln!("  bfs/per-fanout ratio: {slack_ratio:.3} (slack target: ≤ 1.10 on default terrain)",);
     if slack_ratio > 1.10 {
         eprintln!(
             "  WARN: BFS slower than per-fanout by >10% on default terrain. \
@@ -331,7 +328,12 @@ fn churn_drop_sand(world: &mut World, rng: &mut BenchRng, n: usize) {
         // usage pattern — drops from ~the player's head height).
         let y = side - 4 + (rng.next_u64() % 2);
         let z = rng.next_u64() % (side - 4) + 2;
-        world.set(WorldCoord(x as i64), WorldCoord(y as i64), WorldCoord(z as i64), sand);
+        world.set(
+            WorldCoord(x as i64),
+            WorldCoord(y as i64),
+            WorldCoord(z as i64),
+            sand,
+        );
     }
 }
 
@@ -424,13 +426,8 @@ fn bench_churn_step_with_strategy(
 #[test]
 #[ignore]
 fn bench_hashlife_256_churn_short() {
-    let serial = bench_churn_step_with_strategy(
-        "256³ churn serial",
-        8,
-        50,
-        20,
-        BaseCaseStrategy::Serial,
-    );
+    let serial =
+        bench_churn_step_with_strategy("256³ churn serial", 8, 50, 20, BaseCaseStrategy::Serial);
     let per_fanout = bench_churn_step_with_strategy(
         "256³ churn rayon (per-fanout)",
         8,
@@ -453,12 +450,8 @@ fn bench_hashlife_256_churn_short() {
     );
     let bfs_vs_perfanout = bfs.step_us_median as f64 / per_fanout.step_us_median.max(1) as f64;
     let bfs_vs_serial = bfs.step_us_median as f64 / serial.step_us_median.max(1) as f64;
-    eprintln!(
-        "  bfs/per-fanout ratio: {bfs_vs_perfanout:.3} (lower = bfs wins on churn)",
-    );
-    eprintln!(
-        "  bfs/serial ratio:     {bfs_vs_serial:.3} (parallelism multiplier under churn)",
-    );
+    eprintln!("  bfs/per-fanout ratio: {bfs_vs_perfanout:.3} (lower = bfs wins on churn)",);
+    eprintln!("  bfs/serial ratio:     {bfs_vs_serial:.3} (parallelism multiplier under churn)",);
 }
 
 /// hash-thing-5e3e (tk4j.1) — long variant: 200 generations, 30 sand

@@ -1169,11 +1169,7 @@ impl World {
     /// callers (step_node, the per-fanout rayon path, and step_root_bfs)
     /// share one implementation. Standard-Codex review specifically
     /// asked for this consolidation.
-    fn try_resolve_short_circuit(
-        &mut self,
-        node: NodeId,
-        result_level: u32,
-    ) -> Option<NodeId> {
+    fn try_resolve_short_circuit(&mut self, node: NodeId, result_level: u32) -> Option<NodeId> {
         if self.store.population(node) == 0 {
             self.hashlife_stats.empty_skips += 1;
             return Some(self.store.empty(result_level));
@@ -1194,12 +1190,7 @@ impl World {
     /// (memo_period > 2) but the subtree at `node` contains no
     /// slow-divisor cells, fold the schedule phase to `phase % 2` so
     /// fast subtrees alias across every-other-generation pairs.
-    fn effective_phase_for(
-        &mut self,
-        node: NodeId,
-        schedule_phase: u64,
-        memo_period: u64,
-    ) -> u64 {
+    fn effective_phase_for(&mut self, node: NodeId, schedule_phase: u64, memo_period: u64) -> u64 {
         if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
             schedule_phase % 2
         } else {
@@ -1402,14 +1393,11 @@ impl World {
                     let sub_nid = sub_roots[i];
 
                     // Mirror step_node prelude order: short-circuit FIRST.
-                    if let Some(short) =
-                        self.try_resolve_short_circuit(sub_nid, lower_level - 1)
-                    {
+                    if let Some(short) = self.try_resolve_short_circuit(sub_nid, lower_level - 1) {
                         child_slots[i] = BfsChildSlot::Direct(short);
                         continue;
                     }
-                    let sub_eff =
-                        self.effective_phase_for(sub_nid, schedule_phase, memo_period);
+                    let sub_eff = self.effective_phase_for(sub_nid, schedule_phase, memo_period);
                     let sub_key = (sub_nid, sub_eff);
 
                     if let Some(&cached) = self.hashlife_cache.get(&sub_key) {
