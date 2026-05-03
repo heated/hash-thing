@@ -167,6 +167,11 @@ Write `notes/.tmp/trident-{REVIEW_ID}/team-review-context.md` with all gathered 
 ## Files Changed
 {git diff --stat output}
 
+## Perf Review Checklist
+- If this change relies on render_gpu, require render_gpu_lag <= 1 in the cited evidence; otherwise treat render_gpu as stale and require a targeted fence-poll or off-surface measurement to back the conclusion. Flag as BLOCKER if the conclusion depends on a stale render_gpu reading.
+
+Footnote: render_gpu_lag exists because stale GPU timestamp readings have misled prior perf conclusions; see 3aq0, dlse, dbz5, fitq, and vqke.1.1.
+
 ## Full Diff
 {If diff is small: embed here}
 {If diff is large: "The diff is {N} lines. Read it from notes/.tmp/trident-{REVIEW_ID}/full-diff.txt"}
