@@ -68,6 +68,18 @@ const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 /// jitter (hash-thing-4ioh).
 const TITLE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+fn record_gpu_timing_sample(
+    perf: &mut perf::Perf,
+    duration_metric: &'static str,
+    lag_metric: &'static str,
+    sample: render::RendererGpuTimingSample,
+) {
+    perf.record(duration_metric, sample.duration);
+    if let Some(lag) = sample.lag_frames {
+        perf.record_scalar(lag_metric, lag as f64);
+    }
+}
+
 /// Bound on consecutive failed FPS cursor-grab attempts before the
 /// per-frame retry tap goes dormant (hash-thing-ezx8). 600 frames
 /// ~= 10 s at 60 Hz: long enough to ride out the slow-startup
@@ -2929,7 +2941,10 @@ impl ApplicationHandler<AppUserEvent> for App {
             // re-seeds terrain on top of the lattice/spectacle/etc. world
             // we just loaded.
             if let Some(scene) = self.dump_scene {
-                log::info!("--dump-scene: dispatching {} before first frame", scene.label());
+                log::info!(
+                    "--dump-scene: dispatching {} before first frame",
+                    scene.label()
+                );
                 self.dispatch_scene_swap(scene.to_swap());
                 self.startup_scene_pending = false;
             }
@@ -3322,7 +3337,8 @@ impl ApplicationHandler<AppUserEvent> for App {
                             if let Some(renderer) = &mut self.renderer {
                                 let w = self.window.as_ref().unwrap();
                                 let size = w.inner_size();
-                                renderer.render_scale = next_render_scale_down(renderer.render_scale);
+                                renderer.render_scale =
+                                    next_render_scale_down(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
@@ -3856,15 +3872,25 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.perf.record("prior_gpu_pipeline_cpu", pipeline);
                         }
                     }
-                    if let Some(d) = renderer.take_last_gpu_frame_time() {
-                        self.perf.record("render_gpu", d);
+                    if let Some(sample) = renderer.take_last_gpu_frame_time() {
+                        record_gpu_timing_sample(
+                            &mut self.perf,
+                            "render_gpu",
+                            "render_gpu_lag",
+                            sample,
+                        );
                     }
                     // dlse.2.4: second bracket around the blit + overlay
                     // render pass. `render_gpu` has always been
                     // compute-only despite the name; the render-pass
                     // GPU cost lands in this separate metric.
-                    if let Some(d) = renderer.take_last_render_pass_gpu_frame_time() {
-                        self.perf.record("render_pass_gpu", d);
+                    if let Some(sample) = renderer.take_last_render_pass_gpu_frame_time() {
+                        record_gpu_timing_sample(
+                            &mut self.perf,
+                            "render_pass_gpu",
+                            "render_pass_gpu_lag",
+                            sample,
+                        );
                     }
                 }
 
@@ -4151,8 +4177,9 @@ where
                 if v_str.starts_with("--") || v_str == "-h" {
                     panic!("{USAGE}\n--dump-scene requires a KIND; saw '{v_str}'");
                 }
-                let parsed = DumpScene::parse(v_str)
-                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene KIND: unrecognised '{v_str}'"));
+                let parsed = DumpScene::parse(v_str).unwrap_or_else(|| {
+                    panic!("{USAGE}\n--dump-scene KIND: unrecognised '{v_str}'")
+                });
                 dump_scene = Some(parsed);
             }
             other => {
@@ -4245,7 +4272,10 @@ fn main() {
         );
     }
     if let Some(scene) = dump_scene {
-        log::info!("--dump-scene: {} (will dispatch before dump-frame render)", scene.label());
+        log::info!(
+            "--dump-scene: {} (will dispatch before dump-frame render)",
+            scene.label()
+        );
     }
 
     // Single source of truth for focus-on-launch. Two downstream sites
@@ -4312,6 +4342,36 @@ mod tests {
     use super::*;
     use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
     use std::time::Duration;
+
+    #[test]
+    fn record_gpu_timing_sample_records_duration_and_submit_lag() {
+        let mut perf = perf::Perf::new();
+        record_gpu_timing_sample(
+            &mut perf,
+            "render_gpu",
+            "render_gpu_lag",
+            render::RendererGpuTimingSample {
+                duration: Duration::from_millis(3),
+                lag_frames: Some(3),
+            },
+        );
+        assert_eq!(perf.summary(), "render_gpu=3.00/3.00ms render_gpu_lag=3");
+    }
+
+    #[test]
+    fn record_gpu_timing_sample_suppresses_lag_when_seq_is_newer_than_current() {
+        let mut perf = perf::Perf::new();
+        record_gpu_timing_sample(
+            &mut perf,
+            "render_pass_gpu",
+            "render_pass_gpu_lag",
+            render::RendererGpuTimingSample {
+                duration: Duration::from_millis(4),
+                lag_frames: None,
+            },
+        );
+        assert_eq!(perf.summary(), "render_pass_gpu=4.00/4.00ms");
+    }
 
     #[test]
     fn smooth_fps_seeds_from_zero_prev_returns_instant() {
@@ -4540,7 +4600,12 @@ mod tests {
 
     #[test]
     fn parse_args_from_dump_scene_lattice_intro() {
-        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "lattice-intro"]);
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "lattice-intro",
+        ]);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/x.png")));
         assert_eq!(
             r.dump_scene,
@@ -4556,9 +4621,18 @@ mod tests {
             ("spectacle", DumpScene::Spectacle),
             ("gyroid", DumpScene::Gyroid),
             ("quarantine-atlas", DumpScene::QuarantineAtlas),
-            ("lattice-intro", DumpScene::LatticeBeat(LatticeDemoBeat::Intro)),
-            ("lattice-interior", DumpScene::LatticeBeat(LatticeDemoBeat::Interior)),
-            ("lattice-panorama", DumpScene::LatticeBeat(LatticeDemoBeat::Panorama)),
+            (
+                "lattice-intro",
+                DumpScene::LatticeBeat(LatticeDemoBeat::Intro),
+            ),
+            (
+                "lattice-interior",
+                DumpScene::LatticeBeat(LatticeDemoBeat::Interior),
+            ),
+            (
+                "lattice-panorama",
+                DumpScene::LatticeBeat(LatticeDemoBeat::Panorama),
+            ),
         ] {
             let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", raw]);
             assert_eq!(r.dump_scene, Some(expected), "kind={raw}");
@@ -5342,9 +5416,11 @@ mod tests {
     fn orbit_legend_marks_lattice_jumps_as_debug() {
         let lines = App::legend_lines(CameraMode::Orbit, false);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("DEV intro/interior/reveal")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("DEV intro/interior/reveal"))
+        );
         // a9jd: `[`, `]`, `U`/`I`/`O` remain DEV beat-cycle jumps, but `V`
         // is the user-facing panorama reveal — not a DEV-only key.
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
@@ -5543,10 +5619,7 @@ mod tests {
             app.world.generation, payload_world_gen,
             "world must be swapped back from the payload"
         );
-        assert!(
-            !app.paused,
-            "Ok payload must not pause the sim"
-        );
+        assert!(!app.paused, "Ok payload must not pause the sim");
     }
 
     #[test]

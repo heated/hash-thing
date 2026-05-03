@@ -127,6 +127,33 @@ pub struct RendererCpuPhaseTimes {
     pub prior_gpu_in_flight_at_acquire: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RendererGpuTimingSample {
+    pub duration: Duration,
+    /// Submit-sequence staleness in frames. `None` means the renderer
+    /// suppressed lag because the resolved sample could not be ordered
+    /// against the current submit sequence.
+    pub lag_frames: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedGpuTimingSample {
+    duration: Duration,
+    submit_seq: u64,
+}
+
+fn gpu_timing_lag_frames(current_submit_seq: u64, sample: ResolvedGpuTimingSample) -> Option<u64> {
+    let lag_frames = current_submit_seq.checked_sub(sample.submit_seq);
+    if lag_frames.is_none() {
+        log::warn!(
+            "gpu timing lag suppressed: resolved submit_seq={} is newer than current_submit_seq={}",
+            sample.submit_seq,
+            current_submit_seq,
+        );
+    }
+    lag_frames
+}
+
 /// hash-thing-hc0g: row-tightly-packed RGBA8 readback of the off-surface
 /// render target. Returned by `Renderer::read_off_surface_pixels`. PNG
 /// encoding lives in the binary; this struct is just the shape of the
@@ -201,6 +228,10 @@ struct GpuTiming {
     /// PENDING → IDLE on failure. The render thread transitions IDLE →
     /// PENDING (in `request_readback`) and READY → IDLE (in `poll`).
     state: Arc<AtomicU8>,
+    /// Submit sequence associated with the currently pending readback.
+    /// Stored separately from `state` because `map_async` completion is
+    /// callback-driven and can resolve after later frames have submitted.
+    pending_submit_seq: Arc<Mutex<Option<u64>>>,
     /// When true, the caller sandwiches the compute pass with
     /// `write_timestamp_begin`/`write_timestamp_end` on the encoder and
     /// `compute_pass_writes()` returns `None`. Requires the adapter to
@@ -246,6 +277,7 @@ impl GpuTiming {
             readback_buffer,
             period_ns,
             state: Arc::new(AtomicU8::new(GT_IDLE)),
+            pending_submit_seq: Arc::new(Mutex::new(None)),
             use_in_encoder,
         }
     }
@@ -329,10 +361,11 @@ impl GpuTiming {
         );
     }
 
-    /// Start async readback. Transitions IDLE → PENDING and issues
+    /// Start async readback. Transitions IDLE → PENDING, records the
+    /// submit sequence that owns this resolve, and issues
     /// `map_async`; the callback later flips PENDING → READY (success)
     /// or PENDING → IDLE (failure). Call exactly once per `encode_resolve`.
-    fn request_readback(&self) {
+    fn request_readback(&self, submit_seq: u64) {
         if self
             .state
             .compare_exchange(GT_IDLE, GT_PENDING, Ordering::AcqRel, Ordering::Acquire)
@@ -343,21 +376,26 @@ impl GpuTiming {
             // rather than panic.
             return;
         }
+        *self.pending_submit_seq.lock().unwrap() = Some(submit_seq);
         let state = self.state.clone();
+        let pending_submit_seq = Arc::clone(&self.pending_submit_seq);
         self.readback_buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| match result {
                 Ok(()) => state.store(GT_READY, Ordering::Release),
                 Err(e) => {
                     log::warn!("gpu timing readback failed: {e:?}");
+                    if let Ok(mut seq) = pending_submit_seq.lock() {
+                        *seq = None;
+                    }
                     state.store(GT_IDLE, Ordering::Release);
                 }
             });
     }
 
-    /// Consume a pending readback if one just became ready. Returns
-    /// the resolved `Duration` for the most recently completed frame,
-    /// or `None` if no readback is ready.
+    /// Consume a pending readback if one just became ready. Returns the
+    /// resolved GPU duration plus the submit sequence that produced it, or
+    /// `None` if no readback is ready.
     ///
     /// Does NOT call `device.poll` — callers must invoke
     /// `device.poll(Poll)` exactly once per frame (before polling any
@@ -366,10 +404,11 @@ impl GpuTiming {
     /// exist in the same frame (dlse.2.4).
     ///
     /// Transitions READY → IDLE on success.
-    fn take_resolved(&self) -> Option<Duration> {
+    fn take_resolved(&self) -> Option<ResolvedGpuTimingSample> {
         if self.state.load(Ordering::Acquire) != GT_READY {
             return None;
         }
+        let submit_seq = self.pending_submit_seq.lock().unwrap().take();
 
         let slice = self.readback_buffer.slice(..);
         let data = slice.get_mapped_range();
@@ -393,7 +432,15 @@ impl GpuTiming {
         // request_readback asserts the buffer is not already mapped.
         self.state.store(GT_IDLE, Ordering::Release);
 
-        Some(ticks_to_duration(start, end, self.period_ns))
+        let Some(submit_seq) = submit_seq else {
+            log::warn!("gpu timing readback resolved without submit attribution");
+            return None;
+        };
+
+        Some(ResolvedGpuTimingSample {
+            duration: ticks_to_duration(start, end, self.period_ns),
+            submit_seq,
+        })
     }
 }
 
@@ -512,12 +559,12 @@ pub struct Renderer {
     /// `take_last_gpu_frame_time()`. `None` means no new sample since
     /// the last take (or the adapter lacks TIMESTAMP_QUERY entirely).
     /// Consume-on-read avoids double-recording across frames.
-    last_gpu_frame_time: Option<Duration>,
+    last_gpu_frame_time: Option<ResolvedGpuTimingSample>,
     /// Most recently resolved GPU render-pass duration (blit + HUD +
     /// particles + hotbar + legend), bracketed in parallel with
     /// `last_gpu_frame_time`. Set by `render()`, consumed by
     /// `take_last_render_pass_gpu_frame_time()`. dlse.2.4.
-    last_render_pass_gpu_frame_time: Option<Duration>,
+    last_render_pass_gpu_frame_time: Option<ResolvedGpuTimingSample>,
     /// Most recent CPU-side frame phase timings, consumed by
     /// `take_last_cpu_phase_times()` so callers can record them once.
     last_cpu_phase_times: Option<RendererCpuPhaseTimes>,
@@ -615,7 +662,9 @@ fn is_strong_discrete_name(name: &str) -> bool {
     }
     // AMD: RX 6700+ (RDNA2 high tier) and RX 7xxx+ (RDNA3). RX 6600
     // is borderline; left out. RX 5xxx (RDNA1) is below anchor.
-    if lower.contains("rx 67") || lower.contains("rx 68") || lower.contains("rx 69")
+    if lower.contains("rx 67")
+        || lower.contains("rx 68")
+        || lower.contains("rx 69")
         || lower.contains("rx 7")
     {
         return true;
@@ -796,9 +845,7 @@ impl Renderer {
                 m.scale_factor(),
                 scale_factor,
             ),
-            None => log::info!(
-                "monitor: none reported by winit (scale_factor={scale_factor})"
-            ),
+            None => log::info!("monitor: none reported by winit (scale_factor={scale_factor})"),
         }
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -940,8 +987,8 @@ impl Renderer {
                 target_pixels_for_volume(volume_size),
             ),
             RenderScaleSource::AutoPickedByGpuClass => {
-                let (class, class_pick) = class_default
-                    .expect("AutoPickedByGpuClass implies classify_gpu returned Some");
+                let (class, class_pick) =
+                    class_default.expect("AutoPickedByGpuClass implies classify_gpu returned Some");
                 log::info!(
                     "render_scale={:.3} (auto-picked by GPU class: name={:?} device_type={:?} class={:?} class_pick={:.3} pixel_pick={:.3} volume_size={} physical={}x{}) — override with HASH_THING_RENDER_SCALE or use = / - keys at runtime",
                     render_scale,
@@ -985,10 +1032,8 @@ impl Renderer {
                 // pixel-budget interpretation of "1080p" means the
                 // rendered W×H is generally NOT literal 1920×1080
                 // (uniform scale preserves physical aspect ratio).
-                let rendered_w =
-                    ((size.width as f32 * render_scale) as u32).max(1);
-                let rendered_h =
-                    ((size.height as f32 * render_scale) as u32).max(1);
+                let rendered_w = ((size.width as f32 * render_scale) as u32).max(1);
+                let rendered_h = ((size.height as f32 * render_scale) as u32).max(1);
                 log::info!(
                     "render_scale={:.3} (--res / --demo override; rendered={}x{}, cli_target={} px, physical={}x{})",
                     render_scale,
@@ -1064,9 +1109,15 @@ impl Renderer {
         );
         log::info!(
             "surface_config: present_mode={:?} alpha_mode={:?} format={:?} max_frame_latency={} render_scale={} size={}x{} (physical={}x{})",
-            config.present_mode, config.alpha_mode, config.format,
-            config.desired_maximum_frame_latency, render_scale,
-            config.width, config.height, size.width, size.height,
+            config.present_mode,
+            config.alpha_mode,
+            config.format,
+            config.desired_maximum_frame_latency,
+            render_scale,
+            config.width,
+            config.height,
+            size.width,
+            size.height,
         );
         surface.configure(&device, &config);
 
@@ -2014,8 +2065,8 @@ impl Renderer {
     }
 
     /// Consume and return the most recently resolved GPU
-    /// **compute-pass** duration (SVDAG raycast dispatch), or `None` if
-    /// no new sample has been captured since the last call. Call once
+    /// **compute-pass** timestamp sample (SVDAG raycast dispatch), or
+    /// `None` if no new sample has been captured since the last call. Call once
     /// per frame after `render()` returns; the value is intended to be
     /// fed into `Perf` as the `render_gpu` metric (see
     /// `hash-thing-6x3`).
@@ -2030,12 +2081,12 @@ impl Renderer {
     /// Adapters without `Features::TIMESTAMP_QUERY` always return
     /// `None` — in that case the only render metric is the CPU-submit
     /// `render_cpu` from `main.rs`.
-    pub fn take_last_gpu_frame_time(&mut self) -> Option<Duration> {
-        self.last_gpu_frame_time.take()
+    pub fn take_last_gpu_frame_time(&mut self) -> Option<RendererGpuTimingSample> {
+        self.take_resolved_gpu_sample(true)
     }
 
     /// Consume and return the most recently resolved GPU
-    /// **render-pass** duration (blit + particles + HUD + hotbar +
+    /// **render-pass** timestamp sample (blit + particles + HUD + hotbar +
     /// legend), or `None` if no new sample has been captured since the
     /// last call. Companion to `take_last_gpu_frame_time()` — together
     /// they bracket the two GPU-expensive chunks of the frame encoder
@@ -2043,12 +2094,26 @@ impl Renderer {
     ///
     /// Returns `None` on adapters without `Features::TIMESTAMP_QUERY`
     /// and when `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` is set.
-    pub fn take_last_render_pass_gpu_frame_time(&mut self) -> Option<Duration> {
-        self.last_render_pass_gpu_frame_time.take()
+    pub fn take_last_render_pass_gpu_frame_time(&mut self) -> Option<RendererGpuTimingSample> {
+        self.take_resolved_gpu_sample(false)
     }
 
     pub fn take_last_cpu_phase_times(&mut self) -> Option<RendererCpuPhaseTimes> {
         self.last_cpu_phase_times.take()
+    }
+
+    fn take_resolved_gpu_sample(&mut self, compute_pass: bool) -> Option<RendererGpuTimingSample> {
+        let sample = if compute_pass {
+            self.last_gpu_frame_time.take()
+        } else {
+            self.last_render_pass_gpu_frame_time.take()
+        }?;
+        let current_submit_seq = self.submit_fence.lock().unwrap().submit_seq;
+        let lag_frames = gpu_timing_lag_frames(current_submit_seq, sample);
+        Some(RendererGpuTimingSample {
+            duration: sample.duration,
+            lag_frames,
+        })
     }
 
     /// Upload (or re-upload) a serialized SVDAG to the GPU.
@@ -2396,13 +2461,13 @@ impl Renderer {
         // callbacks.
         let _ = self.device.poll(wgpu::PollType::Poll);
         if let Some(gt) = &self.gpu_timing {
-            if let Some(d) = gt.take_resolved() {
-                self.last_gpu_frame_time = Some(d);
+            if let Some(sample) = gt.take_resolved() {
+                self.last_gpu_frame_time = Some(sample);
             }
         }
         if let Some(gt) = &self.gpu_timing_render_pass {
-            if let Some(d) = gt.take_resolved() {
-                self.last_render_pass_gpu_frame_time = Some(d);
+            if let Some(sample) = gt.take_resolved() {
+                self.last_render_pass_gpu_frame_time = Some(sample);
             }
         }
 
@@ -2816,12 +2881,12 @@ impl Renderer {
 
         if captured_compute_this_frame {
             if let Some(gt) = &self.gpu_timing {
-                gt.request_readback();
+                gt.request_readback(this_seq);
             }
         }
         if captured_render_pass_this_frame {
             if let Some(gt) = &self.gpu_timing_render_pass {
-                gt.request_readback();
+                gt.request_readback(this_seq);
             }
         }
 
@@ -2832,9 +2897,10 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_render_scale, classify_gpu, parse_present_mode, resolved_render_scale,
-        target_pixels_for_volume, ticks_to_duration, FrameOutcome, GpuClass, GpuTiming,
-        RenderScaleSource, RendererLifecycleSnapshot, SubmitFenceState,
+        FrameOutcome, GpuClass, GpuTiming, RenderScaleSource, RendererLifecycleSnapshot,
+        ResolvedGpuTimingSample, SubmitFenceState, auto_render_scale, classify_gpu,
+        gpu_timing_lag_frames, parse_present_mode, resolved_render_scale, target_pixels_for_volume,
+        ticks_to_duration,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3164,8 +3230,7 @@ mod tests {
         // clamp to ~0.74 instead of staying at the v3.1 spec's 1.0.
         // This test enforces the unclamped class default for the strong
         // dGPU bucket.
-        let info =
-            synthetic_adapter_info("NVIDIA GeForce RTX 3060", wgpu::DeviceType::DiscreteGpu);
+        let info = synthetic_adapter_info("NVIDIA GeForce RTX 3060", wgpu::DeviceType::DiscreteGpu);
         let (s, src) = resolved_render_scale(None, None, 2560 * 1440, 256, Some(&info));
         assert_eq!(src, RenderScaleSource::AutoPickedByGpuClass);
         assert!((s - 1.0).abs() < 1e-6, "scale was {s}, expected 1.0");
@@ -3178,10 +3243,12 @@ mod tests {
         // back to the class default (0.5), not the pixel-budget pick.
         // Source stays EnvInvalidFallback so the typo signal is visible.
         let info = synthetic_adapter_info("Apple M2", wgpu::DeviceType::IntegratedGpu);
-        let (s, src) =
-            resolved_render_scale(Some("garbage"), None, 2940 * 1782, 1024, Some(&info));
+        let (s, src) = resolved_render_scale(Some("garbage"), None, 2940 * 1782, 1024, Some(&info));
         assert_eq!(src, RenderScaleSource::EnvInvalidFallback);
-        assert!((s - 0.5).abs() < 1e-6, "scale was {s}, expected class default 0.5");
+        assert!(
+            (s - 0.5).abs() < 1e-6,
+            "scale was {s}, expected class default 0.5"
+        );
     }
 
     #[test]
@@ -3189,12 +3256,13 @@ mod tests {
         // Same contract as above for the strong dGPU bucket — the
         // class default of 1.0 must survive an env typo, not collapse
         // to the pixel-budget pick.
-        let info =
-            synthetic_adapter_info("NVIDIA GeForce RTX 3070", wgpu::DeviceType::DiscreteGpu);
-        let (s, src) =
-            resolved_render_scale(Some("nonsense"), None, 2560 * 1440, 256, Some(&info));
+        let info = synthetic_adapter_info("NVIDIA GeForce RTX 3070", wgpu::DeviceType::DiscreteGpu);
+        let (s, src) = resolved_render_scale(Some("nonsense"), None, 2560 * 1440, 256, Some(&info));
         assert_eq!(src, RenderScaleSource::EnvInvalidFallback);
-        assert!((s - 1.0).abs() < 1e-6, "scale was {s}, expected class default 1.0");
+        assert!(
+            (s - 1.0).abs() < 1e-6,
+            "scale was {s}, expected class default 1.0"
+        );
     }
 
     #[test]
@@ -3577,7 +3645,7 @@ mod tests {
         compute.write_timestamp_end(&mut encoder);
         compute.encode_resolve(&mut encoder);
         queue.submit(std::iter::once(encoder.finish()));
-        compute.request_readback();
+        compute.request_readback(11);
 
         // Pump the `map_async` callback synchronously. The
         // `wait_indefinitely` variant blocks until every pending
@@ -3599,13 +3667,103 @@ mod tests {
         // Drain compute; confirm it returns a duration (the two
         // timestamps are close but non-negative per the saturating
         // subtract in `ticks_to_duration`). Render must still be IDLE.
-        let dur = compute
+        let sample = compute
             .take_resolved()
             .expect("compute readback must be ready after Wait poll");
-        let _ = dur; // value is backend-dependent; shape is what we pin.
+        let _ = sample.duration; // value is backend-dependent; shape is what we pin.
+        assert_eq!(sample.submit_seq, 11);
         assert!(compute.is_idle(), "compute must return to IDLE after take");
         assert!(render.is_idle(), "render still untouched");
         assert!(render.take_resolved().is_none());
+    }
+
+    #[test]
+    fn gpu_timing_resolved_sample_keeps_original_submit_seq_after_skipped_frame() {
+        let Some((device, queue, period, in_encoder)) = try_make_timestamp_device() else {
+            return;
+        };
+        if !in_encoder {
+            return;
+        }
+
+        let timing = GpuTiming::new(&device, period, true, "test_submit_seq");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_submit_seq_encoder"),
+        });
+        timing.write_timestamp_begin(&mut encoder);
+        timing.write_timestamp_end(&mut encoder);
+        timing.encode_resolve(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        timing.request_readback(41);
+
+        // Simulate an intervening skipped instrumentation frame: a later
+        // request must not overwrite the pending sample's submit sequence.
+        timing.request_readback(42);
+
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let sample = timing
+            .take_resolved()
+            .expect("readback must be ready after Wait poll");
+        assert_eq!(sample.submit_seq, 41);
+    }
+
+    #[test]
+    fn gpu_timing_independent_instances_preserve_distinct_submit_seqs() {
+        let Some((device, queue, period, in_encoder)) = try_make_timestamp_device() else {
+            return;
+        };
+        if !in_encoder {
+            return;
+        }
+
+        let compute = GpuTiming::new(&device, period, true, "test_seq_compute");
+        let render = GpuTiming::new(&device, period, true, "test_seq_render");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_independent_seq_encoder"),
+        });
+        compute.write_timestamp_begin(&mut encoder);
+        compute.write_timestamp_end(&mut encoder);
+        compute.encode_resolve(&mut encoder);
+        render.write_timestamp_begin(&mut encoder);
+        render.write_timestamp_end(&mut encoder);
+        render.encode_resolve(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        compute.request_readback(7);
+        render.request_readback(8);
+
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let compute_sample = compute
+            .take_resolved()
+            .expect("compute readback must be ready");
+        let render_sample = render
+            .take_resolved()
+            .expect("render readback must be ready");
+        assert_eq!(compute_sample.submit_seq, 7);
+        assert_eq!(render_sample.submit_seq, 8);
+    }
+
+    #[test]
+    fn gpu_timing_lag_frames_uses_current_submit_seq() {
+        let lag = gpu_timing_lag_frames(
+            7,
+            ResolvedGpuTimingSample {
+                duration: Duration::from_millis(2),
+                submit_seq: 4,
+            },
+        );
+        assert_eq!(lag, Some(3));
+    }
+
+    #[test]
+    fn gpu_timing_lag_frames_suppresses_impossible_ordering() {
+        let lag = gpu_timing_lag_frames(
+            7,
+            ResolvedGpuTimingSample {
+                duration: Duration::from_millis(5),
+                submit_seq: 8,
+            },
+        );
+        assert_eq!(lag, None);
     }
 
     // --- hash-thing-dbz5.1: SubmitFenceState semantics ---
