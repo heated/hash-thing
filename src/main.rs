@@ -3,7 +3,9 @@ use hash_thing::player;
 use hash_thing::render;
 use hash_thing::scale::{CELLS_PER_METER, DEFAULT_VOLUME_SIZE, GROWTH_MARGIN};
 use hash_thing::sim;
-use hash_thing::sim::world::{quarantine_atlas_mixed_containment_plan, QuarantineAtlasPattern};
+#[cfg(test)]
+use hash_thing::sim::world::quarantine_atlas_mixed_containment_plan;
+use hash_thing::sim::world::QuarantineAtlasPattern;
 use hash_thing::terrain;
 
 use std::collections::HashSet;

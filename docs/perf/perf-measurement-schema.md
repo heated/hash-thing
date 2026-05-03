@@ -98,6 +98,7 @@ A comparison is *not* a measurement. The `ratio_metric` must be a key from one o
 | value                  | meaning                                                        |
 |------------------------|----------------------------------------------------------------|
 | `default-ca`           | The current production CA + Margolus rules.                    |
+| `custom:factory-conveyor-v1` | Scenario-local factory conveyor block-rule setup used by `FactoryConveyorRuleV1` (`hash-thing-w4zq`). |
 | `water-margolus`       | Water-only rules (for fluid-only benches).                     |
 | `particle-cellular`    | Particle CA (sand/dust/etc).                                   |
 | `circuit-signal`       | Wire/signal-propagation rules (puzzle-circuit scene families). |
@@ -231,6 +232,8 @@ Units in the name. Mixing units across records breaks downstream tooling.
 | `work_elision_p05_x`  | × multiplier  | 5th-percentile warm-frame Hashlife work elision; anti-cherry-pick thesis metric for churning runs. |
 | `leaf_misses_mean`    | active leaves | Mean active-leaf misses per warm frame.       |
 | `work_elision_leaf_level` | octree level | Active Hashlife leaf level used for work-elision accounting. Usually 3; 4 when slowed block-rule materials need the wider base-case halo. |
+| `factory_sinked_total` | items         | Scenario-specific factory harness sink throughput over measured frames; source/sink harness work is outside timed `step_us` / `step_*` latency. |
+| `factory_backpressure_total` | blocked source attempts | Scenario-specific count of source attempts blocked by occupied lane inputs before the CA step; source/sink harness work is outside timed `step_us` / `step_*` latency. |
 | `seed_ms`             | ms            | Wall-time of the seed step.                   |
 | `compaction_ns`       | ns            | Last `maybe_compact` wall.                    |
 

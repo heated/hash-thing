@@ -1,10 +1,11 @@
 use hash_thing::octree::CellState;
+use hash_thing::sim::margolus::ConveyorBlockRule;
 use hash_thing::sim::world::{
     quarantine_atlas_mixed_containment_plan, WorkElisionStats,
     QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
 };
 use hash_thing::sim::{World, WorldCoord};
-use hash_thing::terrain::materials::{SAND, STONE, WATER};
+use hash_thing::terrain::materials::{METAL, METAL_MATERIAL_ID, SAND, STONE, WATER};
 use hash_thing::terrain::TerrainParams;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Scenario {
     name: String,
@@ -82,12 +83,14 @@ impl Scene {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 enum ScenarioSetup {
     QuarantineAtlasMixedContainmentV1,
+    FactoryConveyorRuleV1,
 }
 
 impl ScenarioSetup {
     fn as_str(self) -> &'static str {
         match self {
             Self::QuarantineAtlasMixedContainmentV1 => QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
+            Self::FactoryConveyorRuleV1 => "FactoryConveyorRuleV1",
         }
     }
 }
@@ -95,12 +98,14 @@ impl ScenarioSetup {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 enum RuleSet {
     DefaultCa,
+    FactoryConveyorV1,
 }
 
 impl RuleSet {
     fn as_str(self) -> &'static str {
         match self {
             Self::DefaultCa => "default-ca",
+            Self::FactoryConveyorV1 => "custom:factory-conveyor-v1",
         }
     }
 }
@@ -177,6 +182,10 @@ struct GenerationRecord {
     work_elision_factor_x: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     leaf_misses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_sinked: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_backpressure: Option<u64>,
     mat_distribution: Option<serde_json::Value>,
 }
 
@@ -200,6 +209,10 @@ struct MetricsRecord {
     leaf_misses_mean: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     work_elision_leaf_level: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_sinked_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_backpressure_total: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -583,8 +596,56 @@ fn validate_comparable(
             subject.backend
         ));
     }
+    validate_factory_parity(subject, baseline)?;
     metric_value(&subject.metrics, metric)?;
     metric_value(&baseline.metrics, metric)?;
+    Ok(())
+}
+
+fn validate_factory_parity(
+    subject: &MeasurementRecord,
+    baseline: &MeasurementRecord,
+) -> Result<(), String> {
+    compare_optional_u64(
+        "metrics.factory_sinked_total",
+        subject.metrics.factory_sinked_total,
+        baseline.metrics.factory_sinked_total,
+    )?;
+    compare_optional_u64(
+        "metrics.factory_backpressure_total",
+        subject.metrics.factory_backpressure_total,
+        baseline.metrics.factory_backpressure_total,
+    )?;
+
+    let factory_subject = subject.metrics.factory_sinked_total.is_some()
+        || subject.metrics.factory_backpressure_total.is_some();
+    let factory_baseline = baseline.metrics.factory_sinked_total.is_some()
+        || baseline.metrics.factory_backpressure_total.is_some();
+    if !(factory_subject || factory_baseline) {
+        return Ok(());
+    }
+    compare_usize(
+        "generations.len",
+        subject.generations.len(),
+        baseline.generations.len(),
+    )?;
+    for (idx, (subject_gen, baseline_gen)) in subject
+        .generations
+        .iter()
+        .zip(baseline.generations.iter())
+        .enumerate()
+    {
+        compare_optional_u64(
+            &format!("generations[{idx}].factory_sinked"),
+            subject_gen.factory_sinked,
+            baseline_gen.factory_sinked,
+        )?;
+        compare_optional_u64(
+            &format!("generations[{idx}].factory_backpressure"),
+            subject_gen.factory_backpressure,
+            baseline_gen.factory_backpressure,
+        )?;
+    }
     Ok(())
 }
 
@@ -645,6 +706,14 @@ fn compare_u64(name: &str, a: u64, b: u64) -> Result<(), String> {
     }
 }
 
+fn compare_optional_u64(name: &str, a: Option<u64>, b: Option<u64>) -> Result<(), String> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(format!("comparison mismatch on {name}: {a:?} vs {b:?}"))
+    }
+}
+
 fn metric_value(metrics: &MetricsRecord, metric: &str) -> Result<f64, String> {
     match metric {
         "step_mean_ms" => Ok(metrics.step_mean_ms),
@@ -673,6 +742,14 @@ fn metric_value(metrics: &MetricsRecord, metric: &str) -> Result<f64, String> {
             .work_elision_leaf_level
             .map(|level| level as f64)
             .ok_or_else(|| "metric work_elision_leaf_level missing".to_string()),
+        "factory_sinked_total" => metrics
+            .factory_sinked_total
+            .map(|count| count as f64)
+            .ok_or_else(|| "metric factory_sinked_total missing".to_string()),
+        "factory_backpressure_total" => metrics
+            .factory_backpressure_total
+            .map(|count| count as f64)
+            .ok_or_else(|| "metric factory_backpressure_total missing".to_string()),
         _ => Err(format!("unknown metric {metric:?}")),
     }
 }
@@ -691,12 +768,14 @@ fn run_scenario(
     let warmup_generations = scenario.warmup_generations.unwrap_or(0);
 
     let microchurn = microchurn_sand_per_step(scenario, level);
+    let factory = FactoryHarness::for_scenario(scenario, side as i64);
     let (generations, metrics) = match scenario.backend {
         Backend::HashlifeRecursive => run_hashlife(
             world,
             warmup_generations,
             scenario.generations,
             microchurn,
+            factory,
             scenario.seed,
         ),
         Backend::ChunkArray => run_chunk_array(
@@ -704,6 +783,7 @@ fn run_scenario(
             warmup_generations,
             scenario.generations,
             microchurn,
+            factory,
             scenario.seed,
         ),
     };
@@ -782,7 +862,34 @@ fn validate_backend_regime(scenario: &Scenario) -> Result<(), String> {
         Backend::HashlifeRecursive if scenario.regime == Regime::NotApplicable => {
             Err("backend=hashlife-recursive requires a memo-cache regime".to_string())
         }
-        _ => Ok(()),
+        _ => validate_setup_scene(scenario),
+    }
+}
+
+fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
+    match (scenario.setup, scenario.scene) {
+        (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), Scene::QuarantineAtlas)
+        | (Some(ScenarioSetup::FactoryConveyorRuleV1), Scene::FactoryConveyor)
+        | (None, _) => Ok(()),
+        (Some(setup), scene) => Err(format!(
+            "setup={} is invalid for scene={}",
+            setup.as_str(),
+            scene.as_str()
+        )),
+    }?;
+    match (scenario.setup, scenario.rule_set) {
+        (Some(ScenarioSetup::FactoryConveyorRuleV1), RuleSet::FactoryConveyorV1)
+        | (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), RuleSet::DefaultCa)
+        | (None, RuleSet::DefaultCa) => Ok(()),
+        (Some(setup), rule_set) => Err(format!(
+            "setup={} requires matching rule_set (got {})",
+            setup.as_str(),
+            rule_set.as_str()
+        )),
+        (None, rule_set) => Err(format!(
+            "rule_set={} requires an explicit setup",
+            rule_set.as_str()
+        )),
     }
 }
 
@@ -800,7 +907,7 @@ fn seed_scene(world: &mut World, scenario: &Scenario) -> Result<(), String> {
                 world.seed_demo_spectacle();
             }
         }
-        Scene::FactoryConveyor => seed_factory_conveyor_toy(world, scenario.seed),
+        Scene::FactoryConveyor => seed_factory_conveyor(world, scenario)?,
         Scene::QuarantineAtlas => seed_quarantine_atlas(world, scenario)?,
     }
     Ok(())
@@ -819,6 +926,33 @@ fn seed_quarantine_atlas(world: &mut World, scenario: &Scenario) -> Result<(), S
             }
         }
         None => {}
+        Some(other) => {
+            return Err(format!(
+                "setup={} is invalid for quarantine-atlas",
+                other.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn seed_factory_conveyor(world: &mut World, scenario: &Scenario) -> Result<(), String> {
+    match scenario.setup {
+        Some(ScenarioSetup::FactoryConveyorRuleV1) => {
+            world.mutate_materials(|materials| {
+                let conveyor =
+                    materials.register_block_rule(ConveyorBlockRule::new(METAL_MATERIAL_ID));
+                materials.assign_block_rule(METAL_MATERIAL_ID, conveyor);
+            });
+            seed_factory_conveyor_rule(world);
+        }
+        None => seed_factory_conveyor_toy(world, scenario.seed),
+        Some(other) => {
+            return Err(format!(
+                "setup={} is invalid for factory-conveyor",
+                other.as_str()
+            ));
+        }
     }
     Ok(())
 }
@@ -839,6 +973,113 @@ fn seed_factory_conveyor_toy(world: &mut World, seed: u64) {
                 world.set(WorldCoord(x), WorldCoord(y - 1), WorldCoord(z), STONE);
             }
         }
+    }
+}
+
+fn seed_factory_conveyor_rule(world: &mut World) {
+    let side = world.side() as i64;
+    let harness = FactoryHarness::new(side);
+    for &z in &harness.lane_z {
+        for x in (harness.source_x + 2..harness.sink_x).step_by(4) {
+            world.set(WorldCoord(x), WorldCoord(harness.y), WorldCoord(z), METAL);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FactoryHarness {
+    source_x: i64,
+    sink_x: i64,
+    y: i64,
+    lane_z: Vec<i64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FactoryStepStats {
+    sinked: u64,
+    backpressure: u64,
+}
+
+impl FactoryHarness {
+    fn new(side: i64) -> Self {
+        let y = side / 2;
+        let lanes = ((side - 8) / 8).max(1);
+        let start_z = 4;
+        let lane_z = (0..lanes).map(|i| start_z + i * 8).collect::<Vec<_>>();
+        Self {
+            source_x: 2,
+            sink_x: side - 3,
+            y,
+            lane_z,
+        }
+    }
+
+    fn for_scenario(scenario: &Scenario, side: i64) -> Option<Self> {
+        (matches!(scenario.setup, Some(ScenarioSetup::FactoryConveyorRuleV1)))
+            .then(|| Self::new(side))
+    }
+
+    fn apply_sources_world(&self, world: &mut World) -> u64 {
+        let mut backpressure = 0;
+        for &z in &self.lane_z {
+            if world.get(WorldCoord(self.source_x), WorldCoord(self.y), WorldCoord(z)) == 0 {
+                world.set(
+                    WorldCoord(self.source_x),
+                    WorldCoord(self.y),
+                    WorldCoord(z),
+                    METAL,
+                );
+            } else {
+                backpressure += 1;
+            }
+        }
+        backpressure
+    }
+
+    fn drain_sinks_world(&self, world: &mut World) -> u64 {
+        let mut sinked = 0;
+        for &z in &self.lane_z {
+            if world.get(WorldCoord(self.sink_x), WorldCoord(self.y), WorldCoord(z)) == METAL {
+                world.set(
+                    WorldCoord(self.sink_x),
+                    WorldCoord(self.y),
+                    WorldCoord(z),
+                    0,
+                );
+                sinked += 1;
+            }
+        }
+        sinked
+    }
+
+    fn apply_sources_grid(&self, grid: &mut [CellState], side: usize) -> u64 {
+        let mut backpressure = 0;
+        for &z in &self.lane_z {
+            let idx = self.idx(side, self.source_x, self.y, z);
+            if grid[idx] == 0 {
+                grid[idx] = METAL;
+            } else {
+                backpressure += 1;
+            }
+        }
+        backpressure
+    }
+
+    fn drain_sinks_grid(&self, grid: &mut [CellState], side: usize) -> u64 {
+        let mut sinked = 0;
+        for &z in &self.lane_z {
+            let idx = self.idx(side, self.sink_x, self.y, z);
+            if grid[idx] == METAL {
+                grid[idx] = 0;
+                sinked += 1;
+            }
+        }
+        sinked
+    }
+
+    fn idx(&self, side: usize, x: i64, y: i64, z: i64) -> usize {
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        x + y * side + z * side * side
     }
 }
 
@@ -930,15 +1171,16 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
     } else {
         ""
     };
-    let setup_note = scenario
-        .setup
-        .map(|setup| {
-            format!(
-                "; setup={} (scripted pre-measurement intervention setup; excludes interactive placement/raycast/cache-invalidation cost)",
-                setup.as_str()
-            )
-        })
-        .unwrap_or_default();
+    let setup_note = match scenario.setup {
+        Some(ScenarioSetup::FactoryConveyorRuleV1) => {
+            "; setup=factory-conveyor-rule-v1 (scripted pre-measurement intervention setup plus per-step source/sink harness; step_us/step_* time only CA stepping and exclude source injection, sink drain, and backpressure accounting)".to_string()
+        }
+        Some(setup) => format!(
+            "; setup={} (scripted pre-measurement intervention setup; excludes interactive placement/raycast/cache-invalidation cost)",
+            setup.as_str()
+        ),
+        None => String::new(),
+    };
     format!(
         "scenario={}, path={}, warmup_generations={}, {}",
         scenario.name,
@@ -955,6 +1197,7 @@ fn run_hashlife(
     warmup_generations: usize,
     generations: usize,
     microchurn_sand_per_step: Option<usize>,
+    factory: Option<FactoryHarness>,
     seed: u64,
 ) -> (Vec<GenerationRecord>, MetricsRecord) {
     let mut microchurn =
@@ -963,21 +1206,35 @@ fn run_hashlife(
         if let Some(churn) = &mut microchurn {
             churn.apply_world(&mut world);
         }
+        if let Some(factory) = &factory {
+            factory.apply_sources_world(&mut world);
+        }
         world.step_recursive();
+        if let Some(factory) = &factory {
+            factory.drain_sinks_world(&mut world);
+        }
     }
     let mut times = Vec::with_capacity(generations);
     let mut records = Vec::with_capacity(generations);
     let mut memo_hits = 0u64;
     let mut memo_misses = 0u64;
     let mut work_elision = Vec::with_capacity(generations);
+    let mut factory_total = FactoryStepStats::default();
     for gen in 0..generations {
         let drops = microchurn_sand_per_step.unwrap_or(0);
         if let Some(churn) = &mut microchurn {
             churn.apply_world(&mut world);
         }
+        let mut factory_step = FactoryStepStats::default();
+        if let Some(factory) = &factory {
+            factory_step.backpressure = factory.apply_sources_world(&mut world);
+        }
         let start = Instant::now();
         world.step_recursive();
         let step_us = start.elapsed().as_micros();
+        if let Some(factory) = &factory {
+            factory_step.sinked = factory.drain_sinks_world(&mut world);
+        }
         let stats = world.hashlife_stats;
         let elision_stats = world.work_elision_stats();
         memo_hits += stats.cache_hits;
@@ -992,8 +1249,12 @@ fn run_hashlife(
             drops,
             work_elision_factor_x: Some(elision_stats.factor_x),
             leaf_misses: Some(elision_stats.leaf_misses),
+            factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
+            factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
             mat_distribution: Some(material_distribution(&grid)),
         });
+        factory_total.sinked += factory_step.sinked;
+        factory_total.backpressure += factory_step.backpressure;
     }
     let mut metrics = metrics(times);
     let memo_total = memo_hits + memo_misses;
@@ -1002,6 +1263,7 @@ fn run_hashlife(
         metrics.elision_factor_x = Some(memo_total as f64 / (memo_misses + 1) as f64);
     }
     apply_work_elision_metrics(&mut metrics, &work_elision);
+    apply_factory_metrics(&mut metrics, factory, factory_total);
     (records, metrics)
 }
 
@@ -1010,30 +1272,46 @@ fn run_chunk_array(
     warmup_generations: usize,
     generations: usize,
     microchurn_sand_per_step: Option<usize>,
+    factory: Option<FactoryHarness>,
     seed: u64,
 ) -> (Vec<GenerationRecord>, MetricsRecord) {
     let mut grid = world.flatten();
     let mut microchurn =
         microchurn_sand_per_step.map(|sand| Microchurn::new(seed, world.level, sand));
+    let side = world.side() as usize;
     for _ in 0..warmup_generations {
         if let Some(churn) = &mut microchurn {
             churn.apply_grid(&mut grid);
         }
+        if let Some(factory) = &factory {
+            factory.apply_sources_grid(&mut grid, side);
+        }
         let next = world.step_grid(&grid);
         grid = next;
+        if let Some(factory) = &factory {
+            factory.drain_sinks_grid(&mut grid, side);
+        }
         world.generation += 1;
     }
     let mut times = Vec::with_capacity(generations);
     let mut records = Vec::with_capacity(generations);
+    let mut factory_total = FactoryStepStats::default();
     for gen in 0..generations {
         let drops = microchurn_sand_per_step.unwrap_or(0);
         if let Some(churn) = &mut microchurn {
             churn.apply_grid(&mut grid);
         }
+        let mut factory_step = FactoryStepStats::default();
+        if let Some(factory) = &factory {
+            factory_step.backpressure = factory.apply_sources_grid(&mut grid, side);
+        }
         let start = Instant::now();
         let next = world.step_grid(&grid);
         let step_us = start.elapsed().as_micros();
         grid = next;
+        if let Some(factory) = &factory {
+            factory_step.sinked = factory.drain_sinks_grid(&mut grid, side);
+        }
         world.generation += 1;
         times.push(step_us);
         records.push(GenerationRecord {
@@ -1043,10 +1321,27 @@ fn run_chunk_array(
             drops,
             work_elision_factor_x: None,
             leaf_misses: None,
+            factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
+            factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
             mat_distribution: Some(material_distribution(&grid)),
         });
+        factory_total.sinked += factory_step.sinked;
+        factory_total.backpressure += factory_step.backpressure;
     }
-    (records, metrics(times))
+    let mut metrics = metrics(times);
+    apply_factory_metrics(&mut metrics, factory, factory_total);
+    (records, metrics)
+}
+
+fn apply_factory_metrics(
+    metrics: &mut MetricsRecord,
+    factory: Option<FactoryHarness>,
+    totals: FactoryStepStats,
+) {
+    if factory.is_some() {
+        metrics.factory_sinked_total = Some(totals.sinked);
+        metrics.factory_backpressure_total = Some(totals.backpressure);
+    }
 }
 
 fn apply_work_elision_metrics(metrics: &mut MetricsRecord, stats: &[WorkElisionStats]) {
@@ -1099,6 +1394,8 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
             work_elision_p05_x: None,
             leaf_misses_mean: None,
             work_elision_leaf_level: None,
+            factory_sinked_total: None,
+            factory_backpressure_total: None,
         };
     }
     let total_us: u128 = times_us.iter().sum();
@@ -1119,6 +1416,8 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
         work_elision_p05_x: None,
         leaf_misses_mean: None,
         work_elision_leaf_level: None,
+        factory_sinked_total: None,
+        factory_backpressure_total: None,
     }
 }
 
@@ -1197,6 +1496,29 @@ mod tests {
     }
 
     #[test]
+    fn factory_setup_changes_hash_and_requires_matching_scene_and_rule_set() {
+        let mut factory = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
+        factory.scene = Scene::FactoryConveyor;
+        factory.rule_set = RuleSet::FactoryConveyorV1;
+        factory.setup = Some(ScenarioSetup::FactoryConveyorRuleV1);
+
+        let mut raw = factory.clone();
+        raw.rule_set = RuleSet::DefaultCa;
+        raw.setup = None;
+
+        assert_ne!(scenario_hash(&factory, 6), scenario_hash(&raw, 6));
+        assert!(validate_backend_regime(&factory).is_ok());
+
+        let mut bad_scene = factory.clone();
+        bad_scene.scene = Scene::DefaultTerrain;
+        assert!(validate_backend_regime(&bad_scene).is_err());
+
+        let mut bad_rule = factory;
+        bad_rule.rule_set = RuleSet::DefaultCa;
+        assert!(validate_backend_regime(&bad_rule).is_err());
+    }
+
+    #[test]
     fn scenario_hash_preserves_no_setup_v2b_inputs() {
         let mut cascade = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
         cascade.name = "cascade-peak".to_string();
@@ -1265,6 +1587,46 @@ mod tests {
     }
 
     #[test]
+    fn compare_records_rejects_factory_total_drift() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        a.metrics.factory_sinked_total = Some(4);
+        a.metrics.factory_backpressure_total = Some(2);
+        a.generations[0].factory_sinked = Some(4);
+        a.generations[0].factory_backpressure = Some(2);
+        b.metrics.factory_sinked_total = Some(3);
+        b.metrics.factory_backpressure_total = Some(2);
+        b.generations[0].factory_sinked = Some(3);
+        b.generations[0].factory_backpressure = Some(2);
+
+        let path = write_jsonl(&[&a, &b]);
+        let err = compare_records(&path, "chunk", "hashlife", "step_p95_ms").unwrap_err();
+
+        assert!(err.contains("metrics.factory_sinked_total"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_rejects_factory_generation_drift() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        a.metrics.factory_sinked_total = Some(4);
+        a.metrics.factory_backpressure_total = Some(2);
+        a.generations[0].factory_sinked = Some(4);
+        a.generations[0].factory_backpressure = Some(2);
+        b.metrics.factory_sinked_total = Some(4);
+        b.metrics.factory_backpressure_total = Some(2);
+        b.generations[0].factory_sinked = Some(3);
+        b.generations[0].factory_backpressure = Some(2);
+
+        let path = write_jsonl(&[&a, &b]);
+        let err = compare_records(&path, "chunk", "hashlife", "step_p95_ms").unwrap_err();
+
+        assert!(err.contains("generations[0].factory_sinked"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn microchurn_keeps_backends_on_same_trajectory() {
         let level = 7;
         let params = TerrainParams::for_level(level);
@@ -1273,8 +1635,8 @@ mod tests {
         let mut chunk_world = World::new(level);
         chunk_world.seed_terrain(&params).unwrap();
 
-        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, Some(8), 7);
-        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, Some(8), 7);
+        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, Some(8), None, 7);
+        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, Some(8), None, 7);
 
         assert_eq!(hashlife.len(), chunk.len());
         for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
@@ -1293,7 +1655,7 @@ mod tests {
         let mut world = World::new(level);
         world.seed_terrain(&params).unwrap();
 
-        let (generations, metrics) = run_hashlife(world, 1, 3, None, 1);
+        let (generations, metrics) = run_hashlife(world, 1, 3, None, None, 1);
 
         assert_eq!(generations.len(), 3);
         assert!(generations
@@ -1313,7 +1675,7 @@ mod tests {
         let mut world = World::new(level);
         world.seed_terrain(&params).unwrap();
 
-        let (generations, metrics) = run_chunk_array(world, 1, 3, None, 1);
+        let (generations, metrics) = run_chunk_array(world, 1, 3, None, None, 1);
 
         assert!(generations
             .iter()
@@ -1359,8 +1721,8 @@ mod tests {
             chunk_world.apply_quarantine_atlas_pattern(pattern, center);
         }
 
-        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, None, 1);
-        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, None, 1);
+        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, None, None, 1);
+        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, None, None, 1);
 
         assert_eq!(hashlife.len(), chunk.len());
         for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
@@ -1370,6 +1732,70 @@ mod tests {
                 "material drift at gen {gen}"
             );
         }
+    }
+
+    #[test]
+    fn factory_conveyor_setup_keeps_backends_on_same_trajectory() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
+        scenario.world = WorldCoordName::Small;
+        scenario.level = Some(6);
+        scenario.scene = Scene::FactoryConveyor;
+        scenario.rule_set = RuleSet::FactoryConveyorV1;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.setup = Some(ScenarioSetup::FactoryConveyorRuleV1);
+
+        let mut hashlife_world = World::new(6);
+        seed_scene(&mut hashlife_world, &scenario).expect("seed hashlife");
+        let mut chunk_world = World::new(6);
+        seed_scene(&mut chunk_world, &scenario).expect("seed chunk");
+        let factory = FactoryHarness::for_scenario(&scenario, 64);
+
+        let (hashlife, hashlife_metrics) =
+            run_hashlife(hashlife_world, 2, 6, None, factory.clone(), 1);
+        let (chunk, chunk_metrics) = run_chunk_array(chunk_world, 2, 6, None, factory, 1);
+
+        assert_eq!(hashlife.len(), chunk.len());
+        for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
+            assert_eq!(h.pop_count, c.pop_count, "pop drift at gen {gen}");
+            assert_eq!(
+                h.mat_distribution, c.mat_distribution,
+                "material drift at gen {gen}"
+            );
+            assert_eq!(
+                h.factory_sinked, c.factory_sinked,
+                "sink drift at gen {gen}"
+            );
+            assert_eq!(
+                h.factory_backpressure, c.factory_backpressure,
+                "backpressure drift at gen {gen}"
+            );
+        }
+        assert!(hashlife_metrics.factory_sinked_total.unwrap() > 0);
+        assert_eq!(
+            hashlife_metrics.factory_sinked_total,
+            chunk_metrics.factory_sinked_total
+        );
+    }
+
+    #[test]
+    fn factory_conveyor_harness_makes_multi_step_progress() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
+        scenario.world = WorldCoordName::Small;
+        scenario.level = Some(6);
+        scenario.scene = Scene::FactoryConveyor;
+        scenario.rule_set = RuleSet::FactoryConveyorV1;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.setup = Some(ScenarioSetup::FactoryConveyorRuleV1);
+
+        let mut world = World::new(6);
+        seed_scene(&mut world, &scenario).expect("seed factory conveyor");
+        let factory = FactoryHarness::for_scenario(&scenario, 64);
+        let (generations, metrics) = run_hashlife(world, 0, 16, None, factory, 1);
+
+        assert!(generations
+            .iter()
+            .any(|gen| gen.factory_sinked.unwrap_or(0) > 0));
+        assert!(metrics.factory_sinked_total.unwrap() > 0);
     }
 
     fn test_scenario(backend: Backend, regime: Regime) -> Scenario {
@@ -1434,6 +1860,8 @@ mod tests {
                 work_elision_p05_x: None,
                 leaf_misses_mean: None,
                 work_elision_leaf_level: None,
+                factory_sinked_total: None,
+                factory_backpressure_total: None,
             },
             generations: vec![GenerationRecord {
                 gen: 0,
@@ -1442,6 +1870,8 @@ mod tests {
                 drops: 0,
                 work_elision_factor_x: None,
                 leaf_misses: None,
+                factory_sinked: None,
+                factory_backpressure: None,
                 mat_distribution: Some(serde_json::json!({"1": 10})),
             }],
         }

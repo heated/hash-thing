@@ -52,7 +52,7 @@ to one of these (or you say "any" if the scene doesn't matter).
 | `default-demo`    | Default terrain + volcano + water sheet + critters. The current demo.                                |
 | `quarantine-atlas`| Quarantine Atlas playtest scene: hazard lane, settlements, and budgeted counter-pattern stamps.       |
 | `random-mix`      | Synthetic random material per cell. Tests upper levels of cache pressure.                            |
-| `factory-conveyor`| Conveyor-rule scene: 1-material moves in fixed direction. Tests hash-cons + repetition. (8ppq.6 family.) |
+| `factory-conveyor`| Conveyor-rule scene: 1-material moves in fixed direction with source/sink/backpressure harness when `setup=FactoryConveyorRuleV1`. Tests hash-cons + repetition plus basic throughput pressure. |
 | `puzzle-circuit`  | Wire/signal-propagation scene. Tests sparse-pattern memo + signal cascades.                          |
 | `replay-scrub`    | Recorded sim trace replayed at variable speed. Tests temporal cache hits at past timesteps. (5j7e family.) |
 | `soup-search`     | Many random initial seeds run in parallel for N gens, classifier picks survivors. (8ppq.5 family.)   |

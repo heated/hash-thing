@@ -22,6 +22,48 @@ impl BlockRule for IdentityBlockRule {
     }
 }
 
+/// Conveyor block rule — moves one material in +X within each Margolus block.
+///
+/// This is a deliberately small factory-probe primitive: if a conveyor item is
+/// in the local x=0 cell and the corresponding x=1 cell is air, the item moves
+/// forward. The alternating global Margolus partition turns that local swap into
+/// fixed-direction motion across repeated steps.
+pub struct ConveyorBlockRule {
+    item_material: u16,
+}
+
+impl ConveyorBlockRule {
+    pub fn new(item_material: u16) -> Self {
+        Self { item_material }
+    }
+}
+
+impl BlockRule for ConveyorBlockRule {
+    fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8] {
+        let mut out = *block;
+        for dy in 0..2 {
+            for dz in 0..2 {
+                let from = block_index(0, dy, dz);
+                let to = block_index(1, dy, dz);
+                if movable[from]
+                    && movable[to]
+                    && out[from].material() == self.item_material
+                    && out[to].is_empty()
+                {
+                    out.swap(from, to);
+                }
+            }
+        }
+        out
+    }
+
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
+        Box::new(ConveyorBlockRule {
+            item_material: self.item_material,
+        })
+    }
+}
+
 /// Fluid block rule — gravity (vertical swaps) plus lateral spread.
 ///
 /// Phase 1 (gravity): same as `GravityBlockRule` — each vertical column
@@ -322,6 +364,48 @@ mod tests {
         let rule = IdentityBlockRule;
         let out = rule.step_block(&block, &[true; 8]);
         assert_mass_conserved(&block, &out);
+    }
+
+    // ---------------------------------------------------------------
+    // ConveyorBlockRule
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn conveyor_moves_item_pos_x_into_air() {
+        let rule = ConveyorBlockRule::new(14);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(0, 0, 0)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 0, 0)], Cell::pack(14, 9));
+        assert_mass_conserved(&block, &out);
+    }
+
+    #[test]
+    fn conveyor_does_not_move_blocked_item() {
+        let rule = ConveyorBlockRule::new(14);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(14, 9);
+        block[block_index(1, 0, 0)] = Cell::pack(14, 3);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out, block);
+    }
+
+    #[test]
+    fn conveyor_respects_movable_mask() {
+        let rule = ConveyorBlockRule::new(14);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(14, 9);
+        let mut movable = [true; 8];
+        movable[block_index(1, 0, 0)] = false;
+
+        let out = rule.step_block(&block, &movable);
+
+        assert_eq!(out, block);
     }
 
     // ---------------------------------------------------------------
