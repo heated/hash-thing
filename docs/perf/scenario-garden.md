@@ -44,6 +44,7 @@ The runner emits one JSONL measurement record matching `perf-measurement-schema.
 
 - `scenarios/default-terrain-idle.ron`
 - `scenarios/cascade-peak.ron`
+- `scenarios/cascade-peak-demo.ron`
 - `scenarios/factory-conveyor-toy.ron`
 - `scenarios/quarantine-atlas-mixed-containment.ron`
 

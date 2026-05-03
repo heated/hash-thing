@@ -1,0 +1,14 @@
+(
+    name: "cascade-peak-demo",
+    world: Demo,
+    level: Some(8),
+    scene: DefaultDemo,
+    rule_set: DefaultCa,
+    intensity: Cascade,
+    regime: Churning,
+    backend: HashlifeRecursive,
+    generations: 30,
+    warmup_generations: Some(5),
+    seed: 1,
+    comparator: Some("chunk-array@same-scenario"),
+)

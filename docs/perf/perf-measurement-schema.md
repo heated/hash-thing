@@ -226,6 +226,11 @@ Units in the name. Mixing units across records breaks downstream tooling.
 | `pop_count`           | int           | Live cell count at end-of-run.                |
 | `memo_hit_ratio`      | 0.0–1.0       | Hashlife memo hit rate (post-warmup).         |
 | `elision_factor_x`    | × multiplier  | See "elision_factor_x formula" below.         |
+| `work_elision_min_x`  | × multiplier  | Minimum warm-frame Hashlife work elision over the run. See "work_elision_* formula" below. |
+| `work_elision_mean_x` | × multiplier  | Mean warm-frame Hashlife work elision over the run. |
+| `work_elision_p05_x`  | × multiplier  | 5th-percentile warm-frame Hashlife work elision; anti-cherry-pick thesis metric for churning runs. |
+| `leaf_misses_mean`    | active leaves | Mean active-leaf misses per warm frame.       |
+| `work_elision_leaf_level` | octree level | Active Hashlife leaf level used for work-elision accounting. Usually 3; 4 when slowed block-rule materials need the wider base-case halo. |
 | `seed_ms`             | ms            | Wall-time of the seed step.                   |
 | `compaction_ns`       | ns            | Last `maybe_compact` wall.                    |
 
@@ -246,6 +251,24 @@ elision_factor_x = (memo_hits + memo_misses) / (memo_misses + 1)
 - Counts are **post-warmup**, gated by the same `confidence.warm_frame_policy` that gates `step_p95_ms`. If `warm_frame_policy` is `skip-first-5`, the `memo_hits` / `memo_misses` totals come from generations 5..end.
 - The `+1` in the denominator is Laplace smoothing — guarantees a finite value on a fully-cold or zero-miss run rather than dividing by zero.
 - `memo_evictions` are NOT in this formula. A high-eviction cache still has `elision_factor_x` ≥ 1; eviction pressure is a separate metric (`memo_evict_ratio`, file follow-up if useful).
+
+### `work_elision_*` formula
+
+`work_elision_*` is the aqq4 thesis metric, not the cache-lookup ratio above.
+It mirrors the `memo_elision=` token from `World::memo_summary()`:
+
+```
+active_leaf_level = 4 if any block-rule tick divisor > 1 else 3
+leaf_nodes_in_world = 2^(3 * (world_level + 1)) / 2^(3 * active_leaf_level)
+work_elision_factor_x(frame) = leaf_nodes_in_world / max(leaf_misses(frame), 1)
+```
+
+The `world_level + 1` term is intentional: `step_recursive` pads the root before
+stepping, and `memo_summary()` uses the same padded denominator. Per-generation
+records may include `work_elision_factor_x` and `leaf_misses`; aggregate metrics
+summarize those per-generation values. For churning/thesis claims, prefer
+`work_elision_p05_x` or `work_elision_min_x` over final-frame-only readings so a
+run cannot pass by ending after the active cascade calms down.
 
 ---
 

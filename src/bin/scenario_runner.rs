@@ -1,6 +1,7 @@
 use hash_thing::octree::CellState;
 use hash_thing::sim::world::{
-    quarantine_atlas_mixed_containment_plan, QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
+    quarantine_atlas_mixed_containment_plan, WorkElisionStats,
+    QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
 };
 use hash_thing::sim::{World, WorldCoord};
 use hash_thing::terrain::materials::{SAND, STONE, WATER};
@@ -172,6 +173,10 @@ struct GenerationRecord {
     step_us: u128,
     pop_count: usize,
     drops: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_elision_factor_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaf_misses: Option<u64>,
     mat_distribution: Option<serde_json::Value>,
 }
 
@@ -185,6 +190,16 @@ struct MetricsRecord {
     memo_hit_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     elision_factor_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_elision_min_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_elision_mean_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_elision_p05_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaf_misses_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_elision_leaf_level: Option<usize>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -237,6 +252,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    if let Some(append_path) = &args.append {
+        ensure_clean_git_tree_for_append(append_path)?;
+    }
     let line = match args.mode {
         Mode::Run { scenario, hardware } => {
             let text = read_utf8(&scenario)?;
@@ -372,6 +390,62 @@ fn append_jsonl(path: &Path, line: &str) -> Result<(), String> {
         .open(path)
         .map_err(|err| format!("open {}: {err}", path.display()))?;
     writeln!(file, "{line}").map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+fn ensure_clean_git_tree_for_append(append_path: &Path) -> Result<(), String> {
+    let allowed = git_status_path(append_path)?;
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .map_err(|err| format!("check git status before append: {err}"))?;
+    if !status.status.success() {
+        return Err("check git status before append failed".to_string());
+    }
+    let dirty = String::from_utf8_lossy(&status.stdout);
+    let unexpected_dirty = dirty
+        .lines()
+        .filter_map(porcelain_path)
+        .filter(|path| path != &allowed)
+        .collect::<Vec<_>>();
+    if unexpected_dirty.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to append closure-grade perf record with dirty paths other than {}: {}",
+        allowed,
+        unexpected_dirty.join(", ")
+    ))
+}
+
+fn git_status_path(path: &Path) -> Result<String, String> {
+    let root = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|err| format!("find git root before append: {err}"))?;
+    if !root.status.success() {
+        return Err("find git root before append failed".to_string());
+    }
+    let root = PathBuf::from(String::from_utf8_lossy(&root.stdout).trim().to_string());
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("read cwd before append: {err}"))?
+            .join(path)
+    };
+    let relative = absolute.strip_prefix(&root).unwrap_or(path);
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn porcelain_path(line: &str) -> Option<String> {
+    let path = line.get(3..)?.trim();
+    Some(
+        path.split(" -> ")
+            .last()
+            .unwrap_or(path)
+            .trim_matches('"')
+            .to_string(),
+    )
 }
 
 fn compare_records(
@@ -583,6 +657,22 @@ fn metric_value(metrics: &MetricsRecord, metric: &str) -> Result<f64, String> {
         "elision_factor_x" => metrics
             .elision_factor_x
             .ok_or_else(|| "metric elision_factor_x missing".to_string()),
+        "work_elision_min_x" => metrics
+            .work_elision_min_x
+            .ok_or_else(|| "metric work_elision_min_x missing".to_string()),
+        "work_elision_mean_x" => metrics
+            .work_elision_mean_x
+            .ok_or_else(|| "metric work_elision_mean_x missing".to_string()),
+        "work_elision_p05_x" => metrics
+            .work_elision_p05_x
+            .ok_or_else(|| "metric work_elision_p05_x missing".to_string()),
+        "leaf_misses_mean" => metrics
+            .leaf_misses_mean
+            .ok_or_else(|| "metric leaf_misses_mean missing".to_string()),
+        "work_elision_leaf_level" => metrics
+            .work_elision_leaf_level
+            .map(|level| level as f64)
+            .ok_or_else(|| "metric work_elision_leaf_level missing".to_string()),
         _ => Err(format!("unknown metric {metric:?}")),
     }
 }
@@ -879,6 +969,7 @@ fn run_hashlife(
     let mut records = Vec::with_capacity(generations);
     let mut memo_hits = 0u64;
     let mut memo_misses = 0u64;
+    let mut work_elision = Vec::with_capacity(generations);
     for gen in 0..generations {
         let drops = microchurn_sand_per_step.unwrap_or(0);
         if let Some(churn) = &mut microchurn {
@@ -888,8 +979,10 @@ fn run_hashlife(
         world.step_recursive();
         let step_us = start.elapsed().as_micros();
         let stats = world.hashlife_stats;
+        let elision_stats = world.work_elision_stats();
         memo_hits += stats.cache_hits;
         memo_misses += stats.cache_misses;
+        work_elision.push(elision_stats);
         let grid = world.flatten();
         times.push(step_us);
         records.push(GenerationRecord {
@@ -897,6 +990,8 @@ fn run_hashlife(
             step_us,
             pop_count: popcount(&grid),
             drops,
+            work_elision_factor_x: Some(elision_stats.factor_x),
+            leaf_misses: Some(elision_stats.leaf_misses),
             mat_distribution: Some(material_distribution(&grid)),
         });
     }
@@ -906,6 +1001,7 @@ fn run_hashlife(
         metrics.memo_hit_ratio = Some(memo_hits as f64 / memo_total as f64);
         metrics.elision_factor_x = Some(memo_total as f64 / (memo_misses + 1) as f64);
     }
+    apply_work_elision_metrics(&mut metrics, &work_elision);
     (records, metrics)
 }
 
@@ -945,10 +1041,32 @@ fn run_chunk_array(
             step_us,
             pop_count: popcount(&grid),
             drops,
+            work_elision_factor_x: None,
+            leaf_misses: None,
             mat_distribution: Some(material_distribution(&grid)),
         });
     }
     (records, metrics(times))
+}
+
+fn apply_work_elision_metrics(metrics: &mut MetricsRecord, stats: &[WorkElisionStats]) {
+    if stats.is_empty() {
+        return;
+    }
+    let mut factors = stats.iter().map(|s| s.factor_x).collect::<Vec<_>>();
+    factors.sort_by(|a, b| a.total_cmp(b));
+    let total_factor: f64 = factors.iter().sum();
+    let total_leaf_misses: u64 = stats.iter().map(|s| s.leaf_misses).sum();
+    let last = factors.len() - 1;
+    let p05_idx = ((factors.len() as f64 * 0.05).ceil() as usize)
+        .saturating_sub(1)
+        .min(last);
+
+    metrics.work_elision_min_x = Some(factors[0]);
+    metrics.work_elision_mean_x = Some(total_factor / factors.len() as f64);
+    metrics.work_elision_p05_x = Some(factors[p05_idx]);
+    metrics.leaf_misses_mean = Some(total_leaf_misses as f64 / stats.len() as f64);
+    metrics.work_elision_leaf_level = Some(stats[0].leaf_level);
 }
 
 fn popcount(grid: &[CellState]) -> usize {
@@ -976,6 +1094,11 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
             wall_total_ms: 0.0,
             memo_hit_ratio: None,
             elision_factor_x: None,
+            work_elision_min_x: None,
+            work_elision_mean_x: None,
+            work_elision_p05_x: None,
+            leaf_misses_mean: None,
+            work_elision_leaf_level: None,
         };
     }
     let total_us: u128 = times_us.iter().sum();
@@ -991,6 +1114,11 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
         wall_total_ms: total_us as f64 / 1000.0,
         memo_hit_ratio: None,
         elision_factor_x: None,
+        work_elision_min_x: None,
+        work_elision_mean_x: None,
+        work_elision_p05_x: None,
+        leaf_misses_mean: None,
+        work_elision_leaf_level: None,
     }
 }
 
@@ -1159,6 +1287,64 @@ mod tests {
     }
 
     #[test]
+    fn hashlife_records_work_elision_metrics() {
+        let level = 5;
+        let params = TerrainParams::for_level(level);
+        let mut world = World::new(level);
+        world.seed_terrain(&params).unwrap();
+
+        let (generations, metrics) = run_hashlife(world, 1, 3, None, 1);
+
+        assert_eq!(generations.len(), 3);
+        assert!(generations
+            .iter()
+            .all(|gen| gen.work_elision_factor_x.is_some() && gen.leaf_misses.is_some()));
+        assert!(metrics.work_elision_min_x.unwrap() > 0.0);
+        assert!(metrics.work_elision_mean_x.unwrap() > 0.0);
+        assert!(metrics.work_elision_p05_x.unwrap() > 0.0);
+        assert!(metrics.leaf_misses_mean.unwrap() >= 0.0);
+        assert!(matches!(metrics.work_elision_leaf_level, Some(3 | 4)));
+    }
+
+    #[test]
+    fn chunk_array_omits_hashlife_work_elision_metrics() {
+        let level = 5;
+        let params = TerrainParams::for_level(level);
+        let mut world = World::new(level);
+        world.seed_terrain(&params).unwrap();
+
+        let (generations, metrics) = run_chunk_array(world, 1, 3, None, 1);
+
+        assert!(generations
+            .iter()
+            .all(|gen| gen.work_elision_factor_x.is_none() && gen.leaf_misses.is_none()));
+        assert!(metrics.work_elision_min_x.is_none());
+        assert!(metrics.work_elision_mean_x.is_none());
+        assert!(metrics.work_elision_p05_x.is_none());
+        assert!(metrics.leaf_misses_mean.is_none());
+        assert!(metrics.work_elision_leaf_level.is_none());
+    }
+
+    #[test]
+    fn old_measurement_json_without_work_elision_fields_still_compares() {
+        let body = r#"{"schema_version":2,"record_kind":"measurement","measurement_id":"chunk","world":"medium","scene":"default-demo","intensity":"cascade","regime":"n/a","rule_set":"default-ca","backend":"chunk-array","hardware":"m2-pro-mbp","scenario_hash":"sha256:test","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":10.0,"step_median_ms":10.0,"step_p95_ms":10.0,"wall_total_ms":20.0},"generations":[{"gen":0,"step_us":10000,"pop_count":11,"drops":0,"mat_distribution":{"1":10}}]}
+{"schema_version":2,"record_kind":"measurement","measurement_id":"hashlife","world":"medium","scene":"default-demo","intensity":"cascade","regime":"saturated","rule_set":"default-ca","backend":"hashlife-recursive","hardware":"m2-pro-mbp","scenario_hash":"sha256:test","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":2.0,"step_median_ms":2.0,"step_p95_ms":2.0,"wall_total_ms":4.0},"generations":[{"gen":0,"step_us":2000,"pop_count":10,"drops":0,"mat_distribution":{"1":10}}]}
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-scenario-runner-old-json-{}-{}.jsonl",
+            std::process::id(),
+            TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, body).expect("write old jsonl");
+
+        let comparison =
+            compare_records(&path, "chunk", "hashlife", "step_p95_ms").expect("comparison");
+
+        assert_eq!(comparison.ratio, 5.0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn quarantine_atlas_mixed_setup_keeps_backends_on_same_trajectory() {
         let level = 7;
         let mut hashlife_world = World::new(level);
@@ -1243,12 +1429,19 @@ mod tests {
                 wall_total_ms: step_p95_ms * 2.0,
                 memo_hit_ratio: None,
                 elision_factor_x: None,
+                work_elision_min_x: None,
+                work_elision_mean_x: None,
+                work_elision_p05_x: None,
+                leaf_misses_mean: None,
+                work_elision_leaf_level: None,
             },
             generations: vec![GenerationRecord {
                 gen: 0,
                 step_us: (step_p95_ms * 1000.0) as u128,
                 pop_count: if backend == "chunk-array" { 11 } else { 10 },
                 drops: 0,
+                work_elision_factor_x: None,
+                leaf_misses: None,
                 mat_distribution: Some(serde_json::json!({"1": 10})),
             }],
         }

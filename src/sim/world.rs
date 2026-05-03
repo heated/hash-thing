@@ -533,6 +533,20 @@ pub struct HashlifeStats {
     pub bfs_max_batch_len: u64,
 }
 
+/// Work-elision summary for the most recent Hashlife step.
+///
+/// This mirrors the `memo_elision=` token in [`World::memo_summary`]:
+/// padded active-leaf nodes divided by active-leaf misses from the latest
+/// step. It is the aqq4 thesis metric, distinct from cache hit ratios such
+/// as `(hits + misses) / misses`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorkElisionStats {
+    pub leaf_level: usize,
+    pub leaf_nodes_in_world: u64,
+    pub leaf_misses: u64,
+    pub factor_x: f64,
+}
+
 impl HashlifeStats {
     /// Field-wise add `step` into `self`. Keeps the scalar counters and the
     /// per-level array in sync (hash-thing-stue.6 lifetime accumulator).
@@ -2617,6 +2631,38 @@ impl World {
     /// `memo_mac` / `memo_mac_bytes` stay at 0 on single-step sessions
     /// (only `step_recursive_pow2` populates the macro cache).
     ///
+    pub fn work_elision_stats(&self) -> WorkElisionStats {
+        let leaf_level = self.active_hashlife_leaf_level();
+        let leaf_cells = 1u64 << (3 * leaf_level);
+        let padded_level = self.level + 1;
+        let leaf_nodes_in_world = (1u64 << (3 * padded_level))
+            .saturating_div(leaf_cells)
+            .max(1);
+        let leaf_miss_idx = leaf_level - 3;
+        let raw_leaf_misses = self.hashlife_stats.misses_by_level[leaf_miss_idx];
+        let factor_x = leaf_nodes_in_world as f64 / raw_leaf_misses.max(1) as f64;
+
+        WorkElisionStats {
+            leaf_level,
+            leaf_nodes_in_world,
+            leaf_misses: raw_leaf_misses,
+            factor_x,
+        }
+    }
+
+    fn active_hashlife_leaf_level(&self) -> usize {
+        if self
+            .materials
+            .block_rule_tick_divisors()
+            .iter()
+            .any(|&divisor| divisor > 1)
+        {
+            4
+        } else {
+            3
+        }
+    }
+
     /// `p1` / `p2` are the last step's per-phase wall times inside
     /// `step_grid_once` (Phase 1 = per-cell CaRule, Phase 2 = per-block
     /// BlockRule / Margolus). Reported per-step (not lifetime) so the
@@ -2710,29 +2756,12 @@ impl World {
         // Floor on `max(_, 1)` so a fully-cached step (leaf misses = 0)
         // doesn't divide by zero — that's the perfect-hit case where
         // the elision factor is effectively unbounded.
-        let leaf_level = if self
-            .materials
-            .block_rule_tick_divisors()
-            .iter()
-            .any(|&divisor| divisor > 1)
-        {
-            4usize
-        } else {
-            3usize
-        };
-        let leaf_cells = 1u64 << (3 * leaf_level);
-        let padded_level = self.level + 1;
-        let leaf_nodes_in_world = (1u64 << (3 * padded_level))
-            .saturating_div(leaf_cells)
-            .max(1);
-        let leaf_miss_idx = leaf_level - 3;
-        let leaf_misses_last = last_step.misses_by_level[leaf_miss_idx].max(1);
-        let elision_factor = leaf_nodes_in_world as f64 / leaf_misses_last as f64;
+        let work_elision = self.work_elision_stats();
         format!(
             "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
             hit_rate,
             churn,
-            elision_factor,
+            work_elision.factor_x,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
             self.macro_cache_bytes_est(),
