@@ -958,6 +958,9 @@ struct App {
     /// so the periodic log can print it even while the next step is on
     /// the background thread (where `self.world` is a placeholder).
     last_memo_summary: String,
+    /// Lines uploaded to the memo HUD. Usually mirrors `last_memo_summary`
+    /// token-by-token; special demos may use a smaller, legible headline.
+    memo_hud_lines: Vec<String>,
     /// Memo HUD overlay toggle (hash-thing-nhwo). On when
     /// `HASH_THING_MEMO_HUD=1` is set at startup; renders memo_* stats
     /// as a top-left text panel. No key-binding — env-var only.
@@ -1635,6 +1638,43 @@ fn soup_tile_text(tile: [i64; 3]) -> String {
     format!("[{},{},{}]", tile[0], tile[1], tile[2])
 }
 
+fn standard_memo_hud_lines(summary: &str) -> Vec<String> {
+    summary.split_whitespace().map(str::to_string).collect()
+}
+
+fn soup_reuse_hud_lines(reuse: &SoupReuseResult) -> Vec<String> {
+    vec![
+        "REUSE".to_string(),
+        format!(
+            "{}->{}",
+            soup_tile_text(reuse.source_tile),
+            soup_tile_text(reuse.target_tile)
+        ),
+        format!(
+            "changed={}",
+            if reuse.target_before_hash != reuse.target_after_hash {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!(
+            "copy={}",
+            if reuse.source_hash == reuse.target_after_hash {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!("post={}", reuse.post_label.as_str()),
+        format!("pop={}", reuse.post_pop),
+    ]
+}
+
+fn soup_reuse_headline(reuse: &SoupReuseResult) -> String {
+    format!("{} ", soup_reuse_hud_lines(reuse).join(" "))
+}
+
 fn soup_hash_short(hash: &str) -> &str {
     hash.get(..23).unwrap_or(hash)
 }
@@ -1716,6 +1756,7 @@ impl App {
             pending_scene_swap: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
+            memo_hud_lines: Vec::new(),
             memo_hud_visible: std::env::var("HASH_THING_MEMO_HUD").ok().as_deref() == Some("1"),
             memo_hud_dirty: true,
             freeze_sim: std::env::var("HASH_THING_FREEZE_SIM").ok().as_deref() == Some("1"),
@@ -1759,6 +1800,7 @@ impl App {
         // (hash-thing-stue.6 reviewer nit). Dirty the HUD too so reseeding
         // here can never race ahead of the construction-time seed.
         app.last_memo_summary = app.world.memo_summary();
+        app.memo_hud_lines = standard_memo_hud_lines(&app.last_memo_summary);
         app.memo_hud_dirty = true;
         let player_pos = app.reset_scene_entities();
         app.spawn_demo_entities();
@@ -3557,8 +3599,15 @@ impl App {
                 )
             })
             .unwrap_or_else(|| "reuse=0 last_reuse=none".to_string());
+        let reuse_hud_lines = state.last_reuse.as_ref().map(soup_reuse_hud_lines);
+        let reuse_headline = state
+            .last_reuse
+            .as_ref()
+            .map(soup_reuse_headline)
+            .unwrap_or_default();
         self.last_memo_summary = format!(
-            "soup_seed={} target_src={} target_tile={} target_label={} target_pop={} target_hash={} catalog={} {} {}",
+            "{}soup_seed={} target_src={} target_tile={} target_label={} target_pop={} target_hash={} catalog={} {} {}",
+            reuse_headline,
             state.selected_pattern + 1,
             target_source,
             soup_tile_text(focus_tile),
@@ -3569,6 +3618,8 @@ impl App {
             last,
             reuse,
         );
+        self.memo_hud_lines =
+            reuse_hud_lines.unwrap_or_else(|| standard_memo_hud_lines(&self.last_memo_summary));
         self.memo_hud_visible = true;
         self.memo_hud_dirty = true;
         true
@@ -3603,6 +3654,7 @@ impl App {
     fn refresh_memo_summary_after_world_update(&mut self) {
         if !self.refresh_soup_prospector_hud() {
             self.last_memo_summary = self.world.memo_summary();
+            self.memo_hud_lines = standard_memo_hud_lines(&self.last_memo_summary);
             self.memo_hud_dirty = true;
         }
     }
@@ -5046,7 +5098,17 @@ impl ApplicationHandler<AppUserEvent> for App {
                     renderer.memo_hud_visible = self.memo_hud_visible;
                     if self.memo_hud_visible && self.memo_hud_dirty {
                         self.memo_hud_dirty = false;
-                        let lines: Vec<&str> = self.last_memo_summary.split_whitespace().collect();
+                        renderer.memo_hud_scale = if self
+                            .memo_hud_lines
+                            .first()
+                            .is_some_and(|line| line == "REUSE")
+                        {
+                            3
+                        } else {
+                            2
+                        };
+                        let lines: Vec<&str> =
+                            self.memo_hud_lines.iter().map(String::as_str).collect();
                         renderer.set_memo_hud_text(&lines);
                     }
                 }
@@ -7590,6 +7652,24 @@ mod tests {
         assert_eq!(reuse.count, 1);
         assert_eq!(state.focus_tile, reuse.target_tile);
         assert!(app.last_memo_summary.contains("reuse=1"));
+        assert!(app.last_memo_summary.starts_with("REUSE "));
+        assert_eq!(
+            app.memo_hud_lines,
+            vec![
+                "REUSE".to_string(),
+                format!(
+                    "{}->{}",
+                    soup_tile_text(source),
+                    soup_tile_text(reuse.target_tile)
+                ),
+                "changed=yes".to_string(),
+                "copy=yes".to_string(),
+                "post=survivor".to_string(),
+                format!("pop={}", reuse.post_pop),
+            ]
+        );
+        assert!(app.last_memo_summary.contains("copy=yes"));
+        assert!(app.last_memo_summary.contains("post=survivor"));
         assert!(app.last_memo_summary.contains("target_src=reuse"));
         assert!(app.last_memo_summary.contains("initial_match=yes"));
         assert!(app.last_memo_summary.contains("post_label="));

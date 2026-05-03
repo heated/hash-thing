@@ -518,6 +518,7 @@ pub struct Renderer {
     memo_hud_tex_w: u32,
     memo_hud_tex_h: u32,
     pub memo_hud_visible: bool,
+    pub memo_hud_scale: u32,
 
     // Material palette (shared by all pipelines)
     palette_buffer: wgpu::Buffer,
@@ -1757,6 +1758,7 @@ impl Renderer {
             memo_hud_tex_w: 0,
             memo_hud_tex_h: 0,
             memo_hud_visible: false,
+            memo_hud_scale: 2,
             palette_buffer,
             uniform_buffer,
             volume_size,
@@ -2315,12 +2317,12 @@ impl Renderer {
         label_tex: &str,
         label_bg: &str,
         uniform_buffer: &wgpu::Buffer,
+        scale: u32,
     ) -> Option<(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup, u32, u32)> {
         if lines.is_empty() || lines.iter().all(|l| l.is_empty()) {
             return None;
         }
 
-        let scale = 2u32;
         let (pixels, w, h) = super::font::render_text_rgba(lines, scale);
 
         let size = wgpu::Extent3d {
@@ -2386,6 +2388,7 @@ impl Renderer {
             "legend_tex",
             "legend_bg",
             &self.legend_uniform_buffer,
+            2,
         ) {
             Some((texture, view, bind_group, w, h)) => {
                 self.legend_tex_w = w;
@@ -2411,6 +2414,7 @@ impl Renderer {
             "memo_hud_tex",
             "memo_hud_bg",
             &self.memo_hud_uniform_buffer,
+            self.memo_hud_scale,
         ) {
             Some((texture, view, bind_group, w, h)) => {
                 self.memo_hud_tex_w = w;
