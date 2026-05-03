@@ -40,6 +40,28 @@ pub enum CaRule {
 
 impl CaRule {
     #[inline]
+    pub fn diag_name(&self) -> &'static str {
+        match self {
+            CaRule::Air(_) => "AirRule",
+            CaRule::Fan(_) => "FanRule",
+            CaRule::FanDriven(_) => "FanDrivenRule",
+            CaRule::Noop(_) => "NoopRule",
+            CaRule::Fire(_) => "FireRule",
+            CaRule::Water(_) => "WaterRule",
+            CaRule::Lava(_) => "LavaRule",
+            CaRule::Ice(_) => "IceRule",
+            CaRule::Flammable(_) => "FlammableRule",
+            CaRule::Vine(_) => "VineRule",
+            CaRule::AirVineGrowth(_) => "AirVineGrowthRule",
+            CaRule::Acid(_) => "AcidRule",
+            CaRule::Dissolvable(_) => "DissolvableRule",
+            CaRule::Steam(_) => "SteamRule",
+            CaRule::Firework(_) => "FireworkRule",
+            CaRule::GameOfLife3D(_) => "GameOfLife3D",
+        }
+    }
+
+    #[inline]
     pub fn step_cell(&self, center: Cell, neighbors: &[Cell; 26]) -> Cell {
         match self {
             CaRule::Air(r) => r.step_cell(center, neighbors),
@@ -127,6 +149,10 @@ pub enum Phase {
 /// only rule/empty positions are written back.
 pub trait BlockRule {
     fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8];
+
+    fn diag_name(&self) -> &'static str {
+        "BlockRule"
+    }
 
     /// Clone into a boxed trait object.
     fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync>;

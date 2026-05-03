@@ -40,7 +40,7 @@
 //! eviction is deliberate so compaction does not retain unbounded cache-only
 //! result subgraphs.
 
-use super::world::World;
+use super::world::{HashlifeRuleMissDiag, World};
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
@@ -835,9 +835,10 @@ impl World {
         // Stack-allocated grid avoids heap allocation per base case (~16K calls).
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let (next, p1_ns, p2_ns) = self.step_grid_once(&grid, self.generation);
+        let (next, p1_ns, p2_ns, diag) = self.step_grid_once(&grid, self.generation);
         self.hashlife_stats.phase1_ns += p1_ns;
         self.hashlife_stats.phase2_ns += p2_ns;
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag);
         self.center_level3_grid_to_node(&next)
     }
 
@@ -854,10 +855,11 @@ impl World {
     fn step_wide_block_base_case(&mut self, node: NodeId, _schedule_phase: u64) -> NodeId {
         let mut grid = vec![0 as CellState; LEVEL4_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL4_SIDE);
-        let (next, p1_ns, p2_ns) =
+        let (next, p1_ns, p2_ns, diag) =
             step_grid_once_vec(&grid, LEVEL4_SIDE, self.generation, &self.materials);
         self.hashlife_stats.phase1_ns += p1_ns;
         self.hashlife_stats.phase2_ns += p2_ns;
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag);
         self.center_level4_grid_to_node(&next)
     }
 
@@ -909,10 +911,12 @@ impl World {
     fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let (next, p1_ns_a, p2_ns_a) = self.step_grid_once(&grid, generation);
-        let (next, p1_ns_b, p2_ns_b) = self.step_grid_once(&next, generation + 1);
+        let (next, p1_ns_a, p2_ns_a, diag_a) = self.step_grid_once(&grid, generation);
+        let (next, p1_ns_b, p2_ns_b, diag_b) = self.step_grid_once(&next, generation + 1);
         self.hashlife_stats.phase1_ns += p1_ns_a + p1_ns_b;
         self.hashlife_stats.phase2_ns += p2_ns_a + p2_ns_b;
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag_a);
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag_b);
         self.center_level3_grid_to_node(&next)
     }
 
@@ -920,7 +924,12 @@ impl World {
         &self,
         grid: &[CellState],
         generation: u64,
-    ) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
+    ) -> (
+        [CellState; LEVEL3_CELL_COUNT],
+        u64,
+        u64,
+        HashlifeRuleMissDiag,
+    ) {
         step_grid_once_pure(grid, generation, &self.materials)
     }
 
@@ -1197,25 +1206,27 @@ impl World {
         const RAYON_BATCH_THRESHOLD: usize = 4;
         let generation = self.generation;
         let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
-        let outputs: Vec<(Vec<CellState>, u64, u64)> = if pending_grids.is_empty() {
-            Vec::new()
-        } else if pending_grids.len() < RAYON_BATCH_THRESHOLD {
-            pending_grids
-                .iter()
-                .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
-                .collect()
-        } else {
-            pending_grids
-                .par_iter()
-                .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
-                .collect()
-        };
+        let outputs: Vec<(Vec<CellState>, u64, u64, HashlifeRuleMissDiag)> =
+            if pending_grids.is_empty() {
+                Vec::new()
+            } else if pending_grids.len() < RAYON_BATCH_THRESHOLD {
+                pending_grids
+                    .iter()
+                    .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
+                    .collect()
+            } else {
+                pending_grids
+                    .par_iter()
+                    .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
+                    .collect()
+            };
 
         // Phase C: commit outputs into store + cache + stats.
         for (out_idx, &(sub_idx, effective_phase)) in pending.iter().enumerate() {
-            let (output_grid, p1ns, p2ns) = &outputs[out_idx];
+            let (output_grid, p1ns, p2ns, diag) = &outputs[out_idx];
             self.hashlife_stats.phase1_ns += p1ns;
             self.hashlife_stats.phase2_ns += p2ns;
+            self.hashlife_stats.rule_miss_diag.accumulate(diag);
             let centered = if leaf_level == 4 {
                 self.center_level4_grid_to_node(output_grid)
             } else {
@@ -1612,7 +1623,8 @@ impl World {
                     self.store.flatten_buf(task.node, &mut grid, LEVEL4_SIDE);
                     pending_grids.push(grid);
                 }
-                let outputs: Vec<(Vec<CellState>, u64, u64)> = if leaf_count < RAYON_BATCH_THRESHOLD
+                let outputs: Vec<(Vec<CellState>, u64, u64, HashlifeRuleMissDiag)> = if leaf_count
+                    < RAYON_BATCH_THRESHOLD
                 {
                     self.hashlife_stats.bfs_batches_serial_fallback += 1;
                     pending_grids
@@ -1628,9 +1640,10 @@ impl World {
                         .collect()
                 };
 
-                for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
+                for (out_idx, (output_grid, p1ns, p2ns, diag)) in outputs.into_iter().enumerate() {
                     self.hashlife_stats.phase1_ns += p1ns;
                     self.hashlife_stats.phase2_ns += p2ns;
+                    self.hashlife_stats.rule_miss_diag.accumulate(&diag);
                     let centered = self.center_level4_grid_to_node(&output_grid);
                     let task = &mut tasks[0][out_idx];
                     self.hashlife_cache
@@ -1645,25 +1658,30 @@ impl World {
                     self.store.flatten_buf(task.node, &mut grid, LEVEL3_SIDE);
                     pending_grids.push(grid);
                 }
-                let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> =
-                    if leaf_count < RAYON_BATCH_THRESHOLD {
-                        self.hashlife_stats.bfs_batches_serial_fallback += 1;
-                        pending_grids
-                            .iter()
-                            .map(|grid| step_grid_once_pure(grid, generation, materials))
-                            .collect()
-                    } else {
-                        use rayon::prelude::*;
-                        self.hashlife_stats.bfs_batches_parallel += 1;
-                        pending_grids
-                            .par_iter()
-                            .map(|grid| step_grid_once_pure(grid, generation, materials))
-                            .collect()
-                    };
+                let outputs: Vec<(
+                    [CellState; LEVEL3_CELL_COUNT],
+                    u64,
+                    u64,
+                    HashlifeRuleMissDiag,
+                )> = if leaf_count < RAYON_BATCH_THRESHOLD {
+                    self.hashlife_stats.bfs_batches_serial_fallback += 1;
+                    pending_grids
+                        .iter()
+                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .collect()
+                } else {
+                    use rayon::prelude::*;
+                    self.hashlife_stats.bfs_batches_parallel += 1;
+                    pending_grids
+                        .par_iter()
+                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .collect()
+                };
 
-                for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
+                for (out_idx, (output_grid, p1ns, p2ns, diag)) in outputs.into_iter().enumerate() {
                     self.hashlife_stats.phase1_ns += p1ns;
                     self.hashlife_stats.phase2_ns += p2ns;
+                    self.hashlife_stats.rule_miss_diag.accumulate(&diag);
                     let centered = self.center_level3_grid_to_node(&output_grid);
                     let task = &mut tasks[0][out_idx];
                     self.hashlife_cache
@@ -1857,11 +1875,16 @@ pub(super) fn step_grid_once_pure(
     grid: &[CellState],
     generation: u64,
     materials: &crate::terrain::materials::MaterialRegistry,
-) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
+) -> (
+    [CellState; LEVEL3_CELL_COUNT],
+    u64,
+    u64,
+    HashlifeRuleMissDiag,
+) {
     let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
-    let (phase1_ns, phase2_ns) =
+    let (phase1_ns, phase2_ns, diag) =
         step_grid_once_into(grid, &mut next, LEVEL3_SIDE, generation, materials);
-    (next, phase1_ns, phase2_ns)
+    (next, phase1_ns, phase2_ns, diag)
 }
 
 fn step_grid_once_vec(
@@ -1869,10 +1892,11 @@ fn step_grid_once_vec(
     side: usize,
     generation: u64,
     materials: &crate::terrain::materials::MaterialRegistry,
-) -> (Vec<CellState>, u64, u64) {
+) -> (Vec<CellState>, u64, u64, HashlifeRuleMissDiag) {
     let mut next = vec![0 as CellState; side * side * side];
-    let (phase1_ns, phase2_ns) = step_grid_once_into(grid, &mut next, side, generation, materials);
-    (next, phase1_ns, phase2_ns)
+    let (phase1_ns, phase2_ns, diag) =
+        step_grid_once_into(grid, &mut next, side, generation, materials);
+    (next, phase1_ns, phase2_ns, diag)
 }
 
 fn step_grid_once_into(
@@ -1881,9 +1905,15 @@ fn step_grid_once_into(
     side: usize,
     generation: u64,
     materials: &crate::terrain::materials::MaterialRegistry,
-) -> (u64, u64) {
+) -> (u64, u64, HashlifeRuleMissDiag) {
     debug_assert_eq!(grid.len(), side * side * side);
     debug_assert_eq!(next.len(), grid.len());
+
+    let mut diag = if memo_diag_enabled() {
+        Some(HashlifeRuleMissDiag::default())
+    } else {
+        None
+    };
 
     // Phase 1: CaRule on interior cells (1..side-1 on each axis).
     // The outermost ring cannot be evolved correctly because its neighbors
@@ -1899,24 +1929,41 @@ fn step_grid_once_into(
                 let idx = x + y * side + z * side * side;
                 let raw = grid[idx];
                 if raw == 0 && air_is_noop {
+                    if let Some(diag) = &mut diag {
+                        diag.record_ca("NoopRule", true);
+                    }
                     continue;
                 }
                 let cell = Cell::from_raw(raw);
                 let mat = cell.material() as usize;
                 if mat < noop_by_material.len() && noop_by_material[mat] {
                     next[idx] = raw;
+                    if let Some(diag) = &mut diag {
+                        diag.record_ca("NoopRule", true);
+                    }
                     continue;
                 }
                 let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
                 if divisor > 1 && !generation.is_multiple_of(divisor) {
                     next[idx] = raw;
+                    if let Some(diag) = &mut diag {
+                        let rule_name = materials
+                            .rule_for_cell(cell)
+                            .map(|rule| rule.diag_name())
+                            .unwrap_or("CaRule");
+                        diag.record_ca(rule_name, true);
+                    }
                     continue;
                 }
                 let rule = materials
                     .rule_for_cell(cell)
                     .unwrap_or_else(|| panic!("missing CaRule for material {}", cell.material()));
                 let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
-                next[idx] = rule.step_cell(cell, &neighbors).raw();
+                let result = rule.step_cell(cell, &neighbors).raw();
+                next[idx] = result;
+                if let Some(diag) = &mut diag {
+                    diag.record_ca(rule.diag_name(), result == raw);
+                }
             }
         }
     }
@@ -1936,7 +1983,7 @@ fn step_grid_once_into(
             while by + 1 < side - 1 {
                 let mut bx = offset;
                 while bx + 1 < side - 1 {
-                    apply_block_in_grid_pure(next, side, bx, by, bz, materials);
+                    apply_block_in_grid_pure(next, side, bx, by, bz, materials, diag.as_mut());
                     bx += 2;
                 }
                 by += 2;
@@ -1961,6 +2008,7 @@ fn step_grid_once_into(
                             generation,
                             block_rule_divisors,
                             materials,
+                            diag.as_mut(),
                         );
                         bx += 2;
                     }
@@ -1971,7 +2019,7 @@ fn step_grid_once_into(
         }
     }
     let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
-    (phase1_ns, phase2_ns)
+    (phase1_ns, phase2_ns, diag.unwrap_or_default())
 }
 
 fn apply_block_in_grid_pure(
@@ -1981,6 +2029,7 @@ fn apply_block_in_grid_pure(
     by: usize,
     bz: usize,
     materials: &crate::terrain::materials::MaterialRegistry,
+    mut diag: Option<&mut HashlifeRuleMissDiag>,
 ) {
     let mut block = [Cell::EMPTY; 8];
     for dz in 0..2 {
@@ -1996,8 +2045,8 @@ fn apply_block_in_grid_pure(
         return;
     }
 
-    let rule_id = match unique_block_rule_pure(materials, &block) {
-        Some(id) => id,
+    let rule_match = match unique_block_rule_pure(materials, &block) {
+        Some(rule_match) => rule_match,
         None => return,
     };
 
@@ -2006,8 +2055,11 @@ fn apply_block_in_grid_pure(
         c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
     });
 
-    let rule = materials.block_rule(rule_id);
+    let rule = materials.block_rule(rule_match.id);
     let result = rule.step_block(&block, &movable);
+    if let Some(diag) = &mut diag {
+        diag.record_block(rule.diag_name(), Some(rule_match.material), result == block);
+    }
 
     debug_assert!(
         (0..8).all(|i| movable[i] || result[i] == block[i]),
@@ -2038,6 +2090,7 @@ fn apply_block_in_grid_with_schedule_pure(
     generation: u64,
     block_rule_divisors: &[u16],
     materials: &crate::terrain::materials::MaterialRegistry,
+    mut diag: Option<&mut HashlifeRuleMissDiag>,
 ) {
     let mut block = [Cell::EMPTY; 8];
     for dz in 0..2 {
@@ -2053,13 +2106,13 @@ fn apply_block_in_grid_with_schedule_pure(
         return;
     }
 
-    let rule_id = match unique_block_rule_pure(materials, &block) {
-        Some(id) => id,
+    let rule_match = match unique_block_rule_pure(materials, &block) {
+        Some(rule_match) => rule_match,
         None => return,
     };
 
     let divisor = block_rule_divisors
-        .get(rule_id.0)
+        .get(rule_match.id.0)
         .copied()
         .unwrap_or(1)
         .max(1) as u64;
@@ -2076,8 +2129,11 @@ fn apply_block_in_grid_with_schedule_pure(
         c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
     });
 
-    let rule = materials.block_rule(rule_id);
+    let rule = materials.block_rule(rule_match.id);
     let result = rule.step_block(&block, &movable);
+    if let Some(diag) = &mut diag {
+        diag.record_block(rule.diag_name(), Some(rule_match.material), result == block);
+    }
 
     debug_assert!(
         (0..8).all(|i| movable[i] || result[i] == block[i]),
@@ -2097,21 +2153,34 @@ fn apply_block_in_grid_with_schedule_pure(
     }
 }
 
+#[derive(Clone, Copy)]
+struct BlockRuleMatch {
+    id: crate::terrain::materials::BlockRuleId,
+    material: u16,
+}
+
 fn unique_block_rule_pure(
     materials: &crate::terrain::materials::MaterialRegistry,
     block: &[Cell; 8],
-) -> Option<crate::terrain::materials::BlockRuleId> {
+) -> Option<BlockRuleMatch> {
     let mut found: Option<crate::terrain::materials::BlockRuleId> = None;
+    let mut material = None;
     for cell in block {
         if let Some(id) = materials.block_rule_id_for_cell(*cell) {
             match found {
-                None => found = Some(id),
+                None => {
+                    found = Some(id);
+                    material = Some(cell.material());
+                }
                 Some(existing) if existing == id => {}
                 Some(_) => return None,
             }
         }
     }
-    found
+    found.map(|id| BlockRuleMatch {
+        id,
+        material: material.expect("found BlockRuleId without source material"),
+    })
 }
 
 #[cfg(test)]
@@ -2120,7 +2189,7 @@ mod tests {
     use crate::sim::rule::ALIVE;
     use crate::sim::{BaseCaseStrategy, GameOfLife3D, WorldCoord};
     use crate::terrain::materials::{
-        DIRT, DIRT_MATERIAL_ID, SAND_MATERIAL_ID, STONE, WATER_MATERIAL_ID,
+        CLONE, DIRT, DIRT_MATERIAL_ID, SAND, SAND_MATERIAL_ID, STONE, WATER, WATER_MATERIAL_ID,
     };
 
     fn wc(coord: u64) -> WorldCoord {
@@ -3825,6 +3894,136 @@ mod tests {
 
         // Reset the gate so any later (parallel) test sees the
         // production default.
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_obeys_gate_for_base_case() {
+        let materials = crate::terrain::materials::MaterialRegistry::terrain_defaults();
+        let grid = [CLONE; LEVEL3_CELL_COUNT];
+
+        force_memo_diag_for_test(false);
+        let (_, _, _, off_diag) = step_grid_once_pure(&grid, 0, &materials);
+        assert!(
+            off_diag.is_empty(),
+            "diag must stay zero when HASH_THING_MEMO_DIAG gate is off: {off_diag:?}"
+        );
+
+        force_memo_diag_for_test(true);
+        let (_, _, _, on_diag) = step_grid_once_pure(&grid, 0, &materials);
+        let ca_total = on_diag.ca_noop_rule + on_diag.ca_game_of_life_3d + on_diag.ca_other_rule;
+        assert_eq!(ca_total, on_diag.ca_noop_rule);
+        assert_eq!(on_diag.ca_noop_rule, on_diag.ca_unchanged);
+        assert_eq!(
+            on_diag.block_gravity_rule
+                + on_diag.block_fluid_water_rule
+                + on_diag.block_fluid_lava_rule
+                + on_diag.block_fluid_acid_rule
+                + on_diag.block_fluid_oil_rule
+                + on_diag.block_identity_rule
+                + on_diag.block_other_rule,
+            0
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_counts_mixed_block_rules() {
+        let materials = crate::terrain::materials::MaterialRegistry::terrain_defaults();
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+
+        for z in 2..4 {
+            for y in 2..4 {
+                for x in 2..4 {
+                    grid[x + y * LEVEL3_SIDE + z * LEVEL3_SIDE * LEVEL3_SIDE] = SAND;
+                }
+            }
+        }
+        for z in 4..6 {
+            for y in 4..6 {
+                for x in 4..6 {
+                    grid[x + y * LEVEL3_SIDE + z * LEVEL3_SIDE * LEVEL3_SIDE] = WATER;
+                }
+            }
+        }
+
+        force_memo_diag_for_test(true);
+        let (_, _, _, diag) = step_grid_once_pure(&grid, 0, &materials);
+
+        assert!(
+            diag.block_gravity_rule > 0,
+            "sand block should attribute at least one GravityBlockRule miss: {diag:?}"
+        );
+        assert!(
+            diag.block_fluid_water_rule > 0,
+            "water block should attribute at least one FluidBlockRule miss: {diag:?}"
+        );
+        assert!(
+            diag.ca_fan_driven_rule > 0 && diag.ca_other_rule > 0,
+            "sand+water scene should include both fan-driven and other CaRule attribution: {diag:?}"
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_accumulates_through_base_case_stats() {
+        force_memo_diag_for_test(true);
+        let mut world = World::new(3);
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        for z in 4..6 {
+            for y in 4..6 {
+                for x in 4..6 {
+                    grid[x + y * LEVEL3_SIDE + z * LEVEL3_SIDE * LEVEL3_SIDE] = WATER;
+                }
+            }
+        }
+
+        let node = world.store.from_flat(&grid, LEVEL3_SIDE);
+        world.step_base_case(node, 0);
+        let diag = world.hashlife_stats.rule_miss_diag;
+        assert!(
+            diag.block_fluid_water_rule > 0,
+            "base-case miss should accumulate water FluidBlockRule attribution into HashlifeStats: {diag:?}"
+        );
+        assert!(
+            world.hashlife_stats_total.rule_miss_diag.is_empty(),
+            "direct base-case helper should update per-step stats only until step_recursive accumulates"
+        );
+
+        world.hashlife_stats_total.accumulate(&world.hashlife_stats);
+        assert!(
+            world
+                .hashlife_rule_miss_summary()
+                .contains("block_fluid_water="),
+            "debug summary should expose specific fluid buckets"
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_uses_rule_cell_material_for_fluid_bucket() {
+        let materials = crate::terrain::materials::MaterialRegistry::terrain_defaults();
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        let bx = 2;
+        let by = 2;
+        let bz = 2;
+        grid[bx + by * LEVEL3_SIDE + bz * LEVEL3_SIDE * LEVEL3_SIDE] = STONE;
+        grid[(bx + 1) + by * LEVEL3_SIDE + bz * LEVEL3_SIDE * LEVEL3_SIDE] = WATER;
+
+        force_memo_diag_for_test(true);
+        let (_, _, _, diag) = step_grid_once_pure(&grid, 0, &materials);
+        assert_eq!(
+            diag.block_fluid_water_rule, 1,
+            "water rule cell should drive the fluid bucket even when stone is first in octant order: {diag:?}"
+        );
+        assert_eq!(
+            diag.block_other_rule, 0,
+            "stone-adjacent water block should not fall into block_other: {diag:?}"
+        );
+
         force_memo_diag_for_test(false);
     }
 

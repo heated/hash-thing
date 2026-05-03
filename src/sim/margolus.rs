@@ -17,6 +17,10 @@ impl BlockRule for IdentityBlockRule {
         *block
     }
 
+    fn diag_name(&self) -> &'static str {
+        "IdentityBlockRule"
+    }
+
     fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(IdentityBlockRule)
     }
@@ -39,6 +43,10 @@ impl ConveyorBlockRule {
 }
 
 impl BlockRule for ConveyorBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "ConveyorBlockRule"
+    }
+
     fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8] {
         let mut out = *block;
         for dy in 0..2 {
@@ -95,6 +103,10 @@ impl FluidBlockRule {
 }
 
 impl BlockRule for FluidBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "FluidBlockRule"
+    }
+
     fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(FluidBlockRule {
             density_fn: self.density_fn,
@@ -259,6 +271,10 @@ impl GravityBlockRule {
 }
 
 impl BlockRule for GravityBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "GravityBlockRule"
+    }
+
     fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(GravityBlockRule {
             density_fn: self.density_fn,

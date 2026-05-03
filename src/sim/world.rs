@@ -535,6 +535,85 @@ pub struct HashlifeStats {
     /// path; can record a higher-level frontier size when the hard cap
     /// trips before leaf descent.
     pub bfs_max_batch_len: u64,
+    /// hash-thing-q7e6: env-gated attribution for leaf base-case memo
+    /// misses. Populated only when `HASH_THING_MEMO_DIAG=1`; otherwise all
+    /// counters stay zero so production steps avoid per-rule bookkeeping.
+    pub rule_miss_diag: HashlifeRuleMissDiag,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HashlifeRuleMissDiag {
+    pub ca_noop_rule: u64,
+    pub ca_game_of_life_3d: u64,
+    pub ca_fan_driven_rule: u64,
+    pub ca_other_rule: u64,
+    pub ca_unchanged: u64,
+    pub block_gravity_rule: u64,
+    pub block_fluid_water_rule: u64,
+    pub block_fluid_lava_rule: u64,
+    pub block_fluid_acid_rule: u64,
+    pub block_fluid_oil_rule: u64,
+    pub block_identity_rule: u64,
+    pub block_other_rule: u64,
+    pub block_unchanged: u64,
+}
+
+impl HashlifeRuleMissDiag {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn record_ca(&mut self, rule_name: &str, unchanged: bool) {
+        match rule_name {
+            "NoopRule" => self.ca_noop_rule += 1,
+            "GameOfLife3D" => self.ca_game_of_life_3d += 1,
+            "FanDrivenRule" => self.ca_fan_driven_rule += 1,
+            _ => self.ca_other_rule += 1,
+        }
+        if unchanged {
+            self.ca_unchanged += 1;
+        }
+    }
+
+    pub fn record_block(&mut self, rule_name: &str, material: Option<u16>, unchanged: bool) {
+        match rule_name {
+            "GravityBlockRule" => self.block_gravity_rule += 1,
+            "FluidBlockRule" => match material {
+                Some(crate::terrain::materials::WATER_MATERIAL_ID) => {
+                    self.block_fluid_water_rule += 1
+                }
+                Some(crate::terrain::materials::LAVA_MATERIAL_ID) => {
+                    self.block_fluid_lava_rule += 1
+                }
+                Some(crate::terrain::materials::ACID_MATERIAL_ID) => {
+                    self.block_fluid_acid_rule += 1
+                }
+                Some(crate::terrain::materials::OIL_MATERIAL_ID) => self.block_fluid_oil_rule += 1,
+                _ => self.block_other_rule += 1,
+            },
+            "IdentityBlockRule" => self.block_identity_rule += 1,
+            _ => self.block_other_rule += 1,
+        }
+        if unchanged {
+            self.block_unchanged += 1;
+        }
+    }
+
+    pub fn accumulate(&mut self, step: &Self) {
+        self.ca_noop_rule += step.ca_noop_rule;
+        self.ca_game_of_life_3d += step.ca_game_of_life_3d;
+        self.ca_fan_driven_rule += step.ca_fan_driven_rule;
+        self.ca_other_rule += step.ca_other_rule;
+        self.ca_unchanged += step.ca_unchanged;
+        self.block_gravity_rule += step.block_gravity_rule;
+        self.block_fluid_water_rule += step.block_fluid_water_rule;
+        self.block_fluid_lava_rule += step.block_fluid_lava_rule;
+        self.block_fluid_acid_rule += step.block_fluid_acid_rule;
+        self.block_fluid_oil_rule += step.block_fluid_oil_rule;
+        self.block_identity_rule += step.block_identity_rule;
+        self.block_other_rule += step.block_other_rule;
+        self.block_unchanged += step.block_unchanged;
+    }
 }
 
 /// Work-elision summary for the most recent Hashlife step.
@@ -574,6 +653,7 @@ impl HashlifeStats {
         self.cache_misses_phase_aliased += step.cache_misses_phase_aliased;
         self.compact_entries_dropped += step.compact_entries_dropped;
         self.compact_entries_kept += step.compact_entries_kept;
+        self.rule_miss_diag.accumulate(&step.rule_miss_diag);
         // hash-thing-ecmn: BFS observability counters.
         self.bfs_level3_unique_misses += step.bfs_level3_unique_misses;
         self.bfs_batches_parallel += step.bfs_batches_parallel;
@@ -2787,6 +2867,26 @@ impl World {
             bfs_par,
             bfs_serial_fb,
             bfs_max,
+        )
+    }
+
+    pub fn hashlife_rule_miss_summary(&self) -> String {
+        let d = self.hashlife_stats_total.rule_miss_diag;
+        format!(
+            "ca_noop={} ca_gol={} ca_fan={} ca_other={} ca_unchanged={} block_gravity={} block_fluid_water={} block_fluid_lava={} block_fluid_acid={} block_fluid_oil={} block_identity={} block_other={} block_unchanged={}",
+            d.ca_noop_rule,
+            d.ca_game_of_life_3d,
+            d.ca_fan_driven_rule,
+            d.ca_other_rule,
+            d.ca_unchanged,
+            d.block_gravity_rule,
+            d.block_fluid_water_rule,
+            d.block_fluid_lava_rule,
+            d.block_fluid_acid_rule,
+            d.block_fluid_oil_rule,
+            d.block_identity_rule,
+            d.block_other_rule,
+            d.block_unchanged,
         )
     }
 
