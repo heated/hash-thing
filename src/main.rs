@@ -79,6 +79,7 @@ const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 const WORLD_PREFETCH_MARGIN_METERS: f64 = 64.0;
 const DEFAULT_CLI_VOLUME_SIZE: u32 = 256;
+const DEFAULT_DEMO_PERF_TRAIL_PATH: &str = ".ship-notes/demo-perf-trail.jsonl";
 const SOUP_PROSPECTOR_TILE: i64 = 16;
 const SOUP_PROSPECTOR_SIDE: i64 = 8;
 const SOUP_PROSPECTOR_DENSITY_PER_1000: u64 = 45;
@@ -103,6 +104,216 @@ fn record_gpu_timing_sample(
     perf.record(duration_metric, sample.duration);
     if let Some(lag) = sample.lag_frames {
         perf.record_scalar(lag_metric, lag as f64);
+    }
+}
+
+#[derive(Debug)]
+struct DemoPerfTrail {
+    path: Option<std::path::PathBuf>,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl DemoPerfTrail {
+    fn from_env() -> Self {
+        let enabled = std::env::var("HASH_THING_DEMO_PERF_TRAIL")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+        if !enabled {
+            return Self {
+                path: None,
+                writer: None,
+            };
+        }
+        let path = std::env::var_os("HASH_THING_DEMO_PERF_TRAIL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_DEMO_PERF_TRAIL_PATH));
+        Self {
+            path: Some(path),
+            writer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn enabled_at(path: std::path::PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            writer: None,
+        }
+    }
+
+    fn append(&mut self, record: &serde_json::Value) {
+        if self.writer.is_none() && !self.open_writer() {
+            return;
+        };
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        let line = match serde_json::to_string(record) {
+            Ok(line) => line,
+            Err(err) => {
+                log::warn!("demo perf trail disabled: could not serialize record: {err}");
+                self.disable();
+                return;
+            }
+        };
+        use std::io::Write;
+        if let Err(err) = writeln!(writer, "{line}") {
+            log::warn!("demo perf trail disabled: could not write record: {err}");
+            self.disable();
+        } else if let Err(err) = writer.flush() {
+            log::warn!("demo perf trail disabled: could not flush record: {err}");
+            self.disable();
+        }
+    }
+
+    fn open_writer(&mut self) -> bool {
+        let Some(path) = self.path.as_ref() else {
+            return false;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                log::warn!(
+                    "demo perf trail disabled: could not create {}: {err}",
+                    parent.display()
+                );
+                self.disable();
+                return false;
+            }
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => {
+                self.writer = Some(std::io::BufWriter::new(file));
+                true
+            }
+            Err(err) => {
+                log::warn!(
+                    "demo perf trail disabled: could not open {}: {err}",
+                    path.display()
+                );
+                self.disable();
+                false
+            }
+        }
+    }
+
+    fn disable(&mut self) {
+        self.path = None;
+        self.writer = None;
+    }
+}
+
+fn summary_token<'a>(summary: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    summary
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+}
+
+fn parse_summary_f64(summary: &str, name: &str) -> Option<f64> {
+    let raw = summary_token(summary, name)?;
+    let end = raw
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+'))
+        .last()
+        .map(|(idx, ch)| idx + ch.len_utf8())?;
+    raw[..end].parse().ok()
+}
+
+fn parse_duration_pair_ms(summary: &str, name: &str) -> Option<(f64, f64)> {
+    let raw = summary_token(summary, name)?.strip_suffix("ms")?;
+    let (mean, p95) = raw.split_once('/')?;
+    Some((mean.parse().ok()?, p95.parse().ok()?))
+}
+
+fn demo_world_coord(volume_size: u32) -> &'static str {
+    match volume_size {
+        16 | 32 => "tiny",
+        64 => "small",
+        128 => "medium",
+        256 => "demo",
+        1024 => "large",
+        4096 => "huge",
+        _ => "pathological",
+    }
+}
+
+fn classify_demo_intensity(memo_summary: &str, sim_active: bool) -> &'static str {
+    if !sim_active {
+        return "idle";
+    }
+    let bfs_l3 = parse_summary_f64(memo_summary, "bfs_l3").unwrap_or(0.0);
+    if bfs_l3 >= 5_000.0 {
+        "cascade"
+    } else if bfs_l3 >= 100.0 {
+        "microchurn"
+    } else {
+        "passive-active"
+    }
+}
+
+fn classify_demo_regime(memo_summary: &str) -> &'static str {
+    let memo_tbl = parse_summary_f64(memo_summary, "memo_tbl").unwrap_or(0.0);
+    let memo_hit = parse_summary_f64(memo_summary, "memo_hit").unwrap_or(0.0);
+    let memo_churn = parse_summary_f64(memo_summary, "memo_churn").unwrap_or(0.0);
+    if memo_tbl == 0.0 {
+        "cold"
+    } else if memo_hit < 0.25 {
+        "warming"
+    } else if memo_churn.abs() >= 0.05 {
+        "churning"
+    } else if memo_hit >= 0.65 {
+        "saturated"
+    } else {
+        "warming"
+    }
+}
+
+fn git_commit_short() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn unix_epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn insert_duration_metrics(
+    metrics: &mut serde_json::Map<String, serde_json::Value>,
+    summary: &str,
+    name: &str,
+    mean_key: &str,
+    p95_key: &str,
+) {
+    if let Some((mean, p95)) = parse_duration_pair_ms(summary, name) {
+        metrics.insert(mean_key.to_string(), serde_json::json!(mean));
+        metrics.insert(p95_key.to_string(), serde_json::json!(p95));
+    }
+}
+
+fn insert_summary_metric(
+    metrics: &mut serde_json::Map<String, serde_json::Value>,
+    summary: &str,
+    source_key: &str,
+    output_key: &str,
+) {
+    if let Some(value) = parse_summary_f64(summary, source_key) {
+        metrics.insert(output_key.to_string(), serde_json::json!(value));
     }
 }
 
@@ -784,6 +995,8 @@ struct App {
     /// The player entity, if spawned.
     player_id: Option<sim::EntityId>,
     perf: perf::Perf,
+    demo_perf_trail: DemoPerfTrail,
+    git_commit: String,
     /// Memory-watchdog metric family — node-count + step-cache ratcheting
     /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
     /// on the wall-clock log path.
@@ -1709,6 +1922,8 @@ impl App {
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
+            demo_perf_trail: DemoPerfTrail::from_env(),
+            git_commit: git_commit_short(),
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
@@ -2867,6 +3082,129 @@ impl App {
         self.mem_stats.reset_peaks();
         self.smoothed_fps = 0.0;
         self.mark_resume_edge();
+    }
+
+    fn demo_scene_coord(&self) -> &'static str {
+        if self.soup_prospector.is_some() {
+            "soup-search"
+        } else if self.quarantine_atlas.is_some() {
+            "quarantine-atlas"
+        } else if self.current_demo_beat.is_some() {
+            "lattice"
+        } else if self.gol_smoke_scene {
+            "random-mix"
+        } else {
+            "default-demo"
+        }
+    }
+
+    fn emit_demo_perf_trail(
+        &mut self,
+        stepping: bool,
+        generation: Option<u64>,
+        population: Option<u64>,
+        mem_summary: Option<String>,
+        svdag_stats: Option<(usize, usize, u32)>,
+    ) {
+        let perf_summary = self.perf.summary();
+        let memo_summary = self.last_memo_summary.clone();
+        let sim_active = !self.paused && !self.freeze_sim;
+        let intensity = classify_demo_intensity(&memo_summary, sim_active);
+        let regime = classify_demo_regime(&memo_summary);
+        let sample_count = [
+            "frame_total",
+            "step",
+            "step_recursive",
+            "render_cpu",
+            "render_gpu",
+            "upload_cpu",
+        ]
+        .iter()
+        .filter_map(|name| self.perf.stats(name).map(|(_, _, count)| count))
+        .max()
+        .unwrap_or(0);
+        let mut metrics = serde_json::Map::new();
+        insert_duration_metrics(
+            &mut metrics,
+            &perf_summary,
+            "step",
+            "step_mean_ms",
+            "step_p95_ms",
+        );
+        insert_duration_metrics(
+            &mut metrics,
+            &perf_summary,
+            "frame_total",
+            "frame_total_mean_ms",
+            "frame_total_p95_ms",
+        );
+        insert_duration_metrics(
+            &mut metrics,
+            &perf_summary,
+            "step_recursive",
+            "step_recursive_mean_ms",
+            "step_recursive_p95_ms",
+        );
+        insert_summary_metric(&mut metrics, &memo_summary, "memo_hit", "memo_hit_ratio");
+        insert_summary_metric(
+            &mut metrics,
+            &memo_summary,
+            "memo_churn",
+            "memo_churn_ratio",
+        );
+        insert_summary_metric(
+            &mut metrics,
+            &memo_summary,
+            "memo_elision",
+            "work_elision_factor_x",
+        );
+        insert_summary_metric(
+            &mut metrics,
+            &memo_summary,
+            "memo_tbl",
+            "memo_table_entries",
+        );
+        insert_summary_metric(&mut metrics, &memo_summary, "bfs_l3", "bfs_l3");
+        let record = serde_json::json!({
+            "schema_version": 2,
+            "record_kind": "demo_perf_snapshot",
+            "coordinate_source": "heuristic",
+            "timestamp_ms": unix_epoch_millis(),
+            "world": demo_world_coord(self.volume_size),
+            "scene": self.demo_scene_coord(),
+            "intensity": intensity,
+            "regime": regime,
+            "rule_set": "default-ca",
+            "backend": "hashlife-recursive",
+            "hardware": std::env::var("HASH_THING_HARDWARE").unwrap_or_else(|_| "unknown".to_string()),
+            "scenario_hash": "unknown",
+            "confidence": {
+                "n": sample_count,
+                "warm_frame_policy": "rolling-64-sample-rings",
+                "source": "demo",
+                "cherry_pick_audit": "mixed",
+                "notes": "hash-thing-x7dl heuristic demo trail; raw summaries are included for reclassification"
+            },
+            "level": self.volume_size.trailing_zeros(),
+            "side": self.volume_size,
+            "git_commit": self.git_commit,
+            "generation": generation,
+            "population": population,
+            "stepping": stepping,
+            "sim_active": sim_active,
+            "paused": self.paused,
+            "metrics": metrics,
+            "svdag": svdag_stats.map(|(nodes, bytes, root_level)| serde_json::json!({
+                "nodes": nodes,
+                "bytes": bytes,
+                "root_level": root_level
+            })),
+            "mem_summary": mem_summary,
+            "perf_summary": perf_summary,
+            "memo_summary": memo_summary,
+            "lod_summary": self.lod_summary()
+        });
+        self.demo_perf_trail.append(&record);
     }
 
     /// Get the player's eye position and look direction.
@@ -5052,10 +5390,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.perf.summary(),
                             self.last_memo_summary,
                         );
+                        self.emit_demo_perf_trail(true, None, None, None, None);
                     } else {
                         let nodes = self.world.store.stats();
                         self.mem_stats.update(nodes);
                         let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
+                        let mem_summary = self.mem_stats.summary();
                         log::info!(
                             "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {} | {} | {}",
                             self.world.generation,
@@ -5063,10 +5403,17 @@ impl ApplicationHandler<AppUserEvent> for App {
                             svdag_nodes,
                             svdag_bytes / 1024,
                             svdag_root_level,
-                            self.mem_stats.summary(),
+                            mem_summary,
                             self.perf.summary(),
                             self.last_memo_summary,
                             self.lod_summary(),
+                        );
+                        self.emit_demo_perf_trail(
+                            false,
+                            Some(self.world.generation),
+                            Some(self.world.population()),
+                            Some(mem_summary),
+                            Some((svdag_nodes, svdag_bytes, svdag_root_level)),
                         );
                     }
                     self.log_timer = std::time::Instant::now();
@@ -6090,6 +6437,87 @@ mod tests {
             },
         );
         assert_eq!(perf.summary(), "render_pass_gpu=4.00/4.00ms");
+    }
+
+    #[test]
+    fn demo_perf_classifies_churning_cascade_from_memo_summary() {
+        let summary =
+            "memo_hit=0.550 memo_churn=-0.087 memo_elision=5.6x memo_tbl=765000 bfs_l3=5842";
+        assert_eq!(classify_demo_intensity(summary, true), "cascade");
+        assert_eq!(classify_demo_regime(summary), "churning");
+    }
+
+    #[test]
+    fn demo_perf_classifies_saturated_microchurn_from_memo_summary() {
+        let summary =
+            "memo_hit=0.719 memo_churn=+0.000 memo_elision=22.0x memo_tbl=588000 bfs_l3=1492";
+        assert_eq!(classify_demo_intensity(summary, true), "microchurn");
+        assert_eq!(classify_demo_regime(summary), "saturated");
+    }
+
+    #[test]
+    fn demo_perf_parses_duration_pairs_and_numeric_suffixes() {
+        let perf_summary = "frame_total=21.10/44.90ms step=36.50/67.60ms";
+        assert_eq!(
+            parse_duration_pair_ms(perf_summary, "step"),
+            Some((36.50, 67.60))
+        );
+        let memo_summary = "memo_elision=79.1x memo_churn=+0.012 bfs_l3=42";
+        assert_eq!(parse_summary_f64(memo_summary, "memo_elision"), Some(79.1));
+        assert_eq!(parse_summary_f64(memo_summary, "memo_churn"), Some(0.012));
+        assert_eq!(parse_summary_f64(memo_summary, "bfs_l3"), Some(42.0));
+    }
+
+    #[test]
+    fn demo_perf_trail_appends_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-demo-perf-trail-{}-{}.jsonl",
+            std::process::id(),
+            unix_epoch_millis()
+        ));
+        let mut trail = DemoPerfTrail::enabled_at(path.clone());
+        trail.append(&serde_json::json!({
+            "schema_version": 2,
+            "record_kind": "demo_perf_snapshot",
+            "world": "demo"
+        }));
+        let body = std::fs::read_to_string(&path).expect("trail should be written");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim()).expect("trail line should be json");
+        assert_eq!(line["record_kind"], "demo_perf_snapshot");
+        assert_eq!(line["world"], "demo");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn demo_perf_emit_keeps_active_frame_non_idle_and_missing_metrics_absent() {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-demo-perf-emit-{}-{}.jsonl",
+            std::process::id(),
+            unix_epoch_millis()
+        ));
+        let mut app = App::new(256);
+        app.demo_perf_trail = DemoPerfTrail::enabled_at(path.clone());
+        app.git_commit = "test-commit".to_string();
+        app.paused = false;
+        app.freeze_sim = false;
+        app.last_memo_summary =
+            "memo_hit=0.719 memo_churn=+0.000 memo_elision=22.0x memo_tbl=588000 bfs_l3=1492"
+                .to_string();
+        app.perf
+            .record("frame_total", std::time::Duration::from_millis(20));
+        app.emit_demo_perf_trail(false, Some(7), Some(42), None, None);
+
+        let body = std::fs::read_to_string(&path).expect("trail should be written");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim()).expect("trail line should be json");
+        assert_eq!(line["intensity"], "microchurn");
+        assert_eq!(line["sim_active"], true);
+        assert_eq!(line["confidence"]["n"], 1);
+        assert_eq!(line["metrics"]["frame_total_mean_ms"], 20.0);
+        assert!(line["metrics"].get("step_recursive_mean_ms").is_none());
+        assert_eq!(line["git_commit"], "test-commit");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

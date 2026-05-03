@@ -172,6 +172,14 @@ without naming which sub-claim feels uncomfortably loose now.
 
 ## Concrete next steps if we adopt this
 
+0. **Demo perf trail** — the demo binary appends heuristic snapshots to
+   `.ship-notes/demo-perf-trail.jsonl` every wall-clock perf-log tick
+   (`hash-thing-x7dl`). These records are `source=demo` and keep raw
+   `perf_summary` / `memo_summary` strings so later tooling can reclassify
+   rough `intensity` and `regime` guesses. Set
+   `HASH_THING_DEMO_PERF_TRAIL=0` to disable, or
+   `HASH_THING_DEMO_PERF_TRAIL_PATH=/path/to/file.jsonl` to redirect.
+
 1. **`bench_perf_landscape`** — one bench that runs every named regime once
    and emits a single table. Replaces ad-hoc per-bench claims with a single
    source-of-truth output. Land in `tests/bench_perf_landscape.rs`. Each
