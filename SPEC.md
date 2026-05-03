@@ -247,7 +247,7 @@ These are the operational specifications. If one of these ever disagrees with th
 
 **Progression:** Metroidvania-as-tutorial. Confined start, each unlock opens a new zone with the next unlock. No tutorial text — learn by doing. Hotbar fills as player progresses.
 
-**Demo target materials:** Sand (gravity/collapse), water (flow/fill), airborne particles (rain/gas), explosions/fireworks. Static materials (stone/dirt) as structural backdrop. Full Powder Game set: clone, fan, firework, lava, ice, acid, oil, gunpowder, steam, gas, metal, vine.
+**Demo target materials:** Sand (gravity/collapse), water (flow/fill), airborne particles (rain/gas), explosions/fireworks. Static materials (stone/dirt) as structural backdrop. Full Powder Game set: clone, fan, firework, lava, ice, acid, oil, gunpowder, steam, gas, metal, vine. Default-demo particle billboards are intentional entity effects: orange/red sparks are volcano fire/lava particles, blue sparks are geyser water particles; whirlpool water particles appear in the terrain demo scene.
 
 **Demo world:** Lattice (repeating geometric megastructures). Confined start → corridor with hints → lattice interiors → panoramic reveal. Scale is withheld until the final vantage point. Follow-up worlds: Inverted Mountains, then World Tree or Organic Towers.
 

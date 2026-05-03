@@ -3115,6 +3115,7 @@ impl App {
                         "  [/] U/I/O  DEV jumps (Tab for orbit)",
                         "  0  Recenter",
                         "  H  Heatmap    +/-  Resolution",
+                        "  Sparks      Volcano/geyser particles",
                         "  F5 Pause      F1  Signal legend",
                         "  C  Clear perf",
                         "  Esc Exit",
@@ -3142,6 +3143,7 @@ impl App {
                 "  V  Panorama reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
+                "  Sparks      Volcano/geyser particles",
                 "  F5 Pause      F1  Signal legend",
                 "  C  Clear perf",
                 "  Esc Exit",
@@ -8243,6 +8245,9 @@ mod tests {
         // a9jd: V is user-facing in every camera mode now (not a DEV jump).
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Volcano/geyser particles")));
     }
 
     #[test]
@@ -8256,6 +8261,9 @@ mod tests {
         // is the user-facing panorama reveal — not a DEV-only key.
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Volcano/geyser particles")));
     }
 
     #[test]
