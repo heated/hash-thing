@@ -3394,6 +3394,95 @@ mod tests {
                     "recursive non-air material counts: {:?}",
                     material_counts(&recur_mid)
                 );
+                if let Some((fx, fy, fz, _, _)) = first {
+                    let wx = (fx / 8) * 8;
+                    let wy = (fy / 8) * 8;
+                    let wz = (fz / 8) * 8;
+                    eprintln!("first divergent 8³ window origin: (x={wx}, y={wy}, z={wz})");
+                    let dump_window = |label: &str, grid: &[CellState]| {
+                        eprintln!("{label}:");
+                        for y in wy..(wy + 8).min(side) {
+                            eprintln!("  y={y}");
+                            for z in wz..(wz + 8).min(side) {
+                                let mut row = String::new();
+                                for x in wx..(wx + 8).min(side) {
+                                    let m = Cell::from_raw(grid[idx(x, y, z)]).material();
+                                    row.push_str(&format!(" {m:>2}"));
+                                }
+                                eprintln!("    z={z}:{row}");
+                            }
+                        }
+                    };
+                    dump_window("pre-step", &pre);
+                    dump_window("brute post-step", &brute_post);
+                    dump_window("recursive post-margolus", &recur_mid);
+
+                    for local_level in [4u32, 5u32] {
+                        let local_side = 1usize << local_level;
+                        let ox = fx.saturating_sub(local_side / 2);
+                        let oy = fy.saturating_sub(local_side / 2);
+                        let oz = fz.saturating_sub(local_side / 2);
+                        if ox + local_side > side
+                            || oy + local_side > side
+                            || oz + local_side > side
+                        {
+                            continue;
+                        }
+                        let mut local_brute = World::new(local_level);
+                        let mut local_recur = World::new(local_level);
+                        local_brute.generation = gen as u64;
+                        local_recur.generation = gen as u64;
+                        for z in 0..local_side {
+                            for y in 0..local_side {
+                                for x in 0..local_side {
+                                    let raw = pre[idx(ox + x, oy + y, oz + z)];
+                                    if raw != 0 {
+                                        local_brute.set(
+                                            wc(x as u64),
+                                            wc(y as u64),
+                                            wc(z as u64),
+                                            raw,
+                                        );
+                                        local_recur.set(
+                                            wc(x as u64),
+                                            wc(y as u64),
+                                            wc(z as u64),
+                                            raw,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        local_brute.step();
+                        local_recur.step_margolus_only();
+                        let lb = local_brute.flatten();
+                        let lr = local_recur.flatten();
+                        if lb == lr {
+                            eprintln!(
+                                "copied local level {local_level} window from full origin ({ox},{oy},{oz}) stayed byte-identical"
+                            );
+                        } else {
+                            let mut local_pairs: BTreeMap<(u16, u16), usize> = BTreeMap::new();
+                            let mut local_first = None;
+                            for z in 0..local_side {
+                                for y in 0..local_side {
+                                    for x in 0..local_side {
+                                        let i = x + y * local_side + z * local_side * local_side;
+                                        let b = Cell::from_raw(lb[i]).material();
+                                        let r = Cell::from_raw(lr[i]).material();
+                                        if b != r {
+                                            local_first.get_or_insert((x, y, z, b, r));
+                                            *local_pairs.entry((b, r)).or_insert(0) += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "copied local level {local_level} window from full origin ({ox},{oy},{oz}) drift: first={local_first:?} pairs={local_pairs:?}"
+                            );
+                        }
+                    }
+                }
 
                 recur.finalize_step_after_external_gap_fill();
                 assert_eq!(
