@@ -241,7 +241,7 @@ Units in the name. Mixing units across records breaks downstream tooling.
 | `bfs_max_batch_len` | tasks | Per-generation largest BFS frontier/batch length in `generations[].bfs_max_batch_len`. Equals `bfs_l3_unique_misses` on the normal leaf-batch path; can differ when a higher-level hard-cap fallback trips. |
 | `bfs_max_batch_len_mean` | tasks | Mean largest BFS frontier/batch length over measured frames. |
 | `bfs_max_batch_len_p95` | tasks | 95th-percentile largest BFS frontier/batch length over measured frames. |
-| `miss_cause_table`   | JSON object    | Structured miss-cause attribution table. Until `hash-thing-vqke.1` lands, scenario-runner records use `{status: "todo", dependency: "hash-thing-vqke.1"}`. |
+| `miss_cause_table`   | JSON object    | Structured miss-cause attribution table. With `HASH_THING_MEMO_DIAG=1`, status is `ok` and rows split misses by level into first-seen/no-surviving-key, parity alias, slow-divisor phase alias, residual unknown, and compaction kept/dropped counts. Without the diagnostic gate, scenario-runner records use `{status: "todo", dependency: "hash-thing-vqke.1"}`. |
 | `factory_sinked_total` | items         | Scenario-specific factory harness sink throughput over measured frames; source/sink harness work is outside timed `step_us` / `step_*` latency. |
 | `factory_backpressure_total` | blocked source attempts | Scenario-specific count of source attempts blocked by occupied lane inputs before the CA step; source/sink harness work is outside timed `step_us` / `step_*` latency. |
 | `seed_ms`             | ms            | Wall-time of the seed step.                   |

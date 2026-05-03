@@ -40,7 +40,7 @@
 //! eviction is deliberate so compaction does not retain unbounded cache-only
 //! result subgraphs.
 
-use super::world::{HashlifeRuleMissDiag, World};
+use super::world::{HashlifeRuleMissDiag, MemoMissCauseStats, World};
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
@@ -218,6 +218,10 @@ enum BfsChildSlot {
 }
 
 impl World {
+    pub fn memo_miss_diag_enabled(&self) -> bool {
+        memo_diag_enabled()
+    }
+
     /// Step the world forward one generation using the recursive Hashlife path.
     pub fn step_recursive(&mut self) {
         assert!(
@@ -465,11 +469,12 @@ impl World {
     pub fn compact_keeping(&mut self, extra_roots: &[NodeId]) {
         let mut roots = self.cache_referenced_nodes();
         roots.extend_from_slice(extra_roots);
+        let old_cache_key_levels = memo_diag_enabled().then(|| self.cache_key_level_indices());
         let (new_store, new_root, remap) =
             self.store.compacted_with_remap_keeping(self.root, &roots);
         self.store = new_store;
         self.root = new_root;
-        self.remap_caches(&remap);
+        self.remap_caches(&remap, old_cache_key_levels.as_ref());
         self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
             Some(existing) => super::world::compose_remap(existing, &remap),
             None => remap,
@@ -493,6 +498,21 @@ impl World {
             nodes.push(node);
         }
         nodes
+    }
+
+    fn cache_key_level_indices(&self) -> FxHashMap<NodeId, usize> {
+        let mut levels = FxHashMap::default();
+        for &(node, _) in self.hashlife_cache.keys() {
+            levels.entry(node).or_insert_with(|| {
+                self.store
+                    .get(node)
+                    .level()
+                    .checked_sub(3)
+                    .map(|idx| idx as usize)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        levels
     }
 
     fn has_block_rule_cells(&mut self) -> bool {
@@ -616,7 +636,11 @@ impl World {
     /// `compact_keeping`, key-side drops should be rare because cache keys are
     /// extra roots; value-side drops are expected when the cached result is no
     /// longer live after GC.
-    fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
+    fn remap_caches(
+        &mut self,
+        remap: &FxHashMap<NodeId, NodeId>,
+        old_cache_key_levels: Option<&FxHashMap<NodeId, usize>>,
+    ) {
         // Remap hashlife_cache: (NodeId, schedule_phase) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
         let before = old_cache.len() as u64;
@@ -627,14 +651,48 @@ impl World {
         // change in this loop. Dropped is `before - kept` — exact.
         // Per Codex plan-review §3.
         let mut kept: u64 = 0;
+        let collect_miss_cause = memo_diag_enabled();
+        let mut cause_by_level = [MemoMissCauseStats::default(); 32];
         for ((node, phase), result) in old_cache {
-            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+            let new_node = remap.get(&node).copied();
+            let idx = collect_miss_cause
+                .then(|| {
+                    old_cache_key_levels
+                        .and_then(|levels| levels.get(&node).copied())
+                        .or_else(|| {
+                            new_node.and_then(|new_node| {
+                                self.store
+                                    .get(new_node)
+                                    .level()
+                                    .checked_sub(3)
+                                    .map(|idx| idx as usize)
+                            })
+                        })
+                        .filter(|&idx| idx < cause_by_level.len())
+                })
+                .flatten();
+            if let (Some(new_node), Some(&new_result)) = (new_node, remap.get(&result)) {
                 self.hashlife_cache.insert((new_node, phase), new_result);
                 kept += 1;
+                if let Some(idx) = idx {
+                    cause_by_level[idx].compact_entries_kept += 1;
+                }
+            } else if let Some(idx) = idx {
+                cause_by_level[idx].compact_entries_dropped += 1;
             }
         }
         self.hashlife_stats.compact_entries_kept += kept;
         self.hashlife_stats.compact_entries_dropped += before - kept;
+        if collect_miss_cause {
+            for (dst, src) in self
+                .hashlife_stats
+                .miss_cause_by_level
+                .iter_mut()
+                .zip(cause_by_level.iter())
+            {
+                dst.accumulate(src);
+            }
+        }
 
         // Remap hashlife_macro_cache: (NodeId, generation) → NodeId
         let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
@@ -793,17 +851,7 @@ impl World {
         // higher alias rate, but post-fold is the relevant signal
         // for whether further key-shape changes (vqke.2.2) would
         // recoup more.
-        if memo_diag_enabled() && memo_period > 1 {
-            for p in 0..memo_period {
-                if p == effective_phase {
-                    continue;
-                }
-                if self.hashlife_cache.contains_key(&(node, p)) {
-                    self.hashlife_stats.cache_misses_phase_aliased += 1;
-                    break;
-                }
-            }
-        }
+        self.record_memo_miss_cause(node, level, effective_phase, memo_period);
 
         let result = if self.requires_wide_block_base_case() && level == 4 {
             self.step_wide_block_base_case(node, effective_phase)
@@ -822,6 +870,55 @@ impl World {
             .block_rule_tick_divisors()
             .iter()
             .any(|&divisor| divisor > 1)
+    }
+
+    fn record_memo_miss_cause(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        effective_phase: u64,
+        memo_period: u64,
+    ) {
+        if !memo_diag_enabled() {
+            return;
+        }
+        let Some(idx) = level
+            .checked_sub(3)
+            .map(|idx| idx as usize)
+            .filter(|&idx| idx < self.hashlife_stats.miss_cause_by_level.len())
+        else {
+            return;
+        };
+
+        if memo_period <= 1 {
+            self.hashlife_stats.miss_cause_by_level[idx].first_seen_or_no_surviving_key += 1;
+            return;
+        }
+
+        let mut saw_same_parity_alias = false;
+        let mut saw_other_parity_alias = false;
+        for p in 0..memo_period {
+            if p == effective_phase {
+                continue;
+            }
+            if self.hashlife_cache.contains_key(&(node, p)) {
+                if p % 2 == effective_phase % 2 {
+                    saw_same_parity_alias = true;
+                } else {
+                    saw_other_parity_alias = true;
+                }
+            }
+        }
+
+        if saw_same_parity_alias {
+            self.hashlife_stats.miss_cause_by_level[idx].slow_divisor_phase_aliased += 1;
+            self.hashlife_stats.cache_misses_phase_aliased += 1;
+        } else if saw_other_parity_alias {
+            self.hashlife_stats.miss_cause_by_level[idx].parity_aliased += 1;
+            self.hashlife_stats.cache_misses_phase_aliased += 1;
+        } else {
+            self.hashlife_stats.miss_cause_by_level[idx].first_seen_or_no_surviving_key += 1;
+        }
     }
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
@@ -1180,18 +1277,7 @@ impl World {
             self.hashlife_stats.cache_misses += 1;
             self.hashlife_stats.misses_by_level[(leaf_level - 3) as usize] += 1;
 
-            // hash-thing-bjdl phase-aliasing diag probe (env-gated).
-            if memo_diag_enabled() && memo_period > 1 {
-                for p in 0..memo_period {
-                    if p == effective_phase {
-                        continue;
-                    }
-                    if self.hashlife_cache.contains_key(&(nid, p)) {
-                        self.hashlife_stats.cache_misses_phase_aliased += 1;
-                        break;
-                    }
-                }
-            }
+            self.record_memo_miss_cause(nid, leaf_level, effective_phase, memo_period);
 
             let mut grid = vec![0 as CellState; leaf_cell_count];
             self.store.flatten_buf(nid, &mut grid, leaf_side);
@@ -1318,22 +1404,14 @@ impl World {
         }
     }
 
-    /// hash-thing-ecmn: the env-gated phase-aliasing diagnostic probe
-    /// (mirror of `step_node` lines 728-738). Always-on cost was
-    /// estimated at single-digit ms/step at observed miss volumes, so
-    /// the probe is gated behind `HASH_THING_MEMO_DIAG=1`.
-    fn memo_diag_probe_alias(&mut self, node: NodeId, effective_phase: u64, memo_period: u64) {
-        if memo_diag_enabled() && memo_period > 1 {
-            for p in 0..memo_period {
-                if p == effective_phase {
-                    continue;
-                }
-                if self.hashlife_cache.contains_key(&(node, p)) {
-                    self.hashlife_stats.cache_misses_phase_aliased += 1;
-                    break;
-                }
-            }
-        }
+    fn memo_diag_probe_alias(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        effective_phase: u64,
+        memo_period: u64,
+    ) {
+        self.record_memo_miss_cause(node, level, effective_phase, memo_period);
     }
 
     /// hash-thing-ecmn: build the 27 intermediate nodes + 8 sub-cube
@@ -1464,7 +1542,7 @@ impl World {
         }
         self.hashlife_stats.cache_misses += 1;
         self.hashlife_stats.misses_by_level[(root_level - 3) as usize] += 1;
-        self.memo_diag_probe_alias(root, root_eff, memo_period);
+        self.memo_diag_probe_alias(root, root_level, root_eff, memo_period);
 
         let leaf_level = if self.requires_wide_block_base_case() {
             4
@@ -1552,7 +1630,7 @@ impl World {
                     // Unique miss — count and queue.
                     self.hashlife_stats.cache_misses += 1;
                     self.hashlife_stats.misses_by_level[(lower_level - 3) as usize] += 1;
-                    self.memo_diag_probe_alias(sub_nid, sub_eff, memo_period);
+                    self.memo_diag_probe_alias(sub_nid, lower_level, sub_eff, memo_period);
 
                     let new_idx = tasks[lower_idx].len();
                     tasks[lower_idx].push(BfsTask {
@@ -3882,6 +3960,10 @@ mod tests {
             after_on > before_on,
             "with diag ON the alias precondition must fire the counter (before={before_on} after={after_on})"
         );
+        assert!(
+            world_on.hashlife_stats.miss_cause_by_level[0].parity_aliased > 0,
+            "with diag ON the per-level miss-cause table must classify the alternate-parity alias"
+        );
 
         // Arm B: gate OFF → counter must stay at 0.
         force_memo_diag_for_test(false);
@@ -3891,9 +3973,42 @@ mod tests {
             world_off.hashlife_stats.cache_misses_phase_aliased, 0,
             "with diag OFF the probe must not fire even when the alias precondition is satisfied"
         );
+        assert_eq!(
+            world_off.hashlife_stats.miss_cause_by_level[0].parity_aliased, 0,
+            "with diag OFF the miss-cause table must stay zero"
+        );
 
         // Reset the gate so any later (parallel) test sees the
         // production default.
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn memo_miss_cause_classifies_first_seen_and_slow_phase_alias() {
+        let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+        for x in 2..6 {
+            for y in 2..6 {
+                for z in 2..6 {
+                    world.set(wc(x), wc(y), wc(z), ALIVE.into());
+                }
+            }
+        }
+        let node = world.root;
+
+        force_memo_diag_for_test(true);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+        assert_eq!(
+            world.hashlife_stats.miss_cause_by_level[0].first_seen_or_no_surviving_key,
+            1
+        );
+
+        world.hashlife_cache.insert((node, 0), node);
+        world.record_memo_miss_cause(node, 3, 2, 4);
+        assert_eq!(
+            world.hashlife_stats.miss_cause_by_level[0].slow_divisor_phase_aliased, 1,
+            "same-parity alternate phase should classify as slow-divisor phase alias"
+        );
+
         force_memo_diag_for_test(false);
     }
 
@@ -4034,9 +4149,9 @@ mod tests {
     #[test]
     fn remap_caches_counts_kept_and_dropped() {
         let mut world = World::new(4);
-        let n1 = world.store.empty(2);
-        let n2 = world.store.empty(3);
-        let n3 = world.store.empty(4);
+        let n1 = world.store.empty(3);
+        let n2 = world.store.empty(4);
+        let n3 = world.store.empty(5);
         // Three cache entries: n1→n2, n2→n3, n3→n1. Two survive
         // remap, one drops.
         world.hashlife_cache.insert((n1, 0), n2);
@@ -4050,7 +4165,9 @@ mod tests {
         // touching n3 should be dropped.
 
         world.hashlife_stats = super::super::world::HashlifeStats::default();
-        world.remap_caches(&remap);
+        force_memo_diag_for_test(true);
+        let old_key_levels = world.cache_key_level_indices();
+        world.remap_caches(&remap, Some(&old_key_levels));
 
         // Survivors: only the (n1, 0) → n2 entry (both endpoints in
         // the remap). The (n2, 1) → n3 entry drops on the value side
@@ -4069,6 +4186,24 @@ mod tests {
             3,
             "kept + dropped must equal the pre-remap cache size (3)"
         );
+        let per_level_kept: u64 = world
+            .hashlife_stats
+            .miss_cause_by_level
+            .iter()
+            .map(|cause| cause.compact_entries_kept)
+            .sum();
+        let per_level_dropped: u64 = world
+            .hashlife_stats
+            .miss_cause_by_level
+            .iter()
+            .map(|cause| cause.compact_entries_dropped)
+            .sum();
+        assert_eq!(per_level_kept, world.hashlife_stats.compact_entries_kept);
+        assert_eq!(
+            per_level_dropped,
+            world.hashlife_stats.compact_entries_dropped
+        );
+        force_memo_diag_for_test(false);
     }
 
     /// `remap_caches` on an empty cache must report 0/0 — no
@@ -4080,7 +4215,7 @@ mod tests {
         world.hashlife_stats = super::super::world::HashlifeStats::default();
         // hashlife_cache is empty by default.
         let remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
-        world.remap_caches(&remap);
+        world.remap_caches(&remap, None);
         assert_eq!(world.hashlife_stats.compact_entries_kept, 0);
         assert_eq!(world.hashlife_stats.compact_entries_dropped, 0);
     }

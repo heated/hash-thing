@@ -2448,11 +2448,7 @@ fn run_hashlife(
     apply_work_elision_metrics(&mut metrics, &work_elision);
     metrics.memo_table_entries_final = Some(world.spatial_memo_entries());
     apply_bfs_source_map_metrics(&mut metrics, &bfs_l3_unique_misses, &bfs_max_batch_lens);
-    metrics.miss_cause_table = Some(serde_json::json!({
-        "status": "todo",
-        "dependency": "hash-thing-vqke.1",
-        "note": "miss-cause attribution has not landed; this scenario record carries the dependency placeholder required by hash-thing-vqke.2",
-    }));
+    metrics.miss_cause_table = Some(miss_cause_table(&world, &metrics));
     apply_factory_metrics(&mut metrics, factory, factory_total);
     (records, metrics)
 }
@@ -3019,6 +3015,64 @@ fn mean_and_p95_u64(values: &[u64]) -> Option<(f64, u64)> {
         .saturating_sub(1)
         .min(sorted.len() - 1);
     Some((total as f64 / values.len() as f64, sorted[p95_idx]))
+}
+
+fn miss_cause_table(world: &World, metrics: &MetricsRecord) -> serde_json::Value {
+    let stats = &world.hashlife_stats_total;
+    let compact_total = stats.compact_entries_kept + stats.compact_entries_dropped;
+    let compact_drop_ratio = if compact_total == 0 {
+        0.0
+    } else {
+        stats.compact_entries_dropped as f64 / compact_total as f64
+    };
+    let mut diag_rows = Vec::new();
+    for (idx, cause) in stats.miss_cause_by_level.iter().enumerate() {
+        let level = idx + 3;
+        let misses = stats.misses_by_level[idx];
+        let cause_total = cause.first_seen_or_no_surviving_key
+            + cause.parity_aliased
+            + cause.slow_divisor_phase_aliased
+            + cause.residual_unknown;
+        if misses == 0
+            && cause_total == 0
+            && cause.compact_entries_kept == 0
+            && cause.compact_entries_dropped == 0
+        {
+            continue;
+        }
+        diag_rows.push(serde_json::json!({
+            "level": level,
+            "misses": misses,
+            "first_seen_or_no_surviving_key": cause.first_seen_or_no_surviving_key,
+            "parity_aliased": cause.parity_aliased,
+            "slow_divisor_phase_aliased": cause.slow_divisor_phase_aliased,
+            "residual_unknown": cause.residual_unknown,
+            "compact_entries_kept": cause.compact_entries_kept,
+            "compact_entries_dropped": cause.compact_entries_dropped,
+        }));
+    }
+
+    if !world.memo_miss_diag_enabled() {
+        return serde_json::json!({
+            "status": "todo",
+            "dependency": "hash-thing-vqke.1",
+            "note": "run scenario-runner with HASH_THING_MEMO_DIAG=1 to populate miss-cause attribution; compaction counters may still be zero when no compaction occurred",
+        });
+    }
+
+    serde_json::json!({
+        "status": "ok",
+        "summary": {
+            "memo_hit_ratio": metrics.memo_hit_ratio,
+            "work_elision_p05_x": metrics.work_elision_p05_x,
+            "memo_table_entries_final": metrics.memo_table_entries_final,
+            "bfs_l3_unique_misses_p95": metrics.bfs_l3_unique_misses_p95,
+            "bfs_max_batch_len_p95": metrics.bfs_max_batch_len_p95,
+            "memo_compact_drop_ratio": compact_drop_ratio,
+            "phase_or_parity_alias_misses": stats.cache_misses_phase_aliased,
+        },
+        "levels": diag_rows,
+    })
 }
 
 fn popcount(grid: &[CellState]) -> usize {

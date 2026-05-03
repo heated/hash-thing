@@ -15,9 +15,9 @@ For `backend=HashlifeRecursive`, records also carry memo source-map fields:
 per-generation `memo_table_entries`, `bfs_l3_unique_misses`, and
 `bfs_max_batch_len`, plus metrics `memo_table_entries_final`,
 `bfs_l3_unique_misses_mean`, `bfs_l3_unique_misses_p95`,
-`bfs_max_batch_len_mean`, `bfs_max_batch_len_p95`, and `miss_cause_table`. Until
-`hash-thing-vqke.1` lands, `miss_cause_table` is a structured TODO pointing at
-that dependency.
+`bfs_max_batch_len_mean`, `bfs_max_batch_len_p95`, and `miss_cause_table`.
+Run with `HASH_THING_MEMO_DIAG=1` to populate the miss-cause table; without the
+diagnostic gate it stays a structured TODO.
 
 ## Schema
 

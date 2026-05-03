@@ -509,6 +509,7 @@ pub struct HashlifeStats {
     /// macro / inert / all-inert caches are tangential to the memo_hit
     /// signal). Per-step.
     pub compact_entries_kept: u64,
+    pub miss_cause_by_level: [MemoMissCauseStats; 32],
     /// hash-thing-ecmn (vqke.4.1): unique BFS task count per frontier
     /// level. Index 0 is the active leaf level: level 3 normally, level 4
     /// when slowed block-rule worlds need the wider base-case halo.
@@ -653,6 +654,13 @@ impl HashlifeStats {
         self.cache_misses_phase_aliased += step.cache_misses_phase_aliased;
         self.compact_entries_dropped += step.compact_entries_dropped;
         self.compact_entries_kept += step.compact_entries_kept;
+        for (dst, src) in self
+            .miss_cause_by_level
+            .iter_mut()
+            .zip(step.miss_cause_by_level.iter())
+        {
+            dst.accumulate(src);
+        }
         self.rule_miss_diag.accumulate(&step.rule_miss_diag);
         // hash-thing-ecmn: BFS observability counters.
         self.bfs_level3_unique_misses += step.bfs_level3_unique_misses;
@@ -676,6 +684,27 @@ impl HashlifeStats {
         {
             *dst += *src;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoMissCauseStats {
+    pub first_seen_or_no_surviving_key: u64,
+    pub parity_aliased: u64,
+    pub slow_divisor_phase_aliased: u64,
+    pub residual_unknown: u64,
+    pub compact_entries_kept: u64,
+    pub compact_entries_dropped: u64,
+}
+
+impl MemoMissCauseStats {
+    pub fn accumulate(&mut self, step: &MemoMissCauseStats) {
+        self.first_seen_or_no_surviving_key += step.first_seen_or_no_surviving_key;
+        self.parity_aliased += step.parity_aliased;
+        self.slow_divisor_phase_aliased += step.slow_divisor_phase_aliased;
+        self.residual_unknown += step.residual_unknown;
+        self.compact_entries_kept += step.compact_entries_kept;
+        self.compact_entries_dropped += step.compact_entries_dropped;
     }
 }
 
