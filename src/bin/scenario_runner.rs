@@ -212,6 +212,12 @@ struct GenerationRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     leaf_misses: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    memo_table_entries: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bfs_l3_unique_misses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bfs_max_batch_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     factory_sinked: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     factory_backpressure: Option<u64>,
@@ -242,6 +248,18 @@ struct MetricsRecord {
     leaf_misses_mean: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     work_elision_leaf_level: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memo_table_entries_final: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bfs_l3_unique_misses_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bfs_l3_unique_misses_p95: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bfs_max_batch_len_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bfs_max_batch_len_p95: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    miss_cause_table: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     factory_sinked_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1439,10 +1457,19 @@ fn validate_chunk_array_metrics(record: &MeasurementRecord) -> Result<(), String
         || record.metrics.work_elision_p05_x.is_some()
         || record.metrics.leaf_misses_mean.is_some()
         || record.metrics.work_elision_leaf_level.is_some()
-        || record
-            .generations
-            .iter()
-            .any(|gen| gen.work_elision_factor_x.is_some() || gen.leaf_misses.is_some())
+        || record.metrics.memo_table_entries_final.is_some()
+        || record.metrics.bfs_l3_unique_misses_mean.is_some()
+        || record.metrics.bfs_l3_unique_misses_p95.is_some()
+        || record.metrics.bfs_max_batch_len_mean.is_some()
+        || record.metrics.bfs_max_batch_len_p95.is_some()
+        || record.metrics.miss_cause_table.is_some()
+        || record.generations.iter().any(|gen| {
+            gen.work_elision_factor_x.is_some()
+                || gen.leaf_misses.is_some()
+                || gen.memo_table_entries.is_some()
+                || gen.bfs_l3_unique_misses.is_some()
+                || gen.bfs_max_batch_len.is_some()
+        })
     {
         return Err(format!(
             "chunk-array measurement {} must not include hashlife metrics",
@@ -1473,6 +1500,28 @@ fn validate_hashlife_metrics(record: &MeasurementRecord) -> Result<(), String> {
             .generations
             .iter()
             .any(|gen| gen.work_elision_factor_x.is_some() || gen.leaf_misses.is_some());
+    let has_all_source_map_metrics = record.metrics.memo_table_entries_final.is_some()
+        && record.metrics.bfs_l3_unique_misses_mean.is_some()
+        && record.metrics.bfs_l3_unique_misses_p95.is_some()
+        && record.metrics.bfs_max_batch_len_mean.is_some()
+        && record.metrics.bfs_max_batch_len_p95.is_some()
+        && record.metrics.miss_cause_table.is_some()
+        && record.generations.iter().all(|gen| {
+            gen.memo_table_entries.is_some()
+                && gen.bfs_l3_unique_misses.is_some()
+                && gen.bfs_max_batch_len.is_some()
+        });
+    let has_any_source_map_metrics = record.metrics.memo_table_entries_final.is_some()
+        || record.metrics.bfs_l3_unique_misses_mean.is_some()
+        || record.metrics.bfs_l3_unique_misses_p95.is_some()
+        || record.metrics.bfs_max_batch_len_mean.is_some()
+        || record.metrics.bfs_max_batch_len_p95.is_some()
+        || record.metrics.miss_cause_table.is_some()
+        || record.generations.iter().any(|gen| {
+            gen.memo_table_entries.is_some()
+                || gen.bfs_l3_unique_misses.is_some()
+                || gen.bfs_max_batch_len.is_some()
+        });
     if !has_memo_metrics {
         return Err(format!(
             "hashlife measurement {} has partial/missing backend-specific metrics",
@@ -1488,6 +1537,12 @@ fn validate_hashlife_metrics(record: &MeasurementRecord) -> Result<(), String> {
     if has_any_work_elision_metrics && !has_all_work_elision_metrics {
         return Err(format!(
             "hashlife measurement {} has partial/missing backend-specific metrics",
+            record.measurement_id
+        ));
+    }
+    if has_any_source_map_metrics && !has_all_source_map_metrics {
+        return Err(format!(
+            "hashlife measurement {} has partial/missing source-map metrics",
             record.measurement_id
         ));
     }
@@ -1521,6 +1576,38 @@ fn validate_hashlife_metrics(record: &MeasurementRecord) -> Result<(), String> {
         record.metrics.leaf_misses_mean,
         record,
     )?;
+    validate_optional_non_negative(
+        "metrics.bfs_l3_unique_misses_mean",
+        record.metrics.bfs_l3_unique_misses_mean,
+        record,
+    )?;
+    validate_optional_non_negative(
+        "metrics.bfs_max_batch_len_mean",
+        record.metrics.bfs_max_batch_len_mean,
+        record,
+    )?;
+    validate_miss_cause_table(record)?;
+    Ok(())
+}
+
+fn validate_miss_cause_table(record: &MeasurementRecord) -> Result<(), String> {
+    let Some(table) = &record.metrics.miss_cause_table else {
+        return Ok(());
+    };
+    if !table.is_object() {
+        return Err(format!(
+            "metrics.miss_cause_table must be an object for {}",
+            record.measurement_id
+        ));
+    }
+    if table.get("status").and_then(|value| value.as_str()) == Some("todo")
+        && table.get("dependency").and_then(|value| value.as_str()) != Some("hash-thing-vqke.1")
+    {
+        return Err(format!(
+            "metrics.miss_cause_table TODO must depend on hash-thing-vqke.1 for {}",
+            record.measurement_id
+        ));
+    }
     Ok(())
 }
 
@@ -2306,6 +2393,8 @@ fn run_hashlife(
     let mut memo_hits = 0u64;
     let mut memo_misses = 0u64;
     let mut work_elision = Vec::with_capacity(generations);
+    let mut bfs_l3_unique_misses = Vec::with_capacity(generations);
+    let mut bfs_max_batch_lens = Vec::with_capacity(generations);
     let mut factory_total = FactoryStepStats::default();
     for gen in 0..generations {
         let drops = microchurn_sand_per_step.unwrap_or(0);
@@ -2327,6 +2416,8 @@ fn run_hashlife(
         memo_hits += stats.cache_hits;
         memo_misses += stats.cache_misses;
         work_elision.push(elision_stats);
+        bfs_l3_unique_misses.push(stats.bfs_level3_unique_misses);
+        bfs_max_batch_lens.push(stats.bfs_max_batch_len);
         let grid = world.flatten();
         times.push(step_us);
         records.push(GenerationRecord {
@@ -2336,6 +2427,9 @@ fn run_hashlife(
             drops,
             work_elision_factor_x: Some(elision_stats.factor_x),
             leaf_misses: Some(elision_stats.leaf_misses),
+            memo_table_entries: Some(world.spatial_memo_entries()),
+            bfs_l3_unique_misses: Some(stats.bfs_level3_unique_misses),
+            bfs_max_batch_len: Some(stats.bfs_max_batch_len),
             factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
             state_hash: Some(grid_hash(&grid)),
@@ -2352,6 +2446,13 @@ fn run_hashlife(
         metrics.elision_factor_x = Some(memo_total as f64 / (memo_misses + 1) as f64);
     }
     apply_work_elision_metrics(&mut metrics, &work_elision);
+    metrics.memo_table_entries_final = Some(world.spatial_memo_entries());
+    apply_bfs_source_map_metrics(&mut metrics, &bfs_l3_unique_misses, &bfs_max_batch_lens);
+    metrics.miss_cause_table = Some(serde_json::json!({
+        "status": "todo",
+        "dependency": "hash-thing-vqke.1",
+        "note": "miss-cause attribution has not landed; this scenario record carries the dependency placeholder required by hash-thing-vqke.2",
+    }));
     apply_factory_metrics(&mut metrics, factory, factory_total);
     (records, metrics)
 }
@@ -2410,6 +2511,9 @@ fn run_chunk_array(
             drops,
             work_elision_factor_x: None,
             leaf_misses: None,
+            memo_table_entries: None,
+            bfs_l3_unique_misses: None,
+            bfs_max_batch_len: None,
             factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
             state_hash: Some(grid_hash(&grid)),
@@ -2889,6 +2993,34 @@ fn apply_work_elision_metrics(metrics: &mut MetricsRecord, stats: &[WorkElisionS
     metrics.work_elision_leaf_level = Some(stats[0].leaf_level);
 }
 
+fn apply_bfs_source_map_metrics(
+    metrics: &mut MetricsRecord,
+    leaf_misses: &[u64],
+    max_batch_lens: &[u64],
+) {
+    if let Some((mean, p95)) = mean_and_p95_u64(leaf_misses) {
+        metrics.bfs_l3_unique_misses_mean = Some(mean);
+        metrics.bfs_l3_unique_misses_p95 = Some(p95);
+    }
+    if let Some((mean, p95)) = mean_and_p95_u64(max_batch_lens) {
+        metrics.bfs_max_batch_len_mean = Some(mean);
+        metrics.bfs_max_batch_len_p95 = Some(p95);
+    }
+}
+
+fn mean_and_p95_u64(values: &[u64]) -> Option<(f64, u64)> {
+    if values.is_empty() {
+        return None;
+    }
+    let total: u64 = values.iter().sum();
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let p95_idx = (((sorted.len() as f64) * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    Some((total as f64 / values.len() as f64, sorted[p95_idx]))
+}
+
 fn popcount(grid: &[CellState]) -> usize {
     grid.iter().filter(|&&cell| cell != 0).count()
 }
@@ -2927,6 +3059,12 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
             work_elision_p05_x: None,
             leaf_misses_mean: None,
             work_elision_leaf_level: None,
+            memo_table_entries_final: None,
+            bfs_l3_unique_misses_mean: None,
+            bfs_l3_unique_misses_p95: None,
+            bfs_max_batch_len_mean: None,
+            bfs_max_batch_len_p95: None,
+            miss_cause_table: None,
             factory_sinked_total: None,
             factory_backpressure_total: None,
         };
@@ -2949,6 +3087,12 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
         work_elision_p05_x: None,
         leaf_misses_mean: None,
         work_elision_leaf_level: None,
+        memo_table_entries_final: None,
+        bfs_l3_unique_misses_mean: None,
+        bfs_l3_unique_misses_p95: None,
+        bfs_max_batch_len_mean: None,
+        bfs_max_batch_len_p95: None,
+        miss_cause_table: None,
         factory_sinked_total: None,
         factory_backpressure_total: None,
     }
@@ -3758,6 +3902,24 @@ mod tests {
         assert!(metrics.work_elision_p05_x.unwrap() > 0.0);
         assert!(metrics.leaf_misses_mean.unwrap() >= 0.0);
         assert!(matches!(metrics.work_elision_leaf_level, Some(3 | 4)));
+        assert!(metrics.memo_table_entries_final.unwrap() > 0);
+        assert!(metrics.bfs_l3_unique_misses_mean.unwrap() >= 0.0);
+        assert!(metrics.bfs_l3_unique_misses_p95.is_some());
+        assert!(metrics.bfs_max_batch_len_mean.unwrap() >= 0.0);
+        assert!(metrics.bfs_max_batch_len_p95.is_some());
+        assert_eq!(
+            metrics
+                .miss_cause_table
+                .as_ref()
+                .and_then(|table| table.get("dependency"))
+                .and_then(|value| value.as_str()),
+            Some("hash-thing-vqke.1")
+        );
+        assert!(generations.iter().all(|gen| {
+            gen.memo_table_entries.is_some()
+                && gen.bfs_l3_unique_misses.is_some()
+                && gen.bfs_max_batch_len.is_some()
+        }));
     }
 
     #[test]
@@ -3777,6 +3939,44 @@ mod tests {
         assert!(metrics.work_elision_p05_x.is_none());
         assert!(metrics.leaf_misses_mean.is_none());
         assert!(metrics.work_elision_leaf_level.is_none());
+        assert!(metrics.memo_table_entries_final.is_none());
+        assert!(metrics.bfs_l3_unique_misses_mean.is_none());
+        assert!(metrics.bfs_l3_unique_misses_p95.is_none());
+        assert!(metrics.bfs_max_batch_len_mean.is_none());
+        assert!(metrics.bfs_max_batch_len_p95.is_none());
+        assert!(metrics.miss_cause_table.is_none());
+        assert!(generations.iter().all(|gen| {
+            gen.memo_table_entries.is_none()
+                && gen.bfs_l3_unique_misses.is_none()
+                && gen.bfs_max_batch_len.is_none()
+        }));
+    }
+
+    #[test]
+    fn hashlife_rejects_partial_source_map_metrics() {
+        let mut record = test_measurement("hashlife", "hashlife-recursive", "churning", 2.0);
+        record.generations[0].memo_table_entries = None;
+
+        let err = validate_hashlife_metrics(&record).expect_err("partial source-map rejected");
+        assert!(
+            err.contains("partial/missing source-map metrics"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hashlife_rejects_bad_miss_cause_todo_dependency() {
+        let mut record = test_measurement("hashlife", "hashlife-recursive", "churning", 2.0);
+        record.metrics.miss_cause_table = Some(serde_json::json!({
+            "status": "todo",
+            "dependency": "hash-thing-other",
+        }));
+
+        let err = validate_hashlife_metrics(&record).expect_err("bad TODO dependency rejected");
+        assert!(
+            err.contains("TODO must depend on hash-thing-vqke.1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3938,6 +4138,9 @@ mod tests {
             drops: 0,
             work_elision_factor_x: None,
             leaf_misses: None,
+            memo_table_entries: None,
+            bfs_l3_unique_misses: None,
+            bfs_max_batch_len: None,
             factory_sinked: None,
             factory_backpressure: None,
             state_hash: Some(grid_hash(&grid)),
@@ -3969,6 +4172,9 @@ mod tests {
             drops: 0,
             work_elision_factor_x: None,
             leaf_misses: None,
+            memo_table_entries: None,
+            bfs_l3_unique_misses: None,
+            bfs_max_batch_len: None,
             factory_sinked: None,
             factory_backpressure: None,
             state_hash: Some(grid_hash(&grid)),
@@ -4007,6 +4213,9 @@ mod tests {
             drops: 0,
             work_elision_factor_x: None,
             leaf_misses: None,
+            memo_table_entries: None,
+            bfs_l3_unique_misses: None,
+            bfs_max_batch_len: None,
             factory_sinked: None,
             factory_backpressure: None,
             state_hash: Some(grid_hash(&grid)),
@@ -4154,6 +4363,15 @@ mod tests {
                 work_elision_p05_x: (backend == "hashlife-recursive").then_some(1.0),
                 leaf_misses_mean: (backend == "hashlife-recursive").then_some(2.0),
                 work_elision_leaf_level: (backend == "hashlife-recursive").then_some(3),
+                memo_table_entries_final: (backend == "hashlife-recursive").then_some(10),
+                bfs_l3_unique_misses_mean: (backend == "hashlife-recursive").then_some(2.0),
+                bfs_l3_unique_misses_p95: (backend == "hashlife-recursive").then_some(2),
+                bfs_max_batch_len_mean: (backend == "hashlife-recursive").then_some(2.0),
+                bfs_max_batch_len_p95: (backend == "hashlife-recursive").then_some(2),
+                miss_cause_table: (backend == "hashlife-recursive").then_some(serde_json::json!({
+                    "status": "todo",
+                    "dependency": "hash-thing-vqke.1",
+                })),
                 factory_sinked_total: None,
                 factory_backpressure_total: None,
             },
@@ -4164,6 +4382,9 @@ mod tests {
                 drops: 0,
                 work_elision_factor_x: (backend == "hashlife-recursive").then_some(1.5),
                 leaf_misses: (backend == "hashlife-recursive").then_some(2),
+                memo_table_entries: (backend == "hashlife-recursive").then_some(10),
+                bfs_l3_unique_misses: (backend == "hashlife-recursive").then_some(2),
+                bfs_max_batch_len: (backend == "hashlife-recursive").then_some(2),
                 factory_sinked: None,
                 factory_backpressure: None,
                 state_hash: Some("sha256:aaaaaaaaaaaaaaaa".to_string()),
@@ -4226,9 +4447,18 @@ mod tests {
         record.metrics.work_elision_p05_x = None;
         record.metrics.leaf_misses_mean = None;
         record.metrics.work_elision_leaf_level = None;
+        record.metrics.memo_table_entries_final = None;
+        record.metrics.bfs_l3_unique_misses_mean = None;
+        record.metrics.bfs_l3_unique_misses_p95 = None;
+        record.metrics.bfs_max_batch_len_mean = None;
+        record.metrics.bfs_max_batch_len_p95 = None;
+        record.metrics.miss_cause_table = None;
         for generation in &mut record.generations {
             generation.work_elision_factor_x = None;
             generation.leaf_misses = None;
+            generation.memo_table_entries = None;
+            generation.bfs_l3_unique_misses = None;
+            generation.bfs_max_batch_len = None;
         }
     }
 

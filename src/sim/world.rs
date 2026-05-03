@@ -2683,6 +2683,10 @@ impl World {
         self.hashlife_macro_cache.len()
     }
 
+    pub fn spatial_memo_entries(&self) -> usize {
+        self.hashlife_cache.len()
+    }
+
     /// Approximate byte footprint of `hashlife_macro_cache` (entries ×
     /// `MACRO_CACHE_BYTES_PER_ENTRY`). Closes the perf paper §5 band that
     /// had a 9 MB floor / 105 MB ceiling projection at 4096³ with no

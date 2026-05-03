@@ -11,6 +11,14 @@ cargo run --bin scenario-runner -- scenarios/default-terrain-idle.ron --append .
 
 The runner emits one JSONL measurement record matching `perf-measurement-schema.md` v2. With `--append`, it also appends that record to a JSONL file. The `scenario_hash` uses the v2-B canonical input over world, level, scene, rule_set, intensity, optional setup, and seed. Backend is deliberately not part of the scenario hash so hashlife and chunk-array runs can be compared on the same scenario.
 
+For `backend=HashlifeRecursive`, records also carry memo source-map fields:
+per-generation `memo_table_entries`, `bfs_l3_unique_misses`, and
+`bfs_max_batch_len`, plus metrics `memo_table_entries_final`,
+`bfs_l3_unique_misses_mean`, `bfs_l3_unique_misses_p95`,
+`bfs_max_batch_len_mean`, `bfs_max_batch_len_p95`, and `miss_cause_table`. Until
+`hash-thing-vqke.1` lands, `miss_cause_table` is a structured TODO pointing at
+that dependency.
+
 ## Schema
 
 ```ron

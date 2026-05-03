@@ -233,6 +233,15 @@ Units in the name. Mixing units across records breaks downstream tooling.
 | `work_elision_p05_x`  | × multiplier  | 5th-percentile warm-frame Hashlife work elision; anti-cherry-pick thesis metric for churning runs. |
 | `leaf_misses_mean`    | active leaves | Mean active-leaf misses per warm frame.       |
 | `work_elision_leaf_level` | octree level | Active Hashlife leaf level used for work-elision accounting. Usually 3; 4 when slowed block-rule materials need the wider base-case halo. |
+| `memo_table_entries`  | entries       | Per-generation Hashlife spatial memo table size in `generations[].memo_table_entries`. |
+| `memo_table_entries_final` | entries  | Final Hashlife spatial memo table size after the measured run. |
+| `bfs_l3_unique_misses` | active leaves | Per-generation active leaf-level unique misses in `generations[].bfs_l3_unique_misses`; legacy name still says L3 even when the active leaf level is 4. |
+| `bfs_l3_unique_misses_mean` | active leaves | Mean active leaf-level unique misses over measured frames. |
+| `bfs_l3_unique_misses_p95` | active leaves | 95th-percentile active leaf-level unique misses over measured frames. |
+| `bfs_max_batch_len` | tasks | Per-generation largest BFS frontier/batch length in `generations[].bfs_max_batch_len`. Equals `bfs_l3_unique_misses` on the normal leaf-batch path; can differ when a higher-level hard-cap fallback trips. |
+| `bfs_max_batch_len_mean` | tasks | Mean largest BFS frontier/batch length over measured frames. |
+| `bfs_max_batch_len_p95` | tasks | 95th-percentile largest BFS frontier/batch length over measured frames. |
+| `miss_cause_table`   | JSON object    | Structured miss-cause attribution table. Until `hash-thing-vqke.1` lands, scenario-runner records use `{status: "todo", dependency: "hash-thing-vqke.1"}`. |
 | `factory_sinked_total` | items         | Scenario-specific factory harness sink throughput over measured frames; source/sink harness work is outside timed `step_us` / `step_*` latency. |
 | `factory_backpressure_total` | blocked source attempts | Scenario-specific count of source attempts blocked by occupied lane inputs before the CA step; source/sink harness work is outside timed `step_us` / `step_*` latency. |
 | `seed_ms`             | ms            | Wall-time of the seed step.                   |
