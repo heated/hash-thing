@@ -99,6 +99,7 @@ A comparison is *not* a measurement. The `ratio_metric` must be a key from one o
 |------------------------|----------------------------------------------------------------|
 | `default-ca`           | The current production CA + Margolus rules.                    |
 | `custom:factory-conveyor-v1` | Scenario-local factory conveyor block-rule setup used by `FactoryConveyorRuleV1` (`hash-thing-w4zq`). |
+| `custom:soup-search-v1` | Scenario-local tiled 3D Game-of-Life soup ensemble used by `SoupSearchV1(tile=16,soup_side=8,density_per_1000=180,rule=445)` (`hash-thing-8ppq.5.1`). |
 | `water-margolus`       | Water-only rules (for fluid-only benches).                     |
 | `particle-cellular`    | Particle CA (sand/dust/etc).                                   |
 | `circuit-signal`       | Wire/signal-propagation rules (puzzle-circuit scene families). |

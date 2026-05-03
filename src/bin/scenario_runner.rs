@@ -1,10 +1,10 @@
-use hash_thing::octree::CellState;
+use hash_thing::octree::{Cell, CellState};
 use hash_thing::sim::margolus::ConveyorBlockRule;
 use hash_thing::sim::world::{
     quarantine_atlas_mixed_containment_plan, WorkElisionStats,
     QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
 };
-use hash_thing::sim::{World, WorldCoord};
+use hash_thing::sim::{GameOfLife3D, World, WorldCoord};
 use hash_thing::terrain::materials::{METAL, METAL_MATERIAL_ID, SAND, STONE, WATER};
 use hash_thing::terrain::TerrainParams;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+const SOUP_SEARCH_SETUP_V1: &str =
+    "SoupSearchV1(tile=16,soup_side=8,density_per_1000=180,rule=445)";
+const SOUP_SEARCH_TILE: i64 = 16;
+const SOUP_SEARCH_SIDE: i64 = 8;
+const SOUP_SEARCH_DENSITY_PER_1000: u64 = 180;
+const SOUP_SEARCH_ALIVE: CellState = Cell::pack(1, 0).raw();
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +74,7 @@ enum Scene {
     DefaultDemo,
     FactoryConveyor,
     QuarantineAtlas,
+    SoupSearch,
 }
 
 impl Scene {
@@ -76,6 +84,7 @@ impl Scene {
             Self::DefaultDemo => "default-demo",
             Self::FactoryConveyor => "factory-conveyor",
             Self::QuarantineAtlas => "quarantine-atlas",
+            Self::SoupSearch => "soup-search",
         }
     }
 }
@@ -84,6 +93,7 @@ impl Scene {
 enum ScenarioSetup {
     QuarantineAtlasMixedContainmentV1,
     FactoryConveyorRuleV1,
+    SoupSearchV1,
 }
 
 impl ScenarioSetup {
@@ -91,6 +101,7 @@ impl ScenarioSetup {
         match self {
             Self::QuarantineAtlasMixedContainmentV1 => QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
             Self::FactoryConveyorRuleV1 => "FactoryConveyorRuleV1",
+            Self::SoupSearchV1 => SOUP_SEARCH_SETUP_V1,
         }
     }
 }
@@ -99,6 +110,7 @@ impl ScenarioSetup {
 enum RuleSet {
     DefaultCa,
     FactoryConveyorV1,
+    SoupSearchV1,
 }
 
 impl RuleSet {
@@ -106,6 +118,7 @@ impl RuleSet {
         match self {
             Self::DefaultCa => "default-ca",
             Self::FactoryConveyorV1 => "custom:factory-conveyor-v1",
+            Self::SoupSearchV1 => "custom:soup-search-v1",
         }
     }
 }
@@ -186,6 +199,8 @@ struct GenerationRecord {
     factory_sinked: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     factory_backpressure: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_hash: Option<String>,
     mat_distribution: Option<serde_json::Value>,
 }
 
@@ -248,9 +263,12 @@ struct TrajectoryDriftRecord {
     subject_final_pop: usize,
     baseline_final_pop: usize,
     final_material_distribution_equal: bool,
+    final_state_hash_equal: bool,
     generation_count_equal: bool,
     subject_final_mat_distribution: Option<serde_json::Value>,
     baseline_final_mat_distribution: Option<serde_json::Value>,
+    subject_final_state_hash: Option<String>,
+    baseline_final_state_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -681,6 +699,7 @@ fn trajectory_drift(
             subject_gen.gen != baseline_gen.gen
                 || subject_gen.pop_count != baseline_gen.pop_count
                 || subject_gen.mat_distribution != baseline_gen.mat_distribution
+                || subject_gen.state_hash != baseline_gen.state_hash
         });
     if first_drift.is_none() && subject.generations.len() == baseline.generations.len() {
         return None;
@@ -699,9 +718,12 @@ fn trajectory_drift(
         baseline_final_pop: last_baseline.pop_count,
         final_material_distribution_equal: last_subject.mat_distribution
             == last_baseline.mat_distribution,
+        final_state_hash_equal: last_subject.state_hash == last_baseline.state_hash,
         generation_count_equal: subject.generations.len() == baseline.generations.len(),
         subject_final_mat_distribution: last_subject.mat_distribution.clone(),
         baseline_final_mat_distribution: last_baseline.mat_distribution.clone(),
+        subject_final_state_hash: last_subject.state_hash.clone(),
+        baseline_final_state_hash: last_baseline.state_hash.clone(),
     })
 }
 
@@ -722,7 +744,7 @@ impl std::fmt::Display for TrajectoryDriftRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-        "trajectory caveat: final measured pop/material distribution differ (subject pop={}, baseline pop={}); see hash-thing-neql",
+        "trajectory caveat: final measured pop/material/state hash differ (subject pop={}, baseline pop={}); see hash-thing-neql",
             self.subject_final_pop, self.baseline_final_pop
         )
     }
@@ -899,6 +921,7 @@ fn validate_measurement_coordinates(record: &MeasurementRecord) -> Result<(), St
             "default-demo",
             "factory-conveyor",
             "quarantine-atlas",
+            "soup-search",
         ],
         record,
     )?;
@@ -911,7 +934,11 @@ fn validate_measurement_coordinates(record: &MeasurementRecord) -> Result<(), St
     validate_one_of(
         "rule_set",
         &record.rule_set,
-        &["default-ca", "custom:factory-conveyor-v1"],
+        &[
+            "default-ca",
+            "custom:factory-conveyor-v1",
+            "custom:soup-search-v1",
+        ],
         record,
     )?;
     validate_hardware(&record.hardware)?;
@@ -933,6 +960,10 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
             "setup=FactoryConveyorRuleV1 is invalid for scene={} in {}",
             record.scene, record.measurement_id
         )),
+        Some(SOUP_SEARCH_SETUP_V1) if record.scene != "soup-search" => Err(format!(
+            "setup=SoupSearchV1 is invalid for scene={} in {}",
+            record.scene, record.measurement_id
+        )),
         Some(QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP) if record.rule_set != "default-ca" => {
             Err(format!(
                 "setup={} requires matching rule_set (got {}) in {}",
@@ -945,10 +976,22 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
                 record.rule_set, record.measurement_id
             ))
         }
-        Some(QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP | "FactoryConveyorRuleV1") => Ok(()),
+        Some(SOUP_SEARCH_SETUP_V1) if record.rule_set != "custom:soup-search-v1" => Err(format!(
+            "setup=SoupSearchV1 requires matching rule_set (got {}) in {}",
+            record.rule_set, record.measurement_id
+        )),
+        Some(
+            QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
+            | "FactoryConveyorRuleV1"
+            | SOUP_SEARCH_SETUP_V1,
+        ) => Ok(()),
         Some(other) => Err(format!(
             "invalid setup {:?} for {}",
             other, record.measurement_id
+        )),
+        None if record.scene == "soup-search" => Err(format!(
+            "scene=soup-search requires setup={} in {}",
+            SOUP_SEARCH_SETUP_V1, record.measurement_id
         )),
         None if record.rule_set == "default-ca" => Ok(()),
         None => Err(format!(
@@ -1089,6 +1132,12 @@ fn validate_hashlife_metrics(record: &MeasurementRecord) -> Result<(), String> {
     if !has_memo_metrics {
         return Err(format!(
             "hashlife measurement {} has partial/missing backend-specific metrics",
+            record.measurement_id
+        ));
+    }
+    if record.scene == "soup-search" && !has_all_work_elision_metrics {
+        return Err(format!(
+            "hashlife soup-search measurement {} requires work-elision metrics",
             record.measurement_id
         ));
     }
@@ -1375,6 +1424,7 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
     match (scenario.setup, scenario.scene) {
         (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), Scene::QuarantineAtlas)
         | (Some(ScenarioSetup::FactoryConveyorRuleV1), Scene::FactoryConveyor)
+        | (Some(ScenarioSetup::SoupSearchV1), Scene::SoupSearch)
         | (None, _) => Ok(()),
         (Some(setup), scene) => Err(format!(
             "setup={} is invalid for scene={}",
@@ -1382,9 +1432,16 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
             scene.as_str()
         )),
     }?;
+    if matches!(scenario.scene, Scene::SoupSearch) && scenario.setup.is_none() {
+        return Err(format!(
+            "scene=soup-search requires setup={}",
+            SOUP_SEARCH_SETUP_V1
+        ));
+    }
     match (scenario.setup, scenario.rule_set) {
         (Some(ScenarioSetup::FactoryConveyorRuleV1), RuleSet::FactoryConveyorV1)
         | (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), RuleSet::DefaultCa)
+        | (Some(ScenarioSetup::SoupSearchV1), RuleSet::SoupSearchV1)
         | (None, RuleSet::DefaultCa) => Ok(()),
         (Some(setup), rule_set) => Err(format!(
             "setup={} requires matching rule_set (got {})",
@@ -1414,8 +1471,83 @@ fn seed_scene(world: &mut World, scenario: &Scenario) -> Result<(), String> {
         }
         Scene::FactoryConveyor => seed_factory_conveyor(world, scenario)?,
         Scene::QuarantineAtlas => seed_quarantine_atlas(world, scenario)?,
+        Scene::SoupSearch => seed_soup_search(world, scenario)?,
     }
     Ok(())
+}
+
+fn seed_soup_search(world: &mut World, scenario: &Scenario) -> Result<(), String> {
+    match scenario.setup {
+        Some(ScenarioSetup::SoupSearchV1) => {}
+        None => {
+            return Err("soup-search scene requires setup=SoupSearchV1".to_string());
+        }
+        Some(other) => {
+            return Err(format!(
+                "setup={} is invalid for soup-search",
+                other.as_str()
+            ));
+        }
+    }
+    if world.side() < 32 {
+        return Err("soup-search scene requires side >= 32".to_string());
+    }
+
+    world.set_gol_smoke_rule(GameOfLife3D::rule445());
+    let side = world.side() as i64;
+    let margin = (SOUP_SEARCH_TILE - SOUP_SEARCH_SIDE) / 2;
+    let mut rng = SoupSearchRng::new(scenario.seed);
+    for tile_z in 0..side / SOUP_SEARCH_TILE {
+        for tile_y in 0..side / SOUP_SEARCH_TILE {
+            for tile_x in 0..side / SOUP_SEARCH_TILE {
+                let origin = [
+                    tile_x * SOUP_SEARCH_TILE + margin,
+                    tile_y * SOUP_SEARCH_TILE + margin,
+                    tile_z * SOUP_SEARCH_TILE + margin,
+                ];
+                for dz in 0..SOUP_SEARCH_SIDE {
+                    for dy in 0..SOUP_SEARCH_SIDE {
+                        for dx in 0..SOUP_SEARCH_SIDE {
+                            if rng.next_mod(1000) < SOUP_SEARCH_DENSITY_PER_1000 {
+                                world.set(
+                                    WorldCoord(origin[0] + dx),
+                                    WorldCoord(origin[1] + dy),
+                                    WorldCoord(origin[2] + dz),
+                                    SOUP_SEARCH_ALIVE,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct SoupSearchRng {
+    state: u64,
+}
+
+impl SoupSearchRng {
+    fn new(seed: u64) -> Self {
+        let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
+        if state == 0 {
+            state = 0xA076_1D64_78BD_642F;
+        }
+        Self { state }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state ^= self.state << 7;
+        self.state ^= self.state >> 9;
+        self.state = self.state.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.state
+    }
+
+    fn next_mod(&mut self, modulo: u64) -> u64 {
+        self.next_u64() % modulo
+    }
 }
 
 fn seed_quarantine_atlas(world: &mut World, scenario: &Scenario) -> Result<(), String> {
@@ -1680,6 +1812,9 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
         Some(ScenarioSetup::FactoryConveyorRuleV1) => {
             "; setup=factory-conveyor-rule-v1 (scripted pre-measurement intervention setup plus per-step source/sink harness; step_us/step_* time only CA stepping and exclude source injection, sink drain, and backpressure accounting)".to_string()
         }
+        Some(ScenarioSetup::SoupSearchV1) => {
+            "; setup=soup-search-v1 (deterministic tiled 3D GoL soup ensemble; this first probe measures the search workload, while survivor classification is tracked in hash-thing-8ppq.5.2)".to_string()
+        }
         Some(setup) => format!(
             "; setup={} (scripted pre-measurement intervention setup; excludes interactive placement/raycast/cache-invalidation cost)",
             setup.as_str()
@@ -1756,6 +1891,7 @@ fn run_hashlife(
             leaf_misses: Some(elision_stats.leaf_misses),
             factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
+            state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
         });
         factory_total.sinked += factory_step.sinked;
@@ -1828,6 +1964,7 @@ fn run_chunk_array(
             leaf_misses: None,
             factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
+            state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
         });
         factory_total.sinked += factory_step.sinked;
@@ -1883,6 +2020,14 @@ fn material_distribution(grid: &[CellState]) -> serde_json::Value {
         *counts.entry(material).or_insert(0) += 1;
     }
     serde_json::json!(counts)
+}
+
+fn grid_hash(grid: &[CellState]) -> String {
+    let mut bytes = Vec::with_capacity(grid.len() * std::mem::size_of::<CellState>());
+    for cell in grid {
+        bytes.extend_from_slice(&cell.to_le_bytes());
+    }
+    format!("sha256:{}", hex16(&bytes))
 }
 
 fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
@@ -2023,6 +2168,35 @@ mod tests {
         let mut bad_rule = factory;
         bad_rule.rule_set = RuleSet::DefaultCa;
         assert!(validate_backend_regime(&bad_rule).is_err());
+    }
+
+    #[test]
+    fn soup_search_setup_changes_hash_and_requires_matching_rule_set() {
+        let mut soup = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
+        soup.scene = Scene::SoupSearch;
+        soup.rule_set = RuleSet::SoupSearchV1;
+        soup.intensity = Intensity::PassiveActive;
+        soup.setup = Some(ScenarioSetup::SoupSearchV1);
+
+        let mut raw = soup.clone();
+        raw.rule_set = RuleSet::DefaultCa;
+        raw.setup = None;
+
+        assert_ne!(scenario_hash(&soup, 6), scenario_hash(&raw, 6));
+        assert!(validate_backend_regime(&soup).is_ok());
+
+        let mut bad_scene = soup.clone();
+        bad_scene.scene = Scene::DefaultTerrain;
+        assert!(validate_backend_regime(&bad_scene).is_err());
+
+        let mut bad_rule = soup.clone();
+        bad_rule.rule_set = RuleSet::DefaultCa;
+        assert!(validate_backend_regime(&bad_rule).is_err());
+
+        let mut missing_setup = soup;
+        missing_setup.setup = None;
+        missing_setup.rule_set = RuleSet::DefaultCa;
+        assert!(validate_backend_regime(&missing_setup).is_err());
     }
 
     #[test]
@@ -2306,6 +2480,41 @@ mod tests {
     }
 
     #[test]
+    fn compare_records_rejects_soup_search_without_setup() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "churning", 2.0);
+        a.scene = "soup-search".to_string();
+        a.intensity = "passive-active".to_string();
+        a.generations[0].pop_count = b.generations[0].pop_count;
+
+        let err = compare_error(&a, &b);
+
+        assert!(err.contains("scene=soup-search requires setup"), "{err}");
+    }
+
+    #[test]
+    fn compare_records_detects_state_hash_drift() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        b.generations[0].pop_count = a.generations[0].pop_count;
+        b.generations[0].mat_distribution = a.generations[0].mat_distribution.clone();
+        b.generations[0].state_hash = Some("sha256:ffffffffffffffff".to_string());
+        let path = write_jsonl(&[&a, &b]);
+
+        let err = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("trajectory drift"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn compare_records_rejects_malformed_scenario_hash() {
         let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
         let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
@@ -2366,6 +2575,32 @@ mod tests {
 
         assert_eq!(comparison.ratio, 5.0);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_rejects_soup_search_hashlife_without_work_elision_metrics() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "churning", 2.0);
+        a.world = "small".to_string();
+        a.scene = "soup-search".to_string();
+        a.intensity = "passive-active".to_string();
+        a.rule_set = "custom:soup-search-v1".to_string();
+        a.setup = Some(SOUP_SEARCH_SETUP_V1.to_string());
+        a.level = 6;
+        a.side = 64;
+        b.world = a.world.clone();
+        b.scene = a.scene.clone();
+        b.intensity = a.intensity.clone();
+        b.rule_set = a.rule_set.clone();
+        b.setup = a.setup.clone();
+        b.level = a.level;
+        b.side = a.side;
+        b.generations[0].pop_count = a.generations[0].pop_count;
+        strip_work_elision_metrics(&mut b);
+
+        let err = compare_error(&a, &b);
+
+        assert!(err.contains("requires work-elision metrics"), "{err}");
     }
 
     #[test]
@@ -2634,6 +2869,65 @@ mod tests {
         assert!(metrics.factory_sinked_total.unwrap() > 0);
     }
 
+    #[test]
+    fn soup_search_seed_is_deterministic_and_nonempty() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
+        scenario.world = WorldCoordName::Small;
+        scenario.level = Some(6);
+        scenario.scene = Scene::SoupSearch;
+        scenario.rule_set = RuleSet::SoupSearchV1;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.setup = Some(ScenarioSetup::SoupSearchV1);
+
+        let mut a = World::new(6);
+        seed_scene(&mut a, &scenario).expect("seed soup a");
+        let mut b = World::new(6);
+        seed_scene(&mut b, &scenario).expect("seed soup b");
+
+        assert_eq!(a.flatten(), b.flatten());
+        assert!(a.population() > 0);
+
+        scenario.seed += 1;
+        let mut c = World::new(6);
+        seed_scene(&mut c, &scenario).expect("seed soup c");
+        assert_ne!(a.flatten(), c.flatten());
+    }
+
+    #[test]
+    fn soup_search_rng_does_not_stick_on_zero_state() {
+        let mut rng = SoupSearchRng::new(0xD1B5_4A32_D192_ED03);
+        assert_ne!(rng.next_u64(), 0);
+    }
+
+    #[test]
+    fn soup_search_keeps_backends_on_same_trajectory() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
+        scenario.world = WorldCoordName::Small;
+        scenario.level = Some(6);
+        scenario.scene = Scene::SoupSearch;
+        scenario.rule_set = RuleSet::SoupSearchV1;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.setup = Some(ScenarioSetup::SoupSearchV1);
+
+        let mut hashlife_world = World::new(6);
+        seed_scene(&mut hashlife_world, &scenario).expect("seed hashlife soup");
+        let mut chunk_world = World::new(6);
+        seed_scene(&mut chunk_world, &scenario).expect("seed chunk soup");
+
+        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, None, None, 11);
+        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, None, None, 11);
+
+        assert_eq!(hashlife.len(), chunk.len());
+        for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
+            assert_eq!(h.pop_count, c.pop_count, "pop drift at gen {gen}");
+            assert_eq!(
+                h.mat_distribution, c.mat_distribution,
+                "material drift at gen {gen}"
+            );
+            assert_eq!(h.state_hash, c.state_hash, "state hash drift at gen {gen}");
+        }
+    }
+
     fn test_scenario(backend: Backend, regime: Regime) -> Scenario {
         Scenario {
             name: "test".to_string(),
@@ -2708,6 +3002,7 @@ mod tests {
                 leaf_misses: (backend == "hashlife-recursive").then_some(2),
                 factory_sinked: None,
                 factory_backpressure: None,
+                state_hash: Some("sha256:aaaaaaaaaaaaaaaa".to_string()),
                 mat_distribution: Some(serde_json::json!({"1": 10})),
             }],
         }

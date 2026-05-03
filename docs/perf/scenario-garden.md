@@ -18,15 +18,15 @@ The runner emits one JSONL measurement record matching `perf-measurement-schema.
     name: "default-terrain-idle",
     world: Tiny,                   // Tiny | Small | Medium | Demo
     level: Some(5),                // optional override for world
-    scene: DefaultTerrain,         // DefaultTerrain | DefaultDemo | FactoryConveyor | QuarantineAtlas
-    rule_set: DefaultCa,           // DefaultCa | FactoryConveyorV1
+    scene: DefaultTerrain,         // DefaultTerrain | DefaultDemo | FactoryConveyor | QuarantineAtlas | SoupSearch
+    rule_set: DefaultCa,           // DefaultCa | FactoryConveyorV1 | SoupSearchV1
     intensity: Idle,               // Idle | Microchurn | PassiveActive | Cascade
     regime: Saturated,             // Saturated | Churning | NotApplicable
     backend: HashlifeRecursive,    // HashlifeRecursive | ChunkArray
     generations: 3,
     warmup_generations: Some(1),
     seed: 1,
-    setup: None,                   // optional; e.g. Some(QuarantineAtlasMixedContainmentV1) or Some(FactoryConveyorRuleV1)
+    setup: None,                   // optional; e.g. Some(QuarantineAtlasMixedContainmentV1), Some(FactoryConveyorRuleV1), or Some(SoupSearchV1)
     comparator: Some("chunk-array@same-scenario"),
 )
 ```
@@ -39,6 +39,7 @@ The runner emits one JSONL measurement record matching `perf-measurement-schema.
 - `default-demo`: default terrain plus water/sand and the demo spectacle when the world is at least 64 cells wide.
 - `factory-conveyor`: either the older repeated-lane toy (`setup=None`) or the `FactoryConveyorRuleV1` source/sink/backpressure harness with a scenario-local one-material +X block rule (`rule_set=FactoryConveyorV1`). Source injection, sink drain, and backpressure counting run outside timed `step_us` / `step_*` latency.
 - `quarantine-atlas`: deterministic Quarantine Atlas playtest scene. Optional setup `QuarantineAtlasMixedContainmentV1` applies the `oym4` six-stamp mixed containment plan before warmup/measured stepping; it excludes interactive placement/raycast/cache-invalidation cost.
+- `soup-search`: deterministic tiled 3D Game-of-Life soup ensemble (`setup=SoupSearchV1`, emitted as `SoupSearchV1(tile=16,soup_side=8,density_per_1000=180,rule=445)`, `rule_set=SoupSearchV1`) for the `8ppq.5` stable-structure discovery lead. This first scenario pair measures the search workload; survivor classification/cataloging is tracked separately in `hash-thing-8ppq.5.2`.
 
 ## Current examples
 
@@ -48,5 +49,7 @@ The runner emits one JSONL measurement record matching `perf-measurement-schema.
 - `scenarios/factory-conveyor-toy.ron`
 - `scenarios/factory-conveyor-rule.ron`
 - `scenarios/quarantine-atlas-mixed-containment.ron`
+- `scenarios/soup-search.ron`
+- `scenarios/soup-search-chunk-array.ron`
 
 Automatic comparison-record synthesis is intentionally left out of the first probe. For now, run paired scenarios with different `backend` values and compare records by matching `scenario_hash`, `rule_set`, and hardware.
