@@ -47,7 +47,7 @@ run_bd() {
         }
         rc=$?
 
-        if printf '%s' "$output" | grep -q "another process holds the exclusive lock"; then
+        if grep -q "another process holds the exclusive lock" <<< "$output"; then
             if [ "$attempt" -eq "$MAX_RETRIES" ]; then
                 printf '%s\n' "$output" >&2
                 return "$rc"
@@ -174,7 +174,7 @@ preflight_close() {
                 printf 'bd close: failed to inspect issue %s\n' "$issue_id" >&2
                 return 2
             }
-            if ! printf '%s' "$issue_json" | grep -Eq "\"assignee\"[[:space:]]*:[[:space:]]*\"$actor\""; then
+            if ! grep -Eq "\"assignee\"[[:space:]]*:[[:space:]]*\"$actor\"" <<< "$issue_json"; then
                 printf 'bd close: issue %s is not assigned to %s\n' "$issue_id" "$actor" >&2
                 return 2
             fi
