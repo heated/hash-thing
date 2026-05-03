@@ -74,6 +74,23 @@ impl RendererLifecycleSnapshot {
     }
 }
 
+fn scaled_render_extent(width: u32, height: u32, render_scale: f32) -> (u32, u32) {
+    (
+        ((width as f32 * render_scale) as u32).max(1),
+        ((height as f32 * render_scale) as u32).max(1),
+    )
+}
+
+fn surface_and_raycast_extents(
+    width: u32,
+    height: u32,
+    render_scale: f32,
+) -> ((u32, u32), (u32, u32)) {
+    let surface = (width.max(1), height.max(1));
+    let raycast = scaled_render_extent(surface.0, surface.1, render_scale);
+    (surface, raycast)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -464,6 +481,8 @@ pub struct Renderer {
     /// Storage texture for compute raycast output (hash-thing-5bb.6.1).
     raycast_texture: wgpu::Texture,
     raycast_texture_view: wgpu::TextureView,
+    raycast_width: u32,
+    raycast_height: u32,
 
     // Blit pass: samples raycast_texture, writes to swapchain (5bb.6.1)
     blit_pipeline: wgpu::RenderPipeline,
@@ -1037,8 +1056,8 @@ impl Renderer {
                 // pixel-budget interpretation of "1080p" means the
                 // rendered W×H is generally NOT literal 1920×1080
                 // (uniform scale preserves physical aspect ratio).
-                let rendered_w = ((size.width as f32 * render_scale) as u32).max(1);
-                let rendered_h = ((size.height as f32 * render_scale) as u32).max(1);
+                let (rendered_w, rendered_h) =
+                    scaled_render_extent(size.width, size.height, render_scale);
                 log::info!(
                     "render_scale={:.3} (--res / --demo override; rendered={}x{}, cli_target={} px, physical={}x{})",
                     render_scale,
@@ -1096,11 +1115,13 @@ impl Renderer {
                 }
             },
         };
+        let ((surface_width, surface_height), (raycast_width, raycast_height)) =
+            surface_and_raycast_extents(size.width, size.height, render_scale);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: ((size.width as f32 * render_scale) as u32).max(1),
-            height: ((size.height as f32 * render_scale) as u32).max(1),
+            width: surface_width,
+            height: surface_height,
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -1113,7 +1134,7 @@ impl Renderer {
             surface_caps.formats,
         );
         log::info!(
-            "surface_config: present_mode={:?} alpha_mode={:?} format={:?} max_frame_latency={} render_scale={} size={}x{} (physical={}x{})",
+            "surface_config: present_mode={:?} alpha_mode={:?} format={:?} max_frame_latency={} render_scale={} size={}x{} raycast={}x{}",
             config.present_mode,
             config.alpha_mode,
             config.format,
@@ -1121,8 +1142,8 @@ impl Renderer {
             render_scale,
             config.width,
             config.height,
-            size.width,
-            size.height,
+            raycast_width,
+            raycast_height,
         );
         surface.configure(&device, &config);
 
@@ -1168,13 +1189,14 @@ impl Renderer {
 
         // === SVDAG compute raycast pipeline (hash-thing-5bb.6.1) ===
 
-        // Storage texture for compute output. Dimensions match the scaled
-        // surface config (already half-res from render_scale).
+        // Storage texture for compute output. The surface remains at the
+        // physical window size; render_scale controls this smaller texture,
+        // which the blit pass nearest-upscales into the surface.
         let raycast_tex_format = wgpu::TextureFormat::Rgba16Float;
         let (raycast_texture, raycast_texture_view) = Self::create_raycast_texture_static(
             &device,
-            config.width,
-            config.height,
+            raycast_width,
+            raycast_height,
             raycast_tex_format,
         );
 
@@ -1724,6 +1746,8 @@ impl Renderer {
             svdag_uploaded_len: 0,
             raycast_texture,
             raycast_texture_view,
+            raycast_width,
+            raycast_height,
             blit_pipeline,
             blit_bind_group_layout,
             blit_bind_group,
@@ -1972,8 +1996,8 @@ impl Renderer {
         let lifecycle = RendererLifecycleSnapshot::from_renderer(self);
         let (tex, view) = Self::create_raycast_texture_static(
             &self.device,
-            self.config.width,
-            self.config.height,
+            self.raycast_width,
+            self.raycast_height,
             wgpu::TextureFormat::Rgba16Float,
         );
         self.raycast_texture = tex;
@@ -2439,15 +2463,21 @@ impl Renderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             let s = self.render_scale;
-            self.config.width = ((width as f32 * s) as u32).max(1);
-            self.config.height = ((height as f32 * s) as u32).max(1);
+            let ((surface_width, surface_height), (raycast_width, raycast_height)) =
+                surface_and_raycast_extents(width, height, s);
+            self.config.width = surface_width;
+            self.config.height = surface_height;
+            self.raycast_width = raycast_width;
+            self.raycast_height = raycast_height;
             log::info!(
-                "resize: physical={}x{} render_scale={} config={}x{} (dlse.2.2 pixel-workload log)",
+                "resize: physical={}x{} render_scale={} config={}x{} raycast={}x{} (dlse.2.2 pixel-workload log)",
                 width,
                 height,
                 s,
                 self.config.width,
                 self.config.height,
+                self.raycast_width,
+                self.raycast_height,
             );
             self.surface.configure(&self.device, &self.config);
             // Recreate storage texture to match new dimensions (5bb.6.1).
@@ -2573,13 +2603,13 @@ impl Renderer {
                 self.volume_size as f32,
                 aspect,
                 fov_tan,
-                self.config.height as f32,
+                self.raycast_height as f32,
             ],
             debug: [
                 self.debug_mode as f32,
                 self.lod_bias,
-                self.config.width as f32,
-                self.config.height as f32,
+                self.raycast_width as f32,
+                self.raycast_height as f32,
             ],
         };
         self.queue
@@ -2660,8 +2690,8 @@ impl Renderer {
                 });
                 compute_pass.set_pipeline(&self.svdag_compute_pipeline);
                 compute_pass.set_bind_group(0, bg, &[]);
-                let wg_x = self.config.width.div_ceil(8);
-                let wg_y = self.config.height.div_ceil(8);
+                let wg_x = self.raycast_width.div_ceil(8);
+                let wg_y = self.raycast_height.div_ceil(8);
                 compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
             if compute_in_encoder_capturing {
@@ -2908,9 +2938,9 @@ impl Renderer {
 mod tests {
     use super::{
         auto_render_scale, classify_gpu, gpu_timing_lag_frames, parse_present_mode,
-        resolved_render_scale, target_pixels_for_volume, ticks_to_duration, FrameOutcome, GpuClass,
-        GpuTiming, RenderScaleSource, RendererLifecycleSnapshot, ResolvedGpuTimingSample,
-        SubmitFenceState,
+        resolved_render_scale, scaled_render_extent, surface_and_raycast_extents,
+        target_pixels_for_volume, ticks_to_duration, FrameOutcome, GpuClass, GpuTiming,
+        RenderScaleSource, RendererLifecycleSnapshot, ResolvedGpuTimingSample, SubmitFenceState,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3564,6 +3594,23 @@ mod tests {
                 "{snapshot:?}"
             );
         }
+    }
+
+    #[test]
+    fn scaled_render_extent_uses_scale_with_minimum_one_pixel() {
+        assert_eq!(scaled_render_extent(3840, 2160, 0.125), (480, 270));
+        assert_eq!(scaled_render_extent(1, 1, 0.125), (1, 1));
+    }
+
+    #[test]
+    fn surface_and_raycast_extents_keep_surface_physical() {
+        let (surface, raycast) = surface_and_raycast_extents(3840, 2160, 0.125);
+        assert_eq!(surface, (3840, 2160));
+        assert_eq!(raycast, (480, 270));
+
+        let (surface, raycast) = surface_and_raycast_extents(1, 100, 0.125);
+        assert_eq!(surface, (1, 100));
+        assert_eq!(raycast, (1, 12));
     }
 
     // hash-thing-lwa2 — device-backed coverage for the two-instance
