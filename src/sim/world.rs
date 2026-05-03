@@ -1260,254 +1260,22 @@ impl World {
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
-        let next = self.step_grid(&grid);
+        let next = brute_step_grid(&grid, side, &self.materials, self.generation);
         self.commit_step(&next, side);
     }
 
     /// Brute-force step on a flat whole-world grid; returns the new grid.
-    ///
-    /// Bench seam for the chunk-array baseline — keeps the flat
-    /// `Vec<CellState>` canonical so the comparator can skip the octree
-    /// rebuild that `commit_step` performs. Does not mutate the octree and
-    /// does not advance `generation`; callers that want full-step semantics
-    /// (`step`) commit to the octree and bump `generation` themselves.
+    /// Thin wrapper around the module-level [`brute_step_grid`] free
+    /// function, kept `pub` so the chunk-array baseline integration bench
+    /// (`tests/bench_chunk_array_baseline.rs`) can access it without
+    /// pulling `pub(crate)` items.
     ///
     /// **Not to be confused with** the leaf-level
     /// `step_grid_once_pure` in `src/sim/hashlife.rs`, which evaluates a
-    /// single 2^L hashlife leaf and is what the recursive memo path
-    /// recurses into.
-    ///
-    /// `pub` because the integration bench in
-    /// `tests/bench_chunk_array_baseline.rs` cannot see `pub(crate)`.
-    /// `#[doc(hidden)]` flags this as a bench-only seam, not a stable
-    /// public API. May be tightened to a feature gate or removed once
-    /// the honest baseline (the cascade follow-up) lands.
+    /// single 2^L hashlife leaf.
     #[doc(hidden)]
     pub fn step_grid(&self, grid: &[CellState]) -> Vec<CellState> {
-        let side = self.side();
-        let mut next = vec![0 as CellState; side * side * side];
-        let divisor_by_material = self.materials.tick_divisor_flags();
-        let generation = self.generation;
-
-        // Phase 1: cell-wise CaRule pass (Moore neighborhood). Per-material
-        // tick_divisor gate mirrors the hashlife path (iowh) so the brute and
-        // recursive paths produce identical output at every generation.
-        for z in 0..side {
-            for y in 0..side {
-                for x in 0..side {
-                    let idx = x + y * side + z * side * side;
-                    let raw = grid[idx];
-                    let center = Cell::from_raw(raw);
-                    let mat = center.material() as usize;
-                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
-                    if divisor > 1 && !generation.is_multiple_of(divisor) {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    let neighbors = get_neighbors(grid, side, x, y, z);
-                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
-                        panic!("missing CaRule for material {}", center.material())
-                    });
-                    next[idx] = rule.step_cell(center, &neighbors).raw();
-                }
-            }
-        }
-
-        // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
-        // Static internal gaps close in 1-2 ticks via the alternating
-        // partition offset (qy4g epic decision 2026-04-26, option G).
-        // Gaps within free-falling columns are co-moving with the column
-        // and appear as a sustained checkerboard until the leading edge
-        // compacts against a solid surface — see SPEC.md for the in-flight
-        // visible-artifact tradeoff and fallbacks A/F. No post-pass
-        // gap-fill runs in production.
-        self.step_blocks(&mut next, side);
-        next
-    }
-
-    /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
-    ///
-    /// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
-    /// Blocks at edges use absorbing boundary conditions: out-of-bounds cells
-    /// are treated as empty, matching hashlife's pad-with-empty semantics.
-    ///
-    /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
-    /// distinct rule exists, run it. If zero or multiple: skip (identity).
-    ///
-    /// Under per-material tick_divisors (iowh): when any divisor > 1, iterate
-    /// both offsets and gate each block on its rule's `(generation / divisor) & 1`
-    /// Margolus offset + firing cadence, matching the hashlife path.
-    fn step_blocks(&self, grid: &mut [CellState], side: usize) {
-        let block_rule_divisors = self.materials.block_rule_tick_divisors();
-        let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1);
-
-        if all_divisors_one {
-            let offset = (self.generation & 1) as usize;
-            let mut bz = offset;
-            while bz < side {
-                let mut by = offset;
-                while by < side {
-                    let mut bx = offset;
-                    while bx < side {
-                        self.apply_block(grid, side, bx, by, bz, None, 0);
-                        bx += 2;
-                    }
-                    by += 2;
-                }
-                bz += 2;
-            }
-            return;
-        }
-
-        for pass_offset in 0..2usize {
-            let mut bz = pass_offset;
-            while bz < side {
-                let mut by = pass_offset;
-                while by < side {
-                    let mut bx = pass_offset;
-                    while bx < side {
-                        self.apply_block(
-                            grid,
-                            side,
-                            bx,
-                            by,
-                            bz,
-                            Some(block_rule_divisors),
-                            pass_offset,
-                        );
-                        bx += 2;
-                    }
-                    by += 2;
-                }
-                bz += 2;
-            }
-        }
-    }
-
-    /// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
-    ///
-    /// Cells outside the grid boundary are treated as empty (absorbing BC).
-    ///
-    /// When `block_rule_divisors` is `Some`, gate the rule on its slowed-down
-    /// schedule (iowh): apply only when `generation % divisor == 0` AND the
-    /// rule's offset `(generation / divisor) & 1` equals `pass_offset`. The
-    /// fast path passes `None` and relies on the caller iterating one offset.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_block(
-        &self,
-        grid: &mut [CellState],
-        side: usize,
-        bx: usize,
-        by: usize,
-        bz: usize,
-        block_rule_divisors: Option<&[u16]>,
-        pass_offset: usize,
-    ) {
-        // Read the 8 cells. OOB → empty (absorbing boundary).
-        let mut block = [Cell::EMPTY; 8];
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let x = bx + dx;
-                    let y = by + dy;
-                    let z = bz + dz;
-                    if x < side && y < side && z < side {
-                        let idx = x + y * side + z * side * side;
-                        block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
-                    }
-                }
-            }
-        }
-
-        // Skip all-empty blocks (optimization).
-        if block.iter().all(|c| c.is_empty()) {
-            return;
-        }
-
-        // Dispatch: find the unique block rule across all cells.
-        let rule_id = match self.unique_block_rule(&block) {
-            Some(id) => id,
-            None => return, // zero or multiple distinct rules → skip
-        };
-
-        if let Some(divisors) = block_rule_divisors {
-            let divisor = divisors.get(rule_id.0).copied().unwrap_or(1).max(1) as u64;
-            if !self.generation.is_multiple_of(divisor) {
-                return;
-            }
-            let rule_offset = ((self.generation / divisor) & 1) as usize;
-            if rule_offset != pass_offset {
-                return;
-            }
-        }
-
-        let movable: [bool; 8] = std::array::from_fn(|i| {
-            let c = block[i];
-            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
-        });
-
-        let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block, &movable);
-
-        // Mass conservation assertion: output must be a permutation of input.
-        debug_assert!(
-            {
-                let mut inp: Vec<u16> = block.iter().map(|c| c.raw()).collect();
-                let mut out: Vec<u16> = result.iter().map(|c| c.raw()).collect();
-                inp.sort();
-                out.sort();
-                inp == out
-            },
-            "block rule violated mass conservation at ({bx}, {by}, {bz})"
-        );
-
-        // Contract assertion: immovable cells must be left in place by the
-        // rule. Without this, a buggy rule that swaps an immovable cell into
-        // a movable slot would silently delete the immovable cell's value
-        // (the write-back filter only writes movable positions). Assert
-        // here so the failure is loud, not a slow water leak.
-        debug_assert!(
-            (0..8).all(|i| movable[i] || result[i] == block[i]),
-            "block rule moved an immovable cell at ({bx}, {by}, {bz})"
-        );
-
-        // Write back. The rule is contracted to leave immovable cells fixed,
-        // so writing the rule output is safe. The `movable` filter is a
-        // belt-and-suspenders guard against a rule that violates the contract.
-        // OOB positions are silently skipped (absorbing boundary).
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let x = bx + dx;
-                    let y = by + dy;
-                    let z = bz + dz;
-                    if x >= side || y >= side || z >= side {
-                        continue;
-                    }
-                    let i = block_index(dx, dy, dz);
-                    let idx = x + y * side + z * side * side;
-                    if movable[i] {
-                        grid[idx] = result[i].raw();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Find the unique BlockRuleId across all non-empty cells in a block.
-    /// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
-    pub(crate) fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
-        let mut found: Option<BlockRuleId> = None;
-        for cell in block {
-            if let Some(id) = self.materials.block_rule_id_for_cell(*cell) {
-                match found {
-                    None => found = Some(id),
-                    Some(existing) if existing == id => {}
-                    Some(_) => return None, // multiple distinct rules → skip
-                }
-            }
-        }
-        found
+        brute_step_grid(grid, self.side(), &self.materials, self.generation)
     }
 
     /// Place a random seed pattern in the center of the world.
@@ -2956,6 +2724,257 @@ impl World {
         self.block_rule_present = None;
         Ok(stats)
     }
+}
+
+/// Brute-force step on a flat grid (CA pass + Margolus block pass).
+/// Module-level free function so both `World::step` and
+/// `ChunkArrayWorld::step` (src/sim/chunk_array.rs) call the same
+/// implementation — single source of truth for brute-force semantics
+/// across the hashlife and chunk-array engines.
+///
+/// Reads `generation` once at entry; callers that iterate must advance
+/// the generation themselves between calls (`World::step` does this via
+/// `commit_step`; `ChunkArrayWorld::step` increments its own counter
+/// after the call returns).
+pub(crate) fn brute_step_grid(
+    grid: &[CellState],
+    side: usize,
+    materials: &MaterialRegistry,
+    generation: u64,
+) -> Vec<CellState> {
+    let mut next = vec![0 as CellState; side * side * side];
+    let divisor_by_material = materials.tick_divisor_flags();
+
+    // Phase 1: cell-wise CaRule pass (Moore neighborhood). Per-material
+    // tick_divisor gate mirrors the hashlife path (iowh) so the brute and
+    // recursive paths produce identical output at every generation.
+    for z in 0..side {
+        for y in 0..side {
+            for x in 0..side {
+                let idx = x + y * side + z * side * side;
+                let raw = grid[idx];
+                let center = Cell::from_raw(raw);
+                let mat = center.material() as usize;
+                let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                if divisor > 1 && !generation.is_multiple_of(divisor) {
+                    next[idx] = raw;
+                    continue;
+                }
+                let neighbors = get_neighbors(grid, side, x, y, z);
+                let rule = materials.rule_for_cell(center).unwrap_or_else(|| {
+                    panic!("missing CaRule for material {}", center.material())
+                });
+                next[idx] = rule.step_cell(center, &neighbors).raw();
+            }
+        }
+    }
+
+    // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
+    // Static internal gaps close in 1-2 ticks via the alternating
+    // partition offset (qy4g epic decision 2026-04-26, option G).
+    // Gaps within free-falling columns are co-moving with the column
+    // and appear as a sustained checkerboard until the leading edge
+    // compacts against a solid surface — see SPEC.md for the in-flight
+    // visible-artifact tradeoff and fallbacks A/F. No post-pass
+    // gap-fill runs in production.
+    brute_step_blocks(&mut next, side, materials, generation);
+    next
+}
+
+/// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
+///
+/// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
+/// Blocks at edges use absorbing boundary conditions: out-of-bounds cells
+/// are treated as empty, matching hashlife's pad-with-empty semantics.
+///
+/// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
+/// distinct rule exists, run it. If zero or multiple: skip (identity).
+///
+/// Under per-material tick_divisors (iowh): when any divisor > 1, iterate
+/// both offsets and gate each block on its rule's `(generation / divisor) & 1`
+/// Margolus offset + firing cadence, matching the hashlife path.
+fn brute_step_blocks(
+    grid: &mut [CellState],
+    side: usize,
+    materials: &MaterialRegistry,
+    generation: u64,
+) {
+    let block_rule_divisors = materials.block_rule_tick_divisors();
+    let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1);
+
+    if all_divisors_one {
+        let offset = (generation & 1) as usize;
+        let mut bz = offset;
+        while bz < side {
+            let mut by = offset;
+            while by < side {
+                let mut bx = offset;
+                while bx < side {
+                    brute_apply_block(grid, side, bx, by, bz, None, 0, materials, generation);
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+        return;
+    }
+
+    for pass_offset in 0..2usize {
+        let mut bz = pass_offset;
+        while bz < side {
+            let mut by = pass_offset;
+            while by < side {
+                let mut bx = pass_offset;
+                while bx < side {
+                    brute_apply_block(
+                        grid,
+                        side,
+                        bx,
+                        by,
+                        bz,
+                        Some(block_rule_divisors),
+                        pass_offset,
+                        materials,
+                        generation,
+                    );
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+    }
+}
+
+/// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
+///
+/// Cells outside the grid boundary are treated as empty (absorbing BC).
+///
+/// When `block_rule_divisors` is `Some`, gate the rule on its slowed-down
+/// schedule (iowh): apply only when `generation % divisor == 0` AND the
+/// rule's offset `(generation / divisor) & 1` equals `pass_offset`. The
+/// fast path passes `None` and relies on the caller iterating one offset.
+#[allow(clippy::too_many_arguments)]
+fn brute_apply_block(
+    grid: &mut [CellState],
+    side: usize,
+    bx: usize,
+    by: usize,
+    bz: usize,
+    block_rule_divisors: Option<&[u16]>,
+    pass_offset: usize,
+    materials: &MaterialRegistry,
+    generation: u64,
+) {
+    // Read the 8 cells. OOB → empty (absorbing boundary).
+    let mut block = [Cell::EMPTY; 8];
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let x = bx + dx;
+                let y = by + dy;
+                let z = bz + dz;
+                if x < side && y < side && z < side {
+                    let idx = x + y * side + z * side * side;
+                    block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
+                }
+            }
+        }
+    }
+
+    // Skip all-empty blocks (optimization).
+    if block.iter().all(|c| c.is_empty()) {
+        return;
+    }
+
+    // Dispatch: find the unique block rule across all cells.
+    let rule_id = match brute_unique_block_rule(&block, materials) {
+        Some(id) => id,
+        None => return, // zero or multiple distinct rules → skip
+    };
+
+    if let Some(divisors) = block_rule_divisors {
+        let divisor = divisors.get(rule_id.0).copied().unwrap_or(1).max(1) as u64;
+        if !generation.is_multiple_of(divisor) {
+            return;
+        }
+        let rule_offset = ((generation / divisor) & 1) as usize;
+        if rule_offset != pass_offset {
+            return;
+        }
+    }
+
+    let movable: [bool; 8] = std::array::from_fn(|i| {
+        let c = block[i];
+        c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
+    });
+
+    let rule = materials.block_rule(rule_id);
+    let result = rule.step_block(&block, &movable);
+
+    // Mass conservation assertion: output must be a permutation of input.
+    debug_assert!(
+        {
+            let mut inp: Vec<u16> = block.iter().map(|c| c.raw()).collect();
+            let mut out: Vec<u16> = result.iter().map(|c| c.raw()).collect();
+            inp.sort();
+            out.sort();
+            inp == out
+        },
+        "block rule violated mass conservation at ({bx}, {by}, {bz})"
+    );
+
+    // Contract assertion: immovable cells must be left in place by the
+    // rule. Without this, a buggy rule that swaps an immovable cell into
+    // a movable slot would silently delete the immovable cell's value
+    // (the write-back filter only writes movable positions). Assert
+    // here so the failure is loud, not a slow water leak.
+    debug_assert!(
+        (0..8).all(|i| movable[i] || result[i] == block[i]),
+        "block rule moved an immovable cell at ({bx}, {by}, {bz})"
+    );
+
+    // Write back. The rule is contracted to leave immovable cells fixed,
+    // so writing the rule output is safe. The `movable` filter is a
+    // belt-and-suspenders guard against a rule that violates the contract.
+    // OOB positions are silently skipped (absorbing boundary).
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let x = bx + dx;
+                let y = by + dy;
+                let z = bz + dz;
+                if x >= side || y >= side || z >= side {
+                    continue;
+                }
+                let i = block_index(dx, dy, dz);
+                let idx = x + y * side + z * side * side;
+                if movable[i] {
+                    grid[idx] = result[i].raw();
+                }
+            }
+        }
+    }
+}
+
+/// Find the unique BlockRuleId across all non-empty cells in a block.
+/// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
+fn brute_unique_block_rule(
+    block: &[Cell; 8],
+    materials: &MaterialRegistry,
+) -> Option<BlockRuleId> {
+    let mut found: Option<BlockRuleId> = None;
+    for cell in block {
+        if let Some(id) = materials.block_rule_id_for_cell(*cell) {
+            match found {
+                None => found = Some(id),
+                Some(existing) if existing == id => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
 }
 
 /// Cascading bottom-to-top sweep that fills internal air gaps in
