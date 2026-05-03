@@ -63,6 +63,10 @@ impl MutationQueue {
         self.pending.is_empty()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &WorldMutation> {
+        self.pending.iter()
+    }
+
     /// Drain all pending mutations. Used by `World::apply_mutations`.
     pub(crate) fn take(&mut self) -> Vec<WorldMutation> {
         std::mem::take(&mut self.pending)

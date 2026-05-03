@@ -8,6 +8,7 @@ use hash_thing::sim;
 use hash_thing::sim::world::quarantine_atlas_mixed_containment_plan;
 use hash_thing::sim::world::QuarantineAtlasPattern;
 use hash_thing::terrain;
+use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, LAVA, LAVA_MATERIAL_ID};
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -569,6 +570,70 @@ fn collect_visible_particle_data(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VisibleParticleCounts {
+    total: usize,
+    lava: usize,
+    fire: usize,
+}
+
+fn count_visible_particle_materials(data: &[[f32; 4]]) -> VisibleParticleCounts {
+    let mut counts = VisibleParticleCounts {
+        total: data.len(),
+        ..Default::default()
+    };
+    for item in data {
+        match item[3].to_bits() as u16 {
+            LAVA_MATERIAL_ID => counts.lava += 1,
+            FIRE_MATERIAL_ID => counts.fire += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn count_queued_lava_stamp_attempts(queue: &sim::MutationQueue) -> usize {
+    queue
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation,
+                sim::WorldMutation::SetCell { state, .. } if *state == LAVA
+            )
+        })
+        .count()
+}
+
+fn count_new_lava_stamp_targets(world: &sim::World, queue: &sim::MutationQueue) -> usize {
+    let side = world.side() as i64;
+    let min = world.origin;
+    let max = [min[0] + side, min[1] + side, min[2] + side];
+    queue
+        .iter()
+        .filter_map(|mutation| match mutation {
+            sim::WorldMutation::SetCell { x, y, z, state } if *state == LAVA => {
+                let coord = [x.0, y.0, z.0];
+                let in_bounds = coord[0] >= min[0]
+                    && coord[0] < max[0]
+                    && coord[1] >= min[1]
+                    && coord[1] < max[1]
+                    && coord[2] >= min[2]
+                    && coord[2] < max[2];
+                in_bounds.then_some(coord)
+            }
+            _ => None,
+        })
+        .filter(|coord| {
+            world.get(
+                sim::WorldCoord(coord[0]),
+                sim::WorldCoord(coord[1]),
+                sim::WorldCoord(coord[2]),
+            ) != LAVA
+        })
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlayerPose {
     pos: [f64; 3],
@@ -1070,6 +1135,8 @@ struct App {
     dump_pose: Option<DumpPose>,
     /// hash-thing-nznv: diagnostic shader mode for one-shot dump frames.
     dump_debug: Option<DumpDebugMode>,
+    /// hash-thing-ifre.1: one-shot particle/world layer diagnostic.
+    dump_layer: Option<DumpLayer>,
     /// hash-thing-u8m4: dump-frame-only render LOD bias override.
     dump_lod_bias: Option<f32>,
     /// hash-thing-7aqo: dump-frame-only synchronous sim steps before capture.
@@ -1943,6 +2010,7 @@ impl App {
             dump_scene: None,
             dump_pose: None,
             dump_debug: None,
+            dump_layer: None,
             dump_lod_bias: None,
             dump_steps_remaining: 0,
             dump_soup_catalog: false,
@@ -2544,6 +2612,15 @@ impl App {
             self.render_origin,
             self.render_inv_size,
         );
+        if self.dump_frame_path.is_some() {
+            let counts = count_visible_particle_materials(&particle_data);
+            log::info!(
+                "--dump-layer: visible_particles total={} lava={} fire={}",
+                counts.total,
+                counts.lava,
+                counts.fire
+            );
+        }
 
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_particles(&particle_data);
@@ -2656,11 +2733,23 @@ impl App {
 
     fn run_sync_dump_step(&mut self) {
         self.clear_soup_prospector_markers_for_step();
+        if self.dump_frame_path.is_some() {
+            log::info!(
+                "--dump-layer: applied_lava_stamp_targets_this_step={}",
+                count_new_lava_stamp_targets(&self.world, &self.world.queue)
+            );
+        }
         self.world.apply_mutations();
         self.world.spawn_clones();
         self.world.step_recursive();
         let mut queue = std::mem::take(&mut self.world.queue);
         self.entities.update(&self.world, &mut queue);
+        if self.dump_frame_path.is_some() {
+            log::info!(
+                "--dump-layer: queued_lava_stamp_attempts_for_next_step={}",
+                count_queued_lava_stamp_attempts(&queue)
+            );
+        }
         self.world.queue = queue;
         self.mark_world_changed();
         self.refresh_memo_summary_after_world_update();
@@ -2864,6 +2953,12 @@ impl App {
                 // &mut EntityStore).
                 let mut queue = std::mem::take(&mut self.world.queue);
                 self.entities.update(&self.world, &mut queue);
+                if self.dump_frame_path.is_some() {
+                    log::info!(
+                        "--dump-layer: queued_lava_stamp_attempts_for_next_step={}",
+                        count_queued_lava_stamp_attempts(&queue)
+                    );
+                }
                 self.world.queue = queue;
                 self.sync_render_cache();
                 // SVDAG rebuild + GPU upload.
@@ -3281,6 +3376,12 @@ impl App {
                 yaw: std::f32::consts::FRAC_PI_2,
                 pitch: 0.24,
                 dist: 0.34,
+            }),
+            DumpPose::Volcano => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.10, 0.50],
+                yaw: -std::f32::consts::FRAC_PI_4,
+                pitch: 0.22,
+                dist: 0.30,
             }),
         }
         log::info!("--dump-pose: applied {}", pose.label());
@@ -4659,6 +4760,10 @@ impl ApplicationHandler<AppUserEvent> for App {
             if let Some(mode) = self.dump_debug {
                 renderer.debug_mode = mode.renderer_debug_mode();
             }
+            if let Some(layer) = self.dump_layer {
+                renderer.render_world_layer = layer.render_world();
+                renderer.render_particle_layer = layer.render_particles();
+            }
             if let Some(bias) = self.dump_lod_bias {
                 renderer.lod_bias = bias;
             }
@@ -5901,6 +6006,7 @@ enum DumpPose {
     Blocks,
     TerrainWide,
     Geyser,
+    Volcano,
 }
 
 impl DumpPose {
@@ -5910,6 +6016,7 @@ impl DumpPose {
             "blocks" => Some(Self::Blocks),
             "terrain-wide" => Some(Self::TerrainWide),
             "geyser" => Some(Self::Geyser),
+            "volcano" => Some(Self::Volcano),
             _ => None,
         }
     }
@@ -5920,6 +6027,7 @@ impl DumpPose {
             Self::Blocks => "blocks",
             Self::TerrainWide => "terrain-wide",
             Self::Geyser => "geyser",
+            Self::Volcano => "volcano",
         }
     }
 }
@@ -5958,6 +6066,40 @@ impl DumpDebugMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpLayer {
+    Composite,
+    World,
+    Particles,
+}
+
+impl DumpLayer {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "composite" => Some(Self::Composite),
+            "world" => Some(Self::World),
+            "particles" => Some(Self::Particles),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Composite => "composite",
+            Self::World => "world",
+            Self::Particles => "particles",
+        }
+    }
+
+    fn render_world(self) -> bool {
+        matches!(self, Self::Composite | Self::World)
+    }
+
+    fn render_particles(self) -> bool {
+        matches!(self, Self::Composite | Self::Particles)
+    }
+}
+
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
 /// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
 /// `demo`).
@@ -5981,6 +6123,9 @@ struct ParsedArgs {
     /// `--dump-debug MODE`: hash-thing-nznv, only meaningful with
     /// `--dump-frame`. Selects a diagnostic shader mode before capture.
     dump_debug: Option<DumpDebugMode>,
+    /// `--dump-layer MODE`: hash-thing-ifre.1, only meaningful with
+    /// `--dump-frame`. Selects composite/world/particle visibility.
+    dump_layer: Option<DumpLayer>,
     /// `--dump-lod-bias VALUE`: hash-thing-u8m4, only meaningful with
     /// `--dump-frame`. Overrides renderer LOD bias before capture.
     dump_lod_bias: Option<f32>,
@@ -6016,8 +6161,9 @@ where
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
                          [--dump-frame PATH] \
                          [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|soup-prospector|lattice-intro|lattice-interior|lattice-panorama] \
-                         [--dump-pose wall|blocks|terrain-wide|geyser] \
+                         [--dump-pose wall|blocks|terrain-wide|geyser|volcano] \
                          [--dump-debug normal-axis|hit-kind|material] \
+                         [--dump-layer composite|world|particles] \
                          [--dump-lod-bias VALUE] \
                          [--dump-steps N] \
                          [--dump-soup-catalog] [--dump-soup-reuse]";
@@ -6028,6 +6174,7 @@ where
     let mut dump_scene: Option<DumpScene> = None;
     let mut dump_pose: Option<DumpPose> = None;
     let mut dump_debug: Option<DumpDebugMode> = None;
+    let mut dump_layer: Option<DumpLayer> = None;
     let mut dump_lod_bias: Option<f32> = None;
     let mut dump_steps: Option<u32> = None;
     let mut dump_soup_catalog = false;
@@ -6119,6 +6266,22 @@ where
                 });
                 dump_debug = Some(parsed);
             }
+            "--dump-layer" => {
+                if dump_layer.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-layer");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-layer requires a MODE"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-layer requires a MODE; saw '{v_str}'");
+                }
+                let parsed = DumpLayer::parse(v_str).unwrap_or_else(|| {
+                    panic!("{USAGE}\n--dump-layer MODE: unrecognised '{v_str}'")
+                });
+                dump_layer = Some(parsed);
+            }
             "--dump-lod-bias" => {
                 if dump_lod_bias.is_some() {
                     panic!("{USAGE}\nmore than one --dump-lod-bias");
@@ -6193,6 +6356,9 @@ where
     if dump_debug.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-debug requires --dump-frame");
     }
+    if dump_layer.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-layer requires --dump-frame");
+    }
     if dump_lod_bias.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-lod-bias requires --dump-frame");
     }
@@ -6226,6 +6392,7 @@ where
         dump_scene,
         dump_pose,
         dump_debug,
+        dump_layer,
         dump_lod_bias,
         dump_steps: dump_steps.unwrap_or(0),
         dump_soup_catalog,
@@ -6277,6 +6444,7 @@ fn main() {
         dump_scene,
         dump_pose,
         dump_debug,
+        dump_layer,
         dump_lod_bias,
         dump_steps,
         dump_soup_catalog,
@@ -6317,6 +6485,12 @@ fn main() {
         log::info!(
             "--dump-debug: {} (will apply before dump-frame render)",
             mode.label()
+        );
+    }
+    if let Some(layer) = dump_layer {
+        log::info!(
+            "--dump-layer: {} (will apply before dump-frame render)",
+            layer.label()
         );
     }
     if let Some(bias) = dump_lod_bias {
@@ -6381,6 +6555,7 @@ fn main() {
     app.dump_scene = dump_scene;
     app.dump_pose = dump_pose;
     app.dump_debug = dump_debug;
+    app.dump_layer = dump_layer;
     app.dump_lod_bias = dump_lod_bias;
     app.dump_steps_remaining = dump_steps;
     app.dump_soup_catalog = dump_soup_catalog;
@@ -6860,6 +7035,7 @@ mod tests {
             ("blocks", DumpPose::Blocks),
             ("terrain-wide", DumpPose::TerrainWide),
             ("geyser", DumpPose::Geyser),
+            ("volcano", DumpPose::Volcano),
         ] {
             let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-pose", raw]);
             assert_eq!(r.dump_pose, Some(expected), "pose={raw}");
@@ -6916,6 +7092,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_from_dump_layer_all_kinds() {
+        for (raw, expected, render_world, render_particles) in [
+            ("composite", DumpLayer::Composite, true, true),
+            ("world", DumpLayer::World, true, false),
+            ("particles", DumpLayer::Particles, false, true),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-layer", raw]);
+            assert_eq!(r.dump_layer, Some(expected), "kind={raw}");
+            assert_eq!(expected.render_world(), render_world, "kind={raw}");
+            assert_eq!(expected.render_particles(), render_particles, "kind={raw}");
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "--dump-scene requires --dump-frame")]
     fn parse_args_from_dump_scene_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-scene", "lattice-intro"]);
@@ -6931,6 +7121,12 @@ mod tests {
     #[should_panic(expected = "--dump-debug requires --dump-frame")]
     fn parse_args_from_dump_debug_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-debug", "normal-axis"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-layer requires --dump-frame")]
+    fn parse_args_from_dump_layer_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-layer", "particles"]);
     }
 
     #[test]
@@ -7042,6 +7238,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "--dump-layer MODE: unrecognised 'bogus'")]
+    fn parse_args_from_dump_layer_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-layer", "bogus"]);
+    }
+
+    #[test]
     #[should_panic(expected = "more than one --dump-scene")]
     fn parse_args_from_two_dump_scene_panics() {
         let _ = parse_args_from([
@@ -7077,6 +7279,19 @@ mod tests {
             "normal-axis",
             "--dump-debug",
             "hit-kind",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-layer")]
+    fn parse_args_from_two_dump_layer_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-layer",
+            "world",
+            "--dump-layer",
+            "particles",
         ]);
     }
 
@@ -7940,6 +8155,67 @@ mod tests {
         );
         assert_eq!(visible[0][3].to_bits(), VINE_MATERIAL_ID as u32);
         assert!((visible[0][0] - 2.5 / world.side() as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn particle_diagnostic_counts_visible_fire_and_lava() {
+        let data = [
+            [0.0, 0.0, 0.0, f32::from_bits(FIRE_MATERIAL_ID as u32)],
+            [0.0, 0.0, 0.0, f32::from_bits(LAVA_MATERIAL_ID as u32)],
+            [0.0, 0.0, 0.0, f32::from_bits(LAVA_MATERIAL_ID as u32)],
+            [0.0, 0.0, 0.0, f32::from_bits(VINE_MATERIAL_ID as u32)],
+        ];
+
+        assert_eq!(
+            count_visible_particle_materials(&data),
+            VisibleParticleCounts {
+                total: 4,
+                lava: 2,
+                fire: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn particle_diagnostic_counts_queued_lava_stamp_attempts() {
+        let mut queue = sim::MutationQueue::new();
+        queue.push(sim::WorldMutation::SetCell {
+            x: sim::WorldCoord(1),
+            y: sim::WorldCoord(2),
+            z: sim::WorldCoord(3),
+            state: LAVA,
+        });
+        queue.push(sim::WorldMutation::SetCell {
+            x: sim::WorldCoord(4),
+            y: sim::WorldCoord(5),
+            z: sim::WorldCoord(6),
+            state: hash_thing::terrain::materials::FIRE,
+        });
+
+        assert_eq!(count_queued_lava_stamp_attempts(&queue), 1);
+    }
+
+    #[test]
+    fn particle_diagnostic_counts_distinct_new_in_bounds_lava_targets() {
+        let mut world = sim::World::new(3);
+        world.set(
+            sim::WorldCoord(2),
+            sim::WorldCoord(2),
+            sim::WorldCoord(2),
+            LAVA,
+        );
+
+        let mut queue = sim::MutationQueue::new();
+        for (x, y, z) in [(1, 2, 3), (1, 2, 3), (2, 2, 2), (999, 2, 3)] {
+            queue.push(sim::WorldMutation::SetCell {
+                x: sim::WorldCoord(x),
+                y: sim::WorldCoord(y),
+                z: sim::WorldCoord(z),
+                state: LAVA,
+            });
+        }
+
+        assert_eq!(count_new_lava_stamp_targets(&world, &queue), 1);
     }
 
     #[test]

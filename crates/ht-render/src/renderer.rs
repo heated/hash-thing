@@ -533,6 +533,9 @@ pub struct Renderer {
 
     /// Debug render mode. 0 = normal, 1 = step-count heatmap, 2+=dump diagnostics.
     pub debug_mode: u32,
+    /// Diagnostic layer switches for one-shot captures.
+    pub render_world_layer: bool,
+    pub render_particle_layer: bool,
     /// LOD bias multiplier. 1.0 = default, higher = more aggressive LOD.
     pub lod_bias: f32,
     /// Render resolution scale. 0.5 = half-res (4x fewer pixels), 1.0 = full.
@@ -1767,6 +1770,8 @@ impl Renderer {
             camera_dist: 2.0,
             camera_target: [0.5, 0.5, 0.5],
             debug_mode: 0,
+            render_world_layer: true,
+            render_particle_layer: true,
             lod_bias: 1.0,
             render_scale,
             gpu_timing,
@@ -2703,14 +2708,14 @@ impl Renderer {
             });
 
             // Blit compute output to swapchain (fullscreen triangle).
-            if self.svdag_compute_bind_group.is_some() {
+            if self.render_world_layer && self.svdag_compute_bind_group.is_some() {
                 render_pass.set_pipeline(&self.blit_pipeline);
                 render_pass.set_bind_group(0, &self.blit_bind_group, &[]);
                 render_pass.draw(0..3, 0..1); // fullscreen triangle = 3 verts
             }
 
             // Particle overlay — drawn after voxels with alpha blending.
-            if self.particle_count > 0 {
+            if self.render_particle_layer && self.particle_count > 0 {
                 if let Some(bg) = &self.particle_bind_group {
                     render_pass.set_pipeline(&self.particle_pipeline);
                     render_pass.set_bind_group(0, bg, &[]);
