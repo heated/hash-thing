@@ -9,6 +9,7 @@ use hash_thing::terrain::materials::{METAL, METAL_MATERIAL_ID, SAND, STONE, WATE
 use hash_thing::terrain::TerrainParams;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -382,6 +383,21 @@ struct ComparisonRecord {
     notes: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ComparisonJsonlRecord {
+    schema_version: u32,
+    record_kind: String,
+    comparison_id: String,
+    subject_measurement_id: String,
+    baseline_measurement_id: String,
+    ratio: f64,
+    ratio_metric: String,
+    scenario_hash: String,
+    #[serde(default)]
+    setup: Option<String>,
+    rule_set: String,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("scenario-runner: {err}");
@@ -421,6 +437,7 @@ where
             let record = compare_records(&jsonl, &subject_id, &baseline_id, &metric, options)?;
             serde_json::to_string(&record).map_err(|err| format!("serialize comparison: {err}"))?
         }
+        Mode::Lint { jsonl_paths } => lint_jsonl_files(&jsonl_paths)?,
     };
     if let Some(append_path) = args.append {
         append_jsonl(&append_path, &line)?;
@@ -445,6 +462,9 @@ enum Mode {
         metric: String,
         options: CompareOptions,
     },
+    Lint {
+        jsonl_paths: Vec<PathBuf>,
+    },
 }
 
 impl Mode {
@@ -452,6 +472,7 @@ impl Mode {
         match self {
             Mode::Run { scenario, .. } => vec![scenario.as_path()],
             Mode::Compare { jsonl, .. } => vec![jsonl.as_path()],
+            Mode::Lint { .. } => Vec::new(),
         }
     }
 }
@@ -469,7 +490,16 @@ where
     let first = raw.next().ok_or_else(usage)?;
     let mut append = None;
     let mut hardware = "unknown".to_string();
-    let mode = if first == "--compare" {
+    let mode = if first == "--lint-jsonl" {
+        let jsonl_paths: Vec<PathBuf> = raw.map(PathBuf::from).collect();
+        if jsonl_paths.is_empty() {
+            return Err(format!(
+                "--lint-jsonl requires at least one path\n{}",
+                usage()
+            ));
+        }
+        Mode::Lint { jsonl_paths }
+    } else if first == "--compare" {
         let jsonl = raw
             .next()
             .map(PathBuf::from)
@@ -539,6 +569,180 @@ fn read_utf8(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|err| format!("{} is not UTF-8: {err}", path.display()))
 }
 
+fn lint_jsonl_files(paths: &[PathBuf]) -> Result<String, String> {
+    let mut measurements = HashMap::new();
+    let mut comparisons = Vec::new();
+    let mut existing_files = 0usize;
+    let mut record_count = 0usize;
+
+    for path in paths {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("missing lint input: {}", path.display()));
+            }
+            Err(err) => return Err(format!("read {}: {err}", path.display())),
+        };
+        existing_files += 1;
+        for (line_index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            record_count += 1;
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|err| {
+                format!("parse {} line {}: {err}", path.display(), line_index + 1)
+            })?;
+            match value.get("record_kind").and_then(|v| v.as_str()) {
+                Some("measurement") => {
+                    let record: MeasurementRecord =
+                        serde_json::from_value(value).map_err(|err| {
+                            format!(
+                                "parse measurement {} line {}: {err}",
+                                path.display(),
+                                line_index + 1
+                            )
+                        })?;
+                    validate_measurement_record(&record)?;
+                    let measurement_id = record.measurement_id.clone();
+                    if measurements
+                        .insert(measurement_id.clone(), record)
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "duplicate measurement_id across lint inputs: {}",
+                            measurement_id
+                        ));
+                    }
+                }
+                Some("comparison") => {
+                    let record: ComparisonJsonlRecord =
+                        serde_json::from_value(value).map_err(|err| {
+                            format!(
+                                "parse comparison {} line {}: {err}",
+                                path.display(),
+                                line_index + 1
+                            )
+                        })?;
+                    comparisons.push((path.clone(), line_index + 1, record));
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "invalid record_kind {:?} in {} line {}",
+                        other,
+                        path.display(),
+                        line_index + 1
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "missing record_kind in {} line {}",
+                        path.display(),
+                        line_index + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut comparison_ids = HashSet::new();
+    for (path, line, comparison) in comparisons {
+        validate_comparison_record(&comparison, &measurements)
+            .map_err(|err| format!("{} line {}: {err}", path.display(), line))?;
+        if !comparison_ids.insert(comparison.comparison_id.clone()) {
+            return Err(format!(
+                "duplicate comparison_id across lint inputs: {}",
+                comparison.comparison_id
+            ));
+        }
+    }
+
+    Ok(format!(
+        "perf JSONL lint passed: {record_count} records across {existing_files} existing files"
+    ))
+}
+
+fn validate_comparison_record(
+    comparison: &ComparisonJsonlRecord,
+    measurements: &HashMap<String, MeasurementRecord>,
+) -> Result<(), String> {
+    if comparison.schema_version != 2 {
+        return Err(format!(
+            "unsupported comparison schema_version {} for {}",
+            comparison.schema_version, comparison.comparison_id
+        ));
+    }
+    if comparison.record_kind != "comparison" {
+        return Err(format!(
+            "record_kind is not comparison: {}",
+            comparison.record_kind
+        ));
+    }
+    let subject = measurements
+        .get(&comparison.subject_measurement_id)
+        .ok_or_else(|| {
+            format!(
+                "subject_measurement_id not found for {}: {}",
+                comparison.comparison_id, comparison.subject_measurement_id
+            )
+        })?;
+    let baseline = measurements
+        .get(&comparison.baseline_measurement_id)
+        .ok_or_else(|| {
+            format!(
+                "baseline_measurement_id not found for {}: {}",
+                comparison.comparison_id, comparison.baseline_measurement_id
+            )
+        })?;
+    compare_str(
+        "comparison.scenario_hash",
+        &comparison.scenario_hash,
+        &subject.scenario_hash,
+    )?;
+    compare_str(
+        "comparison.scenario_hash",
+        &comparison.scenario_hash,
+        &baseline.scenario_hash,
+    )?;
+    compare_str(
+        "comparison.rule_set",
+        &comparison.rule_set,
+        &subject.rule_set,
+    )?;
+    compare_str(
+        "comparison.rule_set",
+        &comparison.rule_set,
+        &baseline.rule_set,
+    )?;
+    if comparison.setup != subject.setup || comparison.setup != baseline.setup {
+        return Err(format!(
+            "comparison setup {:?} does not match referenced measurements {:?} / {:?}",
+            comparison.setup, subject.setup, baseline.setup
+        ));
+    }
+    let subject_value = metric_value(&subject.metrics, &comparison.ratio_metric)?;
+    let baseline_value = metric_value(&baseline.metrics, &comparison.ratio_metric)?;
+    if baseline_value == 0.0 {
+        return Err(format!(
+            "baseline metric {} is zero for {}",
+            comparison.ratio_metric, comparison.comparison_id
+        ));
+    }
+    let expected_ratio = subject_value / baseline_value;
+    if !comparison.ratio.is_finite()
+        || (comparison.ratio - expected_ratio).abs() > expected_ratio.abs().max(1.0) * 1e-9
+    {
+        return Err(format!(
+            "comparison ratio {} does not match {} / {} = {} for {}",
+            comparison.ratio,
+            subject_value,
+            baseline_value,
+            expected_ratio,
+            comparison.comparison_id
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hardware(hardware: &str) -> Result<(), String> {
     match hardware {
         "m2-pro-mbp" | "m2-ultra-mac-pro" | "ci-runner-x86" | "unknown" => Ok(()),
@@ -547,7 +751,7 @@ fn validate_hardware(hardware: &str) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin scenario-runner -- <scenario.ron> [--hardware <enum>] [--append <out.jsonl>]\n       cargo run --bin scenario-runner -- --compare <jsonl> <subject-id> <baseline-id> [--metric step_p95_ms] [--allow-trajectory-drift] [--append <out.jsonl>]".to_string()
+    "usage: cargo run --bin scenario-runner -- <scenario.ron> [--hardware <enum>] [--append <out.jsonl>]\n       cargo run --bin scenario-runner -- --compare <jsonl> <subject-id> <baseline-id> [--metric step_p95_ms] [--allow-trajectory-drift] [--append <out.jsonl>]\n       cargo run --bin scenario-runner -- --lint-jsonl <perf-runs.jsonl> [more.jsonl ...]".to_string()
 }
 
 fn append_jsonl(path: &Path, line: &str) -> Result<(), String> {
@@ -1162,6 +1366,26 @@ fn validate_measurement_confidence(record: &MeasurementRecord) -> Result<(), Str
             "confidence.n must be positive for {}",
             record.measurement_id
         ));
+    }
+    match record.confidence.cherry_pick_audit.as_str() {
+        "easy_only"
+            if matches!(
+                record.confidence.hard_followup_bead.as_deref(),
+                None | Some("")
+            ) =>
+        {
+            return Err(format!(
+                "confidence.cherry_pick_audit=easy_only requires hard_followup_bead for {}",
+                record.measurement_id
+            ));
+        }
+        "easy_only" | "hard_included" | "mixed" | "n/a" => {}
+        other => {
+            return Err(format!(
+                "invalid confidence.cherry_pick_audit {:?} for {}",
+                other, record.measurement_id
+            ));
+        }
     }
     if record.confidence.warm_frame_policy == "all-frames" {
         return Ok(());
@@ -2919,6 +3143,120 @@ mod tests {
     }
 
     #[test]
+    fn lint_jsonl_rejects_easy_only_without_hard_followup() {
+        let mut record = test_measurement("easy", "chunk-array", "n/a", 10.0);
+        record.confidence.cherry_pick_audit = "easy_only".to_string();
+        record.confidence.hard_followup_bead = None;
+        let path = write_jsonl(&[&record]);
+
+        let err = lint_jsonl_files(std::slice::from_ref(&path)).unwrap_err();
+
+        assert!(
+            err.contains("easy_only requires hard_followup_bead"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lint_jsonl_accepts_comparison_references_matching_measurements() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        let comparison = serde_json::json!({
+            "schema_version": 2,
+            "record_kind": "comparison",
+            "comparison_id": "chunk-vs-hashlife",
+            "subject_measurement_id": "chunk",
+            "baseline_measurement_id": "hashlife",
+            "ratio": 5.0,
+            "ratio_metric": "step_p95_ms",
+            "scenario_hash": "sha256:0123456789abcdef",
+            "rule_set": "default-ca",
+            "notes": "test comparison"
+        });
+        let path = write_raw_jsonl(&format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&a).expect("measurement a"),
+            serde_json::to_string(&b).expect("measurement b"),
+            serde_json::to_string(&comparison).expect("comparison")
+        ));
+
+        let result = lint_jsonl_files(std::slice::from_ref(&path)).expect("lint");
+
+        assert!(result.contains("3 records"), "{result}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lint_jsonl_rejects_comparison_missing_measurement_reference() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let comparison = serde_json::json!({
+            "schema_version": 2,
+            "record_kind": "comparison",
+            "comparison_id": "chunk-vs-missing",
+            "subject_measurement_id": "chunk",
+            "baseline_measurement_id": "missing",
+            "ratio": 5.0,
+            "ratio_metric": "step_p95_ms",
+            "scenario_hash": "sha256:0123456789abcdef",
+            "rule_set": "default-ca",
+            "notes": "test comparison"
+        });
+        let path = write_raw_jsonl(&format!(
+            "{}\n{}\n",
+            serde_json::to_string(&a).expect("measurement a"),
+            serde_json::to_string(&comparison).expect("comparison")
+        ));
+
+        let err = lint_jsonl_files(std::slice::from_ref(&path)).unwrap_err();
+
+        assert!(err.contains("baseline_measurement_id not found"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lint_jsonl_rejects_missing_input_path() {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-missing-perf-runs-{}-{}.jsonl",
+            std::process::id(),
+            TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let err = lint_jsonl_files(std::slice::from_ref(&path)).unwrap_err();
+
+        assert!(err.contains("missing lint input"), "{err}");
+    }
+
+    #[test]
+    fn lint_jsonl_rejects_stale_comparison_ratio() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        let comparison = serde_json::json!({
+            "schema_version": 2,
+            "record_kind": "comparison",
+            "comparison_id": "chunk-vs-hashlife",
+            "subject_measurement_id": "chunk",
+            "baseline_measurement_id": "hashlife",
+            "ratio": 4.0,
+            "ratio_metric": "step_p95_ms",
+            "scenario_hash": "sha256:0123456789abcdef",
+            "rule_set": "default-ca",
+            "notes": "test comparison"
+        });
+        let path = write_raw_jsonl(&format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&a).expect("measurement a"),
+            serde_json::to_string(&b).expect("measurement b"),
+            serde_json::to_string(&comparison).expect("comparison")
+        ));
+
+        let err = lint_jsonl_files(std::slice::from_ref(&path)).unwrap_err();
+
+        assert!(err.contains("comparison ratio"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn append_hygiene_allows_only_append_target_dirty() {
         let status = " M .ship-notes/perf-runs.jsonl\n";
 
@@ -3849,6 +4187,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, format!("{body}\n")).expect("write test jsonl");
+        path
+    }
+
+    fn write_raw_jsonl(body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-scenario-runner-raw-test-{}-{}.jsonl",
+            std::process::id(),
+            TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, body).expect("write raw test jsonl");
         path
     }
 

@@ -101,6 +101,10 @@ jobs:
         if: matrix.run-tests
         run: cargo test --locked
 
+      - name: Perf JSONL lint
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo run --locked --bin scenario-runner -- --lint-jsonl notes/perf-runs.jsonl
+
       # Gating: fmt drift backlog is clear (hash-thing-k5r closed). rustfmt
       # output is deterministic across platforms, so running on the ubuntu
       # leg only is sufficient.
