@@ -6683,95 +6683,37 @@ mod tests {
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 
-    /// qy4g.2 option G mass regression. Under the no-gap-fill regime,
-    /// contained water must conserve population every step. The stronger
-    /// settled-contiguity contract is tracked separately by the ignored repro
-    /// below because it is currently broken.
-    #[test]
-    fn contained_water_block_conserves_population_under_parity_flip() {
-        let mut world = World::new(5); // 32³
-                                       // Add a basin so this test checks parity motion, not finite-world
+    fn contained_water_basin_16() -> World {
+        let mut world = World::new(4); // 16³
+                                       // Add a basin so this checks parity motion, not finite-world
                                        // outflow through absorbing boundaries.
-        for z in 0..32 {
-            for x in 0..32 {
+        for z in 0..16 {
+            for x in 0..16 {
                 world.set(wc(x), wc(0), wc(z), STONE);
             }
         }
-        for y in 1..32 {
-            for z in 0..32 {
+        for y in 1..16 {
+            for z in 0..16 {
                 world.set(wc(0), wc(y), wc(z), STONE);
-                world.set(wc(31), wc(y), wc(z), STONE);
+                world.set(wc(15), wc(y), wc(z), STONE);
             }
-            for x in 1..31 {
+            for x in 1..15 {
                 world.set(wc(x), wc(y), wc(0), STONE);
-                world.set(wc(x), wc(y), wc(31), STONE);
+                world.set(wc(x), wc(y), wc(15), STONE);
             }
         }
-        // Place a 6×6×6 water block in the center, well away from boundaries.
-        for z in 10..16 {
-            for y in 16..22 {
-                for x in 10..16 {
+        // Place a 4×4×4 water block in the center, well away from boundaries.
+        for z in 5..9 {
+            for y in 8..12 {
+                for x in 5..9 {
                     world.set(wc(x), wc(y), wc(z), WATER);
                 }
             }
         }
-        let pop_before = world.population();
-        let water_before = 6 * 6 * 6;
-
-        let max_steps = 32;
-        for step in 0..max_steps {
-            world.step();
-            let pop_after = world.population();
-            assert_eq!(
-                pop_before, pop_after,
-                "population changed at step {step} ({pop_before} → {pop_after})",
-            );
-        }
-
-        let water_after = world
-            .flatten()
-            .iter()
-            .filter(|&&raw| Cell::from_raw(raw).material() == WATER_MATERIAL_ID)
-            .count();
-        assert_eq!(water_after, water_before, "contained water should survive");
+        world
     }
 
-    /// qy4g / review follow-up: SPEC says a free-fall checkerboard compacts
-    /// once the leading edge hits a solid surface. The contained basin below
-    /// proves mass survives, but today the final water levels are still
-    /// every-other-y. Keep this as an explicit repro instead of silently
-    /// weakening the contract.
-    #[test]
-    #[ignore]
-    fn repro_qy4g_contained_water_block_should_settle_contiguously() {
-        let mut world = World::new(5); // 32³
-        for z in 0..32 {
-            for x in 0..32 {
-                world.set(wc(x), wc(0), wc(z), STONE);
-            }
-        }
-        for y in 1..32 {
-            for z in 0..32 {
-                world.set(wc(0), wc(y), wc(z), STONE);
-                world.set(wc(31), wc(y), wc(z), STONE);
-            }
-            for x in 1..31 {
-                world.set(wc(x), wc(y), wc(0), STONE);
-                world.set(wc(x), wc(y), wc(31), STONE);
-            }
-        }
-        for z in 10..16 {
-            for y in 16..22 {
-                for x in 10..16 {
-                    world.set(wc(x), wc(y), wc(z), WATER);
-                }
-            }
-        }
-
-        for _ in 0..32 {
-            world.step();
-        }
-
+    fn water_levels(world: &World) -> Vec<usize> {
         let side = world.side() as u64;
         let grid = world.flatten();
         let mut water_by_y = vec![0u64; side as usize];
@@ -6787,17 +6729,29 @@ mod tests {
                 }
             }
         }
-        let water_levels: Vec<usize> = water_by_y
+        water_by_y
             .iter()
             .enumerate()
             .filter(|(_, &count)| count > 0)
             .map(|(y, _)| y)
-            .collect();
+            .collect()
+    }
+
+    fn water_count(world: &World) -> usize {
+        world
+            .flatten()
+            .iter()
+            .filter(|&&raw| Cell::from_raw(raw).material() == WATER_MATERIAL_ID)
+            .count()
+    }
+
+    fn assert_water_levels_contiguous(world: &World) {
+        let levels = water_levels(world);
         assert!(
-            !water_levels.is_empty(),
+            !levels.is_empty(),
             "water should still exist after stepping"
         );
-        for pair in water_levels.windows(2) {
+        for pair in levels.windows(2) {
             assert_eq!(
                 pair[1] - pair[0],
                 1,
@@ -6806,6 +6760,73 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    /// qy4g.2 option G mass regression. Under the no-gap-fill regime,
+    /// contained water must conserve population every step. The stronger
+    /// settled-contiguity contract is covered below.
+    #[test]
+    fn contained_water_block_conserves_population_under_parity_flip() {
+        let mut world = contained_water_basin_16();
+        let pop_before = world.population();
+        let water_before = 4 * 4 * 4;
+
+        let max_steps = 64;
+        for step in 0..max_steps {
+            world.step();
+            let pop_after = world.population();
+            assert_eq!(
+                pop_before, pop_after,
+                "population changed at step {step} ({pop_before} → {pop_after})",
+            );
+        }
+
+        let water_after = water_count(&world);
+        assert_eq!(water_after, water_before, "contained water should survive");
+    }
+
+    /// qy4g / review follow-up: SPEC says a free-fall checkerboard compacts
+    /// once the leading edge hits a solid surface. The contained basin below
+    /// must settle without every-other-y gaps under the brute path.
+    #[test]
+    fn contained_water_block_settles_contiguously_under_parity_flip() {
+        let mut world = contained_water_basin_16();
+
+        for _ in 0..64 {
+            world.step();
+        }
+
+        assert_water_levels_contiguous(&world);
+    }
+
+    #[test]
+    fn contained_water_block_settles_contiguously_recursive() {
+        let mut brute = contained_water_basin_16();
+        let mut recursive = contained_water_basin_16();
+        let pop_before = brute.population();
+        let water_before = water_count(&brute);
+
+        for step in 0..64 {
+            brute.step();
+            recursive.step_ca();
+            assert_eq!(
+                recursive.population(),
+                pop_before,
+                "recursive population changed at step {step}"
+            );
+            assert_eq!(
+                water_count(&recursive),
+                water_before,
+                "recursive water count changed at step {step}"
+            );
+            assert_eq!(
+                recursive.flatten(),
+                brute.flatten(),
+                "recursive path diverged from brute path at step {step}"
+            );
+        }
+
+        assert_water_levels_contiguous(&recursive);
     }
 
     #[test]

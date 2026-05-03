@@ -94,30 +94,16 @@ impl BlockRule for FluidBlockRule {
         let hash = Self::content_hash(block);
         for dy in 0..2usize {
             let x_first = (hash >> dy) & 1 == 0;
+            if self.layer_is_diagonal_fluid_air(&out, dy) {
+                self.break_diagonal_layer(&mut out, dy, x_first);
+                continue;
+            }
             if x_first {
-                // X-axis first, then Z-axis
-                for dz in 0..2 {
-                    let a = block_index(0, dy, dz);
-                    let b = block_index(1, dy, dz);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
-                for dx in 0..2 {
-                    let a = block_index(dx, dy, 0);
-                    let b = block_index(dx, dy, 1);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
+                self.apply_lateral_axis(&mut out, dy, true);
+                self.apply_lateral_axis(&mut out, dy, false);
             } else {
-                // Z-axis first, then X-axis
-                for dx in 0..2 {
-                    let a = block_index(dx, dy, 0);
-                    let b = block_index(dx, dy, 1);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
-                for dz in 0..2 {
-                    let a = block_index(0, dy, dz);
-                    let b = block_index(1, dy, dz);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
+                self.apply_lateral_axis(&mut out, dy, false);
+                self.apply_lateral_axis(&mut out, dy, true);
             }
         }
 
@@ -149,6 +135,56 @@ impl FluidBlockRule {
         if (a_is_fluid && b_is_air) || (b_is_fluid && a_is_air) {
             block.swap(a, b);
         }
+    }
+
+    fn apply_lateral_axis(&self, block: &mut [Cell; 8], dy: usize, x_axis: bool) {
+        if x_axis {
+            for dz in 0..2 {
+                let a = block_index(0, dy, dz);
+                let b = block_index(1, dy, dz);
+                self.try_fluid_swap(block, a, b);
+            }
+        } else {
+            for dx in 0..2 {
+                let a = block_index(dx, dy, 0);
+                let b = block_index(dx, dy, 1);
+                self.try_fluid_swap(block, a, b);
+            }
+        }
+    }
+
+    fn break_diagonal_layer(&self, block: &mut [Cell; 8], dy: usize, x_axis: bool) {
+        let c00 = block_index(0, dy, 0);
+        let c10 = block_index(1, dy, 0);
+        let c01 = block_index(0, dy, 1);
+        let c11 = block_index(1, dy, 1);
+
+        if block[c00].material() == self.fluid_material
+            && block[c11].material() == self.fluid_material
+        {
+            if x_axis {
+                block.swap(c00, c10);
+            } else {
+                block.swap(c00, c01);
+            }
+        } else if x_axis {
+            block.swap(c10, c00);
+        } else {
+            block.swap(c10, c11);
+        }
+    }
+
+    fn layer_is_diagonal_fluid_air(&self, block: &[Cell; 8], dy: usize) -> bool {
+        let cells = [
+            block[block_index(0, dy, 0)],
+            block[block_index(1, dy, 0)],
+            block[block_index(0, dy, 1)],
+            block[block_index(1, dy, 1)],
+        ];
+        let is_fluid = |cell: Cell| cell.material() == self.fluid_material;
+        let is_air = |cell: Cell| cell.is_empty();
+        (is_fluid(cells[0]) && is_fluid(cells[3]) && is_air(cells[1]) && is_air(cells[2]))
+            || (is_fluid(cells[1]) && is_fluid(cells[2]) && is_air(cells[0]) && is_air(cells[3]))
     }
 }
 
@@ -476,6 +512,14 @@ mod tests {
         FluidBlockRule::new(simple_density, simple_phase, FLUID_MAT)
     }
 
+    fn layer_is_diagonal(block: &[Cell; 8], dy: usize, material: u16) -> bool {
+        let c00 = block[block_index(0, dy, 0)].material() == material;
+        let c10 = block[block_index(1, dy, 0)].material() == material;
+        let c01 = block[block_index(0, dy, 1)].material() == material;
+        let c11 = block[block_index(1, dy, 1)].material() == material;
+        (c00 && c11 && !c10 && !c01) || (c10 && c01 && !c00 && !c11)
+    }
+
     #[test]
     fn fluid_gravity_heavy_over_air_falls() {
         let rule = fluid_rule();
@@ -511,6 +555,85 @@ mod tests {
         assert_mass_conserved(&block, &out);
         let fluid_count: usize = out.iter().filter(|c| c.material() == FLUID_MAT).count();
         assert_eq!(fluid_count, 1, "exactly one fluid cell must exist");
+    }
+
+    #[test]
+    fn fluid_diagonal_layer_above_floor_is_not_fixed_point() {
+        let rule = fluid_rule();
+        let mut block = [Cell::EMPTY; 8];
+        let movable = [
+            false, false, false, false, // y=0 floor, immovable
+            true, true, true, true,
+        ];
+        for dx in 0..2 {
+            for dz in 0..2 {
+                block[block_index(dx, 0, dz)] = mat(SOLID_MAT);
+            }
+        }
+
+        for diagonal in [
+            [(0usize, 1usize, 0usize), (1, 1, 1)],
+            [(1usize, 1usize, 0usize), (0, 1, 1)],
+        ] {
+            let mut input = block;
+            for (dx, dy, dz) in diagonal {
+                input[block_index(dx, dy, dz)] = mat(FLUID_MAT);
+            }
+            let out = rule.step_block(&input, &movable);
+            assert_ne!(
+                out, input,
+                "diagonal fluid above a floor must not be a fixed point"
+            );
+            assert!(
+                !layer_is_diagonal(&out, 1, FLUID_MAT),
+                "diagonal fluid above a floor should become side-adjacent"
+            );
+            let second = rule.step_block(&out, &movable);
+            assert!(
+                second != input,
+                "diagonal fluid above a floor must not enter a two-step oscillator"
+            );
+            assert_mass_conserved(&input, &out);
+            assert_mass_conserved(&out, &second);
+        }
+    }
+
+    #[test]
+    fn fluid_diagonal_breaker_is_material_generic() {
+        const OTHER_FLUID: u16 = 4;
+        fn other_fluid_phase(cell: Cell) -> Phase {
+            if cell.is_empty() {
+                Phase::Gas
+            } else if cell.material() == OTHER_FLUID {
+                Phase::Liquid
+            } else {
+                Phase::Solid
+            }
+        }
+        let rule = FluidBlockRule::new(simple_density, other_fluid_phase, OTHER_FLUID);
+        let movable = [
+            false, false, false, false, // y=0 floor, immovable
+            true, true, true, true,
+        ];
+        let mut input = [Cell::EMPTY; 8];
+        for dx in 0..2 {
+            for dz in 0..2 {
+                input[block_index(dx, 0, dz)] = mat(SOLID_MAT);
+            }
+        }
+        input[block_index(0, 1, 0)] = mat(OTHER_FLUID);
+        input[block_index(1, 1, 1)] = mat(OTHER_FLUID);
+
+        let out = rule.step_block(&input, &movable);
+        assert_ne!(
+            out, input,
+            "diagonal breaker should apply to any FluidBlockRule material"
+        );
+        assert!(
+            !layer_is_diagonal(&out, 1, OTHER_FLUID),
+            "generic fluid diagonal should become side-adjacent"
+        );
+        assert_mass_conserved(&input, &out);
     }
 
     #[test]
