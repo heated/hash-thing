@@ -39,17 +39,23 @@ if [ -n "$MAIN_ROOT" ] && [ -d "$MAIN_ROOT/.beads" ]; then
 fi
 
 run_bd() {
-    local output rc attempt
+    local output rc attempt stderr_file
+    stderr_file=$(mktemp "${TMPDIR:-/tmp}/bd-wrapper-stderr.XXXXXX")
     for attempt in $(seq 0 "$MAX_RETRIES"); do
-        output=$("$BD_REAL" "$@" 2>&1) && {
+        : >"$stderr_file"
+        output=$("$BD_REAL" "$@" 2>"$stderr_file") && {
             printf '%s\n' "$output"
+            cat "$stderr_file" >&2
+            rm -f "$stderr_file"
             return 0
         }
         rc=$?
 
-        if grep -q "another process holds the exclusive lock" <<< "$output"; then
+        if grep -q "another process holds the exclusive lock" "$stderr_file"; then
             if [ "$attempt" -eq "$MAX_RETRIES" ]; then
-                printf '%s\n' "$output" >&2
+                printf '%s\n' "$output"
+                cat "$stderr_file" >&2
+                rm -f "$stderr_file"
                 return "$rc"
             fi
             # Exponential backoff: 1, 2, 4, 8, 16 seconds + up to 1s jitter
@@ -58,10 +64,13 @@ run_bd() {
             sleep "${delay}.${jitter}"
         else
             # Non-lock error — don't retry
-            printf '%s\n' "$output" >&2
+            printf '%s\n' "$output"
+            cat "$stderr_file" >&2
+            rm -f "$stderr_file"
             return "$rc"
         fi
     done
+    rm -f "$stderr_file"
 }
 
 is_close_command() {
