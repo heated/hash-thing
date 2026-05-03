@@ -1,0 +1,15 @@
+Scenario(
+  name: "temporal-reuse",
+  world: Small,
+  level: Some(6),
+  scene: ReplayScrub,
+  rule_set: SoupSearchV1,
+  intensity: PassiveActive,
+  regime: Churning,
+  backend: HashlifeRecursive,
+  generations: 16,
+  warmup_generations: Some(2),
+  seed: 1337,
+  setup: Some(TemporalReuseV1),
+  comparator: None,
+)

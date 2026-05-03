@@ -1,4 +1,4 @@
-use hash_thing::octree::{Cell, CellState};
+use hash_thing::octree::{Cell, CellState, Node, NodeId};
 use hash_thing::sim::margolus::ConveyorBlockRule;
 use hash_thing::sim::world::{
     quarantine_atlas_mixed_containment_plan, WorkElisionStats,
@@ -20,6 +20,8 @@ const SOUP_SEARCH_SETUP_V1: &str =
 const SOUP_SEARCH_SPARSE_V1: &str =
     "SoupSearchSparseV1(tile=16,soup_side=8,density_per_1000=45,rule=445)";
 const SOUP_SEARCH_ALIVE: CellState = Cell::pack(1, 0).raw();
+const TEMPORAL_REUSE_SETUP_V1: &str =
+    "TemporalReuseV1(seed_center_radius=12,density=0.35,rule=crystal)";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +75,7 @@ enum Scene {
     DefaultDemo,
     FactoryConveyor,
     QuarantineAtlas,
+    ReplayScrub,
     SoupSearch,
 }
 
@@ -83,6 +86,7 @@ impl Scene {
             Self::DefaultDemo => "default-demo",
             Self::FactoryConveyor => "factory-conveyor",
             Self::QuarantineAtlas => "quarantine-atlas",
+            Self::ReplayScrub => "replay-scrub",
             Self::SoupSearch => "soup-search",
         }
     }
@@ -94,6 +98,7 @@ enum ScenarioSetup {
     FactoryConveyorRuleV1,
     SoupSearchV1,
     SoupSearchSparseV1,
+    TemporalReuseV1,
 }
 
 impl ScenarioSetup {
@@ -103,6 +108,7 @@ impl ScenarioSetup {
             Self::FactoryConveyorRuleV1 => "FactoryConveyorRuleV1",
             Self::SoupSearchV1 => SOUP_SEARCH_SETUP_V1,
             Self::SoupSearchSparseV1 => SOUP_SEARCH_SPARSE_V1,
+            Self::TemporalReuseV1 => TEMPORAL_REUSE_SETUP_V1,
         }
     }
 }
@@ -241,6 +247,55 @@ struct MetricsRecord {
     factory_backpressure_total: Option<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TemporalReuseSummary {
+    setup: String,
+    total_generations: usize,
+    total_observations: u64,
+    active_observations: u64,
+    empty_observations: u64,
+    uniform_observations: u64,
+    unique_active_structures: u64,
+    duplicate_active_observations: u64,
+    active_weighted_reuse_ratio: f64,
+    parity_unique_keys: u64,
+    parity_weighted_reuse_ratio: f64,
+    bucket_summaries: Vec<TemporalBucketSummary>,
+    levels: Vec<TemporalLevelSummary>,
+    generations: Vec<TemporalGenerationSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TemporalBucketSummary {
+    bucket_size: usize,
+    windows: usize,
+    active_generation_presences: u64,
+    recurrent_active_observations: u64,
+    weighted_recurrent_cell_volume: u128,
+    active_weighted_cell_volume: u128,
+    weighted_recurrent_ratio: f64,
+    unique_structural_keys: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TemporalLevelSummary {
+    level: u32,
+    observations: u64,
+    active_observations: u64,
+    unique_active_structures: u64,
+    duplicate_active_observations: u64,
+    weighted_duplicate_cell_volume: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TemporalGenerationSummary {
+    gen: usize,
+    pop_count: usize,
+    state_hash: String,
+    active_observations: u64,
+    duplicate_active_observations: u64,
+}
+
 #[derive(Deserialize, Serialize)]
 struct MeasurementRecord {
     schema_version: u32,
@@ -266,6 +321,8 @@ struct MeasurementRecord {
     generations: Vec<GenerationRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     soup_search: Option<SoupSearchSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temporal_reuse: Option<TemporalReuseSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1021,6 +1078,12 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
                 QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP, record.rule_set, record.measurement_id
             ))
         }
+        Some(TEMPORAL_REUSE_SETUP_V1) if record.rule_set != "custom:soup-search-v1" => {
+            Err(format!(
+                "setup={} requires matching rule_set (got {}) in {}",
+                TEMPORAL_REUSE_SETUP_V1, record.rule_set, record.measurement_id
+            ))
+        }
         Some("FactoryConveyorRuleV1") if record.rule_set != "custom:factory-conveyor-v1" => {
             Err(format!(
                 "setup=FactoryConveyorRuleV1 requires matching rule_set (got {}) in {}",
@@ -1454,6 +1517,7 @@ fn run_scenario(
         ),
     };
     let soup_search = soup_search_summary_for(scenario, &generations, side as usize);
+    let temporal_reuse = temporal_reuse_summary_for(scenario, &generations);
 
     let hash_suffix = scenario_hash
         .strip_prefix("sha256:")
@@ -1498,6 +1562,7 @@ fn run_scenario(
         metrics,
         generations,
         soup_search,
+        temporal_reuse,
     })
 }
 
@@ -1540,6 +1605,7 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
         | (Some(ScenarioSetup::FactoryConveyorRuleV1), Scene::FactoryConveyor)
         | (Some(ScenarioSetup::SoupSearchV1), Scene::SoupSearch)
         | (Some(ScenarioSetup::SoupSearchSparseV1), Scene::SoupSearch)
+        | (Some(ScenarioSetup::TemporalReuseV1), Scene::ReplayScrub)
         | (None, _) => Ok(()),
         (Some(setup), scene) => Err(format!(
             "setup={} is invalid for scene={}",
@@ -1558,6 +1624,7 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
         | (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), RuleSet::DefaultCa)
         | (Some(ScenarioSetup::SoupSearchV1), RuleSet::SoupSearchV1)
         | (Some(ScenarioSetup::SoupSearchSparseV1), RuleSet::SoupSearchV1)
+        | (Some(ScenarioSetup::TemporalReuseV1), RuleSet::SoupSearchV1)
         | (None, RuleSet::DefaultCa) => Ok(()),
         (Some(setup), rule_set) => Err(format!(
             "setup={} requires matching rule_set (got {})",
@@ -1587,8 +1654,29 @@ fn seed_scene(world: &mut World, scenario: &Scenario) -> Result<(), String> {
         }
         Scene::FactoryConveyor => seed_factory_conveyor(world, scenario)?,
         Scene::QuarantineAtlas => seed_quarantine_atlas(world, scenario)?,
+        Scene::ReplayScrub => seed_temporal_reuse(world, scenario)?,
         Scene::SoupSearch => seed_soup_search(world, scenario)?,
     }
+    Ok(())
+}
+
+fn seed_temporal_reuse(world: &mut World, scenario: &Scenario) -> Result<(), String> {
+    match scenario.setup {
+        Some(ScenarioSetup::TemporalReuseV1) => {}
+        None => return Err("replay-scrub scene requires setup=TemporalReuseV1".to_string()),
+        Some(other) => {
+            return Err(format!(
+                "setup={} is invalid for replay-scrub",
+                other.as_str()
+            ));
+        }
+    }
+    if world.side() < 32 {
+        return Err("temporal reuse scene requires side >= 32".to_string());
+    }
+    world.set_gol_smoke_rule(GameOfLife3D::new(0, 6, 1, 3));
+    world.simulation_seed = scenario.seed;
+    world.seed_center(12, 0.35);
     Ok(())
 }
 
@@ -2134,6 +2222,324 @@ fn soup_search_summary_for(
         ),
         _ => None,
     })
+}
+
+fn temporal_reuse_summary_for(
+    scenario: &Scenario,
+    generations: &[GenerationRecord],
+) -> Option<TemporalReuseSummary> {
+    if scenario.setup != Some(ScenarioSetup::TemporalReuseV1) {
+        return None;
+    }
+    Some(temporal_reuse_summary(generations, &[4, 8]))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SubtreeFingerprint {
+    level: u32,
+    hash: [u8; 32],
+    population: u64,
+    empty: bool,
+    uniform: bool,
+}
+
+#[derive(Clone)]
+struct SubtreeObservation {
+    gen: usize,
+    level: u32,
+    fingerprint: SubtreeFingerprint,
+    cell_volume: u128,
+}
+
+#[derive(Default)]
+struct TemporalLevelAccumulator {
+    observations: u64,
+    active_observations: u64,
+    unique_active: std::collections::HashSet<SubtreeFingerprint>,
+    duplicate_active_observations: u64,
+    weighted_duplicate_cell_volume: u128,
+}
+
+fn temporal_reuse_summary(
+    generations: &[GenerationRecord],
+    bucket_sizes: &[usize],
+) -> TemporalReuseSummary {
+    let mut observations = Vec::new();
+    for record in generations {
+        if let Some(grid) = record.grid.as_ref() {
+            let side = grid_side(grid.len());
+            collect_subtree_observations(grid, side, record.gen, &mut observations);
+        }
+    }
+
+    let mut global_seen: std::collections::HashMap<SubtreeFingerprint, usize> =
+        std::collections::HashMap::new();
+    let mut parity_seen: std::collections::HashMap<(usize, SubtreeFingerprint), usize> =
+        std::collections::HashMap::new();
+    let mut level_stats: std::collections::BTreeMap<u32, TemporalLevelAccumulator> =
+        std::collections::BTreeMap::new();
+    let mut active_weighted_cell_volume = 0u128;
+    let mut duplicate_active_cell_volume = 0u128;
+    let mut parity_weighted_duplicates = 0u128;
+    let mut active_observations = 0u64;
+    let mut empty_observations = 0u64;
+    let mut uniform_observations = 0u64;
+    let mut duplicate_active_observations = 0u64;
+    let mut generation_rows = Vec::new();
+
+    for record in generations {
+        let before_active = active_observations;
+        let before_duplicate = duplicate_active_observations;
+        for obs in observations.iter().filter(|obs| obs.gen == record.gen) {
+            if obs.fingerprint.empty {
+                empty_observations += 1;
+            }
+            if obs.fingerprint.uniform {
+                uniform_observations += 1;
+            }
+            let level = level_stats.entry(obs.level).or_default();
+            level.observations += 1;
+            if obs.fingerprint.empty {
+                continue;
+            }
+            active_observations += 1;
+            active_weighted_cell_volume += obs.cell_volume;
+            level.active_observations += 1;
+            level.unique_active.insert(obs.fingerprint.clone());
+            if let Some(&first_gen) = global_seen.get(&obs.fingerprint) {
+                if first_gen != record.gen {
+                    duplicate_active_observations += 1;
+                    duplicate_active_cell_volume += obs.cell_volume;
+                    level.duplicate_active_observations += 1;
+                    level.weighted_duplicate_cell_volume += obs.cell_volume;
+                }
+            } else {
+                global_seen.insert(obs.fingerprint.clone(), record.gen);
+            }
+            let parity_key = (record.gen % 2, obs.fingerprint.clone());
+            if let Some(&first_gen) = parity_seen.get(&parity_key) {
+                if first_gen != record.gen {
+                    parity_weighted_duplicates += obs.cell_volume;
+                }
+            } else {
+                parity_seen.insert(parity_key, record.gen);
+            }
+        }
+        generation_rows.push(TemporalGenerationSummary {
+            gen: record.gen,
+            pop_count: record.pop_count,
+            state_hash: record
+                .state_hash
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            active_observations: active_observations - before_active,
+            duplicate_active_observations: duplicate_active_observations - before_duplicate,
+        });
+    }
+
+    let levels = level_stats
+        .into_iter()
+        .map(|(level, stats)| TemporalLevelSummary {
+            level,
+            observations: stats.observations,
+            active_observations: stats.active_observations,
+            unique_active_structures: stats.unique_active.len() as u64,
+            duplicate_active_observations: stats.duplicate_active_observations,
+            weighted_duplicate_cell_volume: stats.weighted_duplicate_cell_volume,
+        })
+        .collect::<Vec<_>>();
+
+    TemporalReuseSummary {
+        setup: TEMPORAL_REUSE_SETUP_V1.to_string(),
+        total_generations: generations.len(),
+        total_observations: observations.len() as u64,
+        active_observations,
+        empty_observations,
+        uniform_observations,
+        unique_active_structures: global_seen.len() as u64,
+        duplicate_active_observations,
+        active_weighted_reuse_ratio: ratio_u128(
+            duplicate_active_cell_volume,
+            active_weighted_cell_volume,
+        ),
+        parity_unique_keys: parity_seen.len() as u64,
+        parity_weighted_reuse_ratio: ratio_u128(
+            parity_weighted_duplicates,
+            active_weighted_cell_volume,
+        ),
+        bucket_summaries: bucket_sizes
+            .iter()
+            .map(|&bucket_size| temporal_bucket_summary(&observations, bucket_size))
+            .collect(),
+        levels,
+        generations: generation_rows,
+    }
+}
+
+fn temporal_bucket_summary(
+    observations: &[SubtreeObservation],
+    bucket_size: usize,
+) -> TemporalBucketSummary {
+    let mut by_window: std::collections::BTreeMap<
+        usize,
+        std::collections::HashMap<&SubtreeFingerprint, std::collections::BTreeMap<usize, u128>>,
+    > = std::collections::BTreeMap::new();
+    for obs in observations.iter().filter(|obs| !obs.fingerprint.empty) {
+        let entry = by_window
+            .entry(obs.gen / bucket_size)
+            .or_default()
+            .entry(&obs.fingerprint)
+            .or_default()
+            .entry(obs.gen)
+            .or_default();
+        *entry += obs.cell_volume;
+    }
+    let mut active_generation_presences = 0u64;
+    let mut recurrent_active_observations = 0u64;
+    let mut active_weighted_cell_volume = 0u128;
+    let mut weighted_recurrent_cell_volume = 0u128;
+    let mut unique = std::collections::HashSet::new();
+    for entries in by_window.values() {
+        for (fingerprint, per_gen_volume) in entries {
+            let count = per_gen_volume.len() as u64;
+            let volume = per_gen_volume.values().sum::<u128>();
+            active_generation_presences += count;
+            active_weighted_cell_volume += volume;
+            unique.insert((*fingerprint).clone());
+            if count > 1 {
+                recurrent_active_observations += count - 1;
+                let first_observation_volume = per_gen_volume.values().next().copied().unwrap_or(0);
+                weighted_recurrent_cell_volume += volume - first_observation_volume;
+            }
+        }
+    }
+    TemporalBucketSummary {
+        bucket_size,
+        windows: by_window.len(),
+        active_generation_presences,
+        recurrent_active_observations,
+        weighted_recurrent_cell_volume,
+        active_weighted_cell_volume,
+        weighted_recurrent_ratio: ratio_u128(
+            weighted_recurrent_cell_volume,
+            active_weighted_cell_volume,
+        ),
+        unique_structural_keys: unique.len() as u64,
+    }
+}
+
+fn collect_subtree_observations(
+    grid: &[CellState],
+    side: usize,
+    gen: usize,
+    out: &mut Vec<SubtreeObservation>,
+) {
+    let mut world = World::new(side.trailing_zeros());
+    for z in 0..side {
+        for y in 0..side {
+            for x in 0..side {
+                let state = grid[x + y * side + z * side * side];
+                if state != 0 {
+                    world.set(
+                        WorldCoord(x as i64),
+                        WorldCoord(y as i64),
+                        WorldCoord(z as i64),
+                        state,
+                    );
+                }
+            }
+        }
+    }
+    collect_world_node_observations(&world, world.root, world.level, gen, out);
+}
+
+fn collect_world_node_observations(
+    world: &World,
+    node: NodeId,
+    level: u32,
+    gen: usize,
+    out: &mut Vec<SubtreeObservation>,
+) {
+    let fingerprint = subtree_fingerprint(world, node, level);
+    out.push(SubtreeObservation {
+        gen,
+        level,
+        fingerprint,
+        cell_volume: cell_volume(level),
+    });
+    if level == 0 {
+        return;
+    }
+    if let Node::Interior { children, .. } = world.store.get(node) {
+        for &child in children {
+            collect_world_node_observations(world, child, level - 1, gen, out);
+        }
+    }
+}
+
+fn subtree_fingerprint(world: &World, node: NodeId, level: u32) -> SubtreeFingerprint {
+    let mut hasher = Sha256::new();
+    fingerprint_node_into(world, node, level, &mut hasher);
+    let hash: [u8; 32] = hasher.finalize().into();
+    let population = world.store.population(node);
+    SubtreeFingerprint {
+        level,
+        hash,
+        population,
+        empty: population == 0,
+        uniform: subtree_uniform_state(world, node, level).is_some(),
+    }
+}
+
+fn fingerprint_node_into(world: &World, node: NodeId, level: u32, hasher: &mut Sha256) {
+    hasher.update(level.to_le_bytes());
+    match world.store.get(node) {
+        Node::Leaf(state) => {
+            hasher.update([0]);
+            hasher.update(state.to_le_bytes());
+        }
+        Node::Interior { children, .. } => {
+            hasher.update([1]);
+            for &child in children {
+                fingerprint_node_into(world, child, level - 1, hasher);
+            }
+        }
+    }
+}
+
+fn subtree_uniform_state(world: &World, node: NodeId, level: u32) -> Option<CellState> {
+    match world.store.get(node) {
+        Node::Leaf(state) => Some(*state),
+        Node::Interior { children, .. } => {
+            let mut iter = children.iter();
+            let first = subtree_uniform_state(world, *iter.next()?, level - 1)?;
+            for child in iter {
+                if subtree_uniform_state(world, *child, level - 1)? != first {
+                    return None;
+                }
+            }
+            Some(first)
+        }
+    }
+}
+
+fn cell_volume(level: u32) -> u128 {
+    let side = 1u128 << level;
+    side * side * side
+}
+
+fn ratio_u128(numerator: u128, denominator: u128) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn grid_side(len: usize) -> usize {
+    let side = (len as f64).cbrt().round() as usize;
+    assert_eq!(side * side * side, len, "grid length must be cubic");
+    side
 }
 
 fn soup_search_summary(
@@ -3214,6 +3620,98 @@ mod tests {
     }
 
     #[test]
+    fn temporal_reuse_summary_reports_structural_window_recurrence() {
+        let side = 8;
+        let mut grid = vec![0; side * side * side];
+        grid[3 + 3 * side + 3 * side * side] = SOUP_SEARCH_ALIVE;
+        let gen = |i| GenerationRecord {
+            gen: i,
+            step_us: 0,
+            pop_count: popcount(&grid),
+            drops: 0,
+            work_elision_factor_x: None,
+            leaf_misses: None,
+            factory_sinked: None,
+            factory_backpressure: None,
+            state_hash: Some(grid_hash(&grid)),
+            mat_distribution: Some(material_distribution(&grid)),
+            grid: Some(grid.clone()),
+        };
+
+        let summary = temporal_reuse_summary(&[gen(0), gen(1)], &[4]);
+
+        assert_eq!(summary.total_generations, 2);
+        assert!(summary.active_observations > 0);
+        assert!(summary.empty_observations > 0);
+        assert!(summary.unique_active_structures > 0);
+        assert!(summary.duplicate_active_observations > 0);
+        assert!(summary.active_weighted_reuse_ratio > 0.0);
+        assert_eq!(summary.bucket_summaries.len(), 1);
+        assert!(summary.bucket_summaries[0].recurrent_active_observations > 0);
+        assert!(summary.bucket_summaries[0].weighted_recurrent_ratio > 0.0);
+        assert_eq!(summary.generations.len(), 2);
+        assert_eq!(
+            summary.generations[0].state_hash,
+            summary.generations[1].state_hash
+        );
+    }
+
+    #[test]
+    fn temporal_reuse_ignores_same_generation_spatial_duplicates() {
+        let side = 8;
+        let mut grid = vec![0; side * side * side];
+        grid[2 + 2 * side + 2 * side * side] = SOUP_SEARCH_ALIVE;
+        grid[5 + 5 * side + 5 * side * side] = SOUP_SEARCH_ALIVE;
+        let record = GenerationRecord {
+            gen: 0,
+            step_us: 0,
+            pop_count: popcount(&grid),
+            drops: 0,
+            work_elision_factor_x: None,
+            leaf_misses: None,
+            factory_sinked: None,
+            factory_backpressure: None,
+            state_hash: Some(grid_hash(&grid)),
+            mat_distribution: Some(material_distribution(&grid)),
+            grid: Some(grid),
+        };
+
+        let summary = temporal_reuse_summary(&[record], &[4]);
+
+        assert!(summary.active_observations > 0);
+        assert_eq!(summary.duplicate_active_observations, 0);
+        assert_eq!(summary.active_weighted_reuse_ratio, 0.0);
+        assert_eq!(summary.parity_weighted_reuse_ratio, 0.0);
+        assert_eq!(summary.bucket_summaries[0].recurrent_active_observations, 0);
+        assert_eq!(summary.bucket_summaries[0].weighted_recurrent_ratio, 0.0);
+    }
+
+    #[test]
+    fn temporal_reuse_scenario_emits_summary() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        scenario.world = WorldCoordName::Small;
+        scenario.level = Some(6);
+        scenario.scene = Scene::ReplayScrub;
+        scenario.rule_set = RuleSet::SoupSearchV1;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.setup = Some(ScenarioSetup::TemporalReuseV1);
+        scenario.generations = 3;
+
+        let record = run_scenario(Path::new("test-temporal-reuse.ron"), &scenario, "unknown")
+            .expect("run temporal reuse scenario");
+        let summary = record.temporal_reuse.expect("temporal summary");
+
+        assert_eq!(summary.setup, TEMPORAL_REUSE_SETUP_V1);
+        assert_eq!(summary.total_generations, 3);
+        assert_eq!(summary.generations.len(), 3);
+        assert!(summary.active_observations > 0);
+        assert!(summary
+            .bucket_summaries
+            .iter()
+            .any(|bucket| bucket.bucket_size == 4));
+    }
+
+    #[test]
     fn soup_search_keeps_backends_on_same_trajectory() {
         let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
         scenario.world = WorldCoordName::Small;
@@ -3335,6 +3833,7 @@ mod tests {
                 grid: None,
             }],
             soup_search: None,
+            temporal_reuse: None,
         }
     }
 
