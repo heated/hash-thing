@@ -79,7 +79,7 @@ Use one visually rich generated scene, not a menu of small test boxes. The scene
 should justify the material orchestra: lava seams below, water pockets above,
 sand shelves, vents, organic patches, and structural voids.
 
-Voxel target is roughly 10 cm, 3-4x finer per axis than Minecraft-scale blocks.
+Voxel target is roughly 25 cm, 4x finer per axis than Minecraft-scale blocks.
 The world can start at 256^3 for the first shippable demo, but the scene should
 be framed so 4096^3 streaming work naturally extends it instead of replacing it.
 
