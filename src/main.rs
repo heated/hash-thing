@@ -769,6 +769,9 @@ struct App {
     /// pose instead of the App-default terrain. `None` keeps the previous
     /// hc0g default-terrain behavior unchanged.
     dump_scene: Option<DumpScene>,
+    /// hash-thing-jszv: deterministic diagnostic camera pose for
+    /// `--dump-frame`, applied after any dump scene setup and before capture.
+    dump_pose: Option<DumpPose>,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -1032,7 +1035,12 @@ fn stamp_quarantine_atlas_pattern(
     let region = world.region();
     let mut set = |x: i64, y: i64, z: i64, state| {
         if region.contains(x, y, z) {
-            world.set(sim::WorldCoord(x), sim::WorldCoord(y), sim::WorldCoord(z), state);
+            world.set(
+                sim::WorldCoord(x),
+                sim::WorldCoord(y),
+                sim::WorldCoord(z),
+                state,
+            );
         }
     };
     let [cx, cy, cz] = center;
@@ -1115,6 +1123,7 @@ impl App {
             want_focus_on_launch: false,
             dump_frame_path: None,
             dump_scene: None,
+            dump_pose: None,
             step_pending: false,
             world_prefetch_pending: false,
             step_start: std::time::Instant::now(),
@@ -2205,6 +2214,56 @@ impl App {
                 }
             }
         }
+    }
+
+    fn apply_current_player_camera_pose(&mut self) {
+        let Some(pid) = self.player_id else {
+            return;
+        };
+        let Some(entity) = self.entities.iter().find(|e| e.id == pid) else {
+            return;
+        };
+        let sim::EntityKind::Player(ref ps) = entity.kind else {
+            return;
+        };
+        let eye = [
+            entity.pos[0],
+            entity.pos[1] + PLAYER_HEIGHT * 0.85,
+            entity.pos[2],
+        ];
+        self.camera_mode = CameraMode::FirstPerson;
+        self.camera_feel.reset();
+        self.legend_visible = default_legend_visibility(self.camera_mode);
+        self.legend_dirty = true;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.camera_target = [
+                (eye[0] - self.render_origin[0] as f64) as f32 * self.render_inv_size,
+                (eye[1] - self.render_origin[1] as f64) as f32 * self.render_inv_size,
+                (eye[2] - self.render_origin[2] as f64) as f32 * self.render_inv_size,
+            ];
+            renderer.camera_yaw = ps.yaw as f32;
+            renderer.camera_pitch = ps.pitch as f32;
+            renderer.camera_dist = 0.0;
+        }
+    }
+
+    fn apply_dump_pose(&mut self, pose: DumpPose) {
+        match pose {
+            DumpPose::Wall => self.apply_current_player_camera_pose(),
+            DumpPose::Blocks => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.28, 0.50],
+                yaw: -std::f32::consts::FRAC_PI_4,
+                pitch: 0.18,
+                dist: 0.62,
+            }),
+            DumpPose::TerrainWide => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.36, 0.50],
+                yaw: -3.0 * std::f32::consts::FRAC_PI_4,
+                pitch: 0.34,
+                dist: 0.95,
+            }),
+        }
+        log::info!("--dump-pose: applied {}", pose.label());
     }
 
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
@@ -3370,8 +3429,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                             let digit: u16 = n.parse().unwrap();
                             if self.camera_mode == CameraMode::FirstPerson {
                                 if self.quarantine_atlas.is_some() {
-                                    if let Some(pattern) =
-                                        QuarantineAtlasPattern::from_digit(digit)
+                                    if let Some(pattern) = QuarantineAtlasPattern::from_digit(digit)
                                     {
                                         self.select_quarantine_atlas_pattern(pattern);
                                     } else {
@@ -3642,6 +3700,10 @@ impl ApplicationHandler<AppUserEvent> for App {
                     // with focus / unocclude / scene-swap resume edges —
                     // all four share the same pairing contract (last_frame
                     // + suppress). See hash-thing-v79j / hash-thing-6e4a.
+                    self.mark_resume_edge();
+                }
+                if let Some(pose) = self.dump_pose.take() {
+                    self.apply_dump_pose(pose);
                     self.mark_resume_edge();
                 }
 
@@ -4194,6 +4256,36 @@ impl DumpScene {
     }
 }
 
+/// hash-thing-jszv: deterministic camera presets for dump-frame visual
+/// diagnostics. These are intentionally scene-agnostic: reviewers can pair the
+/// same pose with different `--dump-scene` values to compare material faces
+/// across commits without interactive camera control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpPose {
+    Wall,
+    Blocks,
+    TerrainWide,
+}
+
+impl DumpPose {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "wall" => Some(Self::Wall),
+            "blocks" => Some(Self::Blocks),
+            "terrain-wide" => Some(Self::TerrainWide),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wall => "wall",
+            Self::Blocks => "blocks",
+            Self::TerrainWide => "terrain-wide",
+        }
+    }
+}
+
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
 /// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
 /// `demo`).
@@ -4210,6 +4302,9 @@ struct ParsedArgs {
     /// `--dump-scene KIND`: hash-thing-j1mg, only meaningful with
     /// `--dump-frame`. Selects which scene to dispatch before the dump.
     dump_scene: Option<DumpScene>,
+    /// `--dump-pose NAME`: hash-thing-jszv, only meaningful with
+    /// `--dump-frame`. Selects a deterministic camera pose before capture.
+    dump_pose: Option<DumpPose>,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -4232,12 +4327,14 @@ where
 {
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
                          [--dump-frame PATH] \
-                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|lattice-intro|lattice-interior|lattice-panorama]";
+                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|lattice-intro|lattice-interior|lattice-panorama] \
+                         [--dump-pose wall|blocks|terrain-wide]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
     let mut dump_frame: Option<std::path::PathBuf> = None;
     let mut dump_scene: Option<DumpScene> = None;
+    let mut dump_pose: Option<DumpPose> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -4294,6 +4391,21 @@ where
                 });
                 dump_scene = Some(parsed);
             }
+            "--dump-pose" => {
+                if dump_pose.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-pose");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-pose requires a NAME"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-pose requires a NAME; saw '{v_str}'");
+                }
+                let parsed = DumpPose::parse(v_str)
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-pose NAME: unrecognised '{v_str}'"));
+                dump_pose = Some(parsed);
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -4315,6 +4427,9 @@ where
     if dump_scene.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-scene requires --dump-frame");
     }
+    if dump_pose.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-pose requires --dump-frame");
+    }
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
@@ -4326,6 +4441,7 @@ where
         demo,
         dump_frame,
         dump_scene,
+        dump_pose,
     }
 }
 
@@ -4369,6 +4485,7 @@ fn main() {
         demo,
         dump_frame: dump_frame_path,
         dump_scene,
+        dump_pose,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -4387,6 +4504,12 @@ fn main() {
         log::info!(
             "--dump-scene: {} (will dispatch before dump-frame render)",
             scene.label()
+        );
+    }
+    if let Some(pose) = dump_pose {
+        log::info!(
+            "--dump-pose: {} (will apply before dump-frame render)",
+            pose.label()
         );
     }
 
@@ -4433,6 +4556,7 @@ fn main() {
     app.want_focus_on_launch = want_focus_on_launch;
     app.dump_frame_path = dump_frame_path;
     app.dump_scene = dump_scene;
+    app.dump_pose = dump_pose;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -4487,10 +4611,13 @@ mod tests {
 
     #[test]
     fn world_prefetch_region_none_in_middle() {
-        assert!(
-            world_prefetch_region_for_player([0, 0, 0], 1024, [512.0, 64.0, 512.0], PLAYER_HEIGHT)
-                .is_none()
-        );
+        assert!(world_prefetch_region_for_player(
+            [0, 0, 0],
+            1024,
+            [512.0, 64.0, 512.0],
+            PLAYER_HEIGHT
+        )
+        .is_none());
     }
 
     #[test]
@@ -4808,9 +4935,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_from_dump_pose_all_kinds() {
+        for (raw, expected) in [
+            ("wall", DumpPose::Wall),
+            ("blocks", DumpPose::Blocks),
+            ("terrain-wide", DumpPose::TerrainWide),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-pose", raw]);
+            assert_eq!(r.dump_pose, Some(expected), "pose={raw}");
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "--dump-scene requires --dump-frame")]
     fn parse_args_from_dump_scene_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-scene", "lattice-intro"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-pose requires --dump-frame")]
+    fn parse_args_from_dump_pose_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-pose", "blocks"]);
     }
 
     #[test]
@@ -4832,6 +4977,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "--dump-pose NAME: unrecognised 'bogus'")]
+    fn parse_args_from_dump_pose_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-pose", "bogus"]);
+    }
+
+    #[test]
     #[should_panic(expected = "more than one --dump-scene")]
     fn parse_args_from_two_dump_scene_panics() {
         let _ = parse_args_from([
@@ -4841,6 +4992,19 @@ mod tests {
             "lattice-intro",
             "--dump-scene",
             "gol",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-pose")]
+    fn parse_args_from_two_dump_pose_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-pose",
+            "wall",
+            "--dump-pose",
+            "blocks",
         ]);
     }
 
@@ -5584,11 +5748,9 @@ mod tests {
     fn orbit_legend_marks_lattice_jumps_as_debug() {
         let lines = App::legend_lines(CameraMode::Orbit, false);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("DEV intro/interior/reveal"))
-        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("DEV intro/interior/reveal")));
         // a9jd: `[`, `]`, `U`/`I`/`O` remain DEV beat-cycle jumps, but `V`
         // is the user-facing panorama reveal — not a DEV-only key.
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
@@ -5606,7 +5768,9 @@ mod tests {
         let lines = App::legend_lines(CameraMode::FirstPerson, true);
 
         assert!(lines.iter().any(|line| line.contains("RClick      Stamp")));
-        assert!(lines.iter().any(|line| line.contains("1-3         Pattern")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("1-3         Pattern")));
         assert!(!lines.iter().any(|line| line.contains("Carve")));
         assert!(!lines.iter().any(|line| line.contains("Matter")));
         assert!(!lines.iter().any(|line| line.contains("Clone source")));
