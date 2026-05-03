@@ -145,10 +145,13 @@ where `terrain_params_json` is `serde_json::to_string(&TerrainParams)` rendered 
 **v2-B recipe** (active once 8ppq.2 lands):
 
 ```
-v2-B canonical input: "v2-B|" + sha256(scenario.ron file bytes) + "|" + seed_int
+v2-B canonical input: "v2-B-canonical|world=<world>|level=<level>|scene=<scene>|"
+                      + "rule_set=<rule_set>|intensity=<intensity>|"
+                      + "generations=<generations>|warmup_generations=<warmup>|"
+                      + "seed=<seed>"
 ```
 
-The version prefix (`v2-A|` / `v2-B|`) lets tooling tell pre-8ppq.2 records from RON-driven ones without breaking the comparison-match contract.
+The version prefix (`v2-A|` / `v2-B-canonical|`) lets tooling tell pre-8ppq.2 records from RON-driven ones without breaking the comparison-match contract. The RON file's `backend`, `regime`, `comparator`, and display `name` fields are deliberately excluded: they change the measurement record, not the deterministic seeded scene.
 
 **Why `backend` is NOT in the hash:** the same scenario should produce the same hash regardless of which engine measures it — that's exactly what makes paired-run comparisons valid (chunk-array vs hashlife on the same scene). Engine identity goes in `backend`, not `scenario_hash`.
 
