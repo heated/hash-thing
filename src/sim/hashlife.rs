@@ -341,12 +341,11 @@ impl World {
         let phase = self.generation % period;
         let t_step = std::time::Instant::now();
         let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
-        let step_node_us = t_step.elapsed().as_micros() as u64;
+        let step_node_elapsed = t_step.elapsed();
+        let step_node_us = step_node_elapsed.as_micros() as u64;
+        self.hashlife_stats.step_node_wall_ns = step_node_elapsed.as_nanos() as u64;
         self.root = result;
-        let step_stats = self.hashlife_stats;
-        self.hashlife_stats_total.accumulate(&step_stats);
-        self.memo_window
-            .push(step_stats.cache_hits, step_stats.cache_misses);
+        let step_stats_pre_compact = self.hashlife_stats;
 
         // qy4g.2 option G: gap-fill post-pass deleted from production. StepProfile
         // fields preserved as zeros for back-compat with bench_hashlife consumers.
@@ -356,7 +355,16 @@ impl World {
 
         let t_compact = std::time::Instant::now();
         self.maybe_compact();
-        let compact_us = t_compact.elapsed().as_micros() as u64;
+        let compact_elapsed = t_compact.elapsed();
+        let compact_us = compact_elapsed.as_micros() as u64;
+        self.hashlife_stats.compact_ns = compact_elapsed.as_nanos() as u64;
+
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window.push(
+            step_stats_pre_compact.cache_hits,
+            step_stats_pre_compact.cache_misses,
+        );
 
         StepProfile {
             total_us: t0.elapsed().as_micros() as u64,

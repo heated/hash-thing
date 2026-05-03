@@ -7442,6 +7442,44 @@ mod tests {
     }
 
     #[test]
+    fn step_recursive_profiled_publishes_memo_summary_timing_stats() {
+        // hash-thing-w93q: profiled stepping must leave the same public
+        // HashlifeStats/memo_summary timing contract as step_recursive().
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.store_size_at_last_compact = 1;
+
+        let _profile = world.step_recursive_profiled();
+
+        let stats = &world.hashlife_stats;
+        assert!(
+            stats.cache_misses > 0,
+            "test precondition: profiled step should have at least one memo miss",
+        );
+        assert!(
+            stats.step_node_wall_ns > 0,
+            "profiled step must publish step_node_wall_ns for memo_summary",
+        );
+        assert!(
+            stats.compact_ns > 0,
+            "forced compaction must publish compact_ns for memo_summary",
+        );
+        assert_eq!(
+            world.hashlife_stats_total.step_node_wall_ns, stats.step_node_wall_ns,
+            "lifetime stats must accumulate profiled step_node_wall_ns",
+        );
+        assert_eq!(
+            world.hashlife_stats_total.compact_ns, stats.compact_ns,
+            "lifetime stats must accumulate profiled compact_ns",
+        );
+
+        let summary = world.memo_summary();
+        assert!(summary.contains("p3="), "missing p3 in summary: {summary}");
+        assert!(summary.contains("p4="), "missing p4 in summary: {summary}");
+    }
+
+    #[test]
     fn memo_summary_includes_p3_and_p4_phase_breakdown() {
         // hash-thing-vqke Phase 0: the perf summary must include p3
         // (descent overhead) and p4 (compact wall) so the szyh-baseline
