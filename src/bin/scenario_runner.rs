@@ -768,6 +768,331 @@ fn validate_measurement_record(record: &MeasurementRecord) -> Result<(), String>
             record.measurement_id
         ));
     }
+    validate_measurement_coordinates(record)?;
+    validate_measurement_confidence(record)?;
+    validate_measurement_metrics(record)?;
+    Ok(())
+}
+
+fn validate_measurement_coordinates(record: &MeasurementRecord) -> Result<(), String> {
+    match record.backend.as_str() {
+        "chunk-array" if record.regime != "n/a" => {
+            return Err(format!(
+                "backend=chunk-array requires regime=\"n/a\" for {}",
+                record.measurement_id
+            ));
+        }
+        "hashlife-recursive" if record.regime == "n/a" => {
+            return Err(format!(
+                "backend=hashlife-recursive requires a memo-cache regime for {}",
+                record.measurement_id
+            ));
+        }
+        "chunk-array" | "hashlife-recursive" => {}
+        other => {
+            return Err(format!(
+                "invalid backend {:?} for {}",
+                other, record.measurement_id
+            ));
+        }
+    }
+    validate_one_of(
+        "regime",
+        &record.regime,
+        &["saturated", "churning", "n/a"],
+        record,
+    )?;
+    validate_one_of(
+        "world",
+        &record.world,
+        &["tiny", "small", "medium", "demo"],
+        record,
+    )?;
+    validate_one_of(
+        "scene",
+        &record.scene,
+        &[
+            "default-terrain",
+            "default-demo",
+            "factory-conveyor",
+            "quarantine-atlas",
+        ],
+        record,
+    )?;
+    validate_one_of(
+        "intensity",
+        &record.intensity,
+        &["idle", "microchurn", "passive-active", "cascade"],
+        record,
+    )?;
+    validate_one_of(
+        "rule_set",
+        &record.rule_set,
+        &["default-ca", "custom:factory-conveyor-v1"],
+        record,
+    )?;
+    validate_hardware(&record.hardware)?;
+    validate_setup_coordinates(record)?;
+    validate_scenario_hash(record)?;
+    validate_side(record)?;
+    Ok(())
+}
+
+fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> {
+    match record.setup.as_deref() {
+        Some(QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP) if record.scene != "quarantine-atlas" => {
+            Err(format!(
+                "setup={} is invalid for scene={} in {}",
+                QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP, record.scene, record.measurement_id
+            ))
+        }
+        Some("FactoryConveyorRuleV1") if record.scene != "factory-conveyor" => Err(format!(
+            "setup=FactoryConveyorRuleV1 is invalid for scene={} in {}",
+            record.scene, record.measurement_id
+        )),
+        Some(QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP) if record.rule_set != "default-ca" => {
+            Err(format!(
+                "setup={} requires matching rule_set (got {}) in {}",
+                QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP, record.rule_set, record.measurement_id
+            ))
+        }
+        Some("FactoryConveyorRuleV1") if record.rule_set != "custom:factory-conveyor-v1" => {
+            Err(format!(
+                "setup=FactoryConveyorRuleV1 requires matching rule_set (got {}) in {}",
+                record.rule_set, record.measurement_id
+            ))
+        }
+        Some(QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP | "FactoryConveyorRuleV1") => Ok(()),
+        Some(other) => Err(format!(
+            "invalid setup {:?} for {}",
+            other, record.measurement_id
+        )),
+        None if record.rule_set == "default-ca" => Ok(()),
+        None => Err(format!(
+            "rule_set={} requires an explicit setup in {}",
+            record.rule_set, record.measurement_id
+        )),
+    }
+}
+
+fn validate_scenario_hash(record: &MeasurementRecord) -> Result<(), String> {
+    let Some(suffix) = record.scenario_hash.strip_prefix("sha256:") else {
+        return Err(format!(
+            "malformed scenario_hash {:?} for {}",
+            record.scenario_hash, record.measurement_id
+        ));
+    };
+    if suffix.len() != 16
+        || !suffix
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "malformed scenario_hash {:?} for {}",
+            record.scenario_hash, record.measurement_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_side(record: &MeasurementRecord) -> Result<(), String> {
+    let expected = 1u64.checked_shl(record.level).ok_or_else(|| {
+        format!(
+            "invalid level {} for {}",
+            record.level, record.measurement_id
+        )
+    })?;
+    if record.side != expected {
+        return Err(format!(
+            "side {} does not match level {} for {}",
+            record.side, record.level, record.measurement_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_measurement_confidence(record: &MeasurementRecord) -> Result<(), String> {
+    if record.confidence.n == 0 {
+        return Err(format!(
+            "confidence.n must be positive for {}",
+            record.measurement_id
+        ));
+    }
+    if record.confidence.warm_frame_policy == "all-frames" {
+        return Ok(());
+    }
+    let Some(skipped) = record
+        .confidence
+        .warm_frame_policy
+        .strip_prefix("skip-first-")
+    else {
+        return Err(format!(
+            "invalid confidence.warm_frame_policy {:?} for {}",
+            record.confidence.warm_frame_policy, record.measurement_id
+        ));
+    };
+    if skipped.is_empty() || skipped.parse::<usize>().is_err() {
+        return Err(format!(
+            "invalid confidence.warm_frame_policy {:?} for {}",
+            record.confidence.warm_frame_policy, record.measurement_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_measurement_metrics(record: &MeasurementRecord) -> Result<(), String> {
+    for (name, value) in [
+        ("metrics.step_mean_ms", record.metrics.step_mean_ms),
+        ("metrics.step_median_ms", record.metrics.step_median_ms),
+        ("metrics.step_p95_ms", record.metrics.step_p95_ms),
+        ("metrics.wall_total_ms", record.metrics.wall_total_ms),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "{name} must be finite and non-negative for {}",
+                record.measurement_id
+            ));
+        }
+    }
+    match record.backend.as_str() {
+        "chunk-array" => validate_chunk_array_metrics(record),
+        "hashlife-recursive" => validate_hashlife_metrics(record),
+        _ => Ok(()),
+    }
+}
+
+fn validate_chunk_array_metrics(record: &MeasurementRecord) -> Result<(), String> {
+    if record.metrics.memo_hit_ratio.is_some()
+        || record.metrics.elision_factor_x.is_some()
+        || record.metrics.work_elision_min_x.is_some()
+        || record.metrics.work_elision_mean_x.is_some()
+        || record.metrics.work_elision_p05_x.is_some()
+        || record.metrics.leaf_misses_mean.is_some()
+        || record.metrics.work_elision_leaf_level.is_some()
+        || record
+            .generations
+            .iter()
+            .any(|gen| gen.work_elision_factor_x.is_some() || gen.leaf_misses.is_some())
+    {
+        return Err(format!(
+            "chunk-array measurement {} must not include hashlife metrics",
+            record.measurement_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hashlife_metrics(record: &MeasurementRecord) -> Result<(), String> {
+    let has_memo_metrics =
+        record.metrics.memo_hit_ratio.is_some() && record.metrics.elision_factor_x.is_some();
+    let has_all_work_elision_metrics = record.metrics.work_elision_min_x.is_some()
+        && record.metrics.work_elision_mean_x.is_some()
+        && record.metrics.work_elision_p05_x.is_some()
+        && record.metrics.leaf_misses_mean.is_some()
+        && record.metrics.work_elision_leaf_level.is_some()
+        && record
+            .generations
+            .iter()
+            .all(|gen| gen.work_elision_factor_x.is_some() && gen.leaf_misses.is_some());
+    let has_any_work_elision_metrics = record.metrics.work_elision_min_x.is_some()
+        || record.metrics.work_elision_mean_x.is_some()
+        || record.metrics.work_elision_p05_x.is_some()
+        || record.metrics.leaf_misses_mean.is_some()
+        || record.metrics.work_elision_leaf_level.is_some()
+        || record
+            .generations
+            .iter()
+            .any(|gen| gen.work_elision_factor_x.is_some() || gen.leaf_misses.is_some());
+    if !has_memo_metrics {
+        return Err(format!(
+            "hashlife measurement {} has partial/missing backend-specific metrics",
+            record.measurement_id
+        ));
+    }
+    if has_any_work_elision_metrics && !has_all_work_elision_metrics {
+        return Err(format!(
+            "hashlife measurement {} has partial/missing backend-specific metrics",
+            record.measurement_id
+        ));
+    }
+    validate_optional_ratio(
+        "metrics.memo_hit_ratio",
+        record.metrics.memo_hit_ratio,
+        record,
+    )?;
+    validate_optional_non_negative(
+        "metrics.elision_factor_x",
+        record.metrics.elision_factor_x,
+        record,
+    )?;
+    validate_optional_non_negative(
+        "metrics.work_elision_min_x",
+        record.metrics.work_elision_min_x,
+        record,
+    )?;
+    validate_optional_non_negative(
+        "metrics.work_elision_mean_x",
+        record.metrics.work_elision_mean_x,
+        record,
+    )?;
+    validate_optional_non_negative(
+        "metrics.work_elision_p05_x",
+        record.metrics.work_elision_p05_x,
+        record,
+    )?;
+    validate_optional_non_negative(
+        "metrics.leaf_misses_mean",
+        record.metrics.leaf_misses_mean,
+        record,
+    )?;
+    Ok(())
+}
+
+fn validate_one_of(
+    name: &str,
+    value: &str,
+    allowed: &[&str],
+    record: &MeasurementRecord,
+) -> Result<(), String> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid {name} {:?} for {}",
+            value, record.measurement_id
+        ))
+    }
+}
+
+fn validate_optional_non_negative(
+    name: &str,
+    value: Option<f64>,
+    record: &MeasurementRecord,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "{name} must be finite and non-negative for {}",
+                record.measurement_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_ratio(
+    name: &str,
+    value: Option<f64>,
+    record: &MeasurementRecord,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!(
+                "{name} must be a finite 0..=1 ratio for {}",
+                record.measurement_id
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1791,6 +2116,128 @@ mod tests {
     }
 
     #[test]
+    fn compare_records_rejects_invalid_backend_regime_pair() {
+        let mut a = test_measurement("chunk", "chunk-array", "saturated", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        a.generations[0].pop_count = b.generations[0].pop_count;
+
+        let err = compare_error(&a, &b);
+
+        assert!(err.contains("backend=chunk-array requires regime"), "{err}");
+    }
+
+    #[test]
+    fn compare_records_rejects_invalid_setup_rule_set_pair() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        a.scene = "factory-conveyor".to_string();
+        a.setup = Some("FactoryConveyorRuleV1".to_string());
+        a.rule_set = "default-ca".to_string();
+        a.generations[0].pop_count = b.generations[0].pop_count;
+
+        let err = compare_error(&a, &b);
+
+        assert!(err.contains("requires matching rule_set"), "{err}");
+    }
+
+    #[test]
+    fn compare_records_rejects_malformed_scenario_hash() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        a.scenario_hash = "sha256:test".to_string();
+        a.generations[0].pop_count = b.generations[0].pop_count;
+
+        let err = compare_error(&a, &b);
+
+        assert!(err.contains("malformed scenario_hash"), "{err}");
+    }
+
+    #[test]
+    fn compare_records_rejects_partial_hashlife_metrics() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        b.metrics.work_elision_mean_x = None;
+        b.generations[0].pop_count = a.generations[0].pop_count;
+
+        let err = compare_error(&a, &b);
+
+        assert!(
+            err.contains("partial/missing backend-specific metrics"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn compare_records_rejects_hashlife_without_backend_metrics() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        strip_hashlife_metrics(&mut b);
+        b.generations[0].pop_count = a.generations[0].pop_count;
+
+        let err = compare_error(&a, &b);
+
+        assert!(
+            err.contains("partial/missing backend-specific metrics"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn compare_records_accepts_legacy_hashlife_memo_only_metrics() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        strip_work_elision_metrics(&mut b);
+        b.generations[0].pop_count = a.generations[0].pop_count;
+        let path = write_jsonl(&[&a, &b]);
+
+        let comparison = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .expect("comparison");
+
+        assert_eq!(comparison.ratio, 5.0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_rejects_chunk_array_hashlife_metrics() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        a.metrics.memo_hit_ratio = Some(0.5);
+        a.generations[0].pop_count = b.generations[0].pop_count;
+
+        let err = compare_error(&a, &b);
+
+        assert!(err.contains("must not include hashlife metrics"), "{err}");
+    }
+
+    #[test]
+    fn compare_records_accepts_all_frames_warm_policy() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        a.confidence.warm_frame_policy = "all-frames".to_string();
+        b.confidence.warm_frame_policy = "all-frames".to_string();
+        b.generations[0].pop_count = a.generations[0].pop_count;
+        let path = write_jsonl(&[&a, &b]);
+
+        let comparison = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .expect("comparison");
+
+        assert_eq!(comparison.ratio, 5.0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn compare_records_rejects_factory_total_drift() {
         let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
         let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
@@ -1907,8 +2354,8 @@ mod tests {
 
     #[test]
     fn old_measurement_json_without_work_elision_fields_still_compares() {
-        let body = r#"{"schema_version":2,"record_kind":"measurement","measurement_id":"chunk","world":"medium","scene":"default-demo","intensity":"cascade","regime":"n/a","rule_set":"default-ca","backend":"chunk-array","hardware":"m2-pro-mbp","scenario_hash":"sha256:test","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":10.0,"step_median_ms":10.0,"step_p95_ms":10.0,"wall_total_ms":20.0},"generations":[{"gen":0,"step_us":10000,"pop_count":11,"drops":0,"mat_distribution":{"1":10}}]}
-{"schema_version":2,"record_kind":"measurement","measurement_id":"hashlife","world":"medium","scene":"default-demo","intensity":"cascade","regime":"saturated","rule_set":"default-ca","backend":"hashlife-recursive","hardware":"m2-pro-mbp","scenario_hash":"sha256:test","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":2.0,"step_median_ms":2.0,"step_p95_ms":2.0,"wall_total_ms":4.0},"generations":[{"gen":0,"step_us":2000,"pop_count":11,"drops":0,"mat_distribution":{"1":10}}]}
+        let body = r#"{"schema_version":2,"record_kind":"measurement","measurement_id":"chunk","world":"medium","scene":"default-demo","intensity":"cascade","regime":"n/a","rule_set":"default-ca","backend":"chunk-array","hardware":"m2-pro-mbp","scenario_hash":"sha256:0123456789abcdef","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":10.0,"step_median_ms":10.0,"step_p95_ms":10.0,"wall_total_ms":20.0},"generations":[{"gen":0,"step_us":10000,"pop_count":11,"drops":0,"mat_distribution":{"1":10}}]}
+{"schema_version":2,"record_kind":"measurement","measurement_id":"hashlife","world":"medium","scene":"default-demo","intensity":"cascade","regime":"saturated","rule_set":"default-ca","backend":"hashlife-recursive","hardware":"m2-pro-mbp","scenario_hash":"sha256:0123456789abcdef","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":2.0,"step_median_ms":2.0,"step_p95_ms":2.0,"wall_total_ms":4.0,"memo_hit_ratio":0.5,"elision_factor_x":1.5},"generations":[{"gen":0,"step_us":2000,"pop_count":11,"drops":0,"mat_distribution":{"1":10}}]}
 	"#;
         let path = std::env::temp_dir().join(format!(
             "hash-thing-scenario-runner-old-json-{}-{}.jsonl",
@@ -2057,7 +2504,7 @@ mod tests {
             rule_set: "default-ca".to_string(),
             backend: backend.to_string(),
             hardware: "m2-pro-mbp".to_string(),
-            scenario_hash: "sha256:test".to_string(),
+            scenario_hash: "sha256:0123456789abcdef".to_string(),
             setup: None,
             confidence: ConfidenceRecord {
                 n: 2,
@@ -2077,13 +2524,13 @@ mod tests {
                 step_median_ms: step_p95_ms,
                 step_p95_ms,
                 wall_total_ms: step_p95_ms * 2.0,
-                memo_hit_ratio: None,
-                elision_factor_x: None,
-                work_elision_min_x: None,
-                work_elision_mean_x: None,
-                work_elision_p05_x: None,
-                leaf_misses_mean: None,
-                work_elision_leaf_level: None,
+                memo_hit_ratio: (backend == "hashlife-recursive").then_some(0.5),
+                elision_factor_x: (backend == "hashlife-recursive").then_some(1.5),
+                work_elision_min_x: (backend == "hashlife-recursive").then_some(1.0),
+                work_elision_mean_x: (backend == "hashlife-recursive").then_some(1.5),
+                work_elision_p05_x: (backend == "hashlife-recursive").then_some(1.0),
+                leaf_misses_mean: (backend == "hashlife-recursive").then_some(2.0),
+                work_elision_leaf_level: (backend == "hashlife-recursive").then_some(3),
                 factory_sinked_total: None,
                 factory_backpressure_total: None,
             },
@@ -2092,8 +2539,8 @@ mod tests {
                 step_us: (step_p95_ms * 1000.0) as u128,
                 pop_count: if backend == "chunk-array" { 11 } else { 10 },
                 drops: 0,
-                work_elision_factor_x: None,
-                leaf_misses: None,
+                work_elision_factor_x: (backend == "hashlife-recursive").then_some(1.5),
+                leaf_misses: (backend == "hashlife-recursive").then_some(2),
                 factory_sinked: None,
                 factory_backpressure: None,
                 mat_distribution: Some(serde_json::json!({"1": 10})),
@@ -2114,6 +2561,38 @@ mod tests {
             .join("\n");
         std::fs::write(&path, format!("{body}\n")).expect("write test jsonl");
         path
+    }
+
+    fn compare_error(a: &MeasurementRecord, b: &MeasurementRecord) -> String {
+        let path = write_jsonl(&[a, b]);
+        let err = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(path);
+        err
+    }
+
+    fn strip_hashlife_metrics(record: &mut MeasurementRecord) {
+        record.metrics.memo_hit_ratio = None;
+        record.metrics.elision_factor_x = None;
+        strip_work_elision_metrics(record);
+    }
+
+    fn strip_work_elision_metrics(record: &mut MeasurementRecord) {
+        record.metrics.work_elision_min_x = None;
+        record.metrics.work_elision_mean_x = None;
+        record.metrics.work_elision_p05_x = None;
+        record.metrics.leaf_misses_mean = None;
+        record.metrics.work_elision_leaf_level = None;
+        for generation in &mut record.generations {
+            generation.work_elision_factor_x = None;
+            generation.leaf_misses = None;
+        }
     }
 
     fn compare_args(path: &Path, allow_trajectory_drift: bool) -> Vec<std::ffi::OsString> {
