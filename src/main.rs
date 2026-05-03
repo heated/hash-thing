@@ -385,6 +385,7 @@ enum PendingSoupAction {
     PlaceSelected,
     SelectPattern(usize),
     Catalog,
+    ReuseCatalog,
 }
 
 /// Scene-swap request queued while a background sim step is in flight.
@@ -701,6 +702,22 @@ struct SoupCatalogEntry {
     state_hash: String,
     pattern: usize,
     label: SoupCatalogLabel,
+    snapshot: Vec<CellState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupReuseResult {
+    source_tile: [i64; 3],
+    target_tile: [i64; 3],
+    source_hash: String,
+    target_before_pop: usize,
+    target_before_hash: String,
+    target_after_pop: usize,
+    target_after_hash: String,
+    post_pop: usize,
+    post_hash: String,
+    post_label: SoupCatalogLabel,
+    count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -710,6 +727,8 @@ struct SoupProspectorState {
     tile_min: [i64; 3],
     tile_max: [i64; 3],
     catalog: Vec<SoupCatalogEntry>,
+    last_reuse: Option<SoupReuseResult>,
+    reuse_count: usize,
     pop_history: HashMap<[i64; 3], Vec<SoupTilePopSample>>,
 }
 
@@ -721,6 +740,8 @@ impl SoupProspectorState {
             tile_min,
             tile_max,
             catalog: Vec::new(),
+            last_reuse: None,
+            reuse_count: 0,
             pop_history: HashMap::new(),
         }
     }
@@ -844,6 +865,10 @@ struct App {
     /// catalog the current aimed soup tile after dump steps and before
     /// capture, so the screenshot can prove durable in-game catalog feedback.
     dump_soup_catalog: bool,
+    /// Dump-frame diagnostic for Soup Prospector reuse artifacts:
+    /// catalog the current aimed soup tile, reuse it into a distinct tile,
+    /// run one sync retest step, then capture.
+    dump_soup_reuse: bool,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -1322,12 +1347,8 @@ fn frame_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
     }
 }
 
-fn soup_marker_material_for_live_index(index: usize, material: CellState) -> CellState {
-    if material == hash_thing::terrain::materials::SOUP_CATALOG_MARKER || index % 2 == 0 {
-        material
-    } else {
-        SOUP_PROSPECTOR_ALIVE
-    }
+fn soup_marker_material_for_live_index(_index: usize, material: CellState) -> CellState {
+    material
 }
 
 fn clear_soup_marker_cell(cell: CellState) -> CellState {
@@ -1489,6 +1510,91 @@ fn soup_tile_stats(world: &sim::World, tile: [i64; 3]) -> (usize, String) {
     )
 }
 
+fn capture_soup_tile_snapshot(world: &sim::World, tile: [i64; 3]) -> Vec<CellState> {
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut cells = Vec::with_capacity((SOUP_PROSPECTOR_TILE as usize).pow(3));
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                cells.push(normalize_soup_marker_cell(world.get(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                )));
+            }
+        }
+    }
+    cells
+}
+
+fn paste_soup_tile_snapshot(world: &mut sim::World, tile: [i64; 3], snapshot: &[CellState]) {
+    assert_eq!(
+        snapshot.len(),
+        (SOUP_PROSPECTOR_TILE as usize).pow(3),
+        "soup tile snapshots must cover exactly one full tile"
+    );
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut index = 0;
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                world.set(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                    normalize_soup_marker_cell(snapshot[index]),
+                );
+                index += 1;
+            }
+        }
+    }
+}
+
+fn soup_tile_within_demo(tile: [i64; 3], tile_min: [i64; 3], tile_max: [i64; 3]) -> bool {
+    (0..3).all(|axis| tile[axis] >= tile_min[axis] && tile[axis] < tile_max[axis])
+}
+
+fn choose_soup_reuse_target(
+    preferred: Option<[i64; 3]>,
+    source: [i64; 3],
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+) -> Option<[i64; 3]> {
+    if let Some(tile) = preferred {
+        if tile != source && soup_tile_within_demo(tile, tile_min, tile_max) {
+            return Some(tile);
+        }
+    }
+    for offset in [
+        [-1, 0, 0],
+        [1, 0, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+        [0, 1, 0],
+        [0, -1, 0],
+    ] {
+        let tile = [
+            source[0] + offset[0],
+            source[1] + offset[1],
+            source[2] + offset[2],
+        ];
+        if soup_tile_within_demo(tile, tile_min, tile_max) {
+            return Some(tile);
+        }
+    }
+    for z in tile_min[2]..tile_max[2] {
+        for y in tile_min[1]..tile_max[1] {
+            for x in tile_min[0]..tile_max[0] {
+                let tile = [x, y, z];
+                if tile != source {
+                    return Some(tile);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn soup_tile_label(pop: usize, samples: &[SoupTilePopSample]) -> SoupCatalogLabel {
     if pop == 0 {
         return SoupCatalogLabel::Extinct;
@@ -1585,6 +1691,7 @@ impl App {
             dump_lod_bias: None,
             dump_steps_remaining: 0,
             dump_soup_catalog: false,
+            dump_soup_reuse: false,
             step_pending: false,
             world_prefetch_pending: false,
             next_world_prefetch_generation: 0,
@@ -2618,6 +2725,7 @@ impl App {
                         "  RClick      Place soup",
                         "  1-3         Soup seed",
                         "  C           Catalog tile",
+                        "  E           Reuse last",
                     ]
                 } else if quarantine_atlas_active {
                     vec![
@@ -3386,7 +3494,11 @@ impl App {
         }
         self.sample_soup_prospector_tiles();
         let aimed_tile = self.aimed_soup_tile();
-        let focus_tile = aimed_tile.unwrap_or_else(|| {
+        let reuse_focus_tile = self
+            .soup_prospector
+            .as_ref()
+            .and_then(|state| state.last_reuse.as_ref().map(|reuse| reuse.target_tile));
+        let focus_tile = reuse_focus_tile.or(aimed_tile).unwrap_or_else(|| {
             self.soup_prospector
                 .as_ref()
                 .map(|state| state.focus_tile)
@@ -3400,7 +3512,9 @@ impl App {
         };
         state.focus_tile = focus_tile;
         let target_label = record_soup_tile_pop_sample(state, focus_tile, generation, target_pop);
-        let target_source = if aimed_tile.is_some() {
+        let target_source = if reuse_focus_tile.is_some() {
+            "reuse"
+        } else if aimed_tile.is_some() {
             "aimed"
         } else {
             "focus"
@@ -3418,8 +3532,33 @@ impl App {
                 )
             })
             .unwrap_or_else(|| "last_label=none".to_string());
+        let reuse = state
+            .last_reuse
+            .as_ref()
+            .map(|reuse| {
+                format!(
+                    "reuse={} last_reuse={}->{} changed={} initial_match={} post_label={} post_pop={} post_hash={}",
+                    reuse.count,
+                    soup_tile_text(reuse.source_tile),
+                    soup_tile_text(reuse.target_tile),
+                    if reuse.target_before_hash != reuse.target_after_hash {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    if reuse.source_hash == reuse.target_after_hash {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    reuse.post_label.as_str(),
+                    reuse.post_pop,
+                    soup_hash_short(&reuse.post_hash),
+                )
+            })
+            .unwrap_or_else(|| "reuse=0 last_reuse=none".to_string());
         self.last_memo_summary = format!(
-            "soup_seed={} target_src={} target_tile={} target_label={} target_pop={} target_hash={} catalog={} {}",
+            "soup_seed={} target_src={} target_tile={} target_label={} target_pop={} target_hash={} catalog={} {} {}",
             state.selected_pattern + 1,
             target_source,
             soup_tile_text(focus_tile),
@@ -3428,6 +3567,7 @@ impl App {
             soup_hash_short(&target_hash),
             state.catalog.len(),
             last,
+            reuse,
         );
         self.memo_hud_visible = true;
         self.memo_hud_dirty = true;
@@ -3482,6 +3622,7 @@ impl App {
                 self.select_soup_prospector_pattern(pattern, false)
             }
             PendingSoupAction::Catalog => self.catalog_soup_prospector_target(),
+            PendingSoupAction::ReuseCatalog => self.reuse_latest_soup_catalog_entry(true),
         }
     }
 
@@ -3506,6 +3647,7 @@ impl App {
             };
             state.selected_pattern = pattern;
             state.focus_tile = focus_tile;
+            state.last_reuse = None;
         }
         if !place_now {
             log::info!("Soup Prospector seed selected: {}", pattern + 1);
@@ -3554,11 +3696,14 @@ impl App {
         let Some(tile) = self.soup_action_tile() else {
             return false;
         };
+        self.clear_soup_prospector_markers_for_step();
         let Some(state) = self.soup_prospector.as_mut() else {
             return false;
         };
         state.focus_tile = tile;
+        state.last_reuse = None;
         let (pop, state_hash) = soup_tile_stats(&self.world, tile);
+        let snapshot = capture_soup_tile_snapshot(&self.world, tile);
         let generation = self.world.generation;
         let label = record_soup_tile_pop_sample(state, tile, generation, pop);
         let entry = SoupCatalogEntry {
@@ -3568,6 +3713,7 @@ impl App {
             state_hash,
             pattern: state.selected_pattern,
             label,
+            snapshot,
         };
         log::info!(
             "Soup catalog #{}: tile={:?} gen={} pop={} label={} pattern={} hash={}",
@@ -3580,6 +3726,101 @@ impl App {
             entry.state_hash
         );
         state.catalog.push(entry);
+        self.refresh_soup_prospector_hud();
+        self.mark_world_changed();
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        true
+    }
+
+    fn reuse_latest_soup_catalog_entry(&mut self, run_post_step: bool) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        let Some(entry) = state.catalog.last().cloned() else {
+            log::info!("Soup reuse ignored: catalog is empty");
+            return false;
+        };
+        let preferred = self.aimed_soup_tile().or(Some(state.focus_tile));
+        let Some(target_tile) =
+            choose_soup_reuse_target(preferred, entry.tile, state.tile_min, state.tile_max)
+        else {
+            log::info!("Soup reuse ignored: no distinct in-bounds target tile");
+            return false;
+        };
+
+        self.clear_soup_prospector_markers_for_step();
+        let (target_before_pop, target_before_hash) = soup_tile_stats(&self.world, target_tile);
+        paste_soup_tile_snapshot(&mut self.world, target_tile, &entry.snapshot);
+        frame_soup_tile(&mut self.world, target_tile);
+        let (target_after_pop, target_after_hash) = soup_tile_stats(&self.world, target_tile);
+        self.mark_world_changed();
+
+        let mut post_pop = target_after_pop;
+        let mut post_hash = target_after_hash.clone();
+        let mut post_label = {
+            let generation = self.world.generation;
+            let Some(state) = self.soup_prospector.as_mut() else {
+                return false;
+            };
+            record_soup_tile_pop_sample(state, target_tile, generation, post_pop)
+        };
+
+        if run_post_step {
+            self.run_sync_dump_step();
+            (post_pop, post_hash) = soup_tile_stats(&self.world, target_tile);
+            let generation = self.world.generation;
+            let Some(state) = self.soup_prospector.as_mut() else {
+                return false;
+            };
+            post_label = record_soup_tile_pop_sample(state, target_tile, generation, post_pop);
+        }
+
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        state.reuse_count += 1;
+        state.focus_tile = target_tile;
+        state.last_reuse = Some(SoupReuseResult {
+            source_tile: entry.tile,
+            target_tile,
+            source_hash: entry.state_hash.clone(),
+            target_before_pop,
+            target_before_hash,
+            target_after_pop,
+            target_after_hash,
+            post_pop,
+            post_hash,
+            post_label,
+            count: state.reuse_count,
+        });
+        log::info!(
+            "Soup reuse #{}: source={:?} target={:?} changed={} initial_match={} post_label={} post_pop={}",
+            state.reuse_count,
+            entry.tile,
+            target_tile,
+            state
+                .last_reuse
+                .as_ref()
+                .is_some_and(|reuse| reuse.target_before_hash != reuse.target_after_hash),
+            state
+                .last_reuse
+                .as_ref()
+                .is_some_and(|reuse| reuse.source_hash == reuse.target_after_hash),
+            post_label.as_str(),
+            post_pop
+        );
         self.refresh_soup_prospector_hud();
         self.mark_world_changed();
         let player_pos = self.player_world_pos();
@@ -4394,6 +4635,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.perf.clear();
                             log::info!("perf histograms cleared");
                         }
+                        winit::keyboard::Key::Character("e") => {
+                            if self.soup_prospector.is_some() {
+                                self.run_soup_action_or_queue(PendingSoupAction::ReuseCatalog);
+                                return;
+                            }
+                        }
                         winit::keyboard::Key::Character("h") => {
                             // Toggle step-count heatmap debug mode.
                             if let Some(renderer) = &mut self.renderer {
@@ -4657,6 +4904,21 @@ impl ApplicationHandler<AppUserEvent> for App {
                     self.dump_soup_catalog = false;
                     log::info!("--dump-soup-catalog: cataloging aimed soup tile before capture");
                     self.catalog_soup_prospector_target();
+                    self.mark_resume_edge();
+                }
+                if self.dump_frame_path.is_some() && self.dump_soup_reuse {
+                    self.dump_soup_reuse = false;
+                    log::info!(
+                        "--dump-soup-reuse: cataloging, reusing, and retesting aimed soup tile before capture"
+                    );
+                    if self
+                        .soup_prospector
+                        .as_ref()
+                        .is_none_or(|state| state.catalog.is_empty())
+                    {
+                        self.catalog_soup_prospector_target();
+                    }
+                    self.reuse_latest_soup_catalog_entry(true);
                     self.mark_resume_edge();
                 }
                 if let Some(pose) = self.dump_pose.take() {
@@ -5319,6 +5581,9 @@ struct ParsedArgs {
     /// `--dump-soup-catalog`: dump-frame-only acceptance helper. Catalogs
     /// the current Soup Prospector target before capture.
     dump_soup_catalog: bool,
+    /// `--dump-soup-reuse`: dump-frame-only acceptance helper. Catalogs,
+    /// reuses, and retests the current Soup Prospector target before capture.
+    dump_soup_reuse: bool,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -5346,7 +5611,7 @@ where
                          [--dump-debug normal-axis|hit-kind|material] \
                          [--dump-lod-bias VALUE] \
                          [--dump-steps N] \
-                         [--dump-soup-catalog]";
+                         [--dump-soup-catalog] [--dump-soup-reuse]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
@@ -5357,6 +5622,7 @@ where
     let mut dump_lod_bias: Option<f32> = None;
     let mut dump_steps: Option<u32> = None;
     let mut dump_soup_catalog = false;
+    let mut dump_soup_reuse = false;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -5485,6 +5751,12 @@ where
                 }
                 dump_soup_catalog = true;
             }
+            "--dump-soup-reuse" => {
+                if dump_soup_reuse {
+                    panic!("{USAGE}\nmore than one --dump-soup-reuse");
+                }
+                dump_soup_reuse = true;
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -5524,6 +5796,12 @@ where
     if dump_soup_catalog && dump_scene != Some(DumpScene::SoupProspector) {
         panic!("{USAGE}\n--dump-soup-catalog requires --dump-scene soup-prospector");
     }
+    if dump_soup_reuse && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-soup-reuse requires --dump-frame");
+    }
+    if dump_soup_reuse && dump_scene != Some(DumpScene::SoupProspector) {
+        panic!("{USAGE}\n--dump-soup-reuse requires --dump-scene soup-prospector");
+    }
     let volume_size_explicit = volume_size.is_some();
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
@@ -5542,6 +5820,7 @@ where
         dump_lod_bias,
         dump_steps: dump_steps.unwrap_or(0),
         dump_soup_catalog,
+        dump_soup_reuse,
     }
 }
 
@@ -5592,6 +5871,7 @@ fn main() {
         dump_lod_bias,
         dump_steps,
         dump_soup_catalog,
+        dump_soup_reuse,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -5639,6 +5919,11 @@ fn main() {
     if dump_soup_catalog {
         log::info!(
             "--dump-soup-catalog: will catalog the aimed soup tile before dump-frame render"
+        );
+    }
+    if dump_soup_reuse {
+        log::info!(
+            "--dump-soup-reuse: will catalog, reuse, and retest the aimed soup tile before dump-frame render"
         );
     }
 
@@ -5690,6 +5975,7 @@ fn main() {
     app.dump_lod_bias = dump_lod_bias;
     app.dump_steps_remaining = dump_steps;
     app.dump_soup_catalog = dump_soup_catalog;
+    app.dump_soup_reuse = dump_soup_reuse;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -6115,6 +6401,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_from_dump_soup_reuse() {
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-reuse",
+        ]);
+        assert!(r.dump_soup_reuse);
+    }
+
+    #[test]
     fn parse_args_from_dump_debug_all_kinds() {
         for (raw, expected, debug_mode) in [
             ("normal-axis", DumpDebugMode::NormalAxis, 2),
@@ -6164,9 +6462,21 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "--dump-soup-reuse requires --dump-frame")]
+    fn parse_args_from_dump_soup_reuse_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-soup-reuse"]);
+    }
+
+    #[test]
     #[should_panic(expected = "--dump-soup-catalog requires --dump-scene soup-prospector")]
     fn parse_args_from_dump_soup_catalog_without_soup_scene_panics() {
         let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-soup-catalog"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-soup-reuse requires --dump-scene soup-prospector")]
+    fn parse_args_from_dump_soup_reuse_without_soup_scene_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-soup-reuse"]);
     }
 
     #[test]
@@ -6316,6 +6626,19 @@ mod tests {
             "soup-prospector",
             "--dump-soup-catalog",
             "--dump-soup-catalog",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-soup-reuse")]
+    fn parse_args_from_two_dump_soup_reuse_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-reuse",
+            "--dump-soup-reuse",
         ]);
     }
 
@@ -7201,6 +7524,9 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("C           Catalog tile")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("E           Reuse last")));
         assert!(!lines.iter().any(|line| line.contains("Clone source")));
     }
 
@@ -7225,9 +7551,74 @@ mod tests {
         assert_eq!(state.catalog[0].tile, tile);
         assert_eq!(state.catalog[0].pop, pop);
         assert_eq!(state.catalog[0].state_hash, hash);
+        assert_eq!(
+            state.catalog[0].snapshot.len(),
+            (SOUP_PROSPECTOR_TILE as usize).pow(3)
+        );
+        assert!(!state.catalog[0]
+            .snapshot
+            .contains(&hash_thing::terrain::materials::SOUP_TARGET_MARKER));
+        assert!(!state.catalog[0]
+            .snapshot
+            .contains(&hash_thing::terrain::materials::SOUP_CATALOG_MARKER));
         assert_ne!(state.catalog[0].label, SoupCatalogLabel::Extinct);
         assert!(app.last_memo_summary.contains("target_label="));
         assert!(app.last_memo_summary.contains("last_label="));
+    }
+
+    #[test]
+    fn soup_catalog_reuse_retests_last_entry_in_distinct_tile() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        let source = app
+            .soup_action_tile()
+            .expect("soup scene should start aimed at field");
+
+        assert!(app.catalog_soup_prospector_target());
+        let source_hash = app.soup_prospector.as_ref().unwrap().catalog[0]
+            .state_hash
+            .clone();
+        assert!(app.reuse_latest_soup_catalog_entry(true));
+
+        let state = app.soup_prospector.as_ref().unwrap();
+        let reuse = state.last_reuse.as_ref().expect("reuse should be recorded");
+        assert_eq!(reuse.source_tile, source);
+        assert_ne!(reuse.target_tile, source);
+        assert_eq!(reuse.source_hash, source_hash);
+        assert_ne!(reuse.target_before_hash, reuse.target_after_hash);
+        assert_eq!(reuse.source_hash, reuse.target_after_hash);
+        assert_eq!(reuse.count, 1);
+        assert_eq!(state.focus_tile, reuse.target_tile);
+        assert!(app.last_memo_summary.contains("reuse=1"));
+        assert!(app.last_memo_summary.contains("target_src=reuse"));
+        assert!(app.last_memo_summary.contains("initial_match=yes"));
+        assert!(app.last_memo_summary.contains("post_label="));
+        assert!(soup_tile_includes_material(
+            &app.world,
+            reuse.source_tile,
+            hash_thing::terrain::materials::SOUP_CATALOG_MARKER
+        ));
+        assert!(soup_tile_includes_material(
+            &app.world,
+            reuse.target_tile,
+            hash_thing::terrain::materials::SOUP_TARGET_MARKER
+        ));
+    }
+
+    #[test]
+    fn soup_reuse_target_fallback_avoids_source_tile() {
+        assert_eq!(
+            choose_soup_reuse_target(Some([1, 0, 1]), [1, 0, 1], [1, 0, 1], [3, 2, 3]),
+            Some([2, 0, 1])
+        );
+        assert_eq!(
+            choose_soup_reuse_target(Some([2, 0, 1]), [1, 0, 1], [1, 0, 1], [3, 2, 3]),
+            Some([2, 0, 1])
+        );
+        assert_eq!(
+            choose_soup_reuse_target(Some([2, 0, 3]), [2, 0, 3], [1, 0, 1], [5, 4, 5]),
+            Some([1, 0, 3])
+        );
     }
 
     #[test]
@@ -7349,7 +7740,6 @@ mod tests {
         frame_soup_tile(&mut world, tile);
         let before = soup_tile_stats(&world, tile);
 
-        stamp_soup_catalog_marker(&mut world, tile);
         stamp_soup_target_marker(&mut world, tile);
 
         assert_eq!(soup_tile_stats(&world, tile), before);
@@ -7358,6 +7748,9 @@ mod tests {
             tile,
             hash_thing::terrain::materials::SOUP_TARGET_MARKER
         ));
+        clear_soup_tile_markers(&mut world, tile);
+        stamp_soup_catalog_marker(&mut world, tile);
+        assert_eq!(soup_tile_stats(&world, tile), before);
         assert!(soup_tile_includes_material(
             &world,
             tile,
