@@ -7,6 +7,8 @@
 //! - 100 random level-4 (16³) worlds with mixed materials (default `cargo test`).
 //! - The same corpus at level 5 (32³), exercising recursive descent into
 //!   multiple level-4 fanouts (`--ignored`).
+//! - A bounded level-6 (64³) random smoke in default `cargo test`, covering
+//!   deeper BFS frontier descent without the level-7 sweep's runtime.
 //! - 4 explicit fixtures hitting the BlockRule paths the random sweep
 //!   would mostly miss: empty, all-stone (inert short-circuit), sand
 //!   column (gravity), water lattice (fluid spread).
@@ -342,6 +344,14 @@ fn bfs_observability_counters_fire_on_random_level5() {
         "BFS observability: neither bfs_batches_parallel nor bfs_batches_serial_fallback \
          fired — Phase 2 did not execute",
     );
+}
+
+/// hash-thing-a08q.6: bounded default coverage for deeper BFS frontier
+/// descent. Level 6 is the smallest non-ignored smoke that walks beyond the
+/// level-5 random corpus while staying inside normal crew command budgets.
+#[test]
+fn rayon_parity_random_level6_bfs_smoke() {
+    assert_parity(6, |w| seed_world(w, 0xa086_6000, 4), 1, "level6-bfs-smoke");
 }
 
 /// hash-thing-bfsq: slowed water BlockRule worlds use a level-4 leaf
