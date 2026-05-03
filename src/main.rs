@@ -1,7 +1,7 @@
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
-use hash_thing::scale::{CELLS_PER_METER, DEFAULT_VOLUME_SIZE, GROWTH_MARGIN};
+use hash_thing::scale::{CELLS_PER_METER, GROWTH_MARGIN};
 use hash_thing::sim;
 #[cfg(test)]
 use hash_thing::sim::world::quarantine_atlas_mixed_containment_plan;
@@ -76,6 +76,7 @@ use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_S
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 const WORLD_PREFETCH_MARGIN_METERS: f64 = 64.0;
+const DEFAULT_CLI_VOLUME_SIZE: u32 = 256;
 
 /// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
 /// the threshold at which a human reads a changing number without
@@ -4374,6 +4375,7 @@ impl DumpDebugMode {
 #[derive(Debug, Clone, PartialEq)]
 struct ParsedArgs {
     volume_size: u32,
+    volume_size_explicit: bool,
     target_pixels: Option<u64>,
     /// hash-thing-kh9l: `--demo` was passed (independent of target_pixels,
     /// since `--res 1080p` produces the same pixel budget). Drives
@@ -4587,13 +4589,15 @@ where
     if dump_steps.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-steps requires --dump-frame");
     }
+    let volume_size_explicit = volume_size.is_some();
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
         res_target
     };
     ParsedArgs {
-        volume_size: volume_size.unwrap_or(DEFAULT_VOLUME_SIZE),
+        volume_size: volume_size.unwrap_or(DEFAULT_CLI_VOLUME_SIZE),
+        volume_size_explicit,
         target_pixels,
         demo,
         dump_frame,
@@ -4641,6 +4645,7 @@ fn main() {
 
     let ParsedArgs {
         volume_size,
+        volume_size_explicit,
         target_pixels: target_pixels_override,
         demo,
         dump_frame: dump_frame_path,
@@ -4654,6 +4659,12 @@ fn main() {
         "Volume: {volume_size}^3 (level {})",
         volume_size.trailing_zeros()
     );
+    if !volume_size_explicit {
+        log::info!(
+            "No SIZE supplied; defaulting to {DEFAULT_CLI_VOLUME_SIZE}^3 for fast startup. \
+             Pass an explicit power-of-two SIZE for larger worlds."
+        );
+    }
     if let Some(target) = target_pixels_override {
         log::info!("CLI render target: {target} px (--demo / --res)");
     }
@@ -4954,6 +4965,7 @@ mod tests {
     fn parse_args_from_size_only() {
         let r = parse_args_from(["256"]);
         assert_eq!(r.volume_size, 256);
+        assert!(r.volume_size_explicit);
         assert_eq!(r.target_pixels, None);
         assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
@@ -4962,7 +4974,8 @@ mod tests {
     #[test]
     fn parse_args_from_no_args_uses_default() {
         let r = parse_args_from(std::iter::empty::<&str>());
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
         assert_eq!(r.target_pixels, None);
         assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
@@ -4971,7 +4984,8 @@ mod tests {
     #[test]
     fn parse_args_from_demo_alone() {
         let r = parse_args_from(["--demo"]);
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
         assert!(r.demo, "kh9l: --demo must surface as demo=true");
     }
@@ -4981,8 +4995,10 @@ mod tests {
         let r1 = parse_args_from(["--demo", "256"]);
         let r2 = parse_args_from(["256", "--demo"]);
         assert_eq!((r1.volume_size, r1.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r1.volume_size_explicit);
         assert!(r1.demo);
         assert_eq!((r2.volume_size, r2.target_pixels), (256, Some(1920 * 1080)));
+        assert!(r2.volume_size_explicit);
         assert!(r2.demo);
     }
 
@@ -5000,7 +5016,8 @@ mod tests {
     #[test]
     fn parse_args_from_res_arbitrary_wxh() {
         let r = parse_args_from(["--res", "1920x1080"]);
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
         assert_eq!(r.target_pixels, Some(1920 * 1080));
         assert!(
             !r.demo,
@@ -5023,7 +5040,8 @@ mod tests {
     #[test]
     fn parse_args_from_dump_frame_path() {
         let r = parse_args_from(["--dump-frame", "/tmp/foo.png"]);
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
         assert_eq!(r.target_pixels, None);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
     }
