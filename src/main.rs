@@ -9,7 +9,7 @@ use hash_thing::sim::world::QuarantineAtlasPattern;
 use hash_thing::terrain;
 
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// hash-thing-imvg (vqke.1): timing data the sim thread returns alongside
@@ -670,12 +670,36 @@ impl Default for QuarantineAtlasState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupTilePopSample {
+    generation: u64,
+    pop: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoupCatalogLabel {
+    Extinct,
+    Survivor,
+    CandidateStable,
+}
+
+impl SoupCatalogLabel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Extinct => "extinct",
+            Self::Survivor => "survivor",
+            Self::CandidateStable => "candidate-stable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SoupCatalogEntry {
     tile: [i64; 3],
     generation: u64,
     pop: usize,
     state_hash: String,
     pattern: usize,
+    label: SoupCatalogLabel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -685,6 +709,7 @@ struct SoupProspectorState {
     tile_min: [i64; 3],
     tile_max: [i64; 3],
     catalog: Vec<SoupCatalogEntry>,
+    pop_history: HashMap<[i64; 3], Vec<SoupTilePopSample>>,
 }
 
 impl SoupProspectorState {
@@ -695,6 +720,7 @@ impl SoupProspectorState {
             tile_min,
             tile_max,
             catalog: Vec::new(),
+            pop_history: HashMap::new(),
         }
     }
 }
@@ -813,6 +839,10 @@ struct App {
     dump_lod_bias: Option<f32>,
     /// hash-thing-7aqo: dump-frame-only synchronous sim steps before capture.
     dump_steps_remaining: u32,
+    /// Dump-frame diagnostic for Soup Prospector acceptance artifacts:
+    /// catalog the current aimed soup tile after dump steps and before
+    /// capture, so the screenshot can prove durable in-game catalog feedback.
+    dump_soup_catalog: bool,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -1177,7 +1207,11 @@ fn ray_aabb_entry(
         }
     }
     (t_max >= 0.0).then(|| {
-        let t = t_min.max(0.0);
+        let t = if t_min <= 1e-6 {
+            t_max.min(SOUP_PROSPECTOR_TILE as f64 * 0.5).max(0.0)
+        } else {
+            t_min + 1e-6
+        };
         [
             origin[0] + dir[0] * t,
             origin[1] + dir[1] * t,
@@ -1316,6 +1350,50 @@ fn soup_tile_stats(world: &sim::World, tile: [i64; 3]) -> (usize, String) {
     )
 }
 
+fn soup_tile_label(pop: usize, samples: &[SoupTilePopSample]) -> SoupCatalogLabel {
+    if pop == 0 {
+        return SoupCatalogLabel::Extinct;
+    }
+    if samples.len() >= 3 {
+        let last = &samples[samples.len() - 3..];
+        if last[0].generation + 1 == last[1].generation
+            && last[1].generation + 1 == last[2].generation
+            && last.iter().all(|sample| sample.pop == pop)
+        {
+            return SoupCatalogLabel::CandidateStable;
+        }
+    }
+    SoupCatalogLabel::Survivor
+}
+
+fn record_soup_tile_pop_sample(
+    state: &mut SoupProspectorState,
+    tile: [i64; 3],
+    generation: u64,
+    pop: usize,
+) -> SoupCatalogLabel {
+    let samples = state.pop_history.entry(tile).or_default();
+    if let Some(last) = samples.last_mut() {
+        if last.generation == generation {
+            last.pop = pop;
+            return soup_tile_label(pop, samples);
+        }
+    }
+    samples.push(SoupTilePopSample { generation, pop });
+    if samples.len() > 3 {
+        samples.remove(0);
+    }
+    soup_tile_label(pop, samples)
+}
+
+fn soup_tile_text(tile: [i64; 3]) -> String {
+    format!("[{},{},{}]", tile[0], tile[1], tile[2])
+}
+
+fn soup_hash_short(hash: &str) -> &str {
+    hash.get(..23).unwrap_or(hash)
+}
+
 impl App {
     fn new(volume_size: u32) -> Self {
         let level = volume_size.trailing_zeros();
@@ -1367,6 +1445,7 @@ impl App {
             dump_debug: None,
             dump_lod_bias: None,
             dump_steps_remaining: 0,
+            dump_soup_catalog: false,
             step_pending: false,
             world_prefetch_pending: false,
             next_world_prefetch_generation: 0,
@@ -2079,8 +2158,7 @@ impl App {
         self.entities.update(&self.world, &mut queue);
         self.world.queue = queue;
         self.mark_world_changed();
-        self.last_memo_summary = self.world.memo_summary();
-        self.memo_hud_dirty = true;
+        self.refresh_memo_summary_after_world_update();
     }
 
     fn maybe_start_world_prefetch(&mut self, min: [sim::WorldCoord; 3], max: [sim::WorldCoord; 3]) {
@@ -2164,8 +2242,7 @@ impl App {
                     let _t = self.perf.start("collision_snapshot_refresh");
                     self.collision_snapshot = Some(self.world.collision_snapshot());
                 }
-                self.last_memo_summary = self.world.memo_summary();
-                self.memo_hud_dirty = true;
+                self.refresh_memo_summary_after_world_update();
                 self.sync_render_cache();
                 {
                     let player_pos = self.player_world_pos();
@@ -2277,8 +2354,7 @@ impl App {
                 // is in hand (hash-thing-stue.6): the (stepping) log
                 // branch below cannot read self.world (it's about to be
                 // replaced by a placeholder again on the next step).
-                self.last_memo_summary = self.world.memo_summary();
-                self.memo_hud_dirty = true;
+                self.refresh_memo_summary_after_world_update();
                 // Entity update on main thread (needs both &World and
                 // &mut EntityStore).
                 let mut queue = std::mem::take(&mut self.world.queue);
@@ -3134,6 +3210,92 @@ impl App {
             .or_else(|| self.soup_prospector.as_ref().map(|state| state.focus_tile))
     }
 
+    fn refresh_soup_prospector_hud(&mut self) -> bool {
+        if self.soup_prospector.is_none() {
+            return false;
+        }
+        self.sample_soup_prospector_tiles();
+        let aimed_tile = self.aimed_soup_tile();
+        let focus_tile = aimed_tile.unwrap_or_else(|| {
+            self.soup_prospector
+                .as_ref()
+                .map(|state| state.focus_tile)
+                .unwrap_or([0, 0, 0])
+        });
+        let (target_pop, target_hash) = soup_tile_stats(&self.world, focus_tile);
+        let generation = self.world.generation;
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        state.focus_tile = focus_tile;
+        let target_label = record_soup_tile_pop_sample(state, focus_tile, generation, target_pop);
+        let target_source = if aimed_tile.is_some() {
+            "aimed"
+        } else {
+            "focus"
+        };
+        let last = state
+            .catalog
+            .last()
+            .map(|entry| {
+                format!(
+                    "last_label={} last_tile={} last_pop={} last_hash={}",
+                    entry.label.as_str(),
+                    soup_tile_text(entry.tile),
+                    entry.pop,
+                    soup_hash_short(&entry.state_hash)
+                )
+            })
+            .unwrap_or_else(|| "last_label=none".to_string());
+        self.last_memo_summary = format!(
+            "soup_seed={} target_src={} target_tile={} target_label={} target_pop={} target_hash={} catalog={} {}",
+            state.selected_pattern + 1,
+            target_source,
+            soup_tile_text(focus_tile),
+            target_label.as_str(),
+            target_pop,
+            soup_hash_short(&target_hash),
+            state.catalog.len(),
+            last,
+        );
+        self.memo_hud_visible = true;
+        self.memo_hud_dirty = true;
+        true
+    }
+
+    fn sample_soup_prospector_tiles(&mut self) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        let tile_min = state.tile_min;
+        let tile_max = state.tile_max;
+        let generation = self.world.generation;
+        let mut samples = Vec::new();
+        for z in tile_min[2]..tile_max[2] {
+            for y in tile_min[1]..tile_max[1] {
+                for x in tile_min[0]..tile_max[0] {
+                    let tile = [x, y, z];
+                    let (pop, _) = soup_tile_stats(&self.world, tile);
+                    samples.push((tile, pop));
+                }
+            }
+        }
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        for (tile, pop) in samples {
+            record_soup_tile_pop_sample(state, tile, generation, pop);
+        }
+        true
+    }
+
+    fn refresh_memo_summary_after_world_update(&mut self) {
+        if !self.refresh_soup_prospector_hud() {
+            self.last_memo_summary = self.world.memo_summary();
+            self.memo_hud_dirty = true;
+        }
+    }
+
     fn run_soup_action_or_queue(&mut self, action: PendingSoupAction) -> bool {
         if self.soup_prospector.is_none() {
             return false;
@@ -3176,17 +3338,7 @@ impl App {
         }
         if !place_now {
             log::info!("Soup Prospector seed selected: {}", pattern + 1);
-            self.last_memo_summary = format!(
-                "soup_selected={} soup_tile={:?} soup_catalog={}",
-                pattern + 1,
-                focus_tile,
-                self.soup_prospector
-                    .as_ref()
-                    .map(|state| state.catalog.len())
-                    .unwrap_or(0),
-            );
-            self.memo_hud_visible = true;
-            self.memo_hud_dirty = true;
+            self.refresh_soup_prospector_hud();
             return true;
         }
         let generation = self.world.generation;
@@ -3214,18 +3366,7 @@ impl App {
             pattern + 1,
             focus_tile
         );
-        self.last_memo_summary = format!(
-            "soup_selected={} soup_tile={:?} soup_initial_pop={} soup_catalog={}",
-            pattern + 1,
-            focus_tile,
-            placed,
-            self.soup_prospector
-                .as_ref()
-                .map(|state| state.catalog.len())
-                .unwrap_or(0),
-        );
-        self.memo_hud_visible = true;
-        self.memo_hud_dirty = true;
+        self.refresh_soup_prospector_hud();
         true
     }
 
@@ -3247,33 +3388,28 @@ impl App {
         };
         state.focus_tile = tile;
         let (pop, state_hash) = soup_tile_stats(&self.world, tile);
+        let generation = self.world.generation;
+        let label = record_soup_tile_pop_sample(state, tile, generation, pop);
         let entry = SoupCatalogEntry {
             tile,
-            generation: self.world.generation,
+            generation,
             pop,
             state_hash,
             pattern: state.selected_pattern,
+            label,
         };
         log::info!(
-            "Soup catalog #{}: tile={:?} gen={} pop={} pattern={} hash={}",
+            "Soup catalog #{}: tile={:?} gen={} pop={} label={} pattern={} hash={}",
             state.catalog.len() + 1,
             entry.tile,
             entry.generation,
             entry.pop,
+            entry.label.as_str(),
             entry.pattern + 1,
             entry.state_hash
         );
         state.catalog.push(entry);
-        self.last_memo_summary = format!(
-            "soup_catalog={} soup_tile={:?} soup_gen={} soup_pop={} soup_hash={}",
-            state.catalog.len(),
-            tile,
-            self.world.generation,
-            pop,
-            state.catalog.last().unwrap().state_hash,
-        );
-        self.memo_hud_visible = true;
-        self.memo_hud_dirty = true;
+        self.refresh_soup_prospector_hud();
         true
     }
 
@@ -3402,12 +3538,6 @@ impl App {
         self.gol_smoke_scene = true;
         self.soup_prospector = Some(SoupProspectorState::new(focus_tile, tile_min, tile_max));
         self.legend_dirty = true;
-        self.memo_hud_visible = true;
-        self.memo_hud_dirty = true;
-        self.last_memo_summary = format!(
-            "soup_selected=1 soup_tile={:?} soup_catalog=0 soup_goal=save_survivors",
-            focus_tile,
-        );
         self.noise_ns_per_sample = 0.0;
         self.paused = false;
         self.reset_scene_perf_state();
@@ -3440,6 +3570,7 @@ impl App {
             -0.24,
         );
         self.apply_current_player_camera_pose();
+        self.refresh_soup_prospector_hud();
         let (focus_pop, _) = soup_tile_stats(&self.world, focus_tile);
         log::info!(
             "Soup Prospector: sparse 445 board loaded in {:.1}ms; tiles={} focus_tile={:?} focus_pop={focus_pop}",
@@ -3939,8 +4070,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                                 self.world.queue = queue;
                             }
                             self.mark_world_changed();
-                            self.last_memo_summary = self.world.memo_summary();
-                            self.memo_hud_dirty = true;
+                            self.refresh_memo_summary_after_world_update();
                             let player_pos = self.player_world_pos();
                             Self::upload_volume(
                                 &mut self.renderer,
@@ -4335,6 +4465,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                             last_growth_ratio: &mut self.last_lod_growth_ratio,
                         },
                     );
+                    self.mark_resume_edge();
+                }
+                if self.dump_frame_path.is_some() && self.dump_soup_catalog {
+                    self.dump_soup_catalog = false;
+                    log::info!("--dump-soup-catalog: cataloging aimed soup tile before capture");
+                    self.catalog_soup_prospector_target();
                     self.mark_resume_edge();
                 }
                 if let Some(pose) = self.dump_pose.take() {
@@ -4994,6 +5130,9 @@ struct ParsedArgs {
     /// `--dump-steps N`: hash-thing-7aqo, only meaningful with `--dump-frame`.
     /// Advances the loaded scene synchronously before capture.
     dump_steps: u32,
+    /// `--dump-soup-catalog`: dump-frame-only acceptance helper. Catalogs
+    /// the current Soup Prospector target before capture.
+    dump_soup_catalog: bool,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -5020,7 +5159,8 @@ where
                          [--dump-pose wall|blocks|terrain-wide|geyser] \
                          [--dump-debug normal-axis|hit-kind|material] \
                          [--dump-lod-bias VALUE] \
-                         [--dump-steps N]";
+                         [--dump-steps N] \
+                         [--dump-soup-catalog]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
@@ -5030,6 +5170,7 @@ where
     let mut dump_debug: Option<DumpDebugMode> = None;
     let mut dump_lod_bias: Option<f32> = None;
     let mut dump_steps: Option<u32> = None;
+    let mut dump_soup_catalog = false;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -5152,6 +5293,12 @@ where
                     .unwrap_or_else(|_| panic!("{USAGE}\n--dump-steps COUNT: invalid '{v_str}'"));
                 dump_steps = Some(parsed);
             }
+            "--dump-soup-catalog" => {
+                if dump_soup_catalog {
+                    panic!("{USAGE}\nmore than one --dump-soup-catalog");
+                }
+                dump_soup_catalog = true;
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -5185,6 +5332,12 @@ where
     if dump_steps.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-steps requires --dump-frame");
     }
+    if dump_soup_catalog && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-soup-catalog requires --dump-frame");
+    }
+    if dump_soup_catalog && dump_scene != Some(DumpScene::SoupProspector) {
+        panic!("{USAGE}\n--dump-soup-catalog requires --dump-scene soup-prospector");
+    }
     let volume_size_explicit = volume_size.is_some();
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
@@ -5202,6 +5355,7 @@ where
         dump_debug,
         dump_lod_bias,
         dump_steps: dump_steps.unwrap_or(0),
+        dump_soup_catalog,
     }
 }
 
@@ -5251,6 +5405,7 @@ fn main() {
         dump_debug,
         dump_lod_bias,
         dump_steps,
+        dump_soup_catalog,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -5294,6 +5449,11 @@ fn main() {
     }
     if dump_steps > 0 {
         log::info!("--dump-steps: {dump_steps} sync steps before dump-frame render");
+    }
+    if dump_soup_catalog {
+        log::info!(
+            "--dump-soup-catalog: will catalog the aimed soup tile before dump-frame render"
+        );
     }
 
     // Single source of truth for focus-on-launch. Two downstream sites
@@ -5343,6 +5503,7 @@ fn main() {
     app.dump_debug = dump_debug;
     app.dump_lod_bias = dump_lod_bias;
     app.dump_steps_remaining = dump_steps;
+    app.dump_soup_catalog = dump_soup_catalog;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -5756,6 +5917,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_from_dump_soup_catalog() {
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-catalog",
+        ]);
+        assert!(r.dump_soup_catalog);
+    }
+
+    #[test]
     fn parse_args_from_dump_debug_all_kinds() {
         for (raw, expected, debug_mode) in [
             ("normal-axis", DumpDebugMode::NormalAxis, 2),
@@ -5796,6 +5969,18 @@ mod tests {
     #[should_panic(expected = "--dump-steps requires --dump-frame")]
     fn parse_args_from_dump_steps_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-steps", "24"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-soup-catalog requires --dump-frame")]
+    fn parse_args_from_dump_soup_catalog_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-soup-catalog"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-soup-catalog requires --dump-scene soup-prospector")]
+    fn parse_args_from_dump_soup_catalog_without_soup_scene_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-soup-catalog"]);
     }
 
     #[test]
@@ -5932,6 +6117,19 @@ mod tests {
             "2",
             "--dump-steps",
             "4",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-soup-catalog")]
+    fn parse_args_from_two_dump_soup_catalog_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-catalog",
+            "--dump-soup-catalog",
         ]);
     }
 
@@ -6841,6 +7039,9 @@ mod tests {
         assert_eq!(state.catalog[0].tile, tile);
         assert_eq!(state.catalog[0].pop, pop);
         assert_eq!(state.catalog[0].state_hash, hash);
+        assert_ne!(state.catalog[0].label, SoupCatalogLabel::Extinct);
+        assert!(app.last_memo_summary.contains("target_label="));
+        assert!(app.last_memo_summary.contains("last_label="));
     }
 
     #[test]
@@ -6901,6 +7102,71 @@ mod tests {
             soup_tile_from_field_ray([0, 0, 0], min, max, eye, dir),
             Some([2, 2, 3])
         );
+    }
+
+    #[test]
+    fn soup_field_ray_inside_bounds_samples_forward_tile() {
+        let focus = soup_focus_tile_for_side(64);
+        let (min, max) = soup_demo_tile_bounds(64, focus);
+        let eye = [32.0, 32.0, 40.0];
+        let dir = [0.0, 0.0, 1.0];
+
+        assert_eq!(
+            soup_tile_from_field_ray([0, 0, 0], min, max, eye, dir),
+            Some([2, 2, 3])
+        );
+    }
+
+    #[test]
+    fn soup_prospector_default_pose_aims_without_focus_fallback() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+
+        assert_eq!(app.aimed_soup_tile(), Some([1, 0, 1]));
+        assert_eq!(app.soup_prospector.as_ref().unwrap().focus_tile, [1, 0, 1]);
+        assert_ne!(
+            app.soup_prospector.as_ref().unwrap().focus_tile,
+            soup_focus_tile_for_side(app.world.side())
+        );
+        assert!(app.last_memo_summary.contains("target_src=aimed"));
+    }
+
+    #[test]
+    fn soup_catalog_label_uses_last_three_population_samples() {
+        let mut state = SoupProspectorState::new([1, 1, 1], [0, 0, 0], [2, 2, 2]);
+        let tile = [1, 1, 1];
+
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 1, 7),
+            SoupCatalogLabel::Survivor
+        );
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 2, 7),
+            SoupCatalogLabel::Survivor
+        );
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 3, 7),
+            SoupCatalogLabel::CandidateStable
+        );
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 4, 0),
+            SoupCatalogLabel::Extinct
+        );
+    }
+
+    #[test]
+    fn soup_prospector_samples_every_demo_tile_for_classifier_window() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        app.run_sync_dump_step();
+        app.run_sync_dump_step();
+
+        let state = app.soup_prospector.as_ref().unwrap();
+        let expected_tiles = ((state.tile_max[0] - state.tile_min[0])
+            * (state.tile_max[1] - state.tile_min[1])
+            * (state.tile_max[2] - state.tile_min[2])) as usize;
+        assert_eq!(state.pop_history.len(), expected_tiles);
+        assert!(state.pop_history.values().all(|samples| samples.len() == 3));
     }
 
     #[test]
