@@ -7,7 +7,7 @@
 //! checkerboard) and dumps the floor-adjacent xz slice across multiple
 //! steps so the mechanism can be characterized.
 //!
-//! Run: `cargo test --profile bench --test repro_14yp_water_floor_checkerboard
+//! Run: `cargo test --profile perf --test repro_14yp_water_floor_checkerboard
 //!       -- --ignored --nocapture`
 //!
 //! Scope: pure CPU, deterministic, small (level=5, 32³). No GPU, no winit.

@@ -17,7 +17,7 @@
 //!
 //! Run with:
 //! ```text
-//! cargo test --profile bench --test bench_cold_gen_lod -- --ignored --nocapture
+//! cargo test --profile perf --test bench_cold_gen_lod -- --ignored --nocapture
 //! ```
 //!
 //! Confidence note: observational only — prints timings and a

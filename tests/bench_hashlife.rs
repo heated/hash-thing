@@ -511,7 +511,7 @@ fn bench_hashlife_4096_seed() {
 /// ceiling on M1-class hardware — run out-of-band with an explicit longer
 /// timeout:
 /// ```text
-/// cargo test --release --test bench_hashlife bench_hashlife_4096_step \
+/// cargo test --profile perf --test bench_hashlife bench_hashlife_4096_step \
 ///     -- --ignored --nocapture
 /// ```
 /// Required to measure warm-step cost at 4096³ (`render_gpu` / macro-cache

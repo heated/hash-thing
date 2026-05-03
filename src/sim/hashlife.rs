@@ -2713,7 +2713,7 @@ mod tests {
     }
 
     /// Timing comparison: brute-force vs recursive Hashlife on 64³ terrain.
-    /// Run with `cargo test --release --lib bench_stepper_comparison -- --ignored --nocapture`.
+    /// Run with `cargo test --profile perf --lib bench_stepper_comparison -- --ignored --nocapture`.
     /// At 64³ the recursive path is roughly at parity with brute-force thanks to
     /// the empty-node short-circuit (6gf.14) and incremental cache (m1f.11/m1f.12).
     #[test]

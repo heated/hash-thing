@@ -4794,7 +4794,7 @@ mod tests {
     /// always-on under the 60s soft-max in release / `--profile perf`
     /// (~10s observed); in debug builds the 128³ voxel walk dominates
     /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
-    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// hash-thing-1imu. Run via `cargo test --profile perf` (or any
     /// non-`debug_assertions` profile) to exercise the regression
     /// guard. With the fix reverted, the assertion fires at step 42
     /// with ~254k mismatches. Water pool sits at
@@ -4804,7 +4804,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile perf (hash-thing-1imu)"
+        ignore = "slow on debug build (~10 min @ 128³); runs under --profile perf (hash-thing-1imu)"
     )]
     fn water_and_sand_128_commit_step_skip_sync_corrupts_svdag() {
         let mut world = World::new(7);
@@ -4846,14 +4846,14 @@ mod tests {
     /// always-on under the 60s soft-max in release / `--profile perf`
     /// (~5s observed); in debug builds the 128³ voxel walk dominates
     /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
-    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// hash-thing-1imu. Run via `cargo test --profile perf` (or any
     /// non-`debug_assertions` profile) to exercise the regression
     /// guard. With the fix reverted, the assertion fires at step 24
     /// with ~974k mismatches.
     #[test]
     #[cfg_attr(
         debug_assertions,
-        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile perf (hash-thing-1imu)"
+        ignore = "slow on debug build (~10 min @ 128³); runs under --profile perf (hash-thing-1imu)"
     )]
     fn water_and_sand_128_step_recursive_with_sync_every_step() {
         let mut world = World::new(7);

@@ -10,7 +10,7 @@
 //!
 //! Run with:
 //! ```text
-//! cargo test --profile bench --test bench_flythrough_4096 -- --ignored --nocapture
+//! cargo test --profile perf --test bench_flythrough_4096 -- --ignored --nocapture
 //! ```
 //!
 //! ## What this bench does NOT measure

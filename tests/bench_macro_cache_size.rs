@@ -6,7 +6,7 @@
 //! `(entries, bytes_est)` so the paper can cite measured occupancy.
 //!
 //! Run with:
-//!   `cargo test --release --test bench_macro_cache_size -- --ignored --nocapture`
+//!   `cargo test --profile perf --test bench_macro_cache_size -- --ignored --nocapture`
 //!
 //! Confidence note: observational only. No CI gate — the printed numbers
 //! feed into the perf paper's §5 manually. Sanity assertions guard against
