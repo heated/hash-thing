@@ -161,11 +161,11 @@ fn bench_hashlife_256_tk4j() {
 /// - Primary metric: `step_us` median (full-step wall, not just leaf
 ///   compute) and `step_node_wall_ns` median. p1/p2 are sums of
 ///   per-worker leaf compute under rayon and don't reflect latency.
-/// - Pre-committed slack: BFS step_us median ≤ 1.1× RayonPerFanout
-///   step_us median on this default-terrain scene. If exceeded, file a
-///   follow-up bead and ship behind the env-var only — do not flip
-///   default. (Catches "BFS infrastructure ships but never speeds
-///   anything up" — adversarial-claude's primary concern.)
+/// - Default-health slack: BFS step_us median should stay ≤ 1.1×
+///   RayonPerFanout step_us median on this default-terrain scene. If
+///   exceeded, file a follow-up bead to re-evaluate the current
+///   RayonBfs default. (Catches "BFS infrastructure ships but does not
+///   keep its perf edge" — adversarial-claude's primary concern.)
 /// - Cold warm-up: skip the first 5 generations from median/p95
 ///   computation to avoid first-allocation + cold-cache distortion.
 /// - Bench is informational (no panic) — the absolute "8 ms" bead
@@ -192,7 +192,7 @@ fn bench_hashlife_256_ftuu_rayon_compare() {
     if slack_ratio > 1.10 {
         eprintln!(
             "  WARN: BFS slower than per-fanout by >10% on default terrain. \
-             File follow-up bead — do not flip default to RayonBfs.",
+             File follow-up bead to re-evaluate the current RayonBfs default.",
         );
     }
 }

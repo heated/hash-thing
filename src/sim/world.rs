@@ -770,6 +770,10 @@ impl World {
     /// `BaseCaseStrategy::RayonPerFanout`, `false` to `Serial`. Kept
     /// so existing tests / benches that toggle this knob keep
     /// compiling. Prefer [`Self::set_base_case_strategy`] in new code.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use set_base_case_strategy(BaseCaseStrategy) so callers can select Serial, RayonPerFanout, or RayonBfs explicitly"
+    )]
     pub fn set_base_case_use_rayon(&mut self, enabled: bool) {
         self.base_case_strategy = if enabled {
             BaseCaseStrategy::RayonPerFanout
