@@ -60,6 +60,8 @@ pub const VINE_MATERIAL_ID: MaterialId = 15;
 pub const FAN_MATERIAL_ID: MaterialId = 16;
 pub const FIREWORK_MATERIAL_ID: MaterialId = 17;
 pub const CLONE_MATERIAL_ID: MaterialId = 18;
+pub const SOUP_TARGET_MARKER_MATERIAL_ID: MaterialId = 27;
+pub const SOUP_CATALOG_MARKER_MATERIAL_ID: MaterialId = 28;
 const FAN_STEAM_POS_X_MATERIAL_ID: MaterialId = 19;
 const FAN_STEAM_NEG_X_MATERIAL_ID: MaterialId = 20;
 const FAN_STEAM_POS_Z_MATERIAL_ID: MaterialId = 21;
@@ -100,6 +102,8 @@ pub const VINE: CellState = Cell::pack(VINE_MATERIAL_ID, 0).raw();
 pub const FAN: CellState = Cell::pack(FAN_MATERIAL_ID, 0).raw();
 pub const FIREWORK: CellState = Cell::pack(FIREWORK_MATERIAL_ID, 0).raw();
 pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
+pub const SOUP_TARGET_MARKER: CellState = Cell::pack(SOUP_TARGET_MARKER_MATERIAL_ID, 0).raw();
+pub const SOUP_CATALOG_MARKER: CellState = Cell::pack(SOUP_CATALOG_MARKER_MATERIAL_ID, 0).raw();
 
 /// Pack a CLONE cell whose metadata slot carries the source material id.
 ///
@@ -809,6 +813,37 @@ impl MaterialRegistry {
                 tick_divisor: 1,
             },
         );
+        for (material_id, label, color) in [
+            (
+                SOUP_TARGET_MARKER_MATERIAL_ID,
+                "_soup_target_marker",
+                [0.1, 1.0, 0.8, 1.0],
+            ),
+            (
+                SOUP_CATALOG_MARKER_MATERIAL_ID,
+                "_soup_catalog_marker",
+                [1.0, 0.2, 0.95, 1.0],
+            ),
+        ] {
+            registry.insert(
+                material_id,
+                MaterialEntry {
+                    visual: MaterialVisualProperties {
+                        label,
+                        base_color: color,
+                        texture_ref: None,
+                    },
+                    physical: MaterialPhysicalProperties {
+                        density: 7.0,
+                        flammability: 0.0,
+                        conductivity: 0.95,
+                    },
+                    rule_id: static_rule,
+                    block_rule_id: None,
+                    tick_divisor: 1,
+                },
+            );
+        }
 
         registry.validate_shared_block_rule_divisors();
         registry
@@ -1258,8 +1293,27 @@ mod tests {
     #[test]
     fn materials_are_distinct() {
         let mats = [
-            AIR, STONE, DIRT, GRASS, FIRE, WATER, SAND, LAVA, ICE, ACID, OIL, GUNPOWDER, STEAM,
-            GAS, METAL, VINE, FAN, FIREWORK, CLONE,
+            AIR,
+            STONE,
+            DIRT,
+            GRASS,
+            FIRE,
+            WATER,
+            SAND,
+            LAVA,
+            ICE,
+            ACID,
+            OIL,
+            GUNPOWDER,
+            STEAM,
+            GAS,
+            METAL,
+            VINE,
+            FAN,
+            FIREWORK,
+            CLONE,
+            SOUP_TARGET_MARKER,
+            SOUP_CATALOG_MARKER,
         ];
         for (i, &a) in mats.iter().enumerate() {
             for (j, &b) in mats.iter().enumerate() {
@@ -1371,6 +1425,14 @@ mod tests {
         assert_eq!(palette[WATER_MATERIAL_ID as usize], [0.12, 0.35, 0.84, 1.0]);
         assert_eq!(palette[SAND_MATERIAL_ID as usize], [0.87, 0.80, 0.55, 1.0]);
         assert_eq!(palette[LAVA_MATERIAL_ID as usize], [0.95, 0.25, 0.05, 1.0]);
+        assert_eq!(
+            palette[SOUP_TARGET_MARKER_MATERIAL_ID as usize],
+            [0.1, 1.0, 0.8, 1.0]
+        );
+        assert_eq!(
+            palette[SOUP_CATALOG_MARKER_MATERIAL_ID as usize],
+            [1.0, 0.2, 0.95, 1.0]
+        );
     }
 
     #[test]

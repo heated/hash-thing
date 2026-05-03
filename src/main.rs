@@ -1,3 +1,4 @@
+use hash_thing::octree::CellState;
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
@@ -1321,6 +1322,144 @@ fn frame_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
     }
 }
 
+fn soup_marker_material_for_live_index(index: usize, material: CellState) -> CellState {
+    if material == hash_thing::terrain::materials::SOUP_CATALOG_MARKER || index % 2 == 0 {
+        material
+    } else {
+        SOUP_PROSPECTOR_ALIVE
+    }
+}
+
+fn clear_soup_marker_cell(cell: CellState) -> CellState {
+    match cell {
+        hash_thing::terrain::materials::SOUP_TARGET_MARKER
+        | hash_thing::terrain::materials::SOUP_CATALOG_MARKER => SOUP_PROSPECTOR_ALIVE,
+        other => other,
+    }
+}
+
+fn normalize_soup_marker_cell(cell: CellState) -> CellState {
+    clear_soup_marker_cell(cell)
+}
+
+fn stamp_soup_tile_live_marker(world: &mut sim::World, tile: [i64; 3], material: CellState) {
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut live_index = 0;
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                let coord = [
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                ];
+                if clear_soup_marker_cell(world.get(coord[0], coord[1], coord[2]))
+                    == SOUP_PROSPECTOR_ALIVE
+                {
+                    let marked = soup_marker_material_for_live_index(live_index, material);
+                    if marked != SOUP_PROSPECTOR_ALIVE {
+                        world.set(coord[0], coord[1], coord[2], marked);
+                    }
+                    live_index += 1;
+                }
+            }
+        }
+    }
+}
+
+fn stamp_soup_target_marker(world: &mut sim::World, tile: [i64; 3]) {
+    stamp_soup_tile_live_marker(
+        world,
+        tile,
+        hash_thing::terrain::materials::SOUP_TARGET_MARKER,
+    );
+}
+
+fn stamp_soup_catalog_marker(world: &mut sim::World, tile: [i64; 3]) {
+    stamp_soup_tile_live_marker(
+        world,
+        tile,
+        hash_thing::terrain::materials::SOUP_CATALOG_MARKER,
+    );
+}
+
+#[cfg(test)]
+fn soup_tile_includes_material(world: &sim::World, tile: [i64; 3], material: CellState) -> bool {
+    let origin = soup_tile_origin(world.origin, tile);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                if world.get(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                ) == material
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn clear_soup_tile_markers(world: &mut sim::World, tile: [i64; 3]) {
+    let origin = soup_tile_origin(world.origin, tile);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                let coord = [
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                ];
+                let cell = world.get(coord[0], coord[1], coord[2]);
+                let normalized = clear_soup_marker_cell(cell);
+                if normalized != cell {
+                    world.set(coord[0], coord[1], coord[2], normalized);
+                }
+            }
+        }
+    }
+}
+
+fn clear_soup_demo_markers(world: &mut sim::World, tile_min: [i64; 3], tile_max: [i64; 3]) {
+    for z in tile_min[2]..tile_max[2] {
+        for y in tile_min[1]..tile_max[1] {
+            for x in tile_min[0]..tile_max[0] {
+                clear_soup_tile_markers(world, [x, y, z]);
+            }
+        }
+    }
+}
+
+fn stamp_soup_demo_markers(
+    world: &mut sim::World,
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+    target_tile: Option<[i64; 3]>,
+    catalog_tiles: &[[i64; 3]],
+) {
+    clear_soup_demo_markers(world, tile_min, tile_max);
+    if let Some(tile) = target_tile {
+        if (0..3).all(|axis| tile[axis] >= tile_min[axis] && tile[axis] < tile_max[axis]) {
+            stamp_soup_target_marker(world, tile);
+        }
+    }
+    for &tile in catalog_tiles {
+        if (0..3).all(|axis| tile[axis] >= tile_min[axis] && tile[axis] < tile_max[axis]) {
+            stamp_soup_catalog_marker(world, tile);
+        }
+    }
+}
+
+#[cfg(test)]
+fn unmarked_soup_world(world: &sim::World, tile_min: [i64; 3], tile_max: [i64; 3]) -> sim::World {
+    let mut clone = world.clone();
+    clear_soup_demo_markers(&mut clone, tile_min, tile_max);
+    clone
+}
+
 fn soup_tile_stats(world: &sim::World, tile: [i64; 3]) -> (usize, String) {
     let origin = soup_tile_origin(world.origin, tile);
     let mut pop = 0;
@@ -1328,11 +1467,11 @@ fn soup_tile_stats(world: &sim::World, tile: [i64; 3]) -> (usize, String) {
     for dz in 0..SOUP_PROSPECTOR_TILE {
         for dy in 0..SOUP_PROSPECTOR_TILE {
             for dx in 0..SOUP_PROSPECTOR_TILE {
-                let cell = world.get(
+                let cell = normalize_soup_marker_cell(world.get(
                     sim::WorldCoord(origin[0] + dx),
                     sim::WorldCoord(origin[1] + dy),
                     sim::WorldCoord(origin[2] + dz),
-                );
+                ));
                 if cell == SOUP_PROSPECTOR_ALIVE {
                     pop += 1;
                 }
@@ -2057,6 +2196,7 @@ impl App {
             return;
         }
         self.step_start = std::time::Instant::now();
+        self.clear_soup_prospector_markers_for_step();
         // Refresh the main-thread collision snapshot BEFORE moving the world
         // to the step thread. Player collision during the step reads from
         // this snapshot, not the placeholder we're about to swap in
@@ -2151,6 +2291,7 @@ impl App {
     }
 
     fn run_sync_dump_step(&mut self) {
+        self.clear_soup_prospector_markers_for_step();
         self.world.apply_mutations();
         self.world.spawn_clones();
         self.world.step_recursive();
@@ -3210,6 +3351,35 @@ impl App {
             .or_else(|| self.soup_prospector.as_ref().map(|state| state.focus_tile))
     }
 
+    fn refresh_soup_prospector_markers(&mut self, target_tile: Option<[i64; 3]>) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        let tile_min = state.tile_min;
+        let tile_max = state.tile_max;
+        let catalog_tiles = state
+            .catalog
+            .iter()
+            .map(|entry| entry.tile)
+            .collect::<Vec<_>>();
+        stamp_soup_demo_markers(
+            &mut self.world,
+            tile_min,
+            tile_max,
+            target_tile,
+            &catalog_tiles,
+        );
+        true
+    }
+
+    fn clear_soup_prospector_markers_for_step(&mut self) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        clear_soup_demo_markers(&mut self.world, state.tile_min, state.tile_max);
+        true
+    }
+
     fn refresh_soup_prospector_hud(&mut self) -> bool {
         if self.soup_prospector.is_none() {
             return false;
@@ -3222,6 +3392,7 @@ impl App {
                 .map(|state| state.focus_tile)
                 .unwrap_or([0, 0, 0])
         });
+        self.refresh_soup_prospector_markers(Some(focus_tile));
         let (target_pop, target_hash) = soup_tile_stats(&self.world, focus_tile);
         let generation = self.world.generation;
         let Some(state) = self.soup_prospector.as_mut() else {
@@ -3348,6 +3519,12 @@ impl App {
             soup_pattern_seed(pattern) ^ generation,
         );
         self.mark_world_changed();
+        log::info!(
+            "Soup Prospector seed {} placed at tile {:?}: initial_pop={placed}",
+            pattern + 1,
+            focus_tile
+        );
+        self.refresh_soup_prospector_hud();
         let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
@@ -3361,12 +3538,6 @@ impl App {
                 last_growth_ratio: &mut self.last_lod_growth_ratio,
             },
         );
-        log::info!(
-            "Soup Prospector seed {} placed at tile {:?}: initial_pop={placed}",
-            pattern + 1,
-            focus_tile
-        );
-        self.refresh_soup_prospector_hud();
         true
     }
 
@@ -3410,6 +3581,20 @@ impl App {
         );
         state.catalog.push(entry);
         self.refresh_soup_prospector_hud();
+        self.mark_world_changed();
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
         true
     }
 
@@ -4062,6 +4247,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
+                                self.clear_soup_prospector_markers_for_step();
                                 let _t = self.perf.start("step");
                                 self.world.apply_mutations();
                                 self.world.step_recursive();
@@ -7151,6 +7337,68 @@ mod tests {
         assert_eq!(
             record_soup_tile_pop_sample(&mut state, tile, 4, 0),
             SoupCatalogLabel::Extinct
+        );
+    }
+
+    #[test]
+    fn soup_marker_recoloring_preserves_tile_stats() {
+        let mut world = sim::World::new(5);
+        world.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let tile = soup_focus_tile_for_side(world.side());
+        seed_soup_tile(&mut world, tile, soup_pattern_seed(0));
+        frame_soup_tile(&mut world, tile);
+        let before = soup_tile_stats(&world, tile);
+
+        stamp_soup_catalog_marker(&mut world, tile);
+        stamp_soup_target_marker(&mut world, tile);
+
+        assert_eq!(soup_tile_stats(&world, tile), before);
+        assert!(soup_tile_includes_material(
+            &world,
+            tile,
+            hash_thing::terrain::materials::SOUP_TARGET_MARKER
+        ));
+        assert!(soup_tile_includes_material(
+            &world,
+            tile,
+            hash_thing::terrain::materials::SOUP_CATALOG_MARKER
+        ));
+    }
+
+    #[test]
+    fn soup_marker_recoloring_preserves_one_step_tile_stats() {
+        let mut baseline = sim::World::new(5);
+        baseline.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let tile = soup_focus_tile_for_side(baseline.side());
+        let (tile_min, tile_max) = soup_demo_tile_bounds(baseline.side(), tile);
+        for z in tile_min[2]..tile_max[2] {
+            for y in tile_min[1]..tile_max[1] {
+                for x in tile_min[0]..tile_max[0] {
+                    let current = [x, y, z];
+                    seed_soup_tile(&mut baseline, current, soup_pattern_seed(0));
+                    frame_soup_tile(&mut baseline, current);
+                }
+            }
+        }
+
+        let mut marked = baseline.clone();
+        stamp_soup_demo_markers(&mut marked, tile_min, tile_max, Some(tile), &[tile]);
+        clear_soup_demo_markers(&mut marked, tile_min, tile_max);
+        assert_eq!(
+            soup_tile_stats(&marked, tile),
+            soup_tile_stats(&baseline, tile)
+        );
+
+        baseline.step();
+        marked.step();
+
+        assert_eq!(
+            soup_tile_stats(&marked, tile),
+            soup_tile_stats(&baseline, tile)
+        );
+        assert_eq!(
+            soup_tile_stats(&unmarked_soup_world(&marked, tile_min, tile_max), tile),
+            soup_tile_stats(&baseline, tile)
         );
     }
 
