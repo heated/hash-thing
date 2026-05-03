@@ -241,6 +241,19 @@ struct MeasurementRecord {
 }
 
 #[derive(Debug, Serialize)]
+struct TrajectoryDriftRecord {
+    generation_index: Option<usize>,
+    subject_gen: Option<usize>,
+    baseline_gen: Option<usize>,
+    subject_final_pop: usize,
+    baseline_final_pop: usize,
+    final_material_distribution_equal: bool,
+    generation_count_equal: bool,
+    subject_final_mat_distribution: Option<serde_json::Value>,
+    baseline_final_mat_distribution: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
 struct ComparisonRecord {
     schema_version: u32,
     record_kind: &'static str,
@@ -253,6 +266,9 @@ struct ComparisonRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     setup: Option<String>,
     rule_set: String,
+    trajectory_equivalent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trajectory_drift: Option<TrajectoryDriftRecord>,
     notes: String,
 }
 
@@ -264,7 +280,16 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let args = parse_args()?;
+    let line = run_with_args(std::env::args_os().skip(1))?;
+    println!("{line}");
+    Ok(())
+}
+
+fn run_with_args<I>(raw: I) -> Result<String, String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let args = parse_args_from(raw)?;
     if let Some(append_path) = &args.append {
         ensure_clean_git_tree_for_append(append_path)?;
     }
@@ -281,16 +306,16 @@ fn run() -> Result<(), String> {
             subject_id,
             baseline_id,
             metric,
+            options,
         } => {
-            let record = compare_records(&jsonl, &subject_id, &baseline_id, &metric)?;
+            let record = compare_records(&jsonl, &subject_id, &baseline_id, &metric, options)?;
             serde_json::to_string(&record).map_err(|err| format!("serialize comparison: {err}"))?
         }
     };
-    println!("{line}");
     if let Some(append_path) = args.append {
         append_jsonl(&append_path, &line)?;
     }
-    Ok(())
+    Ok(line)
 }
 
 struct Args {
@@ -308,11 +333,20 @@ enum Mode {
         subject_id: String,
         baseline_id: String,
         metric: String,
+        options: CompareOptions,
     },
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut raw = std::env::args_os().skip(1);
+#[derive(Clone, Copy, Debug, Default)]
+struct CompareOptions {
+    allow_trajectory_drift: bool,
+}
+
+fn parse_args_from<I>(raw: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut raw = raw.into_iter();
     let first = raw.next().ok_or_else(usage)?;
     let mut append = None;
     let mut hardware = "unknown".to_string();
@@ -330,12 +364,15 @@ fn parse_args() -> Result<Args, String> {
             .map(|s| s.to_string_lossy().into_owned())
             .ok_or_else(|| format!("--compare requires <baseline-id>\n{}", usage()))?;
         let mut metric = "step_p95_ms".to_string();
+        let mut options = CompareOptions::default();
         while let Some(arg) = raw.next() {
             if arg == "--metric" {
                 metric = raw
                     .next()
                     .map(|s| s.to_string_lossy().into_owned())
                     .ok_or_else(|| "--metric requires a metric name".to_string())?;
+            } else if arg == "--allow-trajectory-drift" {
+                options.allow_trajectory_drift = true;
             } else if arg == "--append" {
                 append = Some(
                     raw.next()
@@ -351,6 +388,7 @@ fn parse_args() -> Result<Args, String> {
             subject_id,
             baseline_id,
             metric,
+            options,
         }
     } else {
         let scenario = PathBuf::from(first);
@@ -390,7 +428,7 @@ fn validate_hardware(hardware: &str) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin scenario-runner -- <scenario.ron> [--hardware <enum>] [--append <out.jsonl>]\n       cargo run --bin scenario-runner -- --compare <jsonl> <subject-id> <baseline-id> [--metric step_p95_ms] [--append <out.jsonl>]".to_string()
+    "usage: cargo run --bin scenario-runner -- <scenario.ron> [--hardware <enum>] [--append <out.jsonl>]\n       cargo run --bin scenario-runner -- --compare <jsonl> <subject-id> <baseline-id> [--metric step_p95_ms] [--allow-trajectory-drift] [--append <out.jsonl>]".to_string()
 }
 
 fn append_jsonl(path: &Path, line: &str) -> Result<(), String> {
@@ -466,6 +504,7 @@ fn compare_records(
     subject_id: &str,
     baseline_id: &str,
     metric: &str,
+    options: CompareOptions,
 ) -> Result<ComparisonRecord, String> {
     let text = read_utf8(jsonl)?;
     let mut seen_measurement_ids = std::collections::HashSet::new();
@@ -504,13 +543,18 @@ fn compare_records(
     let baseline =
         baseline.ok_or_else(|| format!("baseline measurement not found: {baseline_id}"))?;
     validate_comparable(&subject, &baseline, metric)?;
+    let trajectory_drift = trajectory_drift(&subject, &baseline);
+    if trajectory_drift.is_some() && !options.allow_trajectory_drift {
+        return Err(trajectory_drift_rejection(&subject, &baseline));
+    }
     let subject_value = metric_value(&subject.metrics, metric)?;
     let baseline_value = metric_value(&baseline.metrics, metric)?;
     if baseline_value == 0.0 {
         return Err(format!("baseline metric {metric} is zero"));
     }
     let ratio = subject_value / baseline_value;
-    let drift = generation_drift_note(&subject, &baseline)
+    let drift = trajectory_drift
+        .as_ref()
         .map(|note| format!("; {note}"))
         .unwrap_or_default();
     Ok(ComparisonRecord {
@@ -524,6 +568,8 @@ fn compare_records(
         scenario_hash: subject.scenario_hash.clone(),
         setup: subject.setup.clone(),
         rule_set: subject.rule_set.clone(),
+        trajectory_equivalent: trajectory_drift.is_none(),
+        trajectory_drift,
         notes: format!(
             "{} {}={:.3} vs {} {}={:.3}; ratio={:.3}",
             subject.measurement_id,
@@ -537,21 +583,66 @@ fn compare_records(
     })
 }
 
-fn generation_drift_note(
+fn trajectory_drift(
     subject: &MeasurementRecord,
     baseline: &MeasurementRecord,
-) -> Option<String> {
+) -> Option<TrajectoryDriftRecord> {
     let last_subject = subject.generations.last()?;
     let last_baseline = baseline.generations.last()?;
-    if last_subject.pop_count == last_baseline.pop_count
-        && last_subject.mat_distribution == last_baseline.mat_distribution
-    {
+    let first_drift = subject
+        .generations
+        .iter()
+        .zip(&baseline.generations)
+        .enumerate()
+        .find(|(_, (subject_gen, baseline_gen))| {
+            subject_gen.gen != baseline_gen.gen
+                || subject_gen.pop_count != baseline_gen.pop_count
+                || subject_gen.mat_distribution != baseline_gen.mat_distribution
+        });
+    if first_drift.is_none() && subject.generations.len() == baseline.generations.len() {
         return None;
     }
-    Some(format!(
+    let (generation_index, subject_gen, baseline_gen) =
+        if let Some((index, (subject_gen, baseline_gen))) = first_drift {
+            (Some(index), Some(subject_gen.gen), Some(baseline_gen.gen))
+        } else {
+            (None, None, None)
+        };
+    Some(TrajectoryDriftRecord {
+        generation_index,
+        subject_gen,
+        baseline_gen,
+        subject_final_pop: last_subject.pop_count,
+        baseline_final_pop: last_baseline.pop_count,
+        final_material_distribution_equal: last_subject.mat_distribution
+            == last_baseline.mat_distribution,
+        generation_count_equal: subject.generations.len() == baseline.generations.len(),
+        subject_final_mat_distribution: last_subject.mat_distribution.clone(),
+        baseline_final_mat_distribution: last_baseline.mat_distribution.clone(),
+    })
+}
+
+fn trajectory_drift_rejection(subject: &MeasurementRecord, baseline: &MeasurementRecord) -> String {
+    let Some(drift) = trajectory_drift(subject, baseline) else {
+        return "comparison trajectory is equivalent".to_string();
+    };
+    format!(
+        "comparison trajectory drift between {} and {}: final measured pop/material distribution differ (subject pop={}, baseline pop={}); pass --allow-trajectory-drift to emit an explicit drift comparison",
+        subject.measurement_id,
+        baseline.measurement_id,
+        drift.subject_final_pop,
+        drift.baseline_final_pop
+    )
+}
+
+impl std::fmt::Display for TrajectoryDriftRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
         "trajectory caveat: final measured pop/material distribution differ (subject pop={}, baseline pop={}); see hash-thing-neql",
-        last_subject.pop_count, last_baseline.pop_count
-    ))
+            self.subject_final_pop, self.baseline_final_pop
+        )
+    }
 }
 
 fn validate_comparable(
@@ -669,6 +760,12 @@ fn validate_measurement_record(record: &MeasurementRecord) -> Result<(), String>
         return Err(format!(
             "invalid confidence.source {:?} for {}",
             record.confidence.source, record.measurement_id
+        ));
+    }
+    if record.generations.is_empty() {
+        return Err(format!(
+            "measurement {} has no generation records",
+            record.measurement_id
         ));
     }
     Ok(())
@@ -1558,20 +1655,120 @@ mod tests {
         let a = test_measurement("same-id", "chunk-array", "n/a", 10.0);
         let b = test_measurement("same-id", "hashlife-recursive", "saturated", 1.0);
         let path = write_jsonl(&[&a, &b]);
-        let err = compare_records(&path, "same-id", "missing", "step_p95_ms").unwrap_err();
+        let err = compare_records(
+            &path,
+            "same-id",
+            "missing",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("duplicate measurement_id"), "{err}");
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn compare_records_emits_ratio_and_drift_caveat() {
+    fn compare_records_rejects_trajectory_drift_by_default() {
         let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
         let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
         let path = write_jsonl(&[&a, &b]);
-        let comparison =
-            compare_records(&path, "chunk", "hashlife", "step_p95_ms").expect("comparison");
+
+        let err = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("trajectory drift"), "{err}");
+        assert!(err.contains("--allow-trajectory-drift"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_allows_explicit_trajectory_drift_with_structured_fields() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        let path = write_jsonl(&[&a, &b]);
+
+        let comparison = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions {
+                allow_trajectory_drift: true,
+            },
+        )
+        .expect("comparison");
+
         assert_eq!(comparison.ratio, 5.0);
+        assert!(!comparison.trajectory_equivalent);
+        let drift = comparison.trajectory_drift.expect("trajectory drift");
+        assert_eq!(drift.generation_index, Some(0));
+        assert_eq!(drift.subject_final_pop, 11);
+        assert_eq!(drift.baseline_final_pop, 10);
+        assert!(drift.generation_count_equal);
+        assert!(drift.final_material_distribution_equal);
         assert!(comparison.notes.contains("trajectory caveat"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_emits_ratio_for_equivalent_trajectory() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        b.generations[0].pop_count = a.generations[0].pop_count;
+        let path = write_jsonl(&[&a, &b]);
+
+        let comparison = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .expect("comparison");
+
+        assert_eq!(comparison.ratio, 5.0);
+        assert!(comparison.trajectory_equivalent);
+        assert!(comparison.trajectory_drift.is_none());
+        assert!(!comparison.notes.contains("trajectory caveat"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_command_rejects_drift_without_allow_flag() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        let path = write_jsonl(&[&a, &b]);
+
+        let err = run_with_args(compare_args(&path, false)).unwrap_err();
+
+        assert!(err.contains("trajectory drift"), "{err}");
+        assert!(err.contains("--allow-trajectory-drift"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_command_allow_flag_emits_structured_drift_json() {
+        let a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
+        let path = write_jsonl(&[&a, &b]);
+
+        let line = run_with_args(compare_args(&path, true)).expect("comparison");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("comparison json");
+
+        assert_eq!(value["record_kind"], "comparison");
+        assert_eq!(value["trajectory_equivalent"], false);
+        assert_eq!(value["trajectory_drift"]["subject_final_pop"], 11);
+        assert_eq!(value["trajectory_drift"]["baseline_final_pop"], 10);
+        assert_eq!(
+            value["trajectory_drift"]["final_material_distribution_equal"],
+            true
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1581,7 +1778,14 @@ mod tests {
         let mut b = test_measurement("hashlife", "hashlife-recursive", "saturated", 2.0);
         b.hardware = "m2-ultra-mac-pro".to_string();
         let path = write_jsonl(&[&a, &b]);
-        let err = compare_records(&path, "chunk", "hashlife", "step_p95_ms").unwrap_err();
+        let err = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("hardware"), "{err}");
         let _ = std::fs::remove_file(path);
     }
@@ -1600,7 +1804,14 @@ mod tests {
         b.generations[0].factory_backpressure = Some(2);
 
         let path = write_jsonl(&[&a, &b]);
-        let err = compare_records(&path, "chunk", "hashlife", "step_p95_ms").unwrap_err();
+        let err = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .unwrap_err();
 
         assert!(err.contains("metrics.factory_sinked_total"), "{err}");
         let _ = std::fs::remove_file(path);
@@ -1620,7 +1831,14 @@ mod tests {
         b.generations[0].factory_backpressure = Some(2);
 
         let path = write_jsonl(&[&a, &b]);
-        let err = compare_records(&path, "chunk", "hashlife", "step_p95_ms").unwrap_err();
+        let err = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .unwrap_err();
 
         assert!(err.contains("generations[0].factory_sinked"), "{err}");
         let _ = std::fs::remove_file(path);
@@ -1690,8 +1908,8 @@ mod tests {
     #[test]
     fn old_measurement_json_without_work_elision_fields_still_compares() {
         let body = r#"{"schema_version":2,"record_kind":"measurement","measurement_id":"chunk","world":"medium","scene":"default-demo","intensity":"cascade","regime":"n/a","rule_set":"default-ca","backend":"chunk-array","hardware":"m2-pro-mbp","scenario_hash":"sha256:test","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":10.0,"step_median_ms":10.0,"step_p95_ms":10.0,"wall_total_ms":20.0},"generations":[{"gen":0,"step_us":10000,"pop_count":11,"drops":0,"mat_distribution":{"1":10}}]}
-{"schema_version":2,"record_kind":"measurement","measurement_id":"hashlife","world":"medium","scene":"default-demo","intensity":"cascade","regime":"saturated","rule_set":"default-ca","backend":"hashlife-recursive","hardware":"m2-pro-mbp","scenario_hash":"sha256:test","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":2.0,"step_median_ms":2.0,"step_p95_ms":2.0,"wall_total_ms":4.0},"generations":[{"gen":0,"step_us":2000,"pop_count":10,"drops":0,"mat_distribution":{"1":10}}]}
-"#;
+{"schema_version":2,"record_kind":"measurement","measurement_id":"hashlife","world":"medium","scene":"default-demo","intensity":"cascade","regime":"saturated","rule_set":"default-ca","backend":"hashlife-recursive","hardware":"m2-pro-mbp","scenario_hash":"sha256:test","confidence":{"n":2,"warm_frame_policy":"skip-first-1","source":"bench","cherry_pick_audit":"hard_included","notes":"test"},"level":7,"side":128,"git_commit":"test","bench_fn":"scenario-runner","comparator":null,"metrics":{"step_mean_ms":2.0,"step_median_ms":2.0,"step_p95_ms":2.0,"wall_total_ms":4.0},"generations":[{"gen":0,"step_us":2000,"pop_count":11,"drops":0,"mat_distribution":{"1":10}}]}
+	"#;
         let path = std::env::temp_dir().join(format!(
             "hash-thing-scenario-runner-old-json-{}-{}.jsonl",
             std::process::id(),
@@ -1699,8 +1917,14 @@ mod tests {
         ));
         std::fs::write(&path, body).expect("write old jsonl");
 
-        let comparison =
-            compare_records(&path, "chunk", "hashlife", "step_p95_ms").expect("comparison");
+        let comparison = compare_records(
+            &path,
+            "chunk",
+            "hashlife",
+            "step_p95_ms",
+            CompareOptions::default(),
+        )
+        .expect("comparison");
 
         assert_eq!(comparison.ratio, 5.0);
         let _ = std::fs::remove_file(path);
@@ -1890,5 +2114,20 @@ mod tests {
             .join("\n");
         std::fs::write(&path, format!("{body}\n")).expect("write test jsonl");
         path
+    }
+
+    fn compare_args(path: &Path, allow_trajectory_drift: bool) -> Vec<std::ffi::OsString> {
+        let mut args = vec![
+            std::ffi::OsString::from("--compare"),
+            path.as_os_str().to_owned(),
+            std::ffi::OsString::from("chunk"),
+            std::ffi::OsString::from("hashlife"),
+            std::ffi::OsString::from("--metric"),
+            std::ffi::OsString::from("step_p95_ms"),
+        ];
+        if allow_trajectory_drift {
+            args.push(std::ffi::OsString::from("--allow-trajectory-drift"));
+        }
+        args
     }
 }
