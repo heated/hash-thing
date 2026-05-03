@@ -757,6 +757,8 @@ struct App {
     dump_pose: Option<DumpPose>,
     /// hash-thing-nznv: diagnostic shader mode for one-shot dump frames.
     dump_debug: Option<DumpDebugMode>,
+    /// hash-thing-u8m4: dump-frame-only render LOD bias override.
+    dump_lod_bias: Option<f32>,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -1066,6 +1068,7 @@ impl App {
             dump_scene: None,
             dump_pose: None,
             dump_debug: None,
+            dump_lod_bias: None,
             step_pending: false,
             world_prefetch_pending: false,
             next_world_prefetch_generation: 0,
@@ -2239,6 +2242,12 @@ impl App {
                 pitch: 0.34,
                 dist: 0.95,
             }),
+            DumpPose::Geyser => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.28, 0.35, 0.59],
+                yaw: std::f32::consts::FRAC_PI_2,
+                pitch: 0.24,
+                dist: 0.34,
+            }),
         }
         log::info!("--dump-pose: applied {}", pose.label());
     }
@@ -3120,6 +3129,9 @@ impl ApplicationHandler<AppUserEvent> for App {
             ));
             if let Some(mode) = self.dump_debug {
                 renderer.debug_mode = mode.renderer_debug_mode();
+            }
+            if let Some(bias) = self.dump_lod_bias {
+                renderer.lod_bias = bias;
             }
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
             // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
@@ -4259,6 +4271,7 @@ enum DumpPose {
     Wall,
     Blocks,
     TerrainWide,
+    Geyser,
 }
 
 impl DumpPose {
@@ -4267,6 +4280,7 @@ impl DumpPose {
             "wall" => Some(Self::Wall),
             "blocks" => Some(Self::Blocks),
             "terrain-wide" => Some(Self::TerrainWide),
+            "geyser" => Some(Self::Geyser),
             _ => None,
         }
     }
@@ -4276,6 +4290,7 @@ impl DumpPose {
             Self::Wall => "wall",
             Self::Blocks => "blocks",
             Self::TerrainWide => "terrain-wide",
+            Self::Geyser => "geyser",
         }
     }
 }
@@ -4317,7 +4332,7 @@ impl DumpDebugMode {
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
 /// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
 /// `demo`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ParsedArgs {
     volume_size: u32,
     target_pixels: Option<u64>,
@@ -4336,6 +4351,9 @@ struct ParsedArgs {
     /// `--dump-debug MODE`: hash-thing-nznv, only meaningful with
     /// `--dump-frame`. Selects a diagnostic shader mode before capture.
     dump_debug: Option<DumpDebugMode>,
+    /// `--dump-lod-bias VALUE`: hash-thing-u8m4, only meaningful with
+    /// `--dump-frame`. Overrides renderer LOD bias before capture.
+    dump_lod_bias: Option<f32>,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
@@ -4359,8 +4377,9 @@ where
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
                          [--dump-frame PATH] \
                          [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|lattice-intro|lattice-interior|lattice-panorama] \
-                         [--dump-pose wall|blocks|terrain-wide] \
-                         [--dump-debug normal-axis|hit-kind|material]";
+                         [--dump-pose wall|blocks|terrain-wide|geyser] \
+                         [--dump-debug normal-axis|hit-kind|material] \
+                         [--dump-lod-bias VALUE]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
@@ -4368,6 +4387,7 @@ where
     let mut dump_scene: Option<DumpScene> = None;
     let mut dump_pose: Option<DumpPose> = None;
     let mut dump_debug: Option<DumpDebugMode> = None;
+    let mut dump_lod_bias: Option<f32> = None;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -4455,6 +4475,25 @@ where
                 });
                 dump_debug = Some(parsed);
             }
+            "--dump-lod-bias" => {
+                if dump_lod_bias.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-lod-bias");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-lod-bias requires a VALUE"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-lod-bias requires a VALUE; saw '{v_str}'");
+                }
+                let parsed: f32 = v_str.parse().unwrap_or_else(|_| {
+                    panic!("{USAGE}\n--dump-lod-bias VALUE: invalid '{v_str}'")
+                });
+                if !parsed.is_finite() || parsed < 1.0 {
+                    panic!("{USAGE}\n--dump-lod-bias VALUE must be finite and >= 1.0");
+                }
+                dump_lod_bias = Some(parsed);
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -4482,6 +4521,9 @@ where
     if dump_debug.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-debug requires --dump-frame");
     }
+    if dump_lod_bias.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-lod-bias requires --dump-frame");
+    }
     let target_pixels = if demo {
         Some(1920u64 * 1080u64)
     } else {
@@ -4495,6 +4537,7 @@ where
         dump_scene,
         dump_pose,
         dump_debug,
+        dump_lod_bias,
     }
 }
 
@@ -4540,6 +4583,7 @@ fn main() {
         dump_scene,
         dump_pose,
         dump_debug,
+        dump_lod_bias,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -4571,6 +4615,9 @@ fn main() {
             "--dump-debug: {} (will apply before dump-frame render)",
             mode.label()
         );
+    }
+    if let Some(bias) = dump_lod_bias {
+        log::info!("--dump-lod-bias: {bias}x (will apply before dump-frame render)");
     }
 
     // Single source of truth for focus-on-launch. Two downstream sites
@@ -4618,6 +4665,7 @@ fn main() {
     app.dump_scene = dump_scene;
     app.dump_pose = dump_pose;
     app.dump_debug = dump_debug;
+    app.dump_lod_bias = dump_lod_bias;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -5003,10 +5051,17 @@ mod tests {
             ("wall", DumpPose::Wall),
             ("blocks", DumpPose::Blocks),
             ("terrain-wide", DumpPose::TerrainWide),
+            ("geyser", DumpPose::Geyser),
         ] {
             let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-pose", raw]);
             assert_eq!(r.dump_pose, Some(expected), "pose={raw}");
         }
+    }
+
+    #[test]
+    fn parse_args_from_dump_lod_bias() {
+        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "4.5"]);
+        assert_eq!(r.dump_lod_bias, Some(4.5));
     }
 
     #[test]
@@ -5041,6 +5096,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "--dump-lod-bias requires --dump-frame")]
+    fn parse_args_from_dump_lod_bias_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-lod-bias", "2"]);
+    }
+
+    #[test]
     #[should_panic(expected = "--dump-scene requires a KIND")]
     fn parse_args_from_dump_scene_without_value_panics() {
         let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene"]);
@@ -5056,6 +5117,30 @@ mod tests {
     #[should_panic(expected = "unrecognised 'bogus'")]
     fn parse_args_from_dump_scene_garbage_panics() {
         let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias requires a VALUE")]
+    fn parse_args_from_dump_lod_bias_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias requires a VALUE; saw '--demo'")]
+    fn parse_args_from_dump_lod_bias_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias VALUE: invalid 'bogus'")]
+    fn parse_args_from_dump_lod_bias_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias VALUE must be finite and >= 1.0")]
+    fn parse_args_from_dump_lod_bias_too_low_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "0.5"]);
     }
 
     #[test]
@@ -5106,6 +5191,19 @@ mod tests {
             "normal-axis",
             "--dump-debug",
             "hit-kind",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-lod-bias")]
+    fn parse_args_from_two_dump_lod_bias_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-lod-bias",
+            "2",
+            "--dump-lod-bias",
+            "4",
         ]);
     }
 
