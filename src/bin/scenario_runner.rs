@@ -88,6 +88,7 @@ impl RuleSet {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 enum Intensity {
     Idle,
+    Microchurn,
     PassiveActive,
     Cascade,
 }
@@ -96,6 +97,7 @@ impl Intensity {
     fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Microchurn => "microchurn",
             Self::PassiveActive => "passive-active",
             Self::Cascade => "cascade",
         }
@@ -568,9 +570,22 @@ fn run_scenario(
     seed_scene(&mut world, scenario)?;
     let warmup_generations = scenario.warmup_generations.unwrap_or(0);
 
+    let microchurn = microchurn_sand_per_step(scenario, level);
     let (generations, metrics) = match scenario.backend {
-        Backend::HashlifeRecursive => run_hashlife(world, warmup_generations, scenario.generations),
-        Backend::ChunkArray => run_chunk_array(world, warmup_generations, scenario.generations),
+        Backend::HashlifeRecursive => run_hashlife(
+            world,
+            warmup_generations,
+            scenario.generations,
+            microchurn,
+            scenario.seed,
+        ),
+        Backend::ChunkArray => run_chunk_array(
+            world,
+            warmup_generations,
+            scenario.generations,
+            microchurn,
+            scenario.seed,
+        ),
     };
 
     let hash_suffix = scenario_hash
@@ -688,6 +703,64 @@ fn seed_factory_conveyor_toy(world: &mut World, seed: u64) {
     }
 }
 
+fn microchurn_sand_per_step(scenario: &Scenario, level: u32) -> Option<usize> {
+    (matches!(scenario.scene, Scene::DefaultTerrain)
+        && matches!(scenario.intensity, Intensity::Microchurn))
+    .then_some(if level >= 6 { 8 } else { 4 })
+}
+
+fn microchurn_note(microchurn_sand_per_step: Option<usize>, warmup_generations: usize) -> String {
+    microchurn_sand_per_step
+        .map(|drops| format!("; microchurn injects {drops} sand writes/step after {warmup_generations} warmup generations"))
+        .unwrap_or_default()
+}
+
+struct Microchurn {
+    state: u64,
+    side: i64,
+    sand_per_step: usize,
+}
+
+impl Microchurn {
+    fn new(seed: u64, level: u32, sand_per_step: usize) -> Self {
+        Self {
+            state: 0x9E3779B97F4A7C15 ^ seed,
+            side: 1i64 << level,
+            sand_per_step,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
+
+    fn next_drop(&mut self) -> (i64, i64, i64) {
+        let x = (self.next_u64() % (self.side as u64 - 4)) as i64 + 2;
+        let y = self.side - 4 + (self.next_u64() % 2) as i64;
+        let z = (self.next_u64() % (self.side as u64 - 4)) as i64 + 2;
+        (x, y, z)
+    }
+
+    fn apply_world(&mut self, world: &mut World) {
+        for _ in 0..self.sand_per_step {
+            let (x, y, z) = self.next_drop();
+            world.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), SAND);
+        }
+    }
+
+    fn apply_grid(&mut self, grid: &mut [CellState]) {
+        let side = self.side as usize;
+        for _ in 0..self.sand_per_step {
+            let (x, y, z) = self.next_drop();
+            let (x, y, z) = (x as usize, y as usize, z as usize);
+            grid[x + y * side + z * side * side] = SAND;
+        }
+    }
+}
+
 fn warm_frame_policy(warmup_generations: usize) -> String {
     if warmup_generations == 0 {
         "all-frames".to_string()
@@ -701,6 +774,10 @@ fn hard_followup_bead(scenario: &Scenario) -> Option<String> {
 }
 
 fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize) -> String {
+    let microchurn = microchurn_sand_per_step(
+        scenario,
+        scenario.level.unwrap_or_else(|| scenario.world.level()),
+    );
     let seed_note = match scenario.backend {
         Backend::ChunkArray => {
             "chunk-array path snapshots a hashlife-seeded world; per-step metrics are comparator data, seed cost is not a chunk-array-native seed benchmark"
@@ -720,15 +797,23 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
         path.display(),
         warmup_generations,
         seed_note
-    ) + drift_note
+    ) + &microchurn_note(microchurn, warmup_generations)
+        + drift_note
 }
 
 fn run_hashlife(
     mut world: World,
     warmup_generations: usize,
     generations: usize,
+    microchurn_sand_per_step: Option<usize>,
+    seed: u64,
 ) -> (Vec<GenerationRecord>, MetricsRecord) {
+    let mut microchurn =
+        microchurn_sand_per_step.map(|sand| Microchurn::new(seed, world.level, sand));
     for _ in 0..warmup_generations {
+        if let Some(churn) = &mut microchurn {
+            churn.apply_world(&mut world);
+        }
         world.step_recursive();
     }
     let mut times = Vec::with_capacity(generations);
@@ -736,6 +821,10 @@ fn run_hashlife(
     let mut memo_hits = 0u64;
     let mut memo_misses = 0u64;
     for gen in 0..generations {
+        let drops = microchurn_sand_per_step.unwrap_or(0);
+        if let Some(churn) = &mut microchurn {
+            churn.apply_world(&mut world);
+        }
         let start = Instant::now();
         world.step_recursive();
         let step_us = start.elapsed().as_micros();
@@ -748,7 +837,7 @@ fn run_hashlife(
             gen,
             step_us,
             pop_count: popcount(&grid),
-            drops: 0,
+            drops,
             mat_distribution: Some(material_distribution(&grid)),
         });
     }
@@ -765,9 +854,16 @@ fn run_chunk_array(
     mut world: World,
     warmup_generations: usize,
     generations: usize,
+    microchurn_sand_per_step: Option<usize>,
+    seed: u64,
 ) -> (Vec<GenerationRecord>, MetricsRecord) {
     let mut grid = world.flatten();
+    let mut microchurn =
+        microchurn_sand_per_step.map(|sand| Microchurn::new(seed, world.level, sand));
     for _ in 0..warmup_generations {
+        if let Some(churn) = &mut microchurn {
+            churn.apply_grid(&mut grid);
+        }
         let next = world.step_grid(&grid);
         grid = next;
         world.generation += 1;
@@ -775,6 +871,10 @@ fn run_chunk_array(
     let mut times = Vec::with_capacity(generations);
     let mut records = Vec::with_capacity(generations);
     for gen in 0..generations {
+        let drops = microchurn_sand_per_step.unwrap_or(0);
+        if let Some(churn) = &mut microchurn {
+            churn.apply_grid(&mut grid);
+        }
         let start = Instant::now();
         let next = world.step_grid(&grid);
         let step_us = start.elapsed().as_micros();
@@ -785,7 +885,7 @@ fn run_chunk_array(
             gen,
             step_us,
             pop_count: popcount(&grid),
-            drops: 0,
+            drops,
             mat_distribution: Some(material_distribution(&grid)),
         });
     }
@@ -865,6 +965,7 @@ fn cherry_pick_audit(scenario: &Scenario) -> &'static str {
     match scenario.intensity {
         Intensity::Cascade => "hard_included",
         Intensity::Idle => "easy_only",
+        Intensity::Microchurn => "mixed",
         Intensity::PassiveActive => "mixed",
     }
 }
@@ -892,6 +993,17 @@ mod tests {
     fn chunk_array_requires_na_regime() {
         let scenario = test_scenario(Backend::ChunkArray, Regime::Saturated);
         assert!(validate_backend_regime(&scenario).is_err());
+    }
+
+    #[test]
+    fn microchurn_intensity_selects_synthetic_churn() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        scenario.intensity = Intensity::Microchurn;
+        assert_eq!(microchurn_sand_per_step(&scenario, 5), Some(4));
+        assert_eq!(microchurn_sand_per_step(&scenario, 7), Some(8));
+
+        scenario.intensity = Intensity::PassiveActive;
+        assert_eq!(microchurn_sand_per_step(&scenario, 7), None);
     }
 
     #[test]
@@ -925,6 +1037,28 @@ mod tests {
         let err = compare_records(&path, "chunk", "hashlife", "step_p95_ms").unwrap_err();
         assert!(err.contains("hardware"), "{err}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn microchurn_keeps_backends_on_same_trajectory() {
+        let level = 7;
+        let params = TerrainParams::for_level(level);
+        let mut hashlife_world = World::new(level);
+        hashlife_world.seed_terrain(&params).unwrap();
+        let mut chunk_world = World::new(level);
+        chunk_world.seed_terrain(&params).unwrap();
+
+        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, Some(8), 7);
+        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, Some(8), 7);
+
+        assert_eq!(hashlife.len(), chunk.len());
+        for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
+            assert_eq!(h.pop_count, c.pop_count, "pop drift at gen {gen}");
+            assert_eq!(
+                h.mat_distribution, c.mat_distribution,
+                "material drift at gen {gen}"
+            );
+        }
     }
 
     fn test_scenario(backend: Backend, regime: Regime) -> Scenario {
