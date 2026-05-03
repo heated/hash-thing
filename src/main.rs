@@ -80,6 +80,7 @@ const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 const WORLD_PREFETCH_MARGIN_METERS: f64 = 64.0;
 const DEFAULT_CLI_VOLUME_SIZE: u32 = 256;
+const DEMO_RENDER_SCALE: f32 = 0.25;
 const DEFAULT_DEMO_PERF_TRAIL_PATH: &str = ".ship-notes/demo-perf-trail.jsonl";
 const SOUP_PROSPECTOR_TILE: i64 = 16;
 const SOUP_PROSPECTOR_SIDE: i64 = 8;
@@ -1106,11 +1107,11 @@ struct App {
     /// applied at the start of the next tick.
     entities: sim::EntityStore,
     volume_size: u32,
-    /// hash-thing-06so: pinned rendered-pixel budget from `--demo` / `--res`.
+    /// hash-thing-06so/uc2m: pinned render-scale override from `--demo` / `--res`.
     /// `None` → auto-pick. Set in `main()` after construction (the 40+
     /// existing `App::new(N)` test callers default this to `None`).
     /// Threaded through to `Renderer::new`.
-    target_pixels_override: Option<u64>,
+    render_scale_override: Option<render::RenderScaleOverride>,
     /// hash-thing-kh9l: focus the window on launch. Set in `main()` from
     /// `--demo` (kh9l) or `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults
     /// to `false` so the 40+ test callers stay in the no-focus regime.
@@ -2004,7 +2005,7 @@ impl App {
             last_title_update: None,
             entities: sim::EntityStore::new(),
             volume_size,
-            target_pixels_override: None,
+            render_scale_override: None,
             want_focus_on_launch: false,
             dump_frame_path: None,
             dump_scene: None,
@@ -4757,7 +4758,7 @@ impl ApplicationHandler<AppUserEvent> for App {
             let mut renderer = pollster::block_on(render::Renderer::new(
                 window.clone(),
                 self.volume_size,
-                self.target_pixels_override,
+                self.render_scale_override,
             ));
             if let Some(mode) = self.dump_debug {
                 renderer.debug_mode = mode.renderer_debug_mode();
@@ -6109,10 +6110,9 @@ impl DumpLayer {
 struct ParsedArgs {
     volume_size: u32,
     volume_size_explicit: bool,
-    target_pixels: Option<u64>,
-    /// hash-thing-kh9l: `--demo` was passed (independent of target_pixels,
-    /// since `--res 1080p` produces the same pixel budget). Drives
-    /// window focus-on-launch in main().
+    render_scale_override: Option<render::RenderScaleOverride>,
+    /// hash-thing-kh9l: `--demo` was passed. Drives window focus-on-launch
+    /// in main() and the static demo render-scale floor in `parse_args_from`.
     demo: bool,
     /// `--dump-frame PATH`: render one frame to PNG at `PATH`, then exit.
     dump_frame: Option<std::path::PathBuf>,
@@ -6380,15 +6380,15 @@ where
         panic!("{USAGE}\n--dump-soup-reuse requires --dump-scene soup-prospector");
     }
     let volume_size_explicit = volume_size.is_some();
-    let target_pixels = if demo {
-        Some(1920u64 * 1080u64)
+    let render_scale_override = if demo {
+        Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
     } else {
-        res_target
+        res_target.map(render::RenderScaleOverride::TargetPixels)
     };
     ParsedArgs {
         volume_size: volume_size.unwrap_or(DEFAULT_CLI_VOLUME_SIZE),
         volume_size_explicit,
-        target_pixels,
+        render_scale_override,
         demo,
         dump_frame,
         dump_scene,
@@ -6440,7 +6440,7 @@ fn main() {
     let ParsedArgs {
         volume_size,
         volume_size_explicit,
-        target_pixels: target_pixels_override,
+        render_scale_override,
         demo,
         dump_frame: dump_frame_path,
         dump_scene,
@@ -6462,8 +6462,15 @@ fn main() {
              Pass an explicit power-of-two SIZE for larger worlds."
         );
     }
-    if let Some(target) = target_pixels_override {
-        log::info!("CLI render target: {target} px (--demo / --res)");
+    if let Some(override_) = render_scale_override {
+        match override_ {
+            render::RenderScaleOverride::TargetPixels(target) => {
+                log::info!("CLI render target: {target} px (--res)");
+            }
+            render::RenderScaleOverride::FixedScale(scale) => {
+                log::info!("CLI render scale: {scale:.3} (--demo)");
+            }
+        }
     }
     if let Some(path) = dump_frame_path.as_ref() {
         log::info!(
@@ -6551,7 +6558,7 @@ fn main() {
         .expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
-    app.target_pixels_override = target_pixels_override;
+    app.render_scale_override = render_scale_override;
     app.want_focus_on_launch = want_focus_on_launch;
     app.dump_frame_path = dump_frame_path;
     app.dump_scene = dump_scene;
@@ -6863,7 +6870,7 @@ mod tests {
         let r = parse_args_from(["256"]);
         assert_eq!(r.volume_size, 256);
         assert!(r.volume_size_explicit);
-        assert_eq!(r.target_pixels, None);
+        assert_eq!(r.render_scale_override, None);
         assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
     }
@@ -6873,7 +6880,7 @@ mod tests {
         let r = parse_args_from(std::iter::empty::<&str>());
         assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
         assert!(!r.volume_size_explicit);
-        assert_eq!(r.target_pixels, None);
+        assert_eq!(r.render_scale_override, None);
         assert!(!r.demo);
         assert_eq!(r.dump_frame, None);
     }
@@ -6883,7 +6890,10 @@ mod tests {
         let r = parse_args_from(["--demo"]);
         assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
         assert!(!r.volume_size_explicit);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
         assert!(r.demo, "kh9l: --demo must surface as demo=true");
     }
 
@@ -6891,10 +6901,18 @@ mod tests {
     fn parse_args_from_demo_with_size_either_order() {
         let r1 = parse_args_from(["--demo", "256"]);
         let r2 = parse_args_from(["256", "--demo"]);
-        assert_eq!((r1.volume_size, r1.target_pixels), (256, Some(1920 * 1080)));
+        assert_eq!(r1.volume_size, 256);
+        assert_eq!(
+            r1.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
         assert!(r1.volume_size_explicit);
         assert!(r1.demo);
-        assert_eq!((r2.volume_size, r2.target_pixels), (256, Some(1920 * 1080)));
+        assert_eq!(r2.volume_size, 256);
+        assert_eq!(
+            r2.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
         assert!(r2.volume_size_explicit);
         assert!(r2.demo);
     }
@@ -6903,7 +6921,10 @@ mod tests {
     fn parse_args_from_res_named() {
         let r = parse_args_from(["--res", "1440p", "512"]);
         assert_eq!(r.volume_size, 512);
-        assert_eq!(r.target_pixels, Some(2560 * 1440));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(2560 * 1440))
+        );
         assert!(
             !r.demo,
             "kh9l: --res 1440p is NOT --demo, even with same pixel budget"
@@ -6915,7 +6936,10 @@ mod tests {
         let r = parse_args_from(["--res", "1920x1080"]);
         assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
         assert!(!r.volume_size_explicit);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1920 * 1080))
+        );
         assert!(
             !r.demo,
             "kh9l: --res 1920x1080 has same target as --demo but demo=false"
@@ -6924,11 +6948,13 @@ mod tests {
 
     #[test]
     fn parse_args_from_res_1080p_is_not_demo() {
-        // kh9l regression guard: --res 1080p produces the same target
-        // pixel budget as --demo, but `demo` is false. This bit drives
-        // focus-on-launch and must not fire for --res 1080p.
+        // kh9l/uc2m regression guard: --res 1080p keeps pixel-budget
+        // semantics while --demo uses a fixed low render scale.
         let r = parse_args_from(["--res", "1080p"]);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1920 * 1080))
+        );
         assert!(!r.demo);
     }
 
@@ -6939,7 +6965,7 @@ mod tests {
         let r = parse_args_from(["--dump-frame", "/tmp/foo.png"]);
         assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
         assert!(!r.volume_size_explicit);
-        assert_eq!(r.target_pixels, None);
+        assert_eq!(r.render_scale_override, None);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
     }
 
@@ -6948,7 +6974,10 @@ mod tests {
         // --dump-frame is orthogonal to --demo / size: all three coexist.
         let r = parse_args_from(["64", "--demo", "--dump-frame", "/tmp/foo.png"]);
         assert_eq!(r.volume_size, 64);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
         assert!(r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
     }
@@ -6957,7 +6986,10 @@ mod tests {
     fn parse_args_from_dump_frame_with_res() {
         let r = parse_args_from(["--res", "720p", "--dump-frame", "out.png", "256"]);
         assert_eq!(r.volume_size, 256);
-        assert_eq!(r.target_pixels, Some(1280 * 720));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1280 * 720))
+        );
         assert!(!r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("out.png")));
     }

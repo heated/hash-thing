@@ -2,7 +2,9 @@ pub(crate) mod font;
 mod renderer;
 mod svdag;
 
-pub use renderer::{FrameOutcome, OffSurfacePixels, Renderer, RendererGpuTimingSample};
+pub use renderer::{
+    FrameOutcome, OffSurfacePixels, RenderScaleOverride, Renderer, RendererGpuTimingSample,
+};
 pub use svdag::{cpu_trace, Svdag};
 
 #[cfg(test)]

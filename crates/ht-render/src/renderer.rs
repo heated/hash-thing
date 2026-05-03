@@ -651,9 +651,18 @@ enum RenderScaleSource {
     /// Env var was set but failed parsing or fell outside `0.125..=1.0`,
     /// and no CLI override fired either.
     EnvInvalidFallback,
-    /// `--demo` / `--res` CLI flag pinned a target pixel count.
+    /// `--res` CLI flag pinned a target pixel count.
     /// Env var was unset or invalid; CLI wins (hash-thing-06so).
-    CliOverride,
+    CliTargetPixels,
+    /// `--demo` CLI flag pinned a concrete render scale.
+    /// Env var was unset or invalid; CLI wins (hash-thing-uc2m).
+    CliFixedScale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderScaleOverride {
+    TargetPixels(u64),
+    FixedScale(f32),
 }
 
 /// Coarse GPU class — drives `render_scale` startup default per the
@@ -795,7 +804,7 @@ fn auto_render_scale(physical_pixels: u64, volume_size: u32) -> f32 {
 
 /// Resolve the effective render scale + which branch fired. Precedence:
 /// 1. `HASH_THING_RENDER_SCALE` env (if present AND valid).
-/// 2. `--res` / `--demo` CLI override (if `cli_target` is `Some`).
+/// 2. `--res` / `--demo` CLI override (if `cli_override` is `Some`).
 /// 3. Auto-pick keyed by `volume_size`.
 ///
 /// Invalid env still loses to CLI when CLI is set; otherwise it falls
@@ -803,14 +812,22 @@ fn auto_render_scale(physical_pixels: u64, volume_size: u32) -> f32 {
 /// can surface the typo (hash-thing-zytn extended by hash-thing-06so).
 fn resolved_render_scale(
     env: Option<&str>,
-    cli_target: Option<u64>,
+    cli_override: Option<RenderScaleOverride>,
     physical_pixels: u64,
     volume_size: u32,
     adapter_info: Option<&wgpu::AdapterInfo>,
 ) -> (f32, RenderScaleSource) {
-    let cli_scale = cli_target.map(|target| {
-        let physical = physical_pixels.max(1) as f64;
-        ((target as f64 / physical).sqrt() as f32).clamp(0.125, 1.0)
+    let cli_scale = cli_override.map(|override_| match override_ {
+        RenderScaleOverride::TargetPixels(target) => {
+            let physical = physical_pixels.max(1) as f64;
+            (
+                ((target as f64 / physical).sqrt() as f32).clamp(0.125, 1.0),
+                RenderScaleSource::CliTargetPixels,
+            )
+        }
+        RenderScaleOverride::FixedScale(scale) => {
+            (scale.clamp(0.125, 1.0), RenderScaleSource::CliFixedScale)
+        }
     });
     // hash-thing-pfpn: when neither env nor CLI fired, prefer the
     // GPU-class default over the pixel-budget pick. Per trident plan
@@ -830,13 +847,13 @@ fn resolved_render_scale(
     };
     match env {
         None => match cli_scale {
-            Some(s) => (s, RenderScaleSource::CliOverride),
+            Some((s, source)) => (s, source),
             None => auto_pair,
         },
         Some(raw) => match raw.parse::<f32>() {
             Ok(s) if (0.125..=1.0).contains(&s) => (s, RenderScaleSource::EnvOverride),
             _ => match cli_scale {
-                Some(s) => (s, RenderScaleSource::CliOverride),
+                Some((s, source)) => (s, source),
                 None => (auto_pair.0, RenderScaleSource::EnvInvalidFallback),
             },
         },
@@ -865,13 +882,13 @@ fn parse_present_mode(s: &str) -> Option<wgpu::PresentMode> {
 }
 
 impl Renderer {
-    /// `cli_target_pixels`: when `Some`, pin the rendered-pixel budget to
-    /// this total (e.g. `1920 * 1080` for `--demo`). Env override still
-    /// wins if set. wasm/unit-test callers can pass `None`. (hash-thing-06so)
+    /// `cli_render_scale`: when `Some`, pin either the rendered-pixel budget
+    /// (`--res`) or a concrete scale (`--demo`). Env override still wins if set.
+    /// wasm/unit-test callers can pass `None`. (hash-thing-06so / uc2m)
     pub async fn new(
         window: Arc<Window>,
         volume_size: u32,
-        cli_target_pixels: Option<u64>,
+        cli_render_scale: Option<RenderScaleOverride>,
     ) -> Self {
         let size = window.inner_size();
 
@@ -989,7 +1006,7 @@ impl Renderer {
         let physical_pixels: u64 = (size.width as u64) * (size.height as u64);
         let (render_scale, scale_source) = resolved_render_scale(
             env_raw.as_deref(),
-            cli_target_pixels,
+            cli_render_scale,
             physical_pixels,
             volume_size,
             Some(&adapter_info),
@@ -1060,13 +1077,13 @@ impl Renderer {
                     render_scale,
                 ),
             },
-            RenderScaleSource::CliOverride => {
+            RenderScaleSource::CliTargetPixels => {
                 // hash-thing-06so: surface the env-typo signal even when CLI
                 // wins, so a user passing both `HASH_THING_RENDER_SCALE=foo`
-                // and `--demo` still notices the typo.
+                // and `--res` still notices the typo.
                 if let Some(raw) = env_raw.as_deref() {
                     log::warn!(
-                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.125..=1.0); ignored — using --res / --demo CLI override instead",
+                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.125..=1.0); ignored — using --res CLI override instead",
                     );
                 }
                 // Show the resulting framebuffer dimensions so a user
@@ -1078,11 +1095,31 @@ impl Renderer {
                 let (rendered_w, rendered_h) =
                     scaled_render_extent(size.width, size.height, render_scale);
                 log::info!(
-                    "render_scale={:.3} (--res / --demo override; rendered={}x{}, cli_target={} px, physical={}x{})",
+                    "render_scale={:.3} (--res override; rendered={}x{}, cli_target={} px, physical={}x{})",
                     render_scale,
                     rendered_w,
                     rendered_h,
-                    cli_target_pixels.expect("CliOverride implies cli_target_pixels=Some"),
+                    match cli_render_scale {
+                        Some(RenderScaleOverride::TargetPixels(target)) => target,
+                        _ => unreachable!("CliTargetPixels implies TargetPixels override"),
+                    },
+                    size.width,
+                    size.height,
+                );
+            }
+            RenderScaleSource::CliFixedScale => {
+                if let Some(raw) = env_raw.as_deref() {
+                    log::warn!(
+                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.125..=1.0); ignored — using --demo render-scale override instead",
+                    );
+                }
+                let (rendered_w, rendered_h) =
+                    scaled_render_extent(size.width, size.height, render_scale);
+                log::info!(
+                    "render_scale={:.3} (--demo override; rendered={}x{}, physical={}x{})",
+                    render_scale,
+                    rendered_w,
+                    rendered_h,
                     size.width,
                     size.height,
                 );
@@ -2958,8 +2995,8 @@ mod tests {
         auto_render_scale, classify_gpu, gpu_timing_lag_frames, parse_present_mode,
         resolved_render_scale, scaled_render_extent, should_reallocate_svdag_buffer,
         surface_and_raycast_extents, svdag_buffer_cap_for_needed, target_pixels_for_volume,
-        ticks_to_duration, FrameOutcome, GpuClass, GpuTiming, RenderScaleSource,
-        RendererLifecycleSnapshot, ResolvedGpuTimingSample, SubmitFenceState,
+        ticks_to_duration, FrameOutcome, GpuClass, GpuTiming, RenderScaleOverride,
+        RenderScaleSource, RendererLifecycleSnapshot, ResolvedGpuTimingSample, SubmitFenceState,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3097,44 +3134,111 @@ mod tests {
     #[test]
     fn resolved_render_scale_cli_used_when_no_env() {
         // 1080p budget (2.07 M px) on a 5.24 M physical → scale ≈ 0.629.
-        let (s, src) = resolved_render_scale(None, Some(1920 * 1080), 2940 * 1782, 512, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.629).abs() < 0.01, "scale was {s}");
     }
 
     #[test]
     fn resolved_render_scale_env_wins_over_cli() {
         // Valid env beats CLI override.
-        let (s, src) =
-            resolved_render_scale(Some("0.75"), Some(1920 * 1080), 2940 * 1782, 512, None);
+        let (s, src) = resolved_render_scale(
+            Some("0.75"),
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            None,
+        );
         assert_eq!(src, RenderScaleSource::EnvOverride);
         assert!((s - 0.75).abs() < 1e-6);
     }
 
     #[test]
     fn resolved_render_scale_cli_used_when_env_invalid() {
-        // Invalid env + CLI present → CliOverride (typo signal surfaced
+        // Invalid env + CLI present → CLI override (typo signal surfaced
         // separately by the call site's log line, not by source enum).
-        let (s, src) =
-            resolved_render_scale(Some("garbage"), Some(1920 * 1080), 2940 * 1782, 512, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            Some("garbage"),
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.629).abs() < 0.01, "scale was {s}");
     }
 
     #[test]
     fn resolved_render_scale_cli_clamps_high() {
         // Asking for 4K on a 720p screen → clamps to 1.0 (native, no upscale).
-        let (s, src) = resolved_render_scale(None, Some(3840 * 2160), 1280 * 720, 256, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(3840 * 2160)),
+            1280 * 720,
+            256,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 1.0).abs() < 1e-6, "scale was {s}");
     }
 
     #[test]
     fn resolved_render_scale_cli_clamps_low() {
         // Asking for tiny budget on a huge display clamps to the 0.125 floor.
-        let (s, src) = resolved_render_scale(None, Some(160 * 90), 5000 * 5000, 1024, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(160 * 90)),
+            5000 * 5000,
+            1024,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.125).abs() < 1e-6, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_demo_fixed_scale_uses_floor() {
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::FixedScale(0.25)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliFixedScale);
+        assert!((s - 0.25).abs() < 1e-6, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_env_wins_over_demo_fixed_scale() {
+        let (s, src) = resolved_render_scale(
+            Some("0.75"),
+            Some(RenderScaleOverride::FixedScale(0.25)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::EnvOverride);
+        assert!((s - 0.75).abs() < 1e-6, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_invalid_env_falls_back_to_demo_fixed_scale() {
+        let (s, src) = resolved_render_scale(
+            Some("garbage"),
+            Some(RenderScaleOverride::FixedScale(0.25)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliFixedScale);
+        assert!((s - 0.25).abs() < 1e-6, "scale was {s}");
     }
 
     // --- hash-thing-pfpn: GPU-class classifier + class-default
@@ -3357,9 +3461,14 @@ mod tests {
     fn resolved_cli_still_wins_with_adapter() {
         // CLI beats class default.
         let info = synthetic_adapter_info("Apple M2", wgpu::DeviceType::IntegratedGpu);
-        let (s, src) =
-            resolved_render_scale(None, Some(1920 * 1080), 2940 * 1782, 512, Some(&info));
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            Some(&info),
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.629).abs() < 0.01, "scale was {s}");
     }
 
