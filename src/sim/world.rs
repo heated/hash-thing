@@ -11,7 +11,7 @@ use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
     pack_clone_source, BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE,
-    FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
+    FIREWORK, GRASS, LAVA, METAL, OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
 use rustc_hash::FxHashMap;
@@ -210,6 +210,17 @@ impl ActiveMaterialStats {
     pub fn active_cells(self) -> u32 {
         self.fire_cells + self.water_cells
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuarantineAtlasLayout {
+    pub player_pos: [f64; 3],
+    pub player_yaw: f64,
+    pub player_pitch: f64,
+    pub floor_y: i64,
+    pub hazard_center: [i64; 3],
+    pub settlements: [[i64; 3]; 3],
+    pub counter_patterns: [[i64; 3]; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1655,6 +1666,163 @@ impl World {
         }
     }
 
+    pub fn seed_quarantine_atlas_demo(&mut self) -> QuarantineAtlasLayout {
+        let side = self.side() as i64;
+        assert!(side >= 64, "Quarantine Atlas demo requires side >= 64");
+
+        self.store = NodeStore::new();
+        self.root = self.store.empty(self.level);
+        self.generation = 0;
+        self.terrain_params = None;
+        self.hashlife_cache.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        self.hashlife_slow_divisor_cache.clear();
+        self.clone_sources.clear();
+        self.block_rule_present = None;
+
+        let margin = (side / 12).max(6);
+        let floor_y = (side / 5).max(10);
+        let center = side / 2;
+        let floor = Box3::new(
+            [margin, floor_y, margin],
+            [side - margin - 1, floor_y, side - margin - 1],
+        );
+        self.fill_box(floor, STONE);
+
+        let spawn_z = center - (side / 5).max(10);
+        let spawn_pad = Box3::new(
+            [center - 3, floor_y + 1, spawn_z - 3],
+            [center + 3, floor_y + 1, spawn_z + 3],
+        );
+        self.fill_box(spawn_pad, METAL);
+
+        let hazard_center = [margin + side / 8, floor_y + 1, center];
+        let settlements = [
+            [side - margin - side / 7, floor_y + 1, margin + side / 6],
+            [side - margin - side / 8, floor_y + 1, center],
+            [
+                side - margin - side / 7,
+                floor_y + 1,
+                side - margin - side / 6,
+            ],
+        ];
+        self.fill_box(
+            Box3::new(
+                [
+                    hazard_center[0] - 2,
+                    floor_y + 1,
+                    hazard_center[2] - 7,
+                ],
+                [
+                    hazard_center[0] + 2,
+                    floor_y + 2,
+                    hazard_center[2] + 7,
+                ],
+            ),
+            LAVA,
+        );
+        self.fill_box(
+            Box3::new(
+                [
+                    hazard_center[0] + 3,
+                    floor_y + 1,
+                    hazard_center[2] - 5,
+                ],
+                [
+                    hazard_center[0] + 6,
+                    floor_y + 1,
+                    hazard_center[2] + 5,
+                ],
+            ),
+            FIRE,
+        );
+
+        let lane_x0 = hazard_center[0] + 7;
+        let lane_x1 = settlements[1][0] - 5;
+        self.fill_box(
+            Box3::new(
+                [lane_x0, floor_y + 1, center - 2],
+                [lane_x1, floor_y + 1, center + 2],
+            ),
+            VINE,
+        );
+        self.fill_box(
+            Box3::new(
+                [lane_x0, floor_y + 1, center - 4],
+                [lane_x1, floor_y + 1, center - 3],
+            ),
+            GRASS,
+        );
+        self.fill_box(
+            Box3::new(
+                [lane_x0, floor_y + 1, center + 3],
+                [lane_x1, floor_y + 1, center + 4],
+            ),
+            GRASS,
+        );
+        for x in (lane_x0 + 4..lane_x1).step_by(10) {
+            self.fill_box(
+                Box3::new([x, floor_y + 1, center - 4], [x + 2, floor_y + 1, center + 4]),
+                VINE,
+            );
+        }
+
+        for settlement in settlements {
+            self.seed_quarantine_settlement(settlement);
+        }
+
+        let counter_patterns = [
+            [center - side / 9, floor_y + 1, center - side / 5],
+            [center, floor_y + 1, center + side / 5],
+            [center + side / 9, floor_y + 1, center],
+        ];
+        self.seed_quarantine_barrier(counter_patterns[0]);
+        self.seed_quarantine_cooling_trench(counter_patterns[1]);
+        self.seed_quarantine_firebreak(counter_patterns[2]);
+
+        QuarantineAtlasLayout {
+            player_pos: [
+                center as f64 + 0.5,
+                floor_y as f64 + 2.0,
+                spawn_z as f64 + 0.5,
+            ],
+            player_yaw: std::f64::consts::FRAC_PI_2,
+            player_pitch: -0.12,
+            floor_y,
+            hazard_center,
+            settlements,
+            counter_patterns,
+        }
+    }
+
+    fn seed_quarantine_settlement(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box(Box3::new([cx - 3, cy, cz - 3], [cx + 3, cy + 2, cz + 3]), DIRT);
+        self.fill_box(Box3::new([cx - 2, cy + 1, cz - 2], [cx + 2, cy + 3, cz + 2]), GRASS);
+        self.fill_box(Box3::new([cx - 1, cy + 4, cz - 1], [cx + 1, cy + 4, cz + 1]), WATER);
+    }
+
+    fn seed_quarantine_barrier(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box(Box3::new([cx - 5, cy, cz], [cx + 5, cy + 3, cz]), STONE);
+        self.fill_box(Box3::new([cx, cy, cz - 2], [cx, cy + 2, cz + 2]), METAL);
+    }
+
+    fn seed_quarantine_cooling_trench(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box(Box3::new([cx - 4, cy, cz - 1], [cx + 4, cy, cz + 1]), WATER);
+        self.fill_box(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz - 2]), STONE);
+        self.fill_box(Box3::new([cx - 5, cy, cz + 2], [cx + 5, cy, cz + 2]), STONE);
+    }
+
+    fn seed_quarantine_firebreak(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz + 2]), SAND);
+        self.fill_box(Box3::new([cx - 4, cy + 1, cz], [cx + 4, cy + 1, cz]), AIR);
+    }
+
     /// Add water and sand to an existing terrain — water pools on a
     /// hilltop (so it cascades down) and sand dunes on one side.
     /// Call after `seed_terrain`.
@@ -1778,16 +1946,22 @@ impl World {
 
     #[cfg(test)]
     fn box_contains_material(&self, volume: Box3, state: CellState) -> bool {
+        self.box_count_material(volume, state) > 0
+    }
+
+    #[cfg(test)]
+    fn box_count_material(&self, volume: Box3, state: CellState) -> usize {
+        let mut count = 0;
         for z in volume.min[2]..=volume.max[2] {
             for y in volume.min[1]..=volume.max[1] {
                 for x in volume.min[0]..=volume.max[0] {
                     if self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) == state {
-                        return true;
+                        count += 1;
                     }
                 }
             }
         }
-        false
+        count
     }
 
     fn fill_floor(&mut self, volume: Box3, state: CellState) {
@@ -3966,6 +4140,116 @@ mod tests {
             ),
             AIR,
             "blind_pos cell must be air so player_collides returns false"
+        );
+    }
+
+    #[test]
+    fn seed_quarantine_atlas_demo_contains_required_playtest_parts() {
+        let mut w = World::new(7);
+        let layout = w.seed_quarantine_atlas_demo();
+        let grid = w.flatten();
+
+        assert!(grid.contains(&LAVA), "hazard front must include lava");
+        assert!(grid.contains(&FIRE), "hazard front must include fire");
+        assert!(grid.contains(&GRASS), "settlements must include vulnerable grass");
+        assert!(grid.contains(&METAL), "counter-patterns/spawn pad must include metal");
+        assert!(grid.contains(&WATER), "counter-patterns/settlements must include water");
+        assert_eq!(
+            w.get(
+                WorldCoord(layout.player_pos[0].floor() as i64),
+                WorldCoord(layout.floor_y + 1),
+                WorldCoord(layout.player_pos[2].floor() as i64)
+            ),
+            METAL,
+            "player starts above the atlas command pad"
+        );
+
+        for center in layout.settlements {
+            assert!(
+                w.box_contains_material(
+                    Box3::new(
+                        [center[0] - 4, center[1], center[2] - 4],
+                        [center[0] + 4, center[1] + 5, center[2] + 4],
+                    ),
+                    GRASS,
+                ),
+                "settlement at {center:?} must have vulnerable material"
+            );
+        }
+
+        let threat_lane = Box3::new(
+            [
+                layout.hazard_center[0] + 7,
+                layout.floor_y + 1,
+                layout.hazard_center[2] - 4,
+            ],
+            [
+                layout.settlements[1][0] - 5,
+                layout.floor_y + 1,
+                layout.hazard_center[2] + 4,
+            ],
+        );
+        assert!(
+            w.box_count_material(threat_lane, GRASS) > 0,
+            "hazard must have a flammable lane toward the middle settlement"
+        );
+        assert!(
+            w.box_count_material(threat_lane, VINE) > 0,
+            "hazard lane must include high-fuel patches"
+        );
+    }
+
+    #[test]
+    fn seed_quarantine_atlas_demo_hazard_front_changes_after_steps() {
+        let mut w = World::new(6);
+        let layout = w.seed_quarantine_atlas_demo();
+        let front_probe = Box3::new(
+            [
+                layout.hazard_center[0] - 8,
+                layout.floor_y,
+                layout.hazard_center[2] - 10,
+            ],
+            [
+                layout.hazard_center[0] + 12,
+                layout.floor_y + 4,
+                layout.hazard_center[2] + 10,
+            ],
+        );
+        let threat_lane = Box3::new(
+            [
+                layout.hazard_center[0] + 7,
+                layout.floor_y + 1,
+                layout.hazard_center[2] - 4,
+            ],
+            [
+                layout.settlements[1][0] - 5,
+                layout.floor_y + 1,
+                layout.hazard_center[2] + 4,
+            ],
+        );
+        let before = (
+            w.box_count_material(front_probe, LAVA),
+            w.box_count_material(front_probe, FIRE),
+            w.box_count_material(front_probe, WATER),
+        );
+        let lane_fire_before = w.box_count_material(threat_lane, FIRE);
+        for _ in 0..3 {
+            w.step_recursive();
+        }
+        let after = (
+            w.box_count_material(front_probe, LAVA),
+            w.box_count_material(front_probe, FIRE),
+            w.box_count_material(front_probe, WATER),
+        );
+        let lane_fire_after = w.box_count_material(threat_lane, FIRE);
+        assert!(before.0 > 0, "precondition: probe must contain lava");
+        assert_ne!(
+            after, before,
+            "hazard/front probe should not be a static diorama after warm steps"
+        );
+        assert!(
+            lane_fire_after > lane_fire_before,
+            "fire should advance into the settlement threat lane after warm steps"
         );
     }
 

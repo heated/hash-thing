@@ -319,6 +319,7 @@ enum PendingSceneSwap {
     LoadLatticePanoramaDemo,
     ResetTerrain,
     LoadGyroid,
+    LoadQuarantineAtlas,
     LoadDemoSpectacle,
     ResetGolSmoke,
     SelectLatticeBeat(LatticeDemoBeat),
@@ -332,6 +333,7 @@ impl PendingSceneSwap {
             Self::LoadLatticePanoramaDemo => "lattice_panorama",
             Self::ResetTerrain => "terrain_reset",
             Self::LoadGyroid => "gyroid",
+            Self::LoadQuarantineAtlas => "quarantine_atlas",
             Self::LoadDemoSpectacle => "demo_spectacle",
             Self::ResetGolSmoke => "gol_smoke_reset",
             Self::SelectLatticeBeat(LatticeDemoBeat::Intro) => "lattice_beat_intro",
@@ -351,6 +353,7 @@ impl PendingSceneSwap {
             | Self::LoadLatticePanoramaDemo
             | Self::ResetTerrain
             | Self::LoadGyroid
+            | Self::LoadQuarantineAtlas
             | Self::LoadDemoSpectacle
             | Self::ResetGolSmoke
             | Self::SelectLatticeBeat(_) => true,
@@ -554,12 +557,54 @@ struct LodUploadCtx<'a> {
     last_growth_ratio: &'a mut Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuarantineAtlasPattern {
+    Barrier,
+    CoolingTrench,
+    Firebreak,
+}
+
+impl QuarantineAtlasPattern {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Barrier => "barrier",
+            Self::CoolingTrench => "cooling trench",
+            Self::Firebreak => "firebreak",
+        }
+    }
+
+    fn from_digit(digit: u16) -> Option<Self> {
+        match digit {
+            1 => Some(Self::Barrier),
+            2 => Some(Self::CoolingTrench),
+            3 => Some(Self::Firebreak),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuarantineAtlasState {
+    interventions_remaining: u8,
+    selected_pattern: QuarantineAtlasPattern,
+}
+
+impl Default for QuarantineAtlasState {
+    fn default() -> Self {
+        Self {
+            interventions_remaining: 6,
+            selected_pattern: QuarantineAtlasPattern::Barrier,
+        }
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
     world: sim::World,
     gol_smoke_rule: sim::GameOfLife3D,
     gol_smoke_scene: bool,
+    quarantine_atlas: Option<QuarantineAtlasState>,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -906,6 +951,53 @@ fn reconcile_modifier_keys(
     removed
 }
 
+fn stamp_quarantine_atlas_pattern(
+    world: &mut sim::World,
+    pattern: QuarantineAtlasPattern,
+    center: [i64; 3],
+) {
+    use hash_thing::terrain::materials::{AIR, METAL, SAND, STONE, WATER};
+
+    let region = world.region();
+    let mut set = |x: i64, y: i64, z: i64, state| {
+        if region.contains(x, y, z) {
+            world.set(sim::WorldCoord(x), sim::WorldCoord(y), sim::WorldCoord(z), state);
+        }
+    };
+    let [cx, cy, cz] = center;
+    match pattern {
+        QuarantineAtlasPattern::Barrier => {
+            for dx in -4..=4 {
+                for dy in 0..=3 {
+                    set(cx + dx, cy + dy, cz, STONE);
+                }
+            }
+            for dz in -1..=1 {
+                set(cx, cy + 1, cz + dz, METAL);
+            }
+        }
+        QuarantineAtlasPattern::CoolingTrench => {
+            for dx in -4..=4 {
+                for dz in -1..=1 {
+                    set(cx + dx, cy, cz + dz, WATER);
+                }
+            }
+            for dx in -5..=5 {
+                set(cx + dx, cy, cz - 2, STONE);
+                set(cx + dx, cy, cz + 2, STONE);
+            }
+        }
+        QuarantineAtlasPattern::Firebreak => {
+            for dx in -5..=5 {
+                for dz in -2..=2 {
+                    set(cx + dx, cy, cz + dz, SAND);
+                    set(cx + dx, cy + 1, cz + dz, AIR);
+                }
+            }
+        }
+    }
+}
+
 impl App {
     fn new(volume_size: u32) -> Self {
         let level = volume_size.trailing_zeros();
@@ -921,6 +1013,7 @@ impl App {
             world,
             gol_smoke_rule: sim::GameOfLife3D::rule445(),
             gol_smoke_scene: false,
+            quarantine_atlas: None,
             svdag: render::Svdag::new(),
             paused: false,
             log_timer: std::time::Instant::now(),
@@ -1317,6 +1410,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!(
             "Initial scene (pyroclastic): pop={} nodes={}",
             self.world.population(),
@@ -1787,6 +1881,9 @@ impl App {
     }
 
     fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
+        if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadQuarantineAtlas) {
+            self.exit_quarantine_atlas_mode();
+        }
         match swap {
             PendingSceneSwap::LoadLatticeDemo => {
                 let _ = self.load_lattice_demo();
@@ -1797,6 +1894,7 @@ impl App {
                 terrain::TerrainParams::for_level(self.volume_size.trailing_zeros()),
             ),
             PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
+            PendingSceneSwap::LoadQuarantineAtlas => self.load_quarantine_atlas_demo(),
             PendingSceneSwap::LoadDemoSpectacle => {
                 self.load_demo_spectacle("Reset spectacle gallery")
             }
@@ -1829,32 +1927,51 @@ impl App {
     }
 
     /// Legend text lines for the current camera mode.
-    fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
+    fn legend_lines(mode: CameraMode, quarantine_atlas_active: bool) -> Vec<&'static str> {
         match mode {
-            CameraMode::FirstPerson => vec![
-                "  FIELD LINK",
-                "",
-                "  WASD        Drift",
-                "  Mouse       Aim",
-                "  Space       Leap",
-                "  Ctrl        Surge",
-                "  LClick      Carve",
-                "  RClick      Cast",
-                "  Scroll/1-9  Matter",
-                "  Ctrl+RClick Clone source",
-                "  Tab         Survey cam",
-                "",
-                "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL bloom",
-                "  M  Gyroid     N  Lattice walk",
-                "  V  Panorama reveal",
-                "  [/] U/I/O  DEV jumps (Tab for orbit)",
-                "  0  Recenter",
-                "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Signal legend",
-                "  C  Clear perf",
-                "  Esc Exit",
-            ],
+            CameraMode::FirstPerson => {
+                let action_lines = if quarantine_atlas_active {
+                    vec![
+                        "  LClick      Disabled",
+                        "  RClick      Stamp",
+                        "  1-3         Pattern",
+                    ]
+                } else {
+                    vec![
+                        "  LClick      Carve",
+                        "  RClick      Cast",
+                        "  Scroll/1-9  Matter",
+                        "  Ctrl+RClick Clone source",
+                    ]
+                };
+                [
+                    vec![
+                        "  FIELD LINK",
+                        "",
+                        "  WASD        Drift",
+                        "  Mouse       Aim",
+                        "  Space       Leap",
+                        "  Ctrl        Surge",
+                    ],
+                    action_lines,
+                    vec![
+                        "  Tab         Survey cam",
+                        "",
+                        "  T  Terrain    B  Spectacle",
+                        "  R  Reset      G  GoL bloom",
+                        "  M  Gyroid     Q  Quarantine",
+                        "  N  Lattice walk",
+                        "  V  Panorama reveal",
+                        "  [/] U/I/O  DEV jumps (Tab for orbit)",
+                        "  0  Recenter",
+                        "  H  Heatmap    +/-  Resolution",
+                        "  F5 Pause      F1  Signal legend",
+                        "  C  Clear perf",
+                        "  Esc Exit",
+                    ],
+                ]
+                .concat()
+            }
             CameraMode::Orbit => vec![
                 "  SURVEY CAM",
                 "",
@@ -1867,7 +1984,8 @@ impl App {
                 "",
                 "  T  Terrain    B  Spectacle",
                 "  R  Reset      G  GoL bloom",
-                "  M  Gyroid     N  Lattice walk",
+                "  M  Gyroid     Q  Quarantine",
+                "  N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
                 "  V  Panorama reveal",
@@ -2017,6 +2135,10 @@ impl App {
         if self.is_stepping() {
             return;
         }
+        if self.quarantine_atlas.is_some() {
+            log::info!("Quarantine Atlas carve disabled; use 1-3 plus right-click stamps");
+            return;
+        }
         let Some((eye, dir)) = self.player_eye_ray() else {
             return;
         };
@@ -2051,6 +2173,10 @@ impl App {
     /// Place a block on the face the player is looking at.
     fn place_block(&mut self) {
         if self.is_stepping() {
+            return;
+        }
+        if self.quarantine_atlas.is_some() {
+            self.deploy_quarantine_atlas_pattern();
             return;
         }
         let pid = self.player_id;
@@ -2098,6 +2224,69 @@ impl App {
                 window.request_redraw();
             }
         }
+    }
+
+    fn select_quarantine_atlas_pattern(&mut self, pattern: QuarantineAtlasPattern) -> bool {
+        let Some(state) = self.quarantine_atlas.as_mut() else {
+            return false;
+        };
+        state.selected_pattern = pattern;
+        log::info!(
+            "Quarantine Atlas pattern: {} (budget {})",
+            pattern.label(),
+            state.interventions_remaining
+        );
+        true
+    }
+
+    fn deploy_quarantine_atlas_pattern(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        let Some((_hit, prev)) = player::raycast_cells(&self.world, eye, dir) else {
+            return;
+        };
+        if self.apply_quarantine_atlas_pattern_at(prev) {
+            let player_pos = self.player_world_pos();
+            Self::upload_volume(
+                &mut self.renderer,
+                &mut self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+                LodUploadCtx {
+                    policy: &mut self.lod_policy,
+                    player_pos,
+                    last_histogram: &mut self.last_lod_histogram,
+                    last_growth_ratio: &mut self.last_lod_growth_ratio,
+                },
+            );
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn apply_quarantine_atlas_pattern_at(&mut self, center: [i64; 3]) -> bool {
+        let Some(state) = self.quarantine_atlas.as_mut() else {
+            return false;
+        };
+        if state.interventions_remaining == 0 {
+            log::info!("Quarantine Atlas budget exhausted");
+            return false;
+        }
+        state.interventions_remaining -= 1;
+        let pattern = state.selected_pattern;
+        stamp_quarantine_atlas_pattern(&mut self.world, pattern, center);
+        log::info!(
+            "Deployed {} at {:?}; budget {}",
+            pattern.label(),
+            center,
+            state.interventions_remaining
+        );
+        true
     }
 
     /// Refresh both GPU uploads (flat3D volume + SVDAG) and cache the
@@ -2271,6 +2460,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -2371,6 +2561,12 @@ impl App {
         self.short_demo_cut = None;
     }
 
+    fn exit_quarantine_atlas_mode(&mut self) {
+        if self.quarantine_atlas.take().is_some() {
+            self.legend_dirty = true;
+        }
+    }
+
     #[allow(dead_code)]
     fn load_burning_room_demo(&mut self, label: &str) {
         if self.is_stepping() {
@@ -2401,6 +2597,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -2450,12 +2647,68 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!(
             "Gyroid megastructure: pop={} gen={:.1}ms collapses={} classifies={}",
             self.world.population(),
             elapsed.as_secs_f64() * 1000.0,
             stats.total_collapses(),
             stats.classify_calls,
+        );
+    }
+
+    fn load_quarantine_atlas_demo(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        if self.volume_size < 64 {
+            log::warn!(
+                "Quarantine Atlas requires SIZE >= 64 (current {})",
+                self.volume_size
+            );
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        let layout = self.world.seed_quarantine_atlas_demo();
+        self.reset_scene_entities();
+        self.spawn_demo_entities();
+        self.reset_player_pose(layout.player_pos, layout.player_yaw, layout.player_pitch);
+        let elapsed = start.elapsed();
+        self.gol_smoke_scene = false;
+        self.quarantine_atlas = Some(QuarantineAtlasState::default());
+        self.legend_dirty = true;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = false;
+        self.reset_scene_perf_state();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
+        }
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.sync_render_cache();
+        self.exit_lattice_demo_mode();
+        log::info!(
+            "Quarantine Atlas: pop={} gen={:.1}ms budget={} pattern={}",
+            self.world.population(),
+            elapsed.as_secs_f64() * 1000.0,
+            self.quarantine_atlas
+                .map(|s| s.interventions_remaining)
+                .unwrap_or(0),
+            self.quarantine_atlas
+                .map(|s| s.selected_pattern.label())
+                .unwrap_or("none"),
         );
     }
 
@@ -2487,6 +2740,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
     }
 
@@ -2528,6 +2782,7 @@ impl App {
         self.sync_render_cache();
         self.current_demo_beat = None;
         self.short_demo_cut = None;
+        self.exit_quarantine_atlas_mode();
         log::info!(
             "Lattice progression demo: pop={} gen={:.1}ms reveal={:?}",
             self.world.population(),
@@ -2585,6 +2840,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
     }
 }
 
@@ -2908,6 +3164,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("m") => {
                             self.request_scene_swap(PendingSceneSwap::LoadGyroid);
                         }
+                        winit::keyboard::Key::Character("q") => {
+                            self.request_scene_swap(PendingSceneSwap::LoadQuarantineAtlas);
+                        }
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
                         }
@@ -2945,6 +3204,18 @@ impl ApplicationHandler<AppUserEvent> for App {
                         ) => {
                             let digit: u16 = n.parse().unwrap();
                             if self.camera_mode == CameraMode::FirstPerson {
+                                if self.quarantine_atlas.is_some() {
+                                    if let Some(pattern) =
+                                        QuarantineAtlasPattern::from_digit(digit)
+                                    {
+                                        self.select_quarantine_atlas_pattern(pattern);
+                                    } else {
+                                        log::debug!(
+                                            "digit {digit} ignored in Quarantine Atlas: pattern selection uses 1-3"
+                                        );
+                                    }
+                                    return;
+                                }
                                 // FPS mode: select held material.
                                 self.select_held_material(digit);
                             } else {
@@ -3105,7 +3376,13 @@ impl ApplicationHandler<AppUserEvent> for App {
                     && state == ElementState::Pressed
                     && self.camera_mode == CameraMode::FirstPerson
                 {
-                    if self.keys_held.contains(&KeyCode::ControlLeft)
+                    if self.quarantine_atlas.is_some() {
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::Place);
+                        } else {
+                            self.deploy_quarantine_atlas_pattern();
+                        }
+                    } else if self.keys_held.contains(&KeyCode::ControlLeft)
                         || self.keys_held.contains(&KeyCode::ControlRight)
                     {
                         if self.is_stepping() {
@@ -3305,7 +3582,10 @@ impl ApplicationHandler<AppUserEvent> for App {
                         self.legend_dirty = false;
                         renderer.legend_visible = self.legend_visible;
                         if self.legend_visible {
-                            renderer.set_legend_text(&Self::legend_lines(self.camera_mode));
+                            renderer.set_legend_text(&Self::legend_lines(
+                                self.camera_mode,
+                                self.quarantine_atlas.is_some(),
+                            ));
                         }
                     }
 
@@ -3732,6 +4012,7 @@ enum DumpScene {
     GolSmoke,
     Spectacle,
     Gyroid,
+    QuarantineAtlas,
     LatticeBeat(LatticeDemoBeat),
 }
 
@@ -3742,6 +4023,7 @@ impl DumpScene {
             "gol" => Some(Self::GolSmoke),
             "spectacle" => Some(Self::Spectacle),
             "gyroid" => Some(Self::Gyroid),
+            "quarantine-atlas" => Some(Self::QuarantineAtlas),
             "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
             "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
             "lattice-panorama" => Some(Self::LatticeBeat(LatticeDemoBeat::Panorama)),
@@ -3755,6 +4037,7 @@ impl DumpScene {
             Self::GolSmoke => PendingSceneSwap::ResetGolSmoke,
             Self::Spectacle => PendingSceneSwap::LoadDemoSpectacle,
             Self::Gyroid => PendingSceneSwap::LoadGyroid,
+            Self::QuarantineAtlas => PendingSceneSwap::LoadQuarantineAtlas,
             Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
         }
     }
@@ -3765,6 +4048,7 @@ impl DumpScene {
             Self::GolSmoke => "gol",
             Self::Spectacle => "spectacle",
             Self::Gyroid => "gyroid",
+            Self::QuarantineAtlas => "quarantine-atlas",
             Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
             Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
             Self::LatticeBeat(LatticeDemoBeat::Panorama) => "lattice-panorama",
@@ -3810,7 +4094,7 @@ where
 {
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
                          [--dump-frame PATH] \
-                         [--dump-scene terrain|gol|spectacle|gyroid|lattice-intro|lattice-interior|lattice-panorama]";
+                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|lattice-intro|lattice-interior|lattice-panorama]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut res_target: Option<u64> = None;
@@ -4271,6 +4555,7 @@ mod tests {
             ("gol", DumpScene::GolSmoke),
             ("spectacle", DumpScene::Spectacle),
             ("gyroid", DumpScene::Gyroid),
+            ("quarantine-atlas", DumpScene::QuarantineAtlas),
             ("lattice-intro", DumpScene::LatticeBeat(LatticeDemoBeat::Intro)),
             ("lattice-interior", DumpScene::LatticeBeat(LatticeDemoBeat::Interior)),
             ("lattice-panorama", DumpScene::LatticeBeat(LatticeDemoBeat::Panorama)),
@@ -4748,9 +5033,62 @@ mod tests {
         assert!(PendingSceneSwap::LoadLatticePanoramaDemo.discards_world());
         assert!(PendingSceneSwap::ResetTerrain.discards_world());
         assert!(PendingSceneSwap::LoadGyroid.discards_world());
+        assert!(PendingSceneSwap::LoadQuarantineAtlas.discards_world());
         assert!(PendingSceneSwap::LoadDemoSpectacle.discards_world());
         assert!(PendingSceneSwap::ResetGolSmoke.discards_world());
         assert!(PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Intro).discards_world());
+    }
+
+    #[test]
+    fn quarantine_atlas_pattern_deployment_consumes_and_enforces_budget() {
+        let mut app = App::new(128);
+        app.load_quarantine_atlas_demo();
+        app.select_quarantine_atlas_pattern(QuarantineAtlasPattern::CoolingTrench);
+
+        let start = app
+            .quarantine_atlas
+            .expect("quarantine mode should be active")
+            .interventions_remaining;
+        assert!(app.apply_quarantine_atlas_pattern_at([64, 27, 64]));
+        let after_one = app
+            .quarantine_atlas
+            .expect("quarantine mode should remain active")
+            .interventions_remaining;
+        assert_eq!(after_one, start - 1);
+
+        if let Some(state) = app.quarantine_atlas.as_mut() {
+            state.interventions_remaining = 0;
+        }
+        assert!(
+            !app.apply_quarantine_atlas_pattern_at([66, 27, 64]),
+            "budget exhaustion must block pattern spam"
+        );
+    }
+
+    #[test]
+    fn quarantine_atlas_loader_rejects_too_small_world_without_panic() {
+        let mut app = App::new(32);
+
+        app.load_quarantine_atlas_demo();
+
+        assert!(
+            app.quarantine_atlas.is_none(),
+            "too-small worlds should leave Quarantine Atlas inactive"
+        );
+    }
+
+    #[test]
+    fn direct_world_loader_exits_quarantine_atlas_mode() {
+        let mut app = App::new(128);
+        app.load_quarantine_atlas_demo();
+        assert!(app.quarantine_atlas.is_some());
+
+        app.load_demo_spectacle("test reset");
+
+        assert!(
+            app.quarantine_atlas.is_none(),
+            "direct world loaders must not leave quarantine input routing active"
+        );
     }
 
     #[test]
@@ -4975,7 +5313,7 @@ mod tests {
 
     #[test]
     fn first_person_legend_notes_lattice_debug_jumps() {
-        let lines = App::legend_lines(CameraMode::FirstPerson);
+        let lines = App::legend_lines(CameraMode::FirstPerson, false);
         assert!(lines.iter().any(|line| line.contains("Space       Leap")));
         assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
@@ -5002,7 +5340,7 @@ mod tests {
 
     #[test]
     fn orbit_legend_marks_lattice_jumps_as_debug() {
-        let lines = App::legend_lines(CameraMode::Orbit);
+        let lines = App::legend_lines(CameraMode::Orbit, false);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
         assert!(lines
             .iter()
@@ -5017,6 +5355,17 @@ mod tests {
     fn legend_defaults_on_in_all_modes() {
         assert!(default_legend_visibility(CameraMode::FirstPerson));
         assert!(default_legend_visibility(CameraMode::Orbit));
+    }
+
+    #[test]
+    fn quarantine_atlas_legend_removes_hand_edit_controls() {
+        let lines = App::legend_lines(CameraMode::FirstPerson, true);
+
+        assert!(lines.iter().any(|line| line.contains("RClick      Stamp")));
+        assert!(lines.iter().any(|line| line.contains("1-3         Pattern")));
+        assert!(!lines.iter().any(|line| line.contains("Carve")));
+        assert!(!lines.iter().any(|line| line.contains("Matter")));
+        assert!(!lines.iter().any(|line| line.contains("Clone source")));
     }
 
     #[test]
@@ -6044,6 +6393,18 @@ mod tests {
         let mut app = App::new(256);
         app.load_demo_spectacle("warp-audit");
         assert_player_in_playable_space(&app, "b / load_demo_spectacle");
+    }
+
+    #[test]
+    fn warp_q_load_quarantine_atlas_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_quarantine_atlas_demo();
+        assert_player_in_playable_space(&app, "q / load_quarantine_atlas_demo");
+        assert!(!app.paused, "Quarantine Atlas hazard should run live");
+        assert!(
+            app.quarantine_atlas.is_some(),
+            "Quarantine Atlas mode should enable budgeted pattern deployment"
+        );
     }
 
     /// Audit `0` (recenter_player): recenter from inside a seeded scene
