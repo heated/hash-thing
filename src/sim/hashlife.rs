@@ -31,11 +31,14 @@
 //! phase alternates 0/1, so stable subtrees hit the cache every other frame;
 //! with slower divisors hits occur every `memo_period` frames at the same phase.
 //!
-//! **Cache-preserving compaction (m1f.15.4):** The recursive descent builds
+//! **Cache-key-preserving compaction (m1f.15.4):** The recursive descent builds
 //! intermediate nodes (27 per recursive level) that become cache keys but are
 //! NOT reachable from the step result. When compaction fires, cache keys are
-//! passed as extra roots to `compacted_with_remap_keeping`, keeping them alive
-//! through GC so cache entries survive.
+//! passed as extra roots to `compacted_with_remap_keeping`, keeping those
+//! lookup keys alive through GC. Cache entries still survive only when both
+//! key and value are reachable in the post-compaction remap; result-side
+//! eviction is deliberate so compaction does not retain unbounded cache-only
+//! result subgraphs.
 
 use super::world::World;
 use crate::octree::node::octant_index;
@@ -408,13 +411,14 @@ impl World {
     }
 
     /// Compact the store when it has grown past 2× its post-compaction size,
-    /// keeping cache-referenced intermediate nodes alive (m1f.15.4).
+    /// keeping cache-key intermediate nodes alive (m1f.15.4).
     ///
     /// Deferred compaction lets intermediate nodes from recursive descent
     /// survive across frames, enabling cache hits. When compaction fires,
-    /// cache keys are passed as extra roots so they survive GC — without
-    /// this, every compaction destroys the cache and forces full
-    /// recomputation.
+    /// cache keys are passed as extra roots so they survive GC — without this,
+    /// every compaction destroys the lookup side of the cache and forces full
+    /// recomputation. Values that are no longer live are allowed to drop so GC
+    /// can still reclaim stale result subgraphs.
     fn maybe_compact(&mut self) {
         let current_size = self.store.stats();
         if self.store_size_at_last_compact == 0 {
@@ -428,11 +432,11 @@ impl World {
     }
 
     /// Unconditional compaction, preserving the world root, hashlife
-    /// cache-referenced nodes, and any caller-provided `extra_roots`.
+    /// cache key nodes, and any caller-provided `extra_roots`.
     ///
     /// Used by:
     /// - [`Self::maybe_compact`] when the 2× growth threshold is met
-    ///   (no extra roots beyond cache references).
+    ///   (no extra roots beyond cache keys).
     /// - The cswp.8.3 chunk-LOD path (hash-thing-e4ep) to shed ghost
     ///   interior chains accumulated by repeated `lod_collapse_chunk`
     ///   calls without losing the live `view_root`. Within the lib,
@@ -465,10 +469,12 @@ impl World {
         self.store_size_at_last_compact = self.store.stats();
     }
 
-    /// Collect cache key NodeIds that must survive compaction.
-    /// Cache keys are intermediate nodes not reachable from the world root;
-    /// cache values are step results that ARE reachable from root, so only
-    /// keys need to be kept alive as extra roots.
+    /// Collect cache key NodeIds that should survive compaction.
+    /// Cache keys are intermediate nodes often not reachable from the world
+    /// root. Cache values are not preserved as extra roots: if a result is no
+    /// longer reachable from the compacted root or another live root, the
+    /// cache entry drops. That keeps compaction from retaining unbounded
+    /// cache-only result subgraphs.
     fn cache_referenced_nodes(&self) -> Vec<NodeId> {
         let mut nodes =
             Vec::with_capacity(self.hashlife_cache.len() + self.hashlife_macro_cache.len());
@@ -598,7 +604,10 @@ impl World {
     }
 
     /// Remap hashlife cache keys and values through a compaction remap table.
-    /// Entries referencing unreachable nodes (not in remap) are dropped.
+    /// Entries referencing unreachable keys or result values are dropped. Under
+    /// `compact_keeping`, key-side drops should be rare because cache keys are
+    /// extra roots; value-side drops are expected when the cached result is no
+    /// longer live after GC.
     fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
         // Remap hashlife_cache: (NodeId, schedule_phase) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
@@ -3813,8 +3822,8 @@ mod tests {
 
     /// `remap_caches` must split its outcome into kept (entries whose
     /// node + result both survived the remap) and dropped (everything
-    /// else). Three entries in, two survive, one dropped: counters
-    /// land at 2/1.
+    /// else). Three entries in, one survives, two drop: counters land
+    /// at 1/2.
     #[test]
     fn remap_caches_counts_kept_and_dropped() {
         let mut world = World::new(4);

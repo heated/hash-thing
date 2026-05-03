@@ -490,15 +490,18 @@ pub struct HashlifeStats {
     /// becomes a lower-bound on the micro-path's true alias rate
     /// (the macro path doesn't probe).
     pub cache_misses_phase_aliased: u64,
-    /// hash-thing-bjdl (vqke.2): probe for hypothesis 2 (cache eviction
-    /// too aggressive). Counts hashlife_cache entries dropped during
-    /// `remap_caches` because their NodeId or result NodeId was not
-    /// present in the post-compaction reachability set. Most steps
-    /// are 0 because `maybe_compact` is gated on the 2× growth
-    /// threshold. A high `dropped/(dropped+kept)` ratio shows the
-    /// cache is fragmenting against the reachability sweep — not
-    /// necessarily a sweep bug, but evidence that cache lifetime is
-    /// shorter than the reuse horizon. A low ratio rules H2 out.
+    /// hash-thing-bjdl/8qpp: probe for hypothesis 2 (cache eviction too
+    /// aggressive). Counts hashlife_cache entries dropped during
+    /// `remap_caches` because their key NodeId or result NodeId was not
+    /// present in the post-compaction reachability set. `compact_keeping`
+    /// preserves cache keys as extra roots, but it deliberately does not
+    /// preserve result values that are otherwise dead; value-side eviction
+    /// keeps GC from retaining unbounded cache-only result subgraphs.
+    /// Most steps are 0 because `maybe_compact` is gated on the 2× growth
+    /// threshold. A high `dropped/(dropped+kept)` ratio is a cache-lifetime
+    /// signal: reusable results are not surviving until their next use, or the
+    /// cache contains results outside the current live horizon. It is not by
+    /// itself evidence of a compaction/remap correctness bug.
     pub compact_entries_dropped: u64,
     /// hash-thing-bjdl (vqke.2): paired with `compact_entries_dropped`.
     /// Counts hashlife_cache entries that survived the most recent
