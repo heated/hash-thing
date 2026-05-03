@@ -5616,7 +5616,7 @@ mod tests {
 
     #[test]
     fn fluid_spreads_laterally_into_air() {
-        // Place water at ground level with air neighbors in the same block.
+        // Place water with air neighbors in the same block.
         // After enough steps, water should have moved laterally.
         let mut world = World::new(4);
         world.simulation_seed = 42;
@@ -5631,14 +5631,26 @@ mod tests {
             world.step();
         }
 
-        // Water must still exist (conservation) but may have moved.
+        // Water must still exist (conservation) and must not only fall
+        // vertically in its original x/z column.
         assert_eq!(
             world.population(),
             1,
             "exactly one water cell should remain"
         );
-        // It should NOT still be at (2,3,2) after gravity — verify it settled
-        // at a y=0 or y=2 position (even-aligned bottom).
+        let grid = world.flatten();
+        let side = world.side();
+        let water_idx = grid
+            .iter()
+            .position(|&raw| Cell::from_raw(raw).material() == WATER_MATERIAL_ID)
+            .expect("water must still exist");
+        let water_x = water_idx % side;
+        let water_z = water_idx / (side * side);
+        assert_ne!(
+            (water_x, water_z),
+            (8, 8),
+            "water should spread laterally out of its original x/z column"
+        );
     }
 
     #[test]
@@ -6671,10 +6683,10 @@ mod tests {
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 
-    /// qy4g.2 option G regression. Under the no-gap-fill regime, contained
-    /// water must conserve population every step. Free-falling or contained
-    /// water may retain a parity checkerboard; option G deliberately accepts
-    /// that artifact instead of running a post-pass gap fill.
+    /// qy4g.2 option G mass regression. Under the no-gap-fill regime,
+    /// contained water must conserve population every step. The stronger
+    /// settled-contiguity contract is tracked separately by the ignored repro
+    /// below because it is currently broken.
     #[test]
     fn contained_water_block_conserves_population_under_parity_flip() {
         let mut world = World::new(5); // 32³
@@ -6722,6 +6734,78 @@ mod tests {
             .filter(|&&raw| Cell::from_raw(raw).material() == WATER_MATERIAL_ID)
             .count();
         assert_eq!(water_after, water_before, "contained water should survive");
+    }
+
+    /// qy4g / review follow-up: SPEC says a free-fall checkerboard compacts
+    /// once the leading edge hits a solid surface. The contained basin below
+    /// proves mass survives, but today the final water levels are still
+    /// every-other-y. Keep this as an explicit repro instead of silently
+    /// weakening the contract.
+    #[test]
+    #[ignore]
+    fn repro_qy4g_contained_water_block_should_settle_contiguously() {
+        let mut world = World::new(5); // 32³
+        for z in 0..32 {
+            for x in 0..32 {
+                world.set(wc(x), wc(0), wc(z), STONE);
+            }
+        }
+        for y in 1..32 {
+            for z in 0..32 {
+                world.set(wc(0), wc(y), wc(z), STONE);
+                world.set(wc(31), wc(y), wc(z), STONE);
+            }
+            for x in 1..31 {
+                world.set(wc(x), wc(y), wc(0), STONE);
+                world.set(wc(x), wc(y), wc(31), STONE);
+            }
+        }
+        for z in 10..16 {
+            for y in 16..22 {
+                for x in 10..16 {
+                    world.set(wc(x), wc(y), wc(z), WATER);
+                }
+            }
+        }
+
+        for _ in 0..32 {
+            world.step();
+        }
+
+        let side = world.side() as u64;
+        let grid = world.flatten();
+        let mut water_by_y = vec![0u64; side as usize];
+        for y in 0..side {
+            for z in 0..side {
+                for x in 0..side {
+                    let idx = x as usize
+                        + y as usize * side as usize
+                        + z as usize * side as usize * side as usize;
+                    if Cell::from_raw(grid[idx]).material() == WATER_MATERIAL_ID {
+                        water_by_y[y as usize] += 1;
+                    }
+                }
+            }
+        }
+        let water_levels: Vec<usize> = water_by_y
+            .iter()
+            .enumerate()
+            .filter(|(_, &count)| count > 0)
+            .map(|(y, _)| y)
+            .collect();
+        assert!(
+            !water_levels.is_empty(),
+            "water should still exist after stepping"
+        );
+        for pair in water_levels.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                1,
+                "gap between y={} and y={} after contained settling",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]

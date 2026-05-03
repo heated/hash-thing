@@ -1914,7 +1914,9 @@ mod tests {
     use super::*;
     use crate::sim::rule::ALIVE;
     use crate::sim::{GameOfLife3D, WorldCoord};
-    use crate::terrain::materials::{DIRT_MATERIAL_ID, SAND_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
+    use crate::terrain::materials::{
+        DIRT, DIRT_MATERIAL_ID, SAND_MATERIAL_ID, STONE, WATER_MATERIAL_ID,
+    };
 
     fn wc(coord: u64) -> WorldCoord {
         WorldCoord(coord as i64)
@@ -2539,10 +2541,9 @@ mod tests {
         assert_recursive_matches_bruteforce(brute, recur, 2, "level5-stone");
     }
 
-    /// Seed water and stone with a margin. CaRule boundaries now match
-    /// (both absorbing), but BlockRule still differs: brute-force clips
-    /// partial blocks at edges, hashlife processes them via overlapping
-    /// sub-cubes. Margins keep block-rule-bearing cells away from edges.
+    /// Seed water and stone with a margin. CaRule and BlockRule boundaries
+    /// now both use absorbing out-of-bounds cells; margins keep randomized
+    /// cases focused on interior recursive composition rather than edge loss.
     fn seed_random_material_cells_margined(world: &mut World, seed: u64, margin: u64) {
         let mut rng = SimpleRng::new(seed);
         let side = world.side() as u64;
@@ -2580,6 +2581,18 @@ mod tests {
         seed_random_material_cells_margined(&mut brute, 0xdee5_u64, 3);
         seed_random_material_cells_margined(&mut recur, 0xdee5_u64, 3);
         assert_recursive_matches_bruteforce(brute, recur, 2, "level5-materials");
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_low_edge_odd_margolus_block() {
+        let mut brute = World::new(3);
+        let mut recur = World::new(3);
+        brute.generation = 1;
+        recur.generation = 1;
+        brute.set(wc(0), wc(2), wc(0), DIRT);
+        recur.set(wc(0), wc(2), wc(0), DIRT);
+
+        assert_recursive_matches_bruteforce(brute, recur, 1, "low-edge-odd-margolus");
     }
 
     #[test]
