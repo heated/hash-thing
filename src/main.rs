@@ -8,6 +8,7 @@ use hash_thing::sim::world::quarantine_atlas_mixed_containment_plan;
 use hash_thing::sim::world::QuarantineAtlasPattern;
 use hash_thing::terrain;
 
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -77,6 +78,15 @@ const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
 const WORLD_PREFETCH_MARGIN_METERS: f64 = 64.0;
 const DEFAULT_CLI_VOLUME_SIZE: u32 = 256;
+const SOUP_PROSPECTOR_TILE: i64 = 16;
+const SOUP_PROSPECTOR_SIDE: i64 = 8;
+const SOUP_PROSPECTOR_DENSITY_PER_1000: u64 = 45;
+const SOUP_PROSPECTOR_ALIVE: ht_octree::CellState = hash_thing::octree::Cell::pack(1, 0).raw();
+const SOUP_PROSPECTOR_PATTERN_SEEDS: [u64; 3] = [
+    0x5eed_0001_8a55_5003,
+    0x5eed_0002_8a55_5003,
+    0x5eed_0003_8a55_5003,
+];
 
 /// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
 /// the threshold at which a human reads a changing number without
@@ -369,6 +379,13 @@ enum PendingPlayerAction {
     PlaceClone,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingSoupAction {
+    PlaceSelected,
+    SelectPattern(usize),
+    Catalog,
+}
+
 /// Scene-swap request queued while a background sim step is in flight.
 ///
 /// Keeps `pending_scene_swap` separate from `pending_player_action`: player
@@ -397,6 +414,7 @@ enum PendingSceneSwap {
     ResetTerrain,
     LoadGyroid,
     LoadQuarantineAtlas,
+    LoadSoupProspector,
     LoadDemoSpectacle,
     ResetGolSmoke,
     SelectLatticeBeat(LatticeDemoBeat),
@@ -411,6 +429,7 @@ impl PendingSceneSwap {
             Self::ResetTerrain => "terrain_reset",
             Self::LoadGyroid => "gyroid",
             Self::LoadQuarantineAtlas => "quarantine_atlas",
+            Self::LoadSoupProspector => "soup_prospector",
             Self::LoadDemoSpectacle => "demo_spectacle",
             Self::ResetGolSmoke => "gol_smoke_reset",
             Self::SelectLatticeBeat(LatticeDemoBeat::Intro) => "lattice_beat_intro",
@@ -431,6 +450,7 @@ impl PendingSceneSwap {
             | Self::ResetTerrain
             | Self::LoadGyroid
             | Self::LoadQuarantineAtlas
+            | Self::LoadSoupProspector
             | Self::LoadDemoSpectacle
             | Self::ResetGolSmoke
             | Self::SelectLatticeBeat(_) => true,
@@ -649,6 +669,36 @@ impl Default for QuarantineAtlasState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupCatalogEntry {
+    tile: [i64; 3],
+    generation: u64,
+    pop: usize,
+    state_hash: String,
+    pattern: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupProspectorState {
+    selected_pattern: usize,
+    focus_tile: [i64; 3],
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+    catalog: Vec<SoupCatalogEntry>,
+}
+
+impl SoupProspectorState {
+    fn new(focus_tile: [i64; 3], tile_min: [i64; 3], tile_max: [i64; 3]) -> Self {
+        Self {
+            selected_pattern: 0,
+            focus_tile,
+            tile_min,
+            tile_max,
+            catalog: Vec::new(),
+        }
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
@@ -656,6 +706,7 @@ struct App {
     gol_smoke_rule: sim::GameOfLife3D,
     gol_smoke_scene: bool,
     quarantine_atlas: Option<QuarantineAtlasState>,
+    soup_prospector: Option<SoupProspectorState>,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -837,6 +888,7 @@ struct App {
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
+    pending_soup_action: Option<PendingSoupAction>,
     /// Defer a scene-swap requested while stepping; drained after step
     /// completion in the same slot as `pending_player_action`. Last-write
     /// wins; any unrelated scene-change key clears it. (hash-thing-a9jd)
@@ -1023,6 +1075,247 @@ fn reconcile_modifier_keys(
     removed
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SoupProspectorRng {
+    state: u64,
+}
+
+impl SoupProspectorRng {
+    fn new(seed: u64) -> Self {
+        let state = if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        };
+        Self { state }
+    }
+
+    fn next_mod(&mut self, modulus: u64) -> u64 {
+        self.state ^= self.state << 7;
+        self.state ^= self.state >> 9;
+        self.state ^= self.state << 8;
+        self.state % modulus
+    }
+}
+
+fn soup_pattern_seed(pattern: usize) -> u64 {
+    SOUP_PROSPECTOR_PATTERN_SEEDS[pattern % SOUP_PROSPECTOR_PATTERN_SEEDS.len()]
+}
+
+fn soup_focus_tile_for_side(side: usize) -> [i64; 3] {
+    let tiles_per_axis = (side as i64 / SOUP_PROSPECTOR_TILE).max(1);
+    let center = tiles_per_axis / 2;
+    [center, center, center]
+}
+
+fn soup_demo_tile_bounds(side: usize, focus_tile: [i64; 3]) -> ([i64; 3], [i64; 3]) {
+    let tiles_per_axis = (side as i64 / SOUP_PROSPECTOR_TILE).max(1);
+    let span = tiles_per_axis.min(4);
+    let mut min = [0; 3];
+    let mut max = [0; 3];
+    for axis in 0..3 {
+        let start = (focus_tile[axis] - span / 2).clamp(0, tiles_per_axis - span);
+        min[axis] = start;
+        max[axis] = start + span;
+    }
+    (min, max)
+}
+
+fn soup_tile_origin(origin: [i64; 3], tile: [i64; 3]) -> [i64; 3] {
+    [
+        origin[0] + tile[0] * SOUP_PROSPECTOR_TILE,
+        origin[1] + tile[1] * SOUP_PROSPECTOR_TILE,
+        origin[2] + tile[2] * SOUP_PROSPECTOR_TILE,
+    ]
+}
+
+fn soup_tile_in_bounds(side: usize, tile: [i64; 3]) -> bool {
+    let tiles_per_axis = side as i64 / SOUP_PROSPECTOR_TILE;
+    tile.iter()
+        .all(|&coord| coord >= 0 && coord < tiles_per_axis)
+}
+
+fn soup_tile_from_world_pos(world: &sim::World, pos: [i64; 3]) -> Option<[i64; 3]> {
+    let local = [
+        pos[0] - world.origin[0],
+        pos[1] - world.origin[1],
+        pos[2] - world.origin[2],
+    ];
+    let tile = [
+        local[0].div_euclid(SOUP_PROSPECTOR_TILE),
+        local[1].div_euclid(SOUP_PROSPECTOR_TILE),
+        local[2].div_euclid(SOUP_PROSPECTOR_TILE),
+    ];
+    soup_tile_in_bounds(world.side(), tile).then_some(tile)
+}
+
+fn ray_aabb_entry(
+    origin: [f64; 3],
+    dir: [f64; 3],
+    min: [f64; 3],
+    max: [f64; 3],
+) -> Option<[f64; 3]> {
+    let mut t_min = 0.0_f64;
+    let mut t_max = f64::INFINITY;
+    for axis in 0..3 {
+        if dir[axis].abs() < 1e-9 {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inv = 1.0 / dir[axis];
+        let mut t1 = (min[axis] - origin[axis]) * inv;
+        let mut t2 = (max[axis] - origin[axis]) * inv;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return None;
+        }
+    }
+    (t_max >= 0.0).then(|| {
+        let t = t_min.max(0.0);
+        [
+            origin[0] + dir[0] * t,
+            origin[1] + dir[1] * t,
+            origin[2] + dir[2] * t,
+        ]
+    })
+}
+
+fn soup_tile_from_field_ray(
+    world_origin: [i64; 3],
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+    eye: [f64; 3],
+    dir: [f64; 3],
+) -> Option<[i64; 3]> {
+    let min = [
+        (world_origin[0] + tile_min[0] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[1] + tile_min[1] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[2] + tile_min[2] * SOUP_PROSPECTOR_TILE) as f64,
+    ];
+    let max = [
+        (world_origin[0] + tile_max[0] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[1] + tile_max[1] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[2] + tile_max[2] * SOUP_PROSPECTOR_TILE) as f64,
+    ];
+    let hit = ray_aabb_entry(eye, dir, min, max)?;
+    let hit = [
+        hit[0].clamp(min[0], max[0] - 1e-6),
+        hit[1].clamp(min[1], max[1] - 1e-6),
+        hit[2].clamp(min[2], max[2] - 1e-6),
+    ];
+    let local = [
+        (hit[0].floor() as i64 - world_origin[0]).div_euclid(SOUP_PROSPECTOR_TILE),
+        (hit[1].floor() as i64 - world_origin[1]).div_euclid(SOUP_PROSPECTOR_TILE),
+        (hit[2].floor() as i64 - world_origin[2]).div_euclid(SOUP_PROSPECTOR_TILE),
+    ];
+    (0..3)
+        .all(|axis| local[axis] >= tile_min[axis] && local[axis] < tile_max[axis])
+        .then_some(local)
+}
+
+fn clear_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
+    let origin = soup_tile_origin(world.origin, tile);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                world.set(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                    hash_thing::octree::Cell::EMPTY.raw(),
+                );
+            }
+        }
+    }
+}
+
+fn seed_soup_tile(world: &mut sim::World, tile: [i64; 3], seed: u64) -> usize {
+    clear_soup_tile(world, tile);
+    let tile_origin = soup_tile_origin(world.origin, tile);
+    let margin = (SOUP_PROSPECTOR_TILE - SOUP_PROSPECTOR_SIDE) / 2;
+    let origin = [
+        tile_origin[0] + margin,
+        tile_origin[1] + margin,
+        tile_origin[2] + margin,
+    ];
+    let mut rng = SoupProspectorRng::new(seed);
+    let mut placed = 0;
+    for dz in 0..SOUP_PROSPECTOR_SIDE {
+        for dy in 0..SOUP_PROSPECTOR_SIDE {
+            for dx in 0..SOUP_PROSPECTOR_SIDE {
+                if rng.next_mod(1000) < SOUP_PROSPECTOR_DENSITY_PER_1000 {
+                    world.set(
+                        sim::WorldCoord(origin[0] + dx),
+                        sim::WorldCoord(origin[1] + dy),
+                        sim::WorldCoord(origin[2] + dz),
+                        SOUP_PROSPECTOR_ALIVE,
+                    );
+                    placed += 1;
+                }
+            }
+        }
+    }
+    placed
+}
+
+fn frame_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
+    let origin = soup_tile_origin(world.origin, tile);
+    let marker = hash_thing::terrain::materials::METAL;
+    let hi = SOUP_PROSPECTOR_TILE - 1;
+    for &(dx, dy, dz) in &[
+        (0, 0, 0),
+        (0, 0, hi),
+        (0, hi, 0),
+        (0, hi, hi),
+        (hi, 0, 0),
+        (hi, 0, hi),
+        (hi, hi, 0),
+        (hi, hi, hi),
+    ] {
+        world.set(
+            sim::WorldCoord(origin[0] + dx),
+            sim::WorldCoord(origin[1] + dy),
+            sim::WorldCoord(origin[2] + dz),
+            marker,
+        );
+    }
+}
+
+fn soup_tile_stats(world: &sim::World, tile: [i64; 3]) -> (usize, String) {
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut pop = 0;
+    let mut bytes = Vec::with_capacity((SOUP_PROSPECTOR_TILE as usize).pow(3) * 2);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                let cell = world.get(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                );
+                if cell == SOUP_PROSPECTOR_ALIVE {
+                    pop += 1;
+                }
+                bytes.extend_from_slice(&cell.to_le_bytes());
+            }
+        }
+    }
+    let digest = Sha256::digest(&bytes);
+    (
+        pop,
+        format!(
+            "sha256:{:016x}",
+            u64::from_be_bytes(digest[0..8].try_into().unwrap())
+        ),
+    )
+}
+
 impl App {
     fn new(volume_size: u32) -> Self {
         let level = volume_size.trailing_zeros();
@@ -1039,6 +1332,7 @@ impl App {
             gol_smoke_rule: sim::GameOfLife3D::rule445(),
             gol_smoke_scene: false,
             quarantine_atlas: None,
+            soup_prospector: None,
             svdag: render::Svdag::new(),
             paused: false,
             log_timer: std::time::Instant::now(),
@@ -1093,6 +1387,7 @@ impl App {
             cursor_capture_grab_warned: false,
             cursor_capture_grab_failures: 0,
             pending_player_action: None,
+            pending_soup_action: None,
             pending_scene_swap: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
@@ -1445,6 +1740,7 @@ impl App {
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
         self.exit_quarantine_atlas_mode();
+        self.exit_soup_prospector_mode();
         log::info!(
             "Initial scene (pyroclastic): pop={} nodes={}",
             self.world.population(),
@@ -2044,6 +2340,9 @@ impl App {
         if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadQuarantineAtlas) {
             self.exit_quarantine_atlas_mode();
         }
+        if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadSoupProspector) {
+            self.exit_soup_prospector_mode();
+        }
         match swap {
             PendingSceneSwap::LoadLatticeDemo => {
                 let _ = self.load_lattice_demo();
@@ -2055,6 +2354,7 @@ impl App {
             ),
             PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
             PendingSceneSwap::LoadQuarantineAtlas => self.load_quarantine_atlas_demo(),
+            PendingSceneSwap::LoadSoupProspector => self.load_soup_prospector_demo(),
             PendingSceneSwap::LoadDemoSpectacle => {
                 self.load_demo_spectacle("Reset spectacle gallery")
             }
@@ -2088,10 +2388,21 @@ impl App {
     }
 
     /// Legend text lines for the current camera mode.
-    fn legend_lines(mode: CameraMode, quarantine_atlas_active: bool) -> Vec<&'static str> {
+    fn legend_lines(
+        mode: CameraMode,
+        quarantine_atlas_active: bool,
+        soup_prospector_active: bool,
+    ) -> Vec<&'static str> {
         match mode {
             CameraMode::FirstPerson => {
-                let action_lines = if quarantine_atlas_active {
+                let action_lines = if soup_prospector_active {
+                    vec![
+                        "  LClick      Disabled",
+                        "  RClick      Place soup",
+                        "  1-3         Soup seed",
+                        "  C           Catalog tile",
+                    ]
+                } else if quarantine_atlas_active {
                     vec![
                         "  LClick      Disabled",
                         "  RClick      Stamp",
@@ -2121,6 +2432,7 @@ impl App {
                         "  T  Terrain    B  Spectacle",
                         "  R  Reset      G  GoL bloom",
                         "  M  Gyroid     Q  Quarantine",
+                        "  Y  Soup prospect",
                         "  N  Lattice walk",
                         "  V  Panorama reveal",
                         "  [/] U/I/O  DEV jumps (Tab for orbit)",
@@ -2146,6 +2458,7 @@ impl App {
                 "  T  Terrain    B  Spectacle",
                 "  R  Reset      G  GoL bloom",
                 "  M  Gyroid     Q  Quarantine",
+                "  Y  Soup prospect",
                 "  N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
@@ -2791,6 +3104,179 @@ impl App {
         }
     }
 
+    fn exit_soup_prospector_mode(&mut self) {
+        if self.soup_prospector.take().is_some() {
+            self.legend_dirty = true;
+        }
+        self.pending_soup_action = None;
+    }
+
+    fn aimed_soup_tile(&self) -> Option<[i64; 3]> {
+        let (eye, dir) = self.player_eye_ray()?;
+        if let Some(state) = self.soup_prospector.as_ref() {
+            if let Some(tile) = soup_tile_from_field_ray(
+                self.world.origin,
+                state.tile_min,
+                state.tile_max,
+                eye,
+                dir,
+            ) {
+                return Some(tile);
+            }
+        }
+        let (hit, prev) = player::raycast_cells(&self.world, eye, dir)?;
+        let pos = if prev == hit { hit } else { prev };
+        soup_tile_from_world_pos(&self.world, pos)
+    }
+
+    fn soup_action_tile(&self) -> Option<[i64; 3]> {
+        self.aimed_soup_tile()
+            .or_else(|| self.soup_prospector.as_ref().map(|state| state.focus_tile))
+    }
+
+    fn run_soup_action_or_queue(&mut self, action: PendingSoupAction) -> bool {
+        if self.soup_prospector.is_none() {
+            return false;
+        }
+        if self.is_stepping() {
+            self.pending_soup_action = Some(action);
+            log::info!("Soup Prospector action queued until current evolution step finishes");
+            return true;
+        }
+        match action {
+            PendingSoupAction::PlaceSelected => self.place_selected_soup_prospector_pattern(),
+            PendingSoupAction::SelectPattern(pattern) => {
+                self.select_soup_prospector_pattern(pattern, false)
+            }
+            PendingSoupAction::Catalog => self.catalog_soup_prospector_target(),
+        }
+    }
+
+    fn run_pending_soup_action(&mut self) {
+        let Some(action) = self.pending_soup_action.take() else {
+            return;
+        };
+        self.run_soup_action_or_queue(action);
+    }
+
+    fn select_soup_prospector_pattern(&mut self, pattern: usize, place_now: bool) -> bool {
+        let pattern = pattern % SOUP_PROSPECTOR_PATTERN_SEEDS.len();
+        let focus_tile = self.soup_action_tile().unwrap_or_else(|| {
+            self.soup_prospector
+                .as_ref()
+                .map(|state| state.focus_tile)
+                .unwrap_or([0, 0, 0])
+        });
+        {
+            let Some(state) = self.soup_prospector.as_mut() else {
+                return false;
+            };
+            state.selected_pattern = pattern;
+            state.focus_tile = focus_tile;
+        }
+        if !place_now {
+            log::info!("Soup Prospector seed selected: {}", pattern + 1);
+            self.last_memo_summary = format!(
+                "soup_selected={} soup_tile={:?} soup_catalog={}",
+                pattern + 1,
+                focus_tile,
+                self.soup_prospector
+                    .as_ref()
+                    .map(|state| state.catalog.len())
+                    .unwrap_or(0),
+            );
+            self.memo_hud_visible = true;
+            self.memo_hud_dirty = true;
+            return true;
+        }
+        let generation = self.world.generation;
+        let placed = seed_soup_tile(
+            &mut self.world,
+            focus_tile,
+            soup_pattern_seed(pattern) ^ generation,
+        );
+        self.mark_world_changed();
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        log::info!(
+            "Soup Prospector seed {} placed at tile {:?}: initial_pop={placed}",
+            pattern + 1,
+            focus_tile
+        );
+        self.last_memo_summary = format!(
+            "soup_selected={} soup_tile={:?} soup_initial_pop={} soup_catalog={}",
+            pattern + 1,
+            focus_tile,
+            placed,
+            self.soup_prospector
+                .as_ref()
+                .map(|state| state.catalog.len())
+                .unwrap_or(0),
+        );
+        self.memo_hud_visible = true;
+        self.memo_hud_dirty = true;
+        true
+    }
+
+    fn place_selected_soup_prospector_pattern(&mut self) -> bool {
+        let pattern = self
+            .soup_prospector
+            .as_ref()
+            .map(|state| state.selected_pattern)
+            .unwrap_or(0);
+        self.select_soup_prospector_pattern(pattern, true)
+    }
+
+    fn catalog_soup_prospector_target(&mut self) -> bool {
+        let Some(tile) = self.soup_action_tile() else {
+            return false;
+        };
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        state.focus_tile = tile;
+        let (pop, state_hash) = soup_tile_stats(&self.world, tile);
+        let entry = SoupCatalogEntry {
+            tile,
+            generation: self.world.generation,
+            pop,
+            state_hash,
+            pattern: state.selected_pattern,
+        };
+        log::info!(
+            "Soup catalog #{}: tile={:?} gen={} pop={} pattern={} hash={}",
+            state.catalog.len() + 1,
+            entry.tile,
+            entry.generation,
+            entry.pop,
+            entry.pattern + 1,
+            entry.state_hash
+        );
+        state.catalog.push(entry);
+        self.last_memo_summary = format!(
+            "soup_catalog={} soup_tile={:?} soup_gen={} soup_pop={} soup_hash={}",
+            state.catalog.len(),
+            tile,
+            self.world.generation,
+            pop,
+            state.catalog.last().unwrap().state_hash,
+        );
+        self.memo_hud_visible = true;
+        self.memo_hud_dirty = true;
+        true
+    }
+
     #[allow(dead_code)]
     fn load_burning_room_demo(&mut self, label: &str) {
         if self.is_stepping() {
@@ -2880,6 +3366,86 @@ impl App {
             elapsed.as_secs_f64() * 1000.0,
             stats.total_collapses(),
             stats.classify_calls,
+        );
+    }
+
+    fn load_soup_prospector_demo(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let focus_tile = soup_focus_tile_for_side(self.world.side());
+        debug_assert!(soup_tile_in_bounds(self.world.side(), focus_tile));
+        let (tile_min, tile_max) = soup_demo_tile_bounds(self.world.side(), focus_tile);
+        let mut seeded_tiles = 0;
+        for z in tile_min[2]..tile_max[2] {
+            for y in tile_min[1]..tile_max[1] {
+                for x in tile_min[0]..tile_max[0] {
+                    let tile = [x, y, z];
+                    let seed = 19
+                        ^ ((x as u64) << 40)
+                        ^ ((y as u64) << 20)
+                        ^ (z as u64)
+                        ^ soup_pattern_seed(0);
+                    seed_soup_tile(&mut self.world, tile, seed);
+                    frame_soup_tile(&mut self.world, tile);
+                    seeded_tiles += 1;
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        self.mark_world_changed();
+        self.reset_scene_entities();
+        self.gol_smoke_rule = sim::GameOfLife3D::rule445();
+        self.gol_smoke_scene = true;
+        self.soup_prospector = Some(SoupProspectorState::new(focus_tile, tile_min, tile_max));
+        self.legend_dirty = true;
+        self.memo_hud_visible = true;
+        self.memo_hud_dirty = true;
+        self.last_memo_summary = format!(
+            "soup_selected=1 soup_tile={:?} soup_catalog=0 soup_goal=save_survivors",
+            focus_tile,
+        );
+        self.noise_ns_per_sample = 0.0;
+        self.paused = false;
+        self.reset_scene_perf_state();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
+        }
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.sync_render_cache();
+        self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
+        self.reset_player_pose(
+            [
+                self.world_center()[0],
+                self.world.origin[1] as f64 + (tile_min[1] * SOUP_PROSPECTOR_TILE + 10) as f64,
+                self.world.origin[2] as f64 + (tile_max[2] * SOUP_PROSPECTOR_TILE - 4) as f64,
+            ],
+            0.0,
+            -0.24,
+        );
+        self.apply_current_player_camera_pose();
+        let (focus_pop, _) = soup_tile_stats(&self.world, focus_tile);
+        log::info!(
+            "Soup Prospector: sparse 445 board loaded in {:.1}ms; tiles={} focus_tile={:?} focus_pop={focus_pop}",
+            elapsed.as_secs_f64() * 1000.0,
+            seeded_tiles,
+            focus_tile,
         );
     }
 
@@ -3413,6 +3979,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("q") => {
                             self.request_scene_swap(PendingSceneSwap::LoadQuarantineAtlas);
                         }
+                        winit::keyboard::Key::Character("y") => {
+                            self.request_scene_swap(PendingSceneSwap::LoadSoupProspector);
+                        }
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
                         }
@@ -3449,6 +4018,18 @@ impl ApplicationHandler<AppUserEvent> for App {
                             n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
                         ) => {
                             let digit: u16 = n.parse().unwrap();
+                            if self.soup_prospector.is_some() {
+                                if (1..=3).contains(&digit) {
+                                    self.run_soup_action_or_queue(
+                                        PendingSoupAction::SelectPattern((digit - 1) as usize),
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "digit {digit} ignored in Soup Prospector: seed selection uses 1-3"
+                                    );
+                                }
+                                return;
+                            }
                             if self.camera_mode == CameraMode::FirstPerson {
                                 if self.quarantine_atlas.is_some() {
                                     if let Some(pattern) = QuarantineAtlasPattern::from_digit(digit)
@@ -3487,6 +4068,10 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.request_scene_swap(PendingSceneSwap::LoadDemoSpectacle);
                         }
                         winit::keyboard::Key::Character("c") => {
+                            if self.soup_prospector.is_some() {
+                                self.run_soup_action_or_queue(PendingSoupAction::Catalog);
+                                return;
+                            }
                             // dlse.2.2: drain perf histograms so the next `P`
                             // dump reflects only post-clear samples. Needed for
                             // clean windowed-vs-fullscreen comparisons.
@@ -3611,7 +4196,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                         }
                     } else if state == ElementState::Pressed {
                         // FPS mode: left click = break block.
-                        if self.is_stepping() {
+                        if self.soup_prospector.is_some() {
+                            log::info!("Soup Prospector carve disabled; use 1-3 to place soups and C to catalog");
+                        } else if self.is_stepping() {
                             self.pending_player_action = Some(PendingPlayerAction::Break);
                         } else {
                             self.break_block();
@@ -3622,7 +4209,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                     && state == ElementState::Pressed
                     && self.camera_mode == CameraMode::FirstPerson
                 {
-                    if self.quarantine_atlas.is_some() {
+                    if self.soup_prospector.is_some() {
+                        self.run_soup_action_or_queue(PendingSoupAction::PlaceSelected);
+                    } else if self.quarantine_atlas.is_some() {
                         if self.is_stepping() {
                             self.pending_player_action = Some(PendingPlayerAction::Place);
                         } else {
@@ -3807,8 +4396,10 @@ impl ApplicationHandler<AppUserEvent> for App {
                         .is_some_and(PendingSceneSwap::discards_world)
                     {
                         self.pending_player_action = None;
+                        self.pending_soup_action = None;
                     }
                     self.run_pending_scene_swap();
+                    self.run_pending_soup_action();
                     self.run_pending_player_action();
                 }
 
@@ -3859,6 +4450,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                             renderer.set_legend_text(&Self::legend_lines(
                                 self.camera_mode,
                                 self.quarantine_atlas.is_some(),
+                                self.soup_prospector.is_some(),
                             ));
                         }
                     }
@@ -4259,6 +4851,7 @@ enum DumpScene {
     Spectacle,
     Gyroid,
     QuarantineAtlas,
+    SoupProspector,
     LatticeBeat(LatticeDemoBeat),
 }
 
@@ -4270,6 +4863,7 @@ impl DumpScene {
             "spectacle" => Some(Self::Spectacle),
             "gyroid" => Some(Self::Gyroid),
             "quarantine-atlas" => Some(Self::QuarantineAtlas),
+            "soup-prospector" => Some(Self::SoupProspector),
             "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
             "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
             "lattice-panorama" => Some(Self::LatticeBeat(LatticeDemoBeat::Panorama)),
@@ -4284,6 +4878,7 @@ impl DumpScene {
             Self::Spectacle => PendingSceneSwap::LoadDemoSpectacle,
             Self::Gyroid => PendingSceneSwap::LoadGyroid,
             Self::QuarantineAtlas => PendingSceneSwap::LoadQuarantineAtlas,
+            Self::SoupProspector => PendingSceneSwap::LoadSoupProspector,
             Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
         }
     }
@@ -4295,6 +4890,7 @@ impl DumpScene {
             Self::Spectacle => "spectacle",
             Self::Gyroid => "gyroid",
             Self::QuarantineAtlas => "quarantine-atlas",
+            Self::SoupProspector => "soup-prospector",
             Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
             Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
             Self::LatticeBeat(LatticeDemoBeat::Panorama) => "lattice-panorama",
@@ -4420,7 +5016,7 @@ where
 {
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
                          [--dump-frame PATH] \
-                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|lattice-intro|lattice-interior|lattice-panorama] \
+                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|soup-prospector|lattice-intro|lattice-interior|lattice-panorama] \
                          [--dump-pose wall|blocks|terrain-wide|geyser] \
                          [--dump-debug normal-axis|hit-kind|material] \
                          [--dump-lod-bias VALUE] \
@@ -4632,6 +5228,7 @@ fn main() {
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  B: reset spectacle gallery");
     log::info!("  M: reset gyroid megastructure");
+    log::info!("  Y: Soup Prospector discovery prototype");
     log::info!("  N: lattice walk-through demo");
     log::info!("  [/] DEV previous/next lattice jump (orbit mode)");
     log::info!("  U/I/O: DEV intro/interior/reveal lattice jumps (orbit mode)");
@@ -5114,6 +5711,7 @@ mod tests {
             ("spectacle", DumpScene::Spectacle),
             ("gyroid", DumpScene::Gyroid),
             ("quarantine-atlas", DumpScene::QuarantineAtlas),
+            ("soup-prospector", DumpScene::SoupProspector),
             (
                 "lattice-intro",
                 DumpScene::LatticeBeat(LatticeDemoBeat::Intro),
@@ -5661,6 +6259,10 @@ mod tests {
             PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Panorama).label(),
             "lattice_beat_panorama",
         );
+        assert_eq!(
+            PendingSceneSwap::LoadSoupProspector.label(),
+            "soup_prospector"
+        );
     }
 
     #[test]
@@ -5769,6 +6371,7 @@ mod tests {
         assert!(PendingSceneSwap::ResetTerrain.discards_world());
         assert!(PendingSceneSwap::LoadGyroid.discards_world());
         assert!(PendingSceneSwap::LoadQuarantineAtlas.discards_world());
+        assert!(PendingSceneSwap::LoadSoupProspector.discards_world());
         assert!(PendingSceneSwap::LoadDemoSpectacle.discards_world());
         assert!(PendingSceneSwap::ResetGolSmoke.discards_world());
         assert!(PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Intro).discards_world());
@@ -6144,7 +6747,7 @@ mod tests {
 
     #[test]
     fn first_person_legend_notes_lattice_debug_jumps() {
-        let lines = App::legend_lines(CameraMode::FirstPerson, false);
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, false);
         assert!(lines.iter().any(|line| line.contains("Space       Leap")));
         assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
@@ -6171,7 +6774,7 @@ mod tests {
 
     #[test]
     fn orbit_legend_marks_lattice_jumps_as_debug() {
-        let lines = App::legend_lines(CameraMode::Orbit, false);
+        let lines = App::legend_lines(CameraMode::Orbit, false, false);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
         assert!(lines
             .iter()
@@ -6190,7 +6793,7 @@ mod tests {
 
     #[test]
     fn quarantine_atlas_legend_removes_hand_edit_controls() {
-        let lines = App::legend_lines(CameraMode::FirstPerson, true);
+        let lines = App::legend_lines(CameraMode::FirstPerson, true, false);
 
         assert!(lines.iter().any(|line| line.contains("RClick      Stamp")));
         assert!(lines
@@ -6199,6 +6802,120 @@ mod tests {
         assert!(!lines.iter().any(|line| line.contains("Carve")));
         assert!(!lines.iter().any(|line| line.contains("Matter")));
         assert!(!lines.iter().any(|line| line.contains("Clone source")));
+    }
+
+    #[test]
+    fn soup_prospector_legend_exposes_seed_place_and_catalog() {
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, true);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("RClick      Place soup")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("1-3         Soup seed")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("C           Catalog tile")));
+        assert!(!lines.iter().any(|line| line.contains("Clone source")));
+    }
+
+    #[test]
+    fn soup_prospector_seed_and_catalog_round_trip_focus_tile() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        assert!(app.soup_prospector.is_some());
+        let tile = app
+            .soup_action_tile()
+            .expect("soup scene should start aimed at field");
+        assert!(soup_tile_in_bounds(app.world.side(), tile));
+
+        assert!(app.select_soup_prospector_pattern(1, true));
+        let (pop, hash) = soup_tile_stats(&app.world, tile);
+        assert!(pop > 0, "placing a soup pattern should populate focus tile");
+        assert!(hash.starts_with("sha256:"));
+
+        assert!(app.catalog_soup_prospector_target());
+        let state = app.soup_prospector.as_ref().unwrap();
+        assert_eq!(state.catalog.len(), 1);
+        assert_eq!(state.catalog[0].tile, tile);
+        assert_eq!(state.catalog[0].pop, pop);
+        assert_eq!(state.catalog[0].state_hash, hash);
+    }
+
+    #[test]
+    fn soup_pattern_selection_does_not_reseed_until_place_action() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        let tile = app
+            .soup_action_tile()
+            .expect("soup scene should start aimed at field");
+        let before = soup_tile_stats(&app.world, tile);
+
+        assert!(app.run_soup_action_or_queue(PendingSoupAction::SelectPattern(2)));
+        assert_eq!(app.soup_prospector.as_ref().unwrap().selected_pattern, 2);
+        assert_eq!(soup_tile_stats(&app.world, tile), before);
+
+        assert!(app.run_soup_action_or_queue(PendingSoupAction::PlaceSelected));
+        assert_ne!(soup_tile_stats(&app.world, tile), before);
+    }
+
+    #[test]
+    fn soup_prospector_pattern_choice_changes_tile_hash() {
+        let mut world_a = sim::World::new(5);
+        world_a.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let tile = soup_focus_tile_for_side(world_a.side());
+        seed_soup_tile(&mut world_a, tile, soup_pattern_seed(0));
+        let (_, hash_a) = soup_tile_stats(&world_a, tile);
+
+        let mut world_b = sim::World::new(5);
+        world_b.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        seed_soup_tile(&mut world_b, tile, soup_pattern_seed(1));
+        let (_, hash_b) = soup_tile_stats(&world_b, tile);
+
+        assert_ne!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn soup_demo_tile_bounds_caps_default_volume_to_probe_sized_field() {
+        let focus = soup_focus_tile_for_side(256);
+        let (min, max) = soup_demo_tile_bounds(256, focus);
+        assert_eq!(
+            [max[0] - min[0], max[1] - min[1], max[2] - min[2]],
+            [4, 4, 4]
+        );
+        assert!(focus
+            .iter()
+            .zip(min.iter().zip(max.iter()))
+            .all(|(&f, (&lo, &hi))| f >= lo && f < hi));
+    }
+
+    #[test]
+    fn soup_field_ray_picks_empty_tile_inside_demo_bounds() {
+        let focus = soup_focus_tile_for_side(64);
+        let (min, max) = soup_demo_tile_bounds(64, focus);
+        let eye = [32.0, 32.0, 90.0];
+        let dir = [0.0, 0.0, -1.0];
+
+        assert_eq!(
+            soup_tile_from_field_ray([0, 0, 0], min, max, eye, dir),
+            Some([2, 2, 3])
+        );
+    }
+
+    #[test]
+    fn soup_actions_queue_while_background_step_owns_world() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        app.step_pending = true;
+
+        assert!(app.run_soup_action_or_queue(PendingSoupAction::Catalog));
+        assert_eq!(app.pending_soup_action, Some(PendingSoupAction::Catalog));
+        assert!(app.soup_prospector.as_ref().unwrap().catalog.is_empty());
+
+        app.step_pending = false;
+        app.run_pending_soup_action();
+        assert_eq!(app.soup_prospector.as_ref().unwrap().catalog.len(), 1);
     }
 
     #[test]
