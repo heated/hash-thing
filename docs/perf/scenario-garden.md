@@ -39,7 +39,7 @@ The runner emits one JSONL measurement record matching `perf-measurement-schema.
 - `default-demo`: default terrain plus water/sand and the demo spectacle when the world is at least 64 cells wide.
 - `factory-conveyor`: either the older repeated-lane toy (`setup=None`) or the `FactoryConveyorRuleV1` source/sink/backpressure harness with a scenario-local one-material +X block rule (`rule_set=FactoryConveyorV1`). Source injection, sink drain, and backpressure counting run outside timed `step_us` / `step_*` latency.
 - `quarantine-atlas`: deterministic Quarantine Atlas playtest scene. Optional setup `QuarantineAtlasMixedContainmentV1` applies the `oym4` six-stamp mixed containment plan before warmup/measured stepping; it excludes interactive placement/raycast/cache-invalidation cost.
-- `soup-search`: deterministic tiled 3D Game-of-Life soup ensemble (`setup=SoupSearchV1`, emitted as `SoupSearchV1(tile=16,soup_side=8,density_per_1000=180,rule=445)`, `rule_set=SoupSearchV1`) for the `8ppq.5` stable-structure discovery lead. This first scenario pair measures the search workload; survivor classification/cataloging is tracked separately in `hash-thing-8ppq.5.2`.
+- `soup-search`: deterministic tiled 3D Game-of-Life soup ensemble (`setup=SoupSearchV1`, emitted as `SoupSearchV1(tile=16,soup_side=8,density_per_1000=180,rule=445)`, `rule_set=SoupSearchV1`) for the `8ppq.5` stable-structure discovery lead. Records include a `soup_search` summary with per-tile population history, survivor/candidate counts, and final tile state hashes; comparison validation requires the summary to match between backends.
 
 ## Current examples
 

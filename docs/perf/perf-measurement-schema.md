@@ -240,6 +240,17 @@ Units in the name. Mixing units across records breaks downstream tooling.
 
 New metric names: pick one with the unit suffix; document here in the same PR.
 
+### `soup_search` summary
+
+`scene=soup-search` records must include a top-level `soup_search` object. It
+contains `setup`, aggregate `tile_count` / `survivor_count` /
+`candidate_stable_count` / `extinct_count`, and a `tiles` array. Each tile row
+records the tile coordinate, `pop_history`, final and max population, measured
+lifespan, survivor/candidate booleans, and `final_state_hash`.
+
+This is a measured-window classifier, not a proof of true oscillator stability.
+Comparison validation requires the whole summary to match between backends.
+
 ### Numerical precision
 
 - All metric values stored at f64 full precision (no pre-rounding at write-time).

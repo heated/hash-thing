@@ -202,6 +202,8 @@ struct GenerationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state_hash: Option<String>,
     mat_distribution: Option<serde_json::Value>,
+    #[serde(skip)]
+    grid: Option<Vec<CellState>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -253,6 +255,30 @@ struct MeasurementRecord {
     comparator: Option<String>,
     metrics: MetricsRecord,
     generations: Vec<GenerationRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    soup_search: Option<SoupSearchSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct SoupSearchSummary {
+    setup: String,
+    tile_count: usize,
+    survivor_count: usize,
+    candidate_stable_count: usize,
+    extinct_count: usize,
+    tiles: Vec<SoupTileSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct SoupTileSummary {
+    tile: [i64; 3],
+    final_pop: usize,
+    max_pop: usize,
+    lifespan_generations: usize,
+    survived_window: bool,
+    candidate_stable: bool,
+    final_state_hash: String,
+    pop_history: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -793,8 +819,22 @@ fn validate_comparable(
         ));
     }
     validate_factory_parity(subject, baseline)?;
+    validate_soup_search_parity(subject, baseline)?;
     metric_value(&subject.metrics, metric)?;
     metric_value(&baseline.metrics, metric)?;
+    Ok(())
+}
+
+fn validate_soup_search_parity(
+    subject: &MeasurementRecord,
+    baseline: &MeasurementRecord,
+) -> Result<(), String> {
+    if subject.soup_search != baseline.soup_search {
+        return Err(format!(
+            "comparison mismatch on soup_search summary: {:?} vs {:?}",
+            subject.soup_search, baseline.soup_search
+        ));
+    }
     Ok(())
 }
 
@@ -1084,7 +1124,8 @@ fn validate_measurement_metrics(record: &MeasurementRecord) -> Result<(), String
         "chunk-array" => validate_chunk_array_metrics(record),
         "hashlife-recursive" => validate_hashlife_metrics(record),
         _ => Ok(()),
-    }
+    }?;
+    validate_soup_search_summary(record)
 }
 
 fn validate_chunk_array_metrics(record: &MeasurementRecord) -> Result<(), String> {
@@ -1177,6 +1218,61 @@ fn validate_hashlife_metrics(record: &MeasurementRecord) -> Result<(), String> {
         record.metrics.leaf_misses_mean,
         record,
     )?;
+    Ok(())
+}
+
+fn validate_soup_search_summary(record: &MeasurementRecord) -> Result<(), String> {
+    let Some(summary) = &record.soup_search else {
+        if record.scene == "soup-search" {
+            return Err(format!(
+                "soup-search measurement {} requires soup_search summary",
+                record.measurement_id
+            ));
+        }
+        return Ok(());
+    };
+    if record.scene != "soup-search" {
+        return Err(format!(
+            "non-soup measurement {} must not include soup_search summary",
+            record.measurement_id
+        ));
+    }
+    if summary.setup != SOUP_SEARCH_SETUP_V1 {
+        return Err(format!(
+            "invalid soup_search setup {:?} for {}",
+            summary.setup, record.measurement_id
+        ));
+    }
+    if summary.tile_count != summary.tiles.len() {
+        return Err(format!(
+            "soup_search tile_count mismatch for {}",
+            record.measurement_id
+        ));
+    }
+    let survivor_count = summary
+        .tiles
+        .iter()
+        .filter(|tile| tile.survived_window)
+        .count();
+    let candidate_stable_count = summary
+        .tiles
+        .iter()
+        .filter(|tile| tile.candidate_stable)
+        .count();
+    let extinct_count = summary
+        .tiles
+        .iter()
+        .filter(|tile| tile.final_pop == 0)
+        .count();
+    if summary.survivor_count != survivor_count
+        || summary.candidate_stable_count != candidate_stable_count
+        || summary.extinct_count != extinct_count
+    {
+        return Err(format!(
+            "soup_search aggregate counts mismatch for {}",
+            record.measurement_id
+        ));
+    }
     Ok(())
 }
 
@@ -1341,6 +1437,7 @@ fn run_scenario(
             scenario.seed,
         ),
     };
+    let soup_search = soup_search_summary_for(scenario, &generations, side as usize);
 
     let hash_suffix = scenario_hash
         .strip_prefix("sha256:")
@@ -1384,6 +1481,7 @@ fn run_scenario(
         comparator: scenario.comparator.clone(),
         metrics,
         generations,
+        soup_search,
     })
 }
 
@@ -1893,6 +1991,7 @@ fn run_hashlife(
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
             state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
+            grid: Some(grid),
         });
         factory_total.sinked += factory_step.sinked;
         factory_total.backpressure += factory_step.backpressure;
@@ -1966,6 +2065,7 @@ fn run_chunk_array(
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
             state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
+            grid: Some(grid.clone()),
         });
         factory_total.sinked += factory_step.sinked;
         factory_total.backpressure += factory_step.backpressure;
@@ -1984,6 +2084,103 @@ fn apply_factory_metrics(
         metrics.factory_sinked_total = Some(totals.sinked);
         metrics.factory_backpressure_total = Some(totals.backpressure);
     }
+}
+
+fn soup_search_summary_for(
+    scenario: &Scenario,
+    generations: &[GenerationRecord],
+    side: usize,
+) -> Option<SoupSearchSummary> {
+    matches!(scenario.setup, Some(ScenarioSetup::SoupSearchV1))
+        .then(|| soup_search_summary(generations, side))
+}
+
+fn soup_search_summary(generations: &[GenerationRecord], side: usize) -> SoupSearchSummary {
+    let tiles_per_axis = side as i64 / SOUP_SEARCH_TILE;
+    let mut tiles = Vec::with_capacity((tiles_per_axis * tiles_per_axis * tiles_per_axis) as usize);
+    for tile_z in 0..tiles_per_axis {
+        for tile_y in 0..tiles_per_axis {
+            for tile_x in 0..tiles_per_axis {
+                let tile = [tile_x, tile_y, tile_z];
+                let pop_history = generations
+                    .iter()
+                    .map(|gen| soup_tile_pop(gen, side, tile))
+                    .collect::<Vec<_>>();
+                let final_pop = *pop_history.last().unwrap_or(&0);
+                let max_pop = pop_history.iter().copied().max().unwrap_or(0);
+                let lifespan_generations = pop_history.iter().filter(|&&pop| pop > 0).count();
+                let survived_window = final_pop > 0;
+                let candidate_stable = survived_window
+                    && pop_history.len() >= 3
+                    && pop_history[pop_history.len() - 3..]
+                        .iter()
+                        .all(|&pop| pop == final_pop);
+                tiles.push(SoupTileSummary {
+                    tile,
+                    final_pop,
+                    max_pop,
+                    lifespan_generations,
+                    survived_window,
+                    candidate_stable,
+                    final_state_hash: generations
+                        .last()
+                        .map(|gen| soup_tile_hash(gen, side, tile))
+                        .unwrap_or_else(|| "sha256:e3b0c44298fc1c14".to_string()),
+                    pop_history,
+                });
+            }
+        }
+    }
+    let survivor_count = tiles.iter().filter(|tile| tile.survived_window).count();
+    let candidate_stable_count = tiles.iter().filter(|tile| tile.candidate_stable).count();
+    let extinct_count = tiles.iter().filter(|tile| tile.final_pop == 0).count();
+    SoupSearchSummary {
+        setup: SOUP_SEARCH_SETUP_V1.to_string(),
+        tile_count: tiles.len(),
+        survivor_count,
+        candidate_stable_count,
+        extinct_count,
+        tiles,
+    }
+}
+
+fn soup_tile_pop(gen: &GenerationRecord, side: usize, tile: [i64; 3]) -> usize {
+    soup_tile_cells(gen, side, tile)
+        .filter(|&cell| cell != 0)
+        .count()
+}
+
+fn soup_tile_hash(gen: &GenerationRecord, side: usize, tile: [i64; 3]) -> String {
+    let mut bytes = Vec::with_capacity((SOUP_SEARCH_TILE as usize).pow(3) * 2);
+    for cell in soup_tile_cells(gen, side, tile) {
+        bytes.extend_from_slice(&cell.to_le_bytes());
+    }
+    format!("sha256:{}", hex16(&bytes))
+}
+
+fn soup_tile_cells<'a>(
+    gen: &'a GenerationRecord,
+    side: usize,
+    tile: [i64; 3],
+) -> impl Iterator<Item = CellState> + 'a {
+    let grid = gen.grid.as_deref().unwrap_or(&[]);
+    let origin = [
+        tile[0] * SOUP_SEARCH_TILE,
+        tile[1] * SOUP_SEARCH_TILE,
+        tile[2] * SOUP_SEARCH_TILE,
+    ];
+    (0..SOUP_SEARCH_TILE).flat_map(move |dz| {
+        (0..SOUP_SEARCH_TILE).flat_map(move |dy| {
+            (0..SOUP_SEARCH_TILE).map(move |dx| {
+                let x = (origin[0] + dx) as usize;
+                let y = (origin[1] + dy) as usize;
+                let z = (origin[2] + dz) as usize;
+                grid.get(x + y * side + z * side * side)
+                    .copied()
+                    .unwrap_or(0)
+            })
+        })
+    })
 }
 
 fn apply_work_elision_metrics(metrics: &mut MetricsRecord, stats: &[WorkElisionStats]) {
@@ -2596,6 +2793,25 @@ mod tests {
         b.level = a.level;
         b.side = a.side;
         b.generations[0].pop_count = a.generations[0].pop_count;
+        let summary = SoupSearchSummary {
+            setup: SOUP_SEARCH_SETUP_V1.to_string(),
+            tile_count: 1,
+            survivor_count: 1,
+            candidate_stable_count: 0,
+            extinct_count: 0,
+            tiles: vec![SoupTileSummary {
+                tile: [0, 0, 0],
+                final_pop: 1,
+                max_pop: 1,
+                lifespan_generations: 1,
+                survived_window: true,
+                candidate_stable: false,
+                final_state_hash: "sha256:aaaaaaaaaaaaaaaa".to_string(),
+                pop_history: vec![1],
+            }],
+        };
+        a.soup_search = Some(summary.clone());
+        b.soup_search = Some(summary);
         strip_work_elision_metrics(&mut b);
 
         let err = compare_error(&a, &b);
@@ -2900,6 +3116,33 @@ mod tests {
     }
 
     #[test]
+    fn soup_search_summary_classifies_extinct_survivor_and_candidate_tiles() {
+        let side = 32;
+        let mut grid = vec![0; side * side * side];
+        grid[4 + 4 * side + 4 * side * side] = SOUP_SEARCH_ALIVE;
+        let gen = |i| GenerationRecord {
+            gen: i,
+            step_us: 0,
+            pop_count: popcount(&grid),
+            drops: 0,
+            work_elision_factor_x: None,
+            leaf_misses: None,
+            factory_sinked: None,
+            factory_backpressure: None,
+            state_hash: Some(grid_hash(&grid)),
+            mat_distribution: Some(material_distribution(&grid)),
+            grid: Some(grid.clone()),
+        };
+
+        let summary = soup_search_summary(&[gen(0), gen(1), gen(2)], side);
+
+        assert_eq!(summary.tile_count, 8);
+        assert_eq!(summary.survivor_count, 1);
+        assert_eq!(summary.candidate_stable_count, 1);
+        assert_eq!(summary.extinct_count, 7);
+    }
+
+    #[test]
     fn soup_search_keeps_backends_on_same_trajectory() {
         let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
         scenario.world = WorldCoordName::Small;
@@ -2926,6 +3169,15 @@ mod tests {
             );
             assert_eq!(h.state_hash, c.state_hash, "state hash drift at gen {gen}");
         }
+        let hashlife_summary = soup_search_summary(&hashlife, 64);
+        let chunk_summary = soup_search_summary(&chunk, 64);
+        assert_eq!(hashlife_summary, chunk_summary);
+        assert_eq!(hashlife_summary.tile_count, 64);
+        assert!(hashlife_summary.survivor_count > 0);
+        assert!(hashlife_summary
+            .tiles
+            .iter()
+            .any(|tile| tile.lifespan_generations > 0));
     }
 
     fn test_scenario(backend: Backend, regime: Regime) -> Scenario {
@@ -3004,7 +3256,9 @@ mod tests {
                 factory_backpressure: None,
                 state_hash: Some("sha256:aaaaaaaaaaaaaaaa".to_string()),
                 mat_distribution: Some(serde_json::json!({"1": 10})),
+                grid: None,
             }],
+            soup_search: None,
         }
     }
 
