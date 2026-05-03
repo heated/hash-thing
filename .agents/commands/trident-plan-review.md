@@ -91,12 +91,89 @@ date +%Y-%m-%dT%H%M
 
 Create the review pack folder alongside the input file:
 ```bash
-mkdir -p "{INPUT_DIR}/{REVIEW_ID}-review-pack-{TIMESTAMP}"
+PACK_DIR="{INPUT_DIR}/{REVIEW_ID}-review-pack-{TIMESTAMP}"
+mkdir -p "$PACK_DIR"
 ```
 
 Example: If reviewing `projects/music_fetcher/PLAN.md`, the pack goes at `projects/music_fetcher/music-fetcher-plan-review-pack-2026-03-10T1423/`.
 
 Store this path as `PACK_DIR`.
+
+### Phase 2b: Smoke Check External CLIs
+
+Before writing prompt files or launching background review agents, verify the
+repo-local wrappers can start. This catches broken Node/npm environments before
+the review silently degrades after launch.
+
+```bash
+PACK_DIR="{INPUT_DIR}/{REVIEW_ID}-review-pack-{TIMESTAMP}"
+mkdir -p "$PACK_DIR"
+CODEX_AVAILABLE=1
+GEMINI_AVAILABLE=1
+printf '%s\n' "$CODEX_AVAILABLE" >/tmp/trident-{REVIEW_ID}-codex-available
+printf '%s\n' "$GEMINI_AVAILABLE" >/tmp/trident-{REVIEW_ID}-gemini-available
+
+if ! CODEX_NO_HANG_REMINDER=1 .bin/codex --version >/tmp/trident-{REVIEW_ID}-codex-version.txt 2>&1; then
+    CODEX_AVAILABLE=0
+    printf '%s\n' "$CODEX_AVAILABLE" >/tmp/trident-{REVIEW_ID}-codex-available
+    echo "Codex CLI preflight failed; do not launch Codex reviewers." >&2
+    cat /tmp/trident-{REVIEW_ID}-codex-version.txt >&2
+    echo "Fallback: run the review with available Claude/Gemini agents and record the Codex outage in the synthesis/audit." >&2
+fi
+
+if ! .bin/gemini --version >/tmp/trident-{REVIEW_ID}-gemini-version.txt 2>&1; then
+    GEMINI_AVAILABLE=0
+    printf '%s\n' "$GEMINI_AVAILABLE" >/tmp/trident-{REVIEW_ID}-gemini-available
+    echo "Gemini CLI preflight failed; do not launch Gemini reviewers." >&2
+    cat /tmp/trident-{REVIEW_ID}-gemini-version.txt >&2
+    echo "Fallback: run the review with available Claude/Codex agents and record the Gemini outage in the synthesis/audit." >&2
+fi
+
+CODEX_AVAILABLE=$(cat /tmp/trident-{REVIEW_ID}-codex-available 2>/dev/null || echo 1)
+if [ "$CODEX_AVAILABLE" -eq 0 ]; then
+    for lens in standard standard-codex-execution adversarial adversarial-codex-dependencies evolutionary; do
+        case "$lens" in
+            standard) file="standard-codex.md" ;;
+            standard-codex-execution) file="standard-codex-execution.md" ;;
+            adversarial) file="adversarial-codex.md" ;;
+            adversarial-codex-dependencies) file="adversarial-codex-dependencies.md" ;;
+            evolutionary) file="evolutionary-codex.md" ;;
+        esac
+        cat > "$PACK_DIR/$file" <<'EOF'
+# Codex Plan Review Unavailable
+
+Codex CLI preflight failed before review launch, so this is an explicit outage placeholder rather than a model review.
+
+No Codex findings were produced. Synthesis agents must treat this file as unavailable-provider metadata, not as an affirmative no-findings review.
+
+See `/tmp/trident-{REVIEW_ID}-codex-version.txt` for the captured preflight output and record the outage in the review audit.
+
+Do not infer consensus from this placeholder. If the corresponding Claude or
+Gemini review found no issue, the correct interpretation is "no Codex signal was
+available," not "Codex agreed." Keep the outage visible in the synthesis summary
+and in any final plan/ship note.
+EOF
+    done
+fi
+
+GEMINI_AVAILABLE=$(cat /tmp/trident-{REVIEW_ID}-gemini-available 2>/dev/null || echo 1)
+if [ "$GEMINI_AVAILABLE" -eq 0 ]; then
+    cat > "$PACK_DIR/standard-gemini.md" <<'EOF'
+# Gemini Plan Review Unavailable
+
+Gemini CLI preflight failed before review launch, so this is an explicit outage placeholder rather than a model review.
+
+No Gemini findings were produced. Synthesis agents must treat this file as unavailable-provider metadata, not as an affirmative no-findings review.
+
+See `/tmp/trident-{REVIEW_ID}-gemini-version.txt` for the captured preflight output and record the outage in the review audit.
+
+Do not infer consensus from this placeholder. If the corresponding Claude or
+Codex review found no issue, the correct interpretation is "no Gemini signal was
+available," not "Gemini agreed." Keep the outage visible in the synthesis
+summary and in any final plan/ship note.
+EOF
+fi
+```
 
 ### Phase 3: Prepare Prompt Files
 
@@ -118,6 +195,7 @@ WS_STAGING="notes/.tmp/trident-{REVIEW_ID}"
 mkdir -p "$WS_STAGING"
 
 # Also create /tmp output dir for Codex
+rm -rf /tmp/trident-{REVIEW_ID}
 mkdir -p /tmp/trident-{REVIEW_ID}
 ```
 
@@ -198,6 +276,10 @@ For Gemini prompt files, use workspace-local paths for both the framework file a
 
 ### Phase 4: Launch All Eight Agents
 
+Use the `CODEX_AVAILABLE` and `GEMINI_AVAILABLE` values from Phase 2b: launch
+only the external providers whose preflight passed, and record skipped providers
+in the quality gate and synthesis/audit notes.
+
 **Launch message template** (for Claude subagents — Codex/Gemini use their prompt files from Phase 3):
 > Read {PROMPT_PATH} for your review approach and thinking framework. Then read {INPUT_FILE} — that is the document you are reviewing.
 >
@@ -226,6 +308,8 @@ Launch two Agent tool calls in a single message with the launch template, substi
 **Codex agents** (5x) — use Bash with `run_in_background: true`:
 
 **Important:** Use `env -u CLAUDECODE` to strip the environment variable that blocks nested sessions. Always redirect stdin to `/dev/null` — codex waits on stdin for EOF before running and hangs indefinitely if bash leaves stdin open (pc95).
+If `CODEX_AVAILABLE=0` from Phase 2b, skip this section and note the outage in
+the quality gate and synthesis/audit notes.
 
 Each agent reads its prompt from the **workspace-local** staging dir (not the absolute INPUT_DIR path). Log files also go to `/tmp/` to avoid tee failures:
 
@@ -244,6 +328,8 @@ env -u CLAUDECODE .bin/codex exec --full-auto -s danger-full-access --skip-git-r
 ---
 
 **Gemini agents** (1x) — use Bash with `run_in_background: true`:
+If `GEMINI_AVAILABLE=0` from Phase 2b, skip this section and note the outage in
+the quality gate and synthesis/audit notes.
 
 Each agent reads its prompt from the file written in Phase 3:
 
@@ -256,10 +342,10 @@ Each agent reads its prompt from the file written in Phase 3:
 **Tell the user:**
 > "Plan: {input_file} | Review Pack: {PACK_DIR}
 >
-> Launched 8 review agents:
+> Review launch:
 > - Claude (Standard, Adversarial)
-> - Codex (Standard, Standard-Execution, Adversarial, Adversarial-Dependencies, Evolutionary)
-> - Gemini (Standard)
+> - Codex (Standard, Standard-Execution, Adversarial, Adversarial-Dependencies, Evolutionary) if `CODEX_AVAILABLE=1`; otherwise placeholder outage files written
+> - Gemini (Standard) if `GEMINI_AVAILABLE=1`; otherwise placeholder outage file written
 >
 > You can continue working. I'll synthesize when complete."
 
@@ -270,9 +356,12 @@ Each agent reads its prompt from the file written in Phase 3:
 
 **Collect Codex output from /tmp:** Codex writes to `/tmp/trident-{REVIEW_ID}/` because PACK_DIR may be outside its sandbox. Copy any output files to PACK_DIR:
 ```bash
-for f in /tmp/trident-{REVIEW_ID}/*codex*.md; do
-    [ -f "$f" ] && cp "$f" "{PACK_DIR}/"
-done
+CODEX_AVAILABLE=$(cat /tmp/trident-{REVIEW_ID}-codex-available 2>/dev/null || echo 1)
+if [ "$CODEX_AVAILABLE" -eq 1 ]; then
+    for f in /tmp/trident-{REVIEW_ID}/*codex*.md; do
+        [ -f "$f" ] && cp "$f" "{PACK_DIR}/"
+    done
+fi
 ```
 
 **Quality gate:** Verify output files exist and have substance:
@@ -287,6 +376,9 @@ wc -c {PACK_DIR}/*.md
 Report any gaps to the user before proceeding to synthesis.
 
 Expected files: `standard-claude.md`, `standard-codex.md`, `standard-codex-execution.md`, `standard-gemini.md`, `adversarial-claude.md`, `adversarial-codex.md`, `adversarial-codex-dependencies.md`, `evolutionary-codex.md`. (No `evolutionary-claude.md` — that lens was dropped per hash-thing-2kkt.)
+Provider-outage placeholder files are expected when a preflight flag is `0`;
+they satisfy path availability but must not be counted as successful model
+reviews.
 
 ### Phase 6: Two Synthesis Agents
 
@@ -355,13 +447,13 @@ Tell the user:
 > - `synthesis-adversarial.md` — critical findings
 > - `evolutionary-codex.md` — evolutionary opportunities (Codex-only; no synthesis pass)
 >
-> Full review pack (10 files: 8 reviews + 2 syntheses) at: `{PACK_DIR}/`"
+> Full review pack at `{PACK_DIR}/` (8 review slots, with explicit outage placeholders for unavailable providers, plus 2 syntheses)"
 
 ---
 
 ## Fallback
 
-If an agent fails or isn't available, proceed with successful agents. Note failures in the relevant synthesis doc. If an entire model is unavailable (e.g., Codex is down), the synthesis still works with 2 inputs instead of 3.
+If an agent fails or isn't available, proceed with successful agents. Note failures in the relevant synthesis doc. If an entire model is unavailable, use the preflight-created placeholder files so synthesis has stable inputs and the outage remains visible.
 
 ---
 
