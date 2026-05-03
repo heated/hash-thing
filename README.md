@@ -54,11 +54,14 @@ is actually active. `hash-thing` is testing a different path: make repeated,
 stable, and empty structure structurally shareable, then spend compute on the
 small regions where material behavior is actually changing.
 
-Early thesis probes show Hashlife is already a real multiplier on easier
-terrain/churn regimes: 16x-46x work elision on 128^3 representative probes, and
-full skips on empty or inert worlds. The hard live-demo cascade regime is still
-not solved: the current ledger records roughly 5.6x elision at cascade peak and
-calls out more baseline work before claiming victory.
+Structured thesis probes show Hashlife is already a real multiplier in both
+easy and hard regimes. At `demo · default-demo · cascade · churning`, the
+current ledger records 79.15x work-elision p05 and a 20.40 ms hashlife p95
+against a 939.17 ms chunk-array p95 on the same cascade scenario. At
+`demo · default-terrain · microchurn · saturated`, the post-ite4 default
+`RayonBfs` path records a 6.7 ms step median. These are still regime-specific
+numbers, not a blanket victory claim; every new perf claim should cite its
+world, scene, intensity, and regime.
 
 That honesty matters. The goal is not a benchmark trick; it is a game where
 scale, stability, and reusable material patterns are player-facing resources.
