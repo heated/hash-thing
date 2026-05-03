@@ -155,6 +155,25 @@ mod wgsl_drift_guard {
     }
 
     #[test]
+    fn wgsl_stone_detail_stays_low_contrast() {
+        let expected_lines = [
+            "let coarse = value_noise(vox * 0.18);",
+            "let fine = value_noise(vox * 1.2);",
+            "let vein = smoothstep(0.50, 0.62, value_noise(vox * vec3<f32>(0.32, 0.13, 0.32)));",
+            "base = base * (0.94 + 0.10 * coarse) * (0.96 + 0.06 * fine);",
+            "base = mix(base, base * 0.78, vein * 0.22);",
+        ];
+        for expected in expected_lines {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(expected),
+                "svdag_raycast.wgsl must contain `{expected}` — stone chamber \
+                 walls should keep low-contrast grain instead of large blurry \
+                 hypertexture patches (hash-thing-hcol)."
+            );
+        }
+    }
+
+    #[test]
     fn wgsl_hit_alpha_tracks_scene_distance() {
         let expected_lines = [
             "vec4<f32>(lit, max(entry + max(lod_hit_t, 0.0), 1e-4))",

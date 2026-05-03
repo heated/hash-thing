@@ -123,13 +123,13 @@ fn material_shade(packed: u32, world_pos: vec3<f32>, normal: vec3<f32>, time: f3
     // 0=air, 1=stone, 2=dirt, 3=grass, 4=fire, 5=water, 6=sand, 7=lava
     switch mat_id {
         case 1u: {
-            // Stone: layered noise for mineral veins + subtle color variation.
-            let coarse = value_noise(vox * 0.3);
-            let fine = value_noise(vox * 1.7);
-            let vein = smoothstep(0.42, 0.48, value_noise(vox * vec3<f32>(0.5, 0.2, 0.5)));
-            base = base * (0.85 + 0.3 * coarse) * (0.92 + 0.16 * fine);
-            // Dark veins
-            base = mix(base, base * 0.55, vein * 0.6);
+            // Stone: low-contrast grain. Keep chamber walls readable as stone
+            // planes instead of large blurry macro-patterns.
+            let coarse = value_noise(vox * 0.18);
+            let fine = value_noise(vox * 1.2);
+            let vein = smoothstep(0.50, 0.62, value_noise(vox * vec3<f32>(0.32, 0.13, 0.32)));
+            base = base * (0.94 + 0.10 * coarse) * (0.96 + 0.06 * fine);
+            base = mix(base, base * 0.78, vein * 0.22);
             props.roughness = 0.95;
         }
         case 2u: {
