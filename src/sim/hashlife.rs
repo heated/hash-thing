@@ -167,6 +167,28 @@ const LEVEL4_CELL_COUNT: usize = LEVEL4_SIDE * LEVEL4_SIDE * LEVEL4_SIDE;
 const CENTER_LEVEL4_SIDE: usize = 8;
 const CENTER_LEVEL4_CELL_COUNT: usize =
     CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE;
+const BFS_FRONTIER_HARD_LIMIT: usize = 16_384;
+
+#[cfg(test)]
+thread_local! {
+    static BFS_FRONTIER_HARD_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn bfs_frontier_hard_limit() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(override_limit) = BFS_FRONTIER_HARD_LIMIT_OVERRIDE.with(|c| c.get()) {
+            return override_limit;
+        }
+    }
+    BFS_FRONTIER_HARD_LIMIT
+}
+
+#[cfg(test)]
+fn set_bfs_frontier_hard_limit_for_test(limit: Option<usize>) {
+    BFS_FRONTIER_HARD_LIMIT_OVERRIDE.with(|c| c.set(limit));
+}
 
 /// hash-thing-ecmn (vqke.4.1): one node-step entry in the BFS frontier.
 /// `node` is the input at level n; `result` is filled at level-(n-1)
@@ -1400,6 +1422,7 @@ impl World {
         memo_period: u64,
     ) -> NodeId {
         debug_assert!(root_level >= 3, "step_root_bfs requires level >= 3");
+        let stats_before_bfs = self.hashlife_stats;
 
         // Root prelude — mirrors step_node lines 650-738.
         if let Some(short) = self.try_resolve_short_circuit(root, root_level - 1) {
@@ -1420,6 +1443,7 @@ impl World {
         } else {
             3
         };
+        let frontier_hard_limit = bfs_frontier_hard_limit();
 
         // Leaf root: no BFS frontier needed — step the base case directly.
         if root_level == leaf_level {
@@ -1509,6 +1533,27 @@ impl World {
                         children: [BfsChildSlot::Direct(NodeId::EMPTY); 8],
                         result: None,
                     });
+                    if tasks[lower_idx].len() > frontier_hard_limit {
+                        let frontier_count = tasks[lower_idx].len();
+                        // Check immediately after push, so the observed peak is
+                        // bounded to limit + 1 and no larger frontier level or
+                        // leaf pending/output batch is allocated.
+                        self.log_bfs_frontier_fallback(
+                            frontier_count,
+                            frontier_hard_limit,
+                            lower_level,
+                            leaf_level,
+                        );
+                        self.hashlife_stats = stats_before_bfs;
+                        let result = self.step_node(root, root_level, schedule_phase, memo_period);
+                        self.hashlife_stats.bfs_tasks_by_level[lower_idx] = frontier_count as u64;
+                        if lower_idx == 0 {
+                            self.hashlife_stats.bfs_level3_unique_misses = frontier_count as u64;
+                        }
+                        self.hashlife_stats.bfs_max_batch_len = frontier_count as u64;
+                        self.hashlife_stats.bfs_batches_serial_fallback += 1;
+                        return result;
+                    }
                     seen[lower_idx].insert(sub_key, new_idx);
                     child_slots[i] = BfsChildSlot::Pending(new_idx);
                 }
@@ -1528,34 +1573,10 @@ impl World {
         self.hashlife_stats.bfs_level3_unique_misses = leaf_count as u64;
         self.hashlife_stats.bfs_max_batch_len = leaf_count as u64;
 
-        // hash-thing-ecmn (review-pass): soft warning when the
-        // unbounded BFS frontier crosses a soft sanity threshold. Plan
-        // §11 documented "no cap, but soft warning if
-        // bfs_level3_unique_misses > 16384". At ~1 KiB grid + ~1 KiB
-        // output per task, 16384 tasks ≈ 32 MiB peak — still safe but
-        // the doubling beyond that gets dangerous fast (262K tasks ≈
-        // 520 MiB at 256³ worst case, multi-GiB at 1024³). When this
-        // warning fires, file a chunked-wavefront follow-up bead. The
-        // log only fires on the BFS path — Serial/RayonPerFanout never
-        // reach this path. (BFS is the default since ite4; operators
-        // who want to revert can set HASH_THING_BASE_CASE_STRATEGY=
-        // per-fanout or serial.)
-        const BFS_FRONTIER_SOFT_LIMIT: usize = 16_384;
-        if leaf_count > BFS_FRONTIER_SOFT_LIMIT {
-            let leaf_cell_count = if leaf_level == 4 {
-                LEVEL4_CELL_COUNT
-            } else {
-                LEVEL3_CELL_COUNT
-            };
-            log::warn!(
-                target: "hash_thing::hashlife::bfs",
-                "BFS leaf frontier exceeded soft limit: {leaf_count} unique tasks \
-                 (limit {BFS_FRONTIER_SOFT_LIMIT}). Memory peak ~{} MiB pending+output. \
-                 Consider chunked wavefront follow-up.",
-                (leaf_count * (leaf_cell_count * std::mem::size_of::<CellState>() * 2))
-                    / (1024 * 1024),
-            );
-        }
+        debug_assert!(
+            leaf_count <= frontier_hard_limit,
+            "oversized BFS frontier should have fallen back during descent"
+        );
 
         if !tasks[0].is_empty() {
             const RAYON_BATCH_THRESHOLD: usize = 4;
@@ -1659,6 +1680,29 @@ impl World {
         tasks[max_level_idx][0]
             .result
             .expect("BFS root must be resolved after ascend")
+    }
+
+    fn log_bfs_frontier_fallback(
+        &self,
+        frontier_count: usize,
+        limit: usize,
+        frontier_level: u32,
+        leaf_level: u32,
+    ) {
+        let leaf_cell_count = if leaf_level == 4 {
+            LEVEL4_CELL_COUNT
+        } else {
+            LEVEL3_CELL_COUNT
+        };
+        log::warn!(
+            target: "hash_thing::hashlife::bfs",
+            "BFS frontier level {frontier_level} exceeded hard limit: {frontier_count} unique \
+             tasks (limit {limit}). Falling back to serial recursive step before allocating \
+             a larger BFS frontier or the leaf pending+output batch. Leaf batch avoided at \
+             this frontier size would be ~{} MiB pending+output.",
+            (frontier_count * (leaf_cell_count * std::mem::size_of::<CellState>() * 2))
+                / (1024 * 1024),
+        );
     }
 
     fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
@@ -2057,7 +2101,7 @@ fn unique_block_rule_pure(
 mod tests {
     use super::*;
     use crate::sim::rule::ALIVE;
-    use crate::sim::{GameOfLife3D, WorldCoord};
+    use crate::sim::{BaseCaseStrategy, GameOfLife3D, WorldCoord};
     use crate::terrain::materials::{
         DIRT, DIRT_MATERIAL_ID, SAND_MATERIAL_ID, STONE, WATER_MATERIAL_ID,
     };
@@ -2397,6 +2441,60 @@ mod tests {
         let pop_before = world.population();
         world.step_recursive();
         assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn bfs_frontier_over_hard_limit_falls_back_to_serial_recursive() {
+        struct ResetLimit;
+        impl Drop for ResetLimit {
+            fn drop(&mut self) {
+                set_bfs_frontier_hard_limit_for_test(None);
+            }
+        }
+
+        set_bfs_frontier_hard_limit_for_test(Some(1));
+        let _reset_limit = ResetLimit;
+
+        let mut bfs = gol_world(5, GameOfLife3D::rule445(), 1);
+        seed_random_alive_cells(&mut bfs, 0xbf5f_u64, 1);
+        bfs.set_base_case_strategy(BaseCaseStrategy::RayonBfs);
+
+        let mut serial = gol_world(5, GameOfLife3D::rule445(), 1);
+        seed_random_alive_cells(&mut serial, 0xbf5f_u64, 1);
+        serial.set_base_case_strategy(BaseCaseStrategy::Serial);
+
+        bfs.step_recursive();
+        serial.step_recursive();
+
+        assert_eq!(bfs.flatten(), serial.flatten());
+        assert_eq!(
+            bfs.hashlife_stats.cache_hits,
+            serial.hashlife_stats.cache_hits
+        );
+        assert_eq!(
+            bfs.hashlife_stats.cache_misses,
+            serial.hashlife_stats.cache_misses
+        );
+        assert_eq!(
+            bfs.hashlife_stats.empty_skips,
+            serial.hashlife_stats.empty_skips
+        );
+        assert_eq!(
+            bfs.hashlife_stats.fixed_point_skips,
+            serial.hashlife_stats.fixed_point_skips
+        );
+        assert_eq!(
+            bfs.hashlife_stats.misses_by_level,
+            serial.hashlife_stats.misses_by_level
+        );
+        assert!(
+            bfs.hashlife_stats.bfs_max_batch_len > 1,
+            "test must exercise an oversized BFS frontier"
+        );
+        assert!(
+            bfs.hashlife_stats.bfs_batches_serial_fallback > 0,
+            "oversized BFS frontier should fall back instead of allocating leaf grids"
+        );
     }
 
     /// hash-thing-4497 investigation: measure the actual divergence

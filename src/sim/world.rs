@@ -521,15 +521,16 @@ pub struct HashlifeStats {
     /// `RAYON_BATCH_THRESHOLD`). Per-step counter; usually 0 or 1
     /// since whole-step BFS produces one large batch.
     pub bfs_batches_parallel: u64,
-    /// hash-thing-ecmn: number of BFS leaf batches that fell back
-    /// to serial iter because batch size was below the rayon
-    /// threshold. Tracks "BFS infrastructure ran but didn't actually
-    /// parallelise" — non-zero means the threshold may be too high or
-    /// the workload is short-circuit-dominated.
+    /// hash-thing-ecmn/a08q.2: number of BFS paths that fell back to
+    /// serial work. This includes small leaf batches below the rayon
+    /// threshold and hard-frontier-cap fallbacks that route the whole
+    /// root through the serial recursive path before allocating a large
+    /// BFS frontier or leaf pending/output batch.
     pub bfs_batches_serial_fallback: u64,
-    /// hash-thing-ecmn: largest leaf batch size observed in this
-    /// step. = bfs_level3_unique_misses on the dominant path; useful
-    /// once a chunked-wavefront fallback is added.
+    /// hash-thing-ecmn/a08q.2: largest BFS frontier size observed in
+    /// this step. = bfs_level3_unique_misses on the normal leaf-batch
+    /// path; can record a higher-level frontier size when the hard cap
+    /// trips before leaf descent.
     pub bfs_max_batch_len: u64,
 }
 
@@ -2733,7 +2734,8 @@ impl World {
         // shape. `bfs_l3` is a legacy label; slowed block-rule worlds use
         // level-4 leaves under the same counter. `bfs_l3=0 bfs_par=0` on
         // Serial / RayonPerFanout strategies — those paths never set the
-        // counters.
+        // counters. `bfs_serfb` includes both small-batch serial leaf
+        // evaluation and hard-frontier-cap fallback for the whole root.
         let bfs_l3 = last_step.bfs_level3_unique_misses;
         let bfs_par = last_step.bfs_batches_parallel;
         let bfs_serial_fb = last_step.bfs_batches_serial_fallback;
