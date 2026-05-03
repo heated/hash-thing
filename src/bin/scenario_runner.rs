@@ -291,7 +291,7 @@ where
 {
     let args = parse_args_from(raw)?;
     if let Some(append_path) = &args.append {
-        ensure_clean_git_tree_for_append(append_path)?;
+        ensure_clean_git_tree_for_append(append_path, args.mode.closure_input_paths())?;
     }
     let line = match args.mode {
         Mode::Run { scenario, hardware } => {
@@ -335,6 +335,15 @@ enum Mode {
         metric: String,
         options: CompareOptions,
     },
+}
+
+impl Mode {
+    fn closure_input_paths(&self) -> Vec<&Path> {
+        match self {
+            Mode::Run { scenario, .. } => vec![scenario.as_path()],
+            Mode::Compare { jsonl, .. } => vec![jsonl.as_path()],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -443,21 +452,27 @@ fn append_jsonl(path: &Path, line: &str) -> Result<(), String> {
     writeln!(file, "{line}").map_err(|err| format!("write {}: {err}", path.display()))
 }
 
-fn ensure_clean_git_tree_for_append(append_path: &Path) -> Result<(), String> {
+fn ensure_clean_git_tree_for_append(
+    append_path: &Path,
+    closure_inputs: Vec<&Path>,
+) -> Result<(), String> {
     let allowed = git_status_path(append_path)?;
+    let required = closure_inputs
+        .into_iter()
+        .map(git_tracked_input_path)
+        .collect::<Result<Vec<_>, _>>()?;
+    for input in &required {
+        ensure_git_tracked_path(input)?;
+    }
     let status = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .output()
         .map_err(|err| format!("check git status before append: {err}"))?;
     if !status.status.success() {
         return Err("check git status before append failed".to_string());
     }
     let dirty = String::from_utf8_lossy(&status.stdout);
-    let unexpected_dirty = dirty
-        .lines()
-        .filter_map(porcelain_path)
-        .filter(|path| path != &allowed)
-        .collect::<Vec<_>>();
+    let unexpected_dirty = unexpected_dirty_paths(&dirty, &allowed);
     if unexpected_dirty.is_empty() {
         return Ok(());
     }
@@ -468,15 +483,32 @@ fn ensure_clean_git_tree_for_append(append_path: &Path) -> Result<(), String> {
     ))
 }
 
-fn git_status_path(path: &Path) -> Result<String, String> {
-    let root = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+fn ensure_git_tracked_path(path: &str) -> Result<(), String> {
+    let root = git_root()?;
+    let status = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", path])
+        .current_dir(root)
         .output()
-        .map_err(|err| format!("find git root before append: {err}"))?;
-    if !root.status.success() {
-        return Err("find git root before append failed".to_string());
+        .map_err(|err| format!("check tracked input {path}: {err}"))?;
+    if status.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to append closure-grade perf record from untracked input: {path}"
+        ))
     }
-    let root = PathBuf::from(String::from_utf8_lossy(&root.stdout).trim().to_string());
+}
+
+fn unexpected_dirty_paths(status: &str, allowed: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(porcelain_path)
+        .filter(|path| path != allowed)
+        .collect::<Vec<_>>()
+}
+
+fn git_status_path(path: &Path) -> Result<String, String> {
+    let root = git_root()?;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -484,8 +516,59 @@ fn git_status_path(path: &Path) -> Result<String, String> {
             .map_err(|err| format!("read cwd before append: {err}"))?
             .join(path)
     };
+    let absolute = canonical_status_path(&absolute)?;
     let relative = absolute.strip_prefix(&root).unwrap_or(path);
     Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn canonical_status_path(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .map_err(|err| format!("canonicalize {}: {err}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        let parent = parent
+            .canonicalize()
+            .map_err(|err| format!("canonicalize {}: {err}", parent.display()))?;
+        if let Some(name) = path.file_name() {
+            return Ok(parent.join(name));
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn git_tracked_input_path(path: &Path) -> Result<String, String> {
+    if !path.is_absolute() {
+        let pathspec = path.to_string_lossy().replace('\\', "/");
+        if is_git_tracked_pathspec(&pathspec)? {
+            return Ok(pathspec);
+        }
+    }
+    git_status_path(path)
+}
+
+fn git_root() -> Result<PathBuf, String> {
+    let root = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|err| format!("find git root before append: {err}"))?;
+    if !root.status.success() {
+        return Err("find git root before append failed".to_string());
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&root.stdout).trim().to_string(),
+    ))
+}
+
+fn is_git_tracked_pathspec(path: &str) -> Result<bool, String> {
+    let root = git_root()?;
+    let status = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", path])
+        .current_dir(root)
+        .output()
+        .map_err(|err| format!("check tracked input {path}: {err}"))?;
+    Ok(status.status.success())
 }
 
 fn porcelain_path(line: &str) -> Option<String> {
@@ -1887,8 +1970,10 @@ fn cherry_pick_audit(scenario: &Scenario) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    static CWD_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn scenario_hash_changes_with_seed() {
@@ -1990,6 +2075,86 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("duplicate measurement_id"), "{err}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn append_hygiene_allows_only_append_target_dirty() {
+        let status = " M .ship-notes/perf-runs.jsonl\n";
+
+        let dirty = unexpected_dirty_paths(status, ".ship-notes/perf-runs.jsonl");
+
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn append_hygiene_reports_untracked_non_append_input() {
+        let status = "?? scenarios/local-only.ron\n M .ship-notes/perf-runs.jsonl\n";
+
+        let dirty = unexpected_dirty_paths(status, ".ship-notes/perf-runs.jsonl");
+
+        assert_eq!(dirty, vec!["scenarios/local-only.ron"]);
+    }
+
+    #[test]
+    fn append_hygiene_rejects_untracked_closure_input() {
+        let _guard = CWD_TEST_LOCK.lock().expect("cwd test lock");
+        let repo = temp_git_repo();
+        let input = repo.join("scenario.ron");
+        std::fs::write(&input, "untracked").expect("write untracked input");
+
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&repo).expect("cd temp repo");
+        let err = ensure_git_tracked_path("scenario.ron").unwrap_err();
+        std::env::set_current_dir(cwd).expect("restore cwd");
+
+        assert!(err.contains("untracked input"), "{err}");
+    }
+
+    #[test]
+    fn append_hygiene_accepts_tracked_closure_input() {
+        let _guard = CWD_TEST_LOCK.lock().expect("cwd test lock");
+        let repo = temp_git_repo();
+        let input = repo.join("scenario.ron");
+        std::fs::write(&input, "tracked").expect("write tracked input");
+        Command::new("git")
+            .args(["add", "scenario.ron"])
+            .current_dir(&repo)
+            .status()
+            .expect("git add");
+
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&repo).expect("cd temp repo");
+        ensure_git_tracked_path("scenario.ron").expect("tracked input");
+        std::env::set_current_dir(cwd).expect("restore cwd");
+    }
+
+    #[test]
+    fn append_hygiene_accepts_repo_relative_tracked_input_from_subdir() {
+        let _guard = CWD_TEST_LOCK.lock().expect("cwd test lock");
+        let repo = temp_git_repo();
+        let scenarios = repo.join("scenarios");
+        let subdir = repo.join("subdir");
+        std::fs::create_dir_all(&scenarios).expect("create scenarios");
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+        std::fs::write(scenarios.join("tracked.ron"), "tracked").expect("write tracked input");
+        let append = repo.join(".ship-notes").join("perf.jsonl");
+        std::fs::create_dir_all(append.parent().unwrap()).expect("create append parent");
+        Command::new("git")
+            .args(["add", "scenarios/tracked.ron"])
+            .current_dir(&repo)
+            .status()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-q", "-m", "track scenario"])
+            .current_dir(&repo)
+            .status()
+            .expect("git commit");
+
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&subdir).expect("cd subdir");
+        ensure_clean_git_tree_for_append(&append, vec![Path::new("scenarios/tracked.ron")])
+            .expect("repo-relative tracked input from subdir");
+        std::env::set_current_dir(cwd).expect("restore cwd");
     }
 
     #[test]
@@ -2608,5 +2773,32 @@ mod tests {
             args.push(std::ffi::OsString::from("--allow-trajectory-drift"));
         }
         args
+    }
+
+    fn temp_git_repo() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-scenario-runner-git-test-{}-{}",
+            std::process::id(),
+            TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp git repo");
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&path)
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init failed");
+        for (key, value) in [
+            ("user.email", "scenario-runner-test@example.invalid"),
+            ("user.name", "Scenario Runner Test"),
+        ] {
+            let status = Command::new("git")
+                .args(["config", key, value])
+                .current_dir(&path)
+                .status()
+                .expect("git config");
+            assert!(status.success(), "git config failed");
+        }
+        path
     }
 }
