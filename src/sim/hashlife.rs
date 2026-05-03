@@ -162,6 +162,11 @@ const LEVEL3_CELL_COUNT: usize = LEVEL3_SIDE * LEVEL3_SIDE * LEVEL3_SIDE;
 const CENTER_LEVEL3_SIDE: usize = 4;
 const CENTER_LEVEL3_CELL_COUNT: usize =
     CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE;
+const LEVEL4_SIDE: usize = 16;
+const LEVEL4_CELL_COUNT: usize = LEVEL4_SIDE * LEVEL4_SIDE * LEVEL4_SIDE;
+const CENTER_LEVEL4_SIDE: usize = 8;
+const CENTER_LEVEL4_CELL_COUNT: usize =
+    CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE;
 
 /// hash-thing-ecmn (vqke.4.1): one node-step entry in the BFS frontier.
 /// `node` is the input at level n; `result` is filled at level-(n-1)
@@ -761,7 +766,9 @@ impl World {
             }
         }
 
-        let result = if level == 3 {
+        let result = if self.requires_wide_block_base_case() && level == 4 {
+            self.step_wide_block_base_case(node, effective_phase)
+        } else if level == 3 {
             self.step_base_case(node, effective_phase)
         } else {
             self.step_recursive_case(node, level, effective_phase, memo_period)
@@ -769,6 +776,13 @@ impl World {
 
         self.hashlife_cache.insert(key, result);
         result
+    }
+
+    fn requires_wide_block_base_case(&self) -> bool {
+        self.materials
+            .block_rule_tick_divisors()
+            .iter()
+            .any(|&divisor| divisor > 1)
     }
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
@@ -786,6 +800,26 @@ impl World {
         self.hashlife_stats.phase1_ns += p1_ns;
         self.hashlife_stats.phase2_ns += p2_ns;
         self.center_level3_grid_to_node(&next)
+    }
+
+    /// Base case for slowed block-rule worlds: level-4 node (16x16x16), one
+    /// generation, center 8x8x8 output.
+    ///
+    /// With mixed block-rule divisors, one generation may run both Margolus
+    /// offsets sequentially. A center cell can then depend on a pass-0 cell
+    /// two positions away before pass 1 runs. The legacy 8x8x8 -> 4x4x4
+    /// base case only has a two-cell halo, but its pass-0 boundary cells
+    /// themselves need a CA neighbor halo. A level-4 leaf gives the output
+    /// center a four-cell halo and keeps the recursive result bit-exact with
+    /// the full-grid brute step.
+    fn step_wide_block_base_case(&mut self, node: NodeId, _schedule_phase: u64) -> NodeId {
+        let mut grid = vec![0 as CellState; LEVEL4_CELL_COUNT];
+        self.store.flatten_buf(node, &mut grid, LEVEL4_SIDE);
+        let (next, p1_ns, p2_ns) =
+            step_grid_once_vec(&grid, LEVEL4_SIDE, self.generation, &self.materials);
+        self.hashlife_stats.phase1_ns += p1_ns;
+        self.hashlife_stats.phase2_ns += p2_ns;
+        self.center_level4_grid_to_node(&next)
     }
 
     fn step_node_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
@@ -866,6 +900,21 @@ impl World {
         self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
     }
 
+    fn center_level4_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
+        let mut center_grid = vec![0 as CellState; CENTER_LEVEL4_CELL_COUNT];
+        for cz in 0..CENTER_LEVEL4_SIDE {
+            for cy in 0..CENTER_LEVEL4_SIDE {
+                for cx in 0..CENTER_LEVEL4_SIDE {
+                    center_grid[cx
+                        + cy * CENTER_LEVEL4_SIDE
+                        + cz * CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE] = grid
+                        [(cx + 4) + (cy + 4) * LEVEL4_SIDE + (cz + 4) * LEVEL4_SIDE * LEVEL4_SIDE];
+                }
+            }
+        }
+        self.store.from_flat(&center_grid, CENTER_LEVEL4_SIDE)
+    }
+
     /// Recursive case: level ≥ 3.
     fn step_recursive_case(
         &mut self,
@@ -910,9 +959,9 @@ impl World {
         }
 
         // Group into 8 overlapping sub-cubes (level n-1) and assemble their
-        // sub_roots up-front. The 8 step_node calls follow — at level==4
-        // (i.e. each sub-cube is a level-3 base case) the calls may be
-        // batched through rayon if `base_case_strategy == RayonPerFanout`.
+        // sub_roots up-front. The 8 step_node calls follow. When this fanout
+        // points directly at the active leaf level, the calls may be batched
+        // through rayon if `base_case_strategy == RayonPerFanout`.
         let mut sub_roots = [NodeId::EMPTY; 8];
         for oz in 0..2usize {
             for oy in 0..2usize {
@@ -933,21 +982,25 @@ impl World {
         }
 
         let mut result_children = [NodeId::EMPTY; 8];
-        if level == 4
+        let leaf_level = if self.requires_wide_block_base_case() {
+            4
+        } else {
+            3
+        };
+        if level == leaf_level + 1
             && matches!(
                 self.base_case_strategy,
                 super::world::BaseCaseStrategy::RayonPerFanout
             )
         {
-            // hash-thing-ftuu (vqke.4): batch the 8 level-3 base cases through
-            // rayon. Replicates the prelude of `step_node` (empty / inert /
-            // cache lookup) inline so the parallel work is restricted to the
-            // pure `step_grid_once_pure` calls — the only non-trivial
-            // computation that can run without `&mut self`.
-            self.step_level4_fanout_rayon(
+            // hash-thing-ftuu (vqke.4): batch the 8 leaf base cases through
+            // rayon. Replicates the prelude of `step_node` inline so the
+            // parallel work is restricted to pure grid stepping.
+            self.step_leaf_fanout_rayon(
                 &sub_roots,
                 schedule_phase,
                 memo_period,
+                leaf_level,
                 &mut result_children,
             );
         } else {
@@ -960,9 +1013,11 @@ impl World {
         self.store.interior(level - 1, result_children)
     }
 
-    /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 level-3
-    /// base cases under a level-4 fanout. Replaces the serial loop over
-    /// `step_node(sub_root, 3, ...)` calls when
+    /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 active
+    /// leaf base cases under the parent fanout. Normal worlds use level-3
+    /// leaves; slowed block-rule worlds use level-4 leaves for a wider halo.
+    /// Replaces the serial loop over `step_node(sub_root, leaf_level, ...)`
+    /// calls when
     /// `base_case_strategy == RayonPerFanout`.
     ///
     /// Phase A (sequential, mutates stats + reads store/cache): mirrors the
@@ -970,17 +1025,17 @@ impl World {
     /// fast-subtree phase fold, cache lookup. Sub-cubes that short-circuit
     /// or hit the cache are recorded directly into `result_children`.
     /// Sub-cubes that miss are recorded into a queue alongside their
-    /// flattened 8³ grid (read-only on store).
+    /// flattened leaf grid (read-only on store).
     ///
     /// Phase B (parallel, no `&self`): rayon `par_iter` over the queued
-    /// flat grids invokes `step_grid_once_pure` to compute each output
+    /// flat grids invokes the pure grid stepper to compute each output
     /// grid. The threshold below `4` falls back to serial `iter` because
     /// rayon's per-task overhead exceeds the win at very small batch sizes
     /// (a level-4 fanout caps at 8 base cases, and most steady-state
     /// fanouts have fewer than 8 misses).
     ///
     /// Phase C (sequential, mutates store + cache + stats): commits each
-    /// output grid via `from_flat` + `center_level3_grid_to_node`, inserts
+    /// output grid via the leaf center extractor, inserts
     /// the result into `hashlife_cache` under the same `(sub_root,
     /// effective_phase)` key the next `step_node` lookup would use, and
     /// folds `phase1_ns` / `phase2_ns` into stats so observability stays
@@ -988,14 +1043,25 @@ impl World {
     ///
     /// Bit-exact with the serial path — verified by
     /// `tests/base_case_rayon_parity.rs`.
-    fn step_level4_fanout_rayon(
+    fn step_leaf_fanout_rayon(
         &mut self,
         sub_roots: &[NodeId; 8],
         schedule_phase: u64,
         memo_period: u64,
+        leaf_level: u32,
         result_children: &mut [NodeId; 8],
     ) {
         use rayon::prelude::*;
+        debug_assert!(
+            leaf_level == 3 || leaf_level == 4,
+            "unsupported leaf level {leaf_level}"
+        );
+        let leaf_side = if leaf_level == 4 {
+            LEVEL4_SIDE
+        } else {
+            LEVEL3_SIDE
+        };
+        let leaf_cell_count = leaf_side * leaf_side * leaf_side;
 
         // Per-sub_root classification: either resolved (short-circuit or
         // cache hit) or pending (miss, needs base-case compute).
@@ -1010,7 +1076,7 @@ impl World {
         // (1 miss + N-1 hits) exactly.
         let mut resolved: [Option<NodeId>; 8] = [None; 8];
         let mut pending: Vec<(usize, u64)> = Vec::with_capacity(8); // (sub_root_index, effective_phase) for unique misses
-        let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> = Vec::with_capacity(8);
+        let mut pending_grids: Vec<Vec<CellState>> = Vec::with_capacity(8);
         let mut deferred_dupes: Vec<(usize, usize)> = Vec::new(); // (sub_root_index, pending_index) for duplicate misses
 
         for i in 0..8 {
@@ -1020,17 +1086,17 @@ impl World {
             // all-inert short-circuits.
             if self.store.population(nid) == 0 {
                 self.hashlife_stats.empty_skips += 1;
-                resolved[i] = Some(self.store.empty(2));
+                resolved[i] = Some(self.store.empty(leaf_level - 1));
                 continue;
             }
             if let Some(state) = self.inert_uniform_state(nid) {
                 self.hashlife_stats.fixed_point_skips += 1;
-                resolved[i] = Some(self.store.uniform(2, state));
+                resolved[i] = Some(self.store.uniform(leaf_level - 1, state));
                 continue;
             }
             if self.is_all_inert(nid) {
                 self.hashlife_stats.fixed_point_skips += 1;
-                resolved[i] = Some(self.center_node(nid, 3));
+                resolved[i] = Some(self.center_node(nid, leaf_level));
                 continue;
             }
 
@@ -1064,7 +1130,7 @@ impl World {
             // Unique miss — record cache_misses now (matches `step_node`
             // line 704 which counts the miss before evaluation).
             self.hashlife_stats.cache_misses += 1;
-            self.hashlife_stats.misses_by_level[0] += 1; // level 3 = misses_by_level[0]
+            self.hashlife_stats.misses_by_level[(leaf_level - 3) as usize] += 1;
 
             // hash-thing-bjdl phase-aliasing diag probe (env-gated).
             if memo_diag_enabled() && memo_period > 1 {
@@ -1079,8 +1145,8 @@ impl World {
                 }
             }
 
-            let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
-            self.store.flatten_buf(nid, &mut grid, LEVEL3_SIDE);
+            let mut grid = vec![0 as CellState; leaf_cell_count];
+            self.store.flatten_buf(nid, &mut grid, leaf_side);
             pending.push((i, effective_phase));
             pending_grids.push(grid);
         }
@@ -1092,17 +1158,17 @@ impl World {
         const RAYON_BATCH_THRESHOLD: usize = 4;
         let generation = self.generation;
         let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
-        let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> = if pending_grids.is_empty() {
+        let outputs: Vec<(Vec<CellState>, u64, u64)> = if pending_grids.is_empty() {
             Vec::new()
         } else if pending_grids.len() < RAYON_BATCH_THRESHOLD {
             pending_grids
                 .iter()
-                .map(|grid| step_grid_once_pure(grid, generation, materials))
+                .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
                 .collect()
         } else {
             pending_grids
                 .par_iter()
-                .map(|grid| step_grid_once_pure(grid, generation, materials))
+                .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
                 .collect()
         };
 
@@ -1111,7 +1177,11 @@ impl World {
             let (output_grid, p1ns, p2ns) = &outputs[out_idx];
             self.hashlife_stats.phase1_ns += p1ns;
             self.hashlife_stats.phase2_ns += p2ns;
-            let centered = self.center_level3_grid_to_node(output_grid);
+            let centered = if leaf_level == 4 {
+                self.center_level4_grid_to_node(output_grid)
+            } else {
+                self.center_level3_grid_to_node(output_grid)
+            };
             self.hashlife_cache
                 .insert((sub_roots[sub_idx], effective_phase), centered);
             resolved[sub_idx] = Some(centered);
@@ -1128,7 +1198,7 @@ impl World {
 
         for i in 0..8 {
             result_children[i] =
-                resolved[i].expect("step_level4_fanout_rayon: every sub_root must be resolved");
+                resolved[i].expect("step_leaf_fanout_rayon: every sub_root must be resolved");
         }
     }
 
@@ -1165,7 +1235,7 @@ impl World {
     /// proceed to cache lookup. `result_level` is the level the result
     /// will live at (= input level - 1 in step_node terms).
     ///
-    /// Extracted from step_node + step_level4_fanout_rayon so all three
+    /// Extracted from step_node + step_leaf_fanout_rayon so all three
     /// callers (step_node, the per-fanout rayon path, and step_root_bfs)
     /// share one implementation. Standard-Codex review specifically
     /// asked for this consolidation.
@@ -1310,7 +1380,7 @@ impl World {
     /// across `World` instances may differ due to intern allocation
     /// order; the parity test compares `flatten()`, not NodeIds.
     ///
-    /// `step_grid_once_pure` receives the raw `self.generation`, NOT
+    /// The pure grid stepper receives the raw `self.generation`, NOT
     /// `effective_phase` — the compute path is generation-based and
     /// only the cache key uses effective_phase. (Per Adversarial-Codex
     /// plan-review feedback.)
@@ -1345,15 +1415,25 @@ impl World {
         self.hashlife_stats.misses_by_level[(root_level - 3) as usize] += 1;
         self.memo_diag_probe_alias(root, root_eff, memo_period);
 
-        // Level-3 root: no BFS frontier needed — step the base case directly.
-        if root_level == 3 {
-            let result = self.step_base_case(root, root_eff);
+        let leaf_level = if self.requires_wide_block_base_case() {
+            4
+        } else {
+            3
+        };
+
+        // Leaf root: no BFS frontier needed — step the base case directly.
+        if root_level == leaf_level {
+            let result = if leaf_level == 4 {
+                self.step_wide_block_base_case(root, root_eff)
+            } else {
+                self.step_base_case(root, root_eff)
+            };
             self.hashlife_cache.insert(root_key, result);
             return result;
         }
 
         // Per-level frontier. tasks[idx] holds the unique tasks at level
-        // `(idx + 3)`. seen[idx] is the dedupe map keyed by
+        // `(idx + leaf_level)`. seen[idx] is the dedupe map keyed by
         // (NodeId, effective_phase) -> task index in tasks[idx].
         //
         // Cross-level dedupe is unnecessary because `Node::Interior`
@@ -1361,7 +1441,7 @@ impl World {
         // different NodeIds. NodeId::EMPTY-style sentinels are handled
         // by the empty short-circuit BEFORE reaching the seen/resolved
         // path.
-        let max_level_idx = (root_level - 3) as usize;
+        let max_level_idx = (root_level - leaf_level) as usize;
         let mut tasks: Vec<Vec<BfsTask>> = (0..=max_level_idx).map(|_| Vec::new()).collect();
         let mut seen: Vec<FxHashMap<(NodeId, u64), usize>> =
             (0..=max_level_idx).map(|_| FxHashMap::default()).collect();
@@ -1375,10 +1455,10 @@ impl World {
         });
         seen[max_level_idx].insert(root_key, 0);
 
-        // Phase 1: descending pass. Walk levels root_level..=4 (level-3
-        // tasks are pure leaves; they don't need sub_roots built).
-        for n in (4..=root_level).rev() {
-            let level_idx = (n - 3) as usize;
+        // Phase 1: descending pass. Walk down to the leaf frontier; leaf
+        // tasks are pure leaves and don't need sub_roots built.
+        for n in ((leaf_level + 1)..=root_level).rev() {
+            let level_idx = (n - leaf_level) as usize;
             let lower_idx = level_idx - 1;
             // Snapshot the count: tasks[level_idx] doesn't grow during
             // this loop (we only append to tasks[lower_idx]), so an
@@ -1442,10 +1522,11 @@ impl World {
             self.hashlife_stats.bfs_tasks_by_level[idx] = level_tasks.len() as u64;
         }
 
-        // Phase 2: level-3 parallel batch.
-        let level3_count = tasks[0].len();
-        self.hashlife_stats.bfs_level3_unique_misses = level3_count as u64;
-        self.hashlife_stats.bfs_max_batch_len = level3_count as u64;
+        // Phase 2: leaf parallel batch. The legacy counter name is level-3,
+        // but slowed block-rule worlds use level-4 leaves for a wider halo.
+        let leaf_count = tasks[0].len();
+        self.hashlife_stats.bfs_level3_unique_misses = leaf_count as u64;
+        self.hashlife_stats.bfs_max_batch_len = leaf_count as u64;
 
         // hash-thing-ecmn (review-pass): soft warning when the
         // unbounded BFS frontier crosses a soft sanity threshold. Plan
@@ -1460,26 +1541,23 @@ impl World {
         // who want to revert can set HASH_THING_BASE_CASE_STRATEGY=
         // per-fanout or serial.)
         const BFS_FRONTIER_SOFT_LIMIT: usize = 16_384;
-        if level3_count > BFS_FRONTIER_SOFT_LIMIT {
+        if leaf_count > BFS_FRONTIER_SOFT_LIMIT {
+            let leaf_cell_count = if leaf_level == 4 {
+                LEVEL4_CELL_COUNT
+            } else {
+                LEVEL3_CELL_COUNT
+            };
             log::warn!(
                 target: "hash_thing::hashlife::bfs",
-                "BFS level-3 frontier exceeded soft limit: {level3_count} unique tasks \
+                "BFS leaf frontier exceeded soft limit: {leaf_count} unique tasks \
                  (limit {BFS_FRONTIER_SOFT_LIMIT}). Memory peak ~{} MiB pending+output. \
                  Consider chunked wavefront follow-up.",
-                (level3_count * (LEVEL3_CELL_COUNT * std::mem::size_of::<CellState>() * 2))
+                (leaf_count * (leaf_cell_count * std::mem::size_of::<CellState>() * 2))
                     / (1024 * 1024),
             );
         }
 
         if !tasks[0].is_empty() {
-            let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> =
-                Vec::with_capacity(level3_count);
-            for task in &tasks[0] {
-                let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
-                self.store.flatten_buf(task.node, &mut grid, LEVEL3_SIDE);
-                pending_grids.push(grid);
-            }
-
             const RAYON_BATCH_THRESHOLD: usize = 4;
             // step_grid_once_pure receives raw self.generation, NOT
             // effective_phase — the rule schedule (CaRule per-cell gates,
@@ -1489,36 +1567,77 @@ impl World {
             // readers.)
             let generation = self.generation;
             let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
-            let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> =
-                if level3_count < RAYON_BATCH_THRESHOLD {
+            if leaf_level == 4 {
+                let mut pending_grids: Vec<Vec<CellState>> = Vec::with_capacity(leaf_count);
+                for task in &tasks[0] {
+                    let mut grid = vec![0 as CellState; LEVEL4_CELL_COUNT];
+                    self.store.flatten_buf(task.node, &mut grid, LEVEL4_SIDE);
+                    pending_grids.push(grid);
+                }
+                let outputs: Vec<(Vec<CellState>, u64, u64)> = if leaf_count < RAYON_BATCH_THRESHOLD
+                {
                     self.hashlife_stats.bfs_batches_serial_fallback += 1;
                     pending_grids
                         .iter()
-                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .map(|grid| step_grid_once_vec(grid, LEVEL4_SIDE, generation, materials))
                         .collect()
                 } else {
                     use rayon::prelude::*;
                     self.hashlife_stats.bfs_batches_parallel += 1;
                     pending_grids
                         .par_iter()
-                        .map(|grid| step_grid_once_pure(grid, generation, materials))
+                        .map(|grid| step_grid_once_vec(grid, LEVEL4_SIDE, generation, materials))
                         .collect()
                 };
 
-            for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
-                self.hashlife_stats.phase1_ns += p1ns;
-                self.hashlife_stats.phase2_ns += p2ns;
-                let centered = self.center_level3_grid_to_node(&output_grid);
-                let task = &mut tasks[0][out_idx];
-                self.hashlife_cache
-                    .insert((task.node, task.effective_phase), centered);
-                task.result = Some(centered);
+                for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
+                    self.hashlife_stats.phase1_ns += p1ns;
+                    self.hashlife_stats.phase2_ns += p2ns;
+                    let centered = self.center_level4_grid_to_node(&output_grid);
+                    let task = &mut tasks[0][out_idx];
+                    self.hashlife_cache
+                        .insert((task.node, task.effective_phase), centered);
+                    task.result = Some(centered);
+                }
+            } else {
+                let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> =
+                    Vec::with_capacity(leaf_count);
+                for task in &tasks[0] {
+                    let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+                    self.store.flatten_buf(task.node, &mut grid, LEVEL3_SIDE);
+                    pending_grids.push(grid);
+                }
+                let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> =
+                    if leaf_count < RAYON_BATCH_THRESHOLD {
+                        self.hashlife_stats.bfs_batches_serial_fallback += 1;
+                        pending_grids
+                            .iter()
+                            .map(|grid| step_grid_once_pure(grid, generation, materials))
+                            .collect()
+                    } else {
+                        use rayon::prelude::*;
+                        self.hashlife_stats.bfs_batches_parallel += 1;
+                        pending_grids
+                            .par_iter()
+                            .map(|grid| step_grid_once_pure(grid, generation, materials))
+                            .collect()
+                    };
+
+                for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
+                    self.hashlife_stats.phase1_ns += p1ns;
+                    self.hashlife_stats.phase2_ns += p2ns;
+                    let centered = self.center_level3_grid_to_node(&output_grid);
+                    let task = &mut tasks[0][out_idx];
+                    self.hashlife_cache
+                        .insert((task.node, task.effective_phase), centered);
+                    task.result = Some(centered);
+                }
             }
         }
 
-        // Phase 3: ascend levels 4..=root_level.
-        for n in 4..=root_level {
-            let level_idx = (n - 3) as usize;
+        // Phase 3: ascend from one level above the leaf frontier to root.
+        for n in (leaf_level + 1)..=root_level {
+            let level_idx = (n - leaf_level) as usize;
             let lower_idx = level_idx - 1;
             let n_tasks_count = tasks[level_idx].len();
             for task_idx in 0..n_tasks_count {
@@ -1678,12 +1797,37 @@ pub(super) fn step_grid_once_pure(
     generation: u64,
     materials: &crate::terrain::materials::MaterialRegistry,
 ) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
-    let side = LEVEL3_SIDE;
+    let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+    let (phase1_ns, phase2_ns) =
+        step_grid_once_into(grid, &mut next, LEVEL3_SIDE, generation, materials);
+    (next, phase1_ns, phase2_ns)
+}
+
+fn step_grid_once_vec(
+    grid: &[CellState],
+    side: usize,
+    generation: u64,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) -> (Vec<CellState>, u64, u64) {
+    let mut next = vec![0 as CellState; side * side * side];
+    let (phase1_ns, phase2_ns) = step_grid_once_into(grid, &mut next, side, generation, materials);
+    (next, phase1_ns, phase2_ns)
+}
+
+fn step_grid_once_into(
+    grid: &[CellState],
+    next: &mut [CellState],
+    side: usize,
+    generation: u64,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) -> (u64, u64) {
+    debug_assert_eq!(grid.len(), side * side * side);
+    debug_assert_eq!(next.len(), grid.len());
+
     // Phase 1: CaRule on interior cells (1..side-1 on each axis).
     // The outermost ring cannot be evolved correctly because its neighbors
-    // would wrap outside the padded region. Callers only extract the center
-    // that remains valid after the requested number of steps.
-    let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+    // would read outside the padded region. Callers only extract a center
+    // whose halo remains valid after the requested block-rule passes.
     let phase1_start = std::time::Instant::now();
     let noop_by_material = materials.noop_flags();
     let divisor_by_material = materials.tick_divisor_flags();
@@ -1717,8 +1861,8 @@ pub(super) fn step_grid_once_pure(
     }
     let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
 
-    // Phase 2: BlockRule on aligned 2×2×2 blocks. See the comment at the
-    // wrapper site for the parity / divisor schedule details.
+    // Phase 2: BlockRule on aligned 2x2x2 blocks. See the brute-step comment
+    // for the parity / divisor schedule details.
     let phase2_start = std::time::Instant::now();
     let block_rule_divisors = materials.block_rule_tick_divisors();
     let all_divisors_one =
@@ -1731,7 +1875,7 @@ pub(super) fn step_grid_once_pure(
             while by + 1 < side - 1 {
                 let mut bx = offset;
                 while bx + 1 < side - 1 {
-                    apply_block_in_grid_pure(&mut next, side, bx, by, bz, materials);
+                    apply_block_in_grid_pure(next, side, bx, by, bz, materials);
                     bx += 2;
                 }
                 by += 2;
@@ -1747,7 +1891,7 @@ pub(super) fn step_grid_once_pure(
                     let mut bx = pass_offset;
                     while bx + 1 < side - 1 {
                         apply_block_in_grid_with_schedule_pure(
-                            &mut next,
+                            next,
                             side,
                             bx,
                             by,
@@ -1766,7 +1910,7 @@ pub(super) fn step_grid_once_pure(
         }
     }
     let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
-    (next, phase1_ns, phase2_ns)
+    (phase1_ns, phase2_ns)
 }
 
 fn apply_block_in_grid_pure(
@@ -3317,12 +3461,12 @@ mod tests {
 
     /// hash-thing-neql: DefaultDemo cascade comparator drift localizer.
     ///
-    /// Reproduces the 8ppq.1.4 comparator caveat at a smaller level than the
-    /// recorded `medium · default-demo · cascade · churning` level-7 run. The
-    /// chunk-array baseline calls `brute_step_grid`; `World::step()` is the
-    /// same brute kernel with octree commit, so a brute-vs-recursive mismatch
-    /// here means the drift is in recursive semantics rather than the
-    /// scenario-runner comparator wrapper.
+    /// Regression for the 8ppq.1.4 comparator caveat at a smaller level than
+    /// the recorded `medium · default-demo · cascade · churning` level-7 run.
+    /// The chunk-array baseline calls `brute_step_grid`; `World::step()` is
+    /// the same brute kernel with octree commit, so a brute-vs-recursive
+    /// mismatch here means the drift is in recursive semantics rather than
+    /// the scenario-runner comparator wrapper.
     #[test]
     #[ignore]
     fn repro_neql_default_demo_cascade_brute_vs_recursive_drift() {
@@ -3489,7 +3633,9 @@ mod tests {
                     brute.generation, recur.generation,
                     "generation counters must stay aligned after split finalize"
                 );
-                return;
+                panic!(
+                    "DefaultDemo cascade drifted at pre-step gen {gen}: first={first:?} pairs={pair_counts:?}"
+                );
             }
 
             recur.finalize_step_after_external_gap_fill();
@@ -3498,8 +3644,6 @@ mod tests {
                 "generation counters diverged after gen {gen}"
             );
         }
-
-        panic!("DefaultDemo cascade stayed byte-identical for 20 generations");
     }
 
     // ============================================================

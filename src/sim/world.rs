@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 /// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling strategy.
 /// `Serial` is pre-ftuu DFS (no rayon). `RayonPerFanout` is ftuu's
 /// per-level-4-fanout 8-way batching. `RayonBfs` is ecmn's
-/// breadth-first whole-step level-3 batching.
+/// breadth-first whole-step leaf batching.
 ///
 /// Default = `RayonBfs` (hash-thing-ite4, 2026-04-29). Promoted from
 /// `RayonPerFanout` after the 5e3e churn bench showed BFS is 1.5× faster
@@ -463,13 +463,14 @@ pub struct HashlifeStats {
     /// macro / inert / all-inert caches are tangential to the memo_hit
     /// signal). Per-step.
     pub compact_entries_kept: u64,
-    /// hash-thing-ecmn (vqke.4.1): unique BFS task count per level.
-    /// Index = level - 3. Populated only by `step_root_bfs`; zero on
-    /// Serial / RayonPerFanout strategies. Used to diagnose whether
-    /// the BFS dispatcher is actually batching meaningful work or
-    /// bottoming out on short-circuits.
+    /// hash-thing-ecmn (vqke.4.1): unique BFS task count per frontier
+    /// level. Index 0 is the active leaf level: level 3 normally, level 4
+    /// when slowed block-rule worlds need the wider base-case halo.
+    /// Populated only by `step_root_bfs`; zero on Serial / RayonPerFanout
+    /// strategies. Used to diagnose whether the BFS dispatcher is actually
+    /// batching meaningful work or bottoming out on short-circuits.
     pub bfs_tasks_by_level: [u64; 32],
-    /// hash-thing-ecmn: unique level-3 base-case misses queued for
+    /// hash-thing-ecmn: unique active-leaf base-case misses queued for
     /// the BFS rayon batch in this step. = bfs_tasks_by_level[0].
     pub bfs_level3_unique_misses: u64,
     /// hash-thing-ecmn: number of step_grid_once_pure invocations the
@@ -477,13 +478,13 @@ pub struct HashlifeStats {
     /// `RAYON_BATCH_THRESHOLD`). Per-step counter; usually 0 or 1
     /// since whole-step BFS produces one large batch.
     pub bfs_batches_parallel: u64,
-    /// hash-thing-ecmn: number of BFS level-3 batches that fell back
+    /// hash-thing-ecmn: number of BFS leaf batches that fell back
     /// to serial iter because batch size was below the rayon
     /// threshold. Tracks "BFS infrastructure ran but didn't actually
     /// parallelise" — non-zero means the threshold may be too high or
     /// the workload is short-circuit-dominated.
     pub bfs_batches_serial_fallback: u64,
-    /// hash-thing-ecmn: largest level-3 batch size observed in this
+    /// hash-thing-ecmn: largest leaf batch size observed in this
     /// step. = bfs_level3_unique_misses on the dominant path; useful
     /// once a chunked-wavefront fallback is added.
     pub bfs_max_batch_len: u64,
@@ -2620,8 +2621,10 @@ impl World {
         // hash-thing-ecmn: BFS observability tokens. Per-step values
         // come from the most-recent-step `hashlife_stats`, not the
         // lifetime accumulator, so they reflect the active step's BFS
-        // shape. `bfs_l3=0 bfs_par=0` on Serial / RayonPerFanout
-        // strategies — those paths never set the counters.
+        // shape. `bfs_l3` is a legacy label; slowed block-rule worlds use
+        // level-4 leaves under the same counter. `bfs_l3=0 bfs_par=0` on
+        // Serial / RayonPerFanout strategies — those paths never set the
+        // counters.
         let bfs_l3 = last_step.bfs_level3_unique_misses;
         let bfs_par = last_step.bfs_batches_parallel;
         let bfs_serial_fb = last_step.bfs_batches_serial_fallback;
@@ -2633,18 +2636,35 @@ impl World {
         // short-circuits + the multiplicative effect of upper-level
         // hits eliding many base cases).
         //
-        // elision = (level-3 nodes in the world) / max(L3 misses last step, 1)
-        //         = (side / 8)^3 / L3_misses
+        // elision = (leaf nodes in the world) / max(leaf misses last step, 1)
+        //         = (side / leaf_side)^3 / leaf_misses
         // A naive every-cell stepper would do (side/8)^3 base-case
-        // evaluations per step. Hashlife does only L3_misses. The ratio
+        // evaluations per step in the normal level-3 leaf regime, or
+        // (side/16)^3 when slowed block-rule worlds need level-4 leaves.
+        // Hashlife does only leaf_misses. The ratio
         // is the multiplier hashlife is buying us. >>1 means the engine
         // is paying off; ~1 means it's degenerating to brute force.
-        // Floor on `max(_, 1)` so a fully-cached step (L3 misses = 0)
+        // Floor on `max(_, 1)` so a fully-cached step (leaf misses = 0)
         // doesn't divide by zero — that's the perfect-hit case where
         // the elision factor is effectively unbounded.
-        let l3_nodes_in_world = (1u64 << (3 * self.level)).saturating_div(512);
-        let l3_misses_last = last_step.misses_by_level[0].max(1);
-        let elision_factor = l3_nodes_in_world as f64 / l3_misses_last as f64;
+        let leaf_level = if self
+            .materials
+            .block_rule_tick_divisors()
+            .iter()
+            .any(|&divisor| divisor > 1)
+        {
+            4usize
+        } else {
+            3usize
+        };
+        let leaf_cells = 1u64 << (3 * leaf_level);
+        let padded_level = self.level + 1;
+        let leaf_nodes_in_world = (1u64 << (3 * padded_level))
+            .saturating_div(leaf_cells)
+            .max(1);
+        let leaf_miss_idx = leaf_level - 3;
+        let leaf_misses_last = last_step.misses_by_level[leaf_miss_idx].max(1);
+        let elision_factor = leaf_nodes_in_world as f64 / leaf_misses_last as f64;
         format!(
             "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
             hit_rate,
