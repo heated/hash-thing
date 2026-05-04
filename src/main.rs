@@ -5648,8 +5648,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("=")
                         | winit::keyboard::Key::Character("+") => {
                             // Increase render scale (sharper, slower).
-                            if let Some(renderer) = &mut self.renderer {
-                                let w = self.window.as_ref().unwrap();
+                            if let (Some(renderer), Some(w)) = (&mut self.renderer, &self.window) {
                                 let size = w.inner_size();
                                 renderer.render_scale = next_render_scale_up(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
@@ -5658,8 +5657,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                         }
                         winit::keyboard::Key::Character("-") => {
                             // Decrease render scale (blurrier, faster).
-                            if let Some(renderer) = &mut self.renderer {
-                                let w = self.window.as_ref().unwrap();
+                            if let (Some(renderer), Some(w)) = (&mut self.renderer, &self.window) {
                                 let size = w.inner_size();
                                 renderer.render_scale =
                                     next_render_scale_down(renderer.render_scale);
