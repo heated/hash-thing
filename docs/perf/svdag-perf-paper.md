@@ -127,18 +127,19 @@ TODO-verify: L1 cache size per GPU core; most public sources report "per-cluster
 
 ### 3.2 Node encoding (from the source)
 
-Our serialized interior node is **9 u32 = 36 bytes**:
+Our serialized interior node is **11 u32 = 44 bytes**:
 - `slot[0]`: child_mask (low 8 bits = octant occupancy, bits 8-23 = representative material for LOD shading).
-- `slot[1..=8]`: eight child entries, each a packed `(is_leaf << 31) | payload`. Leaves are inline — no separate leaf-node fetch — with the 16-bit material state in `payload`.
+- `slot[1..=2]`: 64-bit grandchildren occupancy mask, split into low/high words, 8 bits per child octant.
+- `slot[3..=10]`: eight child entries, each a packed `(is_leaf << 31) | payload`. Leaves are inline — no separate leaf-node fetch — with the 16-bit material state in `payload`.
 
 Per traversal step inside the shader:
 
-1. **One dependent u32×9 load** for the current node's 36 bytes.
+1. **One dependent u32×11 load** for the current node's 44 bytes.
 2. **O(1) arithmetic** to compute the octant index from the ray's position relative to the node's midpoint.
-3. **One indexed read** into `slot[1 + octant]` — already in registers from step 1, no additional memory.
+3. **One indexed read** into `slot[3 + octant]` — already in registers from step 1, no additional memory.
 4. Branch: `is_leaf` → shade and exit; else follow `payload` (child offset) back to step 1.
 
-So one traversal step costs **~36 B of GPU memory traffic** plus a handful of ALU ops. No hash probes (unlike HashDAG); no popcount (unlike 64-tree); no contour decode (unlike ESVO).
+So one traversal step costs **~44 B of GPU memory traffic** plus a handful of ALU ops. No hash probes (unlike HashDAG); no popcount (unlike 64-tree); no contour decode (unlike ESVO).
 
 ### 3.3 Per-ray cost
 
@@ -156,7 +157,7 @@ The prior model guessed ~4 steps/ray. The measured mean is **~4× larger**. The 
 
 *Scope note:* these numbers are for the default-spawn primary-ray sample only. Secondary rays (shadows, GI) would have a different distribution; broader scene coverage would need a live-telemetry path, out of scope for stue.5.
 
-**Per-step latency.** On an integrated unified-memory GPU, a dependent u32×9 load:
+**Per-step latency.** On an integrated unified-memory GPU, a dependent u32×11 load:
 - L1 hit (same cache line as previous step, common when rays in a warp share ancestors): ~4-8 ns amortized.
 - L2 hit (shared 4 MB, hit rate high because the frontier of nodes being traversed fits): ~15-30 ns.
 - Memory miss (unlikely inside a hot frame because the reachable node set at 256³ is ≪ 4 MB — see §3.5): 150-200 ns.
@@ -167,7 +168,7 @@ Assume an 80/20 L1/L2 mix for the typical ray: `0.8 × 6 ns + 0.2 × 22 ns ≈ 9
 
 ### 3.4 Frame cost at 256³ × 50% render scale
 
-576k rays × 15 steps/ray (measured mean, §3.3) × 36 B/step = **~311 MB of node traffic per frame**.
+576k rays × 15 steps/ray (measured mean, §3.3) × 44 B/step = **~380 MB of node traffic per frame**.
 
 At 68 GB/s, this is `311 MB / 68 GB/s ≈ 4.6 ms` in bandwidth-limited form. The shader also writes 576k pixels × 8 B (Rgba16Float) = 4.6 MB per frame — another ~0.07 ms. Plus instruction-issue overhead and imperfect bandwidth utilization (realistic peak is ~60% of spec on Apple Silicon for ray-tracing workloads) gives a **predicted envelope of ≈ 7.6 ms / frame** on M1 MBA for pure SVDAG traversal + raycast write. (Pre-stue.5 this section predicted ~2 ms using a 4-step guess; measurement now pushes it upward to ~7.6 ms, *widening* the gap vs the ~0.24 ms measurement — see §3.6.)
 
@@ -175,7 +176,7 @@ At 68 GB/s, this is `311 MB / 68 GB/s ≈ 4.6 ms` in bandwidth-limited form. The
 
 ### 3.5 Working-set check
 
-At 256³ our hash-consed DAG typically has on the order of 10⁴ to 10⁵ unique interior nodes (measured on steady-state scenes; TODO-verify with a live histogram). At 36 B/node, the entire reachable DAG is **0.4 MB to 4 MB**, which fits the M1 L2. That is why we should not be seeing DRAM-latency (150 ns) loads inside the traversal hot path at this scale.
+At 256³ our hash-consed DAG typically has on the order of 10⁴ to 10⁵ unique interior nodes (measured on steady-state scenes; TODO-verify with a live histogram). At 44 B/node, the entire reachable DAG is **0.44 MB to 4.4 MB**, which fits or nearly fits the M1 L2. That is why we should not be seeing DRAM-latency (150 ns) loads inside the traversal hot path at this scale.
 
 This is the model's strongest prediction: **at 256³ the SVDAG frame-cost on M1 MBA should be bounded by L1/L2 bandwidth, not DRAM bandwidth and not compute.** If measurement shows DRAM-bound behavior, the model is wrong *or* the working set is somehow cache-thrashing.
 
@@ -353,7 +354,7 @@ The instructive finding, though, is not the null — it is the **steady-state co
 
 Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
 
-**3.10.1 Octree depth.** `log₂(4096) = 12`, vs `log₂(256) = 8` — four extra levels of descent. The SVDAG interior-node encoding (§3.2) is unchanged (36 B), so depth scaling enters the model through traversal step count (§3.10.2) and reachable-set size (§3.10.3) only.
+**3.10.1 Octree depth.** `log₂(4096) = 12`, vs `log₂(256) = 8` — four extra levels of descent. The SVDAG interior-node encoding (§3.2) is 44 B after `hash-thing-iqx7`, so depth scaling enters the model through traversal step count (§3.10.2), reachable-set size (§3.10.3), and the larger per-node traffic constant.
 
 **3.10.2 Per-ray traversal at 4096³.** The stue.5 harness measured ~15 mean DDA steps/ray at 256³ default-spawn (§3.3). Two scaling forces:
 
@@ -382,7 +383,7 @@ Implication for §3.10.5: the base-case per-frame step count is **~576k × 26 �
 | 1024³ | 61,399 | 2.11 MB | ~3.0× per 2× linear |
 | **4096³ (seeded, pre-CA)** | **548,179** | **~18.8 MB** | **~3.0× per 2× linear (projection confirmed)** |
 
-From 256³ onward the exponent is stable at `log(3)/log(2) ≈ 1.58` in linear world size. Confirmed by one-shot `bench_hashlife_4096` seed (onyx 2026-04-21): 548k reachable nodes at 4096³ seeded terrain — exactly on the `L^1.58` projection (1024³ × 4^1.58 ≈ 551k). Total serialized DAG: ~18.8 MB (548k × 36 B).
+From 256³ onward the exponent is stable at `log(3)/log(2) ≈ 1.58` in linear world size. Confirmed by one-shot `bench_hashlife_4096` seed (onyx 2026-04-21): 548k reachable nodes at 4096³ seeded terrain — exactly on the `L^1.58` projection (1024³ × 4^1.58 ≈ 551k). Total serialized DAG after `hash-thing-iqx7`: ~24.1 MB (548k × 44 B).
 
 Warm-run post-CA node count was not measured — the test runner's 60-second ignore-mode ceiling killed the first hashlife step before it completed, so the warm (post-step) reachable-node count and macro-cache size remain unmeasured at 4096³. The cold-seeded count is a lower bound; CA churn grows the reachable set by some factor (at 256³, warm grows ~8 % vs cold; scaling is not yet characterized).
 
@@ -396,7 +397,7 @@ This mix is **speculative**, not derived. The actual mix at 4096³ depends on ho
 
 §3.10.5's envelope and likely-measurement predictions are re-derived under all three scenarios (optimistic / mid / pessimistic) rather than only the mid one, so the user of this section can pick the assumption they consider most plausible.
 
-**3.10.5 Frame cost envelope at 4096³.** Holding render scale at 50 % (960×600, 576k rays) on the M1 MBA target. Per-frame node traffic (bandwidth ceiling, unaffected by cache mix), **post-cz0r measurement with default-spawn mean = 26 steps/ray**: `576k × 26 × 36 B ≈ 540 MB`, `540 MB / 68 GB/s ≈ 7.9 ms` raw, `÷ 0.6 utilization ≈ 13.2 ms` envelope. (Horizontal-mid at mean=24 gives a near-identical 12.2 ms envelope; looking-down at mean=17 gives 8.6 ms — the worst default-spawn case drives the budget.)
+**3.10.5 Frame cost envelope at 4096³.** Holding render scale at 50 % (960×600, 576k rays) on the M1 MBA target. Per-frame node traffic (bandwidth ceiling, unaffected by cache mix), **post-cz0r measurement with default-spawn mean = 26 steps/ray**: `576k × 26 × 44 B ≈ 659 MB`, `659 MB / 68 GB/s ≈ 9.7 ms` raw, `÷ 0.6 utilization ≈ 16.2 ms` envelope. (Horizontal-mid at mean=24 gives a near-identical 14.9 ms envelope; looking-down at mean=17 gives 10.8 ms — the worst default-spawn case drives the budget.)
 
 Per-step-latency path, spanning the three §3.10.4 scenarios (rays grouped into 32-wide SIMD groups on M1; the divisor assumes groups descend together so shared ancestor loads are not duplicated):
 
@@ -618,7 +619,7 @@ First pass (2026-04-20, bead `hash-thing-stue.3`, spark). Measurements from `tes
 **Measured at 256³ (terrain + water/sand, 40 warm steps):**
 
 - **Hashlife cache misses (new subtree computations): ~1,847 per step** (73,884 summed).
-- **SVDAG new-slot appends: ~544 per step** (mean 4,892 u32s/step ÷ 9 u32s per interior slot).
+- **SVDAG new-slot appends: ~544 per step** (historical 9-word slot measurement: mean 4,892 u32s/step ÷ 9 u32s per interior slot; after `hash-thing-iqx7`, the same slot count would be 5,984 u32s/step).
 - **Cache hits: ~2,222 per step** (88,899 summed), **hit rate: 54.6%**.
 - **Empty-subtree skips: ~1,670/step** (66,798 summed) — no CA work needed for empty subtrees.
 - **Fixed-point skips: ~930/step** (37,219 summed) — inert uniform subtrees that step to themselves.
@@ -696,7 +697,7 @@ The two hypotheses predict the same `surface_acquire_cpu` reduction. Disambiguat
 **Measured at 256³ (terrain + water/sand, 40 warm steps), release profile:**
 
 - **Upload bytes/step: mean 19.6 KB, max 79 KB.**
-- **New u32s appended to `Svdag::nodes` per step: mean 4,892 (~544 new 9-u32 slots), max 19,782 (~2,198 slots).**
+- **New u32s appended to `Svdag::nodes` per step: historical mean 4,892 (~544 new 9-u32 slots), max 19,782 (~2,198 slots).** After `hash-thing-iqx7`, the same slot counts are 11-u32 slots: ~5,984 mean u32s and ~24,178 max u32s.
 - **Full buffer at cold: 66,061 u32s = 258 KB (7,340 reachable nodes).** A full re-upload is 13× the mean incremental upload.
 - **Compactions fired in 40 steps: 0.** No full re-uploads happened in the measurement window.
 
@@ -778,7 +779,7 @@ Projecting to 4096³ (`L/256 = 16`) across three framings:
 - **1.08-slope pessimism (assumes saturation reverses):** `1,847 × 16^1.08 ≈ 37k misses/step`.
 - **Continued bend (assumes `256→512` slope 0.31 holds at larger scales):** as low as `2,296 × 8^0.31 ≈ 4.3k misses/step`.
 
-**Revised honest span: ~4k–40k misses/step at 4096³**, versus the prior two-point `20k–80k`. The upper end shrinks because the three-point evidence actively refutes `L^1.4+`; the lower end widens because the 512³ measurement opens the possibility of continued saturation. Applying the measured ~30 % slot-append ratio (1,847 misses → 544 SVDAG slot appends at 256³): **~1.2k–12k slot appends/step at 4096³**, translating to **~40 KB–440 KB upload per step** (4 B slot-0 header + slots × 36 B).
+**Revised honest span: ~4k–40k misses/step at 4096³**, versus the prior two-point `20k–80k`. The upper end shrinks because the three-point evidence actively refutes `L^1.4+`; the lower end widens because the 512³ measurement opens the possibility of continued saturation. Applying the measured ~30 % slot-append ratio (1,847 misses → 544 SVDAG slot appends at 256³): **~1.2k–12k slot appends/step at 4096³**, translating to **~53 KB–528 KB upload per step** (4 B slot-0 header + slots × 44 B).
 
 At 60 FPS that is **~2–26 MB/s upload**, still under 0.1 % of the 68 GB/s memory-bandwidth ceiling. **Edward's diff-compressibility hypothesis holds at 4096³** across the whole revised band — with more headroom than the prior two-point projection suggested.
 

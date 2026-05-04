@@ -6,11 +6,13 @@
 //
 // Buffer layout (dag_nodes: array<u32>):
 //   [0]:     root_offset — absolute index of the current root node's slot
-//   [1..]:   append-only stream of 9-u32 interior-node slots
+//   [1..]:   append-only stream of 11-u32 interior-node slots
 //
-// Interior node slot (9 u32s):
+// Interior node slot (11 u32s):
 //   [0]: child_mask (low 8 bits = octant occupancy, bits 8-23 = representative material)
-//   [1..=8]: child entries, where each entry is:
+//   [1]: grandchild occupancy low word, 8 bits per child octant
+//   [2]: grandchild occupancy high word, 8 bits per child octant
+//   [3..=10]: child entries, where each entry is:
 //     - bit 31 set → leaf, low 16 bits = material state
 //     - bit 31 clear → interior, value = absolute offset of child node in buffer
 //
@@ -271,6 +273,9 @@ const INV_RES: f32 = 1.0 / f32(RESOLUTION);
 // improving GPU occupancy and latency hiding. Supports worlds up to
 // 2^16 = 65536 cells/side — well beyond any practical Hashlife scale.
 const MAX_STACK: u32 = 16u;
+const GRAND_MASK_LO_WORD: u32 = 1u;
+const GRAND_MASK_HI_WORD: u32 = 2u;
+const CHILD_BASE_WORD: u32 = 3u;
 
 // hash-thing-2w5: step budget scales with root_level so deep scenes don't
 // silently black out on long sparse traversals. Must stay in lockstep with
@@ -280,6 +285,20 @@ const MAX_STACK: u32 = 16u;
 //                            diagonal worst case)
 const MIN_STEP_BUDGET: u32 = 1024u;
 const STEP_BUDGET_FUDGE: u32 = 8u;
+
+fn grand_mask_bit(lo: u32, hi: u32, child_oct: u32, grand_oct: u32) -> bool {
+    let bit = child_oct * 8u + grand_oct;
+    let word = select(lo, hi, bit >= 32u);
+    let shift = bit & 31u;
+    return (word & (1u << shift)) != 0u;
+}
+
+fn grand_mask_slice(lo: u32, hi: u32, child_oct: u32) -> u32 {
+    let bit = child_oct * 8u;
+    let word = select(lo, hi, bit >= 32u);
+    let shift = bit & 31u;
+    return (word >> shift) & 0xffu;
+}
 
 struct RayResult {
     color: vec4<f32>,
@@ -375,6 +394,8 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     var stack_min: array<vec3<f32>, MAX_STACK>;
     var stack_half: array<f32, MAX_STACK>;
     var stack_cmask: array<u32, MAX_STACK>;
+    var stack_grand_lo: array<u32, MAX_STACK>;
+    var stack_grand_hi: array<u32, MAX_STACK>;
     var depth: u32 = 0u;
 
     // Slot 0 of the buffer holds the current root offset; real slots start at 1.
@@ -383,6 +404,8 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     stack_min[0] = vec3<f32>(0.0);
     stack_half[0] = 0.5;
     stack_cmask[0] = dag_nodes[root_offset];
+    stack_grand_lo[0] = dag_nodes[root_offset + GRAND_MASK_LO_WORD];
+    stack_grand_hi[0] = dag_nodes[root_offset + GRAND_MASK_HI_WORD];
 
     // Local-frame starting t — just past the root entry. `ro_local`
     // already sits on the root face, so we nudge forward by EPS.
@@ -425,6 +448,8 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
             let node_min = stack_min[depth];
             let half = stack_half[depth];
             let cmask = stack_cmask[depth];
+            let grand_lo = stack_grand_lo[depth];
+            let grand_hi = stack_grand_hi[depth];
 
             // LOD cutoff (x5w): if this voxel is sub-pixel, use the
             // representative material packed in bits 8-23 of child_mask
@@ -517,7 +542,19 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                 break; // empty child — go to DDA
             }
 
-            let child_slot = dag_nodes[node_offset + 1u + mirrored_oct];
+            let child_min = vec3<f32>(
+                node_min.x + f32(oct & 1u) * half,
+                node_min.y + f32((oct >> 1u) & 1u) * half,
+                node_min.z + f32((oct >> 2u) & 1u) * half,
+            );
+            let grand_half = half * 0.5;
+            let grand_oct = octant_of(pos, rd_m, child_min, grand_half);
+            let mirrored_grand_oct = grand_oct ^ mirror_mask;
+            if !grand_mask_bit(grand_lo, grand_hi, mirrored_oct, mirrored_grand_oct) {
+                break; // empty grandchild — go to DDA at grandchild scale
+            }
+
+            let child_slot = dag_nodes[node_offset + CHILD_BASE_WORD + mirrored_oct];
 
             if (child_slot & LEAF_BIT) != 0u {
                 let mat = child_slot & 0xFFFFu;
@@ -626,16 +663,13 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
             } else {
                 // Interior node — descend
                 if depth + 1u >= MAX_STACK { break; }
-                let child_min = vec3<f32>(
-                    node_min.x + f32(oct & 1u) * half,
-                    node_min.y + f32((oct >> 1u) & 1u) * half,
-                    node_min.z + f32((oct >> 2u) & 1u) * half,
-                );
                 depth = depth + 1u;
                 stack_node[depth] = child_slot;
                 stack_min[depth] = child_min;
                 stack_half[depth] = half * 0.5;
                 stack_cmask[depth] = dag_nodes[child_slot];
+                stack_grand_lo[depth] = dag_nodes[child_slot + GRAND_MASK_LO_WORD];
+                stack_grand_hi[depth] = dag_nodes[child_slot + GRAND_MASK_HI_WORD];
                 descended = true;
             }
         }
@@ -647,9 +681,31 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
         // empty children of a node in one pass — major win for sparse scenes.
         // Hoist invariants — depth doesn't change within the inner loop.
         // m1f.7.3: use cached child_mask instead of re-reading from buffer.
-        let skip_mask = stack_cmask[depth];
-        let node_min_s = stack_min[depth];
-        let half_s = stack_half[depth];
+        var skip_mask = stack_cmask[depth];
+        var node_min_s = stack_min[depth];
+        var half_s = stack_half[depth];
+        var skip_depth = depth;
+        let grand_lo_s = stack_grand_lo[depth];
+        let grand_hi_s = stack_grand_hi[depth];
+        let pos0_s = (vec3<f32>(int_pos) + 0.5) * INV_RES;
+        let parent_oct = octant_of(pos0_s, rd_m, node_min_s, half_s);
+        let mirrored_parent_oct = parent_oct ^ mirror_mask;
+        let child_grand_mask = grand_mask_slice(grand_lo_s, grand_hi_s, mirrored_parent_oct);
+        if child_grand_mask != 0u {
+            let child_min0 = vec3<f32>(
+                node_min_s.x + f32(parent_oct & 1u) * half_s,
+                node_min_s.y + f32((parent_oct >> 1u) & 1u) * half_s,
+                node_min_s.z + f32((parent_oct >> 2u) & 1u) * half_s,
+            );
+            let child_half0 = half_s * 0.5;
+            let grand_oct0 = octant_of(pos0_s, rd_m, child_min0, child_half0);
+            if (child_grand_mask & (1u << (grand_oct0 ^ mirror_mask))) == 0u {
+                skip_mask = child_grand_mask;
+                node_min_s = child_min0;
+                half_s = child_half0;
+                skip_depth = depth + 1u;
+            }
+        }
         loop {
             let pos_s = (vec3<f32>(int_pos) + 0.5) * INV_RES;
             let oct_s = octant_of(pos_s, rd_m, node_min_s, half_s);
@@ -670,7 +726,7 @@ fn raycast(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
                 exit_axis = 2u;
             }
             // Integer DDA: advance int_pos on exit axis.
-            let step_cells = 1u << (MAX_DEPTH - 1u - depth);
+            let step_cells = 1u << (MAX_DEPTH - 1u - skip_depth);
             let cmin_exit = select(select(child_min_s.x, child_min_s.y, exit_axis == 1u), child_min_s.z, exit_axis == 2u);
             let octant_base = u32(cmin_exit * f32(RESOLUTION));
             let boundary_cell = octant_base + step_cells;

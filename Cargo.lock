@@ -853,6 +853,7 @@ dependencies = [
  "bytemuck",
  "ht-octree",
  "log",
+ "naga",
  "pollster",
  "rustc-hash 2.1.2",
  "wgpu",

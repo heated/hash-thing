@@ -14,6 +14,8 @@ mod wgsl_drift_guard {
     //! `METADATA_BITS` in src/octree/node.rs AND both shader files in the
     //! same change. See comments next to `material_color` in each shader.
     use ht_octree::Cell;
+    use ht_octree::NodeStore;
+    use wgpu::util::DeviceExt;
 
     const SVDAG_RAYCAST_WGSL: &str = include_str!("svdag_raycast.wgsl");
     const PARTICLE_WGSL: &str = include_str!("particle.wgsl");
@@ -243,7 +245,7 @@ mod wgsl_drift_guard {
 
     #[test]
     fn wgsl_svdag_traversal_constants_match_rust() {
-        use crate::svdag::cpu_trace;
+        use crate::svdag::{cpu_trace, CHILD_BASE_WORD, GRAND_MASK_HI_WORD, GRAND_MASK_LO_WORD};
 
         let expected_depth = format!("const MAX_DEPTH: u32 = {}u;", cpu_trace::MAX_DEPTH);
         let expected_min = format!(
@@ -280,6 +282,347 @@ mod wgsl_drift_guard {
             "svdag_raycast.wgsl must contain `{expected_stack}` — \
              MAX_STACK drifted from the CPU oracle in \
              svdag.rs::cpu_trace. Update whichever side is wrong."
+        );
+
+        let expected_grand_lo = format!("const GRAND_MASK_LO_WORD: u32 = {}u;", GRAND_MASK_LO_WORD);
+        let expected_grand_hi = format!("const GRAND_MASK_HI_WORD: u32 = {}u;", GRAND_MASK_HI_WORD);
+        let expected_child_base = format!("const CHILD_BASE_WORD: u32 = {}u;", CHILD_BASE_WORD);
+        for expected in [expected_grand_lo, expected_grand_hi, expected_child_base] {
+            assert!(
+                SVDAG_RAYCAST_WGSL.contains(&expected),
+                "svdag_raycast.wgsl must contain `{expected}` — SVDAG slot \
+                 layout constants drifted from svdag.rs."
+            );
+        }
+    }
+
+    #[test]
+    fn svdag_raycast_wgsl_validates_with_naga() {
+        let module = naga::front::wgsl::parse_str(SVDAG_RAYCAST_WGSL)
+            .expect("svdag_raycast.wgsl must parse as WGSL");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&module)
+            .expect("svdag_raycast.wgsl must pass naga validation");
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct RaycastUniforms {
+        camera_pos: [f32; 4],
+        camera_dir: [f32; 4],
+        camera_up: [f32; 4],
+        camera_right: [f32; 4],
+        params: [f32; 4],
+        debug: [f32; 4],
+    }
+
+    fn normalize(v: [f32; 3]) -> [f32; 3] {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
+
+    fn mat(id: u16) -> u16 {
+        Cell::pack(id, 0).raw()
+    }
+
+    fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            backend_options: Default::default(),
+            display: Default::default(),
+            flags: Default::default(),
+            memory_budget_thresholds: Default::default(),
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("svdag parity test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    fn shader_hits(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dag: &crate::Svdag,
+        ro: [f32; 3],
+        rd: [f32; 3],
+    ) -> bool {
+        let uniforms = RaycastUniforms {
+            camera_pos: [ro[0], ro[1], ro[2], 0.0],
+            camera_dir: [rd[0], rd[1], rd[2], 0.0],
+            camera_up: [0.0, 1.0, 0.0, 0.0],
+            camera_right: [1.0, 0.0, 0.0, 0.0],
+            params: [(1u32 << dag.root_level) as f32, 1.0, 1.0, 1.0],
+            debug: [0.0, 1.0, 1.0, 1.0],
+        };
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("svdag parity uniforms"),
+            contents: bytemuck::bytes_of(&uniforms),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let dag_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("svdag parity dag"),
+            contents: bytemuck::cast_slice(&dag.nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let palette = [[1.0f32, 1.0, 1.0, 1.0]; 16];
+        let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("svdag parity palette"),
+            contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let output = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("svdag parity output"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let output_view = output.create_view(&Default::default());
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("svdag parity layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("svdag parity bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dag_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: palette_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("svdag parity shader"),
+            source: wgpu::ShaderSource::Wgsl(SVDAG_RAYCAST_WGSL.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("svdag parity pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("svdag parity pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let padded_row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("svdag parity readback"),
+            size: padded_row,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("svdag parity encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("svdag parity pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &output,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row as u32),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .expect("svdag parity map callback")
+            .expect("svdag parity map");
+        let mapped = slice.get_mapped_range();
+        let alpha_half_bits = u16::from_le_bytes([mapped[6], mapped[7]]);
+        drop(mapped);
+        readback.unmap();
+        alpha_half_bits != 0
+    }
+
+    fn assert_shader_cpu_hit_parity(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dag: &crate::Svdag,
+        ro: [f32; 3],
+        rd: [f32; 3],
+        label: &str,
+    ) {
+        let cpu_hit = crate::cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, false)
+            .hit_cell
+            .is_some();
+        let shader_hit = shader_hits(device, queue, dag, ro, rd);
+        assert_eq!(shader_hit, cpu_hit, "{label}: shader/CPU hit parity");
+    }
+
+    #[test]
+    fn svdag_raycast_shader_matches_cpu_for_grandchild_masks() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("skipping GPU parity test: no headless adapter");
+            return;
+        };
+
+        let mut store = NodeStore::new();
+        let empty_root = store.empty(2);
+        let empty = crate::Svdag::build(&store, empty_root, 2);
+        assert_shader_cpu_hit_parity(
+            &device,
+            &queue,
+            &empty,
+            [-1.0, 0.5, 0.5],
+            [1.0, 0.0, 0.0],
+            "empty root",
+        );
+
+        let uniform_root = store.leaf(mat(3));
+        let uniform = crate::Svdag::build(&store, uniform_root, 2);
+        assert_shader_cpu_hit_parity(
+            &device,
+            &queue,
+            &uniform,
+            [-1.0, 0.5, 0.5],
+            [1.0, 0.0, 0.0],
+            "uniform root",
+        );
+
+        let mat1 = mat(1);
+        let mut root = store.empty(2);
+        root = store.set_cell(root, 1, 0, 0, mat1);
+        let dag = crate::Svdag::build(&store, root, 2);
+        assert_shader_cpu_hit_parity(
+            &device,
+            &queue,
+            &dag,
+            [-1.0, 0.125, 0.125],
+            [1.0, 0.0, 0.0],
+            "empty grandchild then occupied sibling",
+        );
+
+        let mat2 = mat(2);
+        let mut root = store.empty(2);
+        root = store.set_cell(root, 2, 3, 3, mat2);
+        let dag = crate::Svdag::build(&store, root, 2);
+        let ro = [2.0, 2.0, 2.0];
+        let target = [2.5 / 4.0, 3.5 / 4.0, 3.5 / 4.0];
+        let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
+        assert_shader_cpu_hit_parity(
+            &device,
+            &queue,
+            &dag,
+            ro,
+            rd,
+            "negative mirrored grandchild",
+        );
+
+        let mut root = store.empty(2);
+        root = store.set_cell(root, 0, 0, 2, mat2);
+        let dag = crate::Svdag::build(&store, root, 2);
+        assert_shader_cpu_hit_parity(
+            &device,
+            &queue,
+            &dag,
+            [0.125, 0.125, -1.0],
+            [0.0, 0.0, 1.0],
+            "high-word grandchild",
         );
     }
 }
