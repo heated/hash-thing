@@ -4977,12 +4977,26 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("s")
                             if self.camera_mode != CameraMode::Orbit =>
                         {
-                            log::debug!("s ignored: single-step only in Orbit mode (current=FPS)");
+                            if event.repeat {
+                                log::debug!(
+                                    "s ignored: single-step only in Orbit mode (current=FPS)"
+                                );
+                            } else {
+                                log::info!(
+                                    "s ignored: single-step only works in Orbit mode (Tab to switch camera)"
+                                );
+                            }
                         }
                         winit::keyboard::Key::Character("s") if self.is_stepping() => {
-                            log::debug!(
-                                "s ignored: single-step denied while background step is in flight"
-                            );
+                            if event.repeat {
+                                log::debug!(
+                                    "s ignored: single-step denied while background step is in flight"
+                                );
+                            } else {
+                                log::info!(
+                                    "s ignored: single-step already running; wait for the current step to finish"
+                                );
+                            }
                         }
                         winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
@@ -5222,9 +5236,15 @@ impl ApplicationHandler<AppUserEvent> for App {
                             }
                         }
                         winit::keyboard::Key::Character("p") if self.is_stepping() => {
-                            log::debug!(
-                                "p ignored: perf dump denied while background step is in flight"
-                            );
+                            if event.repeat {
+                                log::debug!(
+                                    "p ignored: perf dump denied while background step is in flight"
+                                );
+                            } else {
+                                log::info!(
+                                    "p ignored: perf dump waits for the current step to finish"
+                                );
+                            }
                         }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
