@@ -2620,8 +2620,12 @@ mod tests {
         let mut brute = World::new(4);
         let mut recur = World::new(4);
         let params = TerrainParams::default();
-        brute.seed_terrain(&params).unwrap();
-        recur.seed_terrain(&params).unwrap();
+        brute
+            .seed_terrain(&params)
+            .expect("default terrain params should seed brute baseline");
+        recur
+            .seed_terrain(&params)
+            .expect("default terrain params should seed recursive baseline");
         assert_eq!(brute.flatten(), recur.flatten(), "initial state must match");
         for _ in 0..2 {
             brute.step();
@@ -3004,8 +3008,12 @@ mod tests {
         let params = TerrainParams::default();
         let mut brute = World::new(level);
         let mut recur = World::new(level);
-        brute.seed_terrain(&params).unwrap();
-        recur.seed_terrain(&params).unwrap();
+        brute
+            .seed_terrain(&params)
+            .expect("default terrain params should seed brute benchmark baseline");
+        recur
+            .seed_terrain(&params)
+            .expect("default terrain params should seed recursive benchmark baseline");
 
         // Brute-force timing.
         let t0 = Instant::now();
@@ -3420,7 +3428,9 @@ mod tests {
 
         let mut world = World::new(7);
         let params = TerrainParams::for_level(7);
-        world.seed_terrain(&params).unwrap();
+        world
+            .seed_terrain(&params)
+            .expect("level-7 terrain params should seed column gap-fill baseline");
         world.seed_water_and_sand();
 
         const GENS: u32 = 16;
