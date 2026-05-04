@@ -85,6 +85,9 @@ const SOUP_PROSPECTOR_TILE: i64 = 16;
 const SOUP_PROSPECTOR_SIDE: i64 = 8;
 const SOUP_PROSPECTOR_DENSITY_PER_1000: u64 = 45;
 const SOUP_PROSPECTOR_ALIVE: ht_octree::CellState = hash_thing::octree::Cell::pack(1, 0).raw();
+const MEGASTRUCTURE_MODULE_SIDE: i64 = 8;
+const MEGASTRUCTURE_TILE_STRIDE: i64 = 16;
+const MEGASTRUCTURE_INITIAL_STAMPS: usize = 10;
 const SOUP_PROSPECTOR_PATTERN_SEEDS: [u64; 3] = [
     0x5eed_0001_8a55_5003,
     0x5eed_0002_8a55_5003,
@@ -694,6 +697,7 @@ enum PendingSceneSwap {
     LoadQuarantineAtlas,
     LoadQuarantineAtlasMixed,
     LoadSoupProspector,
+    LoadMegastructureStamp,
     LoadDemoSpectacle,
     ResetGolSmoke,
     SelectLatticeBeat(LatticeDemoBeat),
@@ -710,6 +714,7 @@ impl PendingSceneSwap {
             Self::LoadQuarantineAtlas => "quarantine_atlas",
             Self::LoadQuarantineAtlasMixed => "quarantine_atlas_mixed",
             Self::LoadSoupProspector => "soup_prospector",
+            Self::LoadMegastructureStamp => "megastructure_stamp",
             Self::LoadDemoSpectacle => "demo_spectacle",
             Self::ResetGolSmoke => "gol_smoke_reset",
             Self::SelectLatticeBeat(LatticeDemoBeat::Intro) => "lattice_beat_intro",
@@ -732,6 +737,7 @@ impl PendingSceneSwap {
             | Self::LoadQuarantineAtlas
             | Self::LoadQuarantineAtlasMixed
             | Self::LoadSoupProspector
+            | Self::LoadMegastructureStamp
             | Self::LoadDemoSpectacle
             | Self::ResetGolSmoke
             | Self::SelectLatticeBeat(_) => true,
@@ -1011,6 +1017,19 @@ struct SoupProspectorState {
     pop_history: HashMap<[i64; 3], Vec<SoupTilePopSample>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MegastructureStampState {
+    stamps_placed: usize,
+    floor_y: i64,
+    last_stamp_origin: Option<[i64; 3]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MegastructureStampResult {
+    written: usize,
+    changed: usize,
+}
+
 impl SoupProspectorState {
     fn new(focus_tile: [i64; 3], tile_min: [i64; 3], tile_max: [i64; 3]) -> Self {
         Self {
@@ -1034,6 +1053,7 @@ struct App {
     gol_smoke_scene: bool,
     quarantine_atlas: Option<QuarantineAtlasState>,
     soup_prospector: Option<SoupProspectorState>,
+    megastructure_stamp: Option<MegastructureStampState>,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -1153,6 +1173,9 @@ struct App {
     /// catalog the current aimed soup tile, reuse it into a distinct tile,
     /// run one sync retest step, then capture.
     dump_soup_reuse: bool,
+    /// Dump-frame diagnostic for Megastructure Stamp acceptance artifacts:
+    /// place one additional module after scene setup and before capture.
+    dump_megastructure_stamp: bool,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -1611,6 +1634,53 @@ fn seed_soup_tile(world: &mut sim::World, tile: [i64; 3], seed: u64) -> usize {
     placed
 }
 
+fn stamp_megastructure_module(
+    world: &mut sim::World,
+    origin: [i64; 3],
+) -> MegastructureStampResult {
+    let mut written = 0;
+    let mut changed = 0;
+    for dz in 0..MEGASTRUCTURE_MODULE_SIDE {
+        for dy in 0..MEGASTRUCTURE_MODULE_SIDE {
+            for dx in 0..MEGASTRUCTURE_MODULE_SIDE {
+                let shell = dx == 0
+                    || dy == 0
+                    || dz == 0
+                    || dx == MEGASTRUCTURE_MODULE_SIDE - 1
+                    || dy == MEGASTRUCTURE_MODULE_SIDE - 1
+                    || dz == MEGASTRUCTURE_MODULE_SIDE - 1;
+                let lattice = dx == dy || dy == dz || (dx + dy + dz) % 5 == 0;
+                if shell || lattice {
+                    let x = sim::WorldCoord(origin[0] + dx);
+                    let y = sim::WorldCoord(origin[1] + dy);
+                    let z = sim::WorldCoord(origin[2] + dz);
+                    if world.get(x, y, z) != SOUP_PROSPECTOR_ALIVE {
+                        changed += 1;
+                    }
+                    world.set(x, y, z, SOUP_PROSPECTOR_ALIVE);
+                    written += 1;
+                }
+            }
+        }
+    }
+    MegastructureStampResult { written, changed }
+}
+
+fn snap_megastructure_stamp_origin(pos: [i64; 3]) -> [i64; 3] {
+    [
+        pos[0].div_euclid(MEGASTRUCTURE_TILE_STRIDE) * MEGASTRUCTURE_TILE_STRIDE,
+        pos[1],
+        pos[2].div_euclid(MEGASTRUCTURE_TILE_STRIDE) * MEGASTRUCTURE_TILE_STRIDE,
+    ]
+}
+
+fn megastructure_stamp_in_bounds(side: i64, origin: [i64; 3]) -> bool {
+    origin.iter().all(|coord| *coord >= 0)
+        && origin[0] + MEGASTRUCTURE_MODULE_SIDE <= side
+        && origin[1] + MEGASTRUCTURE_MODULE_SIDE <= side
+        && origin[2] + MEGASTRUCTURE_MODULE_SIDE <= side
+}
+
 fn frame_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
     let origin = soup_tile_origin(world.origin, tile);
     let marker = hash_thing::terrain::materials::METAL;
@@ -1980,6 +2050,7 @@ impl App {
             gol_smoke_scene: false,
             quarantine_atlas: None,
             soup_prospector: None,
+            megastructure_stamp: None,
             svdag: render::Svdag::new(),
             paused: false,
             log_timer: std::time::Instant::now(),
@@ -2019,6 +2090,7 @@ impl App {
             dump_steps_remaining: 0,
             dump_soup_catalog: false,
             dump_soup_reuse: false,
+            dump_megastructure_stamp: false,
             step_pending: false,
             world_prefetch_pending: false,
             next_world_prefetch_generation: 0,
@@ -2736,6 +2808,7 @@ impl App {
     }
 
     fn run_sync_dump_step(&mut self) {
+        let step_started = std::time::Instant::now();
         self.clear_soup_prospector_markers_for_step();
         if self.dump_frame_path.is_some() {
             log::info!(
@@ -2743,9 +2816,17 @@ impl App {
                 count_new_lava_stamp_targets(&self.world, &self.world.queue)
             );
         }
+        let apply_started = std::time::Instant::now();
         self.world.apply_mutations();
+        self.perf.record("step_apply_mut", apply_started.elapsed());
+        let spawn_started = std::time::Instant::now();
         self.world.spawn_clones();
+        self.perf
+            .record("step_spawn_clones", spawn_started.elapsed());
+        let recursive_started = std::time::Instant::now();
         self.world.step_recursive();
+        self.perf
+            .record("step_recursive", recursive_started.elapsed());
         let mut queue = std::mem::take(&mut self.world.queue);
         self.entities.update(&self.world, &mut queue);
         if self.dump_frame_path.is_some() {
@@ -2755,6 +2836,7 @@ impl App {
             );
         }
         self.world.queue = queue;
+        self.perf.record("step", step_started.elapsed());
         self.mark_world_changed();
         self.refresh_memo_summary_after_world_update();
     }
@@ -3028,6 +3110,9 @@ impl App {
         if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadSoupProspector) {
             self.exit_soup_prospector_mode();
         }
+        if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadMegastructureStamp) {
+            self.exit_megastructure_stamp_mode();
+        }
         match swap {
             PendingSceneSwap::LoadLatticeDemo => {
                 let _ = self.load_lattice_demo();
@@ -3043,6 +3128,7 @@ impl App {
                 self.load_quarantine_atlas_mixed_containment_demo()
             }
             PendingSceneSwap::LoadSoupProspector => self.load_soup_prospector_demo(),
+            PendingSceneSwap::LoadMegastructureStamp => self.load_megastructure_stamp_demo(),
             PendingSceneSwap::LoadDemoSpectacle => {
                 self.load_demo_spectacle("Reset spectacle gallery")
             }
@@ -3084,6 +3170,7 @@ impl App {
         mode: CameraMode,
         quarantine_atlas_active: bool,
         soup_prospector_active: bool,
+        megastructure_stamp_active: bool,
     ) -> Vec<&'static str> {
         match mode {
             CameraMode::FirstPerson => {
@@ -3094,6 +3181,12 @@ impl App {
                         "  1-3         Soup seed",
                         "  C           Catalog tile",
                         "  E           Reuse last",
+                    ]
+                } else if megastructure_stamp_active {
+                    vec![
+                        "  LClick      Disabled",
+                        "  RClick      Stamp module",
+                        "  P           Perf + DAG",
                     ]
                 } else if quarantine_atlas_active {
                     vec![
@@ -3126,6 +3219,7 @@ impl App {
                         "  R  Reset      G  GoL bloom",
                         "  M  Gyroid     Q  Quarantine",
                         "  Y  Soup prospect",
+                        "  X  Module stamps",
                         "  N  Lattice walk",
                         "  V  Panorama reveal",
                         "  [/] U/I/O  DEV jumps (Tab for orbit)",
@@ -3153,6 +3247,7 @@ impl App {
                 "  R  Reset      G  GoL bloom",
                 "  M  Gyroid     Q  Quarantine",
                 "  Y  Soup prospect",
+                "  X  Module stamps",
                 "  N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
@@ -3200,6 +3295,8 @@ impl App {
     fn demo_scene_coord(&self) -> &'static str {
         if self.soup_prospector.is_some() {
             "soup-search"
+        } else if self.megastructure_stamp.is_some() {
+            "megastructure-stamp"
         } else if self.quarantine_atlas.is_some() {
             "quarantine-atlas"
         } else if self.current_demo_beat.is_some() {
@@ -3395,6 +3492,12 @@ impl App {
                 pitch: 0.30,
                 dist: 0.78,
             }),
+            DumpPose::MegastructureStamp => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.30, 0.42],
+                yaw: -std::f32::consts::FRAC_PI_2,
+                pitch: 0.34,
+                dist: 0.72,
+            }),
             DumpPose::Geyser => self.apply_orbit_camera_pose(OrbitCameraPose {
                 target: [0.28, 0.35, 0.59],
                 yaw: std::f32::consts::FRAC_PI_2,
@@ -3408,7 +3511,10 @@ impl App {
                 dist: 0.30,
             }),
         }
-        if pose == DumpPose::QuarantineAtlas {
+        if matches!(
+            pose,
+            DumpPose::QuarantineAtlas | DumpPose::MegastructureStamp
+        ) {
             self.legend_visible = false;
             self.legend_dirty = true;
         }
@@ -3503,6 +3609,10 @@ impl App {
             log::info!("Quarantine Atlas carve disabled; use 1-3 plus right-click stamps");
             return;
         }
+        if self.megastructure_stamp.is_some() {
+            log::info!("Megastructure Stamp carve disabled; right-click places modules");
+            return;
+        }
         let Some((eye, dir)) = self.player_eye_ray() else {
             return;
         };
@@ -3542,6 +3652,10 @@ impl App {
         }
         if self.quarantine_atlas.is_some() {
             self.deploy_quarantine_atlas_pattern();
+            return;
+        }
+        if self.megastructure_stamp.is_some() {
+            self.deploy_megastructure_stamp();
             return;
         }
         let pid = self.player_id;
@@ -3654,6 +3768,66 @@ impl App {
             center,
             interventions_remaining
         );
+        true
+    }
+
+    fn deploy_megastructure_stamp(&mut self) -> bool {
+        if self.is_stepping() {
+            return false;
+        }
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return false;
+        };
+        let Some((_hit, prev)) = player::raycast_cells(&self.world, eye, dir) else {
+            return false;
+        };
+        let mut origin = snap_megastructure_stamp_origin(prev);
+        if let Some(state) = self.megastructure_stamp.as_ref() {
+            origin[1] = state.floor_y + 1;
+        }
+        if !megastructure_stamp_in_bounds(self.world.side() as i64, origin) {
+            log::info!("Megastructure Stamp out of bounds at {:?}", origin);
+            return false;
+        }
+        self.deploy_megastructure_stamp_at_origin(origin)
+    }
+
+    fn deploy_megastructure_stamp_at_origin(&mut self, origin: [i64; 3]) -> bool {
+        if self.is_stepping() || !megastructure_stamp_in_bounds(self.world.side() as i64, origin) {
+            return false;
+        }
+        let stamp = stamp_megastructure_module(&mut self.world, origin);
+        self.mark_world_changed();
+        if let Some(state) = self.megastructure_stamp.as_mut() {
+            if stamp.changed > 0 {
+                state.stamps_placed += 1;
+            }
+            state.last_stamp_origin = Some(origin);
+            log::info!(
+                "Megastructure module stamped at {:?}: cells={} changed={} total_stamps={}",
+                origin,
+                stamp.written,
+                stamp.changed,
+                state.stamps_placed
+            );
+        }
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.refresh_memo_summary_after_world_update();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
         true
     }
 
@@ -3943,6 +4117,12 @@ impl App {
             self.legend_dirty = true;
         }
         self.pending_soup_action = None;
+    }
+
+    fn exit_megastructure_stamp_mode(&mut self) {
+        if self.megastructure_stamp.take().is_some() {
+            self.legend_dirty = true;
+        }
     }
 
     fn aimed_soup_tile(&self) -> Option<[i64; 3]> {
@@ -4447,6 +4627,91 @@ impl App {
             elapsed.as_secs_f64() * 1000.0,
             stats.total_collapses(),
             stats.classify_calls,
+        );
+    }
+
+    fn load_megastructure_stamp_demo(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        if self.volume_size < 128 {
+            log::info!(
+                "Megastructure Stamp requires SIZE >= 128 (current {})",
+                self.volume_size
+            );
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world
+            .set_gol_smoke_rule(sim::GameOfLife3D::new(0, 6, 1, 3));
+        let side = self.world.side() as i64;
+        let floor_y = side / 4;
+        for z in 0..side {
+            for x in 0..side {
+                self.world.set(
+                    sim::WorldCoord(x),
+                    sim::WorldCoord(floor_y),
+                    sim::WorldCoord(z),
+                    hash_thing::terrain::materials::GRASS,
+                );
+            }
+        }
+        let mut stamps = 0;
+        'stamps: for z in (8..side - 8).step_by(MEGASTRUCTURE_TILE_STRIDE as usize) {
+            for x in (8..side - 8).step_by(MEGASTRUCTURE_TILE_STRIDE as usize) {
+                stamp_megastructure_module(&mut self.world, [x, floor_y + 1, z]);
+                stamps += 1;
+                if stamps == MEGASTRUCTURE_INITIAL_STAMPS {
+                    break 'stamps;
+                }
+            }
+        }
+        self.mark_world_changed();
+        self.reset_scene_entities();
+        self.reset_player_pose(
+            [side as f64 * 0.5, floor_y as f64 + 8.0, side as f64 * 0.72],
+            std::f64::consts::PI,
+            -0.25,
+        );
+        self.gol_smoke_scene = false;
+        self.quarantine_atlas = None;
+        self.soup_prospector = None;
+        self.pending_soup_action = None;
+        self.megastructure_stamp = Some(MegastructureStampState {
+            stamps_placed: stamps,
+            floor_y,
+            last_stamp_origin: None,
+        });
+        self.paused = false;
+        self.legend_dirty = true;
+        self.reset_scene_perf_state();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
+        }
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.sync_render_cache();
+        self.exit_lattice_demo_mode();
+        self.apply_current_player_camera_pose();
+        log::info!(
+            "Megastructure Stamp: pop={} gen={:.1}ms stamps={} svdag_nodes={} svdag_kb={}",
+            self.world.population(),
+            start.elapsed().as_secs_f64() * 1000.0,
+            stamps,
+            self.svdag.node_count,
+            self.svdag.byte_size() / 1024,
         );
     }
 
@@ -5095,6 +5360,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("y") => {
                             self.request_scene_swap(PendingSceneSwap::LoadSoupProspector);
                         }
+                        winit::keyboard::Key::Character("x") => {
+                            self.request_scene_swap(PendingSceneSwap::LoadMegastructureStamp);
+                        }
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
                         }
@@ -5323,6 +5591,10 @@ impl ApplicationHandler<AppUserEvent> for App {
                         // FPS mode: left click = break block.
                         if self.soup_prospector.is_some() {
                             log::info!("Soup Prospector carve disabled; use 1-3 to place soups and C to catalog");
+                        } else if self.megastructure_stamp.is_some() {
+                            log::info!(
+                                "Megastructure Stamp carve disabled; right-click places modules"
+                            );
                         } else if self.is_stepping() {
                             self.pending_player_action = Some(PendingPlayerAction::Break);
                         } else {
@@ -5341,6 +5613,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.pending_player_action = Some(PendingPlayerAction::Place);
                         } else {
                             self.deploy_quarantine_atlas_pattern();
+                        }
+                    } else if self.megastructure_stamp.is_some() {
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::Place);
+                        } else {
+                            self.deploy_megastructure_stamp();
                         }
                     } else if self.keys_held.contains(&KeyCode::ControlLeft)
                         || self.keys_held.contains(&KeyCode::ControlRight)
@@ -5483,6 +5761,25 @@ impl ApplicationHandler<AppUserEvent> for App {
                     self.reuse_latest_soup_catalog_entry(true);
                     self.mark_resume_edge();
                 }
+                if self.dump_frame_path.is_some() && self.dump_megastructure_stamp {
+                    self.dump_megastructure_stamp = false;
+                    let origin = self
+                        .megastructure_stamp
+                        .as_ref()
+                        .map(|state| [88, state.floor_y + 1, 88]);
+                    if let Some(origin) = origin {
+                        log::info!(
+                            "--dump-megastructure-stamp: placing scripted module at {:?} before capture",
+                            origin
+                        );
+                        self.deploy_megastructure_stamp_at_origin(origin);
+                    } else {
+                        log::info!(
+                            "--dump-megastructure-stamp ignored; megastructure scene is not active"
+                        );
+                    }
+                    self.mark_resume_edge();
+                }
                 if let Some(pose) = self.dump_pose.take() {
                     self.apply_dump_pose(pose);
                     self.mark_resume_edge();
@@ -5606,6 +5903,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                                 self.camera_mode,
                                 self.quarantine_atlas.is_some(),
                                 self.soup_prospector.is_some(),
+                                self.megastructure_stamp.is_some(),
                             ));
                         }
                     }
@@ -5918,6 +6216,16 @@ impl ApplicationHandler<AppUserEvent> for App {
                             pixels.height,
                             path.display(),
                         );
+                        let nodes = self.world.store.stats();
+                        self.mem_stats.update(nodes);
+                        let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
+                        self.emit_demo_perf_trail(
+                            false,
+                            Some(self.world.generation),
+                            Some(self.world.population()),
+                            Some(self.mem_stats.summary()),
+                            Some((svdag_nodes, svdag_bytes, svdag_root_level)),
+                        );
                         event_loop.exit();
                         return;
                     }
@@ -6018,6 +6326,7 @@ enum DumpScene {
     QuarantineAtlas,
     QuarantineAtlasMixed,
     SoupProspector,
+    MegastructureStamp,
     LatticeBeat(LatticeDemoBeat),
 }
 
@@ -6031,6 +6340,7 @@ impl DumpScene {
             "quarantine-atlas" => Some(Self::QuarantineAtlas),
             "quarantine-atlas-mixed" => Some(Self::QuarantineAtlasMixed),
             "soup-prospector" => Some(Self::SoupProspector),
+            "megastructure-stamp" => Some(Self::MegastructureStamp),
             "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
             "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
             "lattice-panorama" => Some(Self::LatticeBeat(LatticeDemoBeat::Panorama)),
@@ -6047,6 +6357,7 @@ impl DumpScene {
             Self::QuarantineAtlas => PendingSceneSwap::LoadQuarantineAtlas,
             Self::QuarantineAtlasMixed => PendingSceneSwap::LoadQuarantineAtlasMixed,
             Self::SoupProspector => PendingSceneSwap::LoadSoupProspector,
+            Self::MegastructureStamp => PendingSceneSwap::LoadMegastructureStamp,
             Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
         }
     }
@@ -6060,6 +6371,7 @@ impl DumpScene {
             Self::QuarantineAtlas => "quarantine-atlas",
             Self::QuarantineAtlasMixed => "quarantine-atlas-mixed",
             Self::SoupProspector => "soup-prospector",
+            Self::MegastructureStamp => "megastructure-stamp",
             Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
             Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
             Self::LatticeBeat(LatticeDemoBeat::Panorama) => "lattice-panorama",
@@ -6077,6 +6389,7 @@ enum DumpPose {
     Blocks,
     TerrainWide,
     QuarantineAtlas,
+    MegastructureStamp,
     Geyser,
     Volcano,
 }
@@ -6088,6 +6401,7 @@ impl DumpPose {
             "blocks" => Some(Self::Blocks),
             "terrain-wide" => Some(Self::TerrainWide),
             "quarantine-atlas" => Some(Self::QuarantineAtlas),
+            "megastructure-stamp" => Some(Self::MegastructureStamp),
             "geyser" => Some(Self::Geyser),
             "volcano" => Some(Self::Volcano),
             _ => None,
@@ -6100,6 +6414,7 @@ impl DumpPose {
             Self::Blocks => "blocks",
             Self::TerrainWide => "terrain-wide",
             Self::QuarantineAtlas => "quarantine-atlas",
+            Self::MegastructureStamp => "megastructure-stamp",
             Self::Geyser => "geyser",
             Self::Volcano => "volcano",
         }
@@ -6214,6 +6529,9 @@ struct ParsedArgs {
     /// `--dump-soup-reuse`: dump-frame-only acceptance helper. Catalogs,
     /// reuses, and retests the current Soup Prospector target before capture.
     dump_soup_reuse: bool,
+    /// `--dump-megastructure-stamp`: dump-frame-only acceptance helper.
+    /// Places one Megastructure Stamp module before capture.
+    dump_megastructure_stamp: bool,
 }
 
 /// Parse `[SIZE] [--demo | --res VALUE] [--focused] [--dump-frame PATH]` from an arg
@@ -6236,13 +6554,13 @@ where
 {
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|4k|WxH] [--focused] \
                          [--dump-frame PATH] \
-                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|quarantine-atlas-mixed|soup-prospector|lattice-intro|lattice-interior|lattice-panorama] \
-                         [--dump-pose wall|blocks|terrain-wide|quarantine-atlas|geyser|volcano] \
+                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|quarantine-atlas-mixed|soup-prospector|megastructure-stamp|lattice-intro|lattice-interior|lattice-panorama] \
+                         [--dump-pose wall|blocks|terrain-wide|quarantine-atlas|megastructure-stamp|geyser|volcano] \
                          [--dump-debug normal-axis|hit-kind|material] \
                          [--dump-layer composite|world|particles] \
                          [--dump-lod-bias VALUE] \
                          [--dump-steps N] \
-                         [--dump-soup-catalog] [--dump-soup-reuse]";
+                         [--dump-soup-catalog] [--dump-soup-reuse] [--dump-megastructure-stamp]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
     let mut focused: bool = false;
@@ -6256,6 +6574,7 @@ where
     let mut dump_steps: Option<u32> = None;
     let mut dump_soup_catalog = false;
     let mut dump_soup_reuse = false;
+    let mut dump_megastructure_stamp = false;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
@@ -6407,6 +6726,12 @@ where
                 }
                 dump_soup_reuse = true;
             }
+            "--dump-megastructure-stamp" => {
+                if dump_megastructure_stamp {
+                    panic!("{USAGE}\nmore than one --dump-megastructure-stamp");
+                }
+                dump_megastructure_stamp = true;
+            }
             other => {
                 let n: u32 = other
                     .parse()
@@ -6455,6 +6780,12 @@ where
     if dump_soup_reuse && dump_scene != Some(DumpScene::SoupProspector) {
         panic!("{USAGE}\n--dump-soup-reuse requires --dump-scene soup-prospector");
     }
+    if dump_megastructure_stamp && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-megastructure-stamp requires --dump-frame");
+    }
+    if dump_megastructure_stamp && dump_scene != Some(DumpScene::MegastructureStamp) {
+        panic!("{USAGE}\n--dump-megastructure-stamp requires --dump-scene megastructure-stamp");
+    }
     let volume_size_explicit = volume_size.is_some();
     let render_scale_override = if demo {
         Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
@@ -6476,6 +6807,7 @@ where
         dump_steps: dump_steps.unwrap_or(0),
         dump_soup_catalog,
         dump_soup_reuse,
+        dump_megastructure_stamp,
     }
 }
 
@@ -6512,6 +6844,7 @@ fn main() {
     log::info!("  B: reset spectacle gallery");
     log::info!("  M: reset gyroid megastructure");
     log::info!("  Y: Soup Prospector discovery prototype");
+    log::info!("  X: Megastructure module stamping prototype");
     log::info!("  N: lattice walk-through demo");
     log::info!("  [/] DEV previous/next lattice jump (orbit mode)");
     log::info!("  U/I/O: DEV intro/interior/reveal lattice jumps (orbit mode)");
@@ -6538,6 +6871,7 @@ fn main() {
         dump_steps,
         dump_soup_catalog,
         dump_soup_reuse,
+        dump_megastructure_stamp,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
@@ -6605,6 +6939,9 @@ fn main() {
             "--dump-soup-reuse: will catalog, reuse, and retest the aimed soup tile before dump-frame render"
         );
     }
+    if dump_megastructure_stamp {
+        log::info!("--dump-megastructure-stamp: will place one module before dump-frame render");
+    }
 
     // Single source of truth for focus-on-launch. Two downstream sites
     // both consume this: the macOS event-loop builder (must be set BEFORE
@@ -6663,6 +7000,7 @@ fn main() {
     app.dump_steps_remaining = dump_steps;
     app.dump_soup_catalog = dump_soup_catalog;
     app.dump_soup_reuse = dump_soup_reuse;
+    app.dump_megastructure_stamp = dump_megastructure_stamp;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -7209,6 +7547,7 @@ mod tests {
             ("quarantine-atlas", DumpScene::QuarantineAtlas),
             ("quarantine-atlas-mixed", DumpScene::QuarantineAtlasMixed),
             ("soup-prospector", DumpScene::SoupProspector),
+            ("megastructure-stamp", DumpScene::MegastructureStamp),
             (
                 "lattice-intro",
                 DumpScene::LatticeBeat(LatticeDemoBeat::Intro),
@@ -7234,6 +7573,7 @@ mod tests {
             ("blocks", DumpPose::Blocks),
             ("terrain-wide", DumpPose::TerrainWide),
             ("quarantine-atlas", DumpPose::QuarantineAtlas),
+            ("megastructure-stamp", DumpPose::MegastructureStamp),
             ("geyser", DumpPose::Geyser),
             ("volcano", DumpPose::Volcano),
         ] {
@@ -7276,6 +7616,18 @@ mod tests {
             "--dump-soup-reuse",
         ]);
         assert!(r.dump_soup_reuse);
+    }
+
+    #[test]
+    fn parse_args_from_dump_megastructure_stamp() {
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "megastructure-stamp",
+            "--dump-megastructure-stamp",
+        ]);
+        assert!(r.dump_megastructure_stamp);
     }
 
     #[test]
@@ -7354,6 +7706,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "--dump-megastructure-stamp requires --dump-frame")]
+    fn parse_args_from_dump_megastructure_stamp_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-megastructure-stamp"]);
+    }
+
+    #[test]
     #[should_panic(expected = "--dump-soup-catalog requires --dump-scene soup-prospector")]
     fn parse_args_from_dump_soup_catalog_without_soup_scene_panics() {
         let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-soup-catalog"]);
@@ -7363,6 +7721,14 @@ mod tests {
     #[should_panic(expected = "--dump-soup-reuse requires --dump-scene soup-prospector")]
     fn parse_args_from_dump_soup_reuse_without_soup_scene_panics() {
         let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-soup-reuse"]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "--dump-megastructure-stamp requires --dump-scene megastructure-stamp"
+    )]
+    fn parse_args_from_dump_megastructure_stamp_without_megastructure_scene_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-megastructure-stamp"]);
     }
 
     #[test]
@@ -7544,6 +7910,19 @@ mod tests {
             "soup-prospector",
             "--dump-soup-reuse",
             "--dump-soup-reuse",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-megastructure-stamp")]
+    fn parse_args_from_two_dump_megastructure_stamp_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "megastructure-stamp",
+            "--dump-megastructure-stamp",
+            "--dump-megastructure-stamp",
         ]);
     }
 
@@ -7985,6 +8364,7 @@ mod tests {
         assert!(PendingSceneSwap::LoadQuarantineAtlas.discards_world());
         assert!(PendingSceneSwap::LoadQuarantineAtlasMixed.discards_world());
         assert!(PendingSceneSwap::LoadSoupProspector.discards_world());
+        assert!(PendingSceneSwap::LoadMegastructureStamp.discards_world());
         assert!(PendingSceneSwap::LoadDemoSpectacle.discards_world());
         assert!(PendingSceneSwap::ResetGolSmoke.discards_world());
         assert!(PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Intro).discards_world());
@@ -8438,7 +8818,7 @@ mod tests {
 
     #[test]
     fn first_person_legend_notes_lattice_debug_jumps() {
-        let lines = App::legend_lines(CameraMode::FirstPerson, false, false);
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, false, false);
         assert!(lines.iter().any(|line| line.contains("Space       Leap")));
         assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
@@ -8468,7 +8848,7 @@ mod tests {
 
     #[test]
     fn orbit_legend_marks_lattice_jumps_as_debug() {
-        let lines = App::legend_lines(CameraMode::Orbit, false, false);
+        let lines = App::legend_lines(CameraMode::Orbit, false, false, false);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
         assert!(lines
             .iter()
@@ -8490,7 +8870,7 @@ mod tests {
 
     #[test]
     fn quarantine_atlas_legend_removes_hand_edit_controls() {
-        let lines = App::legend_lines(CameraMode::FirstPerson, true, false);
+        let lines = App::legend_lines(CameraMode::FirstPerson, true, false, false);
 
         assert!(lines.iter().any(|line| line.contains("RClick      Stamp")));
         assert!(lines
@@ -8503,7 +8883,7 @@ mod tests {
 
     #[test]
     fn soup_prospector_legend_exposes_seed_place_and_catalog() {
-        let lines = App::legend_lines(CameraMode::FirstPerson, false, true);
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, true, false);
 
         assert!(lines
             .iter()
@@ -8518,6 +8898,84 @@ mod tests {
             .iter()
             .any(|line| line.contains("E           Reuse last")));
         assert!(!lines.iter().any(|line| line.contains("Clone source")));
+    }
+
+    #[test]
+    fn megastructure_stamp_legend_exposes_module_stamping() {
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, false, true);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("RClick      Stamp module")));
+        assert!(lines.iter().any(|line| line.contains("P           Perf")));
+        assert!(!lines.iter().any(|line| line.contains("Clone source")));
+    }
+
+    #[test]
+    fn megastructure_stamp_helpers_snap_and_bound_module_origins() {
+        assert_eq!(snap_megastructure_stamp_origin([31, 99, -1]), [16, 99, -16]);
+        assert!(megastructure_stamp_in_bounds(128, [120, 32, 120]));
+        assert!(!megastructure_stamp_in_bounds(128, [121, 32, 120]));
+        assert!(!megastructure_stamp_in_bounds(128, [-1, 32, 120]));
+    }
+
+    #[test]
+    fn megastructure_stamp_reports_duplicate_overwrites() {
+        let mut world = sim::World::new(7);
+        let first = stamp_megastructure_module(&mut world, [16, 32, 16]);
+        let second = stamp_megastructure_module(&mut world, [16, 32, 16]);
+
+        assert!(first.written > 0);
+        assert_eq!(first.written, second.written);
+        assert_eq!(first.changed, first.written);
+        assert_eq!(second.changed, 0);
+    }
+
+    #[test]
+    fn megastructure_stamp_scene_loads_playable_state() {
+        let mut app = App::new(128);
+
+        app.load_megastructure_stamp_demo();
+
+        let state = app
+            .megastructure_stamp
+            .expect("megastructure stamp mode should be active");
+        assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS);
+        assert_eq!(state.floor_y, 32);
+        assert_eq!(state.last_stamp_origin, None);
+        assert_eq!(app.world.generation, 0);
+        assert!(!app.paused);
+        assert_eq!(app.camera_mode, CameraMode::FirstPerson);
+        assert!(app.player_id.is_some());
+        assert!(app.world.population() > 128 * 128);
+    }
+
+    #[test]
+    fn megastructure_stamp_scene_advances_simulation_after_load() {
+        let mut app = App::new(128);
+
+        app.load_megastructure_stamp_demo();
+        let initial_population = app.world.population();
+        app.run_sync_dump_step();
+
+        assert_eq!(app.world.generation, 1);
+        assert_ne!(app.world.population(), initial_population);
+        assert_eq!(app.demo_scene_coord(), "megastructure-stamp");
+        assert!(app.perf.summary().contains("step"));
+    }
+
+    #[test]
+    fn megastructure_stamp_scripted_deploy_adds_one_module() {
+        let mut app = App::new(128);
+
+        app.load_megastructure_stamp_demo();
+        let before_population = app.world.population();
+        assert!(app.deploy_megastructure_stamp_at_origin([88, 33, 88]));
+
+        let state = app.megastructure_stamp.expect("mode remains active");
+        assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS + 1);
+        assert_eq!(state.last_stamp_origin, Some([88, 33, 88]));
+        assert!(app.world.population() > before_population);
     }
 
     #[test]
