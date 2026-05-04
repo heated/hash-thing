@@ -2503,6 +2503,16 @@ impl App {
         }
     }
 
+    fn title_fps(&self) -> f64 {
+        self.perf
+            .stats("frame_total")
+            .and_then(|(_, p95, _)| {
+                let secs = p95.as_secs_f64();
+                (secs > 0.0).then_some(1.0 / secs)
+            })
+            .unwrap_or(self.smoothed_fps)
+    }
+
     /// hash-thing-4eo8: cold-start scene for the demo build is the
     /// Pyroclastic chamber — stone box, lava embedded in the floor,
     /// water embedded in the ceiling. The molten palette + visible
@@ -5941,7 +5951,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                             let scale_pct = (renderer.render_scale * 100.0) as u32;
                             window.set_title(&format!(
                                 "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                                self.smoothed_fps, self.volume_size, scale_pct,
+                                self.title_fps(),
+                                self.volume_size,
+                                scale_pct,
                             ));
                             self.last_title_update = Some(now);
                         }
@@ -8771,6 +8783,28 @@ mod tests {
             app.smoothed_fps < 1000.0,
             "smoothed_fps must not spike into thousands; got {}",
             app.smoothed_fps,
+        );
+    }
+
+    #[test]
+    fn title_fps_falls_back_to_smoothed_before_frame_total_samples() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 72.0;
+
+        assert_eq!(app.title_fps(), 72.0);
+    }
+
+    #[test]
+    fn title_fps_uses_frame_total_p95_over_smoothed_spike() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 800.0;
+        app.perf
+            .record("frame_total", std::time::Duration::from_millis(40));
+
+        assert!(
+            (app.title_fps() - 25.0).abs() < 1e-9,
+            "title FPS should come from frame_total p95, got {}",
+            app.title_fps()
         );
     }
 
