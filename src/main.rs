@@ -557,9 +557,8 @@ fn collect_visible_particle_data(
         .filter_map(|entity| {
             let mat = match &entity.kind {
                 sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
-                sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
-                    entity.render_material().unwrap() as u32
-                }
+                sim::EntityKind::Particle(state) => state.material as u32,
+                sim::EntityKind::Critter(state) => state.material as u32,
             };
             if !player::has_line_of_sight(world, camera_pos, entity.pos) {
                 return None;
