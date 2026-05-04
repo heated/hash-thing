@@ -62,6 +62,8 @@ pub const FIREWORK_MATERIAL_ID: MaterialId = 17;
 pub const CLONE_MATERIAL_ID: MaterialId = 18;
 pub const SOUP_TARGET_MARKER_MATERIAL_ID: MaterialId = 27;
 pub const SOUP_CATALOG_MARKER_MATERIAL_ID: MaterialId = 28;
+pub const FACTORY_BELT_POS_X_MATERIAL_ID: MaterialId = 29;
+pub const FACTORY_BELT_POS_Z_MATERIAL_ID: MaterialId = 30;
 const FAN_STEAM_POS_X_MATERIAL_ID: MaterialId = 19;
 const FAN_STEAM_NEG_X_MATERIAL_ID: MaterialId = 20;
 const FAN_STEAM_POS_Z_MATERIAL_ID: MaterialId = 21;
@@ -104,6 +106,8 @@ pub const FIREWORK: CellState = Cell::pack(FIREWORK_MATERIAL_ID, 0).raw();
 pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
 pub const SOUP_TARGET_MARKER: CellState = Cell::pack(SOUP_TARGET_MARKER_MATERIAL_ID, 0).raw();
 pub const SOUP_CATALOG_MARKER: CellState = Cell::pack(SOUP_CATALOG_MARKER_MATERIAL_ID, 0).raw();
+pub const FACTORY_BELT_POS_X: CellState = Cell::pack(FACTORY_BELT_POS_X_MATERIAL_ID, 0).raw();
+pub const FACTORY_BELT_POS_Z: CellState = Cell::pack(FACTORY_BELT_POS_Z_MATERIAL_ID, 0).raw();
 
 /// Pack a CLONE cell whose metadata slot carries the source material id.
 ///
@@ -824,6 +828,16 @@ impl MaterialRegistry {
                 "_soup_catalog_marker",
                 [1.0, 0.2, 0.95, 1.0],
             ),
+            (
+                FACTORY_BELT_POS_X_MATERIAL_ID,
+                "_factory_belt_pos_x",
+                [0.95, 0.72, 0.18, 1.0],
+            ),
+            (
+                FACTORY_BELT_POS_Z_MATERIAL_ID,
+                "_factory_belt_pos_z",
+                [0.18, 0.78, 0.95, 1.0],
+            ),
         ] {
             registry.insert(
                 material_id,
@@ -1407,6 +1421,22 @@ mod tests {
         assert_eq!(
             registry.entry(LAVA_MATERIAL_ID).unwrap().visual.label,
             "lava"
+        );
+        assert_eq!(
+            registry
+                .entry(FACTORY_BELT_POS_X_MATERIAL_ID)
+                .unwrap()
+                .visual
+                .label,
+            "_factory_belt_pos_x"
+        );
+        assert_eq!(
+            registry
+                .entry(FACTORY_BELT_POS_Z_MATERIAL_ID)
+                .unwrap()
+                .visual
+                .label,
+            "_factory_belt_pos_z"
         );
         assert!(registry.entry(42).is_none());
     }

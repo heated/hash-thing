@@ -99,6 +99,7 @@ A comparison is *not* a measurement. The `ratio_metric` must be a key from one o
 |------------------------|----------------------------------------------------------------|
 | `default-ca`           | The current production CA + Margolus rules.                    |
 | `custom:factory-conveyor-v1` | Scenario-local factory conveyor block-rule setup used by `FactoryConveyorRuleV1` (`hash-thing-w4zq`). |
+| `custom:factory-encoded-belt-routing-v1` | Scenario-local encoded-belt routing setup used by `FactoryEncodedBeltRoutingV1` (`hash-thing-pa24.1`). |
 | `custom:soup-search-v1` | Scenario-local tiled 3D Game-of-Life soup ensemble used by `SoupSearchV1(tile=16,soup_side=8,density_per_1000=180,rule=445)` and `SoupSearchSparseV1(tile=16,soup_side=8,density_per_1000=45,rule=445)` (`hash-thing-8ppq.5`). |
 | `water-margolus`       | Water-only rules (for fluid-only benches).                     |
 | `particle-cellular`    | Particle CA (sand/dust/etc).                                   |
@@ -244,6 +245,7 @@ Units in the name. Mixing units across records breaks downstream tooling.
 | `miss_cause_table`   | JSON object    | Structured miss-cause attribution table. With `HASH_THING_MEMO_DIAG=1`, status is `ok` and rows split misses by level into first-seen/no-surviving-key, parity alias, slow-divisor phase alias, residual unknown, and compaction kept/dropped counts. Without the diagnostic gate, scenario-runner records use `{status: "todo", dependency: "hash-thing-vqke.1"}`. |
 | `factory_sinked_total` | items         | Scenario-specific factory harness sink throughput over measured frames; source/sink harness work is outside timed `step_us` / `step_*` latency. |
 | `factory_backpressure_total` | blocked source attempts | Scenario-specific count of source attempts blocked by occupied lane inputs before the CA step; source/sink harness work is outside timed `step_us` / `step_*` latency. |
+| `factory_routing_total` | JSON object | Route-specific factory harness totals for encoded-belt setups: per-leg source injection/backpressure, sink drain, turn traversal, and merge winner/stall counts. Comparison validation requires hashlife/chunk-array equality. |
 | `seed_ms`             | ms            | Wall-time of the seed step.                   |
 | `compaction_ns`       | ns            | Last `maybe_compact` wall.                    |
 

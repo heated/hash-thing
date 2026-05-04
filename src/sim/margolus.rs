@@ -72,6 +72,87 @@ impl BlockRule for ConveyorBlockRule {
     }
 }
 
+/// Encoded belt routing rule — moves an item according to the belt below it.
+///
+/// The moving item occupies one cell in a 2-cell-high local column. The
+/// adjacent vertical cell is an inert belt substrate whose material encodes the
+/// direction. Source-belt semantics are intentional: off-belt items are never
+/// pulled onto a belt by destination cells. If both +X and +Z candidates target
+/// the same output cell, +X wins deterministically and the +Z item stays put.
+pub struct EncodedBeltRoutingBlockRule {
+    item_material: u16,
+    belt_pos_x_material: u16,
+    belt_pos_z_material: u16,
+}
+
+impl EncodedBeltRoutingBlockRule {
+    pub fn new(item_material: u16, belt_pos_x_material: u16, belt_pos_z_material: u16) -> Self {
+        Self {
+            item_material,
+            belt_pos_x_material,
+            belt_pos_z_material,
+        }
+    }
+
+    fn is_belt(&self, cell: Cell) -> bool {
+        let material = cell.material();
+        material == self.belt_pos_x_material || material == self.belt_pos_z_material
+    }
+}
+
+impl BlockRule for EncodedBeltRoutingBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "EncodedBeltRoutingBlockRule"
+    }
+
+    fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8] {
+        let mut out = *block;
+        for dy in 0..2 {
+            for z in 0..2 {
+                let from = block_index(0, dy, z);
+                let to = block_index(1, dy, z);
+                let source_belt = block_index(0, 1 - dy, z);
+                let dest_belt = block_index(1, 1 - dy, z);
+                if movable[from]
+                    && movable[to]
+                    && block[source_belt].material() == self.belt_pos_x_material
+                    && self.is_belt(block[dest_belt])
+                    && out[from].material() == self.item_material
+                    && out[to].is_empty()
+                {
+                    out.swap(from, to);
+                }
+            }
+        }
+        for dy in 0..2 {
+            for x in 0..2 {
+                let from = block_index(x, dy, 0);
+                let to = block_index(x, dy, 1);
+                let source_belt = block_index(x, 1 - dy, 0);
+                let dest_belt = block_index(x, 1 - dy, 1);
+                if movable[from]
+                    && movable[to]
+                    && block[source_belt].material() == self.belt_pos_z_material
+                    && self.is_belt(block[dest_belt])
+                    && out[from].material() == self.item_material
+                    && out[to].is_empty()
+                {
+                    out.swap(from, to);
+                }
+            }
+        }
+        out
+    }
+
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
+        Box::new(EncodedBeltRoutingBlockRule {
+            item_material: self.item_material,
+            belt_pos_x_material: self.belt_pos_x_material,
+            belt_pos_z_material: self.belt_pos_z_material,
+        })
+    }
+}
+
 /// Fluid block rule — gravity (vertical swaps) plus lateral spread.
 ///
 /// Phase 1 (gravity): same as `GravityBlockRule` — each vertical column
@@ -422,6 +503,84 @@ mod tests {
         let out = rule.step_block(&block, &movable);
 
         assert_eq!(out, block);
+    }
+
+    // ---------------------------------------------------------------
+    // EncodedBeltRoutingBlockRule
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn encoded_belt_moves_pos_x_from_source_belt() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(1, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(0, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(0, 1, 0)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 1, 0)], Cell::pack(14, 9));
+        assert_eq!(out[block_index(0, 0, 0)], Cell::pack(29, 0));
+        assert_eq!(out[block_index(1, 0, 0)], Cell::pack(29, 0));
+        assert_mass_conserved(&block, &out);
+    }
+
+    #[test]
+    fn encoded_belt_moves_pos_z_from_source_belt() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(1, 0, 0)] = Cell::pack(30, 0);
+        block[block_index(1, 0, 1)] = Cell::pack(29, 0);
+        block[block_index(1, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(1, 1, 0)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 1, 1)], Cell::pack(14, 9));
+        assert_mass_conserved(&block, &out);
+    }
+
+    #[test]
+    fn encoded_belt_does_not_pull_off_belt_item() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(1, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(0, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out, block);
+    }
+
+    #[test]
+    fn encoded_belt_requires_destination_belt() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(0, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out, block);
+    }
+
+    #[test]
+    fn encoded_belt_merge_pressure_prefers_pos_x() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 1)] = Cell::pack(29, 0);
+        block[block_index(1, 0, 1)] = Cell::pack(29, 0);
+        block[block_index(1, 0, 0)] = Cell::pack(30, 0);
+        block[block_index(0, 1, 1)] = Cell::pack(14, 1);
+        block[block_index(1, 1, 0)] = Cell::pack(14, 2);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(0, 1, 1)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 1, 1)], Cell::pack(14, 1));
+        assert_eq!(out[block_index(1, 1, 0)], Cell::pack(14, 2));
+        assert_mass_conserved(&block, &out);
     }
 
     // ---------------------------------------------------------------

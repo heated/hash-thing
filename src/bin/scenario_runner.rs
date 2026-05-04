@@ -1,11 +1,14 @@
 use hash_thing::octree::{Cell, CellState, Node, NodeId};
-use hash_thing::sim::margolus::ConveyorBlockRule;
+use hash_thing::sim::margolus::{ConveyorBlockRule, EncodedBeltRoutingBlockRule};
 use hash_thing::sim::world::{
     quarantine_atlas_mixed_containment_plan, WorkElisionStats,
     QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
 };
 use hash_thing::sim::{GameOfLife3D, World, WorldCoord};
-use hash_thing::terrain::materials::{METAL, METAL_MATERIAL_ID, SAND, STONE, WATER};
+use hash_thing::terrain::materials::{
+    FACTORY_BELT_POS_X, FACTORY_BELT_POS_X_MATERIAL_ID, FACTORY_BELT_POS_Z,
+    FACTORY_BELT_POS_Z_MATERIAL_ID, METAL, METAL_MATERIAL_ID, SAND, STONE, WATER,
+};
 use hash_thing::terrain::TerrainParams;
 use ht_render::Svdag;
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,7 @@ const MEGASTRUCTURE_STAMP_10_V1: &str =
     "MegastructureStampV1(module_side=8,tile_stride=16,stamps=10,rule=crystal)";
 const MEGASTRUCTURE_STAMP_100_V1: &str =
     "MegastructureStampV1(module_side=8,tile_stride=16,stamps=100,rule=crystal)";
+const FACTORY_ENCODED_BELT_ROUTING_V1: &str = "FactoryEncodedBeltRoutingV1";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +108,7 @@ impl Scene {
 enum ScenarioSetup {
     QuarantineAtlasMixedContainmentV1,
     FactoryConveyorRuleV1,
+    FactoryEncodedBeltRoutingV1,
     SoupSearchV1,
     SoupSearchSparseV1,
     TemporalReuseV1,
@@ -116,6 +121,7 @@ impl ScenarioSetup {
         match self {
             Self::QuarantineAtlasMixedContainmentV1 => QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP,
             Self::FactoryConveyorRuleV1 => "FactoryConveyorRuleV1",
+            Self::FactoryEncodedBeltRoutingV1 => FACTORY_ENCODED_BELT_ROUTING_V1,
             Self::SoupSearchV1 => SOUP_SEARCH_SETUP_V1,
             Self::SoupSearchSparseV1 => SOUP_SEARCH_SPARSE_V1,
             Self::TemporalReuseV1 => TEMPORAL_REUSE_SETUP_V1,
@@ -145,6 +151,7 @@ struct SoupSearchParams {
 enum RuleSet {
     DefaultCa,
     FactoryConveyorV1,
+    FactoryEncodedBeltRoutingV1,
     SoupSearchV1,
 }
 
@@ -153,6 +160,7 @@ impl RuleSet {
         match self {
             Self::DefaultCa => "default-ca",
             Self::FactoryConveyorV1 => "custom:factory-conveyor-v1",
+            Self::FactoryEncodedBeltRoutingV1 => "custom:factory-encoded-belt-routing-v1",
             Self::SoupSearchV1 => "custom:soup-search-v1",
         }
     }
@@ -240,6 +248,8 @@ struct GenerationRecord {
     factory_sinked: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     factory_backpressure: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_routing: Option<FactoryRoutingRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state_hash: Option<String>,
     mat_distribution: Option<serde_json::Value>,
@@ -283,6 +293,37 @@ struct MetricsRecord {
     factory_sinked_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     factory_backpressure_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_routing_total: Option<FactoryRoutingRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct FactoryRoutingRecord {
+    source_x_injected: u64,
+    source_z_injected: u64,
+    source_x_backpressure: u64,
+    source_z_backpressure: u64,
+    sink_x_drain: u64,
+    sink_z_drain: u64,
+    turn_traversal: u64,
+    merge_winner_x: u64,
+    merge_winner_z: u64,
+    merge_stall: u64,
+}
+
+impl FactoryRoutingRecord {
+    fn add_assign(&mut self, other: Self) {
+        self.source_x_injected += other.source_x_injected;
+        self.source_z_injected += other.source_z_injected;
+        self.source_x_backpressure += other.source_x_backpressure;
+        self.source_z_backpressure += other.source_z_backpressure;
+        self.sink_x_drain += other.sink_x_drain;
+        self.sink_z_drain += other.sink_z_drain;
+        self.turn_traversal += other.turn_traversal;
+        self.merge_winner_x += other.merge_winner_x;
+        self.merge_winner_z += other.merge_winner_z;
+        self.merge_stall += other.merge_stall;
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1186,11 +1227,19 @@ fn validate_factory_parity(
         subject.metrics.factory_backpressure_total,
         baseline.metrics.factory_backpressure_total,
     )?;
+    if subject.metrics.factory_routing_total != baseline.metrics.factory_routing_total {
+        return Err(format!(
+            "comparison mismatch on metrics.factory_routing_total: {:?} vs {:?}",
+            subject.metrics.factory_routing_total, baseline.metrics.factory_routing_total
+        ));
+    }
 
     let factory_subject = subject.metrics.factory_sinked_total.is_some()
-        || subject.metrics.factory_backpressure_total.is_some();
+        || subject.metrics.factory_backpressure_total.is_some()
+        || subject.metrics.factory_routing_total.is_some();
     let factory_baseline = baseline.metrics.factory_sinked_total.is_some()
-        || baseline.metrics.factory_backpressure_total.is_some();
+        || baseline.metrics.factory_backpressure_total.is_some()
+        || baseline.metrics.factory_routing_total.is_some();
     if !(factory_subject || factory_baseline) {
         return Ok(());
     }
@@ -1215,6 +1264,12 @@ fn validate_factory_parity(
             subject_gen.factory_backpressure,
             baseline_gen.factory_backpressure,
         )?;
+        if subject_gen.factory_routing != baseline_gen.factory_routing {
+            return Err(format!(
+                "comparison mismatch on generations[{idx}].factory_routing: {:?} vs {:?}",
+                subject_gen.factory_routing, baseline_gen.factory_routing
+            ));
+        }
     }
     Ok(())
 }
@@ -1313,6 +1368,7 @@ fn validate_measurement_coordinates(record: &MeasurementRecord) -> Result<(), St
         &[
             "default-ca",
             "custom:factory-conveyor-v1",
+            "custom:factory-encoded-belt-routing-v1",
             "custom:soup-search-v1",
         ],
         record,
@@ -1336,6 +1392,12 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
             "setup=FactoryConveyorRuleV1 is invalid for scene={} in {}",
             record.scene, record.measurement_id
         )),
+        Some(FACTORY_ENCODED_BELT_ROUTING_V1) if record.scene != "factory-conveyor" => {
+            Err(format!(
+                "setup={} is invalid for scene={} in {}",
+                FACTORY_ENCODED_BELT_ROUTING_V1, record.scene, record.measurement_id
+            ))
+        }
         Some(SOUP_SEARCH_SETUP_V1 | SOUP_SEARCH_SPARSE_V1) if record.scene != "soup-search" => {
             Err(format!(
                 "setup=SoupSearchV1 is invalid for scene={} in {}",
@@ -1368,6 +1430,14 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
                 record.rule_set, record.measurement_id
             ))
         }
+        Some(FACTORY_ENCODED_BELT_ROUTING_V1)
+            if record.rule_set != "custom:factory-encoded-belt-routing-v1" =>
+        {
+            Err(format!(
+                "setup={} requires matching rule_set (got {}) in {}",
+                FACTORY_ENCODED_BELT_ROUTING_V1, record.rule_set, record.measurement_id
+            ))
+        }
         Some(SOUP_SEARCH_SETUP_V1 | SOUP_SEARCH_SPARSE_V1)
             if record.rule_set != "custom:soup-search-v1" =>
         {
@@ -1387,6 +1457,7 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
         Some(
             QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
             | "FactoryConveyorRuleV1"
+            | FACTORY_ENCODED_BELT_ROUTING_V1
             | SOUP_SEARCH_SETUP_V1
             | SOUP_SEARCH_SPARSE_V1
             | MEGASTRUCTURE_STAMP_10_V1
@@ -2047,6 +2118,7 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
     match (scenario.setup, scenario.scene) {
         (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), Scene::QuarantineAtlas)
         | (Some(ScenarioSetup::FactoryConveyorRuleV1), Scene::FactoryConveyor)
+        | (Some(ScenarioSetup::FactoryEncodedBeltRoutingV1), Scene::FactoryConveyor)
         | (Some(ScenarioSetup::SoupSearchV1), Scene::SoupSearch)
         | (Some(ScenarioSetup::SoupSearchSparseV1), Scene::SoupSearch)
         | (Some(ScenarioSetup::TemporalReuseV1), Scene::ReplayScrub)
@@ -2067,6 +2139,10 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
     }
     match (scenario.setup, scenario.rule_set) {
         (Some(ScenarioSetup::FactoryConveyorRuleV1), RuleSet::FactoryConveyorV1)
+        | (
+            Some(ScenarioSetup::FactoryEncodedBeltRoutingV1),
+            RuleSet::FactoryEncodedBeltRoutingV1,
+        )
         | (Some(ScenarioSetup::QuarantineAtlasMixedContainmentV1), RuleSet::DefaultCa)
         | (Some(ScenarioSetup::SoupSearchV1), RuleSet::SoupSearchV1)
         | (Some(ScenarioSetup::SoupSearchSparseV1), RuleSet::SoupSearchV1)
@@ -2356,6 +2432,17 @@ fn seed_factory_conveyor(world: &mut World, scenario: &Scenario) -> Result<(), S
             });
             seed_factory_conveyor_rule(world);
         }
+        Some(ScenarioSetup::FactoryEncodedBeltRoutingV1) => {
+            world.mutate_materials(|materials| {
+                let routing = materials.register_block_rule(EncodedBeltRoutingBlockRule::new(
+                    METAL_MATERIAL_ID,
+                    FACTORY_BELT_POS_X_MATERIAL_ID,
+                    FACTORY_BELT_POS_Z_MATERIAL_ID,
+                ));
+                materials.assign_block_rule(METAL_MATERIAL_ID, routing);
+            });
+            seed_factory_encoded_belt_routing(world);
+        }
         None => seed_factory_conveyor_toy(world, scenario.seed),
         Some(other) => {
             return Err(format!(
@@ -2396,18 +2483,60 @@ fn seed_factory_conveyor_rule(world: &mut World) {
     }
 }
 
+fn seed_factory_encoded_belt_routing(world: &mut World) {
+    let harness = FactoryHarness::encoded_routing(world.side() as i64);
+    for (x, z, belt) in harness.encoded_belt_cells() {
+        world.set(
+            WorldCoord(x),
+            WorldCoord(harness.y - 1),
+            WorldCoord(z),
+            belt,
+        );
+        world.set(
+            WorldCoord(x),
+            WorldCoord(harness.y + 1),
+            WorldCoord(z),
+            belt,
+        );
+    }
+}
+
 #[derive(Clone)]
 struct FactoryHarness {
+    kind: FactoryHarnessKind,
     source_x: i64,
     sink_x: i64,
     y: i64,
     lane_z: Vec<i64>,
+    z_source_x: i64,
+    x_source_z: i64,
+    merge_x: i64,
+    merge_z: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FactoryHarnessKind {
+    Conveyor,
+    EncodedRouting,
 }
 
 #[derive(Clone, Copy, Default)]
 struct FactoryStepStats {
     sinked: u64,
     backpressure: u64,
+    routing: Option<FactoryRoutingRecord>,
+}
+
+impl FactoryStepStats {
+    fn add_assign(&mut self, other: Self) {
+        self.sinked += other.sinked;
+        self.backpressure += other.backpressure;
+        if let Some(routing) = other.routing {
+            self.routing
+                .get_or_insert_with(FactoryRoutingRecord::default)
+                .add_assign(routing);
+        }
+    }
 }
 
 impl FactoryHarness {
@@ -2417,19 +2546,45 @@ impl FactoryHarness {
         let start_z = 4;
         let lane_z = (0..lanes).map(|i| start_z + i * 8).collect::<Vec<_>>();
         Self {
+            kind: FactoryHarnessKind::Conveyor,
             source_x: 2,
             sink_x: side - 3,
             y,
             lane_z,
+            z_source_x: 0,
+            x_source_z: 0,
+            merge_x: 0,
+            merge_z: 0,
+        }
+    }
+
+    fn encoded_routing(side: i64) -> Self {
+        let y = side / 2;
+        Self {
+            kind: FactoryHarnessKind::EncodedRouting,
+            source_x: 2,
+            sink_x: side - 4,
+            y,
+            lane_z: Vec::new(),
+            z_source_x: side / 2,
+            x_source_z: side / 2 + 1,
+            merge_x: side / 2,
+            merge_z: side / 2 + 1,
         }
     }
 
     fn for_scenario(scenario: &Scenario, side: i64) -> Option<Self> {
-        (matches!(scenario.setup, Some(ScenarioSetup::FactoryConveyorRuleV1)))
-            .then(|| Self::new(side))
+        match scenario.setup {
+            Some(ScenarioSetup::FactoryConveyorRuleV1) => Some(Self::new(side)),
+            Some(ScenarioSetup::FactoryEncodedBeltRoutingV1) => Some(Self::encoded_routing(side)),
+            _ => None,
+        }
     }
 
-    fn apply_sources_world(&self, world: &mut World) -> u64 {
+    fn apply_sources_world(&self, world: &mut World) -> FactoryStepStats {
+        if self.kind == FactoryHarnessKind::EncodedRouting {
+            return self.apply_encoded_sources_world(world);
+        }
         let mut backpressure = 0;
         for &z in &self.lane_z {
             if world.get(WorldCoord(self.source_x), WorldCoord(self.y), WorldCoord(z)) == 0 {
@@ -2443,10 +2598,17 @@ impl FactoryHarness {
                 backpressure += 1;
             }
         }
-        backpressure
+        FactoryStepStats {
+            sinked: 0,
+            backpressure,
+            routing: None,
+        }
     }
 
-    fn drain_sinks_world(&self, world: &mut World) -> u64 {
+    fn drain_sinks_world(&self, world: &mut World) -> FactoryStepStats {
+        if self.kind == FactoryHarnessKind::EncodedRouting {
+            return self.drain_encoded_sinks_world(world);
+        }
         let mut sinked = 0;
         for &z in &self.lane_z {
             if world.get(WorldCoord(self.sink_x), WorldCoord(self.y), WorldCoord(z)) == METAL {
@@ -2459,10 +2621,17 @@ impl FactoryHarness {
                 sinked += 1;
             }
         }
-        sinked
+        FactoryStepStats {
+            sinked,
+            backpressure: 0,
+            routing: None,
+        }
     }
 
-    fn apply_sources_grid(&self, grid: &mut [CellState], side: usize) -> u64 {
+    fn apply_sources_grid(&self, grid: &mut [CellState], side: usize) -> FactoryStepStats {
+        if self.kind == FactoryHarnessKind::EncodedRouting {
+            return self.apply_encoded_sources_grid(grid, side);
+        }
         let mut backpressure = 0;
         for &z in &self.lane_z {
             let idx = self.idx(side, self.source_x, self.y, z);
@@ -2472,10 +2641,17 @@ impl FactoryHarness {
                 backpressure += 1;
             }
         }
-        backpressure
+        FactoryStepStats {
+            sinked: 0,
+            backpressure,
+            routing: None,
+        }
     }
 
-    fn drain_sinks_grid(&self, grid: &mut [CellState], side: usize) -> u64 {
+    fn drain_sinks_grid(&self, grid: &mut [CellState], side: usize) -> FactoryStepStats {
+        if self.kind == FactoryHarnessKind::EncodedRouting {
+            return self.drain_encoded_sinks_grid(grid, side);
+        }
         let mut sinked = 0;
         for &z in &self.lane_z {
             let idx = self.idx(side, self.sink_x, self.y, z);
@@ -2484,7 +2660,171 @@ impl FactoryHarness {
                 sinked += 1;
             }
         }
-        sinked
+        FactoryStepStats {
+            sinked,
+            backpressure: 0,
+            routing: None,
+        }
+    }
+
+    fn encoded_belt_cells(&self) -> Vec<(i64, i64, CellState)> {
+        let mut cells = Vec::new();
+        for x in self.source_x..=self.merge_x {
+            cells.push((x, self.x_source_z, FACTORY_BELT_POS_X));
+        }
+        for z in self.z_source_x - 10..=self.merge_z {
+            cells.push((self.merge_x, z, FACTORY_BELT_POS_Z));
+        }
+        cells.push((self.merge_x, self.merge_z, FACTORY_BELT_POS_X));
+        for x in self.merge_x..=self.sink_x {
+            cells.push((x, self.merge_z, FACTORY_BELT_POS_X));
+        }
+        cells
+    }
+
+    fn apply_encoded_sources_world(&self, world: &mut World) -> FactoryStepStats {
+        let mut routing = FactoryRoutingRecord::default();
+        if world.get(
+            WorldCoord(self.source_x),
+            WorldCoord(self.y),
+            WorldCoord(self.x_source_z),
+        ) == 0
+        {
+            world.set(
+                WorldCoord(self.source_x),
+                WorldCoord(self.y),
+                WorldCoord(self.x_source_z),
+                METAL,
+            );
+            routing.source_x_injected = 1;
+        } else {
+            routing.source_x_backpressure = 1;
+        }
+        let z_source_z = self.z_source_x - 10;
+        if world.get(
+            WorldCoord(self.z_source_x),
+            WorldCoord(self.y),
+            WorldCoord(z_source_z),
+        ) == 0
+        {
+            world.set(
+                WorldCoord(self.z_source_x),
+                WorldCoord(self.y),
+                WorldCoord(z_source_z),
+                METAL,
+            );
+            routing.source_z_injected = 1;
+        } else {
+            routing.source_z_backpressure = 1;
+        }
+        FactoryStepStats {
+            sinked: 0,
+            backpressure: routing.source_x_backpressure + routing.source_z_backpressure,
+            routing: Some(routing),
+        }
+    }
+
+    fn drain_encoded_sinks_world(&self, world: &mut World) -> FactoryStepStats {
+        let mut routing = self.routing_probe_world(world);
+        if world.get(
+            WorldCoord(self.sink_x),
+            WorldCoord(self.y),
+            WorldCoord(self.merge_z),
+        ) == METAL
+        {
+            world.set(
+                WorldCoord(self.sink_x),
+                WorldCoord(self.y),
+                WorldCoord(self.merge_z),
+                0,
+            );
+            routing.sink_x_drain = 1;
+        }
+        FactoryStepStats {
+            sinked: routing.sink_x_drain + routing.sink_z_drain,
+            backpressure: 0,
+            routing: Some(routing),
+        }
+    }
+
+    fn apply_encoded_sources_grid(&self, grid: &mut [CellState], side: usize) -> FactoryStepStats {
+        let mut routing = FactoryRoutingRecord::default();
+        let x_idx = self.idx(side, self.source_x, self.y, self.x_source_z);
+        if grid[x_idx] == 0 {
+            grid[x_idx] = METAL;
+            routing.source_x_injected = 1;
+        } else {
+            routing.source_x_backpressure = 1;
+        }
+        let z_idx = self.idx(side, self.z_source_x, self.y, self.z_source_x - 10);
+        if grid[z_idx] == 0 {
+            grid[z_idx] = METAL;
+            routing.source_z_injected = 1;
+        } else {
+            routing.source_z_backpressure = 1;
+        }
+        FactoryStepStats {
+            sinked: 0,
+            backpressure: routing.source_x_backpressure + routing.source_z_backpressure,
+            routing: Some(routing),
+        }
+    }
+
+    fn drain_encoded_sinks_grid(&self, grid: &mut [CellState], side: usize) -> FactoryStepStats {
+        let mut routing = self.routing_probe_grid(grid, side);
+        let sink_idx = self.idx(side, self.sink_x, self.y, self.merge_z);
+        if grid[sink_idx] == METAL {
+            grid[sink_idx] = 0;
+            routing.sink_x_drain = 1;
+        }
+        FactoryStepStats {
+            sinked: routing.sink_x_drain + routing.sink_z_drain,
+            backpressure: 0,
+            routing: Some(routing),
+        }
+    }
+
+    fn routing_probe_world(&self, world: &World) -> FactoryRoutingRecord {
+        let mut routing = FactoryRoutingRecord::default();
+        if world.get(
+            WorldCoord(self.merge_x),
+            WorldCoord(self.y),
+            WorldCoord(self.merge_z),
+        ) == METAL
+        {
+            routing.turn_traversal = 1;
+            let x_prev = world.get(
+                WorldCoord(self.merge_x - 1),
+                WorldCoord(self.y),
+                WorldCoord(self.merge_z),
+            );
+            let z_prev = world.get(
+                WorldCoord(self.merge_x),
+                WorldCoord(self.y),
+                WorldCoord(self.merge_z - 1),
+            );
+            match (x_prev == METAL, z_prev == METAL) {
+                (true, true) => routing.merge_stall = 1,
+                (false, true) => routing.merge_winner_z = 1,
+                _ => routing.merge_winner_x = 1,
+            }
+        }
+        routing
+    }
+
+    fn routing_probe_grid(&self, grid: &[CellState], side: usize) -> FactoryRoutingRecord {
+        let mut routing = FactoryRoutingRecord::default();
+        if grid[self.idx(side, self.merge_x, self.y, self.merge_z)] == METAL {
+            routing.turn_traversal = 1;
+            let x_prev = grid[self.idx(side, self.merge_x - 1, self.y, self.merge_z)];
+            let z_prev = grid[self.idx(side, self.merge_x, self.y, self.merge_z - 1)];
+            match (x_prev == METAL, z_prev == METAL) {
+                (true, true) => routing.merge_stall = 1,
+                (false, true) => routing.merge_winner_z = 1,
+                _ => routing.merge_winner_x = 1,
+            }
+        }
+        routing
     }
 
     fn idx(&self, side: usize, x: i64, y: i64, z: i64) -> usize {
@@ -2585,6 +2925,9 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
         Some(ScenarioSetup::FactoryConveyorRuleV1) => {
             "; setup=factory-conveyor-rule-v1 (scripted pre-measurement intervention setup plus per-step source/sink harness; step_us/step_* time only CA stepping and exclude source injection, sink drain, and backpressure accounting)".to_string()
         }
+        Some(ScenarioSetup::FactoryEncodedBeltRoutingV1) => {
+            "; setup=factory-encoded-belt-routing-v1 (scripted source-belt routing harness with per-leg source/sink, turn, and merge telemetry; step_us/step_* time only CA stepping and exclude source injection, sink drain, and routing accounting)".to_string()
+        }
         Some(ScenarioSetup::SoupSearchV1) => {
             "; setup=soup-search-v1 (deterministic tiled 3D GoL soup ensemble; this first probe measures the search workload, while survivor classification is tracked in hash-thing-8ppq.5.2)".to_string()
         }
@@ -2645,13 +2988,13 @@ fn run_hashlife(
         }
         let mut factory_step = FactoryStepStats::default();
         if let Some(factory) = &factory {
-            factory_step.backpressure = factory.apply_sources_world(&mut world);
+            factory_step.add_assign(factory.apply_sources_world(&mut world));
         }
         let start = Instant::now();
         world.step_recursive();
         let step_us = start.elapsed().as_micros();
         if let Some(factory) = &factory {
-            factory_step.sinked = factory.drain_sinks_world(&mut world);
+            factory_step.add_assign(factory.drain_sinks_world(&mut world));
         }
         let stats = world.hashlife_stats;
         let elision_stats = world.work_elision_stats();
@@ -2674,12 +3017,19 @@ fn run_hashlife(
             bfs_max_batch_len: Some(stats.bfs_max_batch_len),
             factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
+            factory_routing: factory_step.routing,
             state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
             grid: Some(grid),
         });
         factory_total.sinked += factory_step.sinked;
         factory_total.backpressure += factory_step.backpressure;
+        if let Some(routing) = factory_step.routing {
+            factory_total
+                .routing
+                .get_or_insert_with(FactoryRoutingRecord::default)
+                .add_assign(routing);
+        }
     }
     let mut metrics = metrics(times);
     let memo_total = memo_hits + memo_misses;
@@ -2731,14 +3081,14 @@ fn run_chunk_array(
         }
         let mut factory_step = FactoryStepStats::default();
         if let Some(factory) = &factory {
-            factory_step.backpressure = factory.apply_sources_grid(&mut grid, side);
+            factory_step.add_assign(factory.apply_sources_grid(&mut grid, side));
         }
         let start = Instant::now();
         let next = world.step_grid(&grid);
         let step_us = start.elapsed().as_micros();
         grid = next;
         if let Some(factory) = &factory {
-            factory_step.sinked = factory.drain_sinks_grid(&mut grid, side);
+            factory_step.add_assign(factory.drain_sinks_grid(&mut grid, side));
         }
         world.generation += 1;
         times.push(step_us);
@@ -2754,12 +3104,19 @@ fn run_chunk_array(
             bfs_max_batch_len: None,
             factory_sinked: factory.as_ref().map(|_| factory_step.sinked),
             factory_backpressure: factory.as_ref().map(|_| factory_step.backpressure),
+            factory_routing: factory_step.routing,
             state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
             grid: Some(grid.clone()),
         });
         factory_total.sinked += factory_step.sinked;
         factory_total.backpressure += factory_step.backpressure;
+        if let Some(routing) = factory_step.routing {
+            factory_total
+                .routing
+                .get_or_insert_with(FactoryRoutingRecord::default)
+                .add_assign(routing);
+        }
     }
     let mut metrics = metrics(times);
     apply_factory_metrics(&mut metrics, factory, factory_total);
@@ -2774,6 +3131,7 @@ fn apply_factory_metrics(
     if factory.is_some() {
         metrics.factory_sinked_total = Some(totals.sinked);
         metrics.factory_backpressure_total = Some(totals.backpressure);
+        metrics.factory_routing_total = totals.routing;
     }
 }
 
@@ -3404,6 +3762,7 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
             miss_cause_table: None,
             factory_sinked_total: None,
             factory_backpressure_total: None,
+            factory_routing_total: None,
         };
     }
     let total_us: u128 = times_us.iter().sum();
@@ -3432,6 +3791,7 @@ fn metrics(mut times_us: Vec<u128>) -> MetricsRecord {
         miss_cause_table: None,
         factory_sinked_total: None,
         factory_backpressure_total: None,
+        factory_routing_total: None,
     }
 }
 
@@ -4529,6 +4889,177 @@ mod tests {
         assert!(metrics.factory_sinked_total.unwrap() > 0);
     }
 
+    fn install_encoded_belt_rule(world: &mut World) {
+        world.mutate_materials(|materials| {
+            let routing = materials.register_block_rule(EncodedBeltRoutingBlockRule::new(
+                METAL_MATERIAL_ID,
+                FACTORY_BELT_POS_X_MATERIAL_ID,
+                FACTORY_BELT_POS_Z_MATERIAL_ID,
+            ));
+            materials.assign_block_rule(METAL_MATERIAL_ID, routing);
+        });
+    }
+
+    fn metal_exists_in_line(
+        world: &World,
+        y: i64,
+        fixed: i64,
+        range: std::ops::RangeInclusive<i64>,
+        axis: char,
+    ) -> bool {
+        range.into_iter().any(|n| match axis {
+            'x' => world.get(WorldCoord(n), WorldCoord(y), WorldCoord(fixed)) == METAL,
+            'z' => world.get(WorldCoord(fixed), WorldCoord(y), WorldCoord(n)) == METAL,
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn encoded_belt_full_world_moves_pos_x_across_phases() {
+        let mut world = World::new(5);
+        install_encoded_belt_rule(&mut world);
+        let (y, z) = (16, 10);
+        for x in 4..=12 {
+            world.set(
+                WorldCoord(x),
+                WorldCoord(y - 1),
+                WorldCoord(z),
+                FACTORY_BELT_POS_X,
+            );
+            world.set(
+                WorldCoord(x),
+                WorldCoord(y + 1),
+                WorldCoord(z),
+                FACTORY_BELT_POS_X,
+            );
+        }
+        world.set(WorldCoord(4), WorldCoord(y), WorldCoord(z), METAL);
+
+        for _ in 0..8 {
+            world.step_recursive();
+        }
+
+        assert_eq!(world.get(WorldCoord(4), WorldCoord(y), WorldCoord(z)), 0);
+        assert!(metal_exists_in_line(&world, y, z, 5..=12, 'x'));
+    }
+
+    #[test]
+    fn encoded_belt_full_world_moves_pos_z_across_phases() {
+        let mut world = World::new(5);
+        install_encoded_belt_rule(&mut world);
+        let (x, y) = (10, 16);
+        for z in 4..=12 {
+            world.set(
+                WorldCoord(x),
+                WorldCoord(y - 1),
+                WorldCoord(z),
+                FACTORY_BELT_POS_Z,
+            );
+            world.set(
+                WorldCoord(x),
+                WorldCoord(y + 1),
+                WorldCoord(z),
+                FACTORY_BELT_POS_Z,
+            );
+        }
+        world.set(WorldCoord(x), WorldCoord(y), WorldCoord(4), METAL);
+
+        for _ in 0..8 {
+            world.step_recursive();
+        }
+
+        assert_eq!(world.get(WorldCoord(x), WorldCoord(y), WorldCoord(4)), 0);
+        assert!(metal_exists_in_line(&world, y, x, 5..=12, 'z'));
+    }
+
+    #[test]
+    fn encoded_belt_full_world_turns_from_pos_x_to_pos_z() {
+        let mut world = World::new(5);
+        install_encoded_belt_rule(&mut world);
+        let y = 16;
+        for x in 4..8 {
+            world.set(
+                WorldCoord(x),
+                WorldCoord(y - 1),
+                WorldCoord(8),
+                FACTORY_BELT_POS_X,
+            );
+            world.set(
+                WorldCoord(x),
+                WorldCoord(y + 1),
+                WorldCoord(8),
+                FACTORY_BELT_POS_X,
+            );
+        }
+        for z in 8..=14 {
+            world.set(
+                WorldCoord(8),
+                WorldCoord(y - 1),
+                WorldCoord(z),
+                FACTORY_BELT_POS_Z,
+            );
+            world.set(
+                WorldCoord(8),
+                WorldCoord(y + 1),
+                WorldCoord(z),
+                FACTORY_BELT_POS_Z,
+            );
+        }
+        world.set(WorldCoord(4), WorldCoord(y), WorldCoord(8), METAL);
+
+        for _ in 0..16 {
+            world.step_recursive();
+        }
+
+        assert_eq!(world.get(WorldCoord(4), WorldCoord(y), WorldCoord(8)), 0);
+        assert!(metal_exists_in_line(&world, y, 8, 9..=14, 'z'));
+    }
+
+    #[test]
+    fn factory_encoded_belt_routing_keeps_backends_on_same_trajectory() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
+        scenario.world = WorldCoordName::Small;
+        scenario.level = Some(6);
+        scenario.scene = Scene::FactoryConveyor;
+        scenario.rule_set = RuleSet::FactoryEncodedBeltRoutingV1;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.setup = Some(ScenarioSetup::FactoryEncodedBeltRoutingV1);
+
+        let mut hashlife_world = World::new(6);
+        seed_scene(&mut hashlife_world, &scenario).expect("seed hashlife");
+        let mut chunk_world = World::new(6);
+        seed_scene(&mut chunk_world, &scenario).expect("seed chunk");
+        let factory = FactoryHarness::for_scenario(&scenario, 64);
+
+        let (hashlife, hashlife_metrics) =
+            run_hashlife(hashlife_world, 4, 16, None, factory.clone(), 1);
+        let (chunk, chunk_metrics) = run_chunk_array(chunk_world, 4, 16, None, factory, 1);
+
+        assert_eq!(hashlife.len(), chunk.len());
+        for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
+            assert_eq!(h.pop_count, c.pop_count, "pop drift at gen {gen}");
+            assert_eq!(
+                h.mat_distribution, c.mat_distribution,
+                "material drift at gen {gen}"
+            );
+            assert_eq!(
+                h.factory_routing, c.factory_routing,
+                "routing drift at gen {gen}"
+            );
+        }
+        let routing = hashlife_metrics
+            .factory_routing_total
+            .expect("routing metrics");
+        assert!(routing.source_x_injected > 0);
+        assert!(routing.source_z_injected > 0);
+        assert!(routing.turn_traversal > 0);
+        assert!(routing.merge_winner_x + routing.merge_winner_z + routing.merge_stall > 0);
+        assert_eq!(
+            hashlife_metrics.factory_routing_total,
+            chunk_metrics.factory_routing_total
+        );
+    }
+
     #[test]
     fn soup_search_seed_is_deterministic_and_nonempty() {
         let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
@@ -4576,6 +5107,7 @@ mod tests {
             bfs_max_batch_len: None,
             factory_sinked: None,
             factory_backpressure: None,
+            factory_routing: None,
             state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
             grid: Some(grid.clone()),
@@ -4610,6 +5142,7 @@ mod tests {
             bfs_max_batch_len: None,
             factory_sinked: None,
             factory_backpressure: None,
+            factory_routing: None,
             state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
             grid: Some(grid.clone()),
@@ -4651,6 +5184,7 @@ mod tests {
             bfs_max_batch_len: None,
             factory_sinked: None,
             factory_backpressure: None,
+            factory_routing: None,
             state_hash: Some(grid_hash(&grid)),
             mat_distribution: Some(material_distribution(&grid)),
             grid: Some(grid),
@@ -4839,6 +5373,7 @@ mod tests {
                 })),
                 factory_sinked_total: None,
                 factory_backpressure_total: None,
+                factory_routing_total: None,
             },
             generations: vec![GenerationRecord {
                 gen: 0,
@@ -4852,6 +5387,7 @@ mod tests {
                 bfs_max_batch_len: (backend == "hashlife-recursive").then_some(2),
                 factory_sinked: None,
                 factory_backpressure: None,
+                factory_routing: None,
                 state_hash: Some("sha256:aaaaaaaaaaaaaaaa".to_string()),
                 mat_distribution: Some(serde_json::json!({"1": 10})),
                 grid: None,

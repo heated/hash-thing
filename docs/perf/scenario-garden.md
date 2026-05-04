@@ -34,7 +34,7 @@ diagnostic gate it stays a structured TODO.
     generations: 3,
     warmup_generations: Some(1),
     seed: 1,
-    setup: None,                   // optional; e.g. Some(QuarantineAtlasMixedContainmentV1), Some(FactoryConveyorRuleV1), Some(SoupSearchV1), or Some(SoupSearchSparseV1)
+    setup: None,                   // optional; e.g. Some(QuarantineAtlasMixedContainmentV1), Some(FactoryConveyorRuleV1), Some(FactoryEncodedBeltRoutingV1), Some(SoupSearchV1), or Some(SoupSearchSparseV1)
     comparator: Some("chunk-array@same-scenario"),
 )
 ```
@@ -45,7 +45,7 @@ diagnostic gate it stays a structured TODO.
 
 - `default-terrain`: `World::seed_terrain(TerrainParams::for_level(level))`.
 - `default-demo`: default terrain plus water/sand and the demo spectacle when the world is at least 64 cells wide.
-- `factory-conveyor`: either the older repeated-lane toy (`setup=None`) or the `FactoryConveyorRuleV1` source/sink/backpressure harness with a scenario-local one-material +X block rule (`rule_set=FactoryConveyorV1`). Source injection, sink drain, and backpressure counting run outside timed `step_us` / `step_*` latency.
+- `factory-conveyor`: either the older repeated-lane toy (`setup=None`), the `FactoryConveyorRuleV1` source/sink/backpressure harness with a scenario-local one-material +X block rule (`rule_set=FactoryConveyorV1`), or the `FactoryEncodedBeltRoutingV1` harness (`rule_set=FactoryEncodedBeltRoutingV1`) with separate inert belt substrate cells, source-belt encoded +X/+Z direction, L-turn traversal, merge pressure, and route-specific telemetry. Source injection, sink drain, and routing/backpressure accounting run outside timed `step_us` / `step_*` latency.
 - `quarantine-atlas`: deterministic Quarantine Atlas playtest scene. Optional setup `QuarantineAtlasMixedContainmentV1` applies the `oym4` six-stamp mixed containment plan before warmup/measured stepping; it excludes interactive placement/raycast/cache-invalidation cost.
 - `soup-search`: deterministic tiled 3D Game-of-Life soup ensemble (`rule_set=SoupSearchV1`) for the `8ppq.5` stable-structure discovery lead. `SoupSearchV1` uses `density_per_1000=180`; `SoupSearchSparseV1` uses `density_per_1000=45` for sparser survivor/candidate discovery. Records include a `soup_search` summary with per-tile population history, survivor/candidate counts, and final tile state hashes; comparison validation requires the summary to match between backends.
 
@@ -56,6 +56,8 @@ diagnostic gate it stays a structured TODO.
 - `scenarios/cascade-peak-demo.ron`
 - `scenarios/factory-conveyor-toy.ron`
 - `scenarios/factory-conveyor-rule.ron`
+- `scenarios/factory-encoded-belt-routing.ron`
+- `scenarios/factory-encoded-belt-routing-chunk-array.ron`
 - `scenarios/quarantine-atlas-mixed-containment.ron`
 - `scenarios/soup-search.ron`
 - `scenarios/soup-search-chunk-array.ron`
