@@ -386,7 +386,9 @@ mod tests {
     fn tick_parity_idle(level: u32, ticks: usize) {
         let params = TerrainParams::for_level(level);
         let mut hashlife = World::new(level);
-        hashlife.seed_terrain(&params).unwrap();
+        hashlife
+            .seed_terrain(&params)
+            .expect("level-derived terrain params should seed hashlife baseline");
         let mut chunk = ChunkArrayWorld::from_world(&hashlife);
 
         for n in 0..=ticks {
@@ -428,7 +430,9 @@ mod tests {
     fn tick_parity_microchurn(level: u32, ticks: usize, sand_per_step: usize) {
         let params = TerrainParams::for_level(level);
         let mut hashlife = World::new(level);
-        hashlife.seed_terrain(&params).unwrap();
+        hashlife
+            .seed_terrain(&params)
+            .expect("level-derived terrain params should seed hashlife baseline");
         let mut chunk = ChunkArrayWorld::from_world(&hashlife);
 
         // Deterministic xorshift — both worlds get the same sand drops
