@@ -4,7 +4,6 @@ use hash_thing::player;
 use hash_thing::render;
 use hash_thing::scale::{CELLS_PER_METER, GROWTH_MARGIN};
 use hash_thing::sim;
-#[cfg(test)]
 use hash_thing::sim::world::quarantine_atlas_mixed_containment_plan;
 use hash_thing::sim::world::QuarantineAtlasPattern;
 use hash_thing::terrain;
@@ -693,6 +692,7 @@ enum PendingSceneSwap {
     ResetTerrain,
     LoadGyroid,
     LoadQuarantineAtlas,
+    LoadQuarantineAtlasMixed,
     LoadSoupProspector,
     LoadDemoSpectacle,
     ResetGolSmoke,
@@ -708,6 +708,7 @@ impl PendingSceneSwap {
             Self::ResetTerrain => "terrain_reset",
             Self::LoadGyroid => "gyroid",
             Self::LoadQuarantineAtlas => "quarantine_atlas",
+            Self::LoadQuarantineAtlasMixed => "quarantine_atlas_mixed",
             Self::LoadSoupProspector => "soup_prospector",
             Self::LoadDemoSpectacle => "demo_spectacle",
             Self::ResetGolSmoke => "gol_smoke_reset",
@@ -729,6 +730,7 @@ impl PendingSceneSwap {
             | Self::ResetTerrain
             | Self::LoadGyroid
             | Self::LoadQuarantineAtlas
+            | Self::LoadQuarantineAtlasMixed
             | Self::LoadSoupProspector
             | Self::LoadDemoSpectacle
             | Self::ResetGolSmoke
@@ -3015,7 +3017,12 @@ impl App {
     }
 
     fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
-        if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadQuarantineAtlas) {
+        if swap.discards_world()
+            && !matches!(
+                swap,
+                PendingSceneSwap::LoadQuarantineAtlas | PendingSceneSwap::LoadQuarantineAtlasMixed
+            )
+        {
             self.exit_quarantine_atlas_mode();
         }
         if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadSoupProspector) {
@@ -3032,6 +3039,9 @@ impl App {
             ),
             PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
             PendingSceneSwap::LoadQuarantineAtlas => self.load_quarantine_atlas_demo(),
+            PendingSceneSwap::LoadQuarantineAtlasMixed => {
+                self.load_quarantine_atlas_mixed_containment_demo()
+            }
             PendingSceneSwap::LoadSoupProspector => self.load_soup_prospector_demo(),
             PendingSceneSwap::LoadDemoSpectacle => {
                 self.load_demo_spectacle("Reset spectacle gallery")
@@ -3040,6 +3050,10 @@ impl App {
             PendingSceneSwap::SelectLatticeBeat(beat) => self.load_lattice_demo_beat(beat),
             PendingSceneSwap::SelectRule(rule, label) => self.apply_selected_rule(rule, label),
         }
+    }
+
+    fn dispatch_dump_scene(&mut self, scene: DumpScene) {
+        self.dispatch_scene_swap(scene.to_swap());
     }
 
     fn apply_selected_rule(&mut self, rule: sim::GameOfLife3D, label: &'static str) {
@@ -3375,6 +3389,12 @@ impl App {
                 pitch: 0.34,
                 dist: 0.95,
             }),
+            DumpPose::QuarantineAtlas => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.54, 0.26, 0.50],
+                yaw: -std::f32::consts::FRAC_PI_2,
+                pitch: 0.30,
+                dist: 0.78,
+            }),
             DumpPose::Geyser => self.apply_orbit_camera_pose(OrbitCameraPose {
                 target: [0.28, 0.35, 0.59],
                 yaw: std::f32::consts::FRAC_PI_2,
@@ -3387,6 +3407,10 @@ impl App {
                 pitch: 0.22,
                 dist: 0.30,
             }),
+        }
+        if pose == DumpPose::QuarantineAtlas {
+            self.legend_visible = false;
+            self.legend_dirty = true;
         }
         log::info!("--dump-pose: applied {}", pose.label());
     }
@@ -4502,6 +4526,14 @@ impl App {
     }
 
     fn load_quarantine_atlas_demo(&mut self) {
+        self.load_quarantine_atlas_demo_with_setup(false);
+    }
+
+    fn load_quarantine_atlas_mixed_containment_demo(&mut self) {
+        self.load_quarantine_atlas_demo_with_setup(true);
+    }
+
+    fn load_quarantine_atlas_demo_with_setup(&mut self, mixed_containment: bool) {
         if self.is_stepping() {
             return;
         }
@@ -4515,6 +4547,11 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let layout = self.world.seed_quarantine_atlas_demo();
+        if mixed_containment {
+            for (pattern, center) in quarantine_atlas_mixed_containment_plan(layout) {
+                self.world.apply_quarantine_atlas_pattern(pattern, center);
+            }
+        }
         self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
@@ -4545,7 +4582,7 @@ impl App {
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
         log::info!(
-            "Quarantine Atlas: pop={} gen={:.1}ms budget={} pattern={}",
+            "Quarantine Atlas: pop={} gen={:.1}ms budget={} pattern={} setup={}",
             self.world.population(),
             elapsed.as_secs_f64() * 1000.0,
             self.quarantine_atlas
@@ -4554,6 +4591,11 @@ impl App {
             self.quarantine_atlas
                 .map(|s| s.selected_pattern.label())
                 .unwrap_or("none"),
+            if mixed_containment {
+                hash_thing::sim::world::QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
+            } else {
+                "none"
+            },
         );
     }
 
@@ -4798,7 +4840,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                     "--dump-scene: dispatching {} before first frame",
                     scene.label()
                 );
-                self.dispatch_scene_swap(scene.to_swap());
+                self.dispatch_dump_scene(scene);
                 self.startup_scene_pending = false;
             }
             // Initial upload — untimed; we haven't started the render
@@ -5974,6 +6016,7 @@ enum DumpScene {
     Spectacle,
     Gyroid,
     QuarantineAtlas,
+    QuarantineAtlasMixed,
     SoupProspector,
     LatticeBeat(LatticeDemoBeat),
 }
@@ -5986,6 +6029,7 @@ impl DumpScene {
             "spectacle" => Some(Self::Spectacle),
             "gyroid" => Some(Self::Gyroid),
             "quarantine-atlas" => Some(Self::QuarantineAtlas),
+            "quarantine-atlas-mixed" => Some(Self::QuarantineAtlasMixed),
             "soup-prospector" => Some(Self::SoupProspector),
             "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
             "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
@@ -6001,6 +6045,7 @@ impl DumpScene {
             Self::Spectacle => PendingSceneSwap::LoadDemoSpectacle,
             Self::Gyroid => PendingSceneSwap::LoadGyroid,
             Self::QuarantineAtlas => PendingSceneSwap::LoadQuarantineAtlas,
+            Self::QuarantineAtlasMixed => PendingSceneSwap::LoadQuarantineAtlasMixed,
             Self::SoupProspector => PendingSceneSwap::LoadSoupProspector,
             Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
         }
@@ -6013,6 +6058,7 @@ impl DumpScene {
             Self::Spectacle => "spectacle",
             Self::Gyroid => "gyroid",
             Self::QuarantineAtlas => "quarantine-atlas",
+            Self::QuarantineAtlasMixed => "quarantine-atlas-mixed",
             Self::SoupProspector => "soup-prospector",
             Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
             Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
@@ -6030,6 +6076,7 @@ enum DumpPose {
     Wall,
     Blocks,
     TerrainWide,
+    QuarantineAtlas,
     Geyser,
     Volcano,
 }
@@ -6040,6 +6087,7 @@ impl DumpPose {
             "wall" => Some(Self::Wall),
             "blocks" => Some(Self::Blocks),
             "terrain-wide" => Some(Self::TerrainWide),
+            "quarantine-atlas" => Some(Self::QuarantineAtlas),
             "geyser" => Some(Self::Geyser),
             "volcano" => Some(Self::Volcano),
             _ => None,
@@ -6051,6 +6099,7 @@ impl DumpPose {
             Self::Wall => "wall",
             Self::Blocks => "blocks",
             Self::TerrainWide => "terrain-wide",
+            Self::QuarantineAtlas => "quarantine-atlas",
             Self::Geyser => "geyser",
             Self::Volcano => "volcano",
         }
@@ -6187,8 +6236,8 @@ where
 {
     const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|4k|WxH] [--focused] \
                          [--dump-frame PATH] \
-                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|soup-prospector|lattice-intro|lattice-interior|lattice-panorama] \
-                         [--dump-pose wall|blocks|terrain-wide|geyser|volcano] \
+                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|quarantine-atlas-mixed|soup-prospector|lattice-intro|lattice-interior|lattice-panorama] \
+                         [--dump-pose wall|blocks|terrain-wide|quarantine-atlas|geyser|volcano] \
                          [--dump-debug normal-axis|hit-kind|material] \
                          [--dump-layer composite|world|particles] \
                          [--dump-lod-bias VALUE] \
@@ -7158,6 +7207,7 @@ mod tests {
             ("spectacle", DumpScene::Spectacle),
             ("gyroid", DumpScene::Gyroid),
             ("quarantine-atlas", DumpScene::QuarantineAtlas),
+            ("quarantine-atlas-mixed", DumpScene::QuarantineAtlasMixed),
             ("soup-prospector", DumpScene::SoupProspector),
             (
                 "lattice-intro",
@@ -7183,6 +7233,7 @@ mod tests {
             ("wall", DumpPose::Wall),
             ("blocks", DumpPose::Blocks),
             ("terrain-wide", DumpPose::TerrainWide),
+            ("quarantine-atlas", DumpPose::QuarantineAtlas),
             ("geyser", DumpPose::Geyser),
             ("volcano", DumpPose::Volcano),
         ] {
@@ -7932,10 +7983,28 @@ mod tests {
         assert!(PendingSceneSwap::ResetTerrain.discards_world());
         assert!(PendingSceneSwap::LoadGyroid.discards_world());
         assert!(PendingSceneSwap::LoadQuarantineAtlas.discards_world());
+        assert!(PendingSceneSwap::LoadQuarantineAtlasMixed.discards_world());
         assert!(PendingSceneSwap::LoadSoupProspector.discards_world());
         assert!(PendingSceneSwap::LoadDemoSpectacle.discards_world());
         assert!(PendingSceneSwap::ResetGolSmoke.discards_world());
         assert!(PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Intro).discards_world());
+    }
+
+    #[test]
+    fn dump_scene_quarantine_atlas_mixed_dispatch_applies_setup() {
+        let mut plain = App::new(128);
+        plain.dispatch_dump_scene(DumpScene::QuarantineAtlas);
+
+        let mut mixed = App::new(128);
+        mixed.dispatch_dump_scene(DumpScene::QuarantineAtlasMixed);
+
+        assert!(
+            mixed.world.population() > plain.world.population(),
+            "mixed dump scene should apply {setup}: plain={} mixed={}",
+            plain.world.population(),
+            mixed.world.population(),
+            setup = hash_thing::sim::world::QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
+        );
     }
 
     #[test]
