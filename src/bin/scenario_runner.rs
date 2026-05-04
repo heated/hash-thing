@@ -4878,7 +4878,12 @@ mod tests {
                 "backpressure drift at gen {gen}"
             );
         }
-        assert!(hashlife_metrics.factory_sinked_total.unwrap() > 0);
+        assert!(
+            expect_metric(
+                hashlife_metrics.factory_sinked_total,
+                "factory_sinked_total"
+            ) > 0
+        );
         assert_eq!(
             hashlife_metrics.factory_sinked_total,
             chunk_metrics.factory_sinked_total
@@ -4903,7 +4908,7 @@ mod tests {
         assert!(generations
             .iter()
             .any(|gen| gen.factory_sinked.unwrap_or(0) > 0));
-        assert!(metrics.factory_sinked_total.unwrap() > 0);
+        assert!(expect_metric(metrics.factory_sinked_total, "factory_sinked_total") > 0);
     }
 
     fn install_encoded_belt_rule(world: &mut World) {
