@@ -52,16 +52,27 @@ diagnostic gate it stays a structured TODO.
 ## Current examples
 
 - `scenarios/default-terrain-idle.ron`
+- `scenarios/default-terrain-microchurn.ron`
+- `scenarios/default-terrain-microchurn-chunk-array.ron`
 - `scenarios/cascade-peak.ron`
+- `scenarios/cascade-peak-chunk-array.ron`
 - `scenarios/cascade-peak-demo.ron`
+- `scenarios/cascade-peak-demo-chunk-array.ron`
 - `scenarios/factory-conveyor-toy.ron`
 - `scenarios/factory-conveyor-rule.ron`
+- `scenarios/factory-conveyor-rule-chunk-array.ron`
 - `scenarios/factory-encoded-belt-routing.ron`
 - `scenarios/factory-encoded-belt-routing-chunk-array.ron`
 - `scenarios/quarantine-atlas-mixed-containment.ron`
+- `scenarios/quarantine-atlas-mixed-containment-chunk-array.ron`
+- `scenarios/megastructure-stamp-10.ron`
+- `scenarios/megastructure-stamp-10-chunk-array.ron`
+- `scenarios/megastructure-stamp-100.ron`
+- `scenarios/megastructure-stamp-100-chunk-array.ron`
 - `scenarios/soup-search.ron`
 - `scenarios/soup-search-chunk-array.ron`
 - `scenarios/soup-search-sparse.ron`
 - `scenarios/soup-search-sparse-chunk-array.ron`
+- `scenarios/temporal-reuse.ron`
 
 Automatic comparison-record synthesis is intentionally left out of the first probe. For now, run paired scenarios with different `backend` values and compare records by matching `scenario_hash`, `rule_set`, and hardware.
