@@ -262,6 +262,26 @@ lifespan, survivor/candidate booleans, and `final_state_hash`.
 This is a measured-window classifier, not a proof of true oscillator stability.
 Comparison validation requires the whole summary to match between backends.
 
+### `temporal_reuse` summary
+
+`setup=TemporalReuseV1` records include a top-level `temporal_reuse` object.
+It contains `setup`, observation totals split by active/empty/uniform
+structures, active and parity weighted reuse ratios, `bucket_summaries`,
+per-level summaries, and per-generation rows with `gen`, `pop_count`,
+`state_hash`, and duplicate-active counts.
+
+This is a diagnostic recurrence summary for the replay-scrub lead, not a
+backend-parity contract.
+
+### `megastructure_stamp` summary
+
+`setup=MegastructureStamp10V1` and `setup=MegastructureStamp100V1` records
+include a top-level `megastructure_stamp` object. It contains `setup`,
+`module_side`, `tile_stride`, `configured_stamps`,
+`initial_active_cells_per_stamp`, `svdag_node_count`, and `svdag_byte_size`.
+
+Comparison validation requires the whole summary to match between backends.
+
 ### Numerical precision
 
 - All metric values stored at f64 full precision (no pre-rounding at write-time).
