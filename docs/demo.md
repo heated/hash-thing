@@ -73,12 +73,13 @@ profile directly, not the wrapper.
 The binary accepts:
 
 ```bash
-hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|4k|WxH]
+hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|4k|WxH] [--focused]
 ```
 
 `--demo` and `--res` are mutually exclusive. `--demo` focuses the window on
 launch and uses the fixed demo render scale. `--res` keeps pixel-budget render
-scale semantics and does not imply demo focus by itself.
+scale semantics and does not imply demo focus by itself. `--focused` opts back
+into launch focus without changing render scale.
 
 The wrapper passes `--demo` when the configured resolution is `1080p`; for any
 other configured or one-shot resolution it passes `--res VALUE`. The wrapper
@@ -89,5 +90,7 @@ the window to activate on launch:
 
 ```bash
 cargo run -- --demo
+cargo run -- --focused
 HASH_THING_FOCUS=1 cargo run
+HASH_THING_FOCUSED=1 cargo run
 ```

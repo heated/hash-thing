@@ -1113,8 +1113,9 @@ struct App {
     /// Threaded through to `Renderer::new`.
     render_scale_override: Option<render::RenderScaleOverride>,
     /// hash-thing-kh9l: focus the window on launch. Set in `main()` from
-    /// `--demo` (kh9l) or `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults
-    /// to `false` so the 40+ test callers stay in the no-focus regime.
+    /// `--demo` (kh9l), `--focused` / `HASH_THING_FOCUSED=1` (xu3d), or
+    /// `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults to `false` so the
+    /// 40+ test callers stay in the no-focus regime.
     /// Mirrored into the macOS event_loop_builder's
     /// `with_activate_ignoring_other_apps` flag so both gates fire from
     /// the same input.
@@ -4739,8 +4740,9 @@ impl ApplicationHandler<AppUserEvent> for App {
             );
             // Do NOT focus-on-launch by default (edward 2026-04-21): the
             // game stealing focus mid-dev-loop blocks keyboard input to the
-            // terminal/agent surface. Opt in with `HASH_THING_FOCUS=1` (sgcv)
-            // or `--demo` (kh9l). Both feed `App::want_focus_on_launch` via
+            // terminal/agent surface. Opt in with `HASH_THING_FOCUS=1` (sgcv),
+            // `--demo` (kh9l), or `--focused` / `HASH_THING_FOCUSED=1` (xu3d).
+            // All feed `App::want_focus_on_launch` via
             // `main()`. The macOS event_loop_builder's
             // `with_activate_ignoring_other_apps` is set from the same
             // signal, so both gates fire together.
@@ -6114,6 +6116,9 @@ struct ParsedArgs {
     /// hash-thing-kh9l: `--demo` was passed. Drives window focus-on-launch
     /// in main() and the static demo render-scale floor in `parse_args_from`.
     demo: bool,
+    /// hash-thing-xu3d: `--focused` opts back into focus-on-launch without
+    /// changing render scale.
+    focused: bool,
     /// `--dump-frame PATH`: render one frame to PNG at `PATH`, then exit.
     dump_frame: Option<std::path::PathBuf>,
     /// `--dump-scene KIND`: hash-thing-j1mg, only meaningful with
@@ -6142,7 +6147,7 @@ struct ParsedArgs {
     dump_soup_reuse: bool,
 }
 
-/// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
+/// Parse `[SIZE] [--demo | --res VALUE] [--focused] [--dump-frame PATH]` from an arg
 /// iterator. `args` should already have the binary path stripped (callers
 /// usually pass `std::env::args().skip(1)`). Pure function for unit testing.
 ///
@@ -6160,7 +6165,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
+    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|4k|WxH] [--focused] \
                          [--dump-frame PATH] \
                          [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|soup-prospector|lattice-intro|lattice-interior|lattice-panorama] \
                          [--dump-pose wall|blocks|terrain-wide|geyser|volcano] \
@@ -6171,6 +6176,7 @@ where
                          [--dump-soup-catalog] [--dump-soup-reuse]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
+    let mut focused: bool = false;
     let mut res_target: Option<u64> = None;
     let mut dump_frame: Option<std::path::PathBuf> = None;
     let mut dump_scene: Option<DumpScene> = None;
@@ -6187,6 +6193,7 @@ where
         match arg {
             "--help" | "-h" => panic!("{USAGE}"),
             "--demo" => demo = true,
+            "--focused" => focused = true,
             "--res" => {
                 if res_target.is_some() {
                     panic!("{USAGE}\nmore than one --res");
@@ -6390,6 +6397,7 @@ where
         volume_size_explicit,
         render_scale_override,
         demo,
+        focused,
         dump_frame,
         dump_scene,
         dump_pose,
@@ -6400,6 +6408,15 @@ where
         dump_soup_catalog,
         dump_soup_reuse,
     }
+}
+
+fn want_focus_on_launch_from_inputs(
+    demo: bool,
+    focused: bool,
+    legacy_focus_env: Option<&str>,
+    focused_env: Option<&str>,
+) -> bool {
+    demo || focused || legacy_focus_env == Some("1") || focused_env == Some("1")
 }
 
 fn main() {
@@ -6442,6 +6459,7 @@ fn main() {
         volume_size_explicit,
         render_scale_override,
         demo,
+        focused,
         dump_frame: dump_frame_path,
         dump_scene,
         dump_pose,
@@ -6523,11 +6541,17 @@ fn main() {
     // both consume this: the macOS event-loop builder (must be set BEFORE
     // event_loop.build()) and `App.want_focus_on_launch` (consumed at
     // window-creation time after winit resumes the app). hash-thing-kh9l
-    // routes `--demo` into this gate so the wrapper-less invocation
-    // `cargo run -- --demo` activates the window the same way that
-    // `HASH_THING_FOCUS=1 cargo run` does today.
-    let want_focus_on_launch =
-        demo || std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
+    // routes `--demo` and `--focused` into this gate so wrapper-less
+    // invocations can opt back into activation. HASH_THING_FOCUS remains
+    // the legacy wrapper env; HASH_THING_FOCUSED is the explicit user env.
+    let legacy_focus_env = std::env::var("HASH_THING_FOCUS").ok();
+    let focused_env = std::env::var("HASH_THING_FOCUSED").ok();
+    let want_focus_on_launch = want_focus_on_launch_from_inputs(
+        demo,
+        focused,
+        legacy_focus_env.as_deref(),
+        focused_env.as_deref(),
+    );
 
     // hash-thing-dbv3 (vqke.1.1): use `EventLoop::<AppUserEvent>::with_user_event()`
     // so the sim worker can wake the main loop via
@@ -6540,7 +6564,8 @@ fn main() {
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
         // hash-thing-sgcv + kh9l: gate the activate-ignoring-other-apps
         // flag behind the same `want_focus_on_launch` derived above
-        // (HASH_THING_FOCUS=1 env or `--demo` flag). Mirrors the
+        // (HASH_THING_FOCUS=1 / HASH_THING_FOCUSED=1 env, `--focused`,
+        // or `--demo` flag). Mirrors the
         // window.focus_window() gate around src/main.rs:2277. winit's
         // default for this flag is `true`
         // (PlatformSpecificEventLoopAttributes in
@@ -6872,6 +6897,7 @@ mod tests {
         assert!(r.volume_size_explicit);
         assert_eq!(r.render_scale_override, None);
         assert!(!r.demo);
+        assert!(!r.focused);
         assert_eq!(r.dump_frame, None);
     }
 
@@ -6882,6 +6908,7 @@ mod tests {
         assert!(!r.volume_size_explicit);
         assert_eq!(r.render_scale_override, None);
         assert!(!r.demo);
+        assert!(!r.focused);
         assert_eq!(r.dump_frame, None);
     }
 
@@ -6895,6 +6922,39 @@ mod tests {
             Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
         );
         assert!(r.demo, "kh9l: --demo must surface as demo=true");
+        assert!(!r.focused);
+    }
+
+    #[test]
+    fn parse_args_from_focused_alone() {
+        let r = parse_args_from(["--focused"]);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
+        assert_eq!(r.render_scale_override, None);
+        assert!(!r.demo);
+        assert!(r.focused, "xu3d: --focused must surface as focused=true");
+    }
+
+    #[test]
+    fn parse_args_from_focused_with_res() {
+        let r = parse_args_from(["--focused", "--res", "720p"]);
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1280 * 720))
+        );
+        assert!(!r.demo);
+        assert!(r.focused);
+    }
+
+    #[test]
+    fn parse_args_from_demo_and_focused() {
+        let r = parse_args_from(["--demo", "--focused"]);
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
+        assert!(r.demo);
+        assert!(r.focused);
     }
 
     #[test]
@@ -6908,6 +6968,7 @@ mod tests {
         );
         assert!(r1.volume_size_explicit);
         assert!(r1.demo);
+        assert!(!r1.focused);
         assert_eq!(r2.volume_size, 256);
         assert_eq!(
             r2.render_scale_override,
@@ -6915,6 +6976,40 @@ mod tests {
         );
         assert!(r2.volume_size_explicit);
         assert!(r2.demo);
+        assert!(!r2.focused);
+    }
+
+    #[test]
+    fn want_focus_on_launch_inputs_default_false() {
+        assert!(!want_focus_on_launch_from_inputs(false, false, None, None));
+    }
+
+    #[test]
+    fn want_focus_on_launch_inputs_cli_flags_enable_focus() {
+        assert!(want_focus_on_launch_from_inputs(true, false, None, None));
+        assert!(want_focus_on_launch_from_inputs(false, true, None, None));
+    }
+
+    #[test]
+    fn want_focus_on_launch_inputs_env_aliases_enable_focus() {
+        assert!(want_focus_on_launch_from_inputs(
+            false,
+            false,
+            Some("1"),
+            None
+        ));
+        assert!(want_focus_on_launch_from_inputs(
+            false,
+            false,
+            None,
+            Some("1")
+        ));
+        assert!(!want_focus_on_launch_from_inputs(
+            false,
+            false,
+            Some("true"),
+            Some("0")
+        ));
     }
 
     #[test]
