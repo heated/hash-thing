@@ -1,0 +1,15 @@
+(
+    name: "megastructure-stamp-10",
+    world: Medium,
+    level: Some(7),
+    scene: MegastructureStamp,
+    rule_set: DefaultCa,
+    intensity: PassiveActive,
+    regime: Churning,
+    backend: HashlifeRecursive,
+    generations: 12,
+    warmup_generations: Some(4),
+    seed: 11,
+    setup: Some(MegastructureStamp10V1),
+    comparator: Some("chunk-array@same-scenario"),
+)

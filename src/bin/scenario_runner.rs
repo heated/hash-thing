@@ -7,6 +7,7 @@ use hash_thing::sim::world::{
 use hash_thing::sim::{GameOfLife3D, World, WorldCoord};
 use hash_thing::terrain::materials::{METAL, METAL_MATERIAL_ID, SAND, STONE, WATER};
 use hash_thing::terrain::TerrainParams;
+use ht_render::Svdag;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +24,10 @@ const SOUP_SEARCH_SPARSE_V1: &str =
 const SOUP_SEARCH_ALIVE: CellState = Cell::pack(1, 0).raw();
 const TEMPORAL_REUSE_SETUP_V1: &str =
     "TemporalReuseV1(seed_center_radius=12,density=0.35,rule=crystal)";
+const MEGASTRUCTURE_STAMP_10_V1: &str =
+    "MegastructureStampV1(module_side=8,tile_stride=16,stamps=10,rule=crystal)";
+const MEGASTRUCTURE_STAMP_100_V1: &str =
+    "MegastructureStampV1(module_side=8,tile_stride=16,stamps=100,rule=crystal)";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +83,7 @@ enum Scene {
     QuarantineAtlas,
     ReplayScrub,
     SoupSearch,
+    MegastructureStamp,
 }
 
 impl Scene {
@@ -89,6 +95,7 @@ impl Scene {
             Self::QuarantineAtlas => "quarantine-atlas",
             Self::ReplayScrub => "replay-scrub",
             Self::SoupSearch => "soup-search",
+            Self::MegastructureStamp => "megastructure-stamp",
         }
     }
 }
@@ -100,6 +107,8 @@ enum ScenarioSetup {
     SoupSearchV1,
     SoupSearchSparseV1,
     TemporalReuseV1,
+    MegastructureStamp10V1,
+    MegastructureStamp100V1,
 }
 
 impl ScenarioSetup {
@@ -110,8 +119,18 @@ impl ScenarioSetup {
             Self::SoupSearchV1 => SOUP_SEARCH_SETUP_V1,
             Self::SoupSearchSparseV1 => SOUP_SEARCH_SPARSE_V1,
             Self::TemporalReuseV1 => TEMPORAL_REUSE_SETUP_V1,
+            Self::MegastructureStamp10V1 => MEGASTRUCTURE_STAMP_10_V1,
+            Self::MegastructureStamp100V1 => MEGASTRUCTURE_STAMP_100_V1,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct MegastructureStampParams {
+    setup: &'static str,
+    stamps: usize,
+    module_side: i64,
+    tile_stride: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -284,6 +303,17 @@ struct TemporalReuseSummary {
     generations: Vec<TemporalGenerationSummary>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct MegastructureStampSummary {
+    setup: String,
+    module_side: i64,
+    tile_stride: i64,
+    configured_stamps: usize,
+    initial_active_cells_per_stamp: usize,
+    svdag_node_count: usize,
+    svdag_byte_size: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TemporalBucketSummary {
     bucket_size: usize,
@@ -342,6 +372,8 @@ struct MeasurementRecord {
     soup_search: Option<SoupSearchSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temporal_reuse: Option<TemporalReuseSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    megastructure_stamp: Option<MegastructureStampSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1108,8 +1140,22 @@ fn validate_comparable(
     }
     validate_factory_parity(subject, baseline)?;
     validate_soup_search_parity(subject, baseline)?;
+    validate_megastructure_stamp_parity(subject, baseline)?;
     metric_value(&subject.metrics, metric)?;
     metric_value(&baseline.metrics, metric)?;
+    Ok(())
+}
+
+fn validate_megastructure_stamp_parity(
+    subject: &MeasurementRecord,
+    baseline: &MeasurementRecord,
+) -> Result<(), String> {
+    if subject.megastructure_stamp != baseline.megastructure_stamp {
+        return Err(format!(
+            "comparison mismatch on megastructure_stamp summary: {:?} vs {:?}",
+            subject.megastructure_stamp, baseline.megastructure_stamp
+        ));
+    }
     Ok(())
 }
 
@@ -1249,7 +1295,9 @@ fn validate_measurement_coordinates(record: &MeasurementRecord) -> Result<(), St
             "default-demo",
             "factory-conveyor",
             "quarantine-atlas",
+            "replay-scrub",
             "soup-search",
+            "megastructure-stamp",
         ],
         record,
     )?;
@@ -1294,6 +1342,14 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
                 record.scene, record.measurement_id
             ))
         }
+        Some(MEGASTRUCTURE_STAMP_10_V1 | MEGASTRUCTURE_STAMP_100_V1)
+            if record.scene != "megastructure-stamp" =>
+        {
+            Err(format!(
+                "setup=MegastructureStampV1 is invalid for scene={} in {}",
+                record.scene, record.measurement_id
+            ))
+        }
         Some(QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP) if record.rule_set != "default-ca" => {
             Err(format!(
                 "setup={} requires matching rule_set (got {}) in {}",
@@ -1320,11 +1376,21 @@ fn validate_setup_coordinates(record: &MeasurementRecord) -> Result<(), String> 
                 record.rule_set, record.measurement_id
             ))
         }
+        Some(MEGASTRUCTURE_STAMP_10_V1 | MEGASTRUCTURE_STAMP_100_V1)
+            if record.rule_set != "default-ca" =>
+        {
+            Err(format!(
+                "setup=MegastructureStampV1 requires matching rule_set (got {}) in {}",
+                record.rule_set, record.measurement_id
+            ))
+        }
         Some(
             QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
             | "FactoryConveyorRuleV1"
             | SOUP_SEARCH_SETUP_V1
-            | SOUP_SEARCH_SPARSE_V1,
+            | SOUP_SEARCH_SPARSE_V1
+            | MEGASTRUCTURE_STAMP_10_V1
+            | MEGASTRUCTURE_STAMP_100_V1,
         ) => Ok(()),
         Some(other) => Err(format!(
             "invalid setup {:?} for {}",
@@ -1446,7 +1512,8 @@ fn validate_measurement_metrics(record: &MeasurementRecord) -> Result<(), String
         "hashlife-recursive" => validate_hashlife_metrics(record),
         _ => Ok(()),
     }?;
-    validate_soup_search_summary(record)
+    validate_soup_search_summary(record)?;
+    validate_megastructure_stamp_summary(record)
 }
 
 fn validate_chunk_array_metrics(record: &MeasurementRecord) -> Result<(), String> {
@@ -1666,6 +1733,70 @@ fn validate_soup_search_summary(record: &MeasurementRecord) -> Result<(), String
     Ok(())
 }
 
+fn validate_megastructure_stamp_summary(record: &MeasurementRecord) -> Result<(), String> {
+    let Some(summary) = &record.megastructure_stamp else {
+        if record.scene == "megastructure-stamp" {
+            return Err(format!(
+                "megastructure-stamp measurement {} requires megastructure_stamp summary",
+                record.measurement_id
+            ));
+        }
+        return Ok(());
+    };
+    if record.scene != "megastructure-stamp" {
+        return Err(format!(
+            "non-megastructure measurement {} must not include megastructure_stamp summary",
+            record.measurement_id
+        ));
+    }
+    let Some(setup) = record.setup.as_deref() else {
+        return Err(format!(
+            "megastructure-stamp measurement {} requires setup",
+            record.measurement_id
+        ));
+    };
+    if summary.setup != setup {
+        return Err(format!(
+            "megastructure_stamp setup mismatch for {}: summary={:?} record={:?}",
+            record.measurement_id, summary.setup, setup
+        ));
+    }
+    let params = match setup {
+        MEGASTRUCTURE_STAMP_10_V1 => MegastructureStampParams {
+            setup: MEGASTRUCTURE_STAMP_10_V1,
+            stamps: 10,
+            module_side: 8,
+            tile_stride: 16,
+        },
+        MEGASTRUCTURE_STAMP_100_V1 => MegastructureStampParams {
+            setup: MEGASTRUCTURE_STAMP_100_V1,
+            stamps: 100,
+            module_side: 8,
+            tile_stride: 16,
+        },
+        other => {
+            return Err(format!(
+                "invalid megastructure_stamp setup {:?} for {}",
+                other, record.measurement_id
+            ));
+        }
+    };
+    if summary.configured_stamps != params.stamps
+        || summary.module_side != params.module_side
+        || summary.tile_stride != params.tile_stride
+        || summary.initial_active_cells_per_stamp
+            != megastructure_active_cells_per_stamp(params.module_side)
+        || summary.svdag_node_count == 0
+        || summary.svdag_byte_size == 0
+    {
+        return Err(format!(
+            "megastructure_stamp summary mismatch for {}",
+            record.measurement_id
+        ));
+    }
+    Ok(())
+}
+
 fn validate_one_of(
     name: &str,
     value: &str,
@@ -1829,6 +1960,7 @@ fn run_scenario(
     };
     let soup_search = soup_search_summary_for(scenario, &generations, side as usize);
     let temporal_reuse = temporal_reuse_summary_for(scenario, &generations);
+    let megastructure_stamp = megastructure_stamp_summary_for(scenario, &generations);
 
     let hash_suffix = scenario_hash
         .strip_prefix("sha256:")
@@ -1874,6 +2006,7 @@ fn run_scenario(
         generations,
         soup_search,
         temporal_reuse,
+        megastructure_stamp,
     })
 }
 
@@ -1917,6 +2050,8 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
         | (Some(ScenarioSetup::SoupSearchV1), Scene::SoupSearch)
         | (Some(ScenarioSetup::SoupSearchSparseV1), Scene::SoupSearch)
         | (Some(ScenarioSetup::TemporalReuseV1), Scene::ReplayScrub)
+        | (Some(ScenarioSetup::MegastructureStamp10V1), Scene::MegastructureStamp)
+        | (Some(ScenarioSetup::MegastructureStamp100V1), Scene::MegastructureStamp)
         | (None, _) => Ok(()),
         (Some(setup), scene) => Err(format!(
             "setup={} is invalid for scene={}",
@@ -1936,6 +2071,8 @@ fn validate_setup_scene(scenario: &Scenario) -> Result<(), String> {
         | (Some(ScenarioSetup::SoupSearchV1), RuleSet::SoupSearchV1)
         | (Some(ScenarioSetup::SoupSearchSparseV1), RuleSet::SoupSearchV1)
         | (Some(ScenarioSetup::TemporalReuseV1), RuleSet::SoupSearchV1)
+        | (Some(ScenarioSetup::MegastructureStamp10V1), RuleSet::DefaultCa)
+        | (Some(ScenarioSetup::MegastructureStamp100V1), RuleSet::DefaultCa)
         | (None, RuleSet::DefaultCa) => Ok(()),
         (Some(setup), rule_set) => Err(format!(
             "setup={} requires matching rule_set (got {})",
@@ -1967,8 +2104,110 @@ fn seed_scene(world: &mut World, scenario: &Scenario) -> Result<(), String> {
         Scene::QuarantineAtlas => seed_quarantine_atlas(world, scenario)?,
         Scene::ReplayScrub => seed_temporal_reuse(world, scenario)?,
         Scene::SoupSearch => seed_soup_search(world, scenario)?,
+        Scene::MegastructureStamp => seed_megastructure_stamp(world, scenario)?,
     }
     Ok(())
+}
+
+fn seed_megastructure_stamp(world: &mut World, scenario: &Scenario) -> Result<(), String> {
+    let params = megastructure_stamp_params(scenario.setup.ok_or_else(|| {
+        format!(
+            "megastructure-stamp scene requires setup={}",
+            MEGASTRUCTURE_STAMP_10_V1
+        )
+    })?)?;
+    if world.side() < 128 {
+        return Err("megastructure-stamp scene requires side >= 128".to_string());
+    }
+
+    world.set_gol_smoke_rule(GameOfLife3D::new(0, 6, 1, 3));
+    let mut placed = 0;
+    let side = world.side() as i64;
+    let margin = 8;
+    'stamps: for z in (margin..side - margin).step_by(params.tile_stride as usize) {
+        for y in (margin..side - margin).step_by(params.tile_stride as usize) {
+            for x in (margin..side - margin).step_by(params.tile_stride as usize) {
+                stamp_megastructure_module(world, [x, y, z], params.module_side);
+                placed += 1;
+                if placed == params.stamps {
+                    break 'stamps;
+                }
+            }
+        }
+    }
+    if placed != params.stamps {
+        return Err(format!(
+            "megastructure-stamp placed {placed} stamps, expected {}",
+            params.stamps
+        ));
+    }
+    Ok(())
+}
+
+fn stamp_megastructure_module(world: &mut World, origin: [i64; 3], side: i64) {
+    for dz in 0..side {
+        for dy in 0..side {
+            for dx in 0..side {
+                let shell = dx == 0
+                    || dy == 0
+                    || dz == 0
+                    || dx == side - 1
+                    || dy == side - 1
+                    || dz == side - 1;
+                let lattice = dx == dy || dy == dz || (dx + dy + dz) % 5 == 0;
+                if shell || lattice {
+                    world.set(
+                        WorldCoord(origin[0] + dx),
+                        WorldCoord(origin[1] + dy),
+                        WorldCoord(origin[2] + dz),
+                        SOUP_SEARCH_ALIVE,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn megastructure_stamp_params(setup: ScenarioSetup) -> Result<MegastructureStampParams, String> {
+    match setup {
+        ScenarioSetup::MegastructureStamp10V1 => Ok(MegastructureStampParams {
+            setup: MEGASTRUCTURE_STAMP_10_V1,
+            stamps: 10,
+            module_side: 8,
+            tile_stride: 16,
+        }),
+        ScenarioSetup::MegastructureStamp100V1 => Ok(MegastructureStampParams {
+            setup: MEGASTRUCTURE_STAMP_100_V1,
+            stamps: 100,
+            module_side: 8,
+            tile_stride: 16,
+        }),
+        other => Err(format!(
+            "setup={} is invalid for megastructure-stamp",
+            other.as_str()
+        )),
+    }
+}
+
+fn megastructure_active_cells_per_stamp(module_side: i64) -> usize {
+    let mut active = 0;
+    for dz in 0..module_side {
+        for dy in 0..module_side {
+            for dx in 0..module_side {
+                let shell = dx == 0
+                    || dy == 0
+                    || dz == 0
+                    || dx == module_side - 1
+                    || dy == module_side - 1
+                    || dz == module_side - 1;
+                let lattice = dx == dy || dy == dz || (dx + dy + dz) % 5 == 0;
+                if shell || lattice {
+                    active += 1;
+                }
+            }
+        }
+    }
+    active
 }
 
 fn seed_temporal_reuse(world: &mut World, scenario: &Scenario) -> Result<(), String> {
@@ -2349,6 +2588,9 @@ fn confidence_notes(scenario: &Scenario, path: &Path, warmup_generations: usize)
         Some(ScenarioSetup::SoupSearchV1) => {
             "; setup=soup-search-v1 (deterministic tiled 3D GoL soup ensemble; this first probe measures the search workload, while survivor classification is tracked in hash-thing-8ppq.5.2)".to_string()
         }
+        Some(ScenarioSetup::MegastructureStamp10V1 | ScenarioSetup::MegastructureStamp100V1) => {
+            "; setup=megastructure-stamp-v1 (scripted clustered repeated-module stamping before measurement; step_us/step_* time only post-stamp simulation, while megastructure_stamp records final SVDAG fold size; excludes interactive placement/raycast/cache-invalidation cost)".to_string()
+        }
         Some(setup) => format!(
             "; setup={} (scripted pre-measurement intervention setup; excludes interactive placement/raycast/cache-invalidation cost)",
             setup.as_str()
@@ -2556,6 +2798,47 @@ fn temporal_reuse_summary_for(
         return None;
     }
     Some(temporal_reuse_summary(generations, &[4, 8]))
+}
+
+fn megastructure_stamp_summary_for(
+    scenario: &Scenario,
+    generations: &[GenerationRecord],
+) -> Option<MegastructureStampSummary> {
+    let setup = scenario.setup?;
+    let params = megastructure_stamp_params(setup).ok()?;
+    let final_grid = generations.last()?.grid.as_ref()?;
+    let side = grid_side(final_grid.len());
+    let (svdag_node_count, svdag_byte_size) = svdag_size_from_grid(final_grid, side);
+    Some(MegastructureStampSummary {
+        setup: params.setup.to_string(),
+        module_side: params.module_side,
+        tile_stride: params.tile_stride,
+        configured_stamps: params.stamps,
+        initial_active_cells_per_stamp: megastructure_active_cells_per_stamp(params.module_side),
+        svdag_node_count,
+        svdag_byte_size,
+    })
+}
+
+fn svdag_size_from_grid(grid: &[CellState], side: usize) -> (usize, usize) {
+    let level = side.trailing_zeros();
+    let mut world = World::new(level);
+    for (idx, &cell) in grid.iter().enumerate() {
+        if cell == 0 {
+            continue;
+        }
+        let x = idx % side;
+        let y = (idx / side) % side;
+        let z = idx / (side * side);
+        world.set(
+            WorldCoord(x as i64),
+            WorldCoord(y as i64),
+            WorldCoord(z as i64),
+            cell,
+        );
+    }
+    let svdag = Svdag::build(&world.store, world.root, world.level);
+    (svdag.node_count, svdag.byte_size())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3252,6 +3535,69 @@ mod tests {
     }
 
     #[test]
+    fn megastructure_stamp_setup_changes_hash_and_requires_matching_scene() {
+        let mut ten = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        ten.world = WorldCoordName::Medium;
+        ten.level = Some(7);
+        ten.scene = Scene::MegastructureStamp;
+        ten.intensity = Intensity::PassiveActive;
+        ten.setup = Some(ScenarioSetup::MegastructureStamp10V1);
+
+        let mut hundred = ten.clone();
+        hundred.setup = Some(ScenarioSetup::MegastructureStamp100V1);
+
+        assert_ne!(scenario_hash(&ten, 7), scenario_hash(&hundred, 7));
+        assert!(validate_backend_regime(&ten).is_ok());
+
+        let mut bad_scene = ten;
+        bad_scene.scene = Scene::DefaultTerrain;
+        assert!(validate_backend_regime(&bad_scene).is_err());
+    }
+
+    #[test]
+    fn megastructure_stamp_summary_records_repetition_shape() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        scenario.name = "megastructure-stamp-10".to_string();
+        scenario.world = WorldCoordName::Medium;
+        scenario.level = Some(7);
+        scenario.scene = Scene::MegastructureStamp;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.generations = 1;
+        scenario.setup = Some(ScenarioSetup::MegastructureStamp10V1);
+
+        let record = run_scenario(
+            Path::new("test-megastructure-stamp-10.ron"),
+            &scenario,
+            "test",
+        )
+        .expect("run megastructure stamp scenario");
+        let summary = record
+            .megastructure_stamp
+            .expect("megastructure stamp summary");
+
+        assert_eq!(summary.configured_stamps, 10);
+        assert_eq!(summary.module_side, 8);
+        assert_eq!(summary.tile_stride, 16);
+        assert!(summary.initial_active_cells_per_stamp > 0);
+        assert!(summary.svdag_node_count > 0);
+        assert!(summary.svdag_byte_size > 0);
+    }
+
+    #[test]
+    fn megastructure_stamp_checked_in_fixtures_parse_and_validate() {
+        for text in [
+            include_str!("../../scenarios/megastructure-stamp-10.ron"),
+            include_str!("../../scenarios/megastructure-stamp-10-chunk-array.ron"),
+            include_str!("../../scenarios/megastructure-stamp-100.ron"),
+            include_str!("../../scenarios/megastructure-stamp-100-chunk-array.ron"),
+        ] {
+            let scenario: Scenario = ron::from_str(text).expect("parse megastructure fixture");
+            assert!(matches!(scenario.scene, Scene::MegastructureStamp));
+            validate_backend_regime(&scenario).expect("valid megastructure fixture");
+        }
+    }
+
+    #[test]
     fn soup_search_setup_changes_hash_and_requires_matching_rule_set() {
         let mut soup = test_scenario(Backend::HashlifeRecursive, Regime::Saturated);
         soup.scene = Scene::SoupSearch;
@@ -3617,6 +3963,39 @@ mod tests {
         assert!(err.contains("trajectory drift"), "{err}");
         assert!(err.contains("--allow-trajectory-drift"), "{err}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_records_rejects_megastructure_missing_summary() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "churning", 2.0);
+        make_megastructure_measurement_pair(&mut a, &mut b);
+        a.megastructure_stamp = None;
+
+        let err = compare_error(&a, &b);
+
+        assert!(
+            err.contains("requires megastructure_stamp summary"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn compare_records_rejects_megastructure_summary_mismatch() {
+        let mut a = test_measurement("chunk", "chunk-array", "n/a", 10.0);
+        let mut b = test_measurement("hashlife", "hashlife-recursive", "churning", 2.0);
+        make_megastructure_measurement_pair(&mut a, &mut b);
+        b.megastructure_stamp
+            .as_mut()
+            .expect("mega summary")
+            .svdag_node_count += 1;
+
+        let err = compare_error(&a, &b);
+
+        assert!(
+            err.contains("comparison mismatch on megastructure_stamp summary"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4355,6 +4734,38 @@ mod tests {
             .any(|tile| tile.lifespan_generations > 0));
     }
 
+    #[test]
+    fn megastructure_stamp_keeps_backends_on_same_trajectory() {
+        let mut scenario = test_scenario(Backend::HashlifeRecursive, Regime::Churning);
+        scenario.world = WorldCoordName::Medium;
+        scenario.level = Some(7);
+        scenario.scene = Scene::MegastructureStamp;
+        scenario.intensity = Intensity::PassiveActive;
+        scenario.setup = Some(ScenarioSetup::MegastructureStamp10V1);
+
+        let mut hashlife_world = World::new(7);
+        seed_scene(&mut hashlife_world, &scenario).expect("seed hashlife stamp");
+        let mut chunk_world = World::new(7);
+        seed_scene(&mut chunk_world, &scenario).expect("seed chunk stamp");
+
+        let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, None, None, 11);
+        let (chunk, _) = run_chunk_array(chunk_world, 1, 4, None, None, 11);
+
+        assert_eq!(hashlife.len(), chunk.len());
+        for (gen, (h, c)) in hashlife.iter().zip(chunk.iter()).enumerate() {
+            assert_eq!(h.pop_count, c.pop_count, "pop drift at gen {gen}");
+            assert_eq!(
+                h.mat_distribution, c.mat_distribution,
+                "material drift at gen {gen}"
+            );
+            assert_eq!(h.state_hash, c.state_hash, "state hash drift at gen {gen}");
+        }
+        assert_eq!(
+            megastructure_stamp_summary_for(&scenario, &hashlife),
+            megastructure_stamp_summary_for(&scenario, &chunk)
+        );
+    }
+
     fn test_scenario(backend: Backend, regime: Regime) -> Scenario {
         Scenario {
             name: "test".to_string(),
@@ -4447,7 +4858,40 @@ mod tests {
             }],
             soup_search: None,
             temporal_reuse: None,
+            megastructure_stamp: None,
         }
+    }
+
+    fn make_megastructure_measurement_pair(a: &mut MeasurementRecord, b: &mut MeasurementRecord) {
+        a.world = "medium".to_string();
+        a.scene = "megastructure-stamp".to_string();
+        a.intensity = "passive-active".to_string();
+        a.rule_set = "default-ca".to_string();
+        a.setup = Some(MEGASTRUCTURE_STAMP_10_V1.to_string());
+        a.scenario_hash = "sha256:49e776b4ae8c3fbd".to_string();
+        a.level = 7;
+        a.side = 128;
+        a.generations[0].pop_count = 10;
+        b.world = a.world.clone();
+        b.scene = a.scene.clone();
+        b.intensity = a.intensity.clone();
+        b.rule_set = a.rule_set.clone();
+        b.setup = a.setup.clone();
+        b.scenario_hash = a.scenario_hash.clone();
+        b.level = a.level;
+        b.side = a.side;
+        b.generations[0].pop_count = a.generations[0].pop_count;
+        let summary = MegastructureStampSummary {
+            setup: MEGASTRUCTURE_STAMP_10_V1.to_string(),
+            module_side: 8,
+            tile_stride: 16,
+            configured_stamps: 10,
+            initial_active_cells_per_stamp: megastructure_active_cells_per_stamp(8),
+            svdag_node_count: 1767,
+            svdag_byte_size: 77752,
+        };
+        a.megastructure_stamp = Some(summary.clone());
+        b.megastructure_stamp = Some(summary);
     }
 
     fn write_jsonl(records: &[&MeasurementRecord]) -> PathBuf {
