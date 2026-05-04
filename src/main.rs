@@ -5119,6 +5119,44 @@ impl App {
         self.exit_lattice_demo_mode();
         self.exit_quarantine_atlas_mode();
     }
+
+    fn handle_digit_key(&mut self, digit: u16) {
+        if self.soup_prospector.is_some() {
+            if (1..=3).contains(&digit) {
+                self.run_soup_action_or_queue(PendingSoupAction::SelectPattern(
+                    (digit - 1) as usize,
+                ));
+            } else {
+                log::debug!("digit {digit} ignored in Soup Prospector: seed selection uses 1-3");
+            }
+            return;
+        }
+        if self.camera_mode == CameraMode::FirstPerson {
+            if self.quarantine_atlas.is_some() {
+                if let Some(pattern) = QuarantineAtlasPattern::from_digit(digit) {
+                    self.select_quarantine_atlas_pattern(pattern);
+                } else {
+                    log::debug!(
+                        "digit {digit} ignored in Quarantine Atlas: pattern selection uses 1-3"
+                    );
+                }
+                return;
+            }
+            // FPS mode: select held material.
+            self.select_held_material(digit);
+        } else {
+            // Orbit mode: select CA rule (1-4 only).
+            match digit {
+                1 => self.select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba"),
+                2 => self.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal"),
+                3 => self.select_rule(sim::GameOfLife3D::rule445(), "445"),
+                4 => self.select_rule(sim::GameOfLife3D::new(4, 7, 6, 8), "Pyroclastic"),
+                _ => {
+                    log::debug!("digit {digit} ignored in Orbit mode: rule selection uses 1-4 only")
+                }
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<AppUserEvent> for App {
@@ -5517,53 +5555,32 @@ impl ApplicationHandler<AppUserEvent> for App {
                             // beat-cycle jumps.
                             self.request_scene_swap(PendingSceneSwap::LoadLatticePanoramaDemo);
                         }
-                        winit::keyboard::Key::Character(
-                            n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
-                        ) => {
-                            let digit: u16 = n.parse().unwrap();
-                            if self.soup_prospector.is_some() {
-                                if (1..=3).contains(&digit) {
-                                    self.run_soup_action_or_queue(
-                                        PendingSoupAction::SelectPattern((digit - 1) as usize),
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "digit {digit} ignored in Soup Prospector: seed selection uses 1-3"
-                                    );
-                                }
-                                return;
-                            }
-                            if self.camera_mode == CameraMode::FirstPerson {
-                                if self.quarantine_atlas.is_some() {
-                                    if let Some(pattern) = QuarantineAtlasPattern::from_digit(digit)
-                                    {
-                                        self.select_quarantine_atlas_pattern(pattern);
-                                    } else {
-                                        log::debug!(
-                                            "digit {digit} ignored in Quarantine Atlas: pattern selection uses 1-3"
-                                        );
-                                    }
-                                    return;
-                                }
-                                // FPS mode: select held material.
-                                self.select_held_material(digit);
-                            } else {
-                                // Orbit mode: select CA rule (1-4 only).
-                                match digit {
-                                    1 => self
-                                        .select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba"),
-                                    2 => self
-                                        .select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal"),
-                                    3 => self.select_rule(sim::GameOfLife3D::rule445(), "445"),
-                                    4 => self.select_rule(
-                                        sim::GameOfLife3D::new(4, 7, 6, 8),
-                                        "Pyroclastic",
-                                    ),
-                                    _ => log::debug!(
-                                        "digit {digit} ignored in Orbit mode: rule selection uses 1-4 only"
-                                    ),
-                                }
-                            }
+                        winit::keyboard::Key::Character("1") => {
+                            self.handle_digit_key(1);
+                        }
+                        winit::keyboard::Key::Character("2") => {
+                            self.handle_digit_key(2);
+                        }
+                        winit::keyboard::Key::Character("3") => {
+                            self.handle_digit_key(3);
+                        }
+                        winit::keyboard::Key::Character("4") => {
+                            self.handle_digit_key(4);
+                        }
+                        winit::keyboard::Key::Character("5") => {
+                            self.handle_digit_key(5);
+                        }
+                        winit::keyboard::Key::Character("6") => {
+                            self.handle_digit_key(6);
+                        }
+                        winit::keyboard::Key::Character("7") => {
+                            self.handle_digit_key(7);
+                        }
+                        winit::keyboard::Key::Character("8") => {
+                            self.handle_digit_key(8);
+                        }
+                        winit::keyboard::Key::Character("9") => {
+                            self.handle_digit_key(9);
                         }
                         winit::keyboard::Key::Character("b") => {
                             // Default demo gallery: deterministic local fire/water set pieces
@@ -8488,6 +8505,30 @@ mod tests {
         assert!(PendingSceneSwap::LoadDemoSpectacle.discards_world());
         assert!(PendingSceneSwap::ResetGolSmoke.discards_world());
         assert!(PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Intro).discards_world());
+    }
+
+    #[test]
+    fn digit_key_dispatch_preserves_mode_specific_routes() {
+        let mut app = App::new(32);
+
+        app.handle_digit_key(5);
+        let held = app
+            .player_id
+            .and_then(|id| app.entities.iter().find(|entity| entity.id == id))
+            .and_then(|entity| match &entity.kind {
+                sim::EntityKind::Player(state) => Some(state.held_material),
+                _ => None,
+            })
+            .expect("player should exist");
+        assert_eq!(held, 5);
+
+        app.camera_mode = CameraMode::Orbit;
+        app.handle_digit_key(2);
+        assert_eq!(app.gol_smoke_rule, sim::GameOfLife3D::new(0, 6, 1, 3));
+
+        app.load_soup_prospector_demo();
+        app.handle_digit_key(3);
+        assert_eq!(app.soup_prospector.as_ref().unwrap().selected_pattern, 2);
     }
 
     #[test]
