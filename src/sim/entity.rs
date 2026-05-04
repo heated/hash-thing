@@ -548,7 +548,7 @@ mod tests {
         let world = World::new(3);
         let mut queue = MutationQueue::new();
         store.update(&world, &mut queue);
-        let e = store.iter().next().unwrap();
+        let e = store.iter().next().expect("updated particle should remain");
         assert!((e.pos[0] - 6.0).abs() < 1e-9);
         assert!((e.pos[2] - 4.0).abs() < 1e-9);
     }
@@ -738,7 +738,7 @@ mod tests {
         let world = floor_world(4);
         let mut queue = MutationQueue::new();
         store.update(&world, &mut queue);
-        let critter = store.iter().next().unwrap();
+        let critter = store.iter().next().expect("updated critter should remain");
         assert!(matches!(critter.kind, EntityKind::Critter(_)));
         assert!(critter.pos[1] > start_y);
     }
