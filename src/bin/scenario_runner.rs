@@ -4221,7 +4221,8 @@ mod tests {
         std::fs::create_dir_all(&subdir).expect("create subdir");
         std::fs::write(scenarios.join("tracked.ron"), "tracked").expect("write tracked input");
         let append = repo.join(".ship-notes").join("perf.jsonl");
-        std::fs::create_dir_all(append.parent().unwrap()).expect("create append parent");
+        std::fs::create_dir_all(append.parent().expect("append path should have parent"))
+            .expect("create append parent");
         Command::new("git")
             .args(["add", "scenarios/tracked.ron"])
             .current_dir(&repo)
