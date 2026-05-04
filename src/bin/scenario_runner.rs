@@ -4655,14 +4655,22 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn expect_metric<T: Copy>(metric: Option<T>, name: &str) -> T {
+        metric.unwrap_or_else(|| panic!("{name} should be recorded for hashlife backend"))
+    }
+
     #[test]
     fn microchurn_keeps_backends_on_same_trajectory() {
         let level = 7;
         let params = TerrainParams::for_level(level);
         let mut hashlife_world = World::new(level);
-        hashlife_world.seed_terrain(&params).unwrap();
+        hashlife_world
+            .seed_terrain(&params)
+            .expect("level-7 terrain params should seed hashlife microchurn baseline");
         let mut chunk_world = World::new(level);
-        chunk_world.seed_terrain(&params).unwrap();
+        chunk_world
+            .seed_terrain(&params)
+            .expect("level-7 terrain params should seed chunk-array microchurn baseline");
 
         let (hashlife, _) = run_hashlife(hashlife_world, 1, 4, Some(8), None, 7);
         let (chunk, _) = run_chunk_array(chunk_world, 1, 4, Some(8), None, 7);
@@ -4682,7 +4690,9 @@ mod tests {
         let level = 5;
         let params = TerrainParams::for_level(level);
         let mut world = World::new(level);
-        world.seed_terrain(&params).unwrap();
+        world
+            .seed_terrain(&params)
+            .expect("level-5 terrain params should seed hashlife metrics baseline");
 
         let (generations, metrics) = run_hashlife(world, 1, 3, None, None, 1);
 
@@ -4690,15 +4700,20 @@ mod tests {
         assert!(generations
             .iter()
             .all(|gen| gen.work_elision_factor_x.is_some() && gen.leaf_misses.is_some()));
-        assert!(metrics.work_elision_min_x.unwrap() > 0.0);
-        assert!(metrics.work_elision_mean_x.unwrap() > 0.0);
-        assert!(metrics.work_elision_p05_x.unwrap() > 0.0);
-        assert!(metrics.leaf_misses_mean.unwrap() >= 0.0);
+        assert!(expect_metric(metrics.work_elision_min_x, "work_elision_min_x") > 0.0);
+        assert!(expect_metric(metrics.work_elision_mean_x, "work_elision_mean_x") > 0.0);
+        assert!(expect_metric(metrics.work_elision_p05_x, "work_elision_p05_x") > 0.0);
+        assert!(expect_metric(metrics.leaf_misses_mean, "leaf_misses_mean") >= 0.0);
         assert!(matches!(metrics.work_elision_leaf_level, Some(3 | 4)));
-        assert!(metrics.memo_table_entries_final.unwrap() > 0);
-        assert!(metrics.bfs_l3_unique_misses_mean.unwrap() >= 0.0);
+        assert!(expect_metric(metrics.memo_table_entries_final, "memo_table_entries_final") > 0);
+        assert!(
+            expect_metric(
+                metrics.bfs_l3_unique_misses_mean,
+                "bfs_l3_unique_misses_mean"
+            ) >= 0.0
+        );
         assert!(metrics.bfs_l3_unique_misses_p95.is_some());
-        assert!(metrics.bfs_max_batch_len_mean.unwrap() >= 0.0);
+        assert!(expect_metric(metrics.bfs_max_batch_len_mean, "bfs_max_batch_len_mean") >= 0.0);
         assert!(metrics.bfs_max_batch_len_p95.is_some());
         assert_eq!(
             metrics
@@ -4720,7 +4735,9 @@ mod tests {
         let level = 5;
         let params = TerrainParams::for_level(level);
         let mut world = World::new(level);
-        world.seed_terrain(&params).unwrap();
+        world
+            .seed_terrain(&params)
+            .expect("level-5 terrain params should seed chunk-array metrics baseline");
 
         let (generations, metrics) = run_chunk_array(world, 1, 3, None, None, 1);
 
