@@ -496,9 +496,9 @@ mod tests {
         perf.record("apple", ms(20));
         perf.record("mango", ms(30));
         let s = perf.summary();
-        let apple_pos = s.find("apple").unwrap();
-        let mango_pos = s.find("mango").unwrap();
-        let zebra_pos = s.find("zebra").unwrap();
+        let apple_pos = s.find("apple").expect("summary should include apple");
+        let mango_pos = s.find("mango").expect("summary should include mango");
+        let zebra_pos = s.find("zebra").expect("summary should include zebra");
         assert!(apple_pos < mango_pos && mango_pos < zebra_pos);
     }
 
