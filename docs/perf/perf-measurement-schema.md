@@ -36,7 +36,7 @@ If you're authoring a perf claim, read `regimes.md` first. If you're writing a r
   "backend": "hashlife-recursive",
   "hardware": "m2-pro-mbp",
   "scenario_hash": "sha256:81aa21c5a72712b2",     // or "none" / "unknown"
-  "setup": "QuarantineAtlasMixedContainmentV1",    // optional deterministic setup identity; omit/null for none
+  "setup": null,                                   // optional deterministic setup identity; omit/null for none
   "confidence": { /* see Confidence section */ },
   // schema_version is the 6th metadata field; declared up top.
 
@@ -80,7 +80,7 @@ If you're authoring a perf claim, read `regimes.md` first. If you're writing a r
   // These MUST agree with both referenced measurements (defensive copy
   // for record-shape sanity, since the JSONL stream may be filtered).
   "scenario_hash": "sha256:81aa21c5a72712b2",
-  "setup": "QuarantineAtlasMixedContainmentV1",    // optional; omit/null for none
+  "setup": null,                                   // optional; omit/null for none
   "rule_set": "default-ca",
 
   "notes": "free-text"
