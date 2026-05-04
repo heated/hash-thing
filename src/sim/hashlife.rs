@@ -753,6 +753,8 @@ impl World {
         }
         self.hashlife_stats.compact_entries_kept += kept;
         self.hashlife_stats.compact_entries_dropped += before - kept;
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         if collect_miss_cause {
             for (dst, src) in self
                 .hashlife_stats
@@ -956,8 +958,14 @@ impl World {
             return;
         };
 
+        let key = (node, effective_phase);
+        let seen_key = self.memo_diag_seen_keys.contains(&key);
+        let seen_node = self.memo_diag_seen_nodes.contains(&node);
+
         if memo_period <= 1 {
-            self.hashlife_stats.miss_cause_by_level[idx].first_seen_or_no_surviving_key += 1;
+            self.record_first_seen_or_no_surviving_miss(idx, seen_key, seen_node);
+            self.memo_diag_seen_keys.insert(key);
+            self.memo_diag_seen_nodes.insert(node);
             return;
         }
 
@@ -983,7 +991,26 @@ impl World {
             self.hashlife_stats.miss_cause_by_level[idx].parity_aliased += 1;
             self.hashlife_stats.cache_misses_phase_aliased += 1;
         } else {
-            self.hashlife_stats.miss_cause_by_level[idx].first_seen_or_no_surviving_key += 1;
+            self.record_first_seen_or_no_surviving_miss(idx, seen_key, seen_node);
+        }
+        self.memo_diag_seen_keys.insert(key);
+        self.memo_diag_seen_nodes.insert(node);
+    }
+
+    fn record_first_seen_or_no_surviving_miss(
+        &mut self,
+        idx: usize,
+        seen_key: bool,
+        seen_node: bool,
+    ) {
+        let cause = &mut self.hashlife_stats.miss_cause_by_level[idx];
+        cause.first_seen_or_no_surviving_key += 1;
+        if seen_key {
+            cause.seen_key_missing_entry += 1;
+        } else if seen_node {
+            cause.seen_node_new_phase += 1;
+        } else {
+            cause.first_seen_key += 1;
         }
     }
 
@@ -4139,6 +4166,10 @@ mod tests {
             world.hashlife_stats.miss_cause_by_level[0].first_seen_or_no_surviving_key,
             1
         );
+        assert_eq!(
+            world.hashlife_stats.miss_cause_by_level[0].first_seen_key, 1,
+            "first observation of an exact memo key should be split from missing retained keys"
+        );
 
         world.hashlife_cache.insert((node, 0), node);
         world.record_memo_miss_cause(node, 3, 2, 4);
@@ -4146,6 +4177,42 @@ mod tests {
             world.hashlife_stats.miss_cause_by_level[0].slow_divisor_phase_aliased, 1,
             "same-parity alternate phase should classify as slow-divisor phase alias"
         );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn memo_miss_cause_splits_seen_exact_key_missing_entry() {
+        let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+        let node = world.root;
+
+        force_memo_diag_for_test(true);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+
+        let cause = world.hashlife_stats.miss_cause_by_level[0];
+        assert_eq!(cause.first_seen_or_no_surviving_key, 2);
+        assert_eq!(cause.first_seen_key, 1);
+        assert_eq!(cause.seen_key_missing_entry, 1);
+        assert_eq!(cause.seen_node_new_phase, 0);
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn memo_miss_cause_splits_seen_node_new_phase() {
+        let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+        let node = world.root;
+
+        force_memo_diag_for_test(true);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+        world.record_memo_miss_cause(node, 3, 2, 4);
+
+        let cause = world.hashlife_stats.miss_cause_by_level[0];
+        assert_eq!(cause.first_seen_or_no_surviving_key, 2);
+        assert_eq!(cause.first_seen_key, 1);
+        assert_eq!(cause.seen_key_missing_entry, 0);
+        assert_eq!(cause.seen_node_new_phase, 1);
 
         force_memo_diag_for_test(false);
     }

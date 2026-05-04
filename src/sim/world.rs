@@ -14,7 +14,7 @@ use crate::terrain::materials::{
     FIREWORK, GRASS, LAVA, METAL, OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling strategy.
 /// `Serial` is pre-ftuu DFS (no rayon). `RayonPerFanout` is ftuu's
@@ -351,6 +351,10 @@ pub struct World {
     /// node-local alignment so origin is no longer in the key (9ww).
     /// `schedule_phase` is `generation % materials.memo_period()` (iowh).
     pub(crate) hashlife_cache: FxHashMap<(NodeId, u64), NodeId>,
+    /// Diagnostic-only history for memo miss classification. Populated only
+    /// while `HASH_THING_MEMO_DIAG=1` is active.
+    pub(crate) memo_diag_seen_keys: FxHashSet<(NodeId, u64)>,
+    pub(crate) memo_diag_seen_nodes: FxHashSet<NodeId>,
     /// Memoization cache for the exponential Hashlife macro-stepper (6gf.7).
     /// Key: (NodeId, starting generation).
     pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, u64), NodeId>,
@@ -706,6 +710,9 @@ impl HashlifeStats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoMissCauseStats {
     pub first_seen_or_no_surviving_key: u64,
+    pub first_seen_key: u64,
+    pub seen_key_missing_entry: u64,
+    pub seen_node_new_phase: u64,
     pub parity_aliased: u64,
     pub slow_divisor_phase_aliased: u64,
     pub residual_unknown: u64,
@@ -716,6 +723,9 @@ pub struct MemoMissCauseStats {
 impl MemoMissCauseStats {
     pub fn accumulate(&mut self, step: &MemoMissCauseStats) {
         self.first_seen_or_no_surviving_key += step.first_seen_or_no_surviving_key;
+        self.first_seen_key += step.first_seen_key;
+        self.seen_key_missing_entry += step.seen_key_missing_entry;
+        self.seen_node_new_phase += step.seen_node_new_phase;
         self.parity_aliased += step.parity_aliased;
         self.slow_divisor_phase_aliased += step.slow_divisor_phase_aliased;
         self.residual_unknown += step.residual_unknown;
@@ -830,6 +840,8 @@ impl World {
             materials,
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
+            memo_diag_seen_keys: FxHashSet::default(),
+            memo_diag_seen_nodes: FxHashSet::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
             hashlife_stats_total: HashlifeStats::default(),
@@ -862,6 +874,8 @@ impl World {
             materials: MaterialRegistry::new(),
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
+            memo_diag_seen_keys: FxHashSet::default(),
+            memo_diag_seen_nodes: FxHashSet::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
             hashlife_stats_total: HashlifeStats::default(),
@@ -938,6 +952,8 @@ impl World {
     /// cause of the dxi4.2 audit finding.
     pub fn invalidate_material_caches(&mut self) {
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -1867,6 +1883,8 @@ impl World {
         self.generation = 0;
         self.terrain_params = None;
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -2072,6 +2090,8 @@ impl World {
     pub fn seed_lattice_megastructure(&mut self) {
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -2111,6 +2131,8 @@ impl World {
     pub fn seed_gyroid_megastructure(&mut self) -> GenStats {
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -3123,6 +3145,8 @@ impl World {
             None => remap,
         });
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -3151,6 +3175,8 @@ impl World {
         params.validate()?;
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -7328,6 +7354,10 @@ mod tests {
         a.misses_by_level[0] = 1;
         a.misses_by_level[3] = 13;
         a.misses_by_level[7] = 17;
+        a.miss_cause_by_level[0].first_seen_or_no_surviving_key = 10;
+        a.miss_cause_by_level[0].first_seen_key = 6;
+        a.miss_cause_by_level[0].seen_key_missing_entry = 3;
+        a.miss_cause_by_level[0].seen_node_new_phase = 1;
         // hash-thing-bjdl (vqke.2): exercise the new accumulators
         // alongside the existing scalar fields, so a future refactor
         // that drops one of these from `accumulate` is caught.
@@ -7359,6 +7389,10 @@ mod tests {
         b.misses_by_level[0] = 10;
         b.misses_by_level[3] = 100;
         b.misses_by_level[7] = 1000;
+        b.miss_cause_by_level[0].first_seen_or_no_surviving_key = 5;
+        b.miss_cause_by_level[0].first_seen_key = 2;
+        b.miss_cause_by_level[0].seen_key_missing_entry = 2;
+        b.miss_cause_by_level[0].seen_node_new_phase = 1;
         b.cache_misses_phase_aliased = 1;
         b.compact_entries_kept = 50;
         b.compact_entries_dropped = 0;
@@ -7387,6 +7421,13 @@ mod tests {
         assert_eq!(total.misses_by_level[0], 11);
         assert_eq!(total.misses_by_level[3], 113);
         assert_eq!(total.misses_by_level[7], 1017);
+        assert_eq!(
+            total.miss_cause_by_level[0].first_seen_or_no_surviving_key,
+            15
+        );
+        assert_eq!(total.miss_cause_by_level[0].first_seen_key, 8);
+        assert_eq!(total.miss_cause_by_level[0].seen_key_missing_entry, 5);
+        assert_eq!(total.miss_cause_by_level[0].seen_node_new_phase, 2);
         assert_eq!(total.cache_misses_phase_aliased, 3);
         assert_eq!(total.compact_entries_kept, 150);
         assert_eq!(total.compact_entries_dropped, 25);

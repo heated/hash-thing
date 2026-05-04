@@ -3667,6 +3667,7 @@ fn miss_cause_table(world: &World, metrics: &MetricsRecord) -> serde_json::Value
         stats.compact_entries_dropped as f64 / compact_total as f64
     };
     let mut diag_rows = Vec::new();
+    let mut miss_classification_delta_total = 0i64;
     for (idx, cause) in stats.miss_cause_by_level.iter().enumerate() {
         let level = idx + 3;
         let misses = stats.misses_by_level[idx];
@@ -3674,6 +3675,8 @@ fn miss_cause_table(world: &World, metrics: &MetricsRecord) -> serde_json::Value
             + cause.parity_aliased
             + cause.slow_divisor_phase_aliased
             + cause.residual_unknown;
+        let classification_delta = misses as i64 - cause_total as i64;
+        miss_classification_delta_total += classification_delta;
         if misses == 0
             && cause_total == 0
             && cause.compact_entries_kept == 0
@@ -3685,9 +3688,14 @@ fn miss_cause_table(world: &World, metrics: &MetricsRecord) -> serde_json::Value
             "level": level,
             "misses": misses,
             "first_seen_or_no_surviving_key": cause.first_seen_or_no_surviving_key,
+            "first_seen_key": cause.first_seen_key,
+            "seen_key_missing_entry": cause.seen_key_missing_entry,
+            "seen_node_new_phase": cause.seen_node_new_phase,
             "parity_aliased": cause.parity_aliased,
             "slow_divisor_phase_aliased": cause.slow_divisor_phase_aliased,
             "residual_unknown": cause.residual_unknown,
+            "classified_misses": cause_total,
+            "classification_delta": classification_delta,
             "compact_entries_kept": cause.compact_entries_kept,
             "compact_entries_dropped": cause.compact_entries_dropped,
         }));
@@ -3710,6 +3718,7 @@ fn miss_cause_table(world: &World, metrics: &MetricsRecord) -> serde_json::Value
             "bfs_l3_unique_misses_p95": metrics.bfs_l3_unique_misses_p95,
             "bfs_max_batch_len_p95": metrics.bfs_max_batch_len_p95,
             "memo_compact_drop_ratio": compact_drop_ratio,
+            "miss_classification_delta_total": miss_classification_delta_total,
             "phase_or_parity_alias_misses": stats.cache_misses_phase_aliased,
         },
         "levels": diag_rows,
