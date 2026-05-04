@@ -612,7 +612,7 @@ mod tests {
         // Shoot from (4, 4, 3) toward -Z
         let result = raycast_cells(&world, [4.5, 4.5, 3.5], [0.0, 0.0, -1.0]);
         assert!(result.is_some());
-        let (hit, prev) = result.unwrap();
+        let (hit, prev) = result.expect("raycast should hit the wall");
         assert_eq!(hit, [4, 4, 0]);
         assert_eq!(prev, [4, 4, 1]);
     }
@@ -629,7 +629,7 @@ mod tests {
         let world = world_with_wall(4, 4, 4);
         let result = raycast_cells(&world, [4.5, 4.5, 4.5], [0.0, 0.0, -1.0]);
         assert!(result.is_some());
-        let (hit, prev) = result.unwrap();
+        let (hit, prev) = result.expect("raycast should report origin cell hit");
         assert_eq!(hit, prev); // documented behavior: prev == hit on first step
     }
 
