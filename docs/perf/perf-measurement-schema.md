@@ -105,7 +105,7 @@ A comparison is *not* a measurement. The `ratio_metric` must be a key from one o
 | `particle-cellular`    | Particle CA (sand/dust/etc).                                   |
 | `circuit-signal`       | Wire/signal-propagation rules (puzzle-circuit scene families). |
 | `graph-cellular`       | Non-cube topology CA (graph-cellular family).                  |
-| `custom:<short-id>`    | Anything not in the enum; cite the bead that defines it.       |
+| `custom:<short-id>`    | Future/proposed extension point; cite the bead and update runner validation before writing records. |
 
 ### `backend`
 
@@ -113,9 +113,9 @@ A comparison is *not* a measurement. The `ratio_metric` must be a key from one o
 |------------------------|----------------------------------------------------------------|
 | `chunk-array`          | Flat `Vec<CellState>` storage; CA + Margolus kernel; no memo.  |
 | `hashlife-recursive`   | The hashlife memo path (`World::step_recursive`).              |
-| `gpu-compute`          | GPU compute shader.                                            |
-| `hybrid`               | Mixed CPU/GPU; document the split in `confidence.notes`.       |
-| `custom:<short-id>`    | Anything not in the enum; cite the bead.                       |
+| `gpu-compute`          | Future/proposed GPU compute shader backend; current `scenario-runner` JSONL validation rejects it until implemented. |
+| `hybrid`               | Future/proposed mixed CPU/GPU backend; current `scenario-runner` JSONL validation rejects it until implemented. Document the split in `confidence.notes` once accepted. |
+| `custom:<short-id>`    | Future/proposed extension point; cite the bead and update runner validation before writing records. |
 
 ### `hardware`
 
@@ -165,10 +165,10 @@ A single, hard cross-axis constraint:
 
 | backend             | allowed `regime` values                                          |
 |---------------------|------------------------------------------------------------------|
-| `hashlife-recursive`| `cold / warming / saturated / churning / compacted` (see regimes.md) |
+| `hashlife-recursive`| `cold / warming / saturated / churning / compacted` (see regimes.md); current runner accepts `saturated` and `churning` records. |
 | `chunk-array`       | `n/a` only                                                       |
-| `gpu-compute`       | `n/a` (until a GPU memo design lands; then revisit this table)   |
-| `hybrid`            | the regime of the engine that holds the load-bearing memo cache; if the hybrid has multiple memo layers, `n/a` and use the optional `regime_components` field. |
+| `gpu-compute`       | future/proposed; current runner rejects the backend until a GPU measurement path lands. |
+| `hybrid`            | future/proposed; once accepted, use the regime of the engine that holds the load-bearing memo cache, or `n/a` plus `regime_components` for multiple memo layers. |
 
 Records that violate this constraint are malformed.
 
