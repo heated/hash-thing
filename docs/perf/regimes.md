@@ -74,10 +74,13 @@ levels; "any" if not relevant.
 | `adversarial` | Inputs designed to break hashlife (every-cell-different)  | research only                        |
 
 Scenario runners may also carry a setup identity outside the four headline
-coordinates. For Quarantine Atlas, `QuarantineAtlasMixedContainmentV1` means
-the deterministic six-stamp mixed firebreak/cooling/barrier plan from
-`hash-thing-oym4` is applied before warmup and measured stepping. Keep this in
-`setup`, not `intensity`; the intensity still describes the measured dynamics.
+coordinates. Examples include `QuarantineAtlasMixedContainmentV1` for the
+deterministic six-stamp mixed firebreak/cooling/barrier plan,
+`FactoryEncodedBeltRoutingV1` for the routed belt substrate harness,
+`TemporalReuseV1` for the replay-scrub recurrence probe, and
+`MegastructureStamp10V1` / `MegastructureStamp100V1` for module-stamp count.
+Keep this in `setup`, not `intensity`; the intensity still describes the
+measured dynamics.
 
 ### 4. `regime` — what the cache looks like
 
