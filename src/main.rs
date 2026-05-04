@@ -1932,13 +1932,10 @@ fn soup_tile_stats(world: &sim::World, tile: [i64; 3]) -> (usize, String) {
         }
     }
     let digest = Sha256::digest(&bytes);
-    (
-        pop,
-        format!(
-            "sha256:{:016x}",
-            u64::from_be_bytes(digest[0..8].try_into().unwrap())
-        ),
-    )
+    let prefix = [
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ];
+    (pop, format!("sha256:{:016x}", u64::from_be_bytes(prefix)))
 }
 
 fn capture_soup_tile_snapshot(world: &sim::World, tile: [i64; 3]) -> Vec<CellState> {
