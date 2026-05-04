@@ -88,6 +88,7 @@ const SOUP_PROSPECTOR_ALIVE: ht_octree::CellState = hash_thing::octree::Cell::pa
 const MEGASTRUCTURE_MODULE_SIDE: i64 = 8;
 const MEGASTRUCTURE_TILE_STRIDE: i64 = 16;
 const MEGASTRUCTURE_INITIAL_STAMPS: usize = 10;
+const MEGASTRUCTURE_OBJECTIVE_STAMPS: usize = 6;
 const SOUP_PROSPECTOR_PATTERN_SEEDS: [u64; 3] = [
     0x5eed_0001_8a55_5003,
     0x5eed_0002_8a55_5003,
@@ -1022,6 +1023,8 @@ struct MegastructureStampState {
     stamps_placed: usize,
     floor_y: i64,
     last_stamp_origin: Option<[i64; 3]>,
+    objective_progress: usize,
+    objective_mask: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1679,6 +1682,78 @@ fn megastructure_stamp_in_bounds(side: i64, origin: [i64; 3]) -> bool {
         && origin[0] + MEGASTRUCTURE_MODULE_SIDE <= side
         && origin[1] + MEGASTRUCTURE_MODULE_SIDE <= side
         && origin[2] + MEGASTRUCTURE_MODULE_SIDE <= side
+}
+
+fn megastructure_objective_origins(floor_y: i64) -> [[i64; 3]; MEGASTRUCTURE_OBJECTIVE_STAMPS] {
+    [
+        [88, floor_y + 1, 24],
+        [88, floor_y + 1, 40],
+        [88, floor_y + 1, 56],
+        [88, floor_y + 1, 72],
+        [88, floor_y + 1, 88],
+        [88, floor_y + 1, 104],
+    ]
+}
+
+fn megastructure_objective_index(origin: [i64; 3], floor_y: i64) -> Option<usize> {
+    megastructure_objective_origins(floor_y)
+        .iter()
+        .position(|candidate| *candidate == origin)
+}
+
+fn set_world_cell_if_in_bounds(world: &mut sim::World, pos: [i64; 3], state: CellState) {
+    let side = world.side() as i64;
+    if pos.iter().all(|coord| (0..side).contains(coord)) {
+        world.set(
+            sim::WorldCoord(pos[0]),
+            sim::WorldCoord(pos[1]),
+            sim::WorldCoord(pos[2]),
+            state,
+        );
+    }
+}
+
+fn paint_megastructure_objective_marker(world: &mut sim::World, origin: [i64; 3], completed: bool) {
+    let floor_y = origin[1] - 1;
+    let marker = if completed {
+        hash_thing::terrain::materials::VINE
+    } else {
+        hash_thing::terrain::materials::ICE
+    };
+    let side = MEGASTRUCTURE_MODULE_SIDE;
+    for dz in -1..=side {
+        for dx in -1..=side {
+            let border = dx == -1 || dz == -1 || dx == side || dz == side;
+            if border {
+                set_world_cell_if_in_bounds(
+                    world,
+                    [origin[0] + dx, floor_y, origin[2] + dz],
+                    marker,
+                );
+            }
+        }
+    }
+    let beacon_x = origin[0] + side + 2;
+    let beacon_z = origin[2] + side / 2;
+    for dy in 1..=6 {
+        set_world_cell_if_in_bounds(world, [beacon_x, floor_y + dy, beacon_z], marker);
+    }
+    if completed {
+        set_world_cell_if_in_bounds(
+            world,
+            [beacon_x, floor_y + 7, beacon_z],
+            hash_thing::terrain::materials::ICE,
+        );
+    }
+}
+
+fn paint_megastructure_objectives(world: &mut sim::World, floor_y: i64, objective_mask: u16) {
+    for (index, origin) in megastructure_objective_origins(floor_y)
+        .into_iter()
+        .enumerate()
+    {
+        paint_megastructure_objective_marker(world, origin, objective_mask & (1 << index) != 0);
+    }
 }
 
 fn frame_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
@@ -3797,20 +3872,44 @@ impl App {
             return false;
         }
         let stamp = stamp_megastructure_module(&mut self.world, origin);
+        let mut completed_objective = None;
         self.mark_world_changed();
         if let Some(state) = self.megastructure_stamp.as_mut() {
             if stamp.changed > 0 {
                 state.stamps_placed += 1;
             }
+            if let Some(index) = megastructure_objective_index(origin, state.floor_y) {
+                let bit = 1 << index;
+                if stamp.changed > 0 && state.objective_mask & bit == 0 {
+                    state.objective_mask |= bit;
+                    state.objective_progress += 1;
+                    completed_objective = Some((index, state.objective_progress));
+                }
+            }
             state.last_stamp_origin = Some(origin);
             log::info!(
-                "Megastructure module stamped at {:?}: cells={} changed={} total_stamps={}",
+                "Megastructure module stamped at {:?}: cells={} changed={} total_stamps={} objective={}/{}",
                 origin,
                 stamp.written,
                 stamp.changed,
-                state.stamps_placed
+                state.stamps_placed,
+                state.objective_progress,
+                MEGASTRUCTURE_OBJECTIVE_STAMPS
             );
         }
+        if let Some((index, progress)) = completed_objective {
+            paint_megastructure_objective_marker(&mut self.world, origin, true);
+            log::info!(
+                "Megastructure objective pylon {} powered: {}/{}",
+                index + 1,
+                progress,
+                MEGASTRUCTURE_OBJECTIVE_STAMPS
+            );
+            if progress == MEGASTRUCTURE_OBJECTIVE_STAMPS {
+                log::info!("Megastructure objective complete: all pylons powered");
+            }
+        }
+        self.refresh_megastructure_objective_hud();
         let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
@@ -4125,6 +4224,22 @@ impl App {
         }
     }
 
+    fn refresh_megastructure_objective_hud(&mut self) {
+        if let Some(state) = self.megastructure_stamp.as_ref() {
+            let remaining = MEGASTRUCTURE_OBJECTIVE_STAMPS.saturating_sub(state.objective_progress);
+            self.memo_hud_lines = vec![
+                "Megastructure uplink".to_string(),
+                format!(
+                    "Powered pylons {}/{}",
+                    state.objective_progress, MEGASTRUCTURE_OBJECTIVE_STAMPS
+                ),
+                format!("Remaining stamps {remaining}"),
+            ];
+            self.memo_hud_visible = true;
+            self.memo_hud_dirty = true;
+        }
+    }
+
     fn aimed_soup_tile(&self) -> Option<[i64; 3]> {
         let (eye, dir) = self.player_eye_ray()?;
         if let Some(state) = self.soup_prospector.as_ref() {
@@ -4301,8 +4416,12 @@ impl App {
     fn refresh_memo_summary_after_world_update(&mut self) {
         if !self.refresh_soup_prospector_hud() {
             self.last_memo_summary = self.world.memo_summary();
-            self.memo_hud_lines = standard_memo_hud_lines(&self.last_memo_summary);
-            self.memo_hud_dirty = true;
+            if self.megastructure_stamp.is_some() {
+                self.refresh_megastructure_objective_hud();
+            } else {
+                self.memo_hud_lines = standard_memo_hud_lines(&self.last_memo_summary);
+                self.memo_hud_dirty = true;
+            }
         }
     }
 
@@ -4667,6 +4786,7 @@ impl App {
                 }
             }
         }
+        paint_megastructure_objectives(&mut self.world, floor_y, 0);
         self.mark_world_changed();
         self.reset_scene_entities();
         self.reset_player_pose(
@@ -4682,7 +4802,10 @@ impl App {
             stamps_placed: stamps,
             floor_y,
             last_stamp_origin: None,
+            objective_progress: 0,
+            objective_mask: 0,
         });
+        self.refresh_megastructure_objective_hud();
         self.paused = false;
         self.legend_dirty = true;
         self.reset_scene_perf_state();
@@ -8943,11 +9066,26 @@ mod tests {
         assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS);
         assert_eq!(state.floor_y, 32);
         assert_eq!(state.last_stamp_origin, None);
+        assert_eq!(state.objective_progress, 0);
+        assert_eq!(state.objective_mask, 0);
         assert_eq!(app.world.generation, 0);
         assert!(!app.paused);
         assert_eq!(app.camera_mode, CameraMode::FirstPerson);
         assert!(app.player_id.is_some());
         assert!(app.world.population() > 128 * 128);
+        assert!(app.memo_hud_visible);
+        assert!(app
+            .memo_hud_lines
+            .iter()
+            .any(|line| line.contains("Powered pylons 0/6")));
+        assert_eq!(
+            app.world.get(
+                sim::WorldCoord(98),
+                sim::WorldCoord(33),
+                sim::WorldCoord(28)
+            ),
+            hash_thing::terrain::materials::ICE
+        );
     }
 
     #[test]
@@ -8975,7 +9113,27 @@ mod tests {
         let state = app.megastructure_stamp.expect("mode remains active");
         assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS + 1);
         assert_eq!(state.last_stamp_origin, Some([88, 33, 88]));
+        assert_eq!(state.objective_progress, 1);
+        assert_eq!(state.objective_mask, 1 << 4);
         assert!(app.world.population() > before_population);
+        assert!(app
+            .memo_hud_lines
+            .iter()
+            .any(|line| line.contains("Powered pylons 1/6")));
+        assert_eq!(
+            app.world.get(
+                sim::WorldCoord(98),
+                sim::WorldCoord(33),
+                sim::WorldCoord(92)
+            ),
+            hash_thing::terrain::materials::VINE
+        );
+        assert!(app.deploy_megastructure_stamp_at_origin([88, 33, 88]));
+        let state = app
+            .megastructure_stamp
+            .expect("mode remains active after duplicate");
+        assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS + 1);
+        assert_eq!(state.objective_progress, 1);
     }
 
     #[test]
