@@ -26,15 +26,15 @@ diagnostic gate it stays a structured TODO.
     name: "default-terrain-idle",
     world: Tiny,                   // Tiny | Small | Medium | Demo
     level: Some(5),                // optional override for world
-    scene: DefaultTerrain,         // DefaultTerrain | DefaultDemo | FactoryConveyor | QuarantineAtlas | SoupSearch
-    rule_set: DefaultCa,           // DefaultCa | FactoryConveyorV1 | SoupSearchV1
+    scene: DefaultTerrain,         // DefaultTerrain | DefaultDemo | FactoryConveyor | QuarantineAtlas | ReplayScrub | SoupSearch | MegastructureStamp
+    rule_set: DefaultCa,           // DefaultCa | FactoryConveyorV1 | FactoryEncodedBeltRoutingV1 | SoupSearchV1
     intensity: Idle,               // Idle | Microchurn | PassiveActive | Cascade
     regime: Saturated,             // Saturated | Churning | NotApplicable
     backend: HashlifeRecursive,    // HashlifeRecursive | ChunkArray
     generations: 3,
     warmup_generations: Some(1),
     seed: 1,
-    setup: None,                   // optional; e.g. Some(QuarantineAtlasMixedContainmentV1), Some(FactoryConveyorRuleV1), Some(FactoryEncodedBeltRoutingV1), Some(SoupSearchV1), or Some(SoupSearchSparseV1)
+    setup: None,                   // optional; e.g. Some(QuarantineAtlasMixedContainmentV1), Some(FactoryConveyorRuleV1), Some(FactoryEncodedBeltRoutingV1), Some(SoupSearchV1), Some(SoupSearchSparseV1), Some(TemporalReuseV1), Some(MegastructureStamp10V1), or Some(MegastructureStamp100V1)
     comparator: Some("chunk-array@same-scenario"),
 )
 ```
@@ -48,6 +48,8 @@ diagnostic gate it stays a structured TODO.
 - `factory-conveyor`: either the older repeated-lane toy (`setup=None`), the `FactoryConveyorRuleV1` source/sink/backpressure harness with a scenario-local one-material +X block rule (`rule_set=FactoryConveyorV1`), or the `FactoryEncodedBeltRoutingV1` harness (`rule_set=FactoryEncodedBeltRoutingV1`) with separate inert belt substrate cells, source-belt encoded +X/+Z direction, L-turn traversal, merge pressure, and route-specific telemetry. Source injection, sink drain, and routing/backpressure accounting run outside timed `step_us` / `step_*` latency.
 - `quarantine-atlas`: deterministic Quarantine Atlas playtest scene. Optional setup `QuarantineAtlasMixedContainmentV1` applies the `oym4` six-stamp mixed containment plan before warmup/measured stepping; it excludes interactive placement/raycast/cache-invalidation cost.
 - `soup-search`: deterministic tiled 3D Game-of-Life soup ensemble (`rule_set=SoupSearchV1`) for the `8ppq.5` stable-structure discovery lead. `SoupSearchV1` uses `density_per_1000=180`; `SoupSearchSparseV1` uses `density_per_1000=45` for sparser survivor/candidate discovery. Records include a `soup_search` summary with per-tile population history, survivor/candidate counts, and final tile state hashes; comparison validation requires the summary to match between backends.
+- `replay-scrub`: temporal-reuse diagnostic (`setup=TemporalReuseV1`) for active-state recurrence probes.
+- `megastructure-stamp`: repeated module-stamping diagnostic (`setup=MegastructureStamp10V1` or `MegastructureStamp100V1`) for structural-folding probes.
 
 ## Current examples
 
