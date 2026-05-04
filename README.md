@@ -89,7 +89,9 @@ scripts/hash-thing-demo --res 1440p
 The wrapper stores defaults in
 `${XDG_CONFIG_HOME:-$HOME/.config}/hash-thing/demo.toml`, prefers an existing
 `target/stable/hash-thing` or `target/release/hash-thing` binary, and falls back
-to building the release binary when needed.
+to building the release binary when needed. See [docs/demo.md](docs/demo.md) for
+the config keys, persistent `set` commands, focus behavior, and binary-pick
+order.
 
 For repeat launches from anywhere:
 
