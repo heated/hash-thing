@@ -4,6 +4,7 @@
 .ship-notes/*
 !.ship-notes/design-ledger.md
 !.ship-notes/multiplayer-model-options.md
+!.ship-notes/litreview-hashlife-perf-edges-session-1.md
 
 # Beads / Dolt files (added by bd init)
 .dolt/
