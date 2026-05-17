@@ -4,7 +4,7 @@
 //! blits to a render target, and measures GPU execution time via TIMESTAMP_QUERY
 //! (falls back to wall-clock if unavailable). No window required.
 //!
-//! Run with: `cargo test --release --test bench_gpu_raycast -- --ignored --nocapture`
+//! Run with: `cargo test --profile perf --test bench_gpu_raycast -- --ignored --nocapture`
 //!
 //! Constraint: each scale caps at ~30 seconds total. If a single frame
 //! exceeds 5 seconds, the benchmark aborts at that scale.

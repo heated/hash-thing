@@ -44,7 +44,7 @@ This is **screen-projected, ray-by-ray LOD**: when a node's half-extent projects
 
 Material propagation during build (`svdag.rs:228-238`) prefers the **largest populated child** (by `population`) so that a sparsely-active subtree doesn't poison the whole coarse cell with a tiny pocket's material.
 
-**This LOD costs nothing at memory level.** All 9 u32s of every node are still resident; the shader just chooses not to recurse. So render LOD does not reduce GPU bookkeeping at large worlds — it only shortens descent.
+**This LOD costs nothing at memory level.** All 11 u32s of every node are still resident; the shader just chooses not to recurse. So render LOD does not reduce GPU bookkeeping at large worlds — it only shortens descent.
 
 ### 1.2 Memory LOD (what cswp.6 designs)
 

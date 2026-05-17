@@ -33,6 +33,18 @@
 //!    buffer + `copy_buffer_to_buffer`, which is a larger refactor.
 //!    See `hash-thing-6x3` for the full GPU-timing pipeline.
 //!
+//!    Current render-cost glossary:
+//!    - `render_cpu`: CPU wall time spent in the renderer call site.
+//!    - `submit_cpu` / `present_cpu` / `surface_acquire_cpu`: CPU-side
+//!      frame phases, not shader execution.
+//!    - `render_gpu`: timestamp query around the SVDAG compute dispatch.
+//!    - `render_pass_gpu`: timestamp query around blit + overlay draws.
+//!    - `render_gpu_lag` / `render_pass_gpu_lag`: submit-sequence staleness
+//!      for the corresponding timestamp sample, in frames.
+//!    - `prior_gpu_pipeline_cpu`: queue submission completion latency from
+//!      `queue.submit()` return to `on_submitted_work_done`; it is not a
+//!      shader-cost metric.
+//!
 //! 2. **Mixed cadences in one summary.** `step` and `upload_cpu` only run on
 //!    a generation tick (~ every 200ms). `render_cpu` runs every redraw, which
 //!    in a winit Poll loop is much faster. Both share the 64-sample ring,
@@ -119,6 +131,7 @@ impl Ring {
 #[derive(Debug)]
 pub struct Perf {
     rings: HashMap<&'static str, Ring>,
+    scalars: HashMap<&'static str, f64>,
 }
 
 impl Default for Perf {
@@ -128,15 +141,25 @@ impl Default for Perf {
 }
 
 impl Perf {
+    /// Construct an empty tracker. Equivalent to `Perf::default()`.
     pub fn new() -> Self {
         Self {
             rings: HashMap::new(),
+            scalars: HashMap::new(),
         }
     }
 
     /// Record a duration for a named metric.
     pub fn record(&mut self, name: &'static str, d: Duration) {
         self.rings.entry(name).or_insert_with(Ring::new).push(d);
+    }
+
+    /// Record a latest-value scalar metric.
+    ///
+    /// Use this for counters whose units are not time. The summary renders
+    /// scalars as `name=value`, not `name=mean/p95ms`.
+    pub fn record_scalar(&mut self, name: &'static str, value: f64) {
+        self.scalars.insert(name, value);
     }
 
     /// Start a scope-bound timer that records its elapsed duration into
@@ -184,26 +207,44 @@ impl Perf {
     /// signal.
     pub fn clear(&mut self) {
         self.rings.clear();
+        self.scalars.clear();
     }
 
     /// One-line summary of all metrics, sorted by name for stable output.
-    /// Format: `name1=mean/p95ms name2=mean/p95ms ...`
+    ///
+    /// Duration metrics render as `name=mean/p95ms`; scalar metrics render
+    /// as `name=value`. Consumers should split by metric name, not assume
+    /// every token carries a `/...ms` duration pair.
     pub fn summary(&self) -> String {
-        let mut names: Vec<&&'static str> = self.rings.keys().collect();
-        names.sort();
-        let parts: Vec<String> = names
+        let mut parts: Vec<(&'static str, String)> = self
+            .rings
             .iter()
-            .map(|name| {
-                let ring = &self.rings[*name];
-                format!(
-                    "{}={:.2}/{:.2}ms",
-                    name,
-                    ring.mean().as_secs_f64() * 1000.0,
-                    ring.p95().as_secs_f64() * 1000.0,
+            .map(|(name, ring)| {
+                (
+                    *name,
+                    format!(
+                        "{}={:.2}/{:.2}ms",
+                        name,
+                        ring.mean().as_secs_f64() * 1000.0,
+                        ring.p95().as_secs_f64() * 1000.0,
+                    ),
                 )
             })
             .collect();
-        parts.join(" ")
+        parts.extend(self.scalars.iter().map(|(name, value)| {
+            let formatted = if value.fract() == 0.0 {
+                format!("{}={:.0}", name, value)
+            } else {
+                format!("{}={:.2}", name, value)
+            };
+            (*name, formatted)
+        }));
+        parts.sort_by_key(|(name, _)| *name);
+        parts
+            .into_iter()
+            .map(|(_, part)| part)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Test-only accessor for the number of samples currently held by `name`.
@@ -455,9 +496,9 @@ mod tests {
         perf.record("apple", ms(20));
         perf.record("mango", ms(30));
         let s = perf.summary();
-        let apple_pos = s.find("apple").unwrap();
-        let mango_pos = s.find("mango").unwrap();
-        let zebra_pos = s.find("zebra").unwrap();
+        let apple_pos = s.find("apple").expect("summary should include apple");
+        let mango_pos = s.find("mango").expect("summary should include mango");
+        let zebra_pos = s.find("zebra").expect("summary should include zebra");
         assert!(apple_pos < mango_pos && mango_pos < zebra_pos);
     }
 
@@ -468,9 +509,20 @@ mod tests {
     }
 
     #[test]
+    fn perf_summary_includes_sorted_scalar_metrics() {
+        let mut perf = Perf::new();
+        perf.record("render_gpu", ms(3));
+        perf.record_scalar("render_gpu_lag", 10.0);
+        perf.record_scalar("alpha", 1.5);
+        let s = perf.summary();
+        assert_eq!(s, "alpha=1.50 render_gpu=3.00/3.00ms render_gpu_lag=10");
+    }
+
+    #[test]
     fn perf_clear_drops_all_keys() {
         let mut perf = Perf::new();
         perf.record("a", ms(1));
+        perf.record_scalar("render_gpu_lag", 10.0);
         perf.record("b", ms(2));
         perf.record("a", ms(3));
         assert_eq!(perf.sample_count("a"), 2);

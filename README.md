@@ -1,101 +1,109 @@
 # hash-thing
 
-3D voxel cellular automaton engine. Hash-consed octree storage, SVDAG rendering, material-type CA rules.
+`hash-thing` is an experimental 3D voxel cellular-automata engine for building
+large material worlds that keep simulating while most of the space is quiet.
 
-## Quick demo (pre-built)
+The bet: if a world is stored as a hash-consed octree, rendered as a GPU SVDAG,
+and stepped with Hashlife-style memoization, then stable and repeated structures
+can become cheap enough to support games that ordinary chunk sims struggle to
+run.
 
-If you've already built once on this machine:
+## What It Is
 
+Today the project is a real-time 3D powder-game sandbox and engine proof. You
+can launch into a voxel world with stone, sand, water, lava, fire, ice, acid,
+vine, metal, clone sources, and other material rules running together. The
+current direction is to make that sandbox feel like a dense material toy first,
+then use the engine's scale and memoization to find the game loop that only this
+substrate can carry.
+
+Under the hood:
+
+- A hash-consed sparse octree stores the world, so identical subtrees share
+  memory.
+- A dynamic SVDAG renderer raycasts the octree-derived scene on the GPU.
+- Material rules are local and deterministic, which keeps memoized stepping
+  valid.
+- Hashlife-style recursive stepping can skip empty, inert, cached, and repeated
+  regions instead of touching every voxel every tick.
+- Streaming and LOD work are aimed at worlds far beyond the first 256^3 demo
+  scale, with 4096^3 as the long-range target.
+
+The project is not just chasing "3D Powder Toy." The current research question
+is sharper: what player action layer becomes possible when huge quiet regions,
+localized active fronts, and repeated structures are computationally privileged?
+
+## Current Demo
+
+The demo is moving toward a compact 3D powder-game slice: a visually rich
+volcanic/material chamber, immediate editing tools, visible cascades, and one
+scale reveal that shows the simulation is not a tiny test box.
+
+Recent prototype work also includes **Quarantine Atlas**, a playable containment
+sketch where a live hazard front moves across a mostly quiet map and the player
+spends a small budget on reusable counter-pattern stamps. It is an action-layer
+test, not the final game direction.
+
+Screenshot/video placeholder: TODO add a fresh capture from the current demo
+once the scene art stabilizes.
+
+## Why It Is Interesting
+
+Most voxel games pay for local simulation by limiting the amount of world that
+is actually active. `hash-thing` is testing a different path: make repeated,
+stable, and empty structure structurally shareable, then spend compute on the
+small regions where material behavior is actually changing.
+
+Structured thesis probes show Hashlife is already a real multiplier in both
+easy and hard regimes. At `demo · default-demo · cascade · churning`, the
+current ledger records 79.15x work-elision p05 and a 20.40 ms hashlife p95
+against a 939.17 ms chunk-array p95 on the same cascade scenario. At
+`demo · default-terrain · microchurn · saturated`, the post-ite4 default
+`RayonBfs` path records a 6.7 ms step median. These are still regime-specific
+numbers, not a blanket victory claim; every new perf claim should cite its
+world, scene, intensity, and regime.
+
+That honesty matters. The goal is not a benchmark trick; it is a game where
+scale, stability, and reusable material patterns are player-facing resources.
+
+## Run It
+
+Requirements:
+
+- Rust via [rustup](https://rustup.rs)
+- A GPU supported by `wgpu` through Metal, Vulkan, or DX12
+
+Use the demo wrapper:
+
+```bash
+scripts/hash-thing-demo
 ```
-./target/release/hash-thing
+
+Useful one-shot overrides:
+
+```bash
+scripts/hash-thing-demo --world 256
+scripts/hash-thing-demo --res 1440p
 ```
 
-## Demo command
+The wrapper stores defaults in
+`${XDG_CONFIG_HOME:-$HOME/.config}/hash-thing/demo.toml`, prefers an existing
+`target/stable/hash-thing` or `target/release/hash-thing` binary, and falls back
+to building the release binary when needed. See [docs/demo.md](docs/demo.md) for
+the config keys, persistent `set` commands, focus behavior, and binary-pick
+order.
 
-Standardized demo runner with a per-user config file:
+For repeat launches from anywhere:
 
-```
-scripts/hash-thing-demo                   # run with current config
-scripts/hash-thing-demo --world 256       # one-shot world override
-scripts/hash-thing-demo --res 1440p       # one-shot resolution override
-scripts/hash-thing-demo set world 256     # persist
-scripts/hash-thing-demo set res 1440p     # persist
-scripts/hash-thing-demo show              # current config + which binary will run
-```
-
-Defaults: `world=512`, `res=1080p`, `scene=default`. Config lives at
-`${XDG_CONFIG_HOME:-$HOME/.config}/hash-thing/demo.toml` so changes
-propagate to other sessions on next invocation (no `source` needed).
-
-The wrapper picks a binary in this priority order: `target/stable/hash-thing`
-→ `target/release/hash-thing` → `cargo build --release`. It always sets
-`HASH_THING_FOCUS=1` so the demo window starts focused.
-
-To invoke from any cwd, symlink the wrapper into `$HOME/bin/`:
-
-```
+```bash
 mkdir -p ~/bin
 ln -sf "$(pwd)/scripts/hash-thing-demo" ~/bin/hash-thing-demo
 ```
 
-Make sure `~/bin` is on your `$PATH` (`echo "$PATH" | tr ':' '\n' | grep -F "$HOME/bin"`
-should print a line). On a fresh macOS, you may need to add
-`export PATH="$HOME/bin:$PATH"` to your shell rc. Then any session can
-run `! hash-thing-demo` (or just `hash-thing-demo` from a regular shell).
+Then make sure `~/bin` is on your `PATH` and run `hash-thing-demo`.
 
-## Build from source
+## Status
 
-```
-cargo run --release
-```
-
-First build ~60s. Subsequent builds are incremental (~2-5s).
-
-Requires Rust (install via [rustup](https://rustup.rs)).
-
-## What you're looking at
-
-A 64^3 procedural terrain (heightmap + value noise) rendered via an SVDAG raycaster on the GPU. The simulation engine supports material-aware cellular automaton rules (fire spreads to grass, water quenches fire) and Margolus 2x2x2 block rules for gravity and fluid flow.
-
-The octree is hash-consed: identical subtrees share storage. This is the foundation for Hashlife-style memoized stepping (in progress).
-
-## Controls
-
-| Key | Action |
-|-----|--------|
-| **Mouse drag** | Orbit camera |
-| **Scroll** | Zoom in/out |
-| **Space** | Pause / resume simulation |
-| **S** | Single step |
-| **R** | Reset terrain (heightmap) |
-| **G** | Switch to legacy Game of Life sphere seed |
-| **1-4** | Switch CA rule (Amoeba, Crystal, Rule445, Pyroclastic) |
-| **V** | Toggle render mode (Flat3D / SVDAG) |
-| **P** | Print perf stats |
-| **Esc** | Quit |
-
-## Architecture
-
-```
-src/
-  octree/       Hash-consed octree (node.rs, store.rs)
-  sim/          Simulation: CaRule + BlockRule dispatch, Margolus 2x2x2
-  terrain/      Procedural generation: heightmap, noise
-  render/       wgpu renderer: flat 3D texture + SVDAG raycaster
-  rng.rs        Deterministic per-cell PRNG (Hashlife-compatible)
-  perf.rs       Ring-buffer latency tracker + memory watchdog
-```
-
-Key invariant: simulation rules are pure functions of their neighborhood. No global PRNG, no scan-order dependence. This keeps Hashlife memoization structurally valid.
-
-## Requirements
-
-- Rust 1.80+ (uses `is_multiple_of` stabilized in 1.87 -- nightly or recent stable)
-- A GPU with Vulkan, Metal, or DX12 support (wgpu backend)
-
-## Tests
-
-```bash
-cargo test
-cargo clippy -- -D warnings
-```
+This is research software, not a packaged game. The engine pieces are real, the
+demo is playable, and the product direction is still being tested through small
+prototype loops and measured perf regimes.

@@ -60,6 +60,10 @@ pub const VINE_MATERIAL_ID: MaterialId = 15;
 pub const FAN_MATERIAL_ID: MaterialId = 16;
 pub const FIREWORK_MATERIAL_ID: MaterialId = 17;
 pub const CLONE_MATERIAL_ID: MaterialId = 18;
+pub const SOUP_TARGET_MARKER_MATERIAL_ID: MaterialId = 27;
+pub const SOUP_CATALOG_MARKER_MATERIAL_ID: MaterialId = 28;
+pub const FACTORY_BELT_POS_X_MATERIAL_ID: MaterialId = 29;
+pub const FACTORY_BELT_POS_Z_MATERIAL_ID: MaterialId = 30;
 const FAN_STEAM_POS_X_MATERIAL_ID: MaterialId = 19;
 const FAN_STEAM_NEG_X_MATERIAL_ID: MaterialId = 20;
 const FAN_STEAM_POS_Z_MATERIAL_ID: MaterialId = 21;
@@ -100,6 +104,10 @@ pub const VINE: CellState = Cell::pack(VINE_MATERIAL_ID, 0).raw();
 pub const FAN: CellState = Cell::pack(FAN_MATERIAL_ID, 0).raw();
 pub const FIREWORK: CellState = Cell::pack(FIREWORK_MATERIAL_ID, 0).raw();
 pub const CLONE: CellState = Cell::pack(CLONE_MATERIAL_ID, 0).raw();
+pub const SOUP_TARGET_MARKER: CellState = Cell::pack(SOUP_TARGET_MARKER_MATERIAL_ID, 0).raw();
+pub const SOUP_CATALOG_MARKER: CellState = Cell::pack(SOUP_CATALOG_MARKER_MATERIAL_ID, 0).raw();
+pub const FACTORY_BELT_POS_X: CellState = Cell::pack(FACTORY_BELT_POS_X_MATERIAL_ID, 0).raw();
+pub const FACTORY_BELT_POS_Z: CellState = Cell::pack(FACTORY_BELT_POS_Z_MATERIAL_ID, 0).raw();
 
 /// Pack a CLONE cell whose metadata slot carries the source material id.
 ///
@@ -809,6 +817,47 @@ impl MaterialRegistry {
                 tick_divisor: 1,
             },
         );
+        for (material_id, label, color) in [
+            (
+                SOUP_TARGET_MARKER_MATERIAL_ID,
+                "_soup_target_marker",
+                [0.1, 1.0, 0.8, 1.0],
+            ),
+            (
+                SOUP_CATALOG_MARKER_MATERIAL_ID,
+                "_soup_catalog_marker",
+                [1.0, 0.2, 0.95, 1.0],
+            ),
+            (
+                FACTORY_BELT_POS_X_MATERIAL_ID,
+                "_factory_belt_pos_x",
+                [0.95, 0.72, 0.18, 1.0],
+            ),
+            (
+                FACTORY_BELT_POS_Z_MATERIAL_ID,
+                "_factory_belt_pos_z",
+                [0.18, 0.78, 0.95, 1.0],
+            ),
+        ] {
+            registry.insert(
+                material_id,
+                MaterialEntry {
+                    visual: MaterialVisualProperties {
+                        label,
+                        base_color: color,
+                        texture_ref: None,
+                    },
+                    physical: MaterialPhysicalProperties {
+                        density: 7.0,
+                        flammability: 0.0,
+                        conductivity: 0.95,
+                    },
+                    rule_id: static_rule,
+                    block_rule_id: None,
+                    tick_divisor: 1,
+                },
+            );
+        }
 
         registry.validate_shared_block_rule_divisors();
         registry
@@ -1250,6 +1299,18 @@ mod tests {
         }
     }
 
+    fn expect_entry(registry: &MaterialRegistry, material_id: MaterialId) -> &MaterialEntry {
+        registry
+            .entry(material_id)
+            .unwrap_or_else(|| panic!("material {material_id} should be registered"))
+    }
+
+    fn expect_rule_for_cell(registry: &MaterialRegistry, cell: Cell) -> &CaRule {
+        registry
+            .rule_for_cell(cell)
+            .unwrap_or_else(|| panic!("rule for material {} should be registered", cell.material()))
+    }
+
     #[test]
     fn air_is_zero() {
         assert_eq!(AIR, 0, "AIR must be CellState 0 — load-bearing invariant");
@@ -1258,8 +1319,27 @@ mod tests {
     #[test]
     fn materials_are_distinct() {
         let mats = [
-            AIR, STONE, DIRT, GRASS, FIRE, WATER, SAND, LAVA, ICE, ACID, OIL, GUNPOWDER, STEAM,
-            GAS, METAL, VINE, FAN, FIREWORK, CLONE,
+            AIR,
+            STONE,
+            DIRT,
+            GRASS,
+            FIRE,
+            WATER,
+            SAND,
+            LAVA,
+            ICE,
+            ACID,
+            OIL,
+            GUNPOWDER,
+            STEAM,
+            GAS,
+            METAL,
+            VINE,
+            FAN,
+            FIREWORK,
+            CLONE,
+            SOUP_TARGET_MARKER,
+            SOUP_CATALOG_MARKER,
         ];
         for (i, &a) in mats.iter().enumerate() {
             for (j, &b) in mats.iter().enumerate() {
@@ -1287,7 +1367,7 @@ mod tests {
         // revert it to 1 (which would visibly double water fall speed)
         // without the test flagging. See rvsh.
         let registry = MaterialRegistry::terrain_defaults();
-        let water = registry.entry(WATER_MATERIAL_ID).unwrap();
+        let water = expect_entry(&registry, WATER_MATERIAL_ID);
         assert_eq!(
             water.tick_divisor, 2,
             "water must ship with tick_divisor=2 (edward pick on hash-thing-rvsh)"
@@ -1322,11 +1402,11 @@ mod tests {
     #[test]
     fn terrain_defaults_share_dissolvable_rule_for_terrain_solids() {
         let registry = MaterialRegistry::terrain_defaults();
-        let stone = registry.entry(STONE_MATERIAL_ID).unwrap();
-        let dirt = registry.entry(DIRT_MATERIAL_ID).unwrap();
-        let grass = registry.entry(GRASS_MATERIAL_ID).unwrap();
-        let fire = registry.entry(FIRE_MATERIAL_ID).unwrap();
-        let water = registry.entry(WATER_MATERIAL_ID).unwrap();
+        let stone = expect_entry(&registry, STONE_MATERIAL_ID);
+        let dirt = expect_entry(&registry, DIRT_MATERIAL_ID);
+        let grass = expect_entry(&registry, GRASS_MATERIAL_ID);
+        let fire = expect_entry(&registry, FIRE_MATERIAL_ID);
+        let water = expect_entry(&registry, WATER_MATERIAL_ID);
 
         // Stone, dirt, grass share DissolvableRule (react to acid).
         assert_eq!(stone.rule_id, dirt.rule_id);
@@ -1341,18 +1421,30 @@ mod tests {
     fn terrain_defaults_register_known_materials_and_leave_unknown_missing() {
         let registry = MaterialRegistry::terrain_defaults();
 
-        assert_eq!(registry.entry(AIR_MATERIAL_ID).unwrap().visual.label, "air");
+        assert_eq!(expect_entry(&registry, AIR_MATERIAL_ID).visual.label, "air");
         assert_eq!(
-            registry.entry(WATER_MATERIAL_ID).unwrap().visual.label,
+            expect_entry(&registry, WATER_MATERIAL_ID).visual.label,
             "water"
         );
         assert_eq!(
-            registry.entry(SAND_MATERIAL_ID).unwrap().visual.label,
+            expect_entry(&registry, SAND_MATERIAL_ID).visual.label,
             "sand"
         );
         assert_eq!(
-            registry.entry(LAVA_MATERIAL_ID).unwrap().visual.label,
+            expect_entry(&registry, LAVA_MATERIAL_ID).visual.label,
             "lava"
+        );
+        assert_eq!(
+            expect_entry(&registry, FACTORY_BELT_POS_X_MATERIAL_ID)
+                .visual
+                .label,
+            "_factory_belt_pos_x"
+        );
+        assert_eq!(
+            expect_entry(&registry, FACTORY_BELT_POS_Z_MATERIAL_ID)
+                .visual
+                .label,
+            "_factory_belt_pos_z"
         );
         assert!(registry.entry(42).is_none());
     }
@@ -1371,6 +1463,14 @@ mod tests {
         assert_eq!(palette[WATER_MATERIAL_ID as usize], [0.12, 0.35, 0.84, 1.0]);
         assert_eq!(palette[SAND_MATERIAL_ID as usize], [0.87, 0.80, 0.55, 1.0]);
         assert_eq!(palette[LAVA_MATERIAL_ID as usize], [0.95, 0.25, 0.05, 1.0]);
+        assert_eq!(
+            palette[SOUP_TARGET_MARKER_MATERIAL_ID as usize],
+            [0.1, 1.0, 0.8, 1.0]
+        );
+        assert_eq!(
+            palette[SOUP_CATALOG_MARKER_MATERIAL_ID as usize],
+            [1.0, 0.2, 0.95, 1.0]
+        );
     }
 
     #[test]
@@ -1380,7 +1480,7 @@ mod tests {
         registry.insert(300, entry_with(rule_id, [0.9, 0.2, 0.1, 1.0]));
         let palette = registry.color_palette_rgba();
 
-        assert_eq!(registry.entry(300).unwrap().rule_id, rule_id);
+        assert_eq!(expect_entry(&registry, 300).rule_id, rule_id);
         assert_eq!(palette.len(), 301);
         assert_eq!(palette[299], [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(palette[300], [0.9, 0.2, 0.1, 1.0]);
@@ -1392,16 +1492,12 @@ mod tests {
         let neighbors = [Cell::pack(FIRE_MATERIAL_ID, 0); 26];
 
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::pack(WATER_MATERIAL_ID, 0))
-                .unwrap()
+            expect_rule_for_cell(&registry, Cell::pack(WATER_MATERIAL_ID, 0))
                 .step_cell(Cell::pack(WATER_MATERIAL_ID, 0), &neighbors),
             Cell::pack(STONE_MATERIAL_ID, 0),
         );
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::pack(STONE_MATERIAL_ID, 0))
-                .unwrap()
+            expect_rule_for_cell(&registry, Cell::pack(STONE_MATERIAL_ID, 0))
                 .step_cell(Cell::pack(STONE_MATERIAL_ID, 0), &neighbors),
             Cell::pack(STONE_MATERIAL_ID, 0),
         );
@@ -1414,16 +1510,11 @@ mod tests {
         growth_neighbors[12] = Cell::pack(VINE_MATERIAL_ID, 2);
 
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::EMPTY)
-                .unwrap()
-                .step_cell(Cell::EMPTY, &growth_neighbors),
+            expect_rule_for_cell(&registry, Cell::EMPTY).step_cell(Cell::EMPTY, &growth_neighbors),
             Cell::pack(VINE_MATERIAL_ID, 0),
         );
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::pack(VINE_MATERIAL_ID, 0))
-                .unwrap()
+            expect_rule_for_cell(&registry, Cell::pack(VINE_MATERIAL_ID, 0))
                 .step_cell(Cell::pack(VINE_MATERIAL_ID, 0), &[Cell::EMPTY; 26]),
             Cell::pack(VINE_MATERIAL_ID, 1),
         );
@@ -1442,16 +1533,11 @@ mod tests {
         let neighbors = [Cell::pack(STONE_MATERIAL_ID, 0); 26];
 
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::EMPTY)
-                .unwrap()
-                .step_cell(Cell::EMPTY, &neighbors),
+            expect_rule_for_cell(&registry, Cell::EMPTY).step_cell(Cell::EMPTY, &neighbors),
             Cell::EMPTY,
         );
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::pack(STONE_MATERIAL_ID, 0))
-                .unwrap()
+            expect_rule_for_cell(&registry, Cell::pack(STONE_MATERIAL_ID, 0))
                 .step_cell(Cell::pack(STONE_MATERIAL_ID, 0), &neighbors),
             Cell::EMPTY,
         );
@@ -1463,16 +1549,12 @@ mod tests {
         let fire_neighbors = [Cell::pack(FIRE_MATERIAL_ID, 0); 26];
 
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::pack(WATER_MATERIAL_ID, 0))
-                .unwrap()
+            expect_rule_for_cell(&registry, Cell::pack(WATER_MATERIAL_ID, 0))
                 .step_cell(Cell::pack(WATER_MATERIAL_ID, 0), &fire_neighbors),
             Cell::pack(STONE_MATERIAL_ID, 0),
         );
         assert_eq!(
-            registry
-                .rule_for_cell(Cell::pack(GRASS_MATERIAL_ID, 7))
-                .unwrap()
+            expect_rule_for_cell(&registry, Cell::pack(GRASS_MATERIAL_ID, 7))
                 .step_cell(Cell::pack(GRASS_MATERIAL_ID, 7), &fire_neighbors),
             Cell::pack(GRASS_MATERIAL_ID, 7),
         );
@@ -1581,11 +1663,12 @@ mod tests {
                 Cell::pack(id, 0)
             };
             let fn_density = material_density(cell);
-            let reg_density = registry.entry(id).unwrap().physical.density;
+            let entry = expect_entry(&registry, id);
+            let reg_density = entry.physical.density;
             assert!(
                 (fn_density - reg_density).abs() < f32::EPSILON,
                 "material_density({}) = {fn_density}, registry = {reg_density}",
-                registry.entry(id).unwrap().visual.label
+                entry.visual.label
             );
         }
     }
@@ -1593,7 +1676,7 @@ mod tests {
     #[test]
     fn terrain_defaults_water_has_block_rule() {
         let registry = MaterialRegistry::terrain_defaults();
-        let water = registry.entry(WATER_MATERIAL_ID).unwrap();
+        let water = expect_entry(&registry, WATER_MATERIAL_ID);
         assert!(
             water.block_rule_id.is_some(),
             "water must have a block rule for fluid flow"
@@ -1604,17 +1687,13 @@ mod tests {
     fn terrain_defaults_stone_grass_no_block_rule() {
         let registry = MaterialRegistry::terrain_defaults();
         assert!(
-            registry
-                .entry(STONE_MATERIAL_ID)
-                .unwrap()
+            expect_entry(&registry, STONE_MATERIAL_ID)
                 .block_rule_id
                 .is_none(),
             "stone should not have a block rule"
         );
         assert!(
-            registry
-                .entry(GRASS_MATERIAL_ID)
-                .unwrap()
+            expect_entry(&registry, GRASS_MATERIAL_ID)
                 .block_rule_id
                 .is_none(),
             "grass should not have a block rule"

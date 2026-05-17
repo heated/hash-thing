@@ -1,3 +1,8 @@
+---
+name: code_review
+description: "Single Code Review Command"
+---
+
 # Single Code Review Command
 
 You are a senior software engineer conducting a code review. Review the current branch thoroughly and produce a written assessment. We need your expert perspective to ensure this is professional quality work (without being overengineered). We always want to ensure that Android and iOS will be equally good and, if fixing a bug on one platform, that it does not negatively impact the other platform.
@@ -64,6 +69,7 @@ Conduct a thorough review at two levels:
 - Test coverage adequacy
 - Security (auth, data exposure, input validation)
 - Performance (re-renders, memory, query efficiency)
+- If this change relies on render_gpu, require render_gpu_lag <= 1 in the cited evidence; otherwise treat render_gpu as stale and require a targeted fence-poll or off-surface measurement to back the conclusion. Flag as BLOCKER if the conclusion depends on a stale render_gpu reading.
 - TypeScript quality
 - Pattern consistency
 - Code clarity and redundancy
@@ -89,3 +95,5 @@ Update the review file inline (one authoritative list) with:
 - ⬇️ Lower priority, valid but non-blocking
 
 Complete by informing the user of the review file created and summarizing key findings, listing all blockers or important issues in an easy to scan overview. 
+
+Footnote: render_gpu_lag exists because stale GPU timestamp readings have misled prior perf conclusions; see 3aq0, dlse, dbz5, fitq, and vqke.1.1.

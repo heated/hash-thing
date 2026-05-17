@@ -1,0 +1,15 @@
+(
+    name: "factory-encoded-belt-routing",
+    world: Small,
+    level: Some(6),
+    scene: FactoryConveyor,
+    rule_set: FactoryEncodedBeltRoutingV1,
+    intensity: PassiveActive,
+    regime: NotApplicable,
+    backend: ChunkArray,
+    generations: 40,
+    warmup_generations: Some(12),
+    seed: 11,
+    setup: Some(FactoryEncodedBeltRoutingV1),
+    comparator: Some("hashlife-recursive@same-scenario"),
+)

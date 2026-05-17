@@ -16,11 +16,13 @@
 //!
 //! Buffer layout (u32 per slot):
 //!   `[0]`:      root_offset — absolute index of the current root node's slot
-//!   `[1..]`:    concatenated 9-u32 interior-node slots, append-only
+//!   `[1..]`:    concatenated 11-u32 interior-node slots, append-only
 //!
-//! Interior node slot (9 u32s = 36 bytes):
+//! Interior node slot (11 u32s = 44 bytes):
 //!   `[0]`:      child_mask (low 8 bits: octant occupancy, bits 8-23: representative material)
-//!   `[1..=8]`:  child entries — packed as (is_leaf << 31) | payload_bits
+//!   `[1]`:      low 32 bits of grandchildren occupancy, 8 bits per child octant
+//!   `[2]`:      high 32 bits of grandchildren occupancy, 8 bits per child octant
+//!   `[3..=10]`: child entries — packed as (is_leaf << 31) | payload_bits
 //!     - is_leaf: payload is the 16-bit material state in low bits
 //!     - else:    payload is the absolute offset of the child node in this buffer
 //!
@@ -32,8 +34,8 @@
 //! `(mask, child_slots)` tuple represent the same voxel volume regardless of which
 //! store epoch they came from.
 //!
-//! `Svdag` exploits this by keeping a persistent `offset_by_slot: FxHashMap<[u32; 9],
-//! u32>` map across calls. `update()` walks the new DAG, computes each node's 9-u32
+//! `Svdag` exploits this by keeping a persistent `offset_by_slot` map across
+//! calls. `update()` walks the new DAG, computes each node's slot
 //! slot bottom-up, and checks the map: hit → reuse the existing GPU-side offset;
 //! miss → append to `nodes` and insert. The root's slot changes almost every step
 //! (its children change), so the root gets a fresh offset; `nodes[0]` is overwritten
@@ -54,11 +56,15 @@ use rustc_hash::FxHashMap;
 /// `LEAF_BIT = 0x80000000u` in `src/render/svdag_raycast.wgsl`; if you change
 /// one, change the other.
 pub(crate) const LEAF_BIT: u32 = 0x8000_0000;
+pub(crate) const SLOT_WORDS: usize = 11;
+pub(crate) const GRAND_MASK_LO_WORD: usize = 1;
+pub(crate) const GRAND_MASK_HI_WORD: usize = 2;
+pub(crate) const CHILD_BASE_WORD: usize = 3;
 
 /// GPU-friendly serialized DAG with persistent content-addressed cache.
 ///
 /// `nodes[0]` is reserved for the current root offset. `nodes[1..]` is an
-/// append-only stream of 9-u32 interior-node slots. `offset_by_slot` maps each
+/// append-only stream of 11-u32 interior-node slots. `offset_by_slot` maps each
 /// unique slot tuple to its absolute offset in `nodes`, so repeated `update()`
 /// calls reuse offsets for content that already lives in the buffer.
 pub struct Svdag {
@@ -66,8 +72,8 @@ pub struct Svdag {
     pub nodes: Vec<u32>,
     /// Persistent content-exact cache: slot bytes → their offset in `nodes`.
     ///
-    /// Keyed by the full 9-u32 slot (not a hash) so lookups are collision-free.
-    offset_by_slot: FxHashMap<[u32; 9], u32>,
+    /// Keyed by the full slot (not a hash) so lookups are collision-free.
+    offset_by_slot: FxHashMap<[u32; SLOT_WORDS], u32>,
     /// Persistent NodeId→offset cache across frames. When the octree store is
     /// compacted (remapping NodeIds), callers must call `apply_remap()` before
     /// the next `update()` so cache keys stay valid. This turns `update()` from
@@ -128,13 +134,16 @@ impl Svdag {
             // Degenerate single-node DAG: all 8 children point at the same
             // inline leaf. Build the slot and cache it normally.
             let occ = if *state != 0 { 0xffu32 } else { 0u32 };
+            let grand_mask = if *state != 0 { u64::MAX } else { 0 };
             let rep = (*state as u32) & 0xFFFF;
             let mask = occ | (rep << 8);
             let leaf_slot = LEAF_BIT | (*state as u32);
-            let mut slot = [0u32; 9];
+            let mut slot = [0u32; SLOT_WORDS];
             slot[0] = mask;
+            slot[GRAND_MASK_LO_WORD] = grand_mask as u32;
+            slot[GRAND_MASK_HI_WORD] = (grand_mask >> 32) as u32;
             for i in 0..8 {
-                slot[1 + i] = leaf_slot;
+                slot[CHILD_BASE_WORD + i] = leaf_slot;
             }
             let offset = self.intern_slot(slot);
             self.nodes[0] = offset;
@@ -204,8 +213,9 @@ impl Svdag {
             }
             Node::Interior { children, .. } => {
                 let children = *children;
-                let mut slot = [0u32; 9];
+                let mut slot = [0u32; SLOT_WORDS];
                 let mut mask: u32 = 0;
+                let mut grand_mask: u64 = 0;
                 let mut rep_mat: u32 = 0;
                 let mut rep_pop: u64 = 0;
                 for (i, &child_id) in children.iter().enumerate() {
@@ -213,18 +223,21 @@ impl Svdag {
                         Node::Leaf(state) => {
                             if *state != 0 {
                                 mask |= 1 << i;
+                                grand_mask |= 0xffu64 << (i * 8);
                                 if rep_mat == 0 || rep_pop == 0 {
                                     rep_mat = *state as u32;
                                     rep_pop = 1;
                                 }
                             }
-                            slot[1 + i] = LEAF_BIT | (*state as u32);
+                            slot[CHILD_BASE_WORD + i] = LEAF_BIT | (*state as u32);
                         }
                         Node::Interior { population, .. } => {
                             if *population > 0 {
                                 mask |= 1 << i;
                                 let child_offset = self.visit(store, child_id);
-                                slot[1 + i] = child_offset;
+                                slot[CHILD_BASE_WORD + i] = child_offset;
+                                let child_cmask = self.nodes[child_offset as usize];
+                                grand_mask |= ((child_cmask & 0xff) as u64) << (i * 8);
                                 // Propagate representative material from the
                                 // largest populated child, not the first
                                 // occupied octant. Water-heavy scenes often
@@ -232,12 +245,11 @@ impl Svdag {
                                 // octants; "first occupied wins" turns whole
                                 // coarse LOD nodes into arbitrary materials.
                                 if *population > rep_pop {
-                                    let child_cmask = self.nodes[child_offset as usize];
                                     rep_mat = (child_cmask >> 8) & 0xFFFF;
                                     rep_pop = *population;
                                 }
                             } else {
-                                slot[1 + i] = LEAF_BIT;
+                                slot[CHILD_BASE_WORD + i] = LEAF_BIT;
                             }
                         }
                     }
@@ -246,6 +258,8 @@ impl Svdag {
                 // Shader LOD reads `(cmask >> 8) & 0xFFFF` to get the material
                 // without scanning children (hash-thing-m1f.7.3.2).
                 slot[0] = mask | ((rep_mat & 0xFFFF) << 8);
+                slot[GRAND_MASK_LO_WORD] = grand_mask as u32;
+                slot[GRAND_MASK_HI_WORD] = (grand_mask >> 32) as u32;
 
                 let offset = self.intern_slot(slot);
                 self.id_to_offset.insert(id, offset);
@@ -255,8 +269,8 @@ impl Svdag {
         }
     }
 
-    /// Intern a 9-u32 slot into the persistent cache. Returns the offset.
-    fn intern_slot(&mut self, slot: [u32; 9]) -> u32 {
+    /// Intern a slot into the persistent cache. Returns the offset.
+    fn intern_slot(&mut self, slot: [u32; SLOT_WORDS]) -> u32 {
         if let Some(&existing) = self.offset_by_slot.get(&slot) {
             return existing;
         }
@@ -348,7 +362,7 @@ impl Svdag {
             let octant = ox | (oy << 1) | (oz << 2);
 
             let mask = self.nodes[offset];
-            let child_word = self.nodes[offset + 1 + octant];
+            let child_word = self.nodes[offset + CHILD_BASE_WORD + octant];
 
             if mask & (1 << octant) == 0 {
                 // Empty octant.
@@ -419,10 +433,25 @@ pub mod cpu_trace {
     /// instrumentable via the new `exhausted` flag on `TraceResult`.
     pub const STEP_BUDGET_FUDGE: usize = 8;
 
+    fn grand_mask_bit(lo: u32, hi: u32, child_oct: usize, grand_oct: usize) -> bool {
+        let bit = child_oct * 8 + grand_oct;
+        let word = if bit < 32 { lo } else { hi };
+        (word & (1u32 << (bit & 31))) != 0
+    }
+
+    fn grand_mask_slice(lo: u32, hi: u32, child_oct: usize) -> u32 {
+        let bit = child_oct * 8;
+        if bit < 32 {
+            (lo >> bit) & 0xff
+        } else {
+            (hi >> (bit - 32)) & 0xff
+        }
+    }
+
     /// Compute the MAX_STEPS budget for a given `root_level`.
     ///
     /// Result: `max(MIN_STEP_BUDGET, STEP_BUDGET_FUDGE * (1 << root_level))`.
-    /// For root_level=6 (256³): `max(1024, 8 * 64) = 1024`.
+    /// For root_level=6 (64³): `max(1024, 8 * 64) = 1024`.
     /// For root_level=12 (4096³): `max(1024, 8 * 4096) = 32768`.
     /// For root_level=14 (16384³): `max(1024, 8 * 16384) = 131072`.
     /// Saturates above root_level=28 at `(1 << 28) * 8 = 2^31 = 2_147_483_648`.
@@ -693,6 +722,8 @@ pub mod cpu_trace {
         let mut stack_min = [[0.0f32; 3]; MAX_STACK];
         let mut stack_half = [0.0f32; MAX_STACK];
         let mut stack_cmask = [0u32; MAX_STACK];
+        let mut stack_grand_lo = [0u32; MAX_STACK];
+        let mut stack_grand_hi = [0u32; MAX_STACK];
         let mut depth: usize = 0;
 
         let root_offset = dag[0];
@@ -700,6 +731,8 @@ pub mod cpu_trace {
         stack_min[0] = [0.0; 3];
         stack_half[0] = 0.5;
         stack_cmask[0] = dag[root_offset as usize];
+        stack_grand_lo[0] = dag[root_offset as usize + GRAND_MASK_LO_WORD];
+        stack_grand_hi[0] = dag[root_offset as usize + GRAND_MASK_HI_WORD];
 
         // Local-frame starting t. Just past the root entry; `ro_local` is
         // already on the root face.
@@ -770,6 +803,8 @@ pub mod cpu_trace {
                 let node_min = stack_min[depth];
                 let half = stack_half[depth];
                 let cmask = stack_cmask[depth];
+                let grand_lo = stack_grand_lo[depth];
+                let grand_hi = stack_grand_hi[depth];
                 let oct = octant_of(pos, rd_m, node_min, half);
                 // Stage 2: XOR to un-mirror the octant for DAG lookup.
                 let mirrored_oct = (oct ^ mirror_mask) as usize;
@@ -782,7 +817,25 @@ pub mod cpu_trace {
                     break;
                 }
 
-                let child_slot = dag[node_offset + 1 + mirrored_oct];
+                let child_min = [
+                    node_min[0] + (oct & 1) as f32 * half,
+                    node_min[1] + ((oct >> 1) & 1) as f32 * half,
+                    node_min[2] + ((oct >> 2) & 1) as f32 * half,
+                ];
+                let grand_half = half * 0.5;
+                let grand_oct = octant_of(pos, rd_m, child_min, grand_half);
+                let mirrored_grand_oct = (grand_oct ^ mirror_mask) as usize;
+                if !grand_mask_bit(grand_lo, grand_hi, mirrored_oct, mirrored_grand_oct) {
+                    if record {
+                        events.push(TraceEvent::EmptyLeaf {
+                            depth: depth + 1,
+                            oct: grand_oct,
+                        });
+                    }
+                    break;
+                }
+
+                let child_slot = dag[node_offset + CHILD_BASE_WORD + mirrored_oct];
 
                 if child_slot & LEAF_BIT != 0 {
                     let mat = child_slot & 0xFFFF;
@@ -823,16 +876,13 @@ pub mod cpu_trace {
                     if depth + 1 >= MAX_STACK {
                         break;
                     }
-                    let child_min = [
-                        node_min[0] + (oct & 1) as f32 * half,
-                        node_min[1] + ((oct >> 1) & 1) as f32 * half,
-                        node_min[2] + ((oct >> 2) & 1) as f32 * half,
-                    ];
                     depth += 1;
                     stack_node[depth] = child_slot;
                     stack_min[depth] = child_min;
                     stack_half[depth] = half * 0.5;
                     stack_cmask[depth] = dag[child_slot as usize];
+                    stack_grand_lo[depth] = dag[child_slot as usize + GRAND_MASK_LO_WORD];
+                    stack_grand_hi[depth] = dag[child_slot as usize + GRAND_MASK_HI_WORD];
                     if record {
                         events.push(TraceEvent::Descend {
                             depth,
@@ -847,9 +897,35 @@ pub mod cpu_trace {
             // empty siblings using the parent's child_mask (hash-thing-x5w.1).
             // Hoist invariants — depth doesn't change within the inner loop.
             // m1f.7.3: use cached child_mask instead of re-reading.
-            let skip_mask = stack_cmask[depth];
-            let node_min = stack_min[depth];
-            let half = stack_half[depth];
+            let mut skip_mask = stack_cmask[depth];
+            let mut node_min = stack_min[depth];
+            let mut half = stack_half[depth];
+            let mut skip_depth = depth;
+            let grand_lo = stack_grand_lo[depth];
+            let grand_hi = stack_grand_hi[depth];
+            let pos_s = [
+                (int_pos[0] as f32 + 0.5) * INV_RES,
+                (int_pos[1] as f32 + 0.5) * INV_RES,
+                (int_pos[2] as f32 + 0.5) * INV_RES,
+            ];
+            let parent_oct = octant_of(pos_s, rd_m, node_min, half);
+            let mirrored_parent_oct = (parent_oct ^ mirror_mask) as usize;
+            let parent_child_mask = grand_mask_slice(grand_lo, grand_hi, mirrored_parent_oct);
+            if parent_child_mask != 0 {
+                let child_min = [
+                    node_min[0] + (parent_oct & 1) as f32 * half,
+                    node_min[1] + ((parent_oct >> 1) & 1) as f32 * half,
+                    node_min[2] + ((parent_oct >> 2) & 1) as f32 * half,
+                ];
+                let child_half = half * 0.5;
+                let grand_oct = octant_of(pos_s, rd_m, child_min, child_half);
+                if parent_child_mask & (1u32 << (grand_oct ^ mirror_mask)) == 0 {
+                    skip_mask = parent_child_mask;
+                    node_min = child_min;
+                    half = child_half;
+                    skip_depth = depth + 1;
+                }
+            }
             loop {
                 let pos_s = [
                     (int_pos[0] as f32 + 0.5) * INV_RES,
@@ -879,7 +955,7 @@ pub mod cpu_trace {
                 if t2[2] < t2[exit_axis] {
                     exit_axis = 2;
                 }
-                let step_cells = 1u32 << (MAX_DEPTH as u32 - 1 - depth as u32);
+                let step_cells = 1u32 << (MAX_DEPTH as u32 - 1 - skip_depth as u32);
                 let octant_base = (child_min[exit_axis] * RESOLUTION as f32) as u32;
                 let boundary_cell = octant_base + step_cells;
                 let t_old = t;
@@ -1169,7 +1245,7 @@ mod tests {
 
     /// Regression for hash-thing-nch I4: `Svdag::build` must accept a leaf
     /// root (uniform world, single-cell fixture, future root-collapse) by
-    /// emitting a degenerate 9-u32 single-node interior DAG. Before this
+    /// emitting a degenerate 11-u32 single-node interior DAG. Before this
     /// fix, `write_node` panicked on leaf roots with a hand-wave comment
     /// that "the root will always be level >= 1 in practice."
     #[test]
@@ -1183,8 +1259,12 @@ mod tests {
         // node encoding.
         let dag = Svdag::build(&store, root, 5);
         assert_eq!(dag.node_count, 1, "degenerate leaf-root DAG is one node");
-        // 1 header word + 9 node u32s = 10
-        assert_eq!(dag.nodes.len(), 10, "header + one interior node = 10 u32s");
+        // 1 header word + 11 node u32s = 12
+        assert_eq!(
+            dag.nodes.len(),
+            1 + SLOT_WORDS,
+            "header + one interior node = 12 u32s"
+        );
         let root_off = dag.nodes[0] as usize;
         assert_eq!(root_off, 1, "root offset points past header");
         // m1f.7.3: child_mask word = low 8 bits occupancy | bits 8-23 rep material.
@@ -1195,9 +1275,19 @@ mod tests {
             0xffu32 | (rep_mat << 8),
             "all 8 octants populated + representative material for a nonzero leaf root"
         );
+        assert_eq!(
+            dag.nodes[root_off + GRAND_MASK_LO_WORD],
+            u32::MAX,
+            "non-empty leaf root must mark every low-word grandchild occupied"
+        );
+        assert_eq!(
+            dag.nodes[root_off + GRAND_MASK_HI_WORD],
+            u32::MAX,
+            "non-empty leaf root must mark every high-word grandchild occupied"
+        );
         for i in 0..8 {
             assert_eq!(
-                dag.nodes[root_off + 1 + i],
+                dag.nodes[root_off + CHILD_BASE_WORD + i],
                 LEAF_BIT | mat3 as u32,
                 "child slot {i} must encode the leaf state inline",
             );
@@ -1242,6 +1332,71 @@ mod tests {
             rep_mat, stone as u32,
             "representative material should follow the largest populated child, \
              not the first occupied octant"
+        );
+    }
+
+    #[test]
+    fn grandchild_mask_marks_low_and_high_words() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2); // 4^3: root children each hold 2^3 grandchildren.
+        root = store.set_cell(root, 1, 0, 0, mat(1)); // child 0, grandchild 1 -> low word bit 1.
+        root = store.set_cell(root, 0, 0, 2, mat(2)); // child 4, grandchild 0 -> high word bit 0.
+
+        let dag = Svdag::build(&store, root, 2);
+        let root_off = dag.nodes[0] as usize;
+        let lo = dag.nodes[root_off + GRAND_MASK_LO_WORD];
+        let hi = dag.nodes[root_off + GRAND_MASK_HI_WORD];
+
+        assert_ne!(lo & (1 << 1), 0, "child 0 grandchild 1 must set low bit 1");
+        assert_ne!(hi & 1, 0, "child 4 grandchild 0 must set high bit 0");
+    }
+
+    #[test]
+    fn grandchild_empty_skip_does_not_skip_occupied_sibling() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2);
+        let mat1 = mat(1);
+        root = store.set_cell(root, 1, 0, 0, mat1);
+        let dag = Svdag::build(&store, root, 2);
+
+        // The ray enters child 0 through empty grandchild 0, then should hit
+        // occupied sibling grandchild 1. A too-coarse skip would jump over it.
+        let result = cpu_trace::raycast(
+            &dag.nodes,
+            dag.root_level,
+            [-1.0, 0.125, 0.125],
+            [1.0, 0.0, 0.0],
+            true,
+        );
+        assert_eq!(
+            result.hit_cell,
+            Some(mat1 as u32),
+            "grandchild skip must not skip the whole child, events: {:#?}",
+            result.events
+        );
+    }
+
+    #[test]
+    fn grandchild_mask_handles_negative_direction_mirroring() {
+        let mut store = NodeStore::new();
+        let mut root = store.empty(2);
+        let mat2 = mat(2);
+        root = store.set_cell(root, 2, 3, 3, mat2);
+        let dag = Svdag::build(&store, root, 2);
+
+        let target = [2.5 / 4.0, 3.5 / 4.0, 3.5 / 4.0];
+        let ro = [2.0, 2.0, 2.0];
+        let rd = normalize([target[0] - ro[0], target[1] - ro[1], target[2] - ro[2]]);
+        assert!(
+            rd[0] < 0.0 && rd[1] < 0.0 && rd[2] < 0.0,
+            "test must exercise mirrored negative axes"
+        );
+        let result = cpu_trace::raycast(&dag.nodes, dag.root_level, ro, rd, true);
+        assert_eq!(
+            result.hit_cell,
+            Some(mat2 as u32),
+            "grandchild mask lookup must mirror child-local octants, events: {:#?}",
+            result.events
         );
     }
 
@@ -1329,7 +1484,7 @@ mod tests {
                 Node::Leaf(s) => *s as u32,
                 Node::Interior { population: 0, .. } => 0,
                 Node::Interior { .. } => {
-                    let child_word = dag.nodes[root_off + 1 + i];
+                    let child_word = dag.nodes[root_off + CHILD_BASE_WORD + i];
                     assert_eq!(
                         child_word & LEAF_BIT,
                         0,
@@ -1389,7 +1544,7 @@ mod tests {
                     Node::Leaf(s) => *s as u32,
                     Node::Interior { population: 0, .. } => 0,
                     Node::Interior { .. } => {
-                        let child_word = dag.nodes[original_offset + 1 + i];
+                        let child_word = dag.nodes[original_offset + CHILD_BASE_WORD + i];
                         if child_word & LEAF_BIT != 0 {
                             // Original child is a populated Interior whose SVDAG
                             // slot encodes it inline as a degenerate leaf — only
@@ -1419,7 +1574,7 @@ mod tests {
             Node::Leaf(_) => return,
         };
         for i in 0..8 {
-            let child_word = dag.nodes[original_offset + 1 + i];
+            let child_word = dag.nodes[original_offset + CHILD_BASE_WORD + i];
             if child_word & LEAF_BIT != 0 {
                 // SVDAG inlined this subtree as a single uniform-state leaf
                 // (or empty subtree). The collapsed-side subtree must carry
@@ -1472,7 +1627,7 @@ mod tests {
         assert_eq!(dag.nodes[root_off], 0u32, "empty leaf root → zero mask");
         for i in 0..8 {
             assert_eq!(
-                dag.nodes[root_off + 1 + i],
+                dag.nodes[root_off + CHILD_BASE_WORD + i],
                 LEAF_BIT,
                 "empty leaf slot is LEAF_BIT with state=0"
             );
@@ -2762,11 +2917,11 @@ mod tests {
         svdag.update(&store, root, 6);
 
         let appended_u32 = svdag.nodes.len() - len_before_edit;
-        let appended_slots = appended_u32 / 9;
+        let appended_slots = appended_u32 / SLOT_WORDS;
 
         assert!(
-            appended_u32.is_multiple_of(9),
-            "appended u32 count must be a multiple of 9 (whole slots), got {appended_u32}"
+            appended_u32.is_multiple_of(SLOT_WORDS),
+            "appended u32 count must be a multiple of SLOT_WORDS (whole slots), got {appended_u32}"
         );
         assert!(
             appended_slots <= 8,
@@ -2848,13 +3003,13 @@ mod tests {
         let svdag = Svdag::build(&store, root, 6);
         let root_offset = svdag.nodes[0] as usize;
 
-        // The root offset should point at a valid 9-u32 slot.
+        // The root offset should point at a valid 11-u32 slot.
         assert!(
             root_offset > 0,
             "root offset 0 would collide with the header word itself"
         );
         assert!(
-            root_offset + 9 <= svdag.nodes.len(),
+            root_offset + SLOT_WORDS <= svdag.nodes.len(),
             "root offset {root_offset} points past buffer end {}",
             svdag.nodes.len()
         );
@@ -2971,14 +3126,14 @@ mod tests {
         let node = store.get(node_id);
         if let Node::Interior { children, .. } = node {
             for (i, &child_id) in children.iter().enumerate() {
-                let child_word = svdag.nodes[offset + 1 + i];
+                let child_word = svdag.nodes[offset + CHILD_BASE_WORD + i];
                 match store.get(child_id) {
                     Node::Leaf(state) => {
                         let expected_word = LEAF_BIT | (*state as u32);
                         if child_word != expected_word {
                             out.push(format!(
                                 "leaf child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
-                                offset + 1 + i,
+                                offset + CHILD_BASE_WORD + i,
                                 if path.is_empty() { "/" } else { path },
                                 child_word,
                                 expected_word,
@@ -2992,7 +3147,7 @@ mod tests {
                             if child_word != LEAF_BIT {
                                 out.push(format!(
                                     "empty-interior child slot mismatch at offset={} (child {i} of '{}'): encoded={:#010x} expected={:#010x}",
-                                    offset + 1 + i,
+                                    offset + CHILD_BASE_WORD + i,
                                     if path.is_empty() { "/" } else { path },
                                     child_word,
                                     LEAF_BIT,
@@ -3003,7 +3158,7 @@ mod tests {
                             if child_word & LEAF_BIT != 0 {
                                 out.push(format!(
                                     "populated-interior child slot has LEAF_BIT at offset={} (child {i} of '{}'): encoded={:#010x}",
-                                    offset + 1 + i,
+                                    offset + CHILD_BASE_WORD + i,
                                     if path.is_empty() { "/" } else { path },
                                     child_word,
                                 ));

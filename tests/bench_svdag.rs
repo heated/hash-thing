@@ -4,7 +4,7 @@
 //! requires a window and is measured via the in-app `render_gpu` perf
 //! metric (hash-thing-6x3) during interactive sessions.
 //!
-//! Run with: `cargo test --release --test bench_svdag -- --ignored --nocapture`
+//! Run with: `cargo test --profile perf --test bench_svdag -- --ignored --nocapture`
 //!
 //! ## Baseline (2026-04-12, M-series Mac, release build)
 //!
@@ -263,7 +263,7 @@ fn bench_svdag_step_deltas_1024() {
 ///
 /// Invoke out-of-band with an explicit longer timeout:
 /// ```text
-/// cargo test --release --test bench_svdag bench_svdag_step_deltas_2048 \
+/// cargo test --profile perf --test bench_svdag bench_svdag_step_deltas_2048 \
 ///     -- --ignored --nocapture
 /// ```
 /// (Shell-level timeout as high as your patience; agent sweeps should
@@ -285,7 +285,7 @@ fn bench_svdag_step_deltas_2048() {
 ///
 /// Invoke:
 /// ```text
-/// cargo test --release --test bench_svdag bench_svdag_step_deltas_4096 \
+/// cargo test --profile perf --test bench_svdag bench_svdag_step_deltas_4096 \
 ///     -- --ignored --nocapture
 /// ```
 ///

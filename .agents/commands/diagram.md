@@ -1,3 +1,8 @@
+---
+name: diagram
+description: "Based on the current conversation context, generate a mermaid diagram of whatever is being discussed. Do not ask clarifying questions — just"
+---
+
 Based on the current conversation context, generate a mermaid diagram of whatever is being discussed. Do not ask clarifying questions — just pick the most useful visualization and render it.
 
 1. Generate mermaid syntax based on context

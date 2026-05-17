@@ -17,7 +17,7 @@
 //!
 //! Run with:
 //! ```
-//! cargo test --release --test bench_depth_histogram -- --ignored --nocapture
+//! cargo test --profile perf --test bench_depth_histogram -- --ignored --nocapture
 //! ```
 //!
 //! ## Camera poses

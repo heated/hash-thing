@@ -11,15 +11,15 @@ use crate::terrain::field::lattice::LatticeField;
 use crate::terrain::field::TerrainBlendField;
 use crate::terrain::materials::{
     pack_clone_source, BlockRuleId, MaterialRegistry, AIR, CLONE_MATERIAL_ID, DIRT, FAN, FIRE,
-    FIREWORK, GRASS, LAVA, OIL, SAND, STONE, VINE, WATER,
+    FIREWORK, GRASS, LAVA, METAL, OIL, SAND, STONE, VINE, WATER,
 };
 use crate::terrain::{gen_region, GenStats, TerrainParams};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// hash-thing-ecmn (vqke.4.1): selectable base-case scheduling strategy.
 /// `Serial` is pre-ftuu DFS (no rayon). `RayonPerFanout` is ftuu's
 /// per-level-4-fanout 8-way batching. `RayonBfs` is ecmn's
-/// breadth-first whole-step level-3 batching.
+/// breadth-first whole-step leaf batching.
 ///
 /// Default = `RayonBfs` (hash-thing-ite4, 2026-04-29). Promoted from
 /// `RayonPerFanout` after the 5e3e churn bench showed BFS is 1.5× faster
@@ -212,6 +212,60 @@ impl ActiveMaterialStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuarantineAtlasLayout {
+    pub player_pos: [f64; 3],
+    pub player_yaw: f64,
+    pub player_pitch: f64,
+    pub floor_y: i64,
+    pub hazard_center: [i64; 3],
+    pub settlements: [[i64; 3]; 3],
+    pub counter_patterns: [[i64; 3]; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantineAtlasPattern {
+    Barrier,
+    CoolingTrench,
+    Firebreak,
+}
+
+impl QuarantineAtlasPattern {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Barrier => "barrier",
+            Self::CoolingTrench => "cooling trench",
+            Self::Firebreak => "firebreak",
+        }
+    }
+
+    pub fn from_digit(digit: u16) -> Option<Self> {
+        match digit {
+            1 => Some(Self::Barrier),
+            2 => Some(Self::CoolingTrench),
+            3 => Some(Self::Firebreak),
+            _ => None,
+        }
+    }
+}
+
+pub const QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP: &str = "QuarantineAtlasMixedContainmentV1";
+
+pub fn quarantine_atlas_mixed_containment_plan(
+    layout: QuarantineAtlasLayout,
+) -> [(QuarantineAtlasPattern, [i64; 3]); 6] {
+    let y = layout.floor_y + 1;
+    let z = layout.hazard_center[2];
+    [
+        (QuarantineAtlasPattern::Firebreak, [40, y, z]),
+        (QuarantineAtlasPattern::CoolingTrench, [50, y, z]),
+        (QuarantineAtlasPattern::Firebreak, [60, y, z]),
+        (QuarantineAtlasPattern::CoolingTrench, [70, y, z]),
+        (QuarantineAtlasPattern::Barrier, [80, y, z]),
+        (QuarantineAtlasPattern::Barrier, [90, y, z]),
+    ]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Box3 {
     min: [i64; 3],
@@ -297,6 +351,10 @@ pub struct World {
     /// node-local alignment so origin is no longer in the key (9ww).
     /// `schedule_phase` is `generation % materials.memo_period()` (iowh).
     pub(crate) hashlife_cache: FxHashMap<(NodeId, u64), NodeId>,
+    /// Diagnostic-only history for memo miss classification. Populated only
+    /// while `HASH_THING_MEMO_DIAG=1` is active.
+    pub(crate) memo_diag_seen_keys: FxHashSet<(NodeId, u64)>,
+    pub(crate) memo_diag_seen_nodes: FxHashSet<NodeId>,
     /// Memoization cache for the exponential Hashlife macro-stepper (6gf.7).
     /// Key: (NodeId, starting generation).
     pub(crate) hashlife_macro_cache: FxHashMap<(NodeId, u64), NodeId>,
@@ -405,6 +463,14 @@ pub struct HashlifeStats {
     /// shape so the `memo_summary` line gives a self-consistent
     /// breakdown.
     pub step_node_wall_ns: u64,
+    pub p3_store_ns: u64,
+    pub p3_store_calls: u64,
+    pub p3_cache_ns: u64,
+    pub p3_cache_calls: u64,
+    pub p3_slow_ns: u64,
+    pub p3_slow_calls: u64,
+    pub p3_reindex_ns: u64,
+    pub p3_reindex_calls: u64,
     /// hash-thing-vqke Phase 0: wall-clock nanoseconds spent in
     /// `maybe_compact()` after `step_node` completes. Most steps are
     /// 0 (the 2× growth threshold gates compaction); the spikes show
@@ -436,15 +502,18 @@ pub struct HashlifeStats {
     /// becomes a lower-bound on the micro-path's true alias rate
     /// (the macro path doesn't probe).
     pub cache_misses_phase_aliased: u64,
-    /// hash-thing-bjdl (vqke.2): probe for hypothesis 2 (cache eviction
-    /// too aggressive). Counts hashlife_cache entries dropped during
-    /// `remap_caches` because their NodeId or result NodeId was not
-    /// present in the post-compaction reachability set. Most steps
-    /// are 0 because `maybe_compact` is gated on the 2× growth
-    /// threshold. A high `dropped/(dropped+kept)` ratio shows the
-    /// cache is fragmenting against the reachability sweep — not
-    /// necessarily a sweep bug, but evidence that cache lifetime is
-    /// shorter than the reuse horizon. A low ratio rules H2 out.
+    /// hash-thing-bjdl/8qpp: probe for hypothesis 2 (cache eviction too
+    /// aggressive). Counts hashlife_cache entries dropped during
+    /// `remap_caches` because their key NodeId or result NodeId was not
+    /// present in the post-compaction reachability set. `compact_keeping`
+    /// preserves cache keys as extra roots, but it deliberately does not
+    /// preserve result values that are otherwise dead; value-side eviction
+    /// keeps GC from retaining unbounded cache-only result subgraphs.
+    /// Most steps are 0 because `maybe_compact` is gated on the 2× growth
+    /// threshold. A high `dropped/(dropped+kept)` ratio is a cache-lifetime
+    /// signal: reusable results are not surviving until their next use, or the
+    /// cache contains results outside the current live horizon. It is not by
+    /// itself evidence of a compaction/remap correctness bug.
     pub compact_entries_dropped: u64,
     /// hash-thing-bjdl (vqke.2): paired with `compact_entries_dropped`.
     /// Counts hashlife_cache entries that survived the most recent
@@ -452,13 +521,15 @@ pub struct HashlifeStats {
     /// macro / inert / all-inert caches are tangential to the memo_hit
     /// signal). Per-step.
     pub compact_entries_kept: u64,
-    /// hash-thing-ecmn (vqke.4.1): unique BFS task count per level.
-    /// Index = level - 3. Populated only by `step_root_bfs`; zero on
-    /// Serial / RayonPerFanout strategies. Used to diagnose whether
-    /// the BFS dispatcher is actually batching meaningful work or
-    /// bottoming out on short-circuits.
+    pub miss_cause_by_level: [MemoMissCauseStats; 32],
+    /// hash-thing-ecmn (vqke.4.1): unique BFS task count per frontier
+    /// level. Index 0 is the active leaf level: level 3 normally, level 4
+    /// when slowed block-rule worlds need the wider base-case halo.
+    /// Populated only by `step_root_bfs`; zero on Serial / RayonPerFanout
+    /// strategies. Used to diagnose whether the BFS dispatcher is actually
+    /// batching meaningful work or bottoming out on short-circuits.
     pub bfs_tasks_by_level: [u64; 32],
-    /// hash-thing-ecmn: unique level-3 base-case misses queued for
+    /// hash-thing-ecmn: unique active-leaf base-case misses queued for
     /// the BFS rayon batch in this step. = bfs_tasks_by_level[0].
     pub bfs_level3_unique_misses: u64,
     /// hash-thing-ecmn: number of step_grid_once_pure invocations the
@@ -466,16 +537,110 @@ pub struct HashlifeStats {
     /// `RAYON_BATCH_THRESHOLD`). Per-step counter; usually 0 or 1
     /// since whole-step BFS produces one large batch.
     pub bfs_batches_parallel: u64,
-    /// hash-thing-ecmn: number of BFS level-3 batches that fell back
-    /// to serial iter because batch size was below the rayon
-    /// threshold. Tracks "BFS infrastructure ran but didn't actually
-    /// parallelise" — non-zero means the threshold may be too high or
-    /// the workload is short-circuit-dominated.
+    /// hash-thing-ecmn/a08q.2: number of BFS paths that fell back to
+    /// serial work. This includes small leaf batches below the rayon
+    /// threshold and hard-frontier-cap fallbacks that route the whole
+    /// root through the serial recursive path before allocating a large
+    /// BFS frontier or leaf pending/output batch.
     pub bfs_batches_serial_fallback: u64,
-    /// hash-thing-ecmn: largest level-3 batch size observed in this
-    /// step. = bfs_level3_unique_misses on the dominant path; useful
-    /// once a chunked-wavefront fallback is added.
+    /// hash-thing-ecmn/a08q.2: largest BFS frontier size observed in
+    /// this step. = bfs_level3_unique_misses on the normal leaf-batch
+    /// path; can record a higher-level frontier size when the hard cap
+    /// trips before leaf descent.
     pub bfs_max_batch_len: u64,
+    /// hash-thing-q7e6: env-gated attribution for leaf base-case memo
+    /// misses. Populated only when `HASH_THING_MEMO_DIAG=1`; otherwise all
+    /// counters stay zero so production steps avoid per-rule bookkeeping.
+    pub rule_miss_diag: HashlifeRuleMissDiag,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HashlifeRuleMissDiag {
+    pub ca_noop_rule: u64,
+    pub ca_game_of_life_3d: u64,
+    pub ca_fan_driven_rule: u64,
+    pub ca_other_rule: u64,
+    pub ca_unchanged: u64,
+    pub block_gravity_rule: u64,
+    pub block_fluid_water_rule: u64,
+    pub block_fluid_lava_rule: u64,
+    pub block_fluid_acid_rule: u64,
+    pub block_fluid_oil_rule: u64,
+    pub block_identity_rule: u64,
+    pub block_other_rule: u64,
+    pub block_unchanged: u64,
+}
+
+impl HashlifeRuleMissDiag {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn record_ca(&mut self, rule_name: &str, unchanged: bool) {
+        match rule_name {
+            "NoopRule" => self.ca_noop_rule += 1,
+            "GameOfLife3D" => self.ca_game_of_life_3d += 1,
+            "FanDrivenRule" => self.ca_fan_driven_rule += 1,
+            _ => self.ca_other_rule += 1,
+        }
+        if unchanged {
+            self.ca_unchanged += 1;
+        }
+    }
+
+    pub fn record_block(&mut self, rule_name: &str, material: Option<u16>, unchanged: bool) {
+        match rule_name {
+            "GravityBlockRule" => self.block_gravity_rule += 1,
+            "FluidBlockRule" => match material {
+                Some(crate::terrain::materials::WATER_MATERIAL_ID) => {
+                    self.block_fluid_water_rule += 1
+                }
+                Some(crate::terrain::materials::LAVA_MATERIAL_ID) => {
+                    self.block_fluid_lava_rule += 1
+                }
+                Some(crate::terrain::materials::ACID_MATERIAL_ID) => {
+                    self.block_fluid_acid_rule += 1
+                }
+                Some(crate::terrain::materials::OIL_MATERIAL_ID) => self.block_fluid_oil_rule += 1,
+                _ => self.block_other_rule += 1,
+            },
+            "IdentityBlockRule" => self.block_identity_rule += 1,
+            _ => self.block_other_rule += 1,
+        }
+        if unchanged {
+            self.block_unchanged += 1;
+        }
+    }
+
+    pub fn accumulate(&mut self, step: &Self) {
+        self.ca_noop_rule += step.ca_noop_rule;
+        self.ca_game_of_life_3d += step.ca_game_of_life_3d;
+        self.ca_fan_driven_rule += step.ca_fan_driven_rule;
+        self.ca_other_rule += step.ca_other_rule;
+        self.ca_unchanged += step.ca_unchanged;
+        self.block_gravity_rule += step.block_gravity_rule;
+        self.block_fluid_water_rule += step.block_fluid_water_rule;
+        self.block_fluid_lava_rule += step.block_fluid_lava_rule;
+        self.block_fluid_acid_rule += step.block_fluid_acid_rule;
+        self.block_fluid_oil_rule += step.block_fluid_oil_rule;
+        self.block_identity_rule += step.block_identity_rule;
+        self.block_other_rule += step.block_other_rule;
+        self.block_unchanged += step.block_unchanged;
+    }
+}
+
+/// Work-elision summary for the most recent Hashlife step.
+///
+/// This mirrors the `memo_elision=` token in [`World::memo_summary`]:
+/// padded active-leaf nodes divided by active-leaf misses from the latest
+/// step. It is the aqq4 thesis metric, distinct from cache hit ratios such
+/// as `(hits + misses) / misses`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorkElisionStats {
+    pub leaf_level: usize,
+    pub leaf_nodes_in_world: u64,
+    pub leaf_misses: u64,
+    pub factor_x: f64,
 }
 
 impl HashlifeStats {
@@ -492,6 +657,14 @@ impl HashlifeStats {
         // wall-clock decompositions. Useful for long-run averages
         // (the per-step values fluctuate with churn / compact cadence).
         self.step_node_wall_ns += step.step_node_wall_ns;
+        self.p3_store_ns += step.p3_store_ns;
+        self.p3_store_calls += step.p3_store_calls;
+        self.p3_cache_ns += step.p3_cache_ns;
+        self.p3_cache_calls += step.p3_cache_calls;
+        self.p3_slow_ns += step.p3_slow_ns;
+        self.p3_slow_calls += step.p3_slow_calls;
+        self.p3_reindex_ns += step.p3_reindex_ns;
+        self.p3_reindex_calls += step.p3_reindex_calls;
         self.compact_ns += step.compact_ns;
         // hash-thing-bjdl (vqke.2): lifetime accumulators for the
         // memo-hit-rate diagnostic counters. Same per-step → lifetime
@@ -501,6 +674,14 @@ impl HashlifeStats {
         self.cache_misses_phase_aliased += step.cache_misses_phase_aliased;
         self.compact_entries_dropped += step.compact_entries_dropped;
         self.compact_entries_kept += step.compact_entries_kept;
+        for (dst, src) in self
+            .miss_cause_by_level
+            .iter_mut()
+            .zip(step.miss_cause_by_level.iter())
+        {
+            dst.accumulate(src);
+        }
+        self.rule_miss_diag.accumulate(&step.rule_miss_diag);
         // hash-thing-ecmn: BFS observability counters.
         self.bfs_level3_unique_misses += step.bfs_level3_unique_misses;
         self.bfs_batches_parallel += step.bfs_batches_parallel;
@@ -523,6 +704,33 @@ impl HashlifeStats {
         {
             *dst += *src;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoMissCauseStats {
+    pub first_seen_or_no_surviving_key: u64,
+    pub first_seen_key: u64,
+    pub seen_key_missing_entry: u64,
+    pub seen_node_new_phase: u64,
+    pub parity_aliased: u64,
+    pub slow_divisor_phase_aliased: u64,
+    pub residual_unknown: u64,
+    pub compact_entries_kept: u64,
+    pub compact_entries_dropped: u64,
+}
+
+impl MemoMissCauseStats {
+    pub fn accumulate(&mut self, step: &MemoMissCauseStats) {
+        self.first_seen_or_no_surviving_key += step.first_seen_or_no_surviving_key;
+        self.first_seen_key += step.first_seen_key;
+        self.seen_key_missing_entry += step.seen_key_missing_entry;
+        self.seen_node_new_phase += step.seen_node_new_phase;
+        self.parity_aliased += step.parity_aliased;
+        self.slow_divisor_phase_aliased += step.slow_divisor_phase_aliased;
+        self.residual_unknown += step.residual_unknown;
+        self.compact_entries_kept += step.compact_entries_kept;
+        self.compact_entries_dropped += step.compact_entries_dropped;
     }
 }
 
@@ -632,6 +840,8 @@ impl World {
             materials,
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
+            memo_diag_seen_keys: FxHashSet::default(),
+            memo_diag_seen_nodes: FxHashSet::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
             hashlife_stats_total: HashlifeStats::default(),
@@ -664,6 +874,8 @@ impl World {
             materials: MaterialRegistry::new(),
             terrain_params: None,
             hashlife_cache: FxHashMap::default(),
+            memo_diag_seen_keys: FxHashSet::default(),
+            memo_diag_seen_nodes: FxHashSet::default(),
             hashlife_macro_cache: FxHashMap::default(),
             hashlife_stats: HashlifeStats::default(),
             hashlife_stats_total: HashlifeStats::default(),
@@ -697,6 +909,10 @@ impl World {
     /// `BaseCaseStrategy::RayonPerFanout`, `false` to `Serial`. Kept
     /// so existing tests / benches that toggle this knob keep
     /// compiling. Prefer [`Self::set_base_case_strategy`] in new code.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use set_base_case_strategy(BaseCaseStrategy) so callers can select Serial, RayonPerFanout, or RayonBfs explicitly"
+    )]
     pub fn set_base_case_use_rayon(&mut self, enabled: bool) {
         self.base_case_strategy = if enabled {
             BaseCaseStrategy::RayonPerFanout
@@ -736,6 +952,8 @@ impl World {
     /// cause of the dxi4.2 audit finding.
     pub fn invalidate_material_caches(&mut self) {
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -1255,235 +1473,28 @@ impl World {
     ///
     /// **Boundary conditions:** Both CaRule and BlockRule use absorbing boundaries
     /// (out-of-bounds = empty), matching hashlife's infinite-world semantics.
-    /// BlockRule additionally skips partial blocks at world edges (clipping) —
-    /// Margolus blocks must not straddle the world boundary.
+    /// Odd Margolus partitions include low-edge blocks that start at -1 and
+    /// high-edge blocks that end at `side`, so both world edges see the same
+    /// OOB-empty behavior as the padded recursive path.
     pub fn step(&mut self) {
         let side = self.side();
         let grid = self.flatten();
-        let mut next = vec![0 as CellState; side * side * side];
-        let divisor_by_material = self.materials.tick_divisor_flags();
-        let generation = self.generation;
-
-        // Phase 1: cell-wise CaRule pass (Moore neighborhood). Per-material
-        // tick_divisor gate mirrors the hashlife path (iowh) so the brute and
-        // recursive paths produce identical output at every generation.
-        for z in 0..side {
-            for y in 0..side {
-                for x in 0..side {
-                    let idx = x + y * side + z * side * side;
-                    let raw = grid[idx];
-                    let center = Cell::from_raw(raw);
-                    let mat = center.material() as usize;
-                    let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
-                    if divisor > 1 && !generation.is_multiple_of(divisor) {
-                        next[idx] = raw;
-                        continue;
-                    }
-                    let neighbors = get_neighbors(&grid, side, x, y, z);
-                    let rule = self.materials.rule_for_cell(center).unwrap_or_else(|| {
-                        panic!("missing CaRule for material {}", center.material())
-                    });
-                    next[idx] = rule.step_cell(center, &neighbors).raw();
-                }
-            }
-        }
-
-        // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
-        // Static internal gaps close in 1-2 ticks via the alternating
-        // partition offset (qy4g epic decision 2026-04-26, option G).
-        // Gaps within free-falling columns are co-moving with the column
-        // and appear as a sustained checkerboard until the leading edge
-        // compacts against a solid surface — see SPEC.md for the in-flight
-        // visible-artifact tradeoff and fallbacks A/F. No post-pass
-        // gap-fill runs in production.
-        self.step_blocks(&mut next, side);
-
+        let next = brute_step_grid(&grid, side, &self.materials, self.generation);
         self.commit_step(&next, side);
     }
 
-    /// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
+    /// Brute-force step on a flat whole-world grid; returns the new grid.
+    /// Thin wrapper around the module-level [`brute_step_grid`] free
+    /// function, kept `pub` so the chunk-array baseline integration bench
+    /// (`tests/bench_chunk_array_baseline.rs`) can access it without
+    /// pulling `pub(crate)` items.
     ///
-    /// Partition offset alternates per generation: even → (0,0,0), odd → (1,1,1).
-    /// Blocks at edges use absorbing boundary conditions: out-of-bounds cells
-    /// are treated as empty, matching hashlife's pad-with-empty semantics.
-    ///
-    /// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
-    /// distinct rule exists, run it. If zero or multiple: skip (identity).
-    ///
-    /// Under per-material tick_divisors (iowh): when any divisor > 1, iterate
-    /// both offsets and gate each block on its rule's `(generation / divisor) & 1`
-    /// Margolus offset + firing cadence, matching the hashlife path.
-    fn step_blocks(&self, grid: &mut [CellState], side: usize) {
-        let block_rule_divisors = self.materials.block_rule_tick_divisors();
-        let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1);
-
-        if all_divisors_one {
-            let offset = (self.generation & 1) as usize;
-            let mut bz = offset;
-            while bz < side {
-                let mut by = offset;
-                while by < side {
-                    let mut bx = offset;
-                    while bx < side {
-                        self.apply_block(grid, side, bx, by, bz, None, 0);
-                        bx += 2;
-                    }
-                    by += 2;
-                }
-                bz += 2;
-            }
-            return;
-        }
-
-        for pass_offset in 0..2usize {
-            let mut bz = pass_offset;
-            while bz < side {
-                let mut by = pass_offset;
-                while by < side {
-                    let mut bx = pass_offset;
-                    while bx < side {
-                        self.apply_block(
-                            grid,
-                            side,
-                            bx,
-                            by,
-                            bz,
-                            Some(block_rule_divisors),
-                            pass_offset,
-                        );
-                        bx += 2;
-                    }
-                    by += 2;
-                }
-                bz += 2;
-            }
-        }
-    }
-
-    /// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
-    ///
-    /// Cells outside the grid boundary are treated as empty (absorbing BC).
-    ///
-    /// When `block_rule_divisors` is `Some`, gate the rule on its slowed-down
-    /// schedule (iowh): apply only when `generation % divisor == 0` AND the
-    /// rule's offset `(generation / divisor) & 1` equals `pass_offset`. The
-    /// fast path passes `None` and relies on the caller iterating one offset.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_block(
-        &self,
-        grid: &mut [CellState],
-        side: usize,
-        bx: usize,
-        by: usize,
-        bz: usize,
-        block_rule_divisors: Option<&[u16]>,
-        pass_offset: usize,
-    ) {
-        // Read the 8 cells. OOB → empty (absorbing boundary).
-        let mut block = [Cell::EMPTY; 8];
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let x = bx + dx;
-                    let y = by + dy;
-                    let z = bz + dz;
-                    if x < side && y < side && z < side {
-                        let idx = x + y * side + z * side * side;
-                        block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
-                    }
-                }
-            }
-        }
-
-        // Skip all-empty blocks (optimization).
-        if block.iter().all(|c| c.is_empty()) {
-            return;
-        }
-
-        // Dispatch: find the unique block rule across all cells.
-        let rule_id = match self.unique_block_rule(&block) {
-            Some(id) => id,
-            None => return, // zero or multiple distinct rules → skip
-        };
-
-        if let Some(divisors) = block_rule_divisors {
-            let divisor = divisors.get(rule_id.0).copied().unwrap_or(1).max(1) as u64;
-            if !self.generation.is_multiple_of(divisor) {
-                return;
-            }
-            let rule_offset = ((self.generation / divisor) & 1) as usize;
-            if rule_offset != pass_offset {
-                return;
-            }
-        }
-
-        let movable: [bool; 8] = std::array::from_fn(|i| {
-            let c = block[i];
-            c.is_empty() || self.materials.block_rule_id_for_cell(c).is_some()
-        });
-
-        let rule = self.materials.block_rule(rule_id);
-        let result = rule.step_block(&block, &movable);
-
-        // Mass conservation assertion: output must be a permutation of input.
-        debug_assert!(
-            {
-                let mut inp: Vec<u16> = block.iter().map(|c| c.raw()).collect();
-                let mut out: Vec<u16> = result.iter().map(|c| c.raw()).collect();
-                inp.sort();
-                out.sort();
-                inp == out
-            },
-            "block rule violated mass conservation at ({bx}, {by}, {bz})"
-        );
-
-        // Contract assertion: immovable cells must be left in place by the
-        // rule. Without this, a buggy rule that swaps an immovable cell into
-        // a movable slot would silently delete the immovable cell's value
-        // (the write-back filter only writes movable positions). Assert
-        // here so the failure is loud, not a slow water leak.
-        debug_assert!(
-            (0..8).all(|i| movable[i] || result[i] == block[i]),
-            "block rule moved an immovable cell at ({bx}, {by}, {bz})"
-        );
-
-        // Write back. The rule is contracted to leave immovable cells fixed,
-        // so writing the rule output is safe. The `movable` filter is a
-        // belt-and-suspenders guard against a rule that violates the contract.
-        // OOB positions are silently skipped (absorbing boundary).
-        for dz in 0..2 {
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let x = bx + dx;
-                    let y = by + dy;
-                    let z = bz + dz;
-                    if x >= side || y >= side || z >= side {
-                        continue;
-                    }
-                    let i = block_index(dx, dy, dz);
-                    let idx = x + y * side + z * side * side;
-                    if movable[i] {
-                        grid[idx] = result[i].raw();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Find the unique BlockRuleId across all non-empty cells in a block.
-    /// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
-    pub(crate) fn unique_block_rule(&self, block: &[Cell; 8]) -> Option<BlockRuleId> {
-        let mut found: Option<BlockRuleId> = None;
-        for cell in block {
-            if let Some(id) = self.materials.block_rule_id_for_cell(*cell) {
-                match found {
-                    None => found = Some(id),
-                    Some(existing) if existing == id => {}
-                    Some(_) => return None, // multiple distinct rules → skip
-                }
-            }
-        }
-        found
+    /// **Not to be confused with** the leaf-level
+    /// `step_grid_once_pure` in `src/sim/hashlife.rs`, which evaluates a
+    /// single 2^L hashlife leaf.
+    #[doc(hidden)]
+    pub fn step_grid(&self, grid: &[CellState]) -> Vec<CellState> {
+        brute_step_grid(grid, self.side(), &self.materials, self.generation)
     }
 
     /// Place a random seed pattern in the center of the world.
@@ -1863,6 +1874,168 @@ impl World {
         }
     }
 
+    pub fn seed_quarantine_atlas_demo(&mut self) -> QuarantineAtlasLayout {
+        let side = self.side() as i64;
+        assert!(side >= 64, "Quarantine Atlas demo requires side >= 64");
+
+        self.store = NodeStore::new();
+        self.root = self.store.empty(self.level);
+        self.generation = 0;
+        self.terrain_params = None;
+        self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
+        self.hashlife_macro_cache.clear();
+        self.hashlife_inert_cache.clear();
+        self.hashlife_all_inert_cache.clear();
+        self.hashlife_slow_divisor_cache.clear();
+        self.clone_sources.clear();
+        self.block_rule_present = None;
+
+        let margin = (side / 12).max(6);
+        let floor_y = (side / 5).max(10);
+        let center = side / 2;
+        let floor = Box3::new(
+            [margin, floor_y, margin],
+            [side - margin - 1, floor_y, side - margin - 1],
+        );
+        self.fill_box(floor, STONE);
+
+        let spawn_z = center - (side / 5).max(10);
+        let spawn_pad = Box3::new(
+            [center - 3, floor_y + 1, spawn_z - 3],
+            [center + 3, floor_y + 1, spawn_z + 3],
+        );
+        self.fill_box(spawn_pad, METAL);
+
+        let hazard_center = [margin + side / 8, floor_y + 1, center];
+        let settlements = [
+            [side - margin - side / 7, floor_y + 1, margin + side / 6],
+            [side - margin - side / 8, floor_y + 1, center],
+            [
+                side - margin - side / 7,
+                floor_y + 1,
+                side - margin - side / 6,
+            ],
+        ];
+        self.fill_box(
+            Box3::new(
+                [hazard_center[0] - 2, floor_y + 1, hazard_center[2] - 7],
+                [hazard_center[0] + 2, floor_y + 2, hazard_center[2] + 7],
+            ),
+            LAVA,
+        );
+        self.fill_box(
+            Box3::new(
+                [hazard_center[0] + 3, floor_y + 1, hazard_center[2] - 5],
+                [hazard_center[0] + 6, floor_y + 1, hazard_center[2] + 5],
+            ),
+            FIRE,
+        );
+
+        let lane_x0 = hazard_center[0] + 7;
+        let lane_x1 = settlements[1][0] - 5;
+        self.fill_box(
+            Box3::new(
+                [lane_x0, floor_y + 1, center - 2],
+                [lane_x1, floor_y + 1, center + 2],
+            ),
+            VINE,
+        );
+        self.fill_box(
+            Box3::new(
+                [lane_x0, floor_y + 1, center - 4],
+                [lane_x1, floor_y + 1, center - 3],
+            ),
+            GRASS,
+        );
+        self.fill_box(
+            Box3::new(
+                [lane_x0, floor_y + 1, center + 3],
+                [lane_x1, floor_y + 1, center + 4],
+            ),
+            GRASS,
+        );
+        for x in (lane_x0 + 4..lane_x1).step_by(10) {
+            self.fill_box(
+                Box3::new(
+                    [x, floor_y + 1, center - 4],
+                    [x + 2, floor_y + 1, center + 4],
+                ),
+                VINE,
+            );
+        }
+
+        for settlement in settlements {
+            self.seed_quarantine_settlement(settlement);
+        }
+
+        let counter_patterns = [
+            [center - side / 9, floor_y + 1, center - side / 5],
+            [center, floor_y + 1, center + side / 5],
+            [center + side / 9, floor_y + 1, center],
+        ];
+        self.apply_quarantine_atlas_pattern(QuarantineAtlasPattern::Barrier, counter_patterns[0]);
+        self.apply_quarantine_atlas_pattern(
+            QuarantineAtlasPattern::CoolingTrench,
+            counter_patterns[1],
+        );
+        self.apply_quarantine_atlas_pattern(QuarantineAtlasPattern::Firebreak, counter_patterns[2]);
+
+        QuarantineAtlasLayout {
+            player_pos: [
+                center as f64 + 0.5,
+                floor_y as f64 + 2.0,
+                spawn_z as f64 + 0.5,
+            ],
+            player_yaw: std::f64::consts::FRAC_PI_2,
+            player_pitch: -0.12,
+            floor_y,
+            hazard_center,
+            settlements,
+            counter_patterns,
+        }
+    }
+
+    fn seed_quarantine_settlement(&mut self, center: [i64; 3]) {
+        let [cx, cy, cz] = center;
+        self.fill_box(
+            Box3::new([cx - 3, cy, cz - 3], [cx + 3, cy + 2, cz + 3]),
+            DIRT,
+        );
+        self.fill_box(
+            Box3::new([cx - 2, cy + 1, cz - 2], [cx + 2, cy + 3, cz + 2]),
+            GRASS,
+        );
+        self.fill_box(
+            Box3::new([cx - 1, cy + 4, cz - 1], [cx + 1, cy + 4, cz + 1]),
+            WATER,
+        );
+    }
+
+    pub fn apply_quarantine_atlas_pattern(
+        &mut self,
+        pattern: QuarantineAtlasPattern,
+        center: [i64; 3],
+    ) {
+        let [cx, cy, cz] = center;
+        match pattern {
+            QuarantineAtlasPattern::Barrier => {
+                self.fill_box_clipped(Box3::new([cx - 4, cy, cz], [cx + 4, cy + 3, cz]), STONE);
+                self.fill_box_clipped(Box3::new([cx, cy + 1, cz - 1], [cx, cy + 1, cz + 1]), METAL);
+            }
+            QuarantineAtlasPattern::CoolingTrench => {
+                self.fill_box_clipped(Box3::new([cx - 4, cy, cz - 1], [cx + 4, cy, cz + 1]), WATER);
+                self.fill_box_clipped(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz - 2]), STONE);
+                self.fill_box_clipped(Box3::new([cx - 5, cy, cz + 2], [cx + 5, cy, cz + 2]), STONE);
+            }
+            QuarantineAtlasPattern::Firebreak => {
+                self.fill_box_clipped(Box3::new([cx - 5, cy, cz - 2], [cx + 5, cy, cz + 2]), SAND);
+                self.fill_box_clipped(Box3::new([cx - 4, cy + 1, cz], [cx + 4, cy + 1, cz]), AIR);
+            }
+        }
+    }
+
     /// Add water and sand to an existing terrain — water pools on a
     /// hilltop (so it cascades down) and sand dunes on one side.
     /// Call after `seed_terrain`.
@@ -1917,6 +2090,8 @@ impl World {
     pub fn seed_lattice_megastructure(&mut self) {
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -1956,6 +2131,8 @@ impl World {
     pub fn seed_gyroid_megastructure(&mut self) -> GenStats {
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -1984,18 +2161,37 @@ impl World {
         }
     }
 
-    #[cfg(test)]
-    fn box_contains_material(&self, volume: Box3, state: CellState) -> bool {
+    fn fill_box_clipped(&mut self, volume: Box3, state: CellState) {
+        let region = self.region();
         for z in volume.min[2]..=volume.max[2] {
             for y in volume.min[1]..=volume.max[1] {
                 for x in volume.min[0]..=volume.max[0] {
-                    if self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) == state {
-                        return true;
+                    if region.contains(x, y, z) {
+                        self.set(WorldCoord(x), WorldCoord(y), WorldCoord(z), state);
                     }
                 }
             }
         }
-        false
+    }
+
+    #[cfg(test)]
+    fn box_contains_material(&self, volume: Box3, state: CellState) -> bool {
+        self.box_count_material(volume, state) > 0
+    }
+
+    #[cfg(test)]
+    fn box_count_material(&self, volume: Box3, state: CellState) -> usize {
+        let mut count = 0;
+        for z in volume.min[2]..=volume.max[2] {
+            for y in volume.min[1]..=volume.max[1] {
+                for x in volume.min[0]..=volume.max[0] {
+                    if self.get(WorldCoord(x), WorldCoord(y), WorldCoord(z)) == state {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
 
     fn fill_floor(&mut self, volume: Box3, state: CellState) {
@@ -2554,6 +2750,10 @@ impl World {
         self.hashlife_macro_cache.len()
     }
 
+    pub fn spatial_memo_entries(&self) -> usize {
+        self.hashlife_cache.len()
+    }
+
     /// Approximate byte footprint of `hashlife_macro_cache` (entries ×
     /// `MACRO_CACHE_BYTES_PER_ENTRY`). Closes the perf paper §5 band that
     /// had a 9 MB floor / 105 MB ceiling projection at 4096³ with no
@@ -2590,6 +2790,38 @@ impl World {
     /// `memo_mac` / `memo_mac_bytes` stay at 0 on single-step sessions
     /// (only `step_recursive_pow2` populates the macro cache).
     ///
+    pub fn work_elision_stats(&self) -> WorkElisionStats {
+        let leaf_level = self.active_hashlife_leaf_level();
+        let leaf_cells = 1u64 << (3 * leaf_level);
+        let padded_level = self.level + 1;
+        let leaf_nodes_in_world = (1u64 << (3 * padded_level))
+            .saturating_div(leaf_cells)
+            .max(1);
+        let leaf_miss_idx = leaf_level - 3;
+        let raw_leaf_misses = self.hashlife_stats.misses_by_level[leaf_miss_idx];
+        let factor_x = leaf_nodes_in_world as f64 / raw_leaf_misses.max(1) as f64;
+
+        WorkElisionStats {
+            leaf_level,
+            leaf_nodes_in_world,
+            leaf_misses: raw_leaf_misses,
+            factor_x,
+        }
+    }
+
+    fn active_hashlife_leaf_level(&self) -> usize {
+        if self
+            .materials
+            .block_rule_tick_divisors()
+            .iter()
+            .any(|&divisor| divisor > 1)
+        {
+            4
+        } else {
+            3
+        }
+    }
+
     /// `p1` / `p2` are the last step's per-phase wall times inside
     /// `step_grid_once` (Phase 1 = per-cell CaRule, Phase 2 = per-block
     /// BlockRule / Margolus). Reported per-step (not lifetime) so the
@@ -2607,16 +2839,27 @@ impl World {
         let last_step = &self.hashlife_stats;
         let p1_ms = last_step.phase1_ns as f64 / 1_000_000.0;
         let p2_ms = last_step.phase2_ns as f64 / 1_000_000.0;
-        // hash-thing-vqke Phase 0: descent-and-intern overhead is
-        // step_node wall minus the per-cell + per-block leaf wall.
-        // saturating_sub keeps the number sane on the rare frame
-        // where leaf timers overlap with descent timers slightly
-        // (e.g. inner-loop measurement quantization).
+        // hash-thing-vqke Phase 0: descent-and-intern overhead is usually
+        // step_node wall minus per-cell + per-block leaf wall. Parallel base
+        // cases sum worker CPU timers, so p1+p2 may exceed wall; keep p3 at
+        // least as large as its directly measured subphase timers so the
+        // public breakdown remains self-consistent.
         let descent_ns = last_step
             .step_node_wall_ns
             .saturating_sub(last_step.phase1_ns)
             .saturating_sub(last_step.phase2_ns);
-        let p3_ms = descent_ns as f64 / 1_000_000.0;
+        let p3_store_ms = last_step.p3_store_ns as f64 / 1_000_000.0;
+        let p3_cache_ms = last_step.p3_cache_ns as f64 / 1_000_000.0;
+        let p3_slow_ms = last_step.p3_slow_ns as f64 / 1_000_000.0;
+        let p3_reindex_ms = last_step.p3_reindex_ns as f64 / 1_000_000.0;
+        let p3_known_ns = last_step
+            .p3_store_ns
+            .saturating_add(last_step.p3_cache_ns)
+            .saturating_add(last_step.p3_slow_ns)
+            .saturating_add(last_step.p3_reindex_ns);
+        let p3_ns = descent_ns.max(p3_known_ns);
+        let p3_ms = p3_ns as f64 / 1_000_000.0;
+        let p3_residual_ms = p3_ns.saturating_sub(p3_known_ns) as f64 / 1_000_000.0;
         let p4_ms = last_step.compact_ns as f64 / 1_000_000.0;
         // hash-thing-bjdl (vqke.2): diagnostic ratios for the
         // memo_hit-rate hypotheses. Bounded-width ratio tokens (each
@@ -2657,8 +2900,11 @@ impl World {
         // hash-thing-ecmn: BFS observability tokens. Per-step values
         // come from the most-recent-step `hashlife_stats`, not the
         // lifetime accumulator, so they reflect the active step's BFS
-        // shape. `bfs_l3=0 bfs_par=0` on Serial / RayonPerFanout
-        // strategies — those paths never set the counters.
+        // shape. `bfs_l3` is a legacy label; slowed block-rule worlds use
+        // level-4 leaves under the same counter. `bfs_l3=0 bfs_par=0` on
+        // Serial / RayonPerFanout strategies — those paths never set the
+        // counters. `bfs_serfb` includes both small-batch serial leaf
+        // evaluation and hard-frontier-cap fallback for the whole root.
         let bfs_l3 = last_step.bfs_level3_unique_misses;
         let bfs_par = last_step.bfs_batches_parallel;
         let bfs_serial_fb = last_step.bfs_batches_serial_fallback;
@@ -2670,23 +2916,23 @@ impl World {
         // short-circuits + the multiplicative effect of upper-level
         // hits eliding many base cases).
         //
-        // elision = (level-3 nodes in the world) / max(L3 misses last step, 1)
-        //         = (side / 8)^3 / L3_misses
+        // elision = (leaf nodes in the world) / max(leaf misses last step, 1)
+        //         = (side / leaf_side)^3 / leaf_misses
         // A naive every-cell stepper would do (side/8)^3 base-case
-        // evaluations per step. Hashlife does only L3_misses. The ratio
+        // evaluations per step in the normal level-3 leaf regime, or
+        // (side/16)^3 when slowed block-rule worlds need level-4 leaves.
+        // Hashlife does only leaf_misses. The ratio
         // is the multiplier hashlife is buying us. >>1 means the engine
         // is paying off; ~1 means it's degenerating to brute force.
-        // Floor on `max(_, 1)` so a fully-cached step (L3 misses = 0)
+        // Floor on `max(_, 1)` so a fully-cached step (leaf misses = 0)
         // doesn't divide by zero — that's the perfect-hit case where
         // the elision factor is effectively unbounded.
-        let l3_nodes_in_world = (1u64 << (3 * self.level)).saturating_div(512);
-        let l3_misses_last = last_step.misses_by_level[0].max(1);
-        let elision_factor = l3_nodes_in_world as f64 / l3_misses_last as f64;
+        let work_elision = self.work_elision_stats();
         format!(
-            "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
+            "memo_hit={:.3} memo_churn={:+.3} memo_elision={:.1}x memo_tbl={} memo_mac={} memo_mac_bytes={} memo_period={} memo_phase_aliased={:.3} memo_compact_drop={:.3} memo_skip_empty={:.3} memo_skip_fixed={:.3} p1={:.2}ms p2={:.2}ms p3={:.2}ms p3a_store={:.2}/{} p3b_cache={:.2}/{} p3c_slow={:.2}/{} p3d_reindex={:.2}/{} p3e_resid={:.2}ms p4={:.2}ms bfs_l3={} bfs_par={} bfs_serfb={} bfs_max={}",
             hit_rate,
             churn,
-            elision_factor,
+            work_elision.factor_x,
             self.hashlife_cache.len(),
             self.hashlife_macro_cache.len(),
             self.macro_cache_bytes_est(),
@@ -2698,11 +2944,40 @@ impl World {
             p1_ms,
             p2_ms,
             p3_ms,
+            p3_store_ms,
+            last_step.p3_store_calls,
+            p3_cache_ms,
+            last_step.p3_cache_calls,
+            p3_slow_ms,
+            last_step.p3_slow_calls,
+            p3_reindex_ms,
+            last_step.p3_reindex_calls,
+            p3_residual_ms,
             p4_ms,
             bfs_l3,
             bfs_par,
             bfs_serial_fb,
             bfs_max,
+        )
+    }
+
+    pub fn hashlife_rule_miss_summary(&self) -> String {
+        let d = self.hashlife_stats_total.rule_miss_diag;
+        format!(
+            "ca_noop={} ca_gol={} ca_fan={} ca_other={} ca_unchanged={} block_gravity={} block_fluid_water={} block_fluid_lava={} block_fluid_acid={} block_fluid_oil={} block_identity={} block_other={} block_unchanged={}",
+            d.ca_noop_rule,
+            d.ca_game_of_life_3d,
+            d.ca_fan_driven_rule,
+            d.ca_other_rule,
+            d.ca_unchanged,
+            d.block_gravity_rule,
+            d.block_fluid_water_rule,
+            d.block_fluid_lava_rule,
+            d.block_fluid_acid_rule,
+            d.block_fluid_oil_rule,
+            d.block_identity_rule,
+            d.block_other_rule,
+            d.block_unchanged,
         )
     }
 
@@ -2870,6 +3145,8 @@ impl World {
             None => remap,
         });
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -2898,6 +3175,8 @@ impl World {
         params.validate()?;
         self.store = NodeStore::new();
         self.hashlife_cache.clear();
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
         self.hashlife_macro_cache.clear();
         self.hashlife_inert_cache.clear();
         self.hashlife_all_inert_cache.clear();
@@ -2932,6 +3211,274 @@ impl World {
         self.block_rule_present = None;
         Ok(stats)
     }
+}
+
+/// Brute-force step on a flat grid (CA pass + Margolus block pass).
+/// Module-level free function so both `World::step` and
+/// `ChunkArrayWorld::step` (src/sim/chunk_array.rs) call the same
+/// implementation — single source of truth for brute-force semantics
+/// across the hashlife and chunk-array engines.
+///
+/// Reads `generation` once at entry; callers that iterate must advance
+/// the generation themselves between calls (`World::step` does this via
+/// `commit_step`; `ChunkArrayWorld::step` increments its own counter
+/// after the call returns).
+pub(crate) fn brute_step_grid(
+    grid: &[CellState],
+    side: usize,
+    materials: &MaterialRegistry,
+    generation: u64,
+) -> Vec<CellState> {
+    assert_eq!(
+        grid.len(),
+        side * side * side,
+        "step_grid requires a whole-world flat grid"
+    );
+    let mut next = vec![0 as CellState; side * side * side];
+    let divisor_by_material = materials.tick_divisor_flags();
+
+    // Phase 1: cell-wise CaRule pass (Moore neighborhood). Per-material
+    // tick_divisor gate mirrors the hashlife path (iowh) so the brute and
+    // recursive paths produce identical output at every generation.
+    for z in 0..side {
+        for y in 0..side {
+            for x in 0..side {
+                let idx = x + y * side + z * side * side;
+                let raw = grid[idx];
+                let center = Cell::from_raw(raw);
+                let mat = center.material() as usize;
+                let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
+                if divisor > 1 && !generation.is_multiple_of(divisor) {
+                    next[idx] = raw;
+                    continue;
+                }
+                let neighbors = get_neighbors(grid, side, x, y, z);
+                let rule = materials
+                    .rule_for_cell(center)
+                    .unwrap_or_else(|| panic!("missing CaRule for material {}", center.material()));
+                next[idx] = rule.step_cell(center, &neighbors).raw();
+            }
+        }
+    }
+
+    // Phase 2: block-wise BlockRule pass (Margolus 2x2x2).
+    // Static internal gaps close in 1-2 ticks via the alternating
+    // partition offset (qy4g epic decision 2026-04-26, option G).
+    // Gaps within free-falling columns are co-moving with the column
+    // and appear as a sustained checkerboard until the leading edge
+    // compacts against a solid surface — see SPEC.md for the in-flight
+    // visible-artifact tradeoff and fallbacks A/F. No post-pass
+    // gap-fill runs in production.
+    brute_step_blocks(&mut next, side, materials, generation);
+    next
+}
+
+/// Apply block rules to non-overlapping 2x2x2 partitions of the grid.
+///
+/// Partition offset alternates per generation: even origins are
+/// 0,2,4,...; odd origins are -1,1,3,... so both low and high edges get
+/// absorbing boundary blocks. Out-of-bounds cells are treated as empty,
+/// matching hashlife's pad-with-empty semantics.
+///
+/// Dispatch: collect distinct BlockRuleIds across the 8 cells. If exactly one
+/// distinct rule exists, run it. If zero or multiple: skip (identity).
+///
+/// Under per-material tick_divisors (iowh): when any divisor > 1, iterate
+/// both offsets and gate each block on its rule's `(generation / divisor) & 1`
+/// Margolus offset + firing cadence, matching the hashlife path.
+fn brute_step_blocks(
+    grid: &mut [CellState],
+    side: usize,
+    materials: &MaterialRegistry,
+    generation: u64,
+) {
+    let block_rule_divisors = materials.block_rule_tick_divisors();
+    let all_divisors_one = block_rule_divisors.iter().all(|&d| d == 1);
+
+    if all_divisors_one {
+        let offset = block_origin_start((generation & 1) as usize);
+        let mut bz = offset;
+        while bz < side as isize {
+            let mut by = offset;
+            while by < side as isize {
+                let mut bx = offset;
+                while bx < side as isize {
+                    brute_apply_block(grid, side, bx, by, bz, None, 0, materials, generation);
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+        return;
+    }
+
+    for pass_offset in 0..2usize {
+        let origin_start = block_origin_start(pass_offset);
+        let mut bz = origin_start;
+        while bz < side as isize {
+            let mut by = origin_start;
+            while by < side as isize {
+                let mut bx = origin_start;
+                while bx < side as isize {
+                    brute_apply_block(
+                        grid,
+                        side,
+                        bx,
+                        by,
+                        bz,
+                        Some(block_rule_divisors),
+                        pass_offset,
+                        materials,
+                        generation,
+                    );
+                    bx += 2;
+                }
+                by += 2;
+            }
+            bz += 2;
+        }
+    }
+}
+
+fn block_origin_start(offset: usize) -> isize {
+    if offset == 0 {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Apply the block rule for a single 2x2x2 block at (bx, by, bz).
+///
+/// Cells outside the grid boundary are treated as empty (absorbing BC).
+///
+/// When `block_rule_divisors` is `Some`, gate the rule on its slowed-down
+/// schedule (iowh): apply only when `generation % divisor == 0` AND the
+/// rule's offset `(generation / divisor) & 1` equals `pass_offset`. The
+/// fast path passes `None` and relies on the caller iterating one offset.
+#[allow(clippy::too_many_arguments)]
+fn brute_apply_block(
+    grid: &mut [CellState],
+    side: usize,
+    bx: isize,
+    by: isize,
+    bz: isize,
+    block_rule_divisors: Option<&[u16]>,
+    pass_offset: usize,
+    materials: &MaterialRegistry,
+    generation: u64,
+) {
+    // Read the 8 cells. OOB → empty (absorbing boundary).
+    let mut block = [Cell::EMPTY; 8];
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let x = bx + dx as isize;
+                let y = by + dy as isize;
+                let z = bz + dz as isize;
+                if let Some(idx) = flat_index_if_in_bounds(x, y, z, side) {
+                    block[block_index(dx, dy, dz)] = Cell::from_raw(grid[idx]);
+                }
+            }
+        }
+    }
+
+    // Skip all-empty blocks (optimization).
+    if block.iter().all(|c| c.is_empty()) {
+        return;
+    }
+
+    // Dispatch: find the unique block rule across all cells.
+    let rule_id = match brute_unique_block_rule(&block, materials) {
+        Some(id) => id,
+        None => return, // zero or multiple distinct rules → skip
+    };
+
+    if let Some(divisors) = block_rule_divisors {
+        let divisor = divisors.get(rule_id.0).copied().unwrap_or(1).max(1) as u64;
+        if !generation.is_multiple_of(divisor) {
+            return;
+        }
+        let rule_offset = ((generation / divisor) & 1) as usize;
+        if rule_offset != pass_offset {
+            return;
+        }
+    }
+
+    let movable: [bool; 8] = std::array::from_fn(|i| {
+        let c = block[i];
+        c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
+    });
+
+    let rule = materials.block_rule(rule_id);
+    let result = rule.step_block(&block, &movable);
+
+    // Mass conservation assertion: output must be a permutation of input.
+    debug_assert!(
+        {
+            let mut inp: Vec<u16> = block.iter().map(|c| c.raw()).collect();
+            let mut out: Vec<u16> = result.iter().map(|c| c.raw()).collect();
+            inp.sort();
+            out.sort();
+            inp == out
+        },
+        "block rule violated mass conservation at ({bx}, {by}, {bz})"
+    );
+
+    // Contract assertion: immovable cells must be left in place by the
+    // rule. Without this, a buggy rule that swaps an immovable cell into
+    // a movable slot would silently delete the immovable cell's value
+    // (the write-back filter only writes movable positions). Assert
+    // here so the failure is loud, not a slow water leak.
+    debug_assert!(
+        (0..8).all(|i| movable[i] || result[i] == block[i]),
+        "block rule moved an immovable cell at ({bx}, {by}, {bz})"
+    );
+
+    // Write back. The rule is contracted to leave immovable cells fixed,
+    // so writing the rule output is safe. The `movable` filter is a
+    // belt-and-suspenders guard against a rule that violates the contract.
+    // OOB positions are silently skipped (absorbing boundary).
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let x = bx + dx as isize;
+                let y = by + dy as isize;
+                let z = bz + dz as isize;
+                let i = block_index(dx, dy, dz);
+                if movable[i] {
+                    if let Some(idx) = flat_index_if_in_bounds(x, y, z, side) {
+                        grid[idx] = result[i].raw();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn flat_index_if_in_bounds(x: isize, y: isize, z: isize, side: usize) -> Option<usize> {
+    if x < 0 || y < 0 || z < 0 {
+        return None;
+    }
+    let (x, y, z) = (x as usize, y as usize, z as usize);
+    (x < side && y < side && z < side).then_some(x + y * side + z * side * side)
+}
+
+/// Find the unique BlockRuleId across all non-empty cells in a block.
+/// Returns `Some(id)` if exactly one distinct rule; `None` if zero or multiple.
+fn brute_unique_block_rule(block: &[Cell; 8], materials: &MaterialRegistry) -> Option<BlockRuleId> {
+    let mut found: Option<BlockRuleId> = None;
+    for cell in block {
+        if let Some(id) = materials.block_rule_id_for_cell(*cell) {
+            match found {
+                None => found = Some(id),
+                Some(existing) if existing == id => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
 }
 
 /// Cascading bottom-to-top sweep that fills internal air gaps in
@@ -3079,6 +3626,16 @@ mod tests {
         let mut world = empty_world();
         world.set_gol_smoke_rule(rule);
         world
+    }
+
+    #[test]
+    #[should_panic(expected = "step_grid requires a whole-world flat grid")]
+    fn step_grid_rejects_partial_flat_grid() {
+        let world = empty_world();
+        let mut grid = world.flatten();
+        grid.pop();
+
+        let _ = world.step_grid(&grid);
     }
 
     fn feet(point: [i64; 3]) -> [f64; 3] {
@@ -3842,11 +4399,23 @@ mod tests {
     fn seed_pyroclastic_chamber_palette_is_volcanic_not_earthy() {
         let mut w = World::new(6); // side 64
         w.seed_pyroclastic_chamber();
-        assert!(w.population() > 0, "chamber must have stone/lava/water cells");
+        assert!(
+            w.population() > 0,
+            "chamber must have stone/lava/water cells"
+        );
         let grid = w.flatten();
-        assert!(grid.contains(&STONE), "chamber walls/floor/ceiling must be stone");
-        assert!(grid.contains(&LAVA), "chamber floor must have embedded lava");
-        assert!(grid.contains(&WATER), "chamber ceiling must have embedded water");
+        assert!(
+            grid.contains(&STONE),
+            "chamber walls/floor/ceiling must be stone"
+        );
+        assert!(
+            grid.contains(&LAVA),
+            "chamber floor must have embedded lava"
+        );
+        assert!(
+            grid.contains(&WATER),
+            "chamber ceiling must have embedded water"
+        );
         assert!(
             !grid.contains(&DIRT),
             "pyroclastic chamber must not contain DIRT (Minecraft-palette disqualifier)"
@@ -3870,15 +4439,11 @@ mod tests {
         let ceiling_y = (hi - 2) as i64;
         let lava_count_at_floor = (lo as i64..hi as i64)
             .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
-            .filter(|(x, z)| {
-                w.get(WorldCoord(*x), WorldCoord(floor_y), WorldCoord(*z)) == LAVA
-            })
+            .filter(|(x, z)| w.get(WorldCoord(*x), WorldCoord(floor_y), WorldCoord(*z)) == LAVA)
             .count();
         let water_count_at_ceiling = (lo as i64..hi as i64)
             .flat_map(|z| (lo as i64..hi as i64).map(move |x| (x, z)))
-            .filter(|(x, z)| {
-                w.get(WorldCoord(*x), WorldCoord(ceiling_y), WorldCoord(*z)) == WATER
-            })
+            .filter(|(x, z)| w.get(WorldCoord(*x), WorldCoord(ceiling_y), WorldCoord(*z)) == WATER)
             .count();
         assert!(
             lava_count_at_floor > 0,
@@ -3923,6 +4488,125 @@ mod tests {
             ),
             AIR,
             "blind_pos cell must be air so player_collides returns false"
+        );
+    }
+
+    #[test]
+    fn seed_quarantine_atlas_demo_contains_required_playtest_parts() {
+        let mut w = World::new(7);
+        let layout = w.seed_quarantine_atlas_demo();
+        let grid = w.flatten();
+
+        assert!(grid.contains(&LAVA), "hazard front must include lava");
+        assert!(grid.contains(&FIRE), "hazard front must include fire");
+        assert!(
+            grid.contains(&GRASS),
+            "settlements must include vulnerable grass"
+        );
+        assert!(
+            grid.contains(&METAL),
+            "counter-patterns/spawn pad must include metal"
+        );
+        assert!(
+            grid.contains(&WATER),
+            "counter-patterns/settlements must include water"
+        );
+        assert_eq!(
+            w.get(
+                WorldCoord(layout.player_pos[0].floor() as i64),
+                WorldCoord(layout.floor_y + 1),
+                WorldCoord(layout.player_pos[2].floor() as i64)
+            ),
+            METAL,
+            "player starts above the atlas command pad"
+        );
+
+        for center in layout.settlements {
+            assert!(
+                w.box_contains_material(
+                    Box3::new(
+                        [center[0] - 4, center[1], center[2] - 4],
+                        [center[0] + 4, center[1] + 5, center[2] + 4],
+                    ),
+                    GRASS,
+                ),
+                "settlement at {center:?} must have vulnerable material"
+            );
+        }
+
+        let threat_lane = Box3::new(
+            [
+                layout.hazard_center[0] + 7,
+                layout.floor_y + 1,
+                layout.hazard_center[2] - 4,
+            ],
+            [
+                layout.settlements[1][0] - 5,
+                layout.floor_y + 1,
+                layout.hazard_center[2] + 4,
+            ],
+        );
+        assert!(
+            w.box_count_material(threat_lane, GRASS) > 0,
+            "hazard must have a flammable lane toward the middle settlement"
+        );
+        assert!(
+            w.box_count_material(threat_lane, VINE) > 0,
+            "hazard lane must include high-fuel patches"
+        );
+    }
+
+    #[test]
+    fn seed_quarantine_atlas_demo_hazard_front_changes_after_steps() {
+        let mut w = World::new(6);
+        let layout = w.seed_quarantine_atlas_demo();
+        let front_probe = Box3::new(
+            [
+                layout.hazard_center[0] - 8,
+                layout.floor_y,
+                layout.hazard_center[2] - 10,
+            ],
+            [
+                layout.hazard_center[0] + 12,
+                layout.floor_y + 4,
+                layout.hazard_center[2] + 10,
+            ],
+        );
+        let threat_lane = Box3::new(
+            [
+                layout.hazard_center[0] + 7,
+                layout.floor_y + 1,
+                layout.hazard_center[2] - 4,
+            ],
+            [
+                layout.settlements[1][0] - 5,
+                layout.floor_y + 1,
+                layout.hazard_center[2] + 4,
+            ],
+        );
+        let before = (
+            w.box_count_material(front_probe, LAVA),
+            w.box_count_material(front_probe, FIRE),
+            w.box_count_material(front_probe, WATER),
+        );
+        let lane_fire_before = w.box_count_material(threat_lane, FIRE);
+        for _ in 0..3 {
+            w.step_recursive();
+        }
+        let after = (
+            w.box_count_material(front_probe, LAVA),
+            w.box_count_material(front_probe, FIRE),
+            w.box_count_material(front_probe, WATER),
+        );
+        let lane_fire_after = w.box_count_material(threat_lane, FIRE);
+        assert!(before.0 > 0, "precondition: probe must contain lava");
+        assert_ne!(
+            after, before,
+            "hazard/front probe should not be a static diorama after warm steps"
+        );
+        assert!(
+            lane_fire_after > lane_fire_before,
+            "fire should advance into the settlement threat lane after warm steps"
         );
     }
 
@@ -4324,7 +5008,7 @@ mod tests {
     /// always-on under the 60s soft-max in release / `--profile perf`
     /// (~10s observed); in debug builds the 128³ voxel walk dominates
     /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
-    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// hash-thing-1imu. Run via `cargo test --profile perf` (or any
     /// non-`debug_assertions` profile) to exercise the regression
     /// guard. With the fix reverted, the assertion fires at step 42
     /// with ~254k mismatches. Water pool sits at
@@ -4334,7 +5018,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile perf (hash-thing-1imu)"
+        ignore = "slow on debug build (~10 min @ 128³); runs under --profile perf (hash-thing-1imu)"
     )]
     fn water_and_sand_128_commit_step_skip_sync_corrupts_svdag() {
         let mut world = World::new(7);
@@ -4376,14 +5060,14 @@ mod tests {
     /// always-on under the 60s soft-max in release / `--profile perf`
     /// (~5s observed); in debug builds the 128³ voxel walk dominates
     /// and the test takes ~10 min, so it's `#[ignore]`d in debug per
-    /// hash-thing-1imu. Run via `cargo test --release` (or any
+    /// hash-thing-1imu. Run via `cargo test --profile perf` (or any
     /// non-`debug_assertions` profile) to exercise the regression
     /// guard. With the fix reverted, the assertion fires at step 24
     /// with ~974k mismatches.
     #[test]
     #[cfg_attr(
         debug_assertions,
-        ignore = "slow on debug build (~10 min @ 128³); runs under --release / --profile perf (hash-thing-1imu)"
+        ignore = "slow on debug build (~10 min @ 128³); runs under --profile perf (hash-thing-1imu)"
     )]
     fn water_and_sand_128_step_recursive_with_sync_every_step() {
         let mut world = World::new(7);
@@ -5049,15 +5733,14 @@ mod tests {
     #[test]
     fn gravity_conserves_population() {
         let mut world = gravity_world(&[DIRT_MATERIAL_ID, WATER_MATERIAL_ID]);
-        // Scatter some cells in even-aligned positions.
-        world.set(wc(0), wc(1), wc(0), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
-        world.set(wc(2), wc(1), wc(2), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        // Scatter cells away from absorbing world edges. Edge blocks are allowed
+        // to move cells out of the finite world, matching the recursive path.
+        world.set(wc(2), wc(1), wc(2), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+        world.set(wc(3), wc(1), wc(3), Cell::pack(WATER_MATERIAL_ID, 0).raw());
         world.set(wc(4), wc(3), wc(4), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
         let pop_before = world.population();
 
-        for _ in 0..4 {
-            world.step();
-        }
+        world.step();
 
         assert_eq!(
             world.population(),
@@ -5083,6 +5766,22 @@ mod tests {
             "dirt should fall on even generation"
         );
         assert_eq!(world.get(wc(0), wc(1), wc(0)), 0);
+    }
+
+    #[test]
+    fn odd_offset_applies_absorbing_low_boundary_block() {
+        let mut world = gravity_world(&[DIRT_MATERIAL_ID]);
+        world.generation = 1;
+        world.set(wc(0), wc(2), wc(0), Cell::pack(DIRT_MATERIAL_ID, 0).raw());
+
+        world.step();
+
+        assert_eq!(
+            world.get(wc(0), wc(1), wc(0)),
+            Cell::pack(DIRT_MATERIAL_ID, 0).raw(),
+            "odd low-edge block should treat x/z=-1 as empty and let dirt fall"
+        );
+        assert_eq!(world.get(wc(0), wc(2), wc(0)), 0);
     }
 
     #[test]
@@ -5248,13 +5947,13 @@ mod tests {
 
     #[test]
     fn fluid_spreads_laterally_into_air() {
-        // Place water at ground level with air neighbors in the same block.
+        // Place water with air neighbors in the same block.
         // After enough steps, water should have moved laterally.
-        let mut world = World::new(3);
+        let mut world = World::new(4);
         world.simulation_seed = 42;
-        // Place water at (2,2,2) — bottom-left of block at (2,2,2).
-        // Positions (3,2,2) and (2,2,3) are in the same block and are air.
-        world.set(wc(2), wc(2), wc(2), Cell::pack(WATER_MATERIAL_ID, 0).raw());
+        // Keep the water away from absorbing world edges; this test is about
+        // lateral motion, not finite-world outflow.
+        world.set(wc(8), wc(8), wc(8), Cell::pack(WATER_MATERIAL_ID, 0).raw());
 
         // Run several steps. Lateral spread is probabilistic (depends on
         // rng_hash), but over multiple steps with alternating offsets the
@@ -5263,14 +5962,26 @@ mod tests {
             world.step();
         }
 
-        // Water must still exist (conservation) but may have moved.
+        // Water must still exist (conservation) and must not only fall
+        // vertically in its original x/z column.
         assert_eq!(
             world.population(),
             1,
             "exactly one water cell should remain"
         );
-        // It should NOT still be at (2,3,2) after gravity — verify it settled
-        // at a y=0 or y=2 position (even-aligned bottom).
+        let grid = world.flatten();
+        let side = world.side();
+        let water_idx = grid
+            .iter()
+            .position(|&raw| Cell::from_raw(raw).material() == WATER_MATERIAL_ID)
+            .expect("water must still exist");
+        let water_x = water_idx % side;
+        let water_z = water_idx / (side * side);
+        assert_ne!(
+            (water_x, water_z),
+            (8, 8),
+            "water should spread laterally out of its original x/z column"
+        );
     }
 
     #[test]
@@ -6177,10 +6888,10 @@ mod tests {
 
     #[test]
     fn sand_conserves_population() {
-        let mut world = World::new(3);
-        world.set(wc(2), wc(3), wc(2), SAND);
-        world.set(wc(4), wc(5), wc(4), SAND);
-        world.set(wc(0), wc(1), wc(0), SAND);
+        let mut world = World::new(4);
+        world.set(wc(4), wc(10), wc(4), SAND);
+        world.set(wc(8), wc(12), wc(8), SAND);
+        world.set(wc(10), wc(9), wc(6), SAND);
         let pop_before = world.population();
 
         for _ in 0..4 {
@@ -6303,45 +7014,37 @@ mod tests {
         assert!(world.is_realized(wc(7), wc(7), wc(7)));
     }
 
-    /// qy4g.2 option G regression. Two invariants checked under the new
-    /// no-gap-fill regime:
-    ///
-    /// 1. **Mass conservation every step.** Population is constant under
-    ///    pure CaRule + Margolus BlockRule (option G's strongest guarantee).
-    /// 2. **Post-compaction contiguity.** Once the falling water block
-    ///    compacts against the floor (or another solid), the resulting
-    ///    settled pile is contiguous (no every-other-y holes left behind).
-    ///
-    /// What this test does **NOT** verify: gap closure during free-fall.
-    /// Option G accepts an in-flight every-other-y checkerboard while a
-    /// column is falling — see `World::step` and SPEC.md "Internal-gap
-    /// closure rides parity-flip" for the explicit tradeoff and fallbacks
-    /// A/F. The 32-tick run lets the 6-cell starter block fall ~16 cells
-    /// onto the floor and settle.
-    #[test]
-    fn water_block_gaps_close_via_parity_flip() {
-        let mut world = World::new(5); // 32³
-                                       // Place a 6×6×6 water block in the center, well away from boundaries.
-        for z in 10..16 {
-            for y in 16..22 {
-                for x in 10..16 {
+    fn contained_water_basin_16() -> World {
+        let mut world = World::new(4); // 16³
+                                       // Add a basin so this checks parity motion, not finite-world
+                                       // outflow through absorbing boundaries.
+        for z in 0..16 {
+            for x in 0..16 {
+                world.set(wc(x), wc(0), wc(z), STONE);
+            }
+        }
+        for y in 1..16 {
+            for z in 0..16 {
+                world.set(wc(0), wc(y), wc(z), STONE);
+                world.set(wc(15), wc(y), wc(z), STONE);
+            }
+            for x in 1..15 {
+                world.set(wc(x), wc(y), wc(0), STONE);
+                world.set(wc(x), wc(y), wc(15), STONE);
+            }
+        }
+        // Place a 4×4×4 water block in the center, well away from boundaries.
+        for z in 5..9 {
+            for y in 8..12 {
+                for x in 5..9 {
                     world.set(wc(x), wc(y), wc(z), WATER);
                 }
             }
         }
-        let pop_before = world.population();
+        world
+    }
 
-        let max_steps = 32;
-        for step in 0..max_steps {
-            world.step();
-            let pop_after = world.population();
-            assert_eq!(
-                pop_before, pop_after,
-                "population changed at step {step} ({pop_before} → {pop_after})",
-            );
-        }
-
-        // Check: for each y-level that contains water, count water cells.
+    fn water_levels(world: &World) -> Vec<usize> {
         let side = world.side() as u64;
         let grid = world.flatten();
         let mut water_by_y = vec![0u64; side as usize];
@@ -6357,34 +7060,104 @@ mod tests {
                 }
             }
         }
-
-        eprintln!("Water cells per y-level after {max_steps} steps:");
-        for (y, &count) in water_by_y.iter().enumerate() {
-            if count > 0 {
-                eprintln!("  y={y}: {count} water cells");
-            }
-        }
-
-        let water_levels: Vec<usize> = water_by_y
+        water_by_y
             .iter()
             .enumerate()
-            .filter(|(_, &c)| c > 0)
+            .filter(|(_, &count)| count > 0)
             .map(|(y, _)| y)
-            .collect();
+            .collect()
+    }
+
+    fn water_count(world: &World) -> usize {
+        world
+            .flatten()
+            .iter()
+            .filter(|&&raw| Cell::from_raw(raw).material() == WATER_MATERIAL_ID)
+            .count()
+    }
+
+    fn assert_water_levels_contiguous(world: &World) {
+        let levels = water_levels(world);
         assert!(
-            !water_levels.is_empty(),
+            !levels.is_empty(),
             "water should still exist after stepping"
         );
-        for pair in water_levels.windows(2) {
+        for pair in levels.windows(2) {
             assert_eq!(
                 pair[1] - pair[0],
                 1,
-                "gap between y={} and y={} — settled pile not contiguous \
-                 after {max_steps} steps",
+                "gap between y={} and y={} after contained settling",
                 pair[0],
                 pair[1]
             );
         }
+    }
+
+    /// qy4g.2 option G mass regression. Under the no-gap-fill regime,
+    /// contained water must conserve population every step. The stronger
+    /// settled-contiguity contract is covered below.
+    #[test]
+    fn contained_water_block_conserves_population_under_parity_flip() {
+        let mut world = contained_water_basin_16();
+        let pop_before = world.population();
+        let water_before = 4 * 4 * 4;
+
+        let max_steps = 64;
+        for step in 0..max_steps {
+            world.step();
+            let pop_after = world.population();
+            assert_eq!(
+                pop_before, pop_after,
+                "population changed at step {step} ({pop_before} → {pop_after})",
+            );
+        }
+
+        let water_after = water_count(&world);
+        assert_eq!(water_after, water_before, "contained water should survive");
+    }
+
+    /// qy4g / review follow-up: SPEC says a free-fall checkerboard compacts
+    /// once the leading edge hits a solid surface. The contained basin below
+    /// must settle without every-other-y gaps under the brute path.
+    #[test]
+    fn contained_water_block_settles_contiguously_under_parity_flip() {
+        let mut world = contained_water_basin_16();
+
+        for _ in 0..64 {
+            world.step();
+        }
+
+        assert_water_levels_contiguous(&world);
+    }
+
+    #[test]
+    fn contained_water_block_settles_contiguously_recursive() {
+        let mut brute = contained_water_basin_16();
+        let mut recursive = contained_water_basin_16();
+        let pop_before = brute.population();
+        let water_before = water_count(&brute);
+
+        for step in 0..64 {
+            brute.step();
+            recursive.step_ca();
+            assert_eq!(
+                recursive.population(),
+                pop_before,
+                "recursive population changed at step {step}"
+            );
+            assert_eq!(
+                water_count(&recursive),
+                water_before,
+                "recursive water count changed at step {step}"
+            );
+            assert_eq!(
+                recursive.flatten(),
+                brute.flatten(),
+                "recursive path diverged from brute path at step {step}"
+            );
+        }
+
+        assert_water_levels_contiguous(&recursive);
     }
 
     #[test]
@@ -6581,6 +7354,10 @@ mod tests {
         a.misses_by_level[0] = 1;
         a.misses_by_level[3] = 13;
         a.misses_by_level[7] = 17;
+        a.miss_cause_by_level[0].first_seen_or_no_surviving_key = 10;
+        a.miss_cause_by_level[0].first_seen_key = 6;
+        a.miss_cause_by_level[0].seen_key_missing_entry = 3;
+        a.miss_cause_by_level[0].seen_node_new_phase = 1;
         // hash-thing-bjdl (vqke.2): exercise the new accumulators
         // alongside the existing scalar fields, so a future refactor
         // that drops one of these from `accumulate` is caught.
@@ -6596,6 +7373,14 @@ mod tests {
         a.bfs_max_batch_len = 50;
         a.bfs_tasks_by_level[0] = 50;
         a.bfs_tasks_by_level[2] = 9;
+        a.p3_store_ns = 10;
+        a.p3_store_calls = 1;
+        a.p3_cache_ns = 20;
+        a.p3_cache_calls = 2;
+        a.p3_slow_ns = 30;
+        a.p3_slow_calls = 3;
+        a.p3_reindex_ns = 40;
+        a.p3_reindex_calls = 4;
 
         b.cache_hits = 2;
         b.cache_misses = 4;
@@ -6604,6 +7389,10 @@ mod tests {
         b.misses_by_level[0] = 10;
         b.misses_by_level[3] = 100;
         b.misses_by_level[7] = 1000;
+        b.miss_cause_by_level[0].first_seen_or_no_surviving_key = 5;
+        b.miss_cause_by_level[0].first_seen_key = 2;
+        b.miss_cause_by_level[0].seen_key_missing_entry = 2;
+        b.miss_cause_by_level[0].seen_node_new_phase = 1;
         b.cache_misses_phase_aliased = 1;
         b.compact_entries_kept = 50;
         b.compact_entries_dropped = 0;
@@ -6613,6 +7402,14 @@ mod tests {
         b.bfs_max_batch_len = 200; // larger; should win the running max
         b.bfs_tasks_by_level[0] = 200;
         b.bfs_tasks_by_level[2] = 17;
+        b.p3_store_ns = 100;
+        b.p3_store_calls = 10;
+        b.p3_cache_ns = 200;
+        b.p3_cache_calls = 20;
+        b.p3_slow_ns = 300;
+        b.p3_slow_calls = 30;
+        b.p3_reindex_ns = 400;
+        b.p3_reindex_calls = 40;
 
         total.accumulate(&a);
         total.accumulate(&b);
@@ -6624,6 +7421,13 @@ mod tests {
         assert_eq!(total.misses_by_level[0], 11);
         assert_eq!(total.misses_by_level[3], 113);
         assert_eq!(total.misses_by_level[7], 1017);
+        assert_eq!(
+            total.miss_cause_by_level[0].first_seen_or_no_surviving_key,
+            15
+        );
+        assert_eq!(total.miss_cause_by_level[0].first_seen_key, 8);
+        assert_eq!(total.miss_cause_by_level[0].seen_key_missing_entry, 5);
+        assert_eq!(total.miss_cause_by_level[0].seen_node_new_phase, 2);
         assert_eq!(total.cache_misses_phase_aliased, 3);
         assert_eq!(total.compact_entries_kept, 150);
         assert_eq!(total.compact_entries_dropped, 25);
@@ -6636,6 +7440,14 @@ mod tests {
         assert_eq!(total.bfs_max_batch_len, 200);
         assert_eq!(total.bfs_tasks_by_level[0], 250);
         assert_eq!(total.bfs_tasks_by_level[2], 26);
+        assert_eq!(total.p3_store_ns, 110);
+        assert_eq!(total.p3_store_calls, 11);
+        assert_eq!(total.p3_cache_ns, 220);
+        assert_eq!(total.p3_cache_calls, 22);
+        assert_eq!(total.p3_slow_ns, 330);
+        assert_eq!(total.p3_slow_calls, 33);
+        assert_eq!(total.p3_reindex_ns, 440);
+        assert_eq!(total.p3_reindex_calls, 44);
         // Untouched indices must remain zero — catches the "summed into
         // index 0" copy-paste bug.
         for (i, &v) in total.misses_by_level.iter().enumerate() {
@@ -6724,9 +7536,8 @@ mod tests {
     /// `memo_tbl=1 234`) which would silently break the HUD layout, and
     /// against per-field widths that overflow the compact HUD panel.
     ///
-    /// Prefix allow-list covers `memo_` (cache fields) and `p1` / `p2`
-    /// (per-step phase timings from hash-thing-71mp, which are part of
-    /// the same HUD block but semantically not memo state).
+    /// Prefix allow-list covers `memo_` (cache fields), per-step phase
+    /// timings, and p3 subphase timings that share the same HUD block.
     #[test]
     fn memo_summary_splits_cleanly_for_hud_overlay() {
         let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
@@ -6747,6 +7558,11 @@ mod tests {
                     || line.starts_with("p1=")
                     || line.starts_with("p2=")
                     || line.starts_with("p3=")
+                    || line.starts_with("p3a_")
+                    || line.starts_with("p3b_")
+                    || line.starts_with("p3c_")
+                    || line.starts_with("p3d_")
+                    || line.starts_with("p3e_")
                     || line.starts_with("p4=")
                     || line.starts_with("bfs_"),
                 "field must use an approved HUD prefix (memo_ / p1 / p2 / p3 / p4 / bfs_), got {line:?}",
@@ -6785,6 +7601,18 @@ mod tests {
             lines.iter().any(|f| f.starts_with("memo_skip_fixed=")),
             "memo_summary must include memo_skip_fixed= token, got {lines:?}",
         );
+        for token in [
+            "p3a_store=",
+            "p3b_cache=",
+            "p3c_slow=",
+            "p3d_reindex=",
+            "p3e_resid=",
+        ] {
+            assert!(
+                lines.iter().any(|f| f.starts_with(token)),
+                "memo_summary must include {token} token, got {lines:?}",
+            );
+        }
     }
 
     #[test]
@@ -6883,6 +7711,44 @@ mod tests {
     }
 
     #[test]
+    fn step_recursive_profiled_publishes_memo_summary_timing_stats() {
+        // hash-thing-w93q: profiled stepping must leave the same public
+        // HashlifeStats/memo_summary timing contract as step_recursive().
+        let mut world = gol_world(GameOfLife3D::new(0, 6, 1, 3));
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
+        world.set(wc(4), wc(4), wc(4), ALIVE.raw());
+        world.store_size_at_last_compact = 1;
+
+        let _profile = world.step_recursive_profiled();
+
+        let stats = &world.hashlife_stats;
+        assert!(
+            stats.cache_misses > 0,
+            "test precondition: profiled step should have at least one memo miss",
+        );
+        assert!(
+            stats.step_node_wall_ns > 0,
+            "profiled step must publish step_node_wall_ns for memo_summary",
+        );
+        assert!(
+            stats.compact_ns > 0,
+            "forced compaction must publish compact_ns for memo_summary",
+        );
+        assert_eq!(
+            world.hashlife_stats_total.step_node_wall_ns, stats.step_node_wall_ns,
+            "lifetime stats must accumulate profiled step_node_wall_ns",
+        );
+        assert_eq!(
+            world.hashlife_stats_total.compact_ns, stats.compact_ns,
+            "lifetime stats must accumulate profiled compact_ns",
+        );
+
+        let summary = world.memo_summary();
+        assert!(summary.contains("p3="), "missing p3 in summary: {summary}");
+        assert!(summary.contains("p4="), "missing p4 in summary: {summary}");
+    }
+
+    #[test]
     fn memo_summary_includes_p3_and_p4_phase_breakdown() {
         // hash-thing-vqke Phase 0: the perf summary must include p3
         // (descent overhead) and p4 (compact wall) so the szyh-baseline
@@ -6896,6 +7762,71 @@ mod tests {
         assert!(summary.contains("p4="), "missing p4 in summary: {summary}");
         // The HUD-overlay tester (memo_summary_splits_cleanly_for_hud_overlay)
         // independently asserts the field-prefix whitelist + width caps.
+    }
+
+    fn parse_summary_ms(summary: &str, token: &str) -> f64 {
+        let value = summary
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(token))
+            .unwrap_or_else(|| panic!("missing {token} in summary: {summary}"));
+        value
+            .split('/')
+            .next()
+            .unwrap_or(value)
+            .strip_suffix("ms")
+            .unwrap_or(value.split('/').next().unwrap_or(value))
+            .parse::<f64>()
+            .unwrap_or_else(|err| panic!("invalid {token} value in {summary}: {err}"))
+    }
+
+    #[test]
+    fn memo_summary_p3_subphase_breakdown_is_self_consistent() {
+        let mut world = World::new(6);
+        world.set_gol_smoke_rule(GameOfLife3D::new(0, 6, 1, 3));
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
+        world.set(wc(32), wc(32), wc(32), ALIVE.raw());
+        world.step_recursive();
+
+        let stats = &world.hashlife_stats;
+        assert!(stats.p3_store_calls > 0, "expected store calls: {stats:?}");
+        assert!(
+            stats.p3_reindex_calls > 0,
+            "expected reindex calls: {stats:?}"
+        );
+
+        let summary = world.memo_summary();
+        let p3 = parse_summary_ms(&summary, "p3=");
+        let known = parse_summary_ms(&summary, "p3a_store=")
+            + parse_summary_ms(&summary, "p3b_cache=")
+            + parse_summary_ms(&summary, "p3c_slow=")
+            + parse_summary_ms(&summary, "p3d_reindex=")
+            + parse_summary_ms(&summary, "p3e_resid=");
+        assert!(
+            p3 + 0.02 >= known,
+            "p3 must cover known subphases without double-counting: p3={p3}, known={known}, summary={summary}",
+        );
+    }
+
+    #[test]
+    fn memo_summary_p3_slow_probe_counts_slow_divisor_checks() {
+        let mut world = World::new(6);
+        world.set_base_case_strategy(BaseCaseStrategy::Serial);
+        world.set(wc(32), wc(32), wc(32), WATER);
+        world.step_recursive();
+
+        assert!(
+            world.materials.memo_period() > 2,
+            "test precondition: terrain registry should include a slow divisor"
+        );
+        assert!(
+            world.hashlife_stats.p3_slow_calls > 0,
+            "slow-divisor phase probe should be counted: {:?}",
+            world.hashlife_stats
+        );
+        assert!(
+            world.memo_summary().contains("p3c_slow="),
+            "summary should expose slow-divisor probe timing"
+        );
     }
 
     #[test]

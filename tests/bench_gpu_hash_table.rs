@@ -9,7 +9,7 @@
 //! packed key (NodeId<<1 | parity) with 0 reserved as empty.
 //!
 //! Run the full sweep (ignored by default):
-//!   cargo test --release --test bench_gpu_hash_table -- --ignored --nocapture
+//!   cargo test --profile perf --test bench_gpu_hash_table -- --ignored --nocapture
 //! Correctness tests run in default `cargo test`.
 
 use std::time::{Duration, Instant};

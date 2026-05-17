@@ -60,7 +60,7 @@ fn bench_step(label: &str, level: u32, generations: usize) {
 
         if gen < 3 || gen == generations - 1 {
             eprintln!(
-                "  gen {gen}: {:.1}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
+                "  gen {gen}: {:.3}ms, pop={}, hits={}, misses={}, empty={}, fixed={}, rate={:.1}%",
                 us as f64 / 1000.0,
                 world.population(),
                 s.cache_hits,
@@ -96,7 +96,7 @@ fn bench_step(label: &str, level: u32, generations: usize) {
         let median_us = times_us[generations / 2];
         let p95_us = times_us[(generations as f64 * 0.95) as usize];
         eprintln!(
-            "  summary: {generations} gens, mean={:.1}ms, median={:.1}ms, p95={:.1}ms, total={:.1}s",
+            "  summary: {generations} gens, mean={:.3}ms, median={:.3}ms, p95={:.3}ms, total={:.1}s",
             mean_us as f64 / 1000.0,
             median_us as f64 / 1000.0,
             p95_us as f64 / 1000.0,
@@ -114,6 +114,22 @@ fn bench_step(label: &str, level: u32, generations: usize) {
 #[ignore]
 fn bench_hashlife_512() {
     bench_step("512³", 9, 20);
+}
+
+/// Small-scene comparator pair against `bench_chunk_array_baseline_32`
+/// in `tests/bench_chunk_array_baseline.rs`. At level=5 (32³) hashlife
+/// is not expected to dominate brute-force chunk-array — memos at this
+/// scale are mostly trivial — and that *is* the data point: it shows
+/// where hashlife's content folding does and does not pay off.
+///
+/// See the chunk-array bench's module-doc for the comparator semantics
+/// (this side times full `step_recursive`; the chunk-array side times
+/// the `step_grid` kernel only — both represent each engine's intrinsic
+/// per-generation cost).
+#[test]
+#[ignore]
+fn bench_hashlife_32() {
+    bench_step("32³ (chunk-array comparator)", 5, 30);
 }
 
 /// hash-thing-tk4j (vqke.3): 256³ matches the szyh baseline scale that
@@ -145,11 +161,11 @@ fn bench_hashlife_256_tk4j() {
 /// - Primary metric: `step_us` median (full-step wall, not just leaf
 ///   compute) and `step_node_wall_ns` median. p1/p2 are sums of
 ///   per-worker leaf compute under rayon and don't reflect latency.
-/// - Pre-committed slack: BFS step_us median ≤ 1.1× RayonPerFanout
-///   step_us median on this default-terrain scene. If exceeded, file a
-///   follow-up bead and ship behind the env-var only — do not flip
-///   default. (Catches "BFS infrastructure ships but never speeds
-///   anything up" — adversarial-claude's primary concern.)
+/// - Default-health slack: BFS step_us median should stay ≤ 1.1×
+///   RayonPerFanout step_us median on this default-terrain scene. If
+///   exceeded, file a follow-up bead to re-evaluate the current
+///   RayonBfs default. (Catches "BFS infrastructure ships but does not
+///   keep its perf edge" — adversarial-claude's primary concern.)
 /// - Cold warm-up: skip the first 5 generations from median/p95
 ///   computation to avoid first-allocation + cold-cache distortion.
 /// - Bench is informational (no panic) — the absolute "8 ms" bead
@@ -164,8 +180,7 @@ fn bench_hashlife_256_ftuu_rayon_compare() {
         30,
         BaseCaseStrategy::RayonPerFanout,
     );
-    let bfs =
-        bench_step_with_strategy("256³ ecmn rayon (bfs)", 8, 30, BaseCaseStrategy::RayonBfs);
+    let bfs = bench_step_with_strategy("256³ ecmn rayon (bfs)", 8, 30, BaseCaseStrategy::RayonBfs);
 
     eprintln!("--- ecmn slack check ---");
     eprintln!(
@@ -173,13 +188,11 @@ fn bench_hashlife_256_ftuu_rayon_compare() {
         serial.step_us_median, per_fanout.step_us_median, bfs.step_us_median,
     );
     let slack_ratio = bfs.step_us_median as f64 / per_fanout.step_us_median.max(1) as f64;
-    eprintln!(
-        "  bfs/per-fanout ratio: {slack_ratio:.3} (slack target: ≤ 1.10 on default terrain)",
-    );
+    eprintln!("  bfs/per-fanout ratio: {slack_ratio:.3} (slack target: ≤ 1.10 on default terrain)",);
     if slack_ratio > 1.10 {
         eprintln!(
             "  WARN: BFS slower than per-fanout by >10% on default terrain. \
-             File follow-up bead — do not flip default to RayonBfs.",
+             File follow-up bead to re-evaluate the current RayonBfs default.",
         );
     }
 }
@@ -315,7 +328,12 @@ fn churn_drop_sand(world: &mut World, rng: &mut BenchRng, n: usize) {
         // usage pattern — drops from ~the player's head height).
         let y = side - 4 + (rng.next_u64() % 2);
         let z = rng.next_u64() % (side - 4) + 2;
-        world.set(WorldCoord(x as i64), WorldCoord(y as i64), WorldCoord(z as i64), sand);
+        world.set(
+            WorldCoord(x as i64),
+            WorldCoord(y as i64),
+            WorldCoord(z as i64),
+            sand,
+        );
     }
 }
 
@@ -408,13 +426,8 @@ fn bench_churn_step_with_strategy(
 #[test]
 #[ignore]
 fn bench_hashlife_256_churn_short() {
-    let serial = bench_churn_step_with_strategy(
-        "256³ churn serial",
-        8,
-        50,
-        20,
-        BaseCaseStrategy::Serial,
-    );
+    let serial =
+        bench_churn_step_with_strategy("256³ churn serial", 8, 50, 20, BaseCaseStrategy::Serial);
     let per_fanout = bench_churn_step_with_strategy(
         "256³ churn rayon (per-fanout)",
         8,
@@ -437,12 +450,8 @@ fn bench_hashlife_256_churn_short() {
     );
     let bfs_vs_perfanout = bfs.step_us_median as f64 / per_fanout.step_us_median.max(1) as f64;
     let bfs_vs_serial = bfs.step_us_median as f64 / serial.step_us_median.max(1) as f64;
-    eprintln!(
-        "  bfs/per-fanout ratio: {bfs_vs_perfanout:.3} (lower = bfs wins on churn)",
-    );
-    eprintln!(
-        "  bfs/serial ratio:     {bfs_vs_serial:.3} (parallelism multiplier under churn)",
-    );
+    eprintln!("  bfs/per-fanout ratio: {bfs_vs_perfanout:.3} (lower = bfs wins on churn)",);
+    eprintln!("  bfs/serial ratio:     {bfs_vs_serial:.3} (parallelism multiplier under churn)",);
 }
 
 /// hash-thing-5e3e (tk4j.1) — long variant: 200 generations, 30 sand
@@ -502,7 +511,7 @@ fn bench_hashlife_4096_seed() {
 /// ceiling on M1-class hardware — run out-of-band with an explicit longer
 /// timeout:
 /// ```text
-/// cargo test --release --test bench_hashlife bench_hashlife_4096_step \
+/// cargo test --profile perf --test bench_hashlife bench_hashlife_4096_step \
 ///     -- --ignored --nocapture
 /// ```
 /// Required to measure warm-step cost at 4096³ (`render_gpu` / macro-cache

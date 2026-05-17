@@ -7,7 +7,7 @@
 //! checkerboard) and dumps the floor-adjacent xz slice across multiple
 //! steps so the mechanism can be characterized.
 //!
-//! Run: `cargo test --profile bench --test repro_14yp_water_floor_checkerboard
+//! Run: `cargo test --profile perf --test repro_14yp_water_floor_checkerboard
 //!       -- --ignored --nocapture`
 //!
 //! Scope: pure CPU, deterministic, small (level=5, 32³). No GPU, no winit.
@@ -137,7 +137,12 @@ fn make_world_with_floor(level: u32, floor_y: u64) -> World {
     let side = world.side() as u64;
     for z in 0..side {
         for x in 0..side {
-            world.set(WorldCoord(x as i64), WorldCoord(floor_y as i64), WorldCoord(z as i64), STONE);
+            world.set(
+                WorldCoord(x as i64),
+                WorldCoord(floor_y as i64),
+                WorldCoord(z as i64),
+                STONE,
+            );
         }
     }
     world
@@ -153,7 +158,11 @@ fn repro_water_column_falls_to_flat_floor() {
     let side = 1u64 << level;
 
     for floor_parity_label in ["floor_y=4 (even)", "floor_y=5 (odd)"] {
-        let floor_y: u64 = if floor_parity_label.contains("even") { 4 } else { 5 };
+        let floor_y: u64 = if floor_parity_label.contains("even") {
+            4
+        } else {
+            5
+        };
         let water_y_lo = floor_y + 4;
         let water_y_hi = floor_y + 12;
 
@@ -165,12 +174,16 @@ fn repro_water_column_falls_to_flat_floor() {
         for z in lo..hi {
             for x in lo..hi {
                 for y in water_y_lo..water_y_hi {
-                    world.set(WorldCoord(x as i64), WorldCoord(y as i64), WorldCoord(z as i64), WATER);
+                    world.set(
+                        WorldCoord(x as i64),
+                        WorldCoord(y as i64),
+                        WorldCoord(z as i64),
+                        WATER,
+                    );
                 }
             }
         }
-        let initial_water = world.population() as i64
-            - (side * side) as i64; // subtract floor count
+        let initial_water = world.population() as i64 - (side * side) as i64; // subtract floor count
         eprintln!("initial water cells: {initial_water}");
         dump_floor(&world, floor_y + 1, "gen 0 (floor+1)");
 
@@ -204,7 +217,11 @@ fn repro_horizontal_checkerboard_stability() {
     let side = 1u64 << level;
 
     for floor_parity_label in ["floor_y=4 (even)", "floor_y=5 (odd)"] {
-        let floor_y = if floor_parity_label.contains("even") { 4 } else { 5 };
+        let floor_y = if floor_parity_label.contains("even") {
+            4
+        } else {
+            5
+        };
         let water_y = floor_y + 1;
 
         eprintln!("=== Scenario B — pre-placed horizontal checkerboard — {floor_parity_label} ===");
@@ -216,12 +233,21 @@ fn repro_horizontal_checkerboard_stability() {
         for z in lo..hi {
             for x in lo..hi {
                 if (x + z) % 2 == 0 {
-                    world.set(WorldCoord(x as i64), WorldCoord(water_y as i64), WorldCoord(z as i64), WATER);
+                    world.set(
+                        WorldCoord(x as i64),
+                        WorldCoord(water_y as i64),
+                        WorldCoord(z as i64),
+                        WATER,
+                    );
                     placed += 1;
                 }
             }
         }
-        eprintln!("placed {placed} water cells in {}x{} checkerboard at y={water_y}", hi - lo, hi - lo);
+        eprintln!(
+            "placed {placed} water cells in {}x{} checkerboard at y={water_y}",
+            hi - lo,
+            hi - lo
+        );
         dump_floor(&world, water_y, "gen 0");
         let initial_score = checkerboard_score(&world, water_y, lo - 2, hi + 2);
         eprintln!("initial cb_score={initial_score:.2}");
@@ -261,7 +287,12 @@ fn repro_horizontal_checkerboard_brute_vs_recursive() {
         for z in lo..hi {
             for x in lo..hi {
                 if (x + z) % 2 == 0 {
-                    world.set(WorldCoord(x as i64), WorldCoord(water_y as i64), WorldCoord(z as i64), WATER);
+                    world.set(
+                        WorldCoord(x as i64),
+                        WorldCoord(water_y as i64),
+                        WorldCoord(z as i64),
+                        WATER,
+                    );
                 }
             }
         }
@@ -280,9 +311,7 @@ fn repro_horizontal_checkerboard_brute_vs_recursive() {
         let rs = checkerboard_score(&recursive, water_y, lo - 2, hi + 2);
         let bp = count_water_at(&brute, water_y);
         let rp = count_water_at(&recursive, water_y);
-        eprintln!(
-            "gen {g:>3}: brute(water={bp}, cb={bs:.2})  recursive(water={rp}, cb={rs:.2})"
-        );
+        eprintln!("gen {g:>3}: brute(water={bp}, cb={bs:.2})  recursive(water={rp}, cb={rs:.2})");
     }
     dump_floor(&brute, water_y, "brute final");
     dump_floor(&recursive, water_y, "recursive final");
@@ -304,7 +333,12 @@ fn repro_horizontal_stripes_x() {
     for z in lo..hi {
         for x in lo..hi {
             if x % 2 == 0 {
-                world.set(WorldCoord(x as i64), WorldCoord(water_y as i64), WorldCoord(z as i64), WATER);
+                world.set(
+                    WorldCoord(x as i64),
+                    WorldCoord(water_y as i64),
+                    WorldCoord(z as i64),
+                    WATER,
+                );
             }
         }
     }
@@ -319,10 +353,7 @@ fn repro_horizontal_stripes_x() {
             g += 1;
         }
         let score = checkerboard_score(&world, water_y, lo - 2, hi + 2);
-        eprintln!(
-            "gen {c:>3}: pop={} cb_score={score:.2}",
-            world.population()
-        );
+        eprintln!("gen {c:>3}: pop={} cb_score={score:.2}", world.population());
     }
     dump_floor(&world, water_y, "final");
 }

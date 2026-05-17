@@ -37,43 +37,45 @@ Apple M1 GPU relevant headline numbers (to be filled in with citations during th
 
 ## 2. Literature survey
 
-First pass (2026-04-20, bead `hash-thing-stue.1`). The list below is the SPEC.md Rendering curation, ordered by when the contribution entered the lineage. Each entry captures core idea, reported number, implied number on M1 MBA, and verdict. Numbers marked **TODO-verify** were taken from secondary summaries because the primary PDFs would not decode through WebFetch during this pass — they are plausible and consistent across sources but have not been eyeballed against the original tables.
+First pass (2026-04-20, bead `hash-thing-stue.1`). Primary-source verification pass (2026-05-03, bead `hash-thing-63gv`) fetched and parsed the ESVO, SVDAG, SSVDAG, HashDAG, and Molenaar-attributes papers directly. The list below is the SPEC.md Rendering curation, ordered by when the contribution entered the lineage. Each entry captures core idea, reported number, implied number on M1 MBA, implied number on the M2 dev machine where we actually measure, and verdict.
 
-Cross-reference for implied-number math: M1 MBA 8-core GPU ≈ 2.6 TFLOPS FP32, ≈ 68 GB/s memory bandwidth, unified memory (no PCIe hop). The baseline papers all target discrete NVIDIA GPUs with 2-10× the bandwidth and 2-20× the compute. SVDAG traversal is dominated by dependent memory loads along the ray, so the **bandwidth ratio** is the right scaling lens, not raw GFLOPS.
+Cross-reference for implied-number math: M1 MBA 8-core GPU ≈ 2.6 TFLOPS FP32, ≈ 68 GB/s memory bandwidth, unified memory (no PCIe hop). Dev M2 base uses ≈ 100 GB/s memory bandwidth. The baseline papers mostly target discrete NVIDIA GPUs with 1.5-6× the bandwidth and 1-20× the compute. SVDAG traversal is dominated by dependent memory loads along the ray, so the **bandwidth ratio** is the first scaling lens, not raw GFLOPS; CPU-side edit timings are called out separately.
+
+Primary-source links checked in the 2026-05-03 pass: ESVO technical report (<https://research.nvidia.com/sites/default/files/pubs/2010-02_Efficient-Sparse-Voxel/laine2010tr1_paper.pdf>), Kämpe SVDAG PDF (<https://icg.gwu.edu/sites/g/files/zaxdzs6126/files/downloads/highResolutionSparseVoxelDAGs.pdf>), SSVDAG PDF (<https://www.crs4.it/vic/data/papers/i3d2016-symmetry-dags.pdf>), HashDAG author copy (<https://newq.net/dl/pub/ModifyingCompressedVoxels-main.pdf>), and Molenaar/Eisemann 2023 repository PDF (<https://repository.tudelft.nl/file/File_6f87e286-d7ce-4d4a-89e2-92c36519467a>).
 
 ### 2.1 Laine & Karras (2010), "Efficient Sparse Voxel Octrees" (ESVO)
 
 - **Core idea.** First paper to make sparse voxel octrees competitive with triangle meshes on a GPU. Iterative descent with explicit ray-position tracking, child-pointer indirection, and per-node "contour" primitives that flatten smooth surfaces. All subsequent SVDAG / HashDAG traversal kernels (including ours) descend from this control-flow shape.
-- **Reported number.** Rendering of contoured ESVO scenes in the low tens of milliseconds per frame on a single NVIDIA GTX 480 at 1024×768 primary rays — competitive with triangle rasterization at the time. TODO-verify against the I3D 2010 and extended technical-report tables (cached PDF exists but did not decode through WebFetch).
-- **Implied on M1 MBA.** GTX 480 has ≈ 177 GB/s bandwidth and 1.35 TFLOPS; M1 8-core has ≈ 68 GB/s and 2.6 TFLOPS. Expect the same algorithm to land at roughly **2-3× the wall time** versus GTX 480 at the same resolution, i.e. ~30-60 ms/frame on M1 MBA at 1024×768 for large scenes. For our 960×600-ish (256³ at 50% render scale) that is ~20-35 ms/frame on the core descent — in the same order as our headless bench's 0.19 ms mean at 1920×1080 *for small worlds*, consistent with ESVO being memory-walk bound rather than ray-count bound.
+- **Reported number.** The extended technical report's Table 4 reports primary-ray throughput on a Quadro FX 5800 at 1024×768 with contours+beam optimization: City 106.0, Sibenik 103.6, Sibenik-D 48.3, Hairball 28.4, Fairy 150.9, Conference 124.3 MRays/s. That is roughly **5-28 ms/frame** at 1024×768, scene-dependent, on the 2009-class Quadro. Table 5's smaller-dataset GTX 285 run reports 39.3-182.2 MRays/s at 1024×768, about 15-22% faster than the Quadro on matching datasets.
+- **Implied on M1 MBA / M2.** Quadro FX 5800 bandwidth is ≈ 102 GB/s; M1 8-core has ≈ 68 GB/s and dev M2 has ≈ 100 GB/s. Bandwidth scaling alone predicts M1 at roughly **1.5× the Quadro time** and M2 roughly **parity with the Quadro** for ESVO-like primary rays at the same resolution: about 8-42 ms/frame on M1 and 5-29 ms/frame on M2 at 1024×768. Our M2 SVDAG raycast is far faster (0.10-0.16 ms compute-pass means in §3.12) because our measured scenes are shallower, smaller in active working set, and use a DAG layout without ESVO contours.
 - **Verdict.** **We already descend from this lineage.** Our WGSL traversal kernel is iteratively structured in the Laine-Karras sense. We do not use contours; our leaves are full 2³ material-tagged voxels, and contours would bias toward smooth analytic surfaces we do not have.
 
 ### 2.2 Kämpe, Sintorn, Assarsson (2013), "High Resolution Sparse Voxel DAGs"
 
 - **Core idea.** Generalize SVO to a DAG by hash-consing subtrees. Empty and repeated regions both get deduplicated. Enables representing binary voxel scenes at 128K³ that would never fit as flat grids or plain SVOs.
-- **Reported number.** 170 MRays/sec (ambient occlusion) / 240 MRays/sec (shadows) on NVIDIA GTX 680 at "competitive with or faster than state-of-the-art triangle ray tracing" for the Epic Citadel scene voxelized to 128K³, **945 MB GPU memory** vs. ~5.1 GB for the equivalent SVO. (Source: semanticscholar summary; TODO-verify against the SIGGRAPH 2013 PDF.)
-- **Implied on M1 MBA.** GTX 680 has ≈ 192 GB/s bandwidth and 3.1 TFLOPS. M1 8-core is ~3× less bandwidth and ~1.2× less compute. Expect **~50-80 MRays/s primary / shadow** on the same algorithm at the same memory layout, for a scene that actually fits. Our 256³ demo at 50% render scale is ~576k rays/frame, so this predicts ~7-12 ms/frame for just the SVDAG traversal. Our headless bench already reports 0.19 ms mean — but our world is a 256³ instead of 128K³, and the tree is much shallower (log₂ 256 = 8 vs. log₂ 128K ≈ 17), so we do ~half the per-ray memory walk. The numbers are internally consistent.
+- **Reported number.** The paper's Fig. 1 caption locks the headline: Epic Citadel voxelized to 128K³, 19B voxels, **945 MB GPU memory** for the SVDAG versus **5.1 GB** for the corresponding SVO, with ambient occlusion at **170 MRays/s** and shadows at **240 MRays/s** on an NVIDIA GTX 680. Table 2 separately shows Epic Citadel at 64K³ as **371 MB** SVDAG versus **1,301 MB** SVO.
+- **Implied on M1 MBA / M2.** GTX 680 has ≈ 192 GB/s bandwidth and 3.1 TFLOPS. M1 8-core is ~0.35× the bandwidth; M2 is ~0.52×. Expect **~60-85 MRays/s on M1** and **~90-125 MRays/s on M2** for the same secondary-ray workload and memory layout, if the scene fits. Our 256³ demo at 50% render scale is ~576k logical rays/frame, so the M2 paper-scaled number predicts ~5-7 ms/frame for Kämpe-scale secondary traversal; our primary-ray compute-pass measurements sit around 0.10-0.16 ms because the live engine's working set and depth are much smaller than the 128K³ benchmark.
 - **Verdict.** **Our GPU node encoding and upload shape descend from here, but our update model does not.** Kämpe's SVDAG is build-once-render-forever: a scene is offline-DAG-ified and then traced as a static structure. Our implementation rebuilds the CPU-side SVDAG serialization *every sim tick* from the live hash-consed octree — see §4.6 for how that differs from both Kämpe (static) and HashDAG (GPU-resident dynamic). Our octree is still hash-consed; our GPU buffer layout is still Kämpe-shaped. But "this is the paper we are implementing" undersells the delta on update semantics.
 
 ### 2.3 Villanueva, Marton, Gobbetti (2016/2017), "Symmetry-aware Sparse Voxel DAGs" (SSVDAG)
 
 - **Core idea.** Extend DAG deduplication to include the mirror and rotational symmetries of a subtree, not just structural equality. Typical scenes have enormous amounts of mirror symmetry (plane-symmetric buildings, rotation-symmetric props). Compression is pure memory win — traversal cost per ray is essentially unchanged because the shader just xors a transform bit into its position update.
-- **Reported number.** State-of-the-art lossless compression over SVDAG on CAD models, 3D scans, and game scenes — typical 2-4× additional memory saving on top of SVDAG for scenes with rich symmetry. Real-time GPU tracing at sub-millimetric precision on the full Boeing 777. TODO-verify exact FPS / ms numbers against the I3D 2016 paper (cached PDF did not decode).
-- **Implied on M1 MBA.** Traversal shader cost is within a few percent of plain SVDAG, so implied throughput is ~50-80 MRays/s (same as §2.2). The win is the **memory ceiling**: where SVDAG at 256³ already fits comfortably, SSVDAG matters if we push toward 2048³+ on 8 GB unified memory, because symmetry-heavy CA rules may produce large mirror-redundant regions.
+- **Reported number.** Table 2 verifies the memory win: at 64K³, Powerplant is **85.8 MB SSVDAG** versus **167.3 MB SVDAG**; Boeing 777 is **2,314.4 MB SSVDAG** versus **4,307.9 MB SVDAG**, fitting a 4 GB GTX 980 where the plain SVDAG is over budget. The authors summarize the 64K³ average as **52.4% of SVDAG storage** after symmetry plus pointer compaction. Rendering is intentionally not optimized; for Powerplant at 64K³, 720p hard-shadow views run at **74/70/36 fps SSVDAG** versus **87/82/43 fps SVDAG** for the three views, so the traversal tax is about 15-16%.
+- **Implied on M1 MBA / M2.** GTX 980 bandwidth is ≈ 224 GB/s. A bandwidth-only translation puts the Powerplant SSVDAG views at about **45/48/93 ms on M1** and **30/32/62 ms on M2** before accounting for driver/API differences. The win is still mainly the **memory ceiling**, not raw shader speed: SSVDAG roughly halves large symmetry-rich models, which matters only when plain SVDAG would otherwise push the 8 GB M1 budget.
 - **Verdict.** **Could adopt, not today.** Our CA rules are not symmetry-seeking by design (gravity breaks vertical symmetry; sand/water flow is directional). Expected win for *our scenes* is smaller than for CAD / architectural assets. Keep on the options shelf for post-1024³ scale work.
 
 ### 2.4 Careil, Billeter, Eisemann (2020), "Interactively Modifying Compressed Sparse Voxel Representations" (HashDAG)
 
 - **Core idea.** Embed the DAG into a GPU hash table so subtrees can be found, inserted, and reused *during editing* without decompressing and re-hash-consing the whole tree. Editing works bottom-up: compute new leaves, look them up in the hash table, promote found-or-inserted pointers up the tree. Reference implementation at <https://github.com/Phyronnaz/HashDAG>.
-- **Reported number.** Interactive carving, filling, copying, and painting on 64K³ and 128K³ scenes at rates described as "interactive" (single-digit-ms edit latencies for localized strokes). TODO-verify per-edit latency table against CGF 2020.
-- **Implied on M1 MBA.** The critical-path operation is a single GPU hash probe per leaf being edited, plus log-height promotion. Hash-probe cost is bandwidth-bound on unified memory, so the per-edit latency should scale with our bandwidth ratio (roughly 3× slower than the reported discrete-GPU numbers). Expect **low-ms per localized edit** on M1 MBA at 256³–1024³, assuming the hash table fits in the ≈ 8 GB budget.
+- **Reported number.** The primary paper is more careful than the earlier summary: the prototype edits the DAG on an Intel i7-8700K CPU and renders with CUDA on an RTX 2080. It demonstrates Epic Citadel at **64K³ and 128K³**, with small edits up to **350k / 2.5M voxels** and large edits up to **350M / 3G voxels** respectively. The text's locked claim is compute time **"in the order of milliseconds"** for scenes with 10^15 voxels and edits of several million voxels, including color attributes; it also calls CPU→GPU transfer of modified data **tens of milliseconds** in the prototype and garbage collection for Epic Citadel 64K³ **25 seconds** unoptimized.
+- **Implied on M1 MBA / M2.** This is CPU-heavy editing plus GPU rendering, so raw GPU bandwidth scaling is the wrong lens. The relevant takeaway for us is architectural: dynamic compressed-domain edits are feasible, but the prototype's upload path would be a user-visible bottleneck unless changes are batched into one buffer and scattered on-GPU. Our current CPU SVDAG incremental upload numbers (§5) are already tiny at 256³ (mean 19.6 KB, max 79 KB per step), so the HashDAG lesson is about moving lookup/insertion to the GPU before 1024³+ churn makes CPU hash-consing the limiter.
 - **Verdict.** **Closest match to our use case. Already on the Phase-B roadmap** (SPEC §Rendering step 5). We need dynamic editing because CA rules mutate the world every tick. This is the target shape for the hash-consed-store-on-GPU that our current CPU-side hashlife approximates. Pure "adopt next."
 
 ### 2.5 Molenaar & Eisemann (2023), "Editing Compressed High-resolution Voxel Scenes with Attributes"
 
 - **Core idea.** HashDAG as published handles only binary occupancy. This paper extends it with compressed per-voxel attributes (colors, materials) decoupled from geometry and laid out along a 3D Morton curve, indexed by popcount of non-empty voxels preceding the current voxel. Provides one lossless and one lossy attribute-compression variant, both compatible with interactive editing.
-- **Reported number.** Benchmarked on Intel i9 (10th gen) + NVIDIA RTX 3070 Ti, Linux, on voxelized Epic Citadel / Lumberyard Bistro / San Miguel. Comparisons against Dado (lossless) and Dolonius (lossy) schemes. TODO-verify exact edit and read latencies from CGF 2023 table.
-- **Implied on M1 MBA.** RTX 3070 Ti has ≈ 608 GB/s memory bandwidth; M1 8-core has ≈ 68 GB/s, a 9× gap. Expect **~5-10× slower per attribute lookup** on M1 for the lossless path, which is still sub-ms for localized reads. The 3D Morton-curve indexing is compute-cheap and bandwidth-friendly, so the ratio holds.
+- **Reported number.** The CGF 2023 paper uses a 10th-generation Intel i9 and RTX 3070 Ti on Linux. The lossless CUDA path compresses at **over 20 GB/s**, roughly two orders of magnitude faster than Dado in their setup. The lossy CPU path runs at **roughly 1 GB/s** and typically uses **30-80% more memory** than Dolonius' offline method. In the Citadel 32K³ painting session, the lossy path adds **roughly 13 ms (~50%)** to each frame; the GPU-accelerated lossless path slightly outperforms the HashDAG baseline in that session.
+- **Implied on M1 MBA / M2.** RTX 3070 Ti has ≈ 608 GB/s memory bandwidth; M1 8-core has ≈ 68 GB/s and M2 ≈ 100 GB/s. A naive bandwidth translation would make the lossless path ~6-9× slower on M-series, but the absolute rates remain plausibly interactive for localized chunks. The important adoption constraint is not lookup speed; it is whether our material attributes can be chunked so recompression stays local and deterministic under CA edits.
 - **Verdict.** **Required for our use case.** Our CA is material-typed, not binary — "sand" ≠ "water" ≠ "air" matters. HashDAG alone does not give us this. Adopt together with §2.4; they are a pair. Lossless path likely the right default for CA (distinct material types don't tolerate quantization).
 
 ### 2.6 Sparse 64-trees (dubiousconst282, 2024, blog + reference impl)
@@ -83,11 +85,26 @@ Cross-reference for implied-number math: M1 MBA 8-core GPU ≈ 2.6 TFLOPS FP32, 
 - **Implied on M1 MBA.** This *is* our hardware class. At a rough 1 GHz iGPU shader clock and 6,358 cycles/ray, the raw ray cost is ~6.4 µs/ray — but that's serial cost; with 1024 SIMD lanes live, per-shader-core throughput is ~1 Gray/s, and M1 has 8 cores, so aggregate ceiling ~8 Gray/s. Our 576k rays/frame fits in <0.1 ms of compute under that model, which is within a factor of 2 of our measured headless 0.19 ms bench. **The 64-tree numbers predict our real measurement, which is a strong signal the underlying per-ray model is right.**
 - **Verdict.** **Strongest candidate for post-SVDAG refactor.** Memory density beats SVDAG on real scenes. Shader is simpler (single popcount per step vs. the chained child-mask test + child-pointer fetch of SVDAG). Hashlife-style memoization would need rework — the 64-ary factor breaks our current 8-ary hash-cons boundaries, so it is not a drop-in. Parked as a future optimization with a clear expected win (~1.5-2× throughput) but requiring simultaneous changes to the sim-side octree.
 
+### 2.7 2026-05-03 M2 reconciliation (`hash-thing-63gv`)
+
+The primary-source pass changes the strategic read less than it changes the confidence. The old §2 secondary-summary numbers were directionally right for Kämpe/SSVDAG/HashDAG, but ESVO's cited hardware was wrong, and HashDAG's text does not promise a clean single-digit-ms table for all edit classes. The stronger conclusion is now:
+
+| Literature anchor | Paper-scaled expectation on M2 | Our nearest M2 measurement | Gap attribution |
+|---|---:|---:|---|
+| ESVO 1024×768 primary rays, Quadro FX 5800 | ~5-29 ms/frame at 1024×768 | `render_gpu` 0.10-0.16 ms mean at 256³/1024³ scene-matrix cells (§3.12); 4096³ seeded raycast 0.30 ms mean (§3.10.5.1) | Faster by one to two orders of magnitude because our measured primary-ray hot set is tiny and warp-coherent; ESVO includes contour traversal and larger per-scene depth. |
+| Kämpe SVDAG secondary rays, GTX 680 | ~90-125 MRays/s on M2 for 170/240 MRays/s paper rows; ~5-7 ms for 576k Kämpe-like rays | 0.10-0.30 ms compute-pass rows for primary rays (§3.12), 0.30 ms mean at 4096³ (§3.10.5.1) | Faster than paper-scaled secondary-ray expectation; our workload is primary rays over a heavily deduplicated live terrain DAG, not AO/shadow rays over 128K³ Citadel. |
+| SSVDAG Powerplant 64K³ 720p hard-shadow views, GTX 980 | ~30/32/62 ms on M2 for the three paper views | No SSVDAG implementation; plain SVDAG 4096³ seeded primary rays = 0.30 ms mean (§3.10.5.1) | SSVDAG is a memory-ceiling technique for symmetry-rich assets, not a near-term speed fix. The measured bottleneck is not SVDAG node memory. |
+| HashDAG compressed-domain edits, i7-8700K + RTX 2080 | Millisecond-class CPU edit compute for several-million-voxel edits; tens-ms prototype CPU→GPU upload caveat | CPU SVDAG incremental upload at 256³ warm = 19.6 KB mean / 79 KB max (§5); sim step, not render upload, is the active bottleneck | HashDAG remains the right long-term update shape, but today's 256³ renderer does not need GPU-resident edit hashing yet. |
+| Molenaar attributes, i9 + RTX 3070 Ti | Lossless >20 GB/s on RTX 3070 Ti; naive M2 bandwidth scale ~3 GB/s; lossy CPU ~1 GB/s before M-series scaling | No attribute compression path yet; materials are inline leaf state today | Required if/when HashDAG-style GPU editing grows beyond compact material tags. Not a current render-frame limiter. |
+| Sparse 64-trees, integrated GPU blog | Blog's 6,358 cycles/ray predicts sub-ms primary-ray traversal on integrated GPUs | 4096³ seeded raycast = 0.30 ms mean / 1.06 ms p95 (§3.10.5.1) | Closest qualitative match to our measured raycast cost. The paper-scaled SVDAG/ESVO envelopes were too pessimistic because the live ray frontier stays L1-hot. |
+
+**Bottom line for perf triage.** The literature does **not** show a 3-5× missing raycast optimization in today's engine. Our M2 primary-ray SVDAG traversal is already faster than ESVO/SVDAG bandwidth-scaled expectations for comparable ray counts, and the sparse-64 integrated-GPU model is the one that best predicts the sub-ms measurement. Render-side user-visible frame time is therefore still a surface-acquire / compositor / render-scale problem, while the critical game-loop bottleneck is simulation step latency. The adoption order from §2 still stands: HashDAG + attributes for dynamic large-world editing later; SSVDAG/sparse-64 only after the sim-side shape needs them.
+
 ---
 
 **Not yet surveyed (follow-up beads):** Transform-Aware SVDAGs (2025), Occupancy-in-memory-location (Modisett), Aokana (2025), Hybrid voxel formats (2024). These are listed in SPEC.md §Rendering and will be covered once the core lineage (2.1-2.6) is rock-solid. File as `hash-thing-stue.1.x` children.
 
-**For each paper, §2 captures:** core idea in one paragraph; the performance number they report and on what hardware; the number their technique implies on our reference hardware (M1 MBA), accounting for clock/bandwidth/cache differences; whether their technique is something we already do, could adopt, or have ruled out — and why.
+**For each paper, §2 captures:** core idea in one paragraph; the performance number they report and on what hardware; the number their technique implies on our reference hardware (M1 MBA) and current dev hardware (M2), accounting for clock/bandwidth/cache differences; whether their technique is something we already do, could adopt, or have ruled out — and why.
 
 ---
 
@@ -110,18 +127,19 @@ TODO-verify: L1 cache size per GPU core; most public sources report "per-cluster
 
 ### 3.2 Node encoding (from the source)
 
-Our serialized interior node is **9 u32 = 36 bytes**:
+Our serialized interior node is **11 u32 = 44 bytes**:
 - `slot[0]`: child_mask (low 8 bits = octant occupancy, bits 8-23 = representative material for LOD shading).
-- `slot[1..=8]`: eight child entries, each a packed `(is_leaf << 31) | payload`. Leaves are inline — no separate leaf-node fetch — with the 16-bit material state in `payload`.
+- `slot[1..=2]`: 64-bit grandchildren occupancy mask, split into low/high words, 8 bits per child octant.
+- `slot[3..=10]`: eight child entries, each a packed `(is_leaf << 31) | payload`. Leaves are inline — no separate leaf-node fetch — with the 16-bit material state in `payload`.
 
 Per traversal step inside the shader:
 
-1. **One dependent u32×9 load** for the current node's 36 bytes.
+1. **One dependent u32×11 load** for the current node's 44 bytes.
 2. **O(1) arithmetic** to compute the octant index from the ray's position relative to the node's midpoint.
-3. **One indexed read** into `slot[1 + octant]` — already in registers from step 1, no additional memory.
+3. **One indexed read** into `slot[3 + octant]` — already in registers from step 1, no additional memory.
 4. Branch: `is_leaf` → shade and exit; else follow `payload` (child offset) back to step 1.
 
-So one traversal step costs **~36 B of GPU memory traffic** plus a handful of ALU ops. No hash probes (unlike HashDAG); no popcount (unlike 64-tree); no contour decode (unlike ESVO).
+So one traversal step costs **~44 B of GPU memory traffic** plus a handful of ALU ops. No hash probes (unlike HashDAG); no popcount (unlike 64-tree); no contour decode (unlike ESVO).
 
 ### 3.3 Per-ray cost
 
@@ -139,7 +157,7 @@ The prior model guessed ~4 steps/ray. The measured mean is **~4× larger**. The 
 
 *Scope note:* these numbers are for the default-spawn primary-ray sample only. Secondary rays (shadows, GI) would have a different distribution; broader scene coverage would need a live-telemetry path, out of scope for stue.5.
 
-**Per-step latency.** On an integrated unified-memory GPU, a dependent u32×9 load:
+**Per-step latency.** On an integrated unified-memory GPU, a dependent u32×11 load:
 - L1 hit (same cache line as previous step, common when rays in a warp share ancestors): ~4-8 ns amortized.
 - L2 hit (shared 4 MB, hit rate high because the frontier of nodes being traversed fits): ~15-30 ns.
 - Memory miss (unlikely inside a hot frame because the reachable node set at 256³ is ≪ 4 MB — see §3.5): 150-200 ns.
@@ -150,7 +168,7 @@ Assume an 80/20 L1/L2 mix for the typical ray: `0.8 × 6 ns + 0.2 × 22 ns ≈ 9
 
 ### 3.4 Frame cost at 256³ × 50% render scale
 
-576k rays × 15 steps/ray (measured mean, §3.3) × 36 B/step = **~311 MB of node traffic per frame**.
+576k rays × 15 steps/ray (measured mean, §3.3) × 44 B/step = **~380 MB of node traffic per frame**.
 
 At 68 GB/s, this is `311 MB / 68 GB/s ≈ 4.6 ms` in bandwidth-limited form. The shader also writes 576k pixels × 8 B (Rgba16Float) = 4.6 MB per frame — another ~0.07 ms. Plus instruction-issue overhead and imperfect bandwidth utilization (realistic peak is ~60% of spec on Apple Silicon for ray-tracing workloads) gives a **predicted envelope of ≈ 7.6 ms / frame** on M1 MBA for pure SVDAG traversal + raycast write. (Pre-stue.5 this section predicted ~2 ms using a 4-step guess; measurement now pushes it upward to ~7.6 ms, *widening* the gap vs the ~0.24 ms measurement — see §3.6.)
 
@@ -158,7 +176,7 @@ At 68 GB/s, this is `311 MB / 68 GB/s ≈ 4.6 ms` in bandwidth-limited form. The
 
 ### 3.5 Working-set check
 
-At 256³ our hash-consed DAG typically has on the order of 10⁴ to 10⁵ unique interior nodes (measured on steady-state scenes; TODO-verify with a live histogram). At 36 B/node, the entire reachable DAG is **0.4 MB to 4 MB**, which fits the M1 L2. That is why we should not be seeing DRAM-latency (150 ns) loads inside the traversal hot path at this scale.
+At 256³ our hash-consed DAG typically has on the order of 10⁴ to 10⁵ unique interior nodes (measured on steady-state scenes; TODO-verify with a live histogram). At 44 B/node, the entire reachable DAG is **0.44 MB to 4.4 MB**, which fits or nearly fits the M1 L2. That is why we should not be seeing DRAM-latency (150 ns) loads inside the traversal hot path at this scale.
 
 This is the model's strongest prediction: **at 256³ the SVDAG frame-cost on M1 MBA should be bounded by L1/L2 bandwidth, not DRAM bandwidth and not compute.** If measurement shows DRAM-bound behavior, the model is wrong *or* the working set is somehow cache-thrashing.
 
@@ -336,7 +354,7 @@ The instructive finding, though, is not the null — it is the **steady-state co
 
 Edward directive 2026-04-20: *"I'm always only interested in the 4096 cubed case."* Sections 3.1–3.6 derive the envelope at 256³ — the bench-harness default, not the demo target. This subsection re-runs the derivation at 4096³ from first principles. Every number here is model-only; §5 gains 4096³ rows only for what can be (or has been) cheaply measured. The dlse.2 present-path investigation (§3.7–§3.9) is world-size-independent and carries over unchanged.
 
-**3.10.1 Octree depth.** `log₂(4096) = 12`, vs `log₂(256) = 8` — four extra levels of descent. The SVDAG interior-node encoding (§3.2) is unchanged (36 B), so depth scaling enters the model through traversal step count (§3.10.2) and reachable-set size (§3.10.3) only.
+**3.10.1 Octree depth.** `log₂(4096) = 12`, vs `log₂(256) = 8` — four extra levels of descent. The SVDAG interior-node encoding (§3.2) is 44 B after `hash-thing-iqx7`, so depth scaling enters the model through traversal step count (§3.10.2), reachable-set size (§3.10.3), and the larger per-node traffic constant.
 
 **3.10.2 Per-ray traversal at 4096³.** The stue.5 harness measured ~15 mean DDA steps/ray at 256³ default-spawn (§3.3). Two scaling forces:
 
@@ -365,7 +383,7 @@ Implication for §3.10.5: the base-case per-frame step count is **~576k × 26 �
 | 1024³ | 61,399 | 2.11 MB | ~3.0× per 2× linear |
 | **4096³ (seeded, pre-CA)** | **548,179** | **~18.8 MB** | **~3.0× per 2× linear (projection confirmed)** |
 
-From 256³ onward the exponent is stable at `log(3)/log(2) ≈ 1.58` in linear world size. Confirmed by one-shot `bench_hashlife_4096` seed (onyx 2026-04-21): 548k reachable nodes at 4096³ seeded terrain — exactly on the `L^1.58` projection (1024³ × 4^1.58 ≈ 551k). Total serialized DAG: ~18.8 MB (548k × 36 B).
+From 256³ onward the exponent is stable at `log(3)/log(2) ≈ 1.58` in linear world size. Confirmed by one-shot `bench_hashlife_4096` seed (onyx 2026-04-21): 548k reachable nodes at 4096³ seeded terrain — exactly on the `L^1.58` projection (1024³ × 4^1.58 ≈ 551k). Total serialized DAG after `hash-thing-iqx7`: ~24.1 MB (548k × 44 B).
 
 Warm-run post-CA node count was not measured — the test runner's 60-second ignore-mode ceiling killed the first hashlife step before it completed, so the warm (post-step) reachable-node count and macro-cache size remain unmeasured at 4096³. The cold-seeded count is a lower bound; CA churn grows the reachable set by some factor (at 256³, warm grows ~8 % vs cold; scaling is not yet characterized).
 
@@ -379,7 +397,7 @@ This mix is **speculative**, not derived. The actual mix at 4096³ depends on ho
 
 §3.10.5's envelope and likely-measurement predictions are re-derived under all three scenarios (optimistic / mid / pessimistic) rather than only the mid one, so the user of this section can pick the assumption they consider most plausible.
 
-**3.10.5 Frame cost envelope at 4096³.** Holding render scale at 50 % (960×600, 576k rays) on the M1 MBA target. Per-frame node traffic (bandwidth ceiling, unaffected by cache mix), **post-cz0r measurement with default-spawn mean = 26 steps/ray**: `576k × 26 × 36 B ≈ 540 MB`, `540 MB / 68 GB/s ≈ 7.9 ms` raw, `÷ 0.6 utilization ≈ 13.2 ms` envelope. (Horizontal-mid at mean=24 gives a near-identical 12.2 ms envelope; looking-down at mean=17 gives 8.6 ms — the worst default-spawn case drives the budget.)
+**3.10.5 Frame cost envelope at 4096³.** Holding render scale at 50 % (960×600, 576k rays) on the M1 MBA target. Per-frame node traffic (bandwidth ceiling, unaffected by cache mix), **post-cz0r measurement with default-spawn mean = 26 steps/ray**: `576k × 26 × 44 B ≈ 659 MB`, `659 MB / 68 GB/s ≈ 9.7 ms` raw, `÷ 0.6 utilization ≈ 16.2 ms` envelope. (Horizontal-mid at mean=24 gives a near-identical 14.9 ms envelope; looking-down at mean=17 gives 10.8 ms — the worst default-spawn case drives the budget.)
 
 Per-step-latency path, spanning the three §3.10.4 scenarios (rays grouped into 32-wide SIMD groups on M1; the divisor assumes groups descend together so shared ancestor loads are not duplicated):
 
@@ -423,7 +441,7 @@ Surface-attached plateau (187 ms) minus off-surface plateau (154 ms) ≈ 33 ms o
 
 **Goal:** fill out the `(world × render_scale)` matrix for compute-pass GPU time, compare against the paper's envelopes, and pick the next shader opt if one is worth shipping.
 
-**Method (onyx 2026-04-22, M2 MBA 16 GB, bench profile, `HASH_THING_FREEZE_SIM=1`, default-spawn camera, warmup-line dropped).** Raw logs under `/tmp/o98b-*.log`; analysis in `.ship-notes/o98b-measurement-log.md`.
+**Method (onyx 2026-04-22, M2 MBA 16 GB, bench profile, `HASH_THING_FREEZE_SIM=1`, default-spawn camera, warmup-line dropped; historical profile renamed to `perf` per `xer4`).** Raw logs under `/tmp/o98b-*.log`; analysis in `.ship-notes/o98b-measurement-log.md`.
 
 | size × scale  | rays   | compute (`render_gpu`) mean / p95 (ms) | `render_pass_gpu` mean / p95 (ms) | `surface_acquire_cpu` mean / p95 (ms) | `submit_cpu` mean / p95 (ms) | effective frame (~FPS) |
 |---------------|-------:|---------------------------------------:|----------------------------------:|--------------------------------------:|-----------------------------:|-----------------------:|
@@ -459,7 +477,7 @@ Key v3 corrections relevant to this paper:
 
 ### 3.14 Cold-gen baseline at 1024³ and 4096³ (`hash-thing-71t7`, `hash-thing-cswp`)
 
-Baseline cold-gen latency for the today-codepath, captured before gen-time hash-consing (cswp.3) lands. Bench harness: `tests/bench_cold_gen_big_map.rs`, 3-run mean, bench profile. M2 16 GB, commit 8fdfd6b. Procedural terrain via `TerrainParams::for_level` (scale-aware defaults).
+Baseline cold-gen latency for the today-codepath, captured before gen-time hash-consing (cswp.3) lands. Bench harness: `tests/bench_cold_gen_big_map.rs`, 3-run mean, bench profile (historical profile renamed to `perf` per `xer4`). M2 16 GB, commit 8fdfd6b. Procedural terrain via `TerrainParams::for_level` (scale-aware defaults).
 
 | Scale | Total mean (ms) | Precompute mean (ms) | gen_region mean (ms) | Pop | Reachable nodes |
 |---|---:|---:|---:|---:|---:|
@@ -483,7 +501,7 @@ cargo test --profile perf --test bench_cold_gen_big_map -- --ignored --nocapture
 
 cswp.3 was filed expecting "≥10× faster than cswp.1's baseline" from adding gen-time hash-cons. Reading the gen pipeline (`World::seed_terrain` → `terrain::gen::gen_region`, `src/sim/world.rs:2459` → `src/terrain/gen.rs:89`) shows the path already builds the SVDAG via recursive `Builder::build` with two intern channels: `WorldGen::classify` short-circuits uniform sub-cubes to `store.uniform`, and the recursive case interns the 8-child node via `store.interior`. cswp.1's measurements (§3.13) ARE the hash-cons-on numbers — the 10–50× analytical estimate was anchored to the stale 25 s no-dedup projection (`hash-thing-stue.2`), which the current codepath already beats by ~100×.
 
-Verified on the same M2 16 GB / bench profile via `tests/verify_gen_hash_cons.rs` (3-run identity + dedup-ratio assertion at each scale):
+Verified on the same M2 16 GB / bench profile (historical profile renamed to `perf` per `xer4`) via `tests/verify_gen_hash_cons.rs` (3-run identity + dedup-ratio assertion at each scale):
 
 | Scale | Voxels | Reachable nodes | voxel/node ratio | Pop |
 |---|---:|---:|---:|---:|
@@ -601,7 +619,7 @@ First pass (2026-04-20, bead `hash-thing-stue.3`, spark). Measurements from `tes
 **Measured at 256³ (terrain + water/sand, 40 warm steps):**
 
 - **Hashlife cache misses (new subtree computations): ~1,847 per step** (73,884 summed).
-- **SVDAG new-slot appends: ~544 per step** (mean 4,892 u32s/step ÷ 9 u32s per interior slot).
+- **SVDAG new-slot appends: ~544 per step** (historical 9-word slot measurement: mean 4,892 u32s/step ÷ 9 u32s per interior slot; after `hash-thing-iqx7`, the same slot count would be 5,984 u32s/step).
 - **Cache hits: ~2,222 per step** (88,899 summed), **hit rate: 54.6%**.
 - **Empty-subtree skips: ~1,670/step** (66,798 summed) — no CA work needed for empty subtrees.
 - **Fixed-point skips: ~930/step** (37,219 summed) — inert uniform subtrees that step to themselves.
@@ -679,7 +697,7 @@ The two hypotheses predict the same `surface_acquire_cpu` reduction. Disambiguat
 **Measured at 256³ (terrain + water/sand, 40 warm steps), release profile:**
 
 - **Upload bytes/step: mean 19.6 KB, max 79 KB.**
-- **New u32s appended to `Svdag::nodes` per step: mean 4,892 (~544 new 9-u32 slots), max 19,782 (~2,198 slots).**
+- **New u32s appended to `Svdag::nodes` per step: historical mean 4,892 (~544 new 9-u32 slots), max 19,782 (~2,198 slots).** After `hash-thing-iqx7`, the same slot counts are 11-u32 slots: ~5,984 mean u32s and ~24,178 max u32s.
 - **Full buffer at cold: 66,061 u32s = 258 KB (7,340 reachable nodes).** A full re-upload is 13× the mean incremental upload.
 - **Compactions fired in 40 steps: 0.** No full re-uploads happened in the measurement window.
 
@@ -761,7 +779,7 @@ Projecting to 4096³ (`L/256 = 16`) across three framings:
 - **1.08-slope pessimism (assumes saturation reverses):** `1,847 × 16^1.08 ≈ 37k misses/step`.
 - **Continued bend (assumes `256→512` slope 0.31 holds at larger scales):** as low as `2,296 × 8^0.31 ≈ 4.3k misses/step`.
 
-**Revised honest span: ~4k–40k misses/step at 4096³**, versus the prior two-point `20k–80k`. The upper end shrinks because the three-point evidence actively refutes `L^1.4+`; the lower end widens because the 512³ measurement opens the possibility of continued saturation. Applying the measured ~30 % slot-append ratio (1,847 misses → 544 SVDAG slot appends at 256³): **~1.2k–12k slot appends/step at 4096³**, translating to **~40 KB–440 KB upload per step** (4 B slot-0 header + slots × 36 B).
+**Revised honest span: ~4k–40k misses/step at 4096³**, versus the prior two-point `20k–80k`. The upper end shrinks because the three-point evidence actively refutes `L^1.4+`; the lower end widens because the 512³ measurement opens the possibility of continued saturation. Applying the measured ~30 % slot-append ratio (1,847 misses → 544 SVDAG slot appends at 256³): **~1.2k–12k slot appends/step at 4096³**, translating to **~53 KB–528 KB upload per step** (4 B slot-0 header + slots × 44 B).
 
 At 60 FPS that is **~2–26 MB/s upload**, still under 0.1 % of the 68 GB/s memory-bandwidth ceiling. **Edward's diff-compressibility hypothesis holds at 4096³** across the whole revised band — with more headroom than the prior two-point projection suggested.
 
@@ -780,7 +798,7 @@ Two caveats on the exponent:
 Invocation (bump the shell timeout explicitly — don't rely on the default 2 min `Bash` budget):
 
 ```text
-cargo test --release --test bench_svdag bench_svdag_step_deltas_4096 \
+cargo test --profile perf --test bench_svdag bench_svdag_step_deltas_4096 \
     -- --ignored --nocapture
 ```
 
@@ -825,7 +843,7 @@ Plausible bands at 4096³:
 - **CPU step cost: the binding concern.** Scales directly with active-region misses; macro-cache short-circuits are load-bearing. The bench harness SIGKILLed a single 4096³ hashlife step at the 60-second ignore-mode ceiling — step cost is already ≫ per-frame budget without further optimization. ivms doesn't re-measure step cost; `hash-thing-hashlife-stride` is the adjacent bead that would.
 - Streaming not needed at 4096³ (strong claim). 8192³ *probably* needs streaming, but that call is intuition.
 
-**4.7.5a LOD policy fly-through measurement (`hash-thing-cswp.8.5`, flint 2026-04-27).** First end-to-end measurement of the cswp.8.3 chunk-LOD policy at the 4096³ design target. Bench: `tests/bench_flythrough_4096.rs`, M2 16 GB, profile=bench, base commit `3ad2ada`. Each `lod_bias` runs against a *fresh* world (per-bias `World::new + seed_terrain`, ~6–11 s cold-gen each) so cross-bias `nodes_max` and `growth_max` columns are not contaminated by prior biases' scaffold; trident-review cleanup of the original shared-world run. 8 trajectory samples per bias, sweeping diagonally from chunk (0,0,0) to chunk (31,31,31). **n=1, no warm-up filter** — these are single-run snapshots, not stabilized benchmarks. `hist` index = LOD level (0 = full detail … 4 = max collapse). Run with `cargo test --profile bench --test bench_flythrough_4096 -- --ignored --nocapture` (~11 min wall on M2 16 GB; multiply by ~1.5 for M1-equivalent dt_ms).
+**4.7.5a LOD policy fly-through measurement (`hash-thing-cswp.8.5`, flint 2026-04-27).** First end-to-end measurement of the cswp.8.3 chunk-LOD policy at the 4096³ design target. Bench: `tests/bench_flythrough_4096.rs`, M2 16 GB, profile=bench (historical profile renamed to `perf` per `xer4`), base commit `3ad2ada`. Each `lod_bias` runs against a *fresh* world (per-bias `World::new + seed_terrain`, ~6–11 s cold-gen each) so cross-bias `nodes_max` and `growth_max` columns are not contaminated by prior biases' scaffold; trident-review cleanup of the original shared-world run. 8 trajectory samples per bias, sweeping diagonally from chunk (0,0,0) to chunk (31,31,31). **n=1, no warm-up filter** — these are single-run snapshots, not stabilized benchmarks. `hist` index = LOD level (0 = full detail … 4 = max collapse). Run with `cargo test --profile perf --test bench_flythrough_4096 -- --ignored --nocapture` (~11 min wall on M2 16 GB; multiply by ~1.5 for M1-equivalent dt_ms).
 
 | `lod_bias` | dt_ms mean | dt_ms max | nodes_max | growth_max | hist[0..5] @ mid-traj |
 |---:|---:|---:|---:|---:|---|
@@ -1369,7 +1387,7 @@ recursive* transition across a *second* fence (D2 = L4 recursive → D3
   for `random_seed_42` matches between brute-force, recursive CPU,
   and GPU — three independent paths agree.
 
-**Throughput** (`gpu_level_5_throughput`, `--profile bench --ignored`,
+**Throughput** (`gpu_level_5_throughput`, `--profile perf --ignored`,
 N=64 worlds, 10 timed iters with fresh buffers each iter; M2 MBA,
 Apple Silicon Metal, in-encoder timestamps per dlse.2.3 methodology;
 matches abwm.3 §8.7 methodology):
@@ -1503,7 +1521,9 @@ runtime — are orthogonal to dispatcher correctness.
 | 2026-04-21 | onyx | §4.7.2, §5, §6 Q11 (bead `hash-thing-slc1`). Three-point memo-miss scaling measurement: 64³=411.75, 256³=1847.1, 512³=2295.8 misses/step (last confirmed twice to 0.01 %). Pair-wise slopes drop from **1.08** (64³→256³) to **0.31** (256³→512³); least-squares fit across all three: `L^0.863`. **The §4.7's "exponent blows up at 1024³+" worry is refuted in the 64³–512³ range** — scaling is *favorably* sub-linear, not super-linear. Revised 4096³ miss-count band: 4k–40k (vs prior 20k–80k two-point projection); upload-bandwidth band at 60 FPS tightens to 2–26 MB/s. Out-of-band 2048³/4096³ measurement remains unresolved — one 2048³ warm step ran >15 min of CPU in the current `#[ignore]` harness before being stopped, well past the 60s soft-ceiling. §6 Q11 marked partially resolved; follow-up bead filed for a long-timeout measurement workflow. |
 | 2026-04-21 | spark | §8.6 retro follow-ups (bead `hash-thing-ta8j`). Replaced the saturating 32-bucket probe-depth histogram with an exact `atomicMax` scalar in the WGSL shader — the N=10K/M=10K/LF=0.9 row's `maxP_miss` resolves from saturated-30 to exact 38 (insert/hit are confirmed exactly 30, not saturated). Added a cross-dispatch-fence comment in `cs_insert` warning a future abwm.3 integrator that queue-submit ordering is load-bearing and WGSL has no release-store. Softened flip condition #3 to match what the correctness test actually asserts (serialization of concurrent same-key inserts + value assertion on the winning slot) rather than an unmeasured 10× slowdown claim. Tightened §8.6 Scope prose to describe the packed-u32 keys the harness actually runs, not the production `(NodeId, parity)` fold (which lives in abwm.3). M-column footnote added. No verdict change: GO for linear probing still holds. |
 | 2026-04-22 | onyx | §3.11 update + new §3.12 (bead `hash-thing-o98b`). Scene-matrix compute-pass measurement at 256³/1024³ × 50%/100% on M2 MBA. **Compute (`render_gpu`) is flat at 0.10–0.16 ms mean across all four cells** — 16× voxel-count change, 4× ray-count change, and the warp-coherent L1 regime still holds. Every cell is dominated by `surface_acquire_cpu`; compute + render-pass GPU work never exceeds ~1 ms at any cell. §3.11's "GPU genuinely spending ~150 ms/frame at 1024³/100%" is **wrong**: the off-surface `render_gpu` plateau (51.77 / 154.04 ms, reproduced in o98b's cross-check) is the same Metal inter-command-buffer wait that §3.9 documented, not real shader time. The windowed compute timestamp for the same workload reads 0.16 / 0.30 ms. **Triage verdict: no shader-opt bead filed** — the three candidates (workgroup-cooperative ancestor caching, Laine-Karras, sparse-64) all shave sub-ms off a 0.16 ms pass against a 142 ms acquire stall. The real lowest-hanging win at 1024³/100% is swapchain-side (owned by `zytn` + dlse.2.2 descendants), not shader-side. Future perf beads proposing "optimise the raycast shader" should cite §3.12 and re-measure before spending engineering time. |
-| 2026-04-25 | cairn | §3.13 + §5 cold-gen baseline at 1024³/4096³ (bead `hash-thing-71t7`, parent `hash-thing-cswp`). New `tests/bench_cold_gen_big_map.rs` (3-run mean, bench profile). M2 16 GB measurements: **1024³ = 236.6 ms mean** (precompute 50.3 / gen_region 186.3), pop=510 M, 56k reachable nodes; **4096³ = 3,664.6 ms mean** (precompute 788.9 / gen_region 2,875.7), pop=32.6 G, 548k reachable nodes (§3.10.3 confirmation, 1×1×1 same numbers within run-to-run variance). 64× cell-count → 15.5× total time → sub-linear in cells; heightmap precompute scales precisely O(side²) (15.7× ≈ 16×). No OOM at either scale on 16 GB. Establishes the baseline against which gen-time hash-cons (cswp.3) will be measured; the prior "25 s single-thread cold-gen at 1024³" framing in cswp's description is already obsolete on the current codepath. |
+| 2026-04-25 | cairn | §3.13 + §5 cold-gen baseline at 1024³/4096³ (bead `hash-thing-71t7`, parent `hash-thing-cswp`). New `tests/bench_cold_gen_big_map.rs` (3-run mean, bench profile; historical profile renamed to `perf` per `xer4`). M2 16 GB measurements: **1024³ = 236.6 ms mean** (precompute 50.3 / gen_region 186.3), pop=510 M, 56k reachable nodes; **4096³ = 3,664.6 ms mean** (precompute 788.9 / gen_region 2,875.7), pop=32.6 G, 548k reachable nodes (§3.10.3 confirmation, 1×1×1 same numbers within run-to-run variance). 64× cell-count → 15.5× total time → sub-linear in cells; heightmap precompute scales precisely O(side²) (15.7× ≈ 16×). No OOM at either scale on 16 GB. Establishes the baseline against which gen-time hash-cons (cswp.3) will be measured; the prior "25 s single-thread cold-gen at 1024³" framing in cswp's description is already obsolete on the current codepath. |
 | 2026-04-25 | ember | New companion doc `docs/perf/cswp-lod.md` (bead `hash-thing-cswp.6`). Memory/streaming LOD *policy* for 4096³+ worlds — design only, no code, no re-derivation of perf-paper budgets. Distinguishes existing render LOD (already shipped, pixel-projected subtree skip per `svdag_raycast.wgsl:418-426`) from memory LOD (memory-resident granularity); proposes log₄ chunk-radius → LOD-level mapping; documents material-collapse policy options (status-quo "largest populated child" recommended as default per `svdag.rs:228-238`, fixed per-material priority flagged for edward as the second-place candidate); recommends hard-swap transitions over crossfade. The doc deliberately does **not** claim memory savings at 4096³ or revise §4.7.4's 8192³ streaming threshold — first attempt did, dual-reviewer pass (Claude + Codex, 2026-04-25) caught that the §5 derivation produced *more* reachable nodes under LOD than without, contradicting its own conclusion. §5 was rewritten as qualitative (shape, not magnitude); the impl sub-bead lands per-chunk measurements that turn the §5 hand-wave into real numbers. |
 | 2026-04-25 | spark | §8.7 GPU breadth-first dispatcher PoC + post-review tightening (bead `hash-thing-abwm.3`, code review fixes). Toy-rule (3D Life Bays-5766) hashlife dispatcher landed as `tests/bench_gpu_level_dispatcher.rs` (~1100 LOC). 27-intermediate / 8-subcube structure on a level-4 (16³) world, two GPU dispatches across separate `queue.submit` boundaries (cross-dispatch fence per the §8.6/abwm.2 comment), GPU == CPU cell-by-cell on a fixed 5-fixture corpus (empty / full / single-live / boundary-touching / random_seed_42 → 109 live cells in inner 8³). On M2 MBA at N=64 worlds: dispatch 1 (110 592 base-case threads) **0.085 ms median**, dispatch 2 (64 recursive threads) **0.019 ms median** — both well under the 1 ms per-dispatch criterion. Wall total 10.7 ms is dominated by spike-only CPU prep (~3-5 ms intermediate construction) and readback (~5-7 ms staging+map) — both disappear in real-sim integration. **Verdict: GO for the dispatcher mechanism**, CAVEAT on wall-time at this scale (decomposed: spike-scale artifact, not architecture). Hash-table memo deferred from the critical path here (NodeId pre-allocation + direct buffer indexing covers the same cross-dispatch-fence test); memo-in-critical-path validation is phase-4 scope. Recursive→recursive transition (level 5) and Margolus block-rule wiring are also phase-4. The §8.3 dispatcher sketch is sound. |
 | 2026-04-26 | spark | §8.8 GPU recursive→recursive transition at level 5 (bead `hash-thing-szqv`). Extends abwm.3 with three dispatches across two `queue.submit` fences. New `cs_step_l4_recursive_wg` (workgroup_size=64, no scratch — addresses Gemini's abwm.3 IMPORTANT on `var<private>` occupancy by direct-from-global stencil reads); new `cs_step_l5_recursive` (workgroup_size=64, 6.75 KB workgroup-shared `phase_a_results`, runtime-validated against `device.limits().max_compute_workgroup_storage_size`; barrier sequence S0/S1 between phase A and phase B). New `cpu_brute_force_l5_step` third-party oracle (naive 4-gen Bays-5766 stencil on 32³, no decomposition) catches shared-algorithm bugs the live-count tripwire alone can't. Three independent paths agree on `random_seed_42` → 909 live cells in inner 16³: brute-force CPU, recursive CPU, GPU dispatcher. On M2 MBA at N=64 worlds: d1 **0.076 ms**, d2 **0.085 ms**, d3 **0.076 ms** medians — d3 is ~13× under the 1 ms ceiling and ~2.1× under the planned 0.16 ms budget; d1 improves on abwm.3's 0.085 ms baseline despite 27× more invocations per world. **Verdict: GO for the recursive→recursive transition**, CAVEAT on wall-time (104 ms dominated by 36 ms cpu_inputs + 36 ms buf_alloc + 28 ms readback — same spike-scale artifact shape as §8.7, ~10× larger because L5 has ~8× the data of L4; ~0.24 ms is dispatcher GPU time, residual ~1.7 ms). Both fences in the §8.3 sketch are now validated. Phase-4 questions (hash-table memo in critical path, Margolus block-rule, NodeId allocation at runtime) are orthogonal to dispatcher correctness — the architecture under test is sound for level 5. Plan-review tier was dual (Claude proceed-with-adjustments; Codex hung pc95) — adjustments incorporated: D3 workgroup-size locked, barrier sequence pinned, runtime budget validation, brute-force oracle added. Code-review tier was triple (Claude LGTM-WITH-FIXES, Gemini LGTM; Codex hung pc95 — fix-pass commit addressed I1 cpu_prep timer scope split, I2 per-iter residual decomposition, I3 verdict-line split). |
+| 2026-05-03 | moss | Post-ecmn/ite4 perf-doc refresh (bead `hash-thing-18kn`). SPEC now points at the current default scheduler (`RayonBfs`) and the canonical post-ite4 row for `demo · default-terrain · microchurn · saturated`: step median ≈ 6.7 ms (`--profile perf`, M2-class hardware). This supersedes the older vqke-era step-latency field reading for that coordinate; the separate memo_hit 0.41→0.72 row remains less tightly coordinated (`intensity=unknown`). README now points at the structured hard-regime cascade rows instead of the stale 5.6× field reading. Canonical audit rows live in `docs/perf/regimes.md`. |
+| 2026-05-03 | moss | §2 primary-source reconciliation (bead `hash-thing-63gv`). Replaced the deferred §2 TODO-verify claims for ESVO, Kämpe SVDAG, SSVDAG, HashDAG, and Molenaar attributes with parsed primary-PDF numbers, added M2 implied rows, and added §2.7. Conclusion: current M2 primary-ray traversal is already faster than ESVO/SVDAG bandwidth-scaled expectations; sparse-64 integrated-GPU numbers best match the sub-ms measurement; render/user-visible work remains surface-acquire/render-scale, while the game-loop bottleneck is sim step. |

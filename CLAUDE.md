@@ -2,32 +2,23 @@
 
 ## Crew default workflow
 
-**Every code-touching bead runs `/ship-auto <bd-id>`.** See `.agents/commands/ship-auto.md`. Headless — no human plan-gate — **but plan review and code review still run** (tiers per `.agents/skills/review-tiers/`, dual minimum). Trident is **2 Claude + 3 Codex + 1 Gemini** (per hash-thing-2kkt: evolutionary-Claude lens dropped, Codex covers the evolutionary angle).
+`/crew` is the workflow. See `~/.claude/commands/crew.md` + `~/.claude/skills/crew-playbook/phases/`. The lane phase decides full-playbook vs narrow-exception per bead.
 
-Escalate by parking the bead (`status=blocked` + structured ESCALATION comment), never by `AskUserQuestion`. The human sweeps `bd list --status blocked` on their own cadence.
+**Hash-thing examples for the `lane.md` "must run full playbook" list** (the generic categories in `lane.md` cover these; spelled out here so the renderer/sim contract isn't accidentally classified as "small"):
 
-**Narrow exception lane — may proceed without full /ship-auto** (per moss's 882n.7.1 proposal, narrowed 2026-04-20 by edward after a w1yq landed unreviewed under the old bug-fix clause):
-- Audit / triage / review / harness work.
-- Diagnostics, repro harnesses, assertions, test additions, logging, small reverts.
-- Review/audit setup work that doesn't change ship policy.
-
-Bug fixes — even narrow, even "restores documented broken behavior" — go through /ship-auto. The crew has demonstrated that "narrow bug fix" is easy to rationalize into shipping an untested architectural change (event-routing rewrite) with zero external review. An extra review is cheap.
-
-**Must go through /ship-auto** (no exception lane):
-- Any code fix that changes program behavior, including bug fixes.
-- New features or capability expansion, even if small.
-- Broad refactors / cross-module cleanups whose main value is code quality.
 - Algorithm, caching, serialization, buffer-layout, renderer/sim contract changes.
-- Changes to invariant-bearing paths.
-- Crew-policy changes that alter review gates, landing rules, or what counts as done.
+- Hashlife / SVDAG / chunk-LOD invariant paths (anything that touches `step_recursive`, the macro cache, the LOD policy, or the SVDAG hash-cons).
+- Bug fixes that "restore documented broken behavior" — these have shipped untested architectural rewrites under that label before (event-routing). Run the full playbook.
 
-If ambiguous, route through /ship-auto. An extra review is cheap; a shipped bug in invariant-bearing code is not.
+**Trident composition for this repo:** 2 Claude + 3 Codex + 1 Gemini (per hash-thing-2kkt: evolutionary-Claude lens dropped, Codex covers the evolutionary angle). Documented in `.agents/skills/review-tiers/SKILL.md`.
 
 ---
 
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
 **Use `.bin/bd` instead of bare `bd` for all commands.** The wrapper forces `bd` to use the repo-root shared `.beads` database/server from any worktree, preserves `BEADS_ACTOR` while hopping to main, and adds preflight checks on `bd close` so issues are only closed after the relevant commit is on `origin/main`.
+
+**Use `.bin/codex` instead of bare `codex` for any background invocation.** The wrapper emits a hang-warning preamble at the call site so the standard `~60s silence → TaskStop` mitigation is impossible to miss. See `hash-thing-27j9`.
 
 Gate-tier rules (when to pull edward in) live in global `~/.claude/CLAUDE.md` under "Gate Tiers." Default sensitivity applies here; amend the line below if the bar should move project-wide.
 
@@ -59,19 +50,20 @@ Each worktree has its own `target/` (no per-target-dir lock contention across co
 - **Bump the sccache cap** to `30G`: `export SCCACHE_CACHE_SIZE=30G` in your shell rc, then `sccache --stop-server` (it autorestarts on next call). Default 10 GiB is too small for the multi-crew working set.
 - **Don't run plain `cargo clean`** in a worktree expecting it to free disk fast — it just nukes that one worktree's target. The shared dep cost is in `~/Library/Caches/Mozilla.sccache` (sccache's storage). For real disk recovery, `rm -rf <worktree>/target` for idle worktrees.
 - **CI override:** `RUSTC_WRAPPER=""` in CI env block to skip sccache when the build is sandboxed and won't benefit.
+- **Reap stale worktree targets** (hash-thing-kqw0). Closed-bead worktrees keep their `target/` until reaped — that's where the project's actual disk pressure comes from, not active build cost. Run `scripts/reap-worktrees.sh` (dry-run by default) to see the action plan, then `--apply` to actually delete. The reaper only touches `target/` for worktrees whose seat-branch resolves to a CLOSED bead; codex pool, `worktree-*` cruft, and active builds are skipped. Wire it into a launchd plist with the absolute path for a daily cadence.
 
 ## Agent surface — where project skills and commands live
 
 This project is designed to work with **any of three CLI agents**: Claude Code (the primary seat), Codex Exec, and Gemini CLI. To keep the three in sync:
 
 - **`AGENTS.md`** is a symlink to this file (`CLAUDE.md`). Codex and Gemini auto-load `AGENTS.md`; Claude Code auto-loads `CLAUDE.md`. Same content, one source of truth.
-- **`.agents/commands/`** holds the project-local slash-command / prompt definitions that `/ship` and related workflows depend on: `code_review.md`, `code_review_critical.md`, `trident-code-review.md`, `trident-plan-review.md`, `ship.md`, `diagram.md`. These are **copies**, not symlinks into `~/.claude/`, so a fresh `git clone` on another machine has everything needed.
-- **`.agents/skills/`** holds the skill definitions the workflows reference, most importantly `review-tiers/SKILL.md` which `/ship` reads to pick its review tier.
-- **Refreshing from `~/.claude/`**: if edward updates his global Claude config, re-sync via `.agents/README.md`'s refresh command. Drift is a file the claude-md-edit queue (or any seat noticing stale content) should refile.
+- **`/crew` lives in user-global**: `~/.claude/commands/crew.md` + `~/.claude/skills/crew-playbook/phases/*.md` + `~/.claude/skills/human-gates/SKILL.md`, installed via the orchestrator-export port (o9zl). `crew-playbook` resolves the phase files at runtime; the `crew` slash command drives the loop.
+- **`.agents/commands/`** holds the project-local review-prompt definitions that the `/crew` `code-review.md` and `plan-review.md` phases dispatch into: `code_review.md`, `code_review_critical.md`, `trident-code-review.md`, `trident-plan-review.md`, `diagram.md`. Copies, not symlinks into `~/.claude/`, so a fresh `git clone` ports cleanly.
+- **`.agents/skills/`** holds skill definitions the project depends on, most importantly `review-tiers/SKILL.md` (consumed by the `/crew` plan-review and code-review phases for tier picks).
 
 **Why this matters for cost**: edward's Claude Code $200/month plan maxes out when trident is all-Claude (9 Claude agents). Shifting to multi-modal trident — **2 Claude + 3 Codex + 1 Gemini** — saves roughly 2/3 of Claude token spend. Only works if Codex and Gemini sessions can read the same project instructions and workflows, which is what this section, the AGENTS.md symlink, and `.agents/` together make possible.
 
-**When invoking Codex or Gemini on this project** (e.g. from `/ship` phase 6 review), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
+**When invoking Codex or Gemini on this project** (e.g. from `/crew`'s code-review or plan-review phase), the review prompt should point at `.agents/commands/code_review.md` (project-local) rather than `~/.claude/commands/code_review.md` (user-global). Treat the project-local review prompts as canonical for this repo.
 
 ## The crew
 
@@ -144,10 +136,10 @@ At every gate (including design gates):
 
 1. `bd update <id> --status blocked`
 2. `bd comments add <id> "<one-line reason — what edward needs to decide>"`
-3. Pull the next task off `bd ready` and start a fresh `/ship <id>`
+3. Pull the next task off `bd ready` and start a fresh `/crew <id>`
 4. Keep cycling — see the dry-queue section below
 
-Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/ship` end-to-end.
+Design-gate tasks stack up silently in the `blocked` queue for whenever edward next looks. Technical tasks keep flowing through `/crew` end-to-end.
 
 **Design gates are narrower than they look.** If a scout finds two independent implementations of the same bead, do NOT park at a human gate just because there's a choice to make. Review both and pick one yourself. Only genuine user-facing design calls (what the system *is*, not how it's built) warrant the gate. Internal-API / implementation-detail decisions are autonomous. See `hash-thing-52b` for the precedent.
 
@@ -186,19 +178,30 @@ Mayor should sweep for drift-parked beads during any invocation. Workers may unp
 
 **Human-initiated edits** (edward says "change CLAUDE.md, do X") are direct — any agent executes without queueing.
 
-## Sweep tiebreak — navigation epic wins
+## Sweep tiebreak — navigation epic wins ties, not priority bumps
 
-When picking from `bd ready` during sweep, **any open child or grandchild of
-`hash-thing-8ppq` (autonomous game-direction navigation epic) beats
-unrelated work of the same priority OR one priority step higher.** A P1
-child of 8ppq beats a P0 unrelated bead unless the unrelated bead is an
-active production-blocking breakage (build broken, tests red on main).
+When picking from `bd ready` during sweep, **at the SAME priority** prefer
+descendants of `hash-thing-8ppq` (autonomous game-direction navigation
+epic) over unrelated work. **Never override an explicit higher priority.**
 
-Rationale: the epic's children are the actual thesis-test work. Without
-this rule, P1/P2 leads under a P0 epic lose to unrelated P1s in the
-default `bd ready` ordering, and the epic becomes ceremony.
+Specifically:
+- Two P1s, one is an `8ppq` descendant: pick the descendant.
+- A P0 unrelated bead vs a P1 `8ppq` descendant: pick the P0.
+- A P0 `8ppq` descendant vs a P0 unrelated bead: prefer the descendant if
+  both have the same urgency profile; pick the unrelated one if it's a
+  jump-the-queue (mayor/edward-filed) P0 or production-blocking breakage.
 
-When in doubt at sweep time: prefer 8ppq descendants.
+Rationale: per project policy "P0 is reserved for mayor/edward — moving
+a bead to P0 is a deliberate jump-the-queue signal." The v1 nav-epic
+filing tried to override this with "P1 child beats unrelated P0," which
+adversarial code review caught as a one-way door demoting legitimate P0s
+(non-build-breaking perf regressions, mayor cleanups, etc.). v2 narrows
+to "tiebreak only at equal priority" so the sweep still naturally pulls
+toward the navigation epic without silently overriding the priority
+system.
+
+When in doubt at sweep time: respect explicit priority first; prefer
+8ppq descendants only when priorities tie.
 
 ## Perf claims cite regime coordinates
 
@@ -223,7 +226,7 @@ Commit at every natural boundary — plan file written, first test green, helper
 **The default lifecycle for any seat:**
 
 1. Claim the bead (`bd update <id> --claim`) on your worktree branch.
-2. Implement / review / fix on the worktree branch — normal `/ship` flow, this part doesn't change.
+2. Implement / review / fix on the worktree branch — normal `/crew` flow, this part doesn't change.
 3. **Before declaring the bead closed, land it on main.** Either fast-forward `origin/main` or create a merge commit to it. If the tree hasn't moved, fast-forward. If it has, pull main first, resolve locally, push main forward. No PR dance, no waiting for edward.
 4. `bd close <id>` fires *after* main has the work, not after the worktree branch does.
 
@@ -240,7 +243,7 @@ Commit at every natural boundary — plan file written, first test green, helper
 - Design-gate parking — the bead is `blocked`, not ready; the branch goes quiet until unparked.
 - A seat found a genuine user-facing design question and is waiting on edward — rare, always a bead comment first.
 
-**What this does NOT mean:** We're not adopting GitLab/GitHub PR review as a gate. The `/ship` review tiers (dual/triple/trident) still run; the crew still cross-reviews. The difference is that "push passes" → "land on main" is one step, not two.
+**What this does NOT mean:** We're not adopting GitLab/GitHub PR review as a gate. The `/crew` review tiers (dual/triple/trident) still run via the `code-review.md` and `plan-review.md` phase files; the crew still cross-reviews. The difference is that "push passes" → "land on main" is one step, not two.
 
 The prior divergence backlog (18 commits on `worktree-vast-leaping-allen`, 9 on `worktree-sleepy-wiggling-fountain`, both ahead of main) was a bug, not a feature. 52b-A is the cleanup for that specific instance.
 

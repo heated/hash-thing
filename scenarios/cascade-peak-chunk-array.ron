@@ -1,0 +1,14 @@
+(
+    name: "cascade-peak",
+    world: Medium,
+    level: Some(7),
+    scene: DefaultDemo,
+    rule_set: DefaultCa,
+    intensity: Cascade,
+    regime: NotApplicable,
+    backend: ChunkArray,
+    generations: 30,
+    warmup_generations: Some(5),
+    seed: 1,
+    comparator: Some("hashlife-recursive@same-scenario"),
+)

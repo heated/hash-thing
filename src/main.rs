@@ -1,11 +1,16 @@
+use hash_thing::octree::CellState;
 use hash_thing::perf;
 use hash_thing::player;
 use hash_thing::render;
-use hash_thing::scale::{CELLS_PER_METER, DEFAULT_VOLUME_SIZE, GROWTH_MARGIN};
+use hash_thing::scale::{CELLS_PER_METER, GROWTH_MARGIN};
 use hash_thing::sim;
+use hash_thing::sim::world::quarantine_atlas_mixed_containment_plan;
+use hash_thing::sim::world::QuarantineAtlasPattern;
 use hash_thing::terrain;
+use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, LAVA, LAVA_MATERIAL_ID};
 
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// hash-thing-imvg (vqke.1): timing data the sim thread returns alongside
@@ -43,6 +48,16 @@ enum AppUserEvent {
     /// records the wrapper / poll-lag perf samples, and calls
     /// `request_redraw()` so the next frame uses the fresh world.
     SimDone(Result<(sim::World, SimThreadTimings), String>),
+    /// The background world-growth worker finished. Rendering continues from
+    /// the previous SVDAG while this is in flight; the main thread restores
+    /// and uploads the grown world when the event arrives.
+    WorldGrowDone(WorldGrowResult),
+}
+
+struct WorldGrowResult {
+    generation: u64,
+    base_world_revision: u64,
+    payload: Result<sim::World, String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -62,11 +77,300 @@ use player::{CameraMode, LOOK_SENSITIVITY, PLAYER_HEIGHT, PLAYER_SPEED, PLAYER_S
 /// or stepping slowly — see hash-thing-q63.
 const LOG_INTERVAL_SECS: f64 = 2.0;
 const DEV_PROFILE_STEP_WARN_MS: u64 = 500;
+const WORLD_PREFETCH_MARGIN_METERS: f64 = 64.0;
+const DEFAULT_CLI_VOLUME_SIZE: u32 = 256;
+const DEMO_RENDER_SCALE: f32 = 0.25;
+const DEFAULT_DEMO_PERF_TRAIL_PATH: &str = ".ship-notes/demo-perf-trail.jsonl";
+const SOUP_PROSPECTOR_TILE: i64 = 16;
+const SOUP_PROSPECTOR_SIDE: i64 = 8;
+const SOUP_PROSPECTOR_DENSITY_PER_1000: u64 = 45;
+const SOUP_PROSPECTOR_ALIVE: ht_octree::CellState = hash_thing::octree::Cell::pack(1, 0).raw();
+const MEGASTRUCTURE_MODULE_SIDE: i64 = 8;
+const MEGASTRUCTURE_TILE_STRIDE: i64 = 16;
+const MEGASTRUCTURE_INITIAL_STAMPS: usize = 10;
+const MEGASTRUCTURE_OBJECTIVE_STAMPS: usize = 6;
+const SOUP_PROSPECTOR_PATTERN_SEEDS: [u64; 3] = [
+    0x5eed_0001_8a55_5003,
+    0x5eed_0002_8a55_5003,
+    0x5eed_0003_8a55_5003,
+];
 
 /// Minimum interval between `window.set_title` calls. 250 ms = 4 Hz,
 /// the threshold at which a human reads a changing number without
 /// jitter (hash-thing-4ioh).
 const TITLE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn record_gpu_timing_sample(
+    perf: &mut perf::Perf,
+    duration_metric: &'static str,
+    lag_metric: &'static str,
+    sample: render::RendererGpuTimingSample,
+) {
+    perf.record(duration_metric, sample.duration);
+    if let Some(lag) = sample.lag_frames {
+        perf.record_scalar(lag_metric, lag as f64);
+    }
+}
+
+#[derive(Debug)]
+struct DemoPerfTrail {
+    path: Option<std::path::PathBuf>,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl DemoPerfTrail {
+    fn from_env() -> Self {
+        let enabled = std::env::var("HASH_THING_DEMO_PERF_TRAIL")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+        if !enabled {
+            return Self {
+                path: None,
+                writer: None,
+            };
+        }
+        let path = std::env::var_os("HASH_THING_DEMO_PERF_TRAIL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_DEMO_PERF_TRAIL_PATH));
+        Self {
+            path: Some(path),
+            writer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn enabled_at(path: std::path::PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            writer: None,
+        }
+    }
+
+    fn append(&mut self, record: &serde_json::Value) {
+        if self.writer.is_none() && !self.open_writer() {
+            return;
+        };
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        let line = match serde_json::to_string(record) {
+            Ok(line) => line,
+            Err(err) => {
+                log::warn!("demo perf trail disabled: could not serialize record: {err}");
+                self.disable();
+                return;
+            }
+        };
+        use std::io::Write;
+        if let Err(err) = writeln!(writer, "{line}") {
+            log::warn!("demo perf trail disabled: could not write record: {err}");
+            self.disable();
+        } else if let Err(err) = writer.flush() {
+            log::warn!("demo perf trail disabled: could not flush record: {err}");
+            self.disable();
+        }
+    }
+
+    fn open_writer(&mut self) -> bool {
+        let Some(path) = self.path.as_ref() else {
+            return false;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                log::warn!(
+                    "demo perf trail disabled: could not create {}: {err}",
+                    parent.display()
+                );
+                self.disable();
+                return false;
+            }
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => {
+                self.writer = Some(std::io::BufWriter::new(file));
+                true
+            }
+            Err(err) => {
+                log::warn!(
+                    "demo perf trail disabled: could not open {}: {err}",
+                    path.display()
+                );
+                self.disable();
+                false
+            }
+        }
+    }
+
+    fn disable(&mut self) {
+        self.path = None;
+        self.writer = None;
+    }
+}
+
+fn summary_token<'a>(summary: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    summary
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+}
+
+fn parse_summary_f64(summary: &str, name: &str) -> Option<f64> {
+    let raw = summary_token(summary, name)?;
+    let end = raw
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+'))
+        .last()
+        .map(|(idx, ch)| idx + ch.len_utf8())?;
+    raw[..end].parse().ok()
+}
+
+fn parse_duration_pair_ms(summary: &str, name: &str) -> Option<(f64, f64)> {
+    let raw = summary_token(summary, name)?.strip_suffix("ms")?;
+    let (mean, p95) = raw.split_once('/')?;
+    Some((mean.parse().ok()?, p95.parse().ok()?))
+}
+
+fn demo_world_coord(volume_size: u32) -> &'static str {
+    match volume_size {
+        16 | 32 => "tiny",
+        64 => "small",
+        128 => "medium",
+        256 => "demo",
+        1024 => "large",
+        4096 => "huge",
+        _ => "pathological",
+    }
+}
+
+fn classify_demo_intensity(memo_summary: &str, sim_active: bool) -> &'static str {
+    if !sim_active {
+        return "idle";
+    }
+    let bfs_l3 = parse_summary_f64(memo_summary, "bfs_l3").unwrap_or(0.0);
+    if bfs_l3 >= 5_000.0 {
+        "cascade"
+    } else if bfs_l3 >= 100.0 {
+        "microchurn"
+    } else {
+        "passive-active"
+    }
+}
+
+fn classify_demo_regime(memo_summary: &str) -> &'static str {
+    let memo_tbl = parse_summary_f64(memo_summary, "memo_tbl").unwrap_or(0.0);
+    let memo_hit = parse_summary_f64(memo_summary, "memo_hit").unwrap_or(0.0);
+    let memo_churn = parse_summary_f64(memo_summary, "memo_churn").unwrap_or(0.0);
+    if memo_tbl == 0.0 {
+        "cold"
+    } else if memo_hit < 0.25 {
+        "warming"
+    } else if memo_churn.abs() >= 0.05 {
+        "churning"
+    } else if memo_hit >= 0.65 {
+        "saturated"
+    } else {
+        "warming"
+    }
+}
+
+fn git_commit_short() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn unix_epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn insert_duration_metrics(
+    metrics: &mut serde_json::Map<String, serde_json::Value>,
+    summary: &str,
+    name: &str,
+    mean_key: &str,
+    p95_key: &str,
+) {
+    if let Some((mean, p95)) = parse_duration_pair_ms(summary, name) {
+        metrics.insert(mean_key.to_string(), serde_json::json!(mean));
+        metrics.insert(p95_key.to_string(), serde_json::json!(p95));
+    }
+}
+
+fn insert_summary_metric(
+    metrics: &mut serde_json::Map<String, serde_json::Value>,
+    summary: &str,
+    source_key: &str,
+    output_key: &str,
+) {
+    if let Some(value) = parse_summary_f64(summary, source_key) {
+        metrics.insert(output_key.to_string(), serde_json::json!(value));
+    }
+}
+
+fn world_prefetch_region_for_player(
+    origin: [i64; 3],
+    side: i64,
+    pos: [f64; 3],
+    player_height: f64,
+) -> Option<([sim::WorldCoord; 3], [sim::WorldCoord; 3])> {
+    let horizontal_margin =
+        (WORLD_PREFETCH_MARGIN_METERS * CELLS_PER_METER).max(GROWTH_MARGIN) as i64;
+    let vertical_margin = GROWTH_MARGIN as i64;
+    let margins = [horizontal_margin, vertical_margin, horizontal_margin];
+    let player_max = [pos[0], pos[1] + player_height, pos[2]];
+    let near_pos_edge =
+        (0..3).any(|i| player_max[i] > origin[i] as f64 + side as f64 - margins[i] as f64);
+    let near_neg_edge = (0..3).any(|i| pos[i] < origin[i] as f64 + margins[i] as f64);
+    if !near_pos_edge && !near_neg_edge {
+        return None;
+    }
+
+    Some((
+        [
+            sim::WorldCoord(pos[0] as i64 - horizontal_margin),
+            sim::WorldCoord(pos[1] as i64 - vertical_margin),
+            sim::WorldCoord(pos[2] as i64 - horizontal_margin),
+        ],
+        [
+            sim::WorldCoord(pos[0] as i64 + horizontal_margin),
+            sim::WorldCoord((pos[1] + player_height) as i64 + vertical_margin),
+            sim::WorldCoord(pos[2] as i64 + horizontal_margin),
+        ],
+    ))
+}
+
+fn clamp_player_pos_to_loaded_world(
+    origin: [i64; 3],
+    side: i64,
+    mut pos: [f64; 3],
+    player_height: f64,
+) -> [f64; 3] {
+    let min = [origin[0] as f64, origin[1] as f64, origin[2] as f64];
+    let max = [
+        (origin[0] + side - 1) as f64,
+        (origin[1] + side - 1) as f64 - player_height,
+        (origin[2] + side - 1) as f64,
+    ];
+    for i in 0..3 {
+        pos[i] = pos[i].clamp(min[i], max[i]);
+    }
+    pos
+}
 
 /// Bound on consecutive failed FPS cursor-grab attempts before the
 /// per-frame retry tap goes dormant (hash-thing-ezx8). 600 frames
@@ -253,9 +557,8 @@ fn collect_visible_particle_data(
         .filter_map(|entity| {
             let mat = match &entity.kind {
                 sim::EntityKind::Player(_) | sim::EntityKind::Emitter(_) => return None,
-                sim::EntityKind::Particle(_) | sim::EntityKind::Critter(_) => {
-                    entity.render_material().unwrap() as u32
-                }
+                sim::EntityKind::Particle(state) => state.material as u32,
+                sim::EntityKind::Critter(state) => state.material as u32,
             };
             if !player::has_line_of_sight(world, camera_pos, entity.pos) {
                 return None;
@@ -268,6 +571,70 @@ fn collect_visible_particle_data(
             ])
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VisibleParticleCounts {
+    total: usize,
+    lava: usize,
+    fire: usize,
+}
+
+fn count_visible_particle_materials(data: &[[f32; 4]]) -> VisibleParticleCounts {
+    let mut counts = VisibleParticleCounts {
+        total: data.len(),
+        ..Default::default()
+    };
+    for item in data {
+        match item[3].to_bits() as u16 {
+            LAVA_MATERIAL_ID => counts.lava += 1,
+            FIRE_MATERIAL_ID => counts.fire += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn count_queued_lava_stamp_attempts(queue: &sim::MutationQueue) -> usize {
+    queue
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation,
+                sim::WorldMutation::SetCell { state, .. } if *state == LAVA
+            )
+        })
+        .count()
+}
+
+fn count_new_lava_stamp_targets(world: &sim::World, queue: &sim::MutationQueue) -> usize {
+    let side = world.side() as i64;
+    let min = world.origin;
+    let max = [min[0] + side, min[1] + side, min[2] + side];
+    queue
+        .iter()
+        .filter_map(|mutation| match mutation {
+            sim::WorldMutation::SetCell { x, y, z, state } if *state == LAVA => {
+                let coord = [x.0, y.0, z.0];
+                let in_bounds = coord[0] >= min[0]
+                    && coord[0] < max[0]
+                    && coord[1] >= min[1]
+                    && coord[1] < max[1]
+                    && coord[2] >= min[2]
+                    && coord[2] < max[2];
+                in_bounds.then_some(coord)
+            }
+            _ => None,
+        })
+        .filter(|coord| {
+            world.get(
+                sim::WorldCoord(coord[0]),
+                sim::WorldCoord(coord[1]),
+                sim::WorldCoord(coord[2]),
+            ) != LAVA
+        })
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -290,6 +657,14 @@ enum PendingPlayerAction {
     Break,
     Place,
     PlaceClone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingSoupAction {
+    PlaceSelected,
+    SelectPattern(usize),
+    Catalog,
+    ReuseCatalog,
 }
 
 /// Scene-swap request queued while a background sim step is in flight.
@@ -319,6 +694,10 @@ enum PendingSceneSwap {
     LoadLatticePanoramaDemo,
     ResetTerrain,
     LoadGyroid,
+    LoadQuarantineAtlas,
+    LoadQuarantineAtlasMixed,
+    LoadSoupProspector,
+    LoadMegastructureStamp,
     LoadDemoSpectacle,
     ResetGolSmoke,
     SelectLatticeBeat(LatticeDemoBeat),
@@ -332,6 +711,10 @@ impl PendingSceneSwap {
             Self::LoadLatticePanoramaDemo => "lattice_panorama",
             Self::ResetTerrain => "terrain_reset",
             Self::LoadGyroid => "gyroid",
+            Self::LoadQuarantineAtlas => "quarantine_atlas",
+            Self::LoadQuarantineAtlasMixed => "quarantine_atlas_mixed",
+            Self::LoadSoupProspector => "soup_prospector",
+            Self::LoadMegastructureStamp => "megastructure_stamp",
             Self::LoadDemoSpectacle => "demo_spectacle",
             Self::ResetGolSmoke => "gol_smoke_reset",
             Self::SelectLatticeBeat(LatticeDemoBeat::Intro) => "lattice_beat_intro",
@@ -351,6 +734,10 @@ impl PendingSceneSwap {
             | Self::LoadLatticePanoramaDemo
             | Self::ResetTerrain
             | Self::LoadGyroid
+            | Self::LoadQuarantineAtlas
+            | Self::LoadQuarantineAtlasMixed
+            | Self::LoadSoupProspector
+            | Self::LoadMegastructureStamp
             | Self::LoadDemoSpectacle
             | Self::ResetGolSmoke
             | Self::SelectLatticeBeat(_) => true,
@@ -554,12 +941,121 @@ struct LodUploadCtx<'a> {
     last_growth_ratio: &'a mut Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuarantineAtlasState {
+    interventions_remaining: u8,
+    selected_pattern: QuarantineAtlasPattern,
+}
+
+impl Default for QuarantineAtlasState {
+    fn default() -> Self {
+        Self {
+            interventions_remaining: 6,
+            selected_pattern: QuarantineAtlasPattern::Barrier,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupTilePopSample {
+    generation: u64,
+    pop: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoupCatalogLabel {
+    Extinct,
+    Survivor,
+    CandidateStable,
+}
+
+impl SoupCatalogLabel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Extinct => "extinct",
+            Self::Survivor => "survivor",
+            Self::CandidateStable => "candidate-stable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupCatalogEntry {
+    tile: [i64; 3],
+    generation: u64,
+    pop: usize,
+    state_hash: String,
+    pattern: usize,
+    label: SoupCatalogLabel,
+    snapshot: Vec<CellState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupReuseResult {
+    source_tile: [i64; 3],
+    target_tile: [i64; 3],
+    source_hash: String,
+    target_before_pop: usize,
+    target_before_hash: String,
+    target_after_pop: usize,
+    target_after_hash: String,
+    post_pop: usize,
+    post_hash: String,
+    post_label: SoupCatalogLabel,
+    count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoupProspectorState {
+    selected_pattern: usize,
+    focus_tile: [i64; 3],
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+    catalog: Vec<SoupCatalogEntry>,
+    last_reuse: Option<SoupReuseResult>,
+    reuse_count: usize,
+    pop_history: HashMap<[i64; 3], Vec<SoupTilePopSample>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MegastructureStampState {
+    stamps_placed: usize,
+    floor_y: i64,
+    last_stamp_origin: Option<[i64; 3]>,
+    objective_progress: usize,
+    objective_mask: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MegastructureStampResult {
+    written: usize,
+    changed: usize,
+}
+
+impl SoupProspectorState {
+    fn new(focus_tile: [i64; 3], tile_min: [i64; 3], tile_max: [i64; 3]) -> Self {
+        Self {
+            selected_pattern: 0,
+            focus_tile,
+            tile_min,
+            tile_max,
+            catalog: Vec::new(),
+            last_reuse: None,
+            reuse_count: 0,
+            pop_history: HashMap::new(),
+        }
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
     world: sim::World,
     gol_smoke_rule: sim::GameOfLife3D,
     gol_smoke_scene: bool,
+    quarantine_atlas: Option<QuarantineAtlasState>,
+    soup_prospector: Option<SoupProspectorState>,
+    megastructure_stamp: Option<MegastructureStampState>,
     /// Persistent serialized DAG. Kept across frames so that its content-
     /// addressed cache lets us upload only new nodes each step (5bb.5).
     svdag: render::Svdag,
@@ -589,6 +1085,8 @@ struct App {
     /// The player entity, if spawned.
     player_id: Option<sim::EntityId>,
     perf: perf::Perf,
+    demo_perf_trail: DemoPerfTrail,
+    git_commit: String,
     /// Memory-watchdog metric family — node-count + step-cache ratcheting
     /// peaks and a byte estimate. Orthogonal to `perf` (latency). Sampled
     /// on the wall-clock log path.
@@ -633,14 +1131,15 @@ struct App {
     /// applied at the start of the next tick.
     entities: sim::EntityStore,
     volume_size: u32,
-    /// hash-thing-06so: pinned rendered-pixel budget from `--demo` / `--res`.
+    /// hash-thing-06so/uc2m: pinned render-scale override from `--demo` / `--res`.
     /// `None` → auto-pick. Set in `main()` after construction (the 40+
     /// existing `App::new(N)` test callers default this to `None`).
     /// Threaded through to `Renderer::new`.
-    target_pixels_override: Option<u64>,
+    render_scale_override: Option<render::RenderScaleOverride>,
     /// hash-thing-kh9l: focus the window on launch. Set in `main()` from
-    /// `--demo` (kh9l) or `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults
-    /// to `false` so the 40+ test callers stay in the no-focus regime.
+    /// `--demo` (kh9l), `--focused` / `HASH_THING_FOCUSED=1` (xu3d), or
+    /// `HASH_THING_FOCUS=1` (sgcv). `App::new` defaults to `false` so the
+    /// 40+ test callers stay in the no-focus regime.
     /// Mirrored into the macOS event_loop_builder's
     /// `with_activate_ignoring_other_apps` flag so both gates fire from
     /// the same input.
@@ -657,6 +1156,28 @@ struct App {
     /// pose instead of the App-default terrain. `None` keeps the previous
     /// hc0g default-terrain behavior unchanged.
     dump_scene: Option<DumpScene>,
+    /// hash-thing-jszv: deterministic diagnostic camera pose for
+    /// `--dump-frame`, applied after any dump scene setup and before capture.
+    dump_pose: Option<DumpPose>,
+    /// hash-thing-nznv: diagnostic shader mode for one-shot dump frames.
+    dump_debug: Option<DumpDebugMode>,
+    /// hash-thing-ifre.1: one-shot particle/world layer diagnostic.
+    dump_layer: Option<DumpLayer>,
+    /// hash-thing-u8m4: dump-frame-only render LOD bias override.
+    dump_lod_bias: Option<f32>,
+    /// hash-thing-7aqo: dump-frame-only synchronous sim steps before capture.
+    dump_steps_remaining: u32,
+    /// Dump-frame diagnostic for Soup Prospector acceptance artifacts:
+    /// catalog the current aimed soup tile after dump steps and before
+    /// capture, so the screenshot can prove durable in-game catalog feedback.
+    dump_soup_catalog: bool,
+    /// Dump-frame diagnostic for Soup Prospector reuse artifacts:
+    /// catalog the current aimed soup tile, reuse it into a distinct tile,
+    /// run one sync retest step, then capture.
+    dump_soup_reuse: bool,
+    /// Dump-frame diagnostic for Megastructure Stamp acceptance artifacts:
+    /// place one additional module after scene setup and before capture.
+    dump_megastructure_stamp: bool,
     /// Background sim step liveness flag (x5w). While `true`, `self.world`
     /// is a tiny placeholder — all world reads must use `render_origin` /
     /// `render_inv_size` or be guarded by `is_stepping()`.
@@ -669,6 +1190,18 @@ struct App {
     /// kicks the worker, cleared in `apply_step_result` when the user
     /// event arrives. The detached worker thread cleans itself up.
     step_pending: bool,
+    /// Background world-prefetch liveness flag (hash-thing-n8hy). Unlike
+    /// `step_pending`, this keeps `self.world` live on the main thread:
+    /// the worker grows a clone and swaps it in only on success.
+    world_prefetch_pending: bool,
+    /// Monotonic generation for background world-prefetch results. The event
+    /// carries this back so stale worker completions cannot clear a newer
+    /// pending prefetch.
+    next_world_prefetch_generation: u64,
+    current_world_prefetch_generation: Option<u64>,
+    /// Monotonic revision of the live main-thread world. Any mutation after a
+    /// prefetch clone invalidates that clone's eventual result.
+    world_revision: u64,
     /// When the background step was spawned, for perf timing.
     step_start: std::time::Instant,
     /// hash-thing-dbv3 (vqke.1.1): proxy used by the sim worker thread
@@ -720,6 +1253,7 @@ struct App {
     /// Replay FPS interactions on the next live-world frame instead of
     /// dropping them while a background step is in flight.
     pending_player_action: Option<PendingPlayerAction>,
+    pending_soup_action: Option<PendingSoupAction>,
     /// Defer a scene-swap requested while stepping; drained after step
     /// completion in the same slot as `pending_player_action`. Last-write
     /// wins; any unrelated scene-change key clears it. (hash-thing-a9jd)
@@ -733,6 +1267,9 @@ struct App {
     /// so the periodic log can print it even while the next step is on
     /// the background thread (where `self.world` is a placeholder).
     last_memo_summary: String,
+    /// Lines uploaded to the memo HUD. Usually mirrors `last_memo_summary`
+    /// token-by-token; special demos may use a smaller, legible headline.
+    memo_hud_lines: Vec<String>,
     /// Memo HUD overlay toggle (hash-thing-nhwo). On when
     /// `HASH_THING_MEMO_HUD=1` is set at startup; renders memo_* stats
     /// as a top-left text panel. No key-binding — env-var only.
@@ -906,6 +1443,667 @@ fn reconcile_modifier_keys(
     removed
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SoupProspectorRng {
+    state: u64,
+}
+
+impl SoupProspectorRng {
+    fn new(seed: u64) -> Self {
+        let state = if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        };
+        Self { state }
+    }
+
+    fn next_mod(&mut self, modulus: u64) -> u64 {
+        self.state ^= self.state << 7;
+        self.state ^= self.state >> 9;
+        self.state ^= self.state << 8;
+        self.state % modulus
+    }
+}
+
+fn soup_pattern_seed(pattern: usize) -> u64 {
+    SOUP_PROSPECTOR_PATTERN_SEEDS[pattern % SOUP_PROSPECTOR_PATTERN_SEEDS.len()]
+}
+
+fn soup_focus_tile_for_side(side: usize) -> [i64; 3] {
+    let tiles_per_axis = (side as i64 / SOUP_PROSPECTOR_TILE).max(1);
+    let center = tiles_per_axis / 2;
+    [center, center, center]
+}
+
+fn soup_demo_tile_bounds(side: usize, focus_tile: [i64; 3]) -> ([i64; 3], [i64; 3]) {
+    let tiles_per_axis = (side as i64 / SOUP_PROSPECTOR_TILE).max(1);
+    let span = tiles_per_axis.min(4);
+    let mut min = [0; 3];
+    let mut max = [0; 3];
+    for axis in 0..3 {
+        let start = (focus_tile[axis] - span / 2).clamp(0, tiles_per_axis - span);
+        min[axis] = start;
+        max[axis] = start + span;
+    }
+    (min, max)
+}
+
+fn soup_tile_origin(origin: [i64; 3], tile: [i64; 3]) -> [i64; 3] {
+    [
+        origin[0] + tile[0] * SOUP_PROSPECTOR_TILE,
+        origin[1] + tile[1] * SOUP_PROSPECTOR_TILE,
+        origin[2] + tile[2] * SOUP_PROSPECTOR_TILE,
+    ]
+}
+
+fn soup_tile_in_bounds(side: usize, tile: [i64; 3]) -> bool {
+    let tiles_per_axis = side as i64 / SOUP_PROSPECTOR_TILE;
+    tile.iter()
+        .all(|&coord| coord >= 0 && coord < tiles_per_axis)
+}
+
+fn soup_tile_from_world_pos(world: &sim::World, pos: [i64; 3]) -> Option<[i64; 3]> {
+    let local = [
+        pos[0] - world.origin[0],
+        pos[1] - world.origin[1],
+        pos[2] - world.origin[2],
+    ];
+    let tile = [
+        local[0].div_euclid(SOUP_PROSPECTOR_TILE),
+        local[1].div_euclid(SOUP_PROSPECTOR_TILE),
+        local[2].div_euclid(SOUP_PROSPECTOR_TILE),
+    ];
+    soup_tile_in_bounds(world.side(), tile).then_some(tile)
+}
+
+fn ray_aabb_entry(
+    origin: [f64; 3],
+    dir: [f64; 3],
+    min: [f64; 3],
+    max: [f64; 3],
+) -> Option<[f64; 3]> {
+    let mut t_min = 0.0_f64;
+    let mut t_max = f64::INFINITY;
+    for axis in 0..3 {
+        if dir[axis].abs() < 1e-9 {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inv = 1.0 / dir[axis];
+        let mut t1 = (min[axis] - origin[axis]) * inv;
+        let mut t2 = (max[axis] - origin[axis]) * inv;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return None;
+        }
+    }
+    (t_max >= 0.0).then(|| {
+        let t = if t_min <= 1e-6 {
+            t_max.min(SOUP_PROSPECTOR_TILE as f64 * 0.5).max(0.0)
+        } else {
+            t_min + 1e-6
+        };
+        [
+            origin[0] + dir[0] * t,
+            origin[1] + dir[1] * t,
+            origin[2] + dir[2] * t,
+        ]
+    })
+}
+
+fn soup_tile_from_field_ray(
+    world_origin: [i64; 3],
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+    eye: [f64; 3],
+    dir: [f64; 3],
+) -> Option<[i64; 3]> {
+    let min = [
+        (world_origin[0] + tile_min[0] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[1] + tile_min[1] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[2] + tile_min[2] * SOUP_PROSPECTOR_TILE) as f64,
+    ];
+    let max = [
+        (world_origin[0] + tile_max[0] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[1] + tile_max[1] * SOUP_PROSPECTOR_TILE) as f64,
+        (world_origin[2] + tile_max[2] * SOUP_PROSPECTOR_TILE) as f64,
+    ];
+    let hit = ray_aabb_entry(eye, dir, min, max)?;
+    let hit = [
+        hit[0].clamp(min[0], max[0] - 1e-6),
+        hit[1].clamp(min[1], max[1] - 1e-6),
+        hit[2].clamp(min[2], max[2] - 1e-6),
+    ];
+    let local = [
+        (hit[0].floor() as i64 - world_origin[0]).div_euclid(SOUP_PROSPECTOR_TILE),
+        (hit[1].floor() as i64 - world_origin[1]).div_euclid(SOUP_PROSPECTOR_TILE),
+        (hit[2].floor() as i64 - world_origin[2]).div_euclid(SOUP_PROSPECTOR_TILE),
+    ];
+    (0..3)
+        .all(|axis| local[axis] >= tile_min[axis] && local[axis] < tile_max[axis])
+        .then_some(local)
+}
+
+fn clear_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
+    let origin = soup_tile_origin(world.origin, tile);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                world.set(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                    hash_thing::octree::Cell::EMPTY.raw(),
+                );
+            }
+        }
+    }
+}
+
+fn seed_soup_tile(world: &mut sim::World, tile: [i64; 3], seed: u64) -> usize {
+    clear_soup_tile(world, tile);
+    let tile_origin = soup_tile_origin(world.origin, tile);
+    let margin = (SOUP_PROSPECTOR_TILE - SOUP_PROSPECTOR_SIDE) / 2;
+    let origin = [
+        tile_origin[0] + margin,
+        tile_origin[1] + margin,
+        tile_origin[2] + margin,
+    ];
+    let mut rng = SoupProspectorRng::new(seed);
+    let mut placed = 0;
+    for dz in 0..SOUP_PROSPECTOR_SIDE {
+        for dy in 0..SOUP_PROSPECTOR_SIDE {
+            for dx in 0..SOUP_PROSPECTOR_SIDE {
+                if rng.next_mod(1000) < SOUP_PROSPECTOR_DENSITY_PER_1000 {
+                    world.set(
+                        sim::WorldCoord(origin[0] + dx),
+                        sim::WorldCoord(origin[1] + dy),
+                        sim::WorldCoord(origin[2] + dz),
+                        SOUP_PROSPECTOR_ALIVE,
+                    );
+                    placed += 1;
+                }
+            }
+        }
+    }
+    placed
+}
+
+fn stamp_megastructure_module(
+    world: &mut sim::World,
+    origin: [i64; 3],
+) -> MegastructureStampResult {
+    let mut written = 0;
+    let mut changed = 0;
+    for dz in 0..MEGASTRUCTURE_MODULE_SIDE {
+        for dy in 0..MEGASTRUCTURE_MODULE_SIDE {
+            for dx in 0..MEGASTRUCTURE_MODULE_SIDE {
+                let shell = dx == 0
+                    || dy == 0
+                    || dz == 0
+                    || dx == MEGASTRUCTURE_MODULE_SIDE - 1
+                    || dy == MEGASTRUCTURE_MODULE_SIDE - 1
+                    || dz == MEGASTRUCTURE_MODULE_SIDE - 1;
+                let lattice = dx == dy || dy == dz || (dx + dy + dz) % 5 == 0;
+                if shell || lattice {
+                    let x = sim::WorldCoord(origin[0] + dx);
+                    let y = sim::WorldCoord(origin[1] + dy);
+                    let z = sim::WorldCoord(origin[2] + dz);
+                    if world.get(x, y, z) != SOUP_PROSPECTOR_ALIVE {
+                        changed += 1;
+                    }
+                    world.set(x, y, z, SOUP_PROSPECTOR_ALIVE);
+                    written += 1;
+                }
+            }
+        }
+    }
+    MegastructureStampResult { written, changed }
+}
+
+fn snap_megastructure_stamp_origin(pos: [i64; 3]) -> [i64; 3] {
+    [
+        pos[0].div_euclid(MEGASTRUCTURE_TILE_STRIDE) * MEGASTRUCTURE_TILE_STRIDE,
+        pos[1],
+        pos[2].div_euclid(MEGASTRUCTURE_TILE_STRIDE) * MEGASTRUCTURE_TILE_STRIDE,
+    ]
+}
+
+fn megastructure_stamp_in_bounds(side: i64, origin: [i64; 3]) -> bool {
+    origin.iter().all(|coord| *coord >= 0)
+        && origin[0] + MEGASTRUCTURE_MODULE_SIDE <= side
+        && origin[1] + MEGASTRUCTURE_MODULE_SIDE <= side
+        && origin[2] + MEGASTRUCTURE_MODULE_SIDE <= side
+}
+
+fn megastructure_objective_origins(floor_y: i64) -> [[i64; 3]; MEGASTRUCTURE_OBJECTIVE_STAMPS] {
+    [
+        [88, floor_y + 1, 24],
+        [88, floor_y + 1, 40],
+        [88, floor_y + 1, 56],
+        [88, floor_y + 1, 72],
+        [88, floor_y + 1, 88],
+        [88, floor_y + 1, 104],
+    ]
+}
+
+fn megastructure_objective_index(origin: [i64; 3], floor_y: i64) -> Option<usize> {
+    megastructure_objective_origins(floor_y)
+        .iter()
+        .position(|candidate| *candidate == origin)
+}
+
+fn set_world_cell_if_in_bounds(world: &mut sim::World, pos: [i64; 3], state: CellState) {
+    let side = world.side() as i64;
+    if pos.iter().all(|coord| (0..side).contains(coord)) {
+        world.set(
+            sim::WorldCoord(pos[0]),
+            sim::WorldCoord(pos[1]),
+            sim::WorldCoord(pos[2]),
+            state,
+        );
+    }
+}
+
+fn paint_megastructure_objective_marker(world: &mut sim::World, origin: [i64; 3], completed: bool) {
+    let floor_y = origin[1] - 1;
+    let marker = if completed {
+        hash_thing::terrain::materials::VINE
+    } else {
+        hash_thing::terrain::materials::ICE
+    };
+    let side = MEGASTRUCTURE_MODULE_SIDE;
+    for dz in -1..=side {
+        for dx in -1..=side {
+            let border = dx == -1 || dz == -1 || dx == side || dz == side;
+            if border {
+                set_world_cell_if_in_bounds(
+                    world,
+                    [origin[0] + dx, floor_y, origin[2] + dz],
+                    marker,
+                );
+            }
+        }
+    }
+    let beacon_x = origin[0] + side + 2;
+    let beacon_z = origin[2] + side / 2;
+    for dy in 1..=6 {
+        set_world_cell_if_in_bounds(world, [beacon_x, floor_y + dy, beacon_z], marker);
+    }
+    if completed {
+        set_world_cell_if_in_bounds(
+            world,
+            [beacon_x, floor_y + 7, beacon_z],
+            hash_thing::terrain::materials::ICE,
+        );
+    }
+}
+
+fn paint_megastructure_objectives(world: &mut sim::World, floor_y: i64, objective_mask: u16) {
+    for (index, origin) in megastructure_objective_origins(floor_y)
+        .into_iter()
+        .enumerate()
+    {
+        paint_megastructure_objective_marker(world, origin, objective_mask & (1 << index) != 0);
+    }
+}
+
+fn frame_soup_tile(world: &mut sim::World, tile: [i64; 3]) {
+    let origin = soup_tile_origin(world.origin, tile);
+    let marker = hash_thing::terrain::materials::METAL;
+    let hi = SOUP_PROSPECTOR_TILE - 1;
+    for &(dx, dy, dz) in &[
+        (0, 0, 0),
+        (0, 0, hi),
+        (0, hi, 0),
+        (0, hi, hi),
+        (hi, 0, 0),
+        (hi, 0, hi),
+        (hi, hi, 0),
+        (hi, hi, hi),
+    ] {
+        world.set(
+            sim::WorldCoord(origin[0] + dx),
+            sim::WorldCoord(origin[1] + dy),
+            sim::WorldCoord(origin[2] + dz),
+            marker,
+        );
+    }
+}
+
+fn soup_marker_material_for_live_index(_index: usize, material: CellState) -> CellState {
+    material
+}
+
+fn clear_soup_marker_cell(cell: CellState) -> CellState {
+    match cell {
+        hash_thing::terrain::materials::SOUP_TARGET_MARKER
+        | hash_thing::terrain::materials::SOUP_CATALOG_MARKER => SOUP_PROSPECTOR_ALIVE,
+        other => other,
+    }
+}
+
+fn normalize_soup_marker_cell(cell: CellState) -> CellState {
+    clear_soup_marker_cell(cell)
+}
+
+fn stamp_soup_tile_live_marker(world: &mut sim::World, tile: [i64; 3], material: CellState) {
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut live_index = 0;
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                let coord = [
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                ];
+                if clear_soup_marker_cell(world.get(coord[0], coord[1], coord[2]))
+                    == SOUP_PROSPECTOR_ALIVE
+                {
+                    let marked = soup_marker_material_for_live_index(live_index, material);
+                    if marked != SOUP_PROSPECTOR_ALIVE {
+                        world.set(coord[0], coord[1], coord[2], marked);
+                    }
+                    live_index += 1;
+                }
+            }
+        }
+    }
+}
+
+fn stamp_soup_target_marker(world: &mut sim::World, tile: [i64; 3]) {
+    stamp_soup_tile_live_marker(
+        world,
+        tile,
+        hash_thing::terrain::materials::SOUP_TARGET_MARKER,
+    );
+}
+
+fn stamp_soup_catalog_marker(world: &mut sim::World, tile: [i64; 3]) {
+    stamp_soup_tile_live_marker(
+        world,
+        tile,
+        hash_thing::terrain::materials::SOUP_CATALOG_MARKER,
+    );
+}
+
+#[cfg(test)]
+fn soup_tile_includes_material(world: &sim::World, tile: [i64; 3], material: CellState) -> bool {
+    let origin = soup_tile_origin(world.origin, tile);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                if world.get(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                ) == material
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn clear_soup_tile_markers(world: &mut sim::World, tile: [i64; 3]) {
+    let origin = soup_tile_origin(world.origin, tile);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                let coord = [
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                ];
+                let cell = world.get(coord[0], coord[1], coord[2]);
+                let normalized = clear_soup_marker_cell(cell);
+                if normalized != cell {
+                    world.set(coord[0], coord[1], coord[2], normalized);
+                }
+            }
+        }
+    }
+}
+
+fn clear_soup_demo_markers(world: &mut sim::World, tile_min: [i64; 3], tile_max: [i64; 3]) {
+    for z in tile_min[2]..tile_max[2] {
+        for y in tile_min[1]..tile_max[1] {
+            for x in tile_min[0]..tile_max[0] {
+                clear_soup_tile_markers(world, [x, y, z]);
+            }
+        }
+    }
+}
+
+fn stamp_soup_demo_markers(
+    world: &mut sim::World,
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+    target_tile: Option<[i64; 3]>,
+    catalog_tiles: &[[i64; 3]],
+) {
+    clear_soup_demo_markers(world, tile_min, tile_max);
+    if let Some(tile) = target_tile {
+        if (0..3).all(|axis| tile[axis] >= tile_min[axis] && tile[axis] < tile_max[axis]) {
+            stamp_soup_target_marker(world, tile);
+        }
+    }
+    for &tile in catalog_tiles {
+        if (0..3).all(|axis| tile[axis] >= tile_min[axis] && tile[axis] < tile_max[axis]) {
+            stamp_soup_catalog_marker(world, tile);
+        }
+    }
+}
+
+#[cfg(test)]
+fn unmarked_soup_world(world: &sim::World, tile_min: [i64; 3], tile_max: [i64; 3]) -> sim::World {
+    let mut clone = world.clone();
+    clear_soup_demo_markers(&mut clone, tile_min, tile_max);
+    clone
+}
+
+fn soup_tile_stats(world: &sim::World, tile: [i64; 3]) -> (usize, String) {
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut pop = 0;
+    let mut bytes = Vec::with_capacity((SOUP_PROSPECTOR_TILE as usize).pow(3) * 2);
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                let cell = normalize_soup_marker_cell(world.get(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                ));
+                if cell == SOUP_PROSPECTOR_ALIVE {
+                    pop += 1;
+                }
+                bytes.extend_from_slice(&cell.to_le_bytes());
+            }
+        }
+    }
+    let digest = Sha256::digest(&bytes);
+    let prefix = [
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ];
+    (pop, format!("sha256:{:016x}", u64::from_be_bytes(prefix)))
+}
+
+fn capture_soup_tile_snapshot(world: &sim::World, tile: [i64; 3]) -> Vec<CellState> {
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut cells = Vec::with_capacity((SOUP_PROSPECTOR_TILE as usize).pow(3));
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                cells.push(normalize_soup_marker_cell(world.get(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                )));
+            }
+        }
+    }
+    cells
+}
+
+fn paste_soup_tile_snapshot(world: &mut sim::World, tile: [i64; 3], snapshot: &[CellState]) {
+    assert_eq!(
+        snapshot.len(),
+        (SOUP_PROSPECTOR_TILE as usize).pow(3),
+        "soup tile snapshots must cover exactly one full tile"
+    );
+    let origin = soup_tile_origin(world.origin, tile);
+    let mut index = 0;
+    for dz in 0..SOUP_PROSPECTOR_TILE {
+        for dy in 0..SOUP_PROSPECTOR_TILE {
+            for dx in 0..SOUP_PROSPECTOR_TILE {
+                world.set(
+                    sim::WorldCoord(origin[0] + dx),
+                    sim::WorldCoord(origin[1] + dy),
+                    sim::WorldCoord(origin[2] + dz),
+                    normalize_soup_marker_cell(snapshot[index]),
+                );
+                index += 1;
+            }
+        }
+    }
+}
+
+fn soup_tile_within_demo(tile: [i64; 3], tile_min: [i64; 3], tile_max: [i64; 3]) -> bool {
+    (0..3).all(|axis| tile[axis] >= tile_min[axis] && tile[axis] < tile_max[axis])
+}
+
+fn choose_soup_reuse_target(
+    preferred: Option<[i64; 3]>,
+    source: [i64; 3],
+    tile_min: [i64; 3],
+    tile_max: [i64; 3],
+) -> Option<[i64; 3]> {
+    if let Some(tile) = preferred {
+        if tile != source && soup_tile_within_demo(tile, tile_min, tile_max) {
+            return Some(tile);
+        }
+    }
+    for offset in [
+        [-1, 0, 0],
+        [1, 0, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+        [0, 1, 0],
+        [0, -1, 0],
+    ] {
+        let tile = [
+            source[0] + offset[0],
+            source[1] + offset[1],
+            source[2] + offset[2],
+        ];
+        if soup_tile_within_demo(tile, tile_min, tile_max) {
+            return Some(tile);
+        }
+    }
+    for z in tile_min[2]..tile_max[2] {
+        for y in tile_min[1]..tile_max[1] {
+            for x in tile_min[0]..tile_max[0] {
+                let tile = [x, y, z];
+                if tile != source {
+                    return Some(tile);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn soup_tile_label(pop: usize, samples: &[SoupTilePopSample]) -> SoupCatalogLabel {
+    if pop == 0 {
+        return SoupCatalogLabel::Extinct;
+    }
+    if samples.len() >= 3 {
+        let last = &samples[samples.len() - 3..];
+        if last[0].generation + 1 == last[1].generation
+            && last[1].generation + 1 == last[2].generation
+            && last.iter().all(|sample| sample.pop == pop)
+        {
+            return SoupCatalogLabel::CandidateStable;
+        }
+    }
+    SoupCatalogLabel::Survivor
+}
+
+fn record_soup_tile_pop_sample(
+    state: &mut SoupProspectorState,
+    tile: [i64; 3],
+    generation: u64,
+    pop: usize,
+) -> SoupCatalogLabel {
+    let samples = state.pop_history.entry(tile).or_default();
+    if let Some(last) = samples.last_mut() {
+        if last.generation == generation {
+            last.pop = pop;
+            return soup_tile_label(pop, samples);
+        }
+    }
+    samples.push(SoupTilePopSample { generation, pop });
+    if samples.len() > 3 {
+        samples.remove(0);
+    }
+    soup_tile_label(pop, samples)
+}
+
+fn soup_tile_text(tile: [i64; 3]) -> String {
+    format!("[{},{},{}]", tile[0], tile[1], tile[2])
+}
+
+fn standard_memo_hud_lines(summary: &str) -> Vec<String> {
+    summary.split_whitespace().map(str::to_string).collect()
+}
+
+fn soup_reuse_hud_lines(reuse: &SoupReuseResult) -> Vec<String> {
+    vec![
+        "REUSE".to_string(),
+        format!(
+            "{}->{}",
+            soup_tile_text(reuse.source_tile),
+            soup_tile_text(reuse.target_tile)
+        ),
+        format!(
+            "changed={}",
+            if reuse.target_before_hash != reuse.target_after_hash {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!(
+            "copy={}",
+            if reuse.source_hash == reuse.target_after_hash {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!("post={}", reuse.post_label.as_str()),
+        format!("pop={}", reuse.post_pop),
+    ]
+}
+
+fn soup_reuse_headline(reuse: &SoupReuseResult) -> String {
+    format!("{} ", soup_reuse_hud_lines(reuse).join(" "))
+}
+
+fn soup_hash_short(hash: &str) -> &str {
+    hash.get(..23).unwrap_or(hash)
+}
+
 impl App {
     fn new(volume_size: u32) -> Self {
         let level = volume_size.trailing_zeros();
@@ -921,6 +2119,9 @@ impl App {
             world,
             gol_smoke_rule: sim::GameOfLife3D::rule445(),
             gol_smoke_scene: false,
+            quarantine_atlas: None,
+            soup_prospector: None,
+            megastructure_stamp: None,
             svdag: render::Svdag::new(),
             paused: false,
             log_timer: std::time::Instant::now(),
@@ -934,6 +2135,8 @@ impl App {
             camera_mode: CameraMode::FirstPerson,
             player_id: None,
             perf: perf::Perf::new(),
+            demo_perf_trail: DemoPerfTrail::from_env(),
+            git_commit: git_commit_short(),
             mem_stats: perf::MemStats::new(),
             last_svdag_stats: (0, 0, 0),
             occluded: false,
@@ -947,11 +2150,23 @@ impl App {
             last_title_update: None,
             entities: sim::EntityStore::new(),
             volume_size,
-            target_pixels_override: None,
+            render_scale_override: None,
             want_focus_on_launch: false,
             dump_frame_path: None,
             dump_scene: None,
+            dump_pose: None,
+            dump_debug: None,
+            dump_layer: None,
+            dump_lod_bias: None,
+            dump_steps_remaining: 0,
+            dump_soup_catalog: false,
+            dump_soup_reuse: false,
+            dump_megastructure_stamp: false,
             step_pending: false,
+            world_prefetch_pending: false,
+            next_world_prefetch_generation: 0,
+            current_world_prefetch_generation: None,
+            world_revision: 0,
             step_start: std::time::Instant::now(),
             event_proxy: None,
             render_origin,
@@ -967,9 +2182,11 @@ impl App {
             cursor_capture_grab_warned: false,
             cursor_capture_grab_failures: 0,
             pending_player_action: None,
+            pending_soup_action: None,
             pending_scene_swap: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_memo_summary: String::new(),
+            memo_hud_lines: Vec::new(),
             memo_hud_visible: std::env::var("HASH_THING_MEMO_HUD").ok().as_deref() == Some("1"),
             memo_hud_dirty: true,
             freeze_sim: std::env::var("HASH_THING_FREEZE_SIM").ok().as_deref() == Some("1"),
@@ -1013,6 +2230,7 @@ impl App {
         // (hash-thing-stue.6 reviewer nit). Dirty the HUD too so reseeding
         // here can never race ahead of the construction-time seed.
         app.last_memo_summary = app.world.memo_summary();
+        app.memo_hud_lines = standard_memo_hud_lines(&app.last_memo_summary);
         app.memo_hud_dirty = true;
         let player_pos = app.reset_scene_entities();
         app.spawn_demo_entities();
@@ -1285,6 +2503,16 @@ impl App {
         }
     }
 
+    fn title_fps(&self) -> f64 {
+        self.perf
+            .stats("frame_total")
+            .and_then(|(_, p95, _)| {
+                let secs = p95.as_secs_f64();
+                (secs > 0.0).then_some(1.0 / secs)
+            })
+            .unwrap_or(self.smoothed_fps)
+    }
+
     /// hash-thing-4eo8: cold-start scene for the demo build is the
     /// Pyroclastic chamber — stone box, lava embedded in the floor,
     /// water embedded in the ceiling. The molten palette + visible
@@ -1294,6 +2522,7 @@ impl App {
     /// reachable via the `r` scene-swap key (PendingSceneSwap::ResetTerrain).
     fn load_initial_scene(&mut self) {
         self.world.seed_pyroclastic_chamber();
+        self.mark_world_changed();
         self.noise_ns_per_sample = 0.0;
         self.reset_scene_entities();
         self.spawn_pyroclastic_entities();
@@ -1317,6 +2546,8 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
+        self.exit_soup_prospector_mode();
         log::info!(
             "Initial scene (pyroclastic): pop={} nodes={}",
             self.world.population(),
@@ -1538,6 +2769,15 @@ impl App {
             self.render_origin,
             self.render_inv_size,
         );
+        if self.dump_frame_path.is_some() {
+            let counts = count_visible_particle_materials(&particle_data);
+            log::info!(
+                "--dump-layer: visible_particles total={} lava={} fire={}",
+                counts.total,
+                counts.lava,
+                counts.fire
+            );
+        }
 
         if let Some(renderer) = &mut self.renderer {
             renderer.upload_particles(&particle_data);
@@ -1550,10 +2790,11 @@ impl App {
     }
 
     fn maybe_start_background_step(&mut self) {
-        if self.paused || self.is_stepping() || self.freeze_sim {
+        if self.paused || self.is_stepping() || self.world_prefetch_pending || self.freeze_sim {
             return;
         }
         self.step_start = std::time::Instant::now();
+        self.clear_soup_prospector_markers_for_step();
         // Refresh the main-thread collision snapshot BEFORE moving the world
         // to the step thread. Player collision during the step reads from
         // this snapshot, not the placeholder we're about to swap in
@@ -1647,6 +2888,152 @@ impl App {
         });
     }
 
+    fn run_sync_dump_step(&mut self) {
+        let step_started = std::time::Instant::now();
+        self.clear_soup_prospector_markers_for_step();
+        if self.dump_frame_path.is_some() {
+            log::info!(
+                "--dump-layer: applied_lava_stamp_targets_this_step={}",
+                count_new_lava_stamp_targets(&self.world, &self.world.queue)
+            );
+        }
+        let apply_started = std::time::Instant::now();
+        self.world.apply_mutations();
+        self.perf.record("step_apply_mut", apply_started.elapsed());
+        let spawn_started = std::time::Instant::now();
+        self.world.spawn_clones();
+        self.perf
+            .record("step_spawn_clones", spawn_started.elapsed());
+        let recursive_started = std::time::Instant::now();
+        self.world.step_recursive();
+        self.perf
+            .record("step_recursive", recursive_started.elapsed());
+        let mut queue = std::mem::take(&mut self.world.queue);
+        self.entities.update(&self.world, &mut queue);
+        if self.dump_frame_path.is_some() {
+            log::info!(
+                "--dump-layer: queued_lava_stamp_attempts_for_next_step={}",
+                count_queued_lava_stamp_attempts(&queue)
+            );
+        }
+        self.world.queue = queue;
+        self.perf.record("step", step_started.elapsed());
+        self.mark_world_changed();
+        self.refresh_memo_summary_after_world_update();
+    }
+
+    fn maybe_start_world_prefetch(&mut self, min: [sim::WorldCoord; 3], max: [sim::WorldCoord; 3]) {
+        if self.is_stepping() || self.world_prefetch_pending {
+            return;
+        }
+        let old_level = self.world.level;
+        self.next_world_prefetch_generation = self.next_world_prefetch_generation.wrapping_add(1);
+        let generation = self.next_world_prefetch_generation;
+        let base_world_revision = self.world_revision;
+        let mut world = self.world.clone();
+        let proxy = self.event_proxy.clone();
+        let window = self.window.clone();
+        self.world_prefetch_pending = true;
+        self.current_world_prefetch_generation = Some(generation);
+        std::thread::spawn(move || {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                world.ensure_region(min, max);
+                world
+            }))
+            .map_err(|e| {
+                if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                }
+            });
+
+            if let Some(proxy) = proxy {
+                let _ = proxy.send_event(AppUserEvent::WorldGrowDone(WorldGrowResult {
+                    generation,
+                    base_world_revision,
+                    payload,
+                }));
+            }
+            if let Some(window) = window {
+                window.request_redraw();
+            }
+        });
+        log::info!(
+            "World prefetch queued from level {old_level} for region {:?}..{:?}",
+            min,
+            max,
+        );
+    }
+
+    fn invalidate_world_prefetch(&mut self) {
+        self.world_prefetch_pending = false;
+        self.current_world_prefetch_generation = None;
+    }
+
+    fn mark_world_changed(&mut self) {
+        self.world_revision = self.world_revision.wrapping_add(1);
+        self.invalidate_world_prefetch();
+    }
+
+    fn apply_world_grow_result(&mut self, result: WorldGrowResult) {
+        if self.current_world_prefetch_generation != Some(result.generation) {
+            return;
+        }
+        if !self.world_prefetch_pending {
+            self.current_world_prefetch_generation = None;
+            return;
+        }
+        if result.base_world_revision != self.world_revision {
+            self.invalidate_world_prefetch();
+            return;
+        }
+
+        self.world_prefetch_pending = false;
+        self.current_world_prefetch_generation = None;
+
+        match result.payload {
+            Ok(world) => {
+                let old_origin = self.render_origin;
+                self.world = world;
+                self.world_revision = self.world_revision.wrapping_add(1);
+                {
+                    let _t = self.perf.start("collision_snapshot_refresh");
+                    self.collision_snapshot = Some(self.world.collision_snapshot());
+                }
+                self.refresh_memo_summary_after_world_update();
+                self.sync_render_cache();
+                {
+                    let player_pos = self.player_world_pos();
+                    let _t = self.perf.start("upload_cpu");
+                    Self::upload_volume(
+                        &mut self.renderer,
+                        &mut self.world,
+                        &mut self.svdag,
+                        &mut self.last_svdag_stats,
+                        LodUploadCtx {
+                            policy: &mut self.lod_policy,
+                            player_pos,
+                            last_histogram: &mut self.last_lod_histogram,
+                            last_growth_ratio: &mut self.last_lod_growth_ratio,
+                        },
+                    );
+                }
+                log::info!(
+                    "World prefetch finished: side {} origin {:?} (was {:?})",
+                    self.world.side(),
+                    self.world.origin,
+                    old_origin,
+                );
+            }
+            Err(msg) => {
+                log::error!("World prefetch panicked: {msg}");
+            }
+        }
+    }
+
     /// hash-thing-dbv3 (vqke.1.1): ingest the sim worker's result. Called
     /// from `fn user_event(SimDone(payload))` the moment winit dispatches
     /// the wake event — which is "as soon as the current event handler
@@ -1695,6 +3082,7 @@ impl App {
         match payload {
             Ok((world, sim_timings)) => {
                 self.world = world;
+                self.mark_world_changed();
                 // hash-thing-imvg (vqke.1): record the wrapper-and-polling
                 // breakdown into perf so the periodic summary line shows
                 // apply / spawn / step_recursive / poll-lag separately.
@@ -1727,12 +3115,17 @@ impl App {
                 // is in hand (hash-thing-stue.6): the (stepping) log
                 // branch below cannot read self.world (it's about to be
                 // replaced by a placeholder again on the next step).
-                self.last_memo_summary = self.world.memo_summary();
-                self.memo_hud_dirty = true;
+                self.refresh_memo_summary_after_world_update();
                 // Entity update on main thread (needs both &World and
                 // &mut EntityStore).
                 let mut queue = std::mem::take(&mut self.world.queue);
                 self.entities.update(&self.world, &mut queue);
+                if self.dump_frame_path.is_some() {
+                    log::info!(
+                        "--dump-layer: queued_lava_stamp_attempts_for_next_step={}",
+                        count_queued_lava_stamp_attempts(&queue)
+                    );
+                }
                 self.world.queue = queue;
                 self.sync_render_cache();
                 // SVDAG rebuild + GPU upload.
@@ -1787,6 +3180,20 @@ impl App {
     }
 
     fn dispatch_scene_swap(&mut self, swap: PendingSceneSwap) {
+        if swap.discards_world()
+            && !matches!(
+                swap,
+                PendingSceneSwap::LoadQuarantineAtlas | PendingSceneSwap::LoadQuarantineAtlasMixed
+            )
+        {
+            self.exit_quarantine_atlas_mode();
+        }
+        if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadSoupProspector) {
+            self.exit_soup_prospector_mode();
+        }
+        if swap.discards_world() && !matches!(swap, PendingSceneSwap::LoadMegastructureStamp) {
+            self.exit_megastructure_stamp_mode();
+        }
         match swap {
             PendingSceneSwap::LoadLatticeDemo => {
                 let _ = self.load_lattice_demo();
@@ -1797,6 +3204,12 @@ impl App {
                 terrain::TerrainParams::for_level(self.volume_size.trailing_zeros()),
             ),
             PendingSceneSwap::LoadGyroid => self.load_gyroid_demo(),
+            PendingSceneSwap::LoadQuarantineAtlas => self.load_quarantine_atlas_demo(),
+            PendingSceneSwap::LoadQuarantineAtlasMixed => {
+                self.load_quarantine_atlas_mixed_containment_demo()
+            }
+            PendingSceneSwap::LoadSoupProspector => self.load_soup_prospector_demo(),
+            PendingSceneSwap::LoadMegastructureStamp => self.load_megastructure_stamp_demo(),
             PendingSceneSwap::LoadDemoSpectacle => {
                 self.load_demo_spectacle("Reset spectacle gallery")
             }
@@ -1806,6 +3219,10 @@ impl App {
         }
     }
 
+    fn dispatch_dump_scene(&mut self, scene: DumpScene) {
+        self.dispatch_scene_swap(scene.to_swap());
+    }
+
     fn apply_selected_rule(&mut self, rule: sim::GameOfLife3D, label: &'static str) {
         // set_gol_smoke_rule routes through mutate_materials, which already
         // invalidates the material-dependent hashlife caches (sim/world.rs:529).
@@ -1813,6 +3230,7 @@ impl App {
         // no caches to invalidate either.
         if self.gol_smoke_scene {
             self.world.set_gol_smoke_rule(rule);
+            self.mark_world_changed();
             if let Some(renderer) = &mut self.renderer {
                 renderer.upload_palette(&self.world.materials().color_palette_rgba());
             }
@@ -1829,32 +3247,73 @@ impl App {
     }
 
     /// Legend text lines for the current camera mode.
-    fn legend_lines(mode: CameraMode) -> Vec<&'static str> {
+    fn legend_lines(
+        mode: CameraMode,
+        quarantine_atlas_active: bool,
+        soup_prospector_active: bool,
+        megastructure_stamp_active: bool,
+    ) -> Vec<&'static str> {
         match mode {
-            CameraMode::FirstPerson => vec![
-                "  FIELD LINK",
-                "",
-                "  WASD        Drift",
-                "  Mouse       Aim",
-                "  Space       Leap",
-                "  Ctrl        Surge",
-                "  LClick      Carve",
-                "  RClick      Cast",
-                "  Scroll/1-9  Matter",
-                "  Ctrl+RClick Clone source",
-                "  Tab         Survey cam",
-                "",
-                "  T  Terrain    B  Spectacle",
-                "  R  Reset      G  GoL bloom",
-                "  M  Gyroid     N  Lattice walk",
-                "  V  Panorama reveal",
-                "  [/] U/I/O  DEV jumps (Tab for orbit)",
-                "  0  Recenter",
-                "  H  Heatmap    +/-  Resolution",
-                "  F5 Pause      F1  Signal legend",
-                "  C  Clear perf",
-                "  Esc Exit",
-            ],
+            CameraMode::FirstPerson => {
+                let action_lines = if soup_prospector_active {
+                    vec![
+                        "  LClick      Disabled",
+                        "  RClick      Place soup",
+                        "  1-3         Soup seed",
+                        "  C           Catalog tile",
+                        "  E           Reuse last",
+                    ]
+                } else if megastructure_stamp_active {
+                    vec![
+                        "  LClick      Disabled",
+                        "  RClick      Stamp module",
+                        "  P           Perf + DAG",
+                    ]
+                } else if quarantine_atlas_active {
+                    vec![
+                        "  LClick      Disabled",
+                        "  RClick      Stamp",
+                        "  1-3         Pattern",
+                    ]
+                } else {
+                    vec![
+                        "  LClick      Carve",
+                        "  RClick      Cast",
+                        "  Scroll/1-9  Matter",
+                        "  Ctrl+RClick Clone source",
+                    ]
+                };
+                [
+                    vec![
+                        "  FIELD LINK",
+                        "",
+                        "  WASD        Drift",
+                        "  Mouse       Aim",
+                        "  Space       Leap",
+                        "  Ctrl        Surge",
+                    ],
+                    action_lines,
+                    vec![
+                        "  Tab         Survey cam",
+                        "",
+                        "  T  Terrain    B  Spectacle",
+                        "  R  Reset      G  GoL bloom",
+                        "  M  Gyroid     Q  Quarantine",
+                        "  Y  Soup prospect",
+                        "  X  Module stamps",
+                        "  N  Lattice walk",
+                        "  V  Panorama reveal",
+                        "  [/] U/I/O  DEV jumps (Tab for orbit)",
+                        "  0  Recenter",
+                        "  H  Heatmap    +/-  Resolution",
+                        "  Sparks      Volcano/geyser particles",
+                        "  F5 Pause      F1  Signal legend",
+                        "  C  Clear perf",
+                        "  Esc Exit",
+                    ],
+                ]
+                .concat()
+            }
             CameraMode::Orbit => vec![
                 "  SURVEY CAM",
                 "",
@@ -1867,12 +3326,16 @@ impl App {
                 "",
                 "  T  Terrain    B  Spectacle",
                 "  R  Reset      G  GoL bloom",
-                "  M  Gyroid     N  Lattice walk",
+                "  M  Gyroid     Q  Quarantine",
+                "  Y  Soup prospect",
+                "  X  Module stamps",
+                "  N  Lattice walk",
                 "  [/] DEV prev/next jump",
                 "  U/I/O DEV intro/interior/reveal",
                 "  V  Panorama reveal",
                 "  0  Recenter",
                 "  H  Heatmap    +/-  Resolution",
+                "  Sparks      Volcano/geyser particles",
                 "  F5 Pause      F1  Signal legend",
                 "  C  Clear perf",
                 "  Esc Exit",
@@ -1910,6 +3373,131 @@ impl App {
         self.mark_resume_edge();
     }
 
+    fn demo_scene_coord(&self) -> &'static str {
+        if self.soup_prospector.is_some() {
+            "soup-search"
+        } else if self.megastructure_stamp.is_some() {
+            "megastructure-stamp"
+        } else if self.quarantine_atlas.is_some() {
+            "quarantine-atlas"
+        } else if self.current_demo_beat.is_some() {
+            "lattice"
+        } else if self.gol_smoke_scene {
+            "random-mix"
+        } else {
+            "default-demo"
+        }
+    }
+
+    fn emit_demo_perf_trail(
+        &mut self,
+        stepping: bool,
+        generation: Option<u64>,
+        population: Option<u64>,
+        mem_summary: Option<String>,
+        svdag_stats: Option<(usize, usize, u32)>,
+    ) {
+        let perf_summary = self.perf.summary();
+        let memo_summary = self.last_memo_summary.clone();
+        let sim_active = !self.paused && !self.freeze_sim;
+        let intensity = classify_demo_intensity(&memo_summary, sim_active);
+        let regime = classify_demo_regime(&memo_summary);
+        let sample_count = [
+            "frame_total",
+            "step",
+            "step_recursive",
+            "render_cpu",
+            "render_gpu",
+            "upload_cpu",
+        ]
+        .iter()
+        .filter_map(|name| self.perf.stats(name).map(|(_, _, count)| count))
+        .max()
+        .unwrap_or(0);
+        let mut metrics = serde_json::Map::new();
+        insert_duration_metrics(
+            &mut metrics,
+            &perf_summary,
+            "step",
+            "step_mean_ms",
+            "step_p95_ms",
+        );
+        insert_duration_metrics(
+            &mut metrics,
+            &perf_summary,
+            "frame_total",
+            "frame_total_mean_ms",
+            "frame_total_p95_ms",
+        );
+        insert_duration_metrics(
+            &mut metrics,
+            &perf_summary,
+            "step_recursive",
+            "step_recursive_mean_ms",
+            "step_recursive_p95_ms",
+        );
+        insert_summary_metric(&mut metrics, &memo_summary, "memo_hit", "memo_hit_ratio");
+        insert_summary_metric(
+            &mut metrics,
+            &memo_summary,
+            "memo_churn",
+            "memo_churn_ratio",
+        );
+        insert_summary_metric(
+            &mut metrics,
+            &memo_summary,
+            "memo_elision",
+            "work_elision_factor_x",
+        );
+        insert_summary_metric(
+            &mut metrics,
+            &memo_summary,
+            "memo_tbl",
+            "memo_table_entries",
+        );
+        insert_summary_metric(&mut metrics, &memo_summary, "bfs_l3", "bfs_l3");
+        let record = serde_json::json!({
+            "schema_version": 2,
+            "record_kind": "demo_perf_snapshot",
+            "coordinate_source": "heuristic",
+            "timestamp_ms": unix_epoch_millis(),
+            "world": demo_world_coord(self.volume_size),
+            "scene": self.demo_scene_coord(),
+            "intensity": intensity,
+            "regime": regime,
+            "rule_set": "default-ca",
+            "backend": "hashlife-recursive",
+            "hardware": std::env::var("HASH_THING_HARDWARE").unwrap_or_else(|_| "unknown".to_string()),
+            "scenario_hash": "unknown",
+            "confidence": {
+                "n": sample_count,
+                "warm_frame_policy": "rolling-64-sample-rings",
+                "source": "demo",
+                "cherry_pick_audit": "mixed",
+                "notes": "hash-thing-x7dl heuristic demo trail; raw summaries are included for reclassification"
+            },
+            "level": self.volume_size.trailing_zeros(),
+            "side": self.volume_size,
+            "git_commit": self.git_commit,
+            "generation": generation,
+            "population": population,
+            "stepping": stepping,
+            "sim_active": sim_active,
+            "paused": self.paused,
+            "metrics": metrics,
+            "svdag": svdag_stats.map(|(nodes, bytes, root_level)| serde_json::json!({
+                "nodes": nodes,
+                "bytes": bytes,
+                "root_level": root_level
+            })),
+            "mem_summary": mem_summary,
+            "perf_summary": perf_summary,
+            "memo_summary": memo_summary,
+            "lod_summary": self.lod_summary()
+        });
+        self.demo_perf_trail.append(&record);
+    }
+
     /// Get the player's eye position and look direction.
     fn player_eye_ray(&self) -> Option<([f64; 3], [f64; 3])> {
         let pid = self.player_id?;
@@ -1931,6 +3519,87 @@ impl App {
                 }
             }
         }
+    }
+
+    fn apply_current_player_camera_pose(&mut self) {
+        let Some(pid) = self.player_id else {
+            return;
+        };
+        let Some(entity) = self.entities.iter().find(|e| e.id == pid) else {
+            return;
+        };
+        let sim::EntityKind::Player(ref ps) = entity.kind else {
+            return;
+        };
+        let eye = [
+            entity.pos[0],
+            entity.pos[1] + PLAYER_HEIGHT * 0.85,
+            entity.pos[2],
+        ];
+        self.camera_mode = CameraMode::FirstPerson;
+        self.camera_feel.reset();
+        self.legend_visible = default_legend_visibility(self.camera_mode);
+        self.legend_dirty = true;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.camera_target = [
+                (eye[0] - self.render_origin[0] as f64) as f32 * self.render_inv_size,
+                (eye[1] - self.render_origin[1] as f64) as f32 * self.render_inv_size,
+                (eye[2] - self.render_origin[2] as f64) as f32 * self.render_inv_size,
+            ];
+            renderer.camera_yaw = ps.yaw as f32;
+            renderer.camera_pitch = ps.pitch as f32;
+            renderer.camera_dist = 0.0;
+        }
+    }
+
+    fn apply_dump_pose(&mut self, pose: DumpPose) {
+        match pose {
+            DumpPose::Wall => self.apply_current_player_camera_pose(),
+            DumpPose::Blocks => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.28, 0.50],
+                yaw: -std::f32::consts::FRAC_PI_4,
+                pitch: 0.18,
+                dist: 0.62,
+            }),
+            DumpPose::TerrainWide => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.36, 0.50],
+                yaw: -3.0 * std::f32::consts::FRAC_PI_4,
+                pitch: 0.34,
+                dist: 0.95,
+            }),
+            DumpPose::QuarantineAtlas => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.54, 0.26, 0.50],
+                yaw: -std::f32::consts::FRAC_PI_2,
+                pitch: 0.30,
+                dist: 0.78,
+            }),
+            DumpPose::MegastructureStamp => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.30, 0.42],
+                yaw: -std::f32::consts::FRAC_PI_2,
+                pitch: 0.34,
+                dist: 0.72,
+            }),
+            DumpPose::Geyser => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.28, 0.35, 0.59],
+                yaw: std::f32::consts::FRAC_PI_2,
+                pitch: 0.24,
+                dist: 0.34,
+            }),
+            DumpPose::Volcano => self.apply_orbit_camera_pose(OrbitCameraPose {
+                target: [0.50, 0.10, 0.50],
+                yaw: -std::f32::consts::FRAC_PI_4,
+                pitch: 0.22,
+                dist: 0.30,
+            }),
+        }
+        if matches!(
+            pose,
+            DumpPose::QuarantineAtlas | DumpPose::MegastructureStamp
+        ) {
+            self.legend_visible = false;
+            self.legend_dirty = true;
+        }
+        log::info!("--dump-pose: applied {}", pose.label());
     }
 
     fn apply_orbit_camera_pose(&mut self, pose: OrbitCameraPose) {
@@ -2017,6 +3686,14 @@ impl App {
         if self.is_stepping() {
             return;
         }
+        if self.quarantine_atlas.is_some() {
+            log::info!("Quarantine Atlas carve disabled; use 1-3 plus right-click stamps");
+            return;
+        }
+        if self.megastructure_stamp.is_some() {
+            log::info!("Megastructure Stamp carve disabled; right-click places modules");
+            return;
+        }
         let Some((eye, dir)) = self.player_eye_ray() else {
             return;
         };
@@ -2031,6 +3708,7 @@ impl App {
                 sim::WorldCoord(hit[2]),
                 hash_thing::octree::Cell::EMPTY.raw(),
             );
+            self.mark_world_changed();
             // Re-upload volume since we modified the world directly.
             let player_pos = self.player_world_pos();
             Self::upload_volume(
@@ -2051,6 +3729,14 @@ impl App {
     /// Place a block on the face the player is looking at.
     fn place_block(&mut self) {
         if self.is_stepping() {
+            return;
+        }
+        if self.quarantine_atlas.is_some() {
+            self.deploy_quarantine_atlas_pattern();
+            return;
+        }
+        if self.megastructure_stamp.is_some() {
+            self.deploy_megastructure_stamp();
             return;
         }
         let pid = self.player_id;
@@ -2081,6 +3767,7 @@ impl App {
                 sim::WorldCoord(prev[2]),
                 state,
             );
+            self.mark_world_changed();
             let player_pos = self.player_world_pos();
             Self::upload_volume(
                 &mut self.renderer,
@@ -2098,6 +3785,155 @@ impl App {
                 window.request_redraw();
             }
         }
+    }
+
+    fn select_quarantine_atlas_pattern(&mut self, pattern: QuarantineAtlasPattern) -> bool {
+        let Some(state) = self.quarantine_atlas.as_mut() else {
+            return false;
+        };
+        state.selected_pattern = pattern;
+        log::info!(
+            "Quarantine Atlas pattern: {} (budget {})",
+            pattern.label(),
+            state.interventions_remaining
+        );
+        true
+    }
+
+    fn deploy_quarantine_atlas_pattern(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return;
+        };
+        let Some((_hit, prev)) = player::raycast_cells(&self.world, eye, dir) else {
+            return;
+        };
+        if self.apply_quarantine_atlas_pattern_at(prev) {
+            let player_pos = self.player_world_pos();
+            Self::upload_volume(
+                &mut self.renderer,
+                &mut self.world,
+                &mut self.svdag,
+                &mut self.last_svdag_stats,
+                LodUploadCtx {
+                    policy: &mut self.lod_policy,
+                    player_pos,
+                    last_histogram: &mut self.last_lod_histogram,
+                    last_growth_ratio: &mut self.last_lod_growth_ratio,
+                },
+            );
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn apply_quarantine_atlas_pattern_at(&mut self, center: [i64; 3]) -> bool {
+        let Some(state) = self.quarantine_atlas.as_mut() else {
+            return false;
+        };
+        if state.interventions_remaining == 0 {
+            log::info!("Quarantine Atlas budget exhausted");
+            return false;
+        }
+        state.interventions_remaining -= 1;
+        let pattern = state.selected_pattern;
+        let interventions_remaining = state.interventions_remaining;
+        self.world.apply_quarantine_atlas_pattern(pattern, center);
+        self.mark_world_changed();
+        log::info!(
+            "Deployed {} at {:?}; budget {}",
+            pattern.label(),
+            center,
+            interventions_remaining
+        );
+        true
+    }
+
+    fn deploy_megastructure_stamp(&mut self) -> bool {
+        if self.is_stepping() {
+            return false;
+        }
+        let Some((eye, dir)) = self.player_eye_ray() else {
+            return false;
+        };
+        let Some((_hit, prev)) = player::raycast_cells(&self.world, eye, dir) else {
+            return false;
+        };
+        let mut origin = snap_megastructure_stamp_origin(prev);
+        if let Some(state) = self.megastructure_stamp.as_ref() {
+            origin[1] = state.floor_y + 1;
+        }
+        if !megastructure_stamp_in_bounds(self.world.side() as i64, origin) {
+            log::info!("Megastructure Stamp out of bounds at {:?}", origin);
+            return false;
+        }
+        self.deploy_megastructure_stamp_at_origin(origin)
+    }
+
+    fn deploy_megastructure_stamp_at_origin(&mut self, origin: [i64; 3]) -> bool {
+        if self.is_stepping() || !megastructure_stamp_in_bounds(self.world.side() as i64, origin) {
+            return false;
+        }
+        let stamp = stamp_megastructure_module(&mut self.world, origin);
+        let mut completed_objective = None;
+        self.mark_world_changed();
+        if let Some(state) = self.megastructure_stamp.as_mut() {
+            if stamp.changed > 0 {
+                state.stamps_placed += 1;
+            }
+            if let Some(index) = megastructure_objective_index(origin, state.floor_y) {
+                let bit = 1 << index;
+                if stamp.changed > 0 && state.objective_mask & bit == 0 {
+                    state.objective_mask |= bit;
+                    state.objective_progress += 1;
+                    completed_objective = Some((index, state.objective_progress));
+                }
+            }
+            state.last_stamp_origin = Some(origin);
+            log::info!(
+                "Megastructure module stamped at {:?}: cells={} changed={} total_stamps={} objective={}/{}",
+                origin,
+                stamp.written,
+                stamp.changed,
+                state.stamps_placed,
+                state.objective_progress,
+                MEGASTRUCTURE_OBJECTIVE_STAMPS
+            );
+        }
+        if let Some((index, progress)) = completed_objective {
+            paint_megastructure_objective_marker(&mut self.world, origin, true);
+            log::info!(
+                "Megastructure objective pylon {} powered: {}/{}",
+                index + 1,
+                progress,
+                MEGASTRUCTURE_OBJECTIVE_STAMPS
+            );
+            if progress == MEGASTRUCTURE_OBJECTIVE_STAMPS {
+                log::info!("Megastructure objective complete: all pylons powered");
+            }
+        }
+        self.refresh_megastructure_objective_hud();
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.refresh_memo_summary_after_world_update();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
     }
 
     /// Refresh both GPU uploads (flat3D volume + SVDAG) and cache the
@@ -2192,6 +4028,7 @@ impl App {
     /// where no sim-step would otherwise trigger an upload (cswp.8.3
     /// review fix — Codex-standard "important" finding).
     fn refresh_view_after_lod_change(&mut self) {
+        self.mark_world_changed();
         let player_pos = self.player_world_pos();
         Self::upload_volume(
             &mut self.renderer,
@@ -2248,6 +4085,7 @@ impl App {
         }
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.seed_demo_spectacle();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
@@ -2271,6 +4109,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -2340,6 +4179,7 @@ impl App {
                 state,
             );
             self.world.clone_sources.push(pos);
+            self.mark_world_changed();
             log::info!(
                 "Placed clone block (spawns material {held_material}) at {:?}",
                 pos
@@ -2371,6 +4211,458 @@ impl App {
         self.short_demo_cut = None;
     }
 
+    fn exit_quarantine_atlas_mode(&mut self) {
+        if self.quarantine_atlas.take().is_some() {
+            self.legend_dirty = true;
+        }
+    }
+
+    fn exit_soup_prospector_mode(&mut self) {
+        if self.soup_prospector.take().is_some() {
+            self.legend_dirty = true;
+        }
+        self.pending_soup_action = None;
+    }
+
+    fn exit_megastructure_stamp_mode(&mut self) {
+        if self.megastructure_stamp.take().is_some() {
+            self.legend_dirty = true;
+        }
+    }
+
+    fn refresh_megastructure_objective_hud(&mut self) {
+        if let Some(state) = self.megastructure_stamp.as_ref() {
+            let remaining = MEGASTRUCTURE_OBJECTIVE_STAMPS.saturating_sub(state.objective_progress);
+            self.memo_hud_lines = vec![
+                "Megastructure uplink".to_string(),
+                format!(
+                    "Powered pylons {}/{}",
+                    state.objective_progress, MEGASTRUCTURE_OBJECTIVE_STAMPS
+                ),
+                format!("Remaining stamps {remaining}"),
+            ];
+            self.memo_hud_visible = true;
+            self.memo_hud_dirty = true;
+        }
+    }
+
+    fn aimed_soup_tile(&self) -> Option<[i64; 3]> {
+        let (eye, dir) = self.player_eye_ray()?;
+        if let Some(state) = self.soup_prospector.as_ref() {
+            if let Some(tile) = soup_tile_from_field_ray(
+                self.world.origin,
+                state.tile_min,
+                state.tile_max,
+                eye,
+                dir,
+            ) {
+                return Some(tile);
+            }
+        }
+        let (hit, prev) = player::raycast_cells(&self.world, eye, dir)?;
+        let pos = if prev == hit { hit } else { prev };
+        soup_tile_from_world_pos(&self.world, pos)
+    }
+
+    fn soup_action_tile(&self) -> Option<[i64; 3]> {
+        self.aimed_soup_tile()
+            .or_else(|| self.soup_prospector.as_ref().map(|state| state.focus_tile))
+    }
+
+    fn refresh_soup_prospector_markers(&mut self, target_tile: Option<[i64; 3]>) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        let tile_min = state.tile_min;
+        let tile_max = state.tile_max;
+        let catalog_tiles = state
+            .catalog
+            .iter()
+            .map(|entry| entry.tile)
+            .collect::<Vec<_>>();
+        stamp_soup_demo_markers(
+            &mut self.world,
+            tile_min,
+            tile_max,
+            target_tile,
+            &catalog_tiles,
+        );
+        true
+    }
+
+    fn clear_soup_prospector_markers_for_step(&mut self) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        clear_soup_demo_markers(&mut self.world, state.tile_min, state.tile_max);
+        true
+    }
+
+    fn refresh_soup_prospector_hud(&mut self) -> bool {
+        if self.soup_prospector.is_none() {
+            return false;
+        }
+        self.sample_soup_prospector_tiles();
+        let aimed_tile = self.aimed_soup_tile();
+        let reuse_focus_tile = self
+            .soup_prospector
+            .as_ref()
+            .and_then(|state| state.last_reuse.as_ref().map(|reuse| reuse.target_tile));
+        let focus_tile = reuse_focus_tile.or(aimed_tile).unwrap_or_else(|| {
+            self.soup_prospector
+                .as_ref()
+                .map(|state| state.focus_tile)
+                .unwrap_or([0, 0, 0])
+        });
+        self.refresh_soup_prospector_markers(Some(focus_tile));
+        let (target_pop, target_hash) = soup_tile_stats(&self.world, focus_tile);
+        let generation = self.world.generation;
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        state.focus_tile = focus_tile;
+        let target_label = record_soup_tile_pop_sample(state, focus_tile, generation, target_pop);
+        let target_source = if reuse_focus_tile.is_some() {
+            "reuse"
+        } else if aimed_tile.is_some() {
+            "aimed"
+        } else {
+            "focus"
+        };
+        let last = state
+            .catalog
+            .last()
+            .map(|entry| {
+                format!(
+                    "last_label={} last_tile={} last_pop={} last_hash={}",
+                    entry.label.as_str(),
+                    soup_tile_text(entry.tile),
+                    entry.pop,
+                    soup_hash_short(&entry.state_hash)
+                )
+            })
+            .unwrap_or_else(|| "last_label=none".to_string());
+        let reuse = state
+            .last_reuse
+            .as_ref()
+            .map(|reuse| {
+                format!(
+                    "reuse={} last_reuse={}->{} changed={} initial_match={} post_label={} post_pop={} post_hash={}",
+                    reuse.count,
+                    soup_tile_text(reuse.source_tile),
+                    soup_tile_text(reuse.target_tile),
+                    if reuse.target_before_hash != reuse.target_after_hash {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    if reuse.source_hash == reuse.target_after_hash {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    reuse.post_label.as_str(),
+                    reuse.post_pop,
+                    soup_hash_short(&reuse.post_hash),
+                )
+            })
+            .unwrap_or_else(|| "reuse=0 last_reuse=none".to_string());
+        let reuse_hud_lines = state.last_reuse.as_ref().map(soup_reuse_hud_lines);
+        let reuse_headline = state
+            .last_reuse
+            .as_ref()
+            .map(soup_reuse_headline)
+            .unwrap_or_default();
+        self.last_memo_summary = format!(
+            "{}soup_seed={} target_src={} target_tile={} target_label={} target_pop={} target_hash={} catalog={} {} {}",
+            reuse_headline,
+            state.selected_pattern + 1,
+            target_source,
+            soup_tile_text(focus_tile),
+            target_label.as_str(),
+            target_pop,
+            soup_hash_short(&target_hash),
+            state.catalog.len(),
+            last,
+            reuse,
+        );
+        self.memo_hud_lines =
+            reuse_hud_lines.unwrap_or_else(|| standard_memo_hud_lines(&self.last_memo_summary));
+        self.memo_hud_visible = true;
+        self.memo_hud_dirty = true;
+        true
+    }
+
+    fn sample_soup_prospector_tiles(&mut self) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        let tile_min = state.tile_min;
+        let tile_max = state.tile_max;
+        let generation = self.world.generation;
+        let mut samples = Vec::new();
+        for z in tile_min[2]..tile_max[2] {
+            for y in tile_min[1]..tile_max[1] {
+                for x in tile_min[0]..tile_max[0] {
+                    let tile = [x, y, z];
+                    let (pop, _) = soup_tile_stats(&self.world, tile);
+                    samples.push((tile, pop));
+                }
+            }
+        }
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        for (tile, pop) in samples {
+            record_soup_tile_pop_sample(state, tile, generation, pop);
+        }
+        true
+    }
+
+    fn refresh_memo_summary_after_world_update(&mut self) {
+        if !self.refresh_soup_prospector_hud() {
+            self.last_memo_summary = self.world.memo_summary();
+            if self.megastructure_stamp.is_some() {
+                self.refresh_megastructure_objective_hud();
+            } else {
+                self.memo_hud_lines = standard_memo_hud_lines(&self.last_memo_summary);
+                self.memo_hud_dirty = true;
+            }
+        }
+    }
+
+    fn run_soup_action_or_queue(&mut self, action: PendingSoupAction) -> bool {
+        if self.soup_prospector.is_none() {
+            return false;
+        }
+        if self.is_stepping() {
+            self.pending_soup_action = Some(action);
+            log::info!("Soup Prospector action queued until current evolution step finishes");
+            return true;
+        }
+        match action {
+            PendingSoupAction::PlaceSelected => self.place_selected_soup_prospector_pattern(),
+            PendingSoupAction::SelectPattern(pattern) => {
+                self.select_soup_prospector_pattern(pattern, false)
+            }
+            PendingSoupAction::Catalog => self.catalog_soup_prospector_target(),
+            PendingSoupAction::ReuseCatalog => self.reuse_latest_soup_catalog_entry(true),
+        }
+    }
+
+    fn run_pending_soup_action(&mut self) {
+        let Some(action) = self.pending_soup_action.take() else {
+            return;
+        };
+        self.run_soup_action_or_queue(action);
+    }
+
+    fn select_soup_prospector_pattern(&mut self, pattern: usize, place_now: bool) -> bool {
+        let pattern = pattern % SOUP_PROSPECTOR_PATTERN_SEEDS.len();
+        let focus_tile = self.soup_action_tile().unwrap_or_else(|| {
+            self.soup_prospector
+                .as_ref()
+                .map(|state| state.focus_tile)
+                .unwrap_or([0, 0, 0])
+        });
+        {
+            let Some(state) = self.soup_prospector.as_mut() else {
+                return false;
+            };
+            state.selected_pattern = pattern;
+            state.focus_tile = focus_tile;
+            state.last_reuse = None;
+        }
+        if !place_now {
+            log::info!("Soup Prospector seed selected: {}", pattern + 1);
+            self.refresh_soup_prospector_hud();
+            return true;
+        }
+        let generation = self.world.generation;
+        let placed = seed_soup_tile(
+            &mut self.world,
+            focus_tile,
+            soup_pattern_seed(pattern) ^ generation,
+        );
+        self.mark_world_changed();
+        log::info!(
+            "Soup Prospector seed {} placed at tile {:?}: initial_pop={placed}",
+            pattern + 1,
+            focus_tile
+        );
+        self.refresh_soup_prospector_hud();
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        true
+    }
+
+    fn place_selected_soup_prospector_pattern(&mut self) -> bool {
+        let pattern = self
+            .soup_prospector
+            .as_ref()
+            .map(|state| state.selected_pattern)
+            .unwrap_or(0);
+        self.select_soup_prospector_pattern(pattern, true)
+    }
+
+    fn catalog_soup_prospector_target(&mut self) -> bool {
+        let Some(tile) = self.soup_action_tile() else {
+            return false;
+        };
+        self.clear_soup_prospector_markers_for_step();
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        state.focus_tile = tile;
+        state.last_reuse = None;
+        let (pop, state_hash) = soup_tile_stats(&self.world, tile);
+        let snapshot = capture_soup_tile_snapshot(&self.world, tile);
+        let generation = self.world.generation;
+        let label = record_soup_tile_pop_sample(state, tile, generation, pop);
+        let entry = SoupCatalogEntry {
+            tile,
+            generation,
+            pop,
+            state_hash,
+            pattern: state.selected_pattern,
+            label,
+            snapshot,
+        };
+        log::info!(
+            "Soup catalog #{}: tile={:?} gen={} pop={} label={} pattern={} hash={}",
+            state.catalog.len() + 1,
+            entry.tile,
+            entry.generation,
+            entry.pop,
+            entry.label.as_str(),
+            entry.pattern + 1,
+            entry.state_hash
+        );
+        state.catalog.push(entry);
+        self.refresh_soup_prospector_hud();
+        self.mark_world_changed();
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        true
+    }
+
+    fn reuse_latest_soup_catalog_entry(&mut self, run_post_step: bool) -> bool {
+        let Some(state) = self.soup_prospector.as_ref() else {
+            return false;
+        };
+        let Some(entry) = state.catalog.last().cloned() else {
+            log::info!("Soup reuse ignored: catalog is empty");
+            return false;
+        };
+        let preferred = self.aimed_soup_tile().or(Some(state.focus_tile));
+        let Some(target_tile) =
+            choose_soup_reuse_target(preferred, entry.tile, state.tile_min, state.tile_max)
+        else {
+            log::info!("Soup reuse ignored: no distinct in-bounds target tile");
+            return false;
+        };
+
+        self.clear_soup_prospector_markers_for_step();
+        let (target_before_pop, target_before_hash) = soup_tile_stats(&self.world, target_tile);
+        paste_soup_tile_snapshot(&mut self.world, target_tile, &entry.snapshot);
+        frame_soup_tile(&mut self.world, target_tile);
+        let (target_after_pop, target_after_hash) = soup_tile_stats(&self.world, target_tile);
+        self.mark_world_changed();
+
+        let mut post_pop = target_after_pop;
+        let mut post_hash = target_after_hash.clone();
+        let mut post_label = {
+            let generation = self.world.generation;
+            let Some(state) = self.soup_prospector.as_mut() else {
+                return false;
+            };
+            record_soup_tile_pop_sample(state, target_tile, generation, post_pop)
+        };
+
+        if run_post_step {
+            self.run_sync_dump_step();
+            (post_pop, post_hash) = soup_tile_stats(&self.world, target_tile);
+            let generation = self.world.generation;
+            let Some(state) = self.soup_prospector.as_mut() else {
+                return false;
+            };
+            post_label = record_soup_tile_pop_sample(state, target_tile, generation, post_pop);
+        }
+
+        let Some(state) = self.soup_prospector.as_mut() else {
+            return false;
+        };
+        state.reuse_count += 1;
+        state.focus_tile = target_tile;
+        state.last_reuse = Some(SoupReuseResult {
+            source_tile: entry.tile,
+            target_tile,
+            source_hash: entry.state_hash.clone(),
+            target_before_pop,
+            target_before_hash,
+            target_after_pop,
+            target_after_hash,
+            post_pop,
+            post_hash,
+            post_label,
+            count: state.reuse_count,
+        });
+        log::info!(
+            "Soup reuse #{}: source={:?} target={:?} changed={} initial_match={} post_label={} post_pop={}",
+            state.reuse_count,
+            entry.tile,
+            target_tile,
+            state
+                .last_reuse
+                .as_ref()
+                .is_some_and(|reuse| reuse.target_before_hash != reuse.target_after_hash),
+            state
+                .last_reuse
+                .as_ref()
+                .is_some_and(|reuse| reuse.source_hash == reuse.target_after_hash),
+            post_label.as_str(),
+            post_pop
+        );
+        self.refresh_soup_prospector_hud();
+        self.mark_world_changed();
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        true
+    }
+
     #[allow(dead_code)]
     fn load_burning_room_demo(&mut self, label: &str) {
         if self.is_stepping() {
@@ -2378,6 +4670,7 @@ impl App {
         }
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.seed_burning_room();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.gol_smoke_scene = false;
         self.noise_ns_per_sample = 0.0;
@@ -2401,6 +4694,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!("{label}: pop={}", self.world.population());
     }
 
@@ -2425,6 +4719,7 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let stats = self.world.seed_gyroid_megastructure();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
         let elapsed = start.elapsed();
@@ -2450,12 +4745,251 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!(
             "Gyroid megastructure: pop={} gen={:.1}ms collapses={} classifies={}",
             self.world.population(),
             elapsed.as_secs_f64() * 1000.0,
             stats.total_collapses(),
             stats.classify_calls,
+        );
+    }
+
+    fn load_megastructure_stamp_demo(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        if self.volume_size < 128 {
+            log::info!(
+                "Megastructure Stamp requires SIZE >= 128 (current {})",
+                self.volume_size
+            );
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world
+            .set_gol_smoke_rule(sim::GameOfLife3D::new(0, 6, 1, 3));
+        let side = self.world.side() as i64;
+        let floor_y = side / 4;
+        for z in 0..side {
+            for x in 0..side {
+                self.world.set(
+                    sim::WorldCoord(x),
+                    sim::WorldCoord(floor_y),
+                    sim::WorldCoord(z),
+                    hash_thing::terrain::materials::GRASS,
+                );
+            }
+        }
+        let mut stamps = 0;
+        'stamps: for z in (8..side - 8).step_by(MEGASTRUCTURE_TILE_STRIDE as usize) {
+            for x in (8..side - 8).step_by(MEGASTRUCTURE_TILE_STRIDE as usize) {
+                stamp_megastructure_module(&mut self.world, [x, floor_y + 1, z]);
+                stamps += 1;
+                if stamps == MEGASTRUCTURE_INITIAL_STAMPS {
+                    break 'stamps;
+                }
+            }
+        }
+        paint_megastructure_objectives(&mut self.world, floor_y, 0);
+        self.mark_world_changed();
+        self.reset_scene_entities();
+        self.reset_player_pose(
+            [side as f64 * 0.5, floor_y as f64 + 8.0, side as f64 * 0.72],
+            std::f64::consts::PI,
+            -0.25,
+        );
+        self.gol_smoke_scene = false;
+        self.quarantine_atlas = None;
+        self.soup_prospector = None;
+        self.pending_soup_action = None;
+        self.megastructure_stamp = Some(MegastructureStampState {
+            stamps_placed: stamps,
+            floor_y,
+            last_stamp_origin: None,
+            objective_progress: 0,
+            objective_mask: 0,
+        });
+        self.refresh_megastructure_objective_hud();
+        self.paused = false;
+        self.legend_dirty = true;
+        self.reset_scene_perf_state();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
+        }
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.sync_render_cache();
+        self.exit_lattice_demo_mode();
+        self.apply_current_player_camera_pose();
+        log::info!(
+            "Megastructure Stamp: pop={} gen={:.1}ms stamps={} svdag_nodes={} svdag_kb={}",
+            self.world.population(),
+            start.elapsed().as_secs_f64() * 1000.0,
+            stamps,
+            self.svdag.node_count,
+            self.svdag.byte_size() / 1024,
+        );
+    }
+
+    fn load_soup_prospector_demo(&mut self) {
+        if self.is_stepping() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        self.world.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let focus_tile = soup_focus_tile_for_side(self.world.side());
+        debug_assert!(soup_tile_in_bounds(self.world.side(), focus_tile));
+        let (tile_min, tile_max) = soup_demo_tile_bounds(self.world.side(), focus_tile);
+        let mut seeded_tiles = 0;
+        for z in tile_min[2]..tile_max[2] {
+            for y in tile_min[1]..tile_max[1] {
+                for x in tile_min[0]..tile_max[0] {
+                    let tile = [x, y, z];
+                    let seed = 19
+                        ^ ((x as u64) << 40)
+                        ^ ((y as u64) << 20)
+                        ^ (z as u64)
+                        ^ soup_pattern_seed(0);
+                    seed_soup_tile(&mut self.world, tile, seed);
+                    frame_soup_tile(&mut self.world, tile);
+                    seeded_tiles += 1;
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        self.mark_world_changed();
+        self.reset_scene_entities();
+        self.gol_smoke_rule = sim::GameOfLife3D::rule445();
+        self.gol_smoke_scene = true;
+        self.soup_prospector = Some(SoupProspectorState::new(focus_tile, tile_min, tile_max));
+        self.legend_dirty = true;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = false;
+        self.reset_scene_perf_state();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
+        }
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.sync_render_cache();
+        self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
+        self.reset_player_pose(
+            [
+                self.world_center()[0],
+                self.world.origin[1] as f64 + (tile_min[1] * SOUP_PROSPECTOR_TILE + 10) as f64,
+                self.world.origin[2] as f64 + (tile_max[2] * SOUP_PROSPECTOR_TILE - 4) as f64,
+            ],
+            0.0,
+            -0.24,
+        );
+        self.apply_current_player_camera_pose();
+        self.refresh_soup_prospector_hud();
+        let (focus_pop, _) = soup_tile_stats(&self.world, focus_tile);
+        log::info!(
+            "Soup Prospector: sparse 445 board loaded in {:.1}ms; tiles={} focus_tile={:?} focus_pop={focus_pop}",
+            elapsed.as_secs_f64() * 1000.0,
+            seeded_tiles,
+            focus_tile,
+        );
+    }
+
+    fn load_quarantine_atlas_demo(&mut self) {
+        self.load_quarantine_atlas_demo_with_setup(false);
+    }
+
+    fn load_quarantine_atlas_mixed_containment_demo(&mut self) {
+        self.load_quarantine_atlas_demo_with_setup(true);
+    }
+
+    fn load_quarantine_atlas_demo_with_setup(&mut self, mixed_containment: bool) {
+        if self.is_stepping() {
+            return;
+        }
+        if self.volume_size < 64 {
+            log::warn!(
+                "Quarantine Atlas requires SIZE >= 64 (current {})",
+                self.volume_size
+            );
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.world = sim::World::new(self.volume_size.trailing_zeros());
+        let layout = self.world.seed_quarantine_atlas_demo();
+        if mixed_containment {
+            for (pattern, center) in quarantine_atlas_mixed_containment_plan(layout) {
+                self.world.apply_quarantine_atlas_pattern(pattern, center);
+            }
+        }
+        self.mark_world_changed();
+        self.reset_scene_entities();
+        self.spawn_demo_entities();
+        self.reset_player_pose(layout.player_pos, layout.player_yaw, layout.player_pitch);
+        let elapsed = start.elapsed();
+        self.gol_smoke_scene = false;
+        self.quarantine_atlas = Some(QuarantineAtlasState::default());
+        self.legend_dirty = true;
+        self.noise_ns_per_sample = 0.0;
+        self.paused = false;
+        self.reset_scene_perf_state();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload_palette(&self.world.materials().color_palette_rgba());
+        }
+        let player_pos = self.player_world_pos();
+        Self::upload_volume(
+            &mut self.renderer,
+            &mut self.world,
+            &mut self.svdag,
+            &mut self.last_svdag_stats,
+            LodUploadCtx {
+                policy: &mut self.lod_policy,
+                player_pos,
+                last_histogram: &mut self.last_lod_histogram,
+                last_growth_ratio: &mut self.last_lod_growth_ratio,
+            },
+        );
+        self.sync_render_cache();
+        self.exit_lattice_demo_mode();
+        log::info!(
+            "Quarantine Atlas: pop={} gen={:.1}ms budget={} pattern={} setup={}",
+            self.world.population(),
+            elapsed.as_secs_f64() * 1000.0,
+            self.quarantine_atlas
+                .map(|s| s.interventions_remaining)
+                .unwrap_or(0),
+            self.quarantine_atlas
+                .map(|s| s.selected_pattern.label())
+                .unwrap_or("none"),
+            if mixed_containment {
+                hash_thing::sim::world::QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
+            } else {
+                "none"
+            },
         );
     }
 
@@ -2466,6 +5000,7 @@ impl App {
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         self.world.set_gol_smoke_rule(self.gol_smoke_rule);
         self.world.seed_center(12, 0.35);
+        self.mark_world_changed();
         self.gol_smoke_scene = true;
         self.paused = true;
         self.reset_scene_perf_state();
@@ -2487,6 +5022,7 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
         log::info!("Reset GoL smoke sphere: pop={}", self.world.population());
     }
 
@@ -2501,6 +5037,7 @@ impl App {
         let start = std::time::Instant::now();
         self.world = sim::World::new(self.volume_size.trailing_zeros());
         let layout = self.world.seed_lattice_progression_demo();
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
         self.reset_player_pose(layout.player_pos, layout.player_yaw, layout.player_pitch);
@@ -2528,6 +5065,7 @@ impl App {
         self.sync_render_cache();
         self.current_demo_beat = None;
         self.short_demo_cut = None;
+        self.exit_quarantine_atlas_mode();
         log::info!(
             "Lattice progression demo: pop={} gen={:.1}ms reveal={:?}",
             self.world.population(),
@@ -2551,6 +5089,7 @@ impl App {
             .world
             .seed_terrain(&params)
             .expect("UI-generated terrain params must validate");
+        self.mark_world_changed();
         self.reset_scene_entities();
         self.spawn_demo_entities();
         let elapsed = start.elapsed();
@@ -2585,6 +5124,45 @@ impl App {
         );
         self.sync_render_cache();
         self.exit_lattice_demo_mode();
+        self.exit_quarantine_atlas_mode();
+    }
+
+    fn handle_digit_key(&mut self, digit: u16) {
+        if self.soup_prospector.is_some() {
+            if (1..=3).contains(&digit) {
+                self.run_soup_action_or_queue(PendingSoupAction::SelectPattern(
+                    (digit - 1) as usize,
+                ));
+            } else {
+                log::debug!("digit {digit} ignored in Soup Prospector: seed selection uses 1-3");
+            }
+            return;
+        }
+        if self.camera_mode == CameraMode::FirstPerson {
+            if self.quarantine_atlas.is_some() {
+                if let Some(pattern) = QuarantineAtlasPattern::from_digit(digit) {
+                    self.select_quarantine_atlas_pattern(pattern);
+                } else {
+                    log::debug!(
+                        "digit {digit} ignored in Quarantine Atlas: pattern selection uses 1-3"
+                    );
+                }
+                return;
+            }
+            // FPS mode: select held material.
+            self.select_held_material(digit);
+        } else {
+            // Orbit mode: select CA rule (1-4 only).
+            match digit {
+                1 => self.select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba"),
+                2 => self.select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal"),
+                3 => self.select_rule(sim::GameOfLife3D::rule445(), "445"),
+                4 => self.select_rule(sim::GameOfLife3D::new(4, 7, 6, 8), "Pyroclastic"),
+                _ => {
+                    log::debug!("digit {digit} ignored in Orbit mode: rule selection uses 1-4 only")
+                }
+            }
+        }
     }
 }
 
@@ -2610,6 +5188,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                     window.request_redraw();
                 }
             }
+            AppUserEvent::WorldGrowDone(payload) => {
+                self.apply_world_grow_result(payload);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
@@ -2630,8 +5214,9 @@ impl ApplicationHandler<AppUserEvent> for App {
             );
             // Do NOT focus-on-launch by default (edward 2026-04-21): the
             // game stealing focus mid-dev-loop blocks keyboard input to the
-            // terminal/agent surface. Opt in with `HASH_THING_FOCUS=1` (sgcv)
-            // or `--demo` (kh9l). Both feed `App::want_focus_on_launch` via
+            // terminal/agent surface. Opt in with `HASH_THING_FOCUS=1` (sgcv),
+            // `--demo` (kh9l), or `--focused` / `HASH_THING_FOCUSED=1` (xu3d).
+            // All feed `App::want_focus_on_launch` via
             // `main()`. The macOS event_loop_builder's
             // `with_activate_ignoring_other_apps` is set from the same
             // signal, so both gates fire together.
@@ -2649,8 +5234,18 @@ impl ApplicationHandler<AppUserEvent> for App {
             let mut renderer = pollster::block_on(render::Renderer::new(
                 window.clone(),
                 self.volume_size,
-                self.target_pixels_override,
+                self.render_scale_override,
             ));
+            if let Some(mode) = self.dump_debug {
+                renderer.debug_mode = mode.renderer_debug_mode();
+            }
+            if let Some(layer) = self.dump_layer {
+                renderer.render_world_layer = layer.render_world();
+                renderer.render_particle_layer = layer.render_particles();
+            }
+            if let Some(bias) = self.dump_lod_bias {
+                renderer.lod_bias = bias;
+            }
             renderer.upload_palette(&self.world.materials().color_palette_rgba());
             // dlse.2.2 step 3: off-surface render-target diagnostic. Bypasses
             // `surface.get_current_texture()` + `present()`; pairs with the
@@ -2673,8 +5268,11 @@ impl ApplicationHandler<AppUserEvent> for App {
             // re-seeds terrain on top of the lattice/spectacle/etc. world
             // we just loaded.
             if let Some(scene) = self.dump_scene {
-                log::info!("--dump-scene: dispatching {} before first frame", scene.label());
-                self.dispatch_scene_swap(scene.to_swap());
+                log::info!(
+                    "--dump-scene: dispatching {} before first frame",
+                    scene.label()
+                );
+                self.dispatch_dump_scene(scene);
                 self.startup_scene_pending = false;
             }
             // Initial upload — untimed; we haven't started the render
@@ -2853,17 +5451,32 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("s")
                             if self.camera_mode != CameraMode::Orbit =>
                         {
-                            log::debug!("s ignored: single-step only in Orbit mode (current=FPS)");
+                            if event.repeat {
+                                log::debug!(
+                                    "s ignored: single-step only in Orbit mode (current=FPS)"
+                                );
+                            } else {
+                                log::info!(
+                                    "s ignored: single-step only works in Orbit mode (Tab to switch camera)"
+                                );
+                            }
                         }
                         winit::keyboard::Key::Character("s") if self.is_stepping() => {
-                            log::debug!(
-                                "s ignored: single-step denied while background step is in flight"
-                            );
+                            if event.repeat {
+                                log::debug!(
+                                    "s ignored: single-step denied while background step is in flight"
+                                );
+                            } else {
+                                log::info!(
+                                    "s ignored: single-step already running; wait for the current step to finish"
+                                );
+                            }
                         }
                         winit::keyboard::Key::Character("s") => {
                             // Single step via recursive Hashlife path, matching
                             // the auto-step loop (hash-thing-6gf.8).
                             {
+                                self.clear_soup_prospector_markers_for_step();
                                 let _t = self.perf.start("step");
                                 self.world.apply_mutations();
                                 self.world.step_recursive();
@@ -2871,8 +5484,8 @@ impl ApplicationHandler<AppUserEvent> for App {
                                 self.entities.update(&self.world, &mut queue);
                                 self.world.queue = queue;
                             }
-                            self.last_memo_summary = self.world.memo_summary();
-                            self.memo_hud_dirty = true;
+                            self.mark_world_changed();
+                            self.refresh_memo_summary_after_world_update();
                             let player_pos = self.player_world_pos();
                             Self::upload_volume(
                                 &mut self.renderer,
@@ -2908,6 +5521,15 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("m") => {
                             self.request_scene_swap(PendingSceneSwap::LoadGyroid);
                         }
+                        winit::keyboard::Key::Character("q") => {
+                            self.request_scene_swap(PendingSceneSwap::LoadQuarantineAtlas);
+                        }
+                        winit::keyboard::Key::Character("y") => {
+                            self.request_scene_swap(PendingSceneSwap::LoadSoupProspector);
+                        }
+                        winit::keyboard::Key::Character("x") => {
+                            self.request_scene_swap(PendingSceneSwap::LoadMegastructureStamp);
+                        }
                         winit::keyboard::Key::Character("n") => {
                             self.request_scene_swap(PendingSceneSwap::LoadLatticeDemo);
                         }
@@ -2940,30 +5562,32 @@ impl ApplicationHandler<AppUserEvent> for App {
                             // beat-cycle jumps.
                             self.request_scene_swap(PendingSceneSwap::LoadLatticePanoramaDemo);
                         }
-                        winit::keyboard::Key::Character(
-                            n @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"),
-                        ) => {
-                            let digit: u16 = n.parse().unwrap();
-                            if self.camera_mode == CameraMode::FirstPerson {
-                                // FPS mode: select held material.
-                                self.select_held_material(digit);
-                            } else {
-                                // Orbit mode: select CA rule (1-4 only).
-                                match digit {
-                                    1 => self
-                                        .select_rule(sim::GameOfLife3D::new(9, 26, 5, 7), "Amoeba"),
-                                    2 => self
-                                        .select_rule(sim::GameOfLife3D::new(0, 6, 1, 3), "Crystal"),
-                                    3 => self.select_rule(sim::GameOfLife3D::rule445(), "445"),
-                                    4 => self.select_rule(
-                                        sim::GameOfLife3D::new(4, 7, 6, 8),
-                                        "Pyroclastic",
-                                    ),
-                                    _ => log::debug!(
-                                        "digit {digit} ignored in Orbit mode: rule selection uses 1-4 only"
-                                    ),
-                                }
-                            }
+                        winit::keyboard::Key::Character("1") => {
+                            self.handle_digit_key(1);
+                        }
+                        winit::keyboard::Key::Character("2") => {
+                            self.handle_digit_key(2);
+                        }
+                        winit::keyboard::Key::Character("3") => {
+                            self.handle_digit_key(3);
+                        }
+                        winit::keyboard::Key::Character("4") => {
+                            self.handle_digit_key(4);
+                        }
+                        winit::keyboard::Key::Character("5") => {
+                            self.handle_digit_key(5);
+                        }
+                        winit::keyboard::Key::Character("6") => {
+                            self.handle_digit_key(6);
+                        }
+                        winit::keyboard::Key::Character("7") => {
+                            self.handle_digit_key(7);
+                        }
+                        winit::keyboard::Key::Character("8") => {
+                            self.handle_digit_key(8);
+                        }
+                        winit::keyboard::Key::Character("9") => {
+                            self.handle_digit_key(9);
                         }
                         winit::keyboard::Key::Character("b") => {
                             // Default demo gallery: deterministic local fire/water set pieces
@@ -2971,11 +5595,21 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.request_scene_swap(PendingSceneSwap::LoadDemoSpectacle);
                         }
                         winit::keyboard::Key::Character("c") => {
+                            if self.soup_prospector.is_some() {
+                                self.run_soup_action_or_queue(PendingSoupAction::Catalog);
+                                return;
+                            }
                             // dlse.2.2: drain perf histograms so the next `P`
                             // dump reflects only post-clear samples. Needed for
                             // clean windowed-vs-fullscreen comparisons.
                             self.perf.clear();
                             log::info!("perf histograms cleared");
+                        }
+                        winit::keyboard::Key::Character("e") => {
+                            if self.soup_prospector.is_some() {
+                                self.run_soup_action_or_queue(PendingSoupAction::ReuseCatalog);
+                                return;
+                            }
                         }
                         winit::keyboard::Key::Character("h") => {
                             // Toggle step-count heatmap debug mode.
@@ -3038,8 +5672,7 @@ impl ApplicationHandler<AppUserEvent> for App {
                         winit::keyboard::Key::Character("=")
                         | winit::keyboard::Key::Character("+") => {
                             // Increase render scale (sharper, slower).
-                            if let Some(renderer) = &mut self.renderer {
-                                let w = self.window.as_ref().unwrap();
+                            if let (Some(renderer), Some(w)) = (&mut self.renderer, &self.window) {
                                 let size = w.inner_size();
                                 renderer.render_scale = next_render_scale_up(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
@@ -3048,18 +5681,24 @@ impl ApplicationHandler<AppUserEvent> for App {
                         }
                         winit::keyboard::Key::Character("-") => {
                             // Decrease render scale (blurrier, faster).
-                            if let Some(renderer) = &mut self.renderer {
-                                let w = self.window.as_ref().unwrap();
+                            if let (Some(renderer), Some(w)) = (&mut self.renderer, &self.window) {
                                 let size = w.inner_size();
-                                renderer.render_scale = next_render_scale_down(renderer.render_scale);
+                                renderer.render_scale =
+                                    next_render_scale_down(renderer.render_scale);
                                 renderer.resize(size.width, size.height);
                                 log::info!("Render scale: {:.0}%", renderer.render_scale * 100.0);
                             }
                         }
                         winit::keyboard::Key::Character("p") if self.is_stepping() => {
-                            log::debug!(
-                                "p ignored: perf dump denied while background step is in flight"
-                            );
+                            if event.repeat {
+                                log::debug!(
+                                    "p ignored: perf dump denied while background step is in flight"
+                                );
+                            } else {
+                                log::info!(
+                                    "p ignored: perf dump waits for the current step to finish"
+                                );
+                            }
                         }
                         // hash-thing-hso: on-demand dump of the full perf +
                         // memory summary, independent of the wall-clock log
@@ -3094,7 +5733,13 @@ impl ApplicationHandler<AppUserEvent> for App {
                         }
                     } else if state == ElementState::Pressed {
                         // FPS mode: left click = break block.
-                        if self.is_stepping() {
+                        if self.soup_prospector.is_some() {
+                            log::info!("Soup Prospector carve disabled; use 1-3 to place soups and C to catalog");
+                        } else if self.megastructure_stamp.is_some() {
+                            log::info!(
+                                "Megastructure Stamp carve disabled; right-click places modules"
+                            );
+                        } else if self.is_stepping() {
                             self.pending_player_action = Some(PendingPlayerAction::Break);
                         } else {
                             self.break_block();
@@ -3105,7 +5750,21 @@ impl ApplicationHandler<AppUserEvent> for App {
                     && state == ElementState::Pressed
                     && self.camera_mode == CameraMode::FirstPerson
                 {
-                    if self.keys_held.contains(&KeyCode::ControlLeft)
+                    if self.soup_prospector.is_some() {
+                        self.run_soup_action_or_queue(PendingSoupAction::PlaceSelected);
+                    } else if self.quarantine_atlas.is_some() {
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::Place);
+                        } else {
+                            self.deploy_quarantine_atlas_pattern();
+                        }
+                    } else if self.megastructure_stamp.is_some() {
+                        if self.is_stepping() {
+                            self.pending_player_action = Some(PendingPlayerAction::Place);
+                        } else {
+                            self.deploy_megastructure_stamp();
+                        }
+                    } else if self.keys_held.contains(&KeyCode::ControlLeft)
                         || self.keys_held.contains(&KeyCode::ControlRight)
                     {
                         if self.is_stepping() {
@@ -3201,6 +5860,74 @@ impl ApplicationHandler<AppUserEvent> for App {
                     // + suppress). See hash-thing-v79j / hash-thing-6e4a.
                     self.mark_resume_edge();
                 }
+                if self.dump_frame_path.is_some() && self.dump_steps_remaining > 0 {
+                    let steps = self.dump_steps_remaining;
+                    log::info!(
+                        "--dump-steps: advancing scene by {steps} sync steps before capture"
+                    );
+                    for _ in 0..steps {
+                        self.run_sync_dump_step();
+                    }
+                    self.dump_steps_remaining = 0;
+                    let player_pos = self.player_world_pos();
+                    Self::upload_volume(
+                        &mut self.renderer,
+                        &mut self.world,
+                        &mut self.svdag,
+                        &mut self.last_svdag_stats,
+                        LodUploadCtx {
+                            policy: &mut self.lod_policy,
+                            player_pos,
+                            last_histogram: &mut self.last_lod_histogram,
+                            last_growth_ratio: &mut self.last_lod_growth_ratio,
+                        },
+                    );
+                    self.mark_resume_edge();
+                }
+                if self.dump_frame_path.is_some() && self.dump_soup_catalog {
+                    self.dump_soup_catalog = false;
+                    log::info!("--dump-soup-catalog: cataloging aimed soup tile before capture");
+                    self.catalog_soup_prospector_target();
+                    self.mark_resume_edge();
+                }
+                if self.dump_frame_path.is_some() && self.dump_soup_reuse {
+                    self.dump_soup_reuse = false;
+                    log::info!(
+                        "--dump-soup-reuse: cataloging, reusing, and retesting aimed soup tile before capture"
+                    );
+                    if self
+                        .soup_prospector
+                        .as_ref()
+                        .is_none_or(|state| state.catalog.is_empty())
+                    {
+                        self.catalog_soup_prospector_target();
+                    }
+                    self.reuse_latest_soup_catalog_entry(true);
+                    self.mark_resume_edge();
+                }
+                if self.dump_frame_path.is_some() && self.dump_megastructure_stamp {
+                    self.dump_megastructure_stamp = false;
+                    let origin = self
+                        .megastructure_stamp
+                        .as_ref()
+                        .map(|state| [88, state.floor_y + 1, 88]);
+                    if let Some(origin) = origin {
+                        log::info!(
+                            "--dump-megastructure-stamp: placing scripted module at {:?} before capture",
+                            origin
+                        );
+                        self.deploy_megastructure_stamp_at_origin(origin);
+                    } else {
+                        log::info!(
+                            "--dump-megastructure-stamp ignored; megastructure scene is not active"
+                        );
+                    }
+                    self.mark_resume_edge();
+                }
+                if let Some(pose) = self.dump_pose.take() {
+                    self.apply_dump_pose(pose);
+                    self.mark_resume_edge();
+                }
 
                 // Frame delta time. `dt` is clamped to 0.1s for xa7
                 // player movement (a 500ms hiccup must not teleport the
@@ -3224,7 +5951,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                             let scale_pct = (renderer.render_scale * 100.0) as u32;
                             window.set_title(&format!(
                                 "hash-thing | {:.0} FPS | {}³ | scale {}%",
-                                self.smoothed_fps, self.volume_size, scale_pct,
+                                self.title_fps(),
+                                self.volume_size,
+                                scale_pct,
                             ));
                             self.last_title_update = Some(now);
                         }
@@ -3256,8 +5985,10 @@ impl ApplicationHandler<AppUserEvent> for App {
                         .is_some_and(PendingSceneSwap::discards_world)
                     {
                         self.pending_player_action = None;
+                        self.pending_soup_action = None;
                     }
                     self.run_pending_scene_swap();
+                    self.run_pending_soup_action();
                     self.run_pending_player_action();
                 }
 
@@ -3274,10 +6005,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.perf.summary(),
                             self.last_memo_summary,
                         );
+                        self.emit_demo_perf_trail(true, None, None, None, None);
                     } else {
                         let nodes = self.world.store.stats();
                         self.mem_stats.update(nodes);
                         let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
+                        let mem_summary = self.mem_stats.summary();
                         log::info!(
                             "Gen {}: pop={} svdag={}/{}KB(L{}) | {} | {} | {} | {}",
                             self.world.generation,
@@ -3285,10 +6018,17 @@ impl ApplicationHandler<AppUserEvent> for App {
                             svdag_nodes,
                             svdag_bytes / 1024,
                             svdag_root_level,
-                            self.mem_stats.summary(),
+                            mem_summary,
                             self.perf.summary(),
                             self.last_memo_summary,
                             self.lod_summary(),
+                        );
+                        self.emit_demo_perf_trail(
+                            false,
+                            Some(self.world.generation),
+                            Some(self.world.population()),
+                            Some(mem_summary),
+                            Some((svdag_nodes, svdag_bytes, svdag_root_level)),
                         );
                     }
                     self.log_timer = std::time::Instant::now();
@@ -3305,7 +6045,12 @@ impl ApplicationHandler<AppUserEvent> for App {
                         self.legend_dirty = false;
                         renderer.legend_visible = self.legend_visible;
                         if self.legend_visible {
-                            renderer.set_legend_text(&Self::legend_lines(self.camera_mode));
+                            renderer.set_legend_text(&Self::legend_lines(
+                                self.camera_mode,
+                                self.quarantine_atlas.is_some(),
+                                self.soup_prospector.is_some(),
+                                self.megastructure_stamp.is_some(),
+                            ));
                         }
                     }
 
@@ -3316,7 +6061,17 @@ impl ApplicationHandler<AppUserEvent> for App {
                     renderer.memo_hud_visible = self.memo_hud_visible;
                     if self.memo_hud_visible && self.memo_hud_dirty {
                         self.memo_hud_dirty = false;
-                        let lines: Vec<&str> = self.last_memo_summary.split_whitespace().collect();
+                        renderer.memo_hud_scale = if self
+                            .memo_hud_lines
+                            .first()
+                            .is_some_and(|line| line == "REUSE")
+                        {
+                            3
+                        } else {
+                            2
+                        };
+                        let lines: Vec<&str> =
+                            self.memo_hud_lines.iter().map(String::as_str).collect();
                         renderer.set_memo_hud_text(&lines);
                     }
                 }
@@ -3383,6 +6138,9 @@ impl ApplicationHandler<AppUserEvent> for App {
                         } else {
                             &self.world
                         };
+                        let loaded_world_bounds = self
+                            .world_prefetch_pending
+                            .then(|| (self.world.origin, self.world.side() as i64));
                         if let Some(p) = self.entities.get_mut(pid) {
                             let step = player::step_grounded_movement(
                                 grid,
@@ -3397,77 +6155,36 @@ impl ApplicationHandler<AppUserEvent> for App {
                                 },
                             );
                             p.pos = step.pos;
+                            if let Some((origin, side)) = loaded_world_bounds {
+                                p.pos = clamp_player_pos_to_loaded_world(
+                                    origin,
+                                    side,
+                                    p.pos,
+                                    PLAYER_HEIGHT,
+                                );
+                            }
                             p.vel[1] = step.vertical_velocity;
                         }
                         if let Some(p) = self.entities.iter().find(|entity| entity.id == pid) {
                             camera_grounded = player::is_grounded(grid, &p.pos);
                         }
                         let camera_motion = (camera_planar_speed, sprinting, camera_grounded);
-                        // hash-thing-m1f.4 / 37r: grow the world when the
-                        // player approaches any boundary (positive or negative).
-                        // Skipped during background step — world is placeholder.
+                        // hash-thing-n8hy: prefetch world growth before the
+                        // player can see the realized root boundary. Generation
+                        // runs on a background worker; render keeps drawing the
+                        // previous SVDAG until the grown world returns.
                         if !self.is_stepping() {
                             if let Some(p) = self.entities.get_mut(pid) {
                                 let origin = self.world.origin;
-                                let side = self.world.side() as f64;
+                                let side = self.world.side() as i64;
                                 let pos = p.pos;
-                                let margin = GROWTH_MARGIN as i64;
-                                let near_pos_edge = pos
-                                    .iter()
-                                    .enumerate()
-                                    .any(|(i, &c)| c > origin[i] as f64 + side - GROWTH_MARGIN);
-                                let near_neg_edge = pos
-                                    .iter()
-                                    .enumerate()
-                                    .any(|(i, &c)| c < origin[i] as f64 + GROWTH_MARGIN);
-                                if near_pos_edge || near_neg_edge {
-                                    let min = [
-                                        sim::WorldCoord(pos[0] as i64 - margin),
-                                        sim::WorldCoord(pos[1] as i64 - margin),
-                                        sim::WorldCoord(pos[2] as i64 - margin),
-                                    ];
-                                    let max = [
-                                        sim::WorldCoord(pos[0] as i64 + margin),
-                                        sim::WorldCoord((pos[1] + PLAYER_HEIGHT) as i64 + margin),
-                                        sim::WorldCoord(pos[2] as i64 + margin),
-                                    ];
-                                    let old_level = self.world.level;
-                                    self.world.ensure_region(min, max);
-                                    // 0s9v: ensure_region may grow the
-                                    // world; refresh the collision snapshot
-                                    // so the next background step starts
-                                    // from the grown state. Timed under the
-                                    // same metric as the other two refresh
-                                    // sites so sweeps observe the full
-                                    // clone-cost distribution.
-                                    {
-                                        let _t = self.perf.start("collision_snapshot_refresh");
-                                        self.collision_snapshot =
-                                            Some(self.world.collision_snapshot());
-                                    }
-                                    if self.world.level != old_level {
-                                        log::info!(
-                                            "World grew: level {} → {} (side {}, origin {:?})",
-                                            old_level,
-                                            self.world.level,
-                                            self.world.side(),
-                                            self.world.origin,
-                                        );
-                                        let player_pos = self.player_world_pos();
-                                        Self::upload_volume(
-                                            &mut self.renderer,
-                                            &mut self.world,
-                                            &mut self.svdag,
-                                            &mut self.last_svdag_stats,
-                                            LodUploadCtx {
-                                                policy: &mut self.lod_policy,
-                                                player_pos,
-                                                last_histogram: &mut self.last_lod_histogram,
-                                                last_growth_ratio: &mut self.last_lod_growth_ratio,
-                                            },
-                                        );
-                                        self.sync_render_cache();
-                                    }
+                                if let Some((min, max)) = world_prefetch_region_for_player(
+                                    origin,
+                                    side,
+                                    pos,
+                                    PLAYER_HEIGHT,
+                                ) {
+                                    self.maybe_start_world_prefetch(min, max);
                                 }
                             }
                         }
@@ -3576,15 +6293,25 @@ impl ApplicationHandler<AppUserEvent> for App {
                             self.perf.record("prior_gpu_pipeline_cpu", pipeline);
                         }
                     }
-                    if let Some(d) = renderer.take_last_gpu_frame_time() {
-                        self.perf.record("render_gpu", d);
+                    if let Some(sample) = renderer.take_last_gpu_frame_time() {
+                        record_gpu_timing_sample(
+                            &mut self.perf,
+                            "render_gpu",
+                            "render_gpu_lag",
+                            sample,
+                        );
                     }
                     // dlse.2.4: second bracket around the blit + overlay
                     // render pass. `render_gpu` has always been
                     // compute-only despite the name; the render-pass
                     // GPU cost lands in this separate metric.
-                    if let Some(d) = renderer.take_last_render_pass_gpu_frame_time() {
-                        self.perf.record("render_pass_gpu", d);
+                    if let Some(sample) = renderer.take_last_render_pass_gpu_frame_time() {
+                        record_gpu_timing_sample(
+                            &mut self.perf,
+                            "render_pass_gpu",
+                            "render_pass_gpu_lag",
+                            sample,
+                        );
                     }
                 }
 
@@ -3634,6 +6361,16 @@ impl ApplicationHandler<AppUserEvent> for App {
                             pixels.width,
                             pixels.height,
                             path.display(),
+                        );
+                        let nodes = self.world.store.stats();
+                        self.mem_stats.update(nodes);
+                        let (svdag_nodes, svdag_bytes, svdag_root_level) = self.last_svdag_stats;
+                        self.emit_demo_perf_trail(
+                            false,
+                            Some(self.world.generation),
+                            Some(self.world.population()),
+                            Some(self.mem_stats.summary()),
+                            Some((svdag_nodes, svdag_bytes, svdag_root_level)),
                         );
                         event_loop.exit();
                         return;
@@ -3732,6 +6469,10 @@ enum DumpScene {
     GolSmoke,
     Spectacle,
     Gyroid,
+    QuarantineAtlas,
+    QuarantineAtlasMixed,
+    SoupProspector,
+    MegastructureStamp,
     LatticeBeat(LatticeDemoBeat),
 }
 
@@ -3742,6 +6483,10 @@ impl DumpScene {
             "gol" => Some(Self::GolSmoke),
             "spectacle" => Some(Self::Spectacle),
             "gyroid" => Some(Self::Gyroid),
+            "quarantine-atlas" => Some(Self::QuarantineAtlas),
+            "quarantine-atlas-mixed" => Some(Self::QuarantineAtlasMixed),
+            "soup-prospector" => Some(Self::SoupProspector),
+            "megastructure-stamp" => Some(Self::MegastructureStamp),
             "lattice-intro" => Some(Self::LatticeBeat(LatticeDemoBeat::Intro)),
             "lattice-interior" => Some(Self::LatticeBeat(LatticeDemoBeat::Interior)),
             "lattice-panorama" => Some(Self::LatticeBeat(LatticeDemoBeat::Panorama)),
@@ -3755,6 +6500,10 @@ impl DumpScene {
             Self::GolSmoke => PendingSceneSwap::ResetGolSmoke,
             Self::Spectacle => PendingSceneSwap::LoadDemoSpectacle,
             Self::Gyroid => PendingSceneSwap::LoadGyroid,
+            Self::QuarantineAtlas => PendingSceneSwap::LoadQuarantineAtlas,
+            Self::QuarantineAtlasMixed => PendingSceneSwap::LoadQuarantineAtlasMixed,
+            Self::SoupProspector => PendingSceneSwap::LoadSoupProspector,
+            Self::MegastructureStamp => PendingSceneSwap::LoadMegastructureStamp,
             Self::LatticeBeat(beat) => PendingSceneSwap::SelectLatticeBeat(beat),
         }
     }
@@ -3765,6 +6514,10 @@ impl DumpScene {
             Self::GolSmoke => "gol",
             Self::Spectacle => "spectacle",
             Self::Gyroid => "gyroid",
+            Self::QuarantineAtlas => "quarantine-atlas",
+            Self::QuarantineAtlasMixed => "quarantine-atlas-mixed",
+            Self::SoupProspector => "soup-prospector",
+            Self::MegastructureStamp => "megastructure-stamp",
             Self::LatticeBeat(LatticeDemoBeat::Intro) => "lattice-intro",
             Self::LatticeBeat(LatticeDemoBeat::Interior) => "lattice-interior",
             Self::LatticeBeat(LatticeDemoBeat::Panorama) => "lattice-panorama",
@@ -3772,25 +6525,162 @@ impl DumpScene {
     }
 }
 
+/// hash-thing-jszv: deterministic camera presets for dump-frame visual
+/// diagnostics. These are intentionally scene-agnostic: reviewers can pair the
+/// same pose with different `--dump-scene` values to compare material faces
+/// across commits without interactive camera control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpPose {
+    Wall,
+    Blocks,
+    TerrainWide,
+    QuarantineAtlas,
+    MegastructureStamp,
+    Geyser,
+    Volcano,
+}
+
+impl DumpPose {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "wall" => Some(Self::Wall),
+            "blocks" => Some(Self::Blocks),
+            "terrain-wide" => Some(Self::TerrainWide),
+            "quarantine-atlas" => Some(Self::QuarantineAtlas),
+            "megastructure-stamp" => Some(Self::MegastructureStamp),
+            "geyser" => Some(Self::Geyser),
+            "volcano" => Some(Self::Volcano),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wall => "wall",
+            Self::Blocks => "blocks",
+            Self::TerrainWide => "terrain-wide",
+            Self::QuarantineAtlas => "quarantine-atlas",
+            Self::MegastructureStamp => "megastructure-stamp",
+            Self::Geyser => "geyser",
+            Self::Volcano => "volcano",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpDebugMode {
+    NormalAxis,
+    HitKind,
+    Material,
+}
+
+impl DumpDebugMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "normal-axis" => Some(Self::NormalAxis),
+            "hit-kind" => Some(Self::HitKind),
+            "material" => Some(Self::Material),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NormalAxis => "normal-axis",
+            Self::HitKind => "hit-kind",
+            Self::Material => "material",
+        }
+    }
+
+    fn renderer_debug_mode(self) -> u32 {
+        match self {
+            Self::NormalAxis => 2,
+            Self::HitKind => 3,
+            Self::Material => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpLayer {
+    Composite,
+    World,
+    Particles,
+}
+
+impl DumpLayer {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "composite" => Some(Self::Composite),
+            "world" => Some(Self::World),
+            "particles" => Some(Self::Particles),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Composite => "composite",
+            Self::World => "world",
+            Self::Particles => "particles",
+        }
+    }
+
+    fn render_world(self) -> bool {
+        matches!(self, Self::Composite | Self::World)
+    }
+
+    fn render_particles(self) -> bool {
+        matches!(self, Self::Composite | Self::Particles)
+    }
+}
+
 /// Parsed CLI args. Field-named struct so adding flags doesn't churn every
 /// caller's destructure (hash-thing-hc0g added `dump_frame`; kh9l added
 /// `demo`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ParsedArgs {
     volume_size: u32,
-    target_pixels: Option<u64>,
-    /// hash-thing-kh9l: `--demo` was passed (independent of target_pixels,
-    /// since `--res 1080p` produces the same pixel budget). Drives
-    /// window focus-on-launch in main().
+    volume_size_explicit: bool,
+    render_scale_override: Option<render::RenderScaleOverride>,
+    /// hash-thing-kh9l: `--demo` was passed. Drives window focus-on-launch
+    /// in main() and the static demo render-scale floor in `parse_args_from`.
     demo: bool,
+    /// hash-thing-xu3d: `--focused` opts back into focus-on-launch without
+    /// changing render scale.
+    focused: bool,
     /// `--dump-frame PATH`: render one frame to PNG at `PATH`, then exit.
     dump_frame: Option<std::path::PathBuf>,
     /// `--dump-scene KIND`: hash-thing-j1mg, only meaningful with
     /// `--dump-frame`. Selects which scene to dispatch before the dump.
     dump_scene: Option<DumpScene>,
+    /// `--dump-pose NAME`: hash-thing-jszv, only meaningful with
+    /// `--dump-frame`. Selects a deterministic camera pose before capture.
+    dump_pose: Option<DumpPose>,
+    /// `--dump-debug MODE`: hash-thing-nznv, only meaningful with
+    /// `--dump-frame`. Selects a diagnostic shader mode before capture.
+    dump_debug: Option<DumpDebugMode>,
+    /// `--dump-layer MODE`: hash-thing-ifre.1, only meaningful with
+    /// `--dump-frame`. Selects composite/world/particle visibility.
+    dump_layer: Option<DumpLayer>,
+    /// `--dump-lod-bias VALUE`: hash-thing-u8m4, only meaningful with
+    /// `--dump-frame`. Overrides renderer LOD bias before capture.
+    dump_lod_bias: Option<f32>,
+    /// `--dump-steps N`: hash-thing-7aqo, only meaningful with `--dump-frame`.
+    /// Advances the loaded scene synchronously before capture.
+    dump_steps: u32,
+    /// `--dump-soup-catalog`: dump-frame-only acceptance helper. Catalogs
+    /// the current Soup Prospector target before capture.
+    dump_soup_catalog: bool,
+    /// `--dump-soup-reuse`: dump-frame-only acceptance helper. Catalogs,
+    /// reuses, and retests the current Soup Prospector target before capture.
+    dump_soup_reuse: bool,
+    /// `--dump-megastructure-stamp`: dump-frame-only acceptance helper.
+    /// Places one Megastructure Stamp module before capture.
+    dump_megastructure_stamp: bool,
 }
 
-/// Parse `[SIZE] [--demo | --res VALUE] [--dump-frame PATH]` from an arg
+/// Parse `[SIZE] [--demo | --res VALUE] [--focused] [--dump-frame PATH]` from an arg
 /// iterator. `args` should already have the binary path stripped (callers
 /// usually pass `std::env::args().skip(1)`). Pure function for unit testing.
 ///
@@ -3808,20 +6698,36 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|WxH] \
+    const USAGE: &str = "usage: hash-thing [SIZE] [--demo | --res 720p|1080p|1440p|2160p|4k|WxH] [--focused] \
                          [--dump-frame PATH] \
-                         [--dump-scene terrain|gol|spectacle|gyroid|lattice-intro|lattice-interior|lattice-panorama]";
+                         [--dump-scene terrain|gol|spectacle|gyroid|quarantine-atlas|quarantine-atlas-mixed|soup-prospector|megastructure-stamp|lattice-intro|lattice-interior|lattice-panorama] \
+                         [--dump-pose wall|blocks|terrain-wide|quarantine-atlas|megastructure-stamp|geyser|volcano] \
+                         [--dump-debug normal-axis|hit-kind|material] \
+                         [--dump-layer composite|world|particles] \
+                         [--dump-lod-bias VALUE] \
+                         [--dump-steps N] \
+                         [--dump-soup-catalog] [--dump-soup-reuse] [--dump-megastructure-stamp]";
     let mut volume_size: Option<u32> = None;
     let mut demo: bool = false;
+    let mut focused: bool = false;
     let mut res_target: Option<u64> = None;
     let mut dump_frame: Option<std::path::PathBuf> = None;
     let mut dump_scene: Option<DumpScene> = None;
+    let mut dump_pose: Option<DumpPose> = None;
+    let mut dump_debug: Option<DumpDebugMode> = None;
+    let mut dump_layer: Option<DumpLayer> = None;
+    let mut dump_lod_bias: Option<f32> = None;
+    let mut dump_steps: Option<u32> = None;
+    let mut dump_soup_catalog = false;
+    let mut dump_soup_reuse = false;
+    let mut dump_megastructure_stamp = false;
     let mut iter = args.into_iter();
     while let Some(arg_owned) = iter.next() {
         let arg = arg_owned.as_ref();
         match arg {
             "--help" | "-h" => panic!("{USAGE}"),
             "--demo" => demo = true,
+            "--focused" => focused = true,
             "--res" => {
                 if res_target.is_some() {
                     panic!("{USAGE}\nmore than one --res");
@@ -3867,9 +6773,110 @@ where
                 if v_str.starts_with("--") || v_str == "-h" {
                     panic!("{USAGE}\n--dump-scene requires a KIND; saw '{v_str}'");
                 }
-                let parsed = DumpScene::parse(v_str)
-                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-scene KIND: unrecognised '{v_str}'"));
+                let parsed = DumpScene::parse(v_str).unwrap_or_else(|| {
+                    panic!("{USAGE}\n--dump-scene KIND: unrecognised '{v_str}'")
+                });
                 dump_scene = Some(parsed);
+            }
+            "--dump-pose" => {
+                if dump_pose.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-pose");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-pose requires a NAME"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-pose requires a NAME; saw '{v_str}'");
+                }
+                let parsed = DumpPose::parse(v_str)
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-pose NAME: unrecognised '{v_str}'"));
+                dump_pose = Some(parsed);
+            }
+            "--dump-debug" => {
+                if dump_debug.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-debug");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-debug requires a MODE"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-debug requires a MODE; saw '{v_str}'");
+                }
+                let parsed = DumpDebugMode::parse(v_str).unwrap_or_else(|| {
+                    panic!("{USAGE}\n--dump-debug MODE: unrecognised '{v_str}'")
+                });
+                dump_debug = Some(parsed);
+            }
+            "--dump-layer" => {
+                if dump_layer.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-layer");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-layer requires a MODE"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-layer requires a MODE; saw '{v_str}'");
+                }
+                let parsed = DumpLayer::parse(v_str).unwrap_or_else(|| {
+                    panic!("{USAGE}\n--dump-layer MODE: unrecognised '{v_str}'")
+                });
+                dump_layer = Some(parsed);
+            }
+            "--dump-lod-bias" => {
+                if dump_lod_bias.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-lod-bias");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-lod-bias requires a VALUE"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-lod-bias requires a VALUE; saw '{v_str}'");
+                }
+                let parsed: f32 = v_str.parse().unwrap_or_else(|_| {
+                    panic!("{USAGE}\n--dump-lod-bias VALUE: invalid '{v_str}'")
+                });
+                if !parsed.is_finite() || parsed < 1.0 {
+                    panic!("{USAGE}\n--dump-lod-bias VALUE must be finite and >= 1.0");
+                }
+                dump_lod_bias = Some(parsed);
+            }
+            "--dump-steps" => {
+                if dump_steps.is_some() {
+                    panic!("{USAGE}\nmore than one --dump-steps");
+                }
+                let v = iter
+                    .next()
+                    .unwrap_or_else(|| panic!("{USAGE}\n--dump-steps requires a COUNT"));
+                let v_str = v.as_ref();
+                if v_str.starts_with("--") || v_str == "-h" {
+                    panic!("{USAGE}\n--dump-steps requires a COUNT; saw '{v_str}'");
+                }
+                let parsed: u32 = v_str
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{USAGE}\n--dump-steps COUNT: invalid '{v_str}'"));
+                dump_steps = Some(parsed);
+            }
+            "--dump-soup-catalog" => {
+                if dump_soup_catalog {
+                    panic!("{USAGE}\nmore than one --dump-soup-catalog");
+                }
+                dump_soup_catalog = true;
+            }
+            "--dump-soup-reuse" => {
+                if dump_soup_reuse {
+                    panic!("{USAGE}\nmore than one --dump-soup-reuse");
+                }
+                dump_soup_reuse = true;
+            }
+            "--dump-megastructure-stamp" => {
+                if dump_megastructure_stamp {
+                    panic!("{USAGE}\nmore than one --dump-megastructure-stamp");
+                }
+                dump_megastructure_stamp = true;
             }
             other => {
                 let n: u32 = other
@@ -3892,18 +6899,71 @@ where
     if dump_scene.is_some() && dump_frame.is_none() {
         panic!("{USAGE}\n--dump-scene requires --dump-frame");
     }
-    let target_pixels = if demo {
-        Some(1920u64 * 1080u64)
+    if dump_pose.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-pose requires --dump-frame");
+    }
+    if dump_debug.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-debug requires --dump-frame");
+    }
+    if dump_layer.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-layer requires --dump-frame");
+    }
+    if dump_lod_bias.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-lod-bias requires --dump-frame");
+    }
+    if dump_steps.is_some() && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-steps requires --dump-frame");
+    }
+    if dump_soup_catalog && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-soup-catalog requires --dump-frame");
+    }
+    if dump_soup_catalog && dump_scene != Some(DumpScene::SoupProspector) {
+        panic!("{USAGE}\n--dump-soup-catalog requires --dump-scene soup-prospector");
+    }
+    if dump_soup_reuse && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-soup-reuse requires --dump-frame");
+    }
+    if dump_soup_reuse && dump_scene != Some(DumpScene::SoupProspector) {
+        panic!("{USAGE}\n--dump-soup-reuse requires --dump-scene soup-prospector");
+    }
+    if dump_megastructure_stamp && dump_frame.is_none() {
+        panic!("{USAGE}\n--dump-megastructure-stamp requires --dump-frame");
+    }
+    if dump_megastructure_stamp && dump_scene != Some(DumpScene::MegastructureStamp) {
+        panic!("{USAGE}\n--dump-megastructure-stamp requires --dump-scene megastructure-stamp");
+    }
+    let volume_size_explicit = volume_size.is_some();
+    let render_scale_override = if demo {
+        Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
     } else {
-        res_target
+        res_target.map(render::RenderScaleOverride::TargetPixels)
     };
     ParsedArgs {
-        volume_size: volume_size.unwrap_or(DEFAULT_VOLUME_SIZE),
-        target_pixels,
+        volume_size: volume_size.unwrap_or(DEFAULT_CLI_VOLUME_SIZE),
+        volume_size_explicit,
+        render_scale_override,
         demo,
+        focused,
         dump_frame,
         dump_scene,
+        dump_pose,
+        dump_debug,
+        dump_layer,
+        dump_lod_bias,
+        dump_steps: dump_steps.unwrap_or(0),
+        dump_soup_catalog,
+        dump_soup_reuse,
+        dump_megastructure_stamp,
     }
+}
+
+fn want_focus_on_launch_from_inputs(
+    demo: bool,
+    focused: bool,
+    legacy_focus_env: Option<&str>,
+    focused_env: Option<&str>,
+) -> bool {
+    demo || focused || legacy_focus_env == Some("1") || focused_env == Some("1")
 }
 
 fn main() {
@@ -3929,6 +6989,8 @@ fn main() {
     log::info!("  R: reset terrain (heightmap)");
     log::info!("  B: reset spectacle gallery");
     log::info!("  M: reset gyroid megastructure");
+    log::info!("  Y: Soup Prospector discovery prototype");
+    log::info!("  X: Megastructure module stamping prototype");
     log::info!("  N: lattice walk-through demo");
     log::info!("  [/] DEV previous/next lattice jump (orbit mode)");
     log::info!("  U/I/O: DEV intro/interior/reveal lattice jumps (orbit mode)");
@@ -3942,17 +7004,40 @@ fn main() {
 
     let ParsedArgs {
         volume_size,
-        target_pixels: target_pixels_override,
+        volume_size_explicit,
+        render_scale_override,
         demo,
+        focused,
         dump_frame: dump_frame_path,
         dump_scene,
+        dump_pose,
+        dump_debug,
+        dump_layer,
+        dump_lod_bias,
+        dump_steps,
+        dump_soup_catalog,
+        dump_soup_reuse,
+        dump_megastructure_stamp,
     } = parse_args_from(std::env::args().skip(1));
     log::info!(
         "Volume: {volume_size}^3 (level {})",
         volume_size.trailing_zeros()
     );
-    if let Some(target) = target_pixels_override {
-        log::info!("CLI render target: {target} px (--demo / --res)");
+    if !volume_size_explicit {
+        log::info!(
+            "No SIZE supplied; defaulting to {DEFAULT_CLI_VOLUME_SIZE}^3 for fast startup. \
+             Pass an explicit power-of-two SIZE for larger worlds."
+        );
+    }
+    if let Some(override_) = render_scale_override {
+        match override_ {
+            render::RenderScaleOverride::TargetPixels(target) => {
+                log::info!("CLI render target: {target} px (--res)");
+            }
+            render::RenderScaleOverride::FixedScale(scale) => {
+                log::info!("CLI render scale: {scale:.3} (--demo)");
+            }
+        }
     }
     if let Some(path) = dump_frame_path.as_ref() {
         log::info!(
@@ -3961,18 +7046,64 @@ fn main() {
         );
     }
     if let Some(scene) = dump_scene {
-        log::info!("--dump-scene: {} (will dispatch before dump-frame render)", scene.label());
+        log::info!(
+            "--dump-scene: {} (will dispatch before dump-frame render)",
+            scene.label()
+        );
+    }
+    if let Some(pose) = dump_pose {
+        log::info!(
+            "--dump-pose: {} (will apply before dump-frame render)",
+            pose.label()
+        );
+    }
+    if let Some(mode) = dump_debug {
+        log::info!(
+            "--dump-debug: {} (will apply before dump-frame render)",
+            mode.label()
+        );
+    }
+    if let Some(layer) = dump_layer {
+        log::info!(
+            "--dump-layer: {} (will apply before dump-frame render)",
+            layer.label()
+        );
+    }
+    if let Some(bias) = dump_lod_bias {
+        log::info!("--dump-lod-bias: {bias}x (will apply before dump-frame render)");
+    }
+    if dump_steps > 0 {
+        log::info!("--dump-steps: {dump_steps} sync steps before dump-frame render");
+    }
+    if dump_soup_catalog {
+        log::info!(
+            "--dump-soup-catalog: will catalog the aimed soup tile before dump-frame render"
+        );
+    }
+    if dump_soup_reuse {
+        log::info!(
+            "--dump-soup-reuse: will catalog, reuse, and retest the aimed soup tile before dump-frame render"
+        );
+    }
+    if dump_megastructure_stamp {
+        log::info!("--dump-megastructure-stamp: will place one module before dump-frame render");
     }
 
     // Single source of truth for focus-on-launch. Two downstream sites
     // both consume this: the macOS event-loop builder (must be set BEFORE
     // event_loop.build()) and `App.want_focus_on_launch` (consumed at
     // window-creation time after winit resumes the app). hash-thing-kh9l
-    // routes `--demo` into this gate so the wrapper-less invocation
-    // `cargo run -- --demo` activates the window the same way that
-    // `HASH_THING_FOCUS=1 cargo run` does today.
-    let want_focus_on_launch =
-        demo || std::env::var("HASH_THING_FOCUS").ok().as_deref() == Some("1");
+    // routes `--demo` and `--focused` into this gate so wrapper-less
+    // invocations can opt back into activation. HASH_THING_FOCUS remains
+    // the legacy wrapper env; HASH_THING_FOCUSED is the explicit user env.
+    let legacy_focus_env = std::env::var("HASH_THING_FOCUS").ok();
+    let focused_env = std::env::var("HASH_THING_FOCUSED").ok();
+    let want_focus_on_launch = want_focus_on_launch_from_inputs(
+        demo,
+        focused,
+        legacy_focus_env.as_deref(),
+        focused_env.as_deref(),
+    );
 
     // hash-thing-dbv3 (vqke.1.1): use `EventLoop::<AppUserEvent>::with_user_event()`
     // so the sim worker can wake the main loop via
@@ -3985,7 +7116,8 @@ fn main() {
         event_loop_builder.with_activation_policy(ActivationPolicy::Regular);
         // hash-thing-sgcv + kh9l: gate the activate-ignoring-other-apps
         // flag behind the same `want_focus_on_launch` derived above
-        // (HASH_THING_FOCUS=1 env or `--demo` flag). Mirrors the
+        // (HASH_THING_FOCUS=1 / HASH_THING_FOCUSED=1 env, `--focused`,
+        // or `--demo` flag). Mirrors the
         // window.focus_window() gate around src/main.rs:2277. winit's
         // default for this flag is `true`
         // (PlatformSpecificEventLoopAttributes in
@@ -4003,10 +7135,18 @@ fn main() {
         .expect("failed to create event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = App::new(volume_size);
-    app.target_pixels_override = target_pixels_override;
+    app.render_scale_override = render_scale_override;
     app.want_focus_on_launch = want_focus_on_launch;
     app.dump_frame_path = dump_frame_path;
     app.dump_scene = dump_scene;
+    app.dump_pose = dump_pose;
+    app.dump_debug = dump_debug;
+    app.dump_layer = dump_layer;
+    app.dump_lod_bias = dump_lod_bias;
+    app.dump_steps_remaining = dump_steps;
+    app.dump_soup_catalog = dump_soup_catalog;
+    app.dump_soup_reuse = dump_soup_reuse;
+    app.dump_megastructure_stamp = dump_megastructure_stamp;
     // hash-thing-dbv3 (vqke.1.1): hand the proxy to App so the sim
     // worker (spawned later by `maybe_start_background_step`) can wake
     // the main loop. Cloning the proxy into the worker is the correct
@@ -4026,8 +7166,180 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hash_thing::sim::world::QuarantineAtlasLayout;
     use hash_thing::terrain::materials::{FIRE_MATERIAL_ID, VINE_MATERIAL_ID};
+    use ht_octree::CellState;
     use std::time::Duration;
+
+    #[test]
+    fn record_gpu_timing_sample_records_duration_and_submit_lag() {
+        let mut perf = perf::Perf::new();
+        record_gpu_timing_sample(
+            &mut perf,
+            "render_gpu",
+            "render_gpu_lag",
+            render::RendererGpuTimingSample {
+                duration: Duration::from_millis(3),
+                lag_frames: Some(3),
+            },
+        );
+        assert_eq!(perf.summary(), "render_gpu=3.00/3.00ms render_gpu_lag=3");
+    }
+
+    #[test]
+    fn record_gpu_timing_sample_suppresses_lag_when_seq_is_newer_than_current() {
+        let mut perf = perf::Perf::new();
+        record_gpu_timing_sample(
+            &mut perf,
+            "render_pass_gpu",
+            "render_pass_gpu_lag",
+            render::RendererGpuTimingSample {
+                duration: Duration::from_millis(4),
+                lag_frames: None,
+            },
+        );
+        assert_eq!(perf.summary(), "render_pass_gpu=4.00/4.00ms");
+    }
+
+    #[test]
+    fn demo_perf_classifies_churning_cascade_from_memo_summary() {
+        let summary =
+            "memo_hit=0.550 memo_churn=-0.087 memo_elision=5.6x memo_tbl=765000 bfs_l3=5842";
+        assert_eq!(classify_demo_intensity(summary, true), "cascade");
+        assert_eq!(classify_demo_regime(summary), "churning");
+    }
+
+    #[test]
+    fn demo_perf_classifies_saturated_microchurn_from_memo_summary() {
+        let summary =
+            "memo_hit=0.719 memo_churn=+0.000 memo_elision=22.0x memo_tbl=588000 bfs_l3=1492";
+        assert_eq!(classify_demo_intensity(summary, true), "microchurn");
+        assert_eq!(classify_demo_regime(summary), "saturated");
+    }
+
+    #[test]
+    fn demo_perf_parses_duration_pairs_and_numeric_suffixes() {
+        let perf_summary = "frame_total=21.10/44.90ms step=36.50/67.60ms";
+        assert_eq!(
+            parse_duration_pair_ms(perf_summary, "step"),
+            Some((36.50, 67.60))
+        );
+        let memo_summary = "memo_elision=79.1x memo_churn=+0.012 bfs_l3=42";
+        assert_eq!(parse_summary_f64(memo_summary, "memo_elision"), Some(79.1));
+        assert_eq!(parse_summary_f64(memo_summary, "memo_churn"), Some(0.012));
+        assert_eq!(parse_summary_f64(memo_summary, "bfs_l3"), Some(42.0));
+    }
+
+    #[test]
+    fn demo_perf_trail_appends_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-demo-perf-trail-{}-{}.jsonl",
+            std::process::id(),
+            unix_epoch_millis()
+        ));
+        let mut trail = DemoPerfTrail::enabled_at(path.clone());
+        trail.append(&serde_json::json!({
+            "schema_version": 2,
+            "record_kind": "demo_perf_snapshot",
+            "world": "demo"
+        }));
+        let body = std::fs::read_to_string(&path).expect("trail should be written");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim()).expect("trail line should be json");
+        assert_eq!(line["record_kind"], "demo_perf_snapshot");
+        assert_eq!(line["world"], "demo");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn demo_perf_emit_keeps_active_frame_non_idle_and_missing_metrics_absent() {
+        let path = std::env::temp_dir().join(format!(
+            "hash-thing-demo-perf-emit-{}-{}.jsonl",
+            std::process::id(),
+            unix_epoch_millis()
+        ));
+        let mut app = App::new(256);
+        app.demo_perf_trail = DemoPerfTrail::enabled_at(path.clone());
+        app.git_commit = "test-commit".to_string();
+        app.paused = false;
+        app.freeze_sim = false;
+        app.last_memo_summary =
+            "memo_hit=0.719 memo_churn=+0.000 memo_elision=22.0x memo_tbl=588000 bfs_l3=1492"
+                .to_string();
+        app.perf
+            .record("frame_total", std::time::Duration::from_millis(20));
+        app.emit_demo_perf_trail(false, Some(7), Some(42), None, None);
+
+        let body = std::fs::read_to_string(&path).expect("trail should be written");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim()).expect("trail line should be json");
+        assert_eq!(line["intensity"], "microchurn");
+        assert_eq!(line["sim_active"], true);
+        assert_eq!(line["confidence"]["n"], 1);
+        assert_eq!(line["metrics"]["frame_total_mean_ms"], 20.0);
+        assert!(line["metrics"].get("step_recursive_mean_ms").is_none());
+        assert_eq!(line["git_commit"], "test-commit");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn world_prefetch_region_none_in_middle() {
+        assert!(world_prefetch_region_for_player(
+            [0, 0, 0],
+            1024,
+            [512.0, 64.0, 512.0],
+            PLAYER_HEIGHT
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_positive_edge() {
+        let (min, max) =
+            world_prefetch_region_for_player([0, 0, 0], 1024, [900.0, 64.0, 512.0], PLAYER_HEIGHT)
+                .expect("player should be inside prefetch band");
+        assert!(max[0].0 >= 1024, "prefetch region must cross +x edge");
+        assert!(min[0].0 < 900);
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_negative_edge() {
+        let (min, max) =
+            world_prefetch_region_for_player([0, 0, 0], 1024, [120.0, 64.0, 512.0], PLAYER_HEIGHT)
+                .expect("player should be inside prefetch band");
+        assert!(min[0].0 < 0, "prefetch region must cross -x edge");
+        assert!(max[0].0 > 120);
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_positive_vertical_edge() {
+        let (min, max) = world_prefetch_region_for_player(
+            [0, 0, 0],
+            1024,
+            [512.0, 1018.0, 512.0],
+            PLAYER_HEIGHT,
+        )
+        .expect("player should be inside vertical prefetch band");
+        assert!(max[1].0 >= 1024, "prefetch region must cross +y edge");
+        assert!(min[1].0 < 1018);
+    }
+
+    #[test]
+    fn world_prefetch_region_triggers_before_negative_vertical_edge() {
+        let (min, max) =
+            world_prefetch_region_for_player([0, 0, 0], 1024, [512.0, 4.0, 512.0], PLAYER_HEIGHT)
+                .expect("player should be inside vertical prefetch band");
+        assert!(min[1].0 < 0, "prefetch region must cross -y edge");
+        assert!(max[1].0 > 4);
+    }
+
+    #[test]
+    fn clamp_player_pos_to_loaded_world_blocks_unrealized_space() {
+        assert_eq!(
+            clamp_player_pos_to_loaded_world([0, 0, 0], 32, [-4.0, 40.0, 99.0], PLAYER_HEIGHT),
+            [0.0, 31.0 - PLAYER_HEIGHT, 31.0]
+        );
+    }
 
     #[test]
     fn smooth_fps_seeds_from_zero_prev_returns_instant() {
@@ -4135,43 +7447,132 @@ mod tests {
     fn parse_args_from_size_only() {
         let r = parse_args_from(["256"]);
         assert_eq!(r.volume_size, 256);
-        assert_eq!(r.target_pixels, None);
+        assert!(r.volume_size_explicit);
+        assert_eq!(r.render_scale_override, None);
         assert!(!r.demo);
+        assert!(!r.focused);
         assert_eq!(r.dump_frame, None);
     }
 
     #[test]
     fn parse_args_from_no_args_uses_default() {
         let r = parse_args_from(std::iter::empty::<&str>());
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
-        assert_eq!(r.target_pixels, None);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
+        assert_eq!(r.render_scale_override, None);
         assert!(!r.demo);
+        assert!(!r.focused);
         assert_eq!(r.dump_frame, None);
     }
 
     #[test]
     fn parse_args_from_demo_alone() {
         let r = parse_args_from(["--demo"]);
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
         assert!(r.demo, "kh9l: --demo must surface as demo=true");
+        assert!(!r.focused);
+    }
+
+    #[test]
+    fn parse_args_from_focused_alone() {
+        let r = parse_args_from(["--focused"]);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
+        assert_eq!(r.render_scale_override, None);
+        assert!(!r.demo);
+        assert!(r.focused, "xu3d: --focused must surface as focused=true");
+    }
+
+    #[test]
+    fn parse_args_from_focused_with_res() {
+        let r = parse_args_from(["--focused", "--res", "720p"]);
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1280 * 720))
+        );
+        assert!(!r.demo);
+        assert!(r.focused);
+    }
+
+    #[test]
+    fn parse_args_from_demo_and_focused() {
+        let r = parse_args_from(["--demo", "--focused"]);
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
+        assert!(r.demo);
+        assert!(r.focused);
     }
 
     #[test]
     fn parse_args_from_demo_with_size_either_order() {
         let r1 = parse_args_from(["--demo", "256"]);
         let r2 = parse_args_from(["256", "--demo"]);
-        assert_eq!((r1.volume_size, r1.target_pixels), (256, Some(1920 * 1080)));
+        assert_eq!(r1.volume_size, 256);
+        assert_eq!(
+            r1.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
+        assert!(r1.volume_size_explicit);
         assert!(r1.demo);
-        assert_eq!((r2.volume_size, r2.target_pixels), (256, Some(1920 * 1080)));
+        assert!(!r1.focused);
+        assert_eq!(r2.volume_size, 256);
+        assert_eq!(
+            r2.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
+        assert!(r2.volume_size_explicit);
         assert!(r2.demo);
+        assert!(!r2.focused);
+    }
+
+    #[test]
+    fn want_focus_on_launch_inputs_default_false() {
+        assert!(!want_focus_on_launch_from_inputs(false, false, None, None));
+    }
+
+    #[test]
+    fn want_focus_on_launch_inputs_cli_flags_enable_focus() {
+        assert!(want_focus_on_launch_from_inputs(true, false, None, None));
+        assert!(want_focus_on_launch_from_inputs(false, true, None, None));
+    }
+
+    #[test]
+    fn want_focus_on_launch_inputs_env_aliases_enable_focus() {
+        assert!(want_focus_on_launch_from_inputs(
+            false,
+            false,
+            Some("1"),
+            None
+        ));
+        assert!(want_focus_on_launch_from_inputs(
+            false,
+            false,
+            None,
+            Some("1")
+        ));
+        assert!(!want_focus_on_launch_from_inputs(
+            false,
+            false,
+            Some("true"),
+            Some("0")
+        ));
     }
 
     #[test]
     fn parse_args_from_res_named() {
         let r = parse_args_from(["--res", "1440p", "512"]);
         assert_eq!(r.volume_size, 512);
-        assert_eq!(r.target_pixels, Some(2560 * 1440));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(2560 * 1440))
+        );
         assert!(
             !r.demo,
             "kh9l: --res 1440p is NOT --demo, even with same pixel budget"
@@ -4181,8 +7582,12 @@ mod tests {
     #[test]
     fn parse_args_from_res_arbitrary_wxh() {
         let r = parse_args_from(["--res", "1920x1080"]);
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1920 * 1080))
+        );
         assert!(
             !r.demo,
             "kh9l: --res 1920x1080 has same target as --demo but demo=false"
@@ -4191,11 +7596,13 @@ mod tests {
 
     #[test]
     fn parse_args_from_res_1080p_is_not_demo() {
-        // kh9l regression guard: --res 1080p produces the same target
-        // pixel budget as --demo, but `demo` is false. This bit drives
-        // focus-on-launch and must not fire for --res 1080p.
+        // kh9l/uc2m regression guard: --res 1080p keeps pixel-budget
+        // semantics while --demo uses a fixed low render scale.
         let r = parse_args_from(["--res", "1080p"]);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1920 * 1080))
+        );
         assert!(!r.demo);
     }
 
@@ -4204,8 +7611,9 @@ mod tests {
     #[test]
     fn parse_args_from_dump_frame_path() {
         let r = parse_args_from(["--dump-frame", "/tmp/foo.png"]);
-        assert_eq!(r.volume_size, DEFAULT_VOLUME_SIZE);
-        assert_eq!(r.target_pixels, None);
+        assert_eq!(r.volume_size, DEFAULT_CLI_VOLUME_SIZE);
+        assert!(!r.volume_size_explicit);
+        assert_eq!(r.render_scale_override, None);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
     }
 
@@ -4214,7 +7622,10 @@ mod tests {
         // --dump-frame is orthogonal to --demo / size: all three coexist.
         let r = parse_args_from(["64", "--demo", "--dump-frame", "/tmp/foo.png"]);
         assert_eq!(r.volume_size, 64);
-        assert_eq!(r.target_pixels, Some(1920 * 1080));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::FixedScale(DEMO_RENDER_SCALE))
+        );
         assert!(r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/foo.png")));
     }
@@ -4223,7 +7634,10 @@ mod tests {
     fn parse_args_from_dump_frame_with_res() {
         let r = parse_args_from(["--res", "720p", "--dump-frame", "out.png", "256"]);
         assert_eq!(r.volume_size, 256);
-        assert_eq!(r.target_pixels, Some(1280 * 720));
+        assert_eq!(
+            r.render_scale_override,
+            Some(render::RenderScaleOverride::TargetPixels(1280 * 720))
+        );
         assert!(!r.demo);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("out.png")));
     }
@@ -4256,7 +7670,12 @@ mod tests {
 
     #[test]
     fn parse_args_from_dump_scene_lattice_intro() {
-        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", "lattice-intro"]);
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "lattice-intro",
+        ]);
         assert_eq!(r.dump_frame, Some(std::path::PathBuf::from("/tmp/x.png")));
         assert_eq!(
             r.dump_scene,
@@ -4271,9 +7690,22 @@ mod tests {
             ("gol", DumpScene::GolSmoke),
             ("spectacle", DumpScene::Spectacle),
             ("gyroid", DumpScene::Gyroid),
-            ("lattice-intro", DumpScene::LatticeBeat(LatticeDemoBeat::Intro)),
-            ("lattice-interior", DumpScene::LatticeBeat(LatticeDemoBeat::Interior)),
-            ("lattice-panorama", DumpScene::LatticeBeat(LatticeDemoBeat::Panorama)),
+            ("quarantine-atlas", DumpScene::QuarantineAtlas),
+            ("quarantine-atlas-mixed", DumpScene::QuarantineAtlasMixed),
+            ("soup-prospector", DumpScene::SoupProspector),
+            ("megastructure-stamp", DumpScene::MegastructureStamp),
+            (
+                "lattice-intro",
+                DumpScene::LatticeBeat(LatticeDemoBeat::Intro),
+            ),
+            (
+                "lattice-interior",
+                DumpScene::LatticeBeat(LatticeDemoBeat::Interior),
+            ),
+            (
+                "lattice-panorama",
+                DumpScene::LatticeBeat(LatticeDemoBeat::Panorama),
+            ),
         ] {
             let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-scene", raw]);
             assert_eq!(r.dump_scene, Some(expected), "kind={raw}");
@@ -4281,9 +7713,168 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_from_dump_pose_all_kinds() {
+        for (raw, expected) in [
+            ("wall", DumpPose::Wall),
+            ("blocks", DumpPose::Blocks),
+            ("terrain-wide", DumpPose::TerrainWide),
+            ("quarantine-atlas", DumpPose::QuarantineAtlas),
+            ("megastructure-stamp", DumpPose::MegastructureStamp),
+            ("geyser", DumpPose::Geyser),
+            ("volcano", DumpPose::Volcano),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-pose", raw]);
+            assert_eq!(r.dump_pose, Some(expected), "pose={raw}");
+        }
+    }
+
+    #[test]
+    fn parse_args_from_dump_lod_bias() {
+        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "4.5"]);
+        assert_eq!(r.dump_lod_bias, Some(4.5));
+    }
+
+    #[test]
+    fn parse_args_from_dump_steps() {
+        let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps", "24"]);
+        assert_eq!(r.dump_steps, 24);
+    }
+
+    #[test]
+    fn parse_args_from_dump_soup_catalog() {
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-catalog",
+        ]);
+        assert!(r.dump_soup_catalog);
+    }
+
+    #[test]
+    fn parse_args_from_dump_soup_reuse() {
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-reuse",
+        ]);
+        assert!(r.dump_soup_reuse);
+    }
+
+    #[test]
+    fn parse_args_from_dump_megastructure_stamp() {
+        let r = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "megastructure-stamp",
+            "--dump-megastructure-stamp",
+        ]);
+        assert!(r.dump_megastructure_stamp);
+    }
+
+    #[test]
+    fn parse_args_from_dump_debug_all_kinds() {
+        for (raw, expected, debug_mode) in [
+            ("normal-axis", DumpDebugMode::NormalAxis, 2),
+            ("hit-kind", DumpDebugMode::HitKind, 3),
+            ("material", DumpDebugMode::Material, 4),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-debug", raw]);
+            assert_eq!(r.dump_debug, Some(expected), "kind={raw}");
+            assert_eq!(expected.renderer_debug_mode(), debug_mode, "kind={raw}");
+        }
+    }
+
+    #[test]
+    fn parse_args_from_dump_layer_all_kinds() {
+        for (raw, expected, render_world, render_particles) in [
+            ("composite", DumpLayer::Composite, true, true),
+            ("world", DumpLayer::World, true, false),
+            ("particles", DumpLayer::Particles, false, true),
+        ] {
+            let r = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-layer", raw]);
+            assert_eq!(r.dump_layer, Some(expected), "kind={raw}");
+            assert_eq!(expected.render_world(), render_world, "kind={raw}");
+            assert_eq!(expected.render_particles(), render_particles, "kind={raw}");
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "--dump-scene requires --dump-frame")]
     fn parse_args_from_dump_scene_without_dump_frame_panics() {
         let _ = parse_args_from(["--dump-scene", "lattice-intro"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-pose requires --dump-frame")]
+    fn parse_args_from_dump_pose_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-pose", "blocks"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-debug requires --dump-frame")]
+    fn parse_args_from_dump_debug_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-debug", "normal-axis"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-layer requires --dump-frame")]
+    fn parse_args_from_dump_layer_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-layer", "particles"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias requires --dump-frame")]
+    fn parse_args_from_dump_lod_bias_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-lod-bias", "2"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps requires --dump-frame")]
+    fn parse_args_from_dump_steps_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-steps", "24"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-soup-catalog requires --dump-frame")]
+    fn parse_args_from_dump_soup_catalog_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-soup-catalog"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-soup-reuse requires --dump-frame")]
+    fn parse_args_from_dump_soup_reuse_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-soup-reuse"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-megastructure-stamp requires --dump-frame")]
+    fn parse_args_from_dump_megastructure_stamp_without_dump_frame_panics() {
+        let _ = parse_args_from(["--dump-megastructure-stamp"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-soup-catalog requires --dump-scene soup-prospector")]
+    fn parse_args_from_dump_soup_catalog_without_soup_scene_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-soup-catalog"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-soup-reuse requires --dump-scene soup-prospector")]
+    fn parse_args_from_dump_soup_reuse_without_soup_scene_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-soup-reuse"]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "--dump-megastructure-stamp requires --dump-scene megastructure-stamp"
+    )]
+    fn parse_args_from_dump_megastructure_stamp_without_megastructure_scene_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-megastructure-stamp"]);
     }
 
     #[test]
@@ -4305,6 +7896,66 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "--dump-lod-bias requires a VALUE")]
+    fn parse_args_from_dump_lod_bias_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias requires a VALUE; saw '--demo'")]
+    fn parse_args_from_dump_lod_bias_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias VALUE: invalid 'bogus'")]
+    fn parse_args_from_dump_lod_bias_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-lod-bias VALUE must be finite and >= 1.0")]
+    fn parse_args_from_dump_lod_bias_too_low_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-lod-bias", "0.5"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps requires a COUNT")]
+    fn parse_args_from_dump_steps_without_value_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps requires a COUNT; saw '--demo'")]
+    fn parse_args_from_dump_steps_followed_by_flag_panics_clearly() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps", "--demo"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-steps COUNT: invalid 'bogus'")]
+    fn parse_args_from_dump_steps_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-steps", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-pose NAME: unrecognised 'bogus'")]
+    fn parse_args_from_dump_pose_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-pose", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-debug MODE: unrecognised 'bogus'")]
+    fn parse_args_from_dump_debug_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-debug", "bogus"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--dump-layer MODE: unrecognised 'bogus'")]
+    fn parse_args_from_dump_layer_garbage_panics() {
+        let _ = parse_args_from(["--dump-frame", "/tmp/x.png", "--dump-layer", "bogus"]);
+    }
+
+    #[test]
     #[should_panic(expected = "more than one --dump-scene")]
     fn parse_args_from_two_dump_scene_panics() {
         let _ = parse_args_from([
@@ -4314,6 +7965,110 @@ mod tests {
             "lattice-intro",
             "--dump-scene",
             "gol",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-pose")]
+    fn parse_args_from_two_dump_pose_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-pose",
+            "wall",
+            "--dump-pose",
+            "blocks",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-debug")]
+    fn parse_args_from_two_dump_debug_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-debug",
+            "normal-axis",
+            "--dump-debug",
+            "hit-kind",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-layer")]
+    fn parse_args_from_two_dump_layer_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-layer",
+            "world",
+            "--dump-layer",
+            "particles",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-lod-bias")]
+    fn parse_args_from_two_dump_lod_bias_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-lod-bias",
+            "2",
+            "--dump-lod-bias",
+            "4",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-steps")]
+    fn parse_args_from_two_dump_steps_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-steps",
+            "2",
+            "--dump-steps",
+            "4",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-soup-catalog")]
+    fn parse_args_from_two_dump_soup_catalog_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-catalog",
+            "--dump-soup-catalog",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-soup-reuse")]
+    fn parse_args_from_two_dump_soup_reuse_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "soup-prospector",
+            "--dump-soup-reuse",
+            "--dump-soup-reuse",
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one --dump-megastructure-stamp")]
+    fn parse_args_from_two_dump_megastructure_stamp_panics() {
+        let _ = parse_args_from([
+            "--dump-frame",
+            "/tmp/x.png",
+            "--dump-scene",
+            "megastructure-stamp",
+            "--dump-megastructure-stamp",
+            "--dump-megastructure-stamp",
         ]);
     }
 
@@ -4641,6 +8396,10 @@ mod tests {
             PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Panorama).label(),
             "lattice_beat_panorama",
         );
+        assert_eq!(
+            PendingSceneSwap::LoadSoupProspector.label(),
+            "soup_prospector"
+        );
     }
 
     #[test]
@@ -4748,9 +8507,202 @@ mod tests {
         assert!(PendingSceneSwap::LoadLatticePanoramaDemo.discards_world());
         assert!(PendingSceneSwap::ResetTerrain.discards_world());
         assert!(PendingSceneSwap::LoadGyroid.discards_world());
+        assert!(PendingSceneSwap::LoadQuarantineAtlas.discards_world());
+        assert!(PendingSceneSwap::LoadQuarantineAtlasMixed.discards_world());
+        assert!(PendingSceneSwap::LoadSoupProspector.discards_world());
+        assert!(PendingSceneSwap::LoadMegastructureStamp.discards_world());
         assert!(PendingSceneSwap::LoadDemoSpectacle.discards_world());
         assert!(PendingSceneSwap::ResetGolSmoke.discards_world());
         assert!(PendingSceneSwap::SelectLatticeBeat(LatticeDemoBeat::Intro).discards_world());
+    }
+
+    #[test]
+    fn digit_key_dispatch_preserves_mode_specific_routes() {
+        let mut app = App::new(32);
+
+        app.handle_digit_key(5);
+        let held = app
+            .player_id
+            .and_then(|id| app.entities.iter().find(|entity| entity.id == id))
+            .and_then(|entity| match &entity.kind {
+                sim::EntityKind::Player(state) => Some(state.held_material),
+                _ => None,
+            })
+            .expect("player should exist");
+        assert_eq!(held, 5);
+
+        app.camera_mode = CameraMode::Orbit;
+        app.handle_digit_key(2);
+        assert_eq!(app.gol_smoke_rule, sim::GameOfLife3D::new(0, 6, 1, 3));
+
+        app.load_soup_prospector_demo();
+        app.handle_digit_key(3);
+        assert_eq!(app.soup_prospector.as_ref().unwrap().selected_pattern, 2);
+    }
+
+    #[test]
+    fn dump_scene_quarantine_atlas_mixed_dispatch_applies_setup() {
+        let mut plain = App::new(128);
+        plain.dispatch_dump_scene(DumpScene::QuarantineAtlas);
+
+        let mut mixed = App::new(128);
+        mixed.dispatch_dump_scene(DumpScene::QuarantineAtlasMixed);
+
+        assert!(
+            mixed.world.population() > plain.world.population(),
+            "mixed dump scene should apply {setup}: plain={} mixed={}",
+            plain.world.population(),
+            mixed.world.population(),
+            setup = hash_thing::sim::world::QUARANTINE_ATLAS_MIXED_CONTAINMENT_SETUP
+        );
+    }
+
+    #[test]
+    fn quarantine_atlas_pattern_deployment_consumes_and_enforces_budget() {
+        let mut app = App::new(128);
+        app.load_quarantine_atlas_demo();
+        app.select_quarantine_atlas_pattern(QuarantineAtlasPattern::CoolingTrench);
+
+        let start = app
+            .quarantine_atlas
+            .expect("quarantine mode should be active")
+            .interventions_remaining;
+        assert!(app.apply_quarantine_atlas_pattern_at([64, 27, 64]));
+        let after_one = app
+            .quarantine_atlas
+            .expect("quarantine mode should remain active")
+            .interventions_remaining;
+        assert_eq!(after_one, start - 1);
+
+        if let Some(state) = app.quarantine_atlas.as_mut() {
+            state.interventions_remaining = 0;
+        }
+        assert!(
+            !app.apply_quarantine_atlas_pattern_at([66, 27, 64]),
+            "budget exhaustion must block pattern spam"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct QuarantineThreatMetrics {
+        fire_or_lava_in_lane: usize,
+        intact_settlement_grass: usize,
+    }
+
+    fn count_materials_in_box(
+        world: &sim::World,
+        min: [i64; 3],
+        max: [i64; 3],
+        materials: &[CellState],
+    ) -> usize {
+        let mut count = 0;
+        for z in min[2]..=max[2] {
+            for y in min[1]..=max[1] {
+                for x in min[0]..=max[0] {
+                    let cell =
+                        world.get(sim::WorldCoord(x), sim::WorldCoord(y), sim::WorldCoord(z));
+                    if materials.contains(&cell) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn quarantine_threat_metrics(
+        world: &sim::World,
+        layout: QuarantineAtlasLayout,
+    ) -> QuarantineThreatMetrics {
+        use hash_thing::terrain::materials::{FIRE, GRASS, LAVA};
+
+        let lane_min = [
+            layout.hazard_center[0] + 7,
+            layout.floor_y + 1,
+            layout.hazard_center[2] - 4,
+        ];
+        let lane_max = [
+            layout.settlements[1][0] - 5,
+            layout.floor_y + 2,
+            layout.hazard_center[2] + 4,
+        ];
+        let settlement = layout.settlements[1];
+        let settlement_min = [settlement[0] - 3, settlement[1], settlement[2] - 3];
+        let settlement_max = [settlement[0] + 3, settlement[1] + 3, settlement[2] + 3];
+
+        QuarantineThreatMetrics {
+            fire_or_lava_in_lane: count_materials_in_box(world, lane_min, lane_max, &[FIRE, LAVA]),
+            intact_settlement_grass: count_materials_in_box(
+                world,
+                settlement_min,
+                settlement_max,
+                &[GRASS],
+            ),
+        }
+    }
+
+    fn run_quarantine_plan(plan: &[(QuarantineAtlasPattern, [i64; 3])]) -> QuarantineThreatMetrics {
+        let mut world = sim::World::new(7);
+        let layout = world.seed_quarantine_atlas_demo();
+        for &(pattern, center) in plan {
+            world.apply_quarantine_atlas_pattern(pattern, center);
+        }
+        for _ in 0..16 {
+            world.step_recursive();
+        }
+        quarantine_threat_metrics(&world, layout)
+    }
+
+    #[test]
+    fn quarantine_atlas_mixed_plan_beats_barrier_only_on_wide_lane() {
+        let mut seeded = sim::World::new(7);
+        let layout = seeded.seed_quarantine_atlas_demo();
+        let y = layout.floor_y + 1;
+        let z = layout.hazard_center[2];
+        let xs = [40, 50, 60, 70, 80, 90];
+        let barrier_only = xs.map(|x| (QuarantineAtlasPattern::Barrier, [x, y, z]));
+        let mixed = quarantine_atlas_mixed_containment_plan(layout);
+
+        let barrier_metrics = run_quarantine_plan(&barrier_only);
+        let mixed_metrics = run_quarantine_plan(&mixed);
+        eprintln!(
+            "Quarantine Atlas comparison: barrier={barrier_metrics:?}, mixed={mixed_metrics:?}"
+        );
+
+        assert!(
+            mixed_metrics.fire_or_lava_in_lane < barrier_metrics.fire_or_lava_in_lane,
+            "mixed plan should leave fewer active hazard cells in the wide lane: barrier={barrier_metrics:?}, mixed={mixed_metrics:?}"
+        );
+        assert!(
+            mixed_metrics.intact_settlement_grass >= barrier_metrics.intact_settlement_grass,
+            "mixed plan should not protect the middle settlement worse: barrier={barrier_metrics:?}, mixed={mixed_metrics:?}"
+        );
+    }
+
+    #[test]
+    fn quarantine_atlas_loader_rejects_too_small_world_without_panic() {
+        let mut app = App::new(32);
+
+        app.load_quarantine_atlas_demo();
+
+        assert!(
+            app.quarantine_atlas.is_none(),
+            "too-small worlds should leave Quarantine Atlas inactive"
+        );
+    }
+
+    #[test]
+    fn direct_world_loader_exits_quarantine_atlas_mode() {
+        let mut app = App::new(128);
+        app.load_quarantine_atlas_demo();
+        assert!(app.quarantine_atlas.is_some());
+
+        app.load_demo_spectacle("test reset");
+
+        assert!(
+            app.quarantine_atlas.is_none(),
+            "direct world loaders must not leave quarantine input routing active"
+        );
     }
 
     #[test]
@@ -4831,6 +8783,28 @@ mod tests {
             app.smoothed_fps < 1000.0,
             "smoothed_fps must not spike into thousands; got {}",
             app.smoothed_fps,
+        );
+    }
+
+    #[test]
+    fn title_fps_falls_back_to_smoothed_before_frame_total_samples() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 72.0;
+
+        assert_eq!(app.title_fps(), 72.0);
+    }
+
+    #[test]
+    fn title_fps_uses_frame_total_p95_over_smoothed_spike() {
+        let mut app = App::new(64);
+        app.smoothed_fps = 800.0;
+        app.perf
+            .record("frame_total", std::time::Duration::from_millis(40));
+
+        assert!(
+            (app.title_fps() - 25.0).abs() < 1e-9,
+            "title FPS should come from frame_total p95, got {}",
+            app.title_fps()
         );
     }
 
@@ -4974,8 +8948,69 @@ mod tests {
     }
 
     #[test]
+    fn particle_diagnostic_counts_visible_fire_and_lava() {
+        let data = [
+            [0.0, 0.0, 0.0, f32::from_bits(FIRE_MATERIAL_ID as u32)],
+            [0.0, 0.0, 0.0, f32::from_bits(LAVA_MATERIAL_ID as u32)],
+            [0.0, 0.0, 0.0, f32::from_bits(LAVA_MATERIAL_ID as u32)],
+            [0.0, 0.0, 0.0, f32::from_bits(VINE_MATERIAL_ID as u32)],
+        ];
+
+        assert_eq!(
+            count_visible_particle_materials(&data),
+            VisibleParticleCounts {
+                total: 4,
+                lava: 2,
+                fire: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn particle_diagnostic_counts_queued_lava_stamp_attempts() {
+        let mut queue = sim::MutationQueue::new();
+        queue.push(sim::WorldMutation::SetCell {
+            x: sim::WorldCoord(1),
+            y: sim::WorldCoord(2),
+            z: sim::WorldCoord(3),
+            state: LAVA,
+        });
+        queue.push(sim::WorldMutation::SetCell {
+            x: sim::WorldCoord(4),
+            y: sim::WorldCoord(5),
+            z: sim::WorldCoord(6),
+            state: hash_thing::terrain::materials::FIRE,
+        });
+
+        assert_eq!(count_queued_lava_stamp_attempts(&queue), 1);
+    }
+
+    #[test]
+    fn particle_diagnostic_counts_distinct_new_in_bounds_lava_targets() {
+        let mut world = sim::World::new(3);
+        world.set(
+            sim::WorldCoord(2),
+            sim::WorldCoord(2),
+            sim::WorldCoord(2),
+            LAVA,
+        );
+
+        let mut queue = sim::MutationQueue::new();
+        for (x, y, z) in [(1, 2, 3), (1, 2, 3), (2, 2, 2), (999, 2, 3)] {
+            queue.push(sim::WorldMutation::SetCell {
+                x: sim::WorldCoord(x),
+                y: sim::WorldCoord(y),
+                z: sim::WorldCoord(z),
+                state: LAVA,
+            });
+        }
+
+        assert_eq!(count_new_lava_stamp_targets(&world, &queue), 1);
+    }
+
+    #[test]
     fn first_person_legend_notes_lattice_debug_jumps() {
-        let lines = App::legend_lines(CameraMode::FirstPerson);
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, false, false);
         assert!(lines.iter().any(|line| line.contains("Space       Leap")));
         assert!(lines.iter().any(|line| line.contains("Scroll/1-9  Matter")));
         assert!(!lines.iter().any(|line| line.contains("Fly up")));
@@ -4998,11 +9033,14 @@ mod tests {
         // a9jd: V is user-facing in every camera mode now (not a DEV jump).
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Volcano/geyser particles")));
     }
 
     #[test]
     fn orbit_legend_marks_lattice_jumps_as_debug() {
-        let lines = App::legend_lines(CameraMode::Orbit);
+        let lines = App::legend_lines(CameraMode::Orbit, false, false, false);
         assert!(lines.iter().any(|line| line.contains("DEV prev/next jump")));
         assert!(lines
             .iter()
@@ -5011,12 +9049,473 @@ mod tests {
         // is the user-facing panorama reveal — not a DEV-only key.
         assert!(lines.iter().any(|line| line.contains("V  Panorama reveal")));
         assert!(lines.iter().any(|line| line.contains("Lattice walk")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Volcano/geyser particles")));
     }
 
     #[test]
     fn legend_defaults_on_in_all_modes() {
         assert!(default_legend_visibility(CameraMode::FirstPerson));
         assert!(default_legend_visibility(CameraMode::Orbit));
+    }
+
+    #[test]
+    fn quarantine_atlas_legend_removes_hand_edit_controls() {
+        let lines = App::legend_lines(CameraMode::FirstPerson, true, false, false);
+
+        assert!(lines.iter().any(|line| line.contains("RClick      Stamp")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("1-3         Pattern")));
+        assert!(!lines.iter().any(|line| line.contains("Carve")));
+        assert!(!lines.iter().any(|line| line.contains("Matter")));
+        assert!(!lines.iter().any(|line| line.contains("Clone source")));
+    }
+
+    #[test]
+    fn soup_prospector_legend_exposes_seed_place_and_catalog() {
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, true, false);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("RClick      Place soup")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("1-3         Soup seed")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("C           Catalog tile")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("E           Reuse last")));
+        assert!(!lines.iter().any(|line| line.contains("Clone source")));
+    }
+
+    #[test]
+    fn megastructure_stamp_legend_exposes_module_stamping() {
+        let lines = App::legend_lines(CameraMode::FirstPerson, false, false, true);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("RClick      Stamp module")));
+        assert!(lines.iter().any(|line| line.contains("P           Perf")));
+        assert!(!lines.iter().any(|line| line.contains("Clone source")));
+    }
+
+    #[test]
+    fn megastructure_stamp_helpers_snap_and_bound_module_origins() {
+        assert_eq!(snap_megastructure_stamp_origin([31, 99, -1]), [16, 99, -16]);
+        assert!(megastructure_stamp_in_bounds(128, [120, 32, 120]));
+        assert!(!megastructure_stamp_in_bounds(128, [121, 32, 120]));
+        assert!(!megastructure_stamp_in_bounds(128, [-1, 32, 120]));
+    }
+
+    #[test]
+    fn megastructure_stamp_reports_duplicate_overwrites() {
+        let mut world = sim::World::new(7);
+        let first = stamp_megastructure_module(&mut world, [16, 32, 16]);
+        let second = stamp_megastructure_module(&mut world, [16, 32, 16]);
+
+        assert!(first.written > 0);
+        assert_eq!(first.written, second.written);
+        assert_eq!(first.changed, first.written);
+        assert_eq!(second.changed, 0);
+    }
+
+    #[test]
+    fn megastructure_stamp_scene_loads_playable_state() {
+        let mut app = App::new(128);
+
+        app.load_megastructure_stamp_demo();
+
+        let state = app
+            .megastructure_stamp
+            .expect("megastructure stamp mode should be active");
+        assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS);
+        assert_eq!(state.floor_y, 32);
+        assert_eq!(state.last_stamp_origin, None);
+        assert_eq!(state.objective_progress, 0);
+        assert_eq!(state.objective_mask, 0);
+        assert_eq!(app.world.generation, 0);
+        assert!(!app.paused);
+        assert_eq!(app.camera_mode, CameraMode::FirstPerson);
+        assert!(app.player_id.is_some());
+        assert!(app.world.population() > 128 * 128);
+        assert!(app.memo_hud_visible);
+        assert!(app
+            .memo_hud_lines
+            .iter()
+            .any(|line| line.contains("Powered pylons 0/6")));
+        assert_eq!(
+            app.world.get(
+                sim::WorldCoord(98),
+                sim::WorldCoord(33),
+                sim::WorldCoord(28)
+            ),
+            hash_thing::terrain::materials::ICE
+        );
+    }
+
+    #[test]
+    fn megastructure_stamp_scene_advances_simulation_after_load() {
+        let mut app = App::new(128);
+
+        app.load_megastructure_stamp_demo();
+        let initial_population = app.world.population();
+        app.run_sync_dump_step();
+
+        assert_eq!(app.world.generation, 1);
+        assert_ne!(app.world.population(), initial_population);
+        assert_eq!(app.demo_scene_coord(), "megastructure-stamp");
+        assert!(app.perf.summary().contains("step"));
+    }
+
+    #[test]
+    fn megastructure_stamp_scripted_deploy_adds_one_module() {
+        let mut app = App::new(128);
+
+        app.load_megastructure_stamp_demo();
+        let before_population = app.world.population();
+        assert!(app.deploy_megastructure_stamp_at_origin([88, 33, 88]));
+
+        let state = app.megastructure_stamp.expect("mode remains active");
+        assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS + 1);
+        assert_eq!(state.last_stamp_origin, Some([88, 33, 88]));
+        assert_eq!(state.objective_progress, 1);
+        assert_eq!(state.objective_mask, 1 << 4);
+        assert!(app.world.population() > before_population);
+        assert!(app
+            .memo_hud_lines
+            .iter()
+            .any(|line| line.contains("Powered pylons 1/6")));
+        assert_eq!(
+            app.world.get(
+                sim::WorldCoord(98),
+                sim::WorldCoord(33),
+                sim::WorldCoord(92)
+            ),
+            hash_thing::terrain::materials::VINE
+        );
+        assert!(app.deploy_megastructure_stamp_at_origin([88, 33, 88]));
+        let state = app
+            .megastructure_stamp
+            .expect("mode remains active after duplicate");
+        assert_eq!(state.stamps_placed, MEGASTRUCTURE_INITIAL_STAMPS + 1);
+        assert_eq!(state.objective_progress, 1);
+    }
+
+    #[test]
+    fn soup_prospector_seed_and_catalog_round_trip_focus_tile() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        assert!(app.soup_prospector.is_some());
+        let tile = app
+            .soup_action_tile()
+            .expect("soup scene should start aimed at field");
+        assert!(soup_tile_in_bounds(app.world.side(), tile));
+
+        assert!(app.select_soup_prospector_pattern(1, true));
+        let (pop, hash) = soup_tile_stats(&app.world, tile);
+        assert!(pop > 0, "placing a soup pattern should populate focus tile");
+        assert!(hash.starts_with("sha256:"));
+
+        assert!(app.catalog_soup_prospector_target());
+        let state = app.soup_prospector.as_ref().unwrap();
+        assert_eq!(state.catalog.len(), 1);
+        assert_eq!(state.catalog[0].tile, tile);
+        assert_eq!(state.catalog[0].pop, pop);
+        assert_eq!(state.catalog[0].state_hash, hash);
+        assert_eq!(
+            state.catalog[0].snapshot.len(),
+            (SOUP_PROSPECTOR_TILE as usize).pow(3)
+        );
+        assert!(!state.catalog[0]
+            .snapshot
+            .contains(&hash_thing::terrain::materials::SOUP_TARGET_MARKER));
+        assert!(!state.catalog[0]
+            .snapshot
+            .contains(&hash_thing::terrain::materials::SOUP_CATALOG_MARKER));
+        assert_ne!(state.catalog[0].label, SoupCatalogLabel::Extinct);
+        assert!(app.last_memo_summary.contains("target_label="));
+        assert!(app.last_memo_summary.contains("last_label="));
+    }
+
+    #[test]
+    fn soup_catalog_reuse_retests_last_entry_in_distinct_tile() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        let source = app
+            .soup_action_tile()
+            .expect("soup scene should start aimed at field");
+
+        assert!(app.catalog_soup_prospector_target());
+        let source_hash = app.soup_prospector.as_ref().unwrap().catalog[0]
+            .state_hash
+            .clone();
+        assert!(app.reuse_latest_soup_catalog_entry(true));
+
+        let state = app.soup_prospector.as_ref().unwrap();
+        let reuse = state.last_reuse.as_ref().expect("reuse should be recorded");
+        assert_eq!(reuse.source_tile, source);
+        assert_ne!(reuse.target_tile, source);
+        assert_eq!(reuse.source_hash, source_hash);
+        assert_ne!(reuse.target_before_hash, reuse.target_after_hash);
+        assert_eq!(reuse.source_hash, reuse.target_after_hash);
+        assert_eq!(reuse.count, 1);
+        assert_eq!(state.focus_tile, reuse.target_tile);
+        assert!(app.last_memo_summary.contains("reuse=1"));
+        assert!(app.last_memo_summary.starts_with("REUSE "));
+        assert_eq!(
+            app.memo_hud_lines,
+            vec![
+                "REUSE".to_string(),
+                format!(
+                    "{}->{}",
+                    soup_tile_text(source),
+                    soup_tile_text(reuse.target_tile)
+                ),
+                "changed=yes".to_string(),
+                "copy=yes".to_string(),
+                "post=survivor".to_string(),
+                format!("pop={}", reuse.post_pop),
+            ]
+        );
+        assert!(app.last_memo_summary.contains("copy=yes"));
+        assert!(app.last_memo_summary.contains("post=survivor"));
+        assert!(app.last_memo_summary.contains("target_src=reuse"));
+        assert!(app.last_memo_summary.contains("initial_match=yes"));
+        assert!(app.last_memo_summary.contains("post_label="));
+        assert!(soup_tile_includes_material(
+            &app.world,
+            reuse.source_tile,
+            hash_thing::terrain::materials::SOUP_CATALOG_MARKER
+        ));
+        assert!(soup_tile_includes_material(
+            &app.world,
+            reuse.target_tile,
+            hash_thing::terrain::materials::SOUP_TARGET_MARKER
+        ));
+    }
+
+    #[test]
+    fn soup_reuse_target_fallback_avoids_source_tile() {
+        assert_eq!(
+            choose_soup_reuse_target(Some([1, 0, 1]), [1, 0, 1], [1, 0, 1], [3, 2, 3]),
+            Some([2, 0, 1])
+        );
+        assert_eq!(
+            choose_soup_reuse_target(Some([2, 0, 1]), [1, 0, 1], [1, 0, 1], [3, 2, 3]),
+            Some([2, 0, 1])
+        );
+        assert_eq!(
+            choose_soup_reuse_target(Some([2, 0, 3]), [2, 0, 3], [1, 0, 1], [5, 4, 5]),
+            Some([1, 0, 3])
+        );
+    }
+
+    #[test]
+    fn soup_pattern_selection_does_not_reseed_until_place_action() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        let tile = app
+            .soup_action_tile()
+            .expect("soup scene should start aimed at field");
+        let before = soup_tile_stats(&app.world, tile);
+
+        assert!(app.run_soup_action_or_queue(PendingSoupAction::SelectPattern(2)));
+        assert_eq!(app.soup_prospector.as_ref().unwrap().selected_pattern, 2);
+        assert_eq!(soup_tile_stats(&app.world, tile), before);
+
+        assert!(app.run_soup_action_or_queue(PendingSoupAction::PlaceSelected));
+        assert_ne!(soup_tile_stats(&app.world, tile), before);
+    }
+
+    #[test]
+    fn soup_prospector_pattern_choice_changes_tile_hash() {
+        let mut world_a = sim::World::new(5);
+        world_a.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let tile = soup_focus_tile_for_side(world_a.side());
+        seed_soup_tile(&mut world_a, tile, soup_pattern_seed(0));
+        let (_, hash_a) = soup_tile_stats(&world_a, tile);
+
+        let mut world_b = sim::World::new(5);
+        world_b.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        seed_soup_tile(&mut world_b, tile, soup_pattern_seed(1));
+        let (_, hash_b) = soup_tile_stats(&world_b, tile);
+
+        assert_ne!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn soup_demo_tile_bounds_caps_default_volume_to_probe_sized_field() {
+        let focus = soup_focus_tile_for_side(256);
+        let (min, max) = soup_demo_tile_bounds(256, focus);
+        assert_eq!(
+            [max[0] - min[0], max[1] - min[1], max[2] - min[2]],
+            [4, 4, 4]
+        );
+        assert!(focus
+            .iter()
+            .zip(min.iter().zip(max.iter()))
+            .all(|(&f, (&lo, &hi))| f >= lo && f < hi));
+    }
+
+    #[test]
+    fn soup_field_ray_picks_empty_tile_inside_demo_bounds() {
+        let focus = soup_focus_tile_for_side(64);
+        let (min, max) = soup_demo_tile_bounds(64, focus);
+        let eye = [32.0, 32.0, 90.0];
+        let dir = [0.0, 0.0, -1.0];
+
+        assert_eq!(
+            soup_tile_from_field_ray([0, 0, 0], min, max, eye, dir),
+            Some([2, 2, 3])
+        );
+    }
+
+    #[test]
+    fn soup_field_ray_inside_bounds_samples_forward_tile() {
+        let focus = soup_focus_tile_for_side(64);
+        let (min, max) = soup_demo_tile_bounds(64, focus);
+        let eye = [32.0, 32.0, 40.0];
+        let dir = [0.0, 0.0, 1.0];
+
+        assert_eq!(
+            soup_tile_from_field_ray([0, 0, 0], min, max, eye, dir),
+            Some([2, 2, 3])
+        );
+    }
+
+    #[test]
+    fn soup_prospector_default_pose_aims_without_focus_fallback() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+
+        assert_eq!(app.aimed_soup_tile(), Some([1, 0, 1]));
+        assert_eq!(app.soup_prospector.as_ref().unwrap().focus_tile, [1, 0, 1]);
+        assert_ne!(
+            app.soup_prospector.as_ref().unwrap().focus_tile,
+            soup_focus_tile_for_side(app.world.side())
+        );
+        assert!(app.last_memo_summary.contains("target_src=aimed"));
+    }
+
+    #[test]
+    fn soup_catalog_label_uses_last_three_population_samples() {
+        let mut state = SoupProspectorState::new([1, 1, 1], [0, 0, 0], [2, 2, 2]);
+        let tile = [1, 1, 1];
+
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 1, 7),
+            SoupCatalogLabel::Survivor
+        );
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 2, 7),
+            SoupCatalogLabel::Survivor
+        );
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 3, 7),
+            SoupCatalogLabel::CandidateStable
+        );
+        assert_eq!(
+            record_soup_tile_pop_sample(&mut state, tile, 4, 0),
+            SoupCatalogLabel::Extinct
+        );
+    }
+
+    #[test]
+    fn soup_marker_recoloring_preserves_tile_stats() {
+        let mut world = sim::World::new(5);
+        world.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let tile = soup_focus_tile_for_side(world.side());
+        seed_soup_tile(&mut world, tile, soup_pattern_seed(0));
+        frame_soup_tile(&mut world, tile);
+        let before = soup_tile_stats(&world, tile);
+
+        stamp_soup_target_marker(&mut world, tile);
+
+        assert_eq!(soup_tile_stats(&world, tile), before);
+        assert!(soup_tile_includes_material(
+            &world,
+            tile,
+            hash_thing::terrain::materials::SOUP_TARGET_MARKER
+        ));
+        clear_soup_tile_markers(&mut world, tile);
+        stamp_soup_catalog_marker(&mut world, tile);
+        assert_eq!(soup_tile_stats(&world, tile), before);
+        assert!(soup_tile_includes_material(
+            &world,
+            tile,
+            hash_thing::terrain::materials::SOUP_CATALOG_MARKER
+        ));
+    }
+
+    #[test]
+    fn soup_marker_recoloring_preserves_one_step_tile_stats() {
+        let mut baseline = sim::World::new(5);
+        baseline.set_gol_smoke_rule(sim::GameOfLife3D::rule445());
+        let tile = soup_focus_tile_for_side(baseline.side());
+        let (tile_min, tile_max) = soup_demo_tile_bounds(baseline.side(), tile);
+        for z in tile_min[2]..tile_max[2] {
+            for y in tile_min[1]..tile_max[1] {
+                for x in tile_min[0]..tile_max[0] {
+                    let current = [x, y, z];
+                    seed_soup_tile(&mut baseline, current, soup_pattern_seed(0));
+                    frame_soup_tile(&mut baseline, current);
+                }
+            }
+        }
+
+        let mut marked = baseline.clone();
+        stamp_soup_demo_markers(&mut marked, tile_min, tile_max, Some(tile), &[tile]);
+        clear_soup_demo_markers(&mut marked, tile_min, tile_max);
+        assert_eq!(
+            soup_tile_stats(&marked, tile),
+            soup_tile_stats(&baseline, tile)
+        );
+
+        baseline.step();
+        marked.step();
+
+        assert_eq!(
+            soup_tile_stats(&marked, tile),
+            soup_tile_stats(&baseline, tile)
+        );
+        assert_eq!(
+            soup_tile_stats(&unmarked_soup_world(&marked, tile_min, tile_max), tile),
+            soup_tile_stats(&baseline, tile)
+        );
+    }
+
+    #[test]
+    fn soup_prospector_samples_every_demo_tile_for_classifier_window() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        app.run_sync_dump_step();
+        app.run_sync_dump_step();
+
+        let state = app.soup_prospector.as_ref().unwrap();
+        let expected_tiles = ((state.tile_max[0] - state.tile_min[0])
+            * (state.tile_max[1] - state.tile_min[1])
+            * (state.tile_max[2] - state.tile_min[2])) as usize;
+        assert_eq!(state.pop_history.len(), expected_tiles);
+        assert!(state.pop_history.values().all(|samples| samples.len() == 3));
+    }
+
+    #[test]
+    fn soup_actions_queue_while_background_step_owns_world() {
+        let mut app = App::new(32);
+        app.load_soup_prospector_demo();
+        app.step_pending = true;
+
+        assert!(app.run_soup_action_or_queue(PendingSoupAction::Catalog));
+        assert_eq!(app.pending_soup_action, Some(PendingSoupAction::Catalog));
+        assert!(app.soup_prospector.as_ref().unwrap().catalog.is_empty());
+
+        app.step_pending = false;
+        app.run_pending_soup_action();
+        assert_eq!(app.soup_prospector.as_ref().unwrap().catalog.len(), 1);
     }
 
     #[test]
@@ -5162,6 +9661,182 @@ mod tests {
         // which is the contract the test is named for.
     }
 
+    #[test]
+    fn background_step_does_not_start_during_world_prefetch() {
+        let mut app = App::new(32);
+        app.world_prefetch_pending = true;
+        app.maybe_start_background_step();
+
+        assert!(
+            !app.step_pending,
+            "sim step must not race a world clone being grown for prefetch"
+        );
+        assert_eq!(
+            app.world.side(),
+            32,
+            "live world must remain available while prefetch is pending"
+        );
+    }
+
+    fn set_test_prefetch(app: &mut App, generation: u64, base_world_revision: u64) {
+        app.world_prefetch_pending = true;
+        app.next_world_prefetch_generation = app.next_world_prefetch_generation.max(generation);
+        app.current_world_prefetch_generation = Some(generation);
+        app.world_revision = base_world_revision;
+    }
+
+    fn test_world_grow_result(
+        generation: u64,
+        base_world_revision: u64,
+        payload: Result<sim::World, String>,
+    ) -> WorldGrowResult {
+        WorldGrowResult {
+            generation,
+            base_world_revision,
+            payload,
+        }
+    }
+
+    #[test]
+    fn apply_world_grow_result_ok_clears_pending_and_swaps_world() {
+        let mut app = App::new(32);
+        let mut grown = app.world.clone();
+        grown.ensure_region(
+            [sim::WorldCoord(-1), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+            ],
+        );
+        let grown_side = grown.side();
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.apply_world_grow_result(test_world_grow_result(1, base_revision, Ok(grown)));
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert_eq!(app.world.side(), grown_side);
+        assert!(app.world.side() > 32, "grown world should be installed");
+        assert_eq!(app.world_revision, base_revision.wrapping_add(1));
+        assert!(!app.paused, "successful prefetch must not pause the sim");
+    }
+
+    #[test]
+    fn apply_world_grow_result_err_keeps_live_world_and_clears_pending() {
+        let mut app = App::new(32);
+        let original_side = app.world.side();
+        let original_origin = app.world.origin;
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.apply_world_grow_result(test_world_grow_result(
+            1,
+            base_revision,
+            Err("simulated prefetch panic".to_string()),
+        ));
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert_eq!(app.world.side(), original_side);
+        assert_eq!(app.world.origin, original_origin);
+        assert_eq!(app.world_revision, base_revision);
+        assert!(!app.paused, "prefetch failure must not pause the sim");
+    }
+
+    #[test]
+    fn stale_world_grow_after_scene_swap_is_ignored() {
+        let mut app = App::new(32);
+        let mut grown = app.world.clone();
+        grown.ensure_region(
+            [sim::WorldCoord(-1), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+            ],
+        );
+        let grown_side = grown.side();
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.request_scene_swap(PendingSceneSwap::ResetTerrain);
+        let scene_revision = app.world_revision;
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert!(scene_revision > base_revision);
+
+        app.apply_world_grow_result(test_world_grow_result(1, base_revision, Ok(grown)));
+
+        assert_ne!(app.world.side(), grown_side);
+        assert_eq!(app.world_revision, scene_revision);
+    }
+
+    #[test]
+    fn stale_world_grow_does_not_clear_newer_pending_prefetch() {
+        let mut app = App::new(32);
+        let base_revision = app.world_revision;
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.mark_world_changed();
+
+        let newer_revision = app.world_revision;
+        set_test_prefetch(&mut app, 2, newer_revision);
+        app.apply_world_grow_result(test_world_grow_result(
+            1,
+            base_revision,
+            Err("old worker finished late".to_string()),
+        ));
+
+        assert!(app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, Some(2));
+        assert_eq!(app.world_revision, newer_revision);
+    }
+
+    #[test]
+    fn stale_world_grow_after_rule_world_mutation_is_ignored() {
+        let mut app = App::new(32);
+        app.gol_smoke_scene = true;
+        let mut grown = app.world.clone();
+        grown.ensure_region(
+            [sim::WorldCoord(-1), sim::WorldCoord(0), sim::WorldCoord(0)],
+            [
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+                sim::WorldCoord(31),
+            ],
+        );
+        let grown_side = grown.side();
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.select_rule(sim::GameOfLife3D::rule445(), "445");
+        let rule_revision = app.world_revision;
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert!(rule_revision > base_revision);
+
+        app.apply_world_grow_result(test_world_grow_result(1, base_revision, Ok(grown)));
+
+        assert_ne!(app.world.side(), grown_side);
+        assert_eq!(app.world_revision, rule_revision);
+    }
+
+    #[test]
+    fn lod_refresh_invalidates_pending_world_grow() {
+        let mut app = App::new(32);
+        let base_revision = app.world_revision;
+
+        set_test_prefetch(&mut app, 1, base_revision);
+        app.refresh_view_after_lod_change();
+
+        assert!(!app.world_prefetch_pending);
+        assert_eq!(app.current_world_prefetch_generation, None);
+        assert!(app.world_revision > base_revision);
+    }
+
     /// hash-thing-dbv3 (vqke.1.1): cover the `apply_step_result` seam
     /// directly. The `background_step_starts_after_live_world_player_update`
     /// test above asserts only the kickoff contract; these tests
@@ -5194,10 +9869,7 @@ mod tests {
             app.world.generation, payload_world_gen,
             "world must be swapped back from the payload"
         );
-        assert!(
-            !app.paused,
-            "Ok payload must not pause the sim"
-        );
+        assert!(!app.paused, "Ok payload must not pause the sim");
     }
 
     #[test]
@@ -6044,6 +10716,18 @@ mod tests {
         let mut app = App::new(256);
         app.load_demo_spectacle("warp-audit");
         assert_player_in_playable_space(&app, "b / load_demo_spectacle");
+    }
+
+    #[test]
+    fn warp_q_load_quarantine_atlas_lands_in_playable_space() {
+        let mut app = App::new(256);
+        app.load_quarantine_atlas_demo();
+        assert_player_in_playable_space(&app, "q / load_quarantine_atlas_demo");
+        assert!(!app.paused, "Quarantine Atlas hazard should run live");
+        assert!(
+            app.quarantine_atlas.is_some(),
+            "Quarantine Atlas mode should enable budgeted pattern deployment"
+        );
     }
 
     /// Audit `0` (recenter_player): recenter from inside a seeded scene

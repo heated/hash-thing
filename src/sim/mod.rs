@@ -1,3 +1,4 @@
+pub(crate) mod chunk_array;
 pub mod chunks;
 pub mod entity;
 pub mod hashlife;

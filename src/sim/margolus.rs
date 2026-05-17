@@ -17,8 +17,139 @@ impl BlockRule for IdentityBlockRule {
         *block
     }
 
+    fn diag_name(&self) -> &'static str {
+        "IdentityBlockRule"
+    }
+
     fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(IdentityBlockRule)
+    }
+}
+
+/// Conveyor block rule — moves one material in +X within each Margolus block.
+///
+/// This is a deliberately small factory-probe primitive: if a conveyor item is
+/// in the local x=0 cell and the corresponding x=1 cell is air, the item moves
+/// forward. The alternating global Margolus partition turns that local swap into
+/// fixed-direction motion across repeated steps.
+pub struct ConveyorBlockRule {
+    item_material: u16,
+}
+
+impl ConveyorBlockRule {
+    pub fn new(item_material: u16) -> Self {
+        Self { item_material }
+    }
+}
+
+impl BlockRule for ConveyorBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "ConveyorBlockRule"
+    }
+
+    fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8] {
+        let mut out = *block;
+        for dy in 0..2 {
+            for dz in 0..2 {
+                let from = block_index(0, dy, dz);
+                let to = block_index(1, dy, dz);
+                if movable[from]
+                    && movable[to]
+                    && out[from].material() == self.item_material
+                    && out[to].is_empty()
+                {
+                    out.swap(from, to);
+                }
+            }
+        }
+        out
+    }
+
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
+        Box::new(ConveyorBlockRule {
+            item_material: self.item_material,
+        })
+    }
+}
+
+/// Encoded belt routing rule — moves an item according to the belt below it.
+///
+/// The moving item occupies one cell in a 2-cell-high local column. The
+/// adjacent vertical cell is an inert belt substrate whose material encodes the
+/// direction. Source-belt semantics are intentional: off-belt items are never
+/// pulled onto a belt by destination cells. If both +X and +Z candidates target
+/// the same output cell, +X wins deterministically and the +Z item stays put.
+pub struct EncodedBeltRoutingBlockRule {
+    item_material: u16,
+    belt_pos_x_material: u16,
+    belt_pos_z_material: u16,
+}
+
+impl EncodedBeltRoutingBlockRule {
+    pub fn new(item_material: u16, belt_pos_x_material: u16, belt_pos_z_material: u16) -> Self {
+        Self {
+            item_material,
+            belt_pos_x_material,
+            belt_pos_z_material,
+        }
+    }
+
+    fn is_belt(&self, cell: Cell) -> bool {
+        let material = cell.material();
+        material == self.belt_pos_x_material || material == self.belt_pos_z_material
+    }
+}
+
+impl BlockRule for EncodedBeltRoutingBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "EncodedBeltRoutingBlockRule"
+    }
+
+    fn step_block(&self, block: &[Cell; 8], movable: &[bool; 8]) -> [Cell; 8] {
+        let mut out = *block;
+        for dy in 0..2 {
+            for z in 0..2 {
+                let from = block_index(0, dy, z);
+                let to = block_index(1, dy, z);
+                let source_belt = block_index(0, 1 - dy, z);
+                let dest_belt = block_index(1, 1 - dy, z);
+                if movable[from]
+                    && movable[to]
+                    && block[source_belt].material() == self.belt_pos_x_material
+                    && self.is_belt(block[dest_belt])
+                    && out[from].material() == self.item_material
+                    && out[to].is_empty()
+                {
+                    out.swap(from, to);
+                }
+            }
+        }
+        for dy in 0..2 {
+            for x in 0..2 {
+                let from = block_index(x, dy, 0);
+                let to = block_index(x, dy, 1);
+                let source_belt = block_index(x, 1 - dy, 0);
+                let dest_belt = block_index(x, 1 - dy, 1);
+                if movable[from]
+                    && movable[to]
+                    && block[source_belt].material() == self.belt_pos_z_material
+                    && self.is_belt(block[dest_belt])
+                    && out[from].material() == self.item_material
+                    && out[to].is_empty()
+                {
+                    out.swap(from, to);
+                }
+            }
+        }
+        out
+    }
+
+    fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
+        Box::new(EncodedBeltRoutingBlockRule {
+            item_material: self.item_material,
+            belt_pos_x_material: self.belt_pos_x_material,
+            belt_pos_z_material: self.belt_pos_z_material,
+        })
     }
 }
 
@@ -53,6 +184,10 @@ impl FluidBlockRule {
 }
 
 impl BlockRule for FluidBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "FluidBlockRule"
+    }
+
     fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(FluidBlockRule {
             density_fn: self.density_fn,
@@ -94,30 +229,16 @@ impl BlockRule for FluidBlockRule {
         let hash = Self::content_hash(block);
         for dy in 0..2usize {
             let x_first = (hash >> dy) & 1 == 0;
+            if self.layer_is_diagonal_fluid_air(&out, dy) {
+                self.break_diagonal_layer(&mut out, dy, x_first);
+                continue;
+            }
             if x_first {
-                // X-axis first, then Z-axis
-                for dz in 0..2 {
-                    let a = block_index(0, dy, dz);
-                    let b = block_index(1, dy, dz);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
-                for dx in 0..2 {
-                    let a = block_index(dx, dy, 0);
-                    let b = block_index(dx, dy, 1);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
+                self.apply_lateral_axis(&mut out, dy, true);
+                self.apply_lateral_axis(&mut out, dy, false);
             } else {
-                // Z-axis first, then X-axis
-                for dx in 0..2 {
-                    let a = block_index(dx, dy, 0);
-                    let b = block_index(dx, dy, 1);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
-                for dz in 0..2 {
-                    let a = block_index(0, dy, dz);
-                    let b = block_index(1, dy, dz);
-                    self.try_fluid_swap(&mut out, a, b);
-                }
+                self.apply_lateral_axis(&mut out, dy, false);
+                self.apply_lateral_axis(&mut out, dy, true);
             }
         }
 
@@ -150,6 +271,56 @@ impl FluidBlockRule {
             block.swap(a, b);
         }
     }
+
+    fn apply_lateral_axis(&self, block: &mut [Cell; 8], dy: usize, x_axis: bool) {
+        if x_axis {
+            for dz in 0..2 {
+                let a = block_index(0, dy, dz);
+                let b = block_index(1, dy, dz);
+                self.try_fluid_swap(block, a, b);
+            }
+        } else {
+            for dx in 0..2 {
+                let a = block_index(dx, dy, 0);
+                let b = block_index(dx, dy, 1);
+                self.try_fluid_swap(block, a, b);
+            }
+        }
+    }
+
+    fn break_diagonal_layer(&self, block: &mut [Cell; 8], dy: usize, x_axis: bool) {
+        let c00 = block_index(0, dy, 0);
+        let c10 = block_index(1, dy, 0);
+        let c01 = block_index(0, dy, 1);
+        let c11 = block_index(1, dy, 1);
+
+        if block[c00].material() == self.fluid_material
+            && block[c11].material() == self.fluid_material
+        {
+            if x_axis {
+                block.swap(c00, c10);
+            } else {
+                block.swap(c00, c01);
+            }
+        } else if x_axis {
+            block.swap(c10, c00);
+        } else {
+            block.swap(c10, c11);
+        }
+    }
+
+    fn layer_is_diagonal_fluid_air(&self, block: &[Cell; 8], dy: usize) -> bool {
+        let cells = [
+            block[block_index(0, dy, 0)],
+            block[block_index(1, dy, 0)],
+            block[block_index(0, dy, 1)],
+            block[block_index(1, dy, 1)],
+        ];
+        let is_fluid = |cell: Cell| cell.material() == self.fluid_material;
+        let is_air = |cell: Cell| cell.is_empty();
+        (is_fluid(cells[0]) && is_fluid(cells[3]) && is_air(cells[1]) && is_air(cells[2]))
+            || (is_fluid(cells[1]) && is_fluid(cells[2]) && is_air(cells[0]) && is_air(cells[3]))
+    }
 }
 
 /// Gravity block rule — heavy materials swap downward with lighter ones.
@@ -181,6 +352,10 @@ impl GravityBlockRule {
 }
 
 impl BlockRule for GravityBlockRule {
+    fn diag_name(&self) -> &'static str {
+        "GravityBlockRule"
+    }
+
     fn clone_box(&self) -> Box<dyn BlockRule + Send + Sync> {
         Box::new(GravityBlockRule {
             density_fn: self.density_fn,
@@ -285,6 +460,126 @@ mod tests {
         ];
         let rule = IdentityBlockRule;
         let out = rule.step_block(&block, &[true; 8]);
+        assert_mass_conserved(&block, &out);
+    }
+
+    // ---------------------------------------------------------------
+    // ConveyorBlockRule
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn conveyor_moves_item_pos_x_into_air() {
+        let rule = ConveyorBlockRule::new(14);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(0, 0, 0)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 0, 0)], Cell::pack(14, 9));
+        assert_mass_conserved(&block, &out);
+    }
+
+    #[test]
+    fn conveyor_does_not_move_blocked_item() {
+        let rule = ConveyorBlockRule::new(14);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(14, 9);
+        block[block_index(1, 0, 0)] = Cell::pack(14, 3);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out, block);
+    }
+
+    #[test]
+    fn conveyor_respects_movable_mask() {
+        let rule = ConveyorBlockRule::new(14);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(14, 9);
+        let mut movable = [true; 8];
+        movable[block_index(1, 0, 0)] = false;
+
+        let out = rule.step_block(&block, &movable);
+
+        assert_eq!(out, block);
+    }
+
+    // ---------------------------------------------------------------
+    // EncodedBeltRoutingBlockRule
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn encoded_belt_moves_pos_x_from_source_belt() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(1, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(0, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(0, 1, 0)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 1, 0)], Cell::pack(14, 9));
+        assert_eq!(out[block_index(0, 0, 0)], Cell::pack(29, 0));
+        assert_eq!(out[block_index(1, 0, 0)], Cell::pack(29, 0));
+        assert_mass_conserved(&block, &out);
+    }
+
+    #[test]
+    fn encoded_belt_moves_pos_z_from_source_belt() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(1, 0, 0)] = Cell::pack(30, 0);
+        block[block_index(1, 0, 1)] = Cell::pack(29, 0);
+        block[block_index(1, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(1, 1, 0)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 1, 1)], Cell::pack(14, 9));
+        assert_mass_conserved(&block, &out);
+    }
+
+    #[test]
+    fn encoded_belt_does_not_pull_off_belt_item() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(1, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(0, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out, block);
+    }
+
+    #[test]
+    fn encoded_belt_requires_destination_belt() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 0)] = Cell::pack(29, 0);
+        block[block_index(0, 1, 0)] = Cell::pack(14, 9);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out, block);
+    }
+
+    #[test]
+    fn encoded_belt_merge_pressure_prefers_pos_x() {
+        let rule = EncodedBeltRoutingBlockRule::new(14, 29, 30);
+        let mut block = [Cell::EMPTY; 8];
+        block[block_index(0, 0, 1)] = Cell::pack(29, 0);
+        block[block_index(1, 0, 1)] = Cell::pack(29, 0);
+        block[block_index(1, 0, 0)] = Cell::pack(30, 0);
+        block[block_index(0, 1, 1)] = Cell::pack(14, 1);
+        block[block_index(1, 1, 0)] = Cell::pack(14, 2);
+
+        let out = rule.step_block(&block, &[true; 8]);
+
+        assert_eq!(out[block_index(0, 1, 1)], Cell::EMPTY);
+        assert_eq!(out[block_index(1, 1, 1)], Cell::pack(14, 1));
+        assert_eq!(out[block_index(1, 1, 0)], Cell::pack(14, 2));
         assert_mass_conserved(&block, &out);
     }
 
@@ -476,6 +771,14 @@ mod tests {
         FluidBlockRule::new(simple_density, simple_phase, FLUID_MAT)
     }
 
+    fn layer_is_diagonal(block: &[Cell; 8], dy: usize, material: u16) -> bool {
+        let c00 = block[block_index(0, dy, 0)].material() == material;
+        let c10 = block[block_index(1, dy, 0)].material() == material;
+        let c01 = block[block_index(0, dy, 1)].material() == material;
+        let c11 = block[block_index(1, dy, 1)].material() == material;
+        (c00 && c11 && !c10 && !c01) || (c10 && c01 && !c00 && !c11)
+    }
+
     #[test]
     fn fluid_gravity_heavy_over_air_falls() {
         let rule = fluid_rule();
@@ -511,6 +814,85 @@ mod tests {
         assert_mass_conserved(&block, &out);
         let fluid_count: usize = out.iter().filter(|c| c.material() == FLUID_MAT).count();
         assert_eq!(fluid_count, 1, "exactly one fluid cell must exist");
+    }
+
+    #[test]
+    fn fluid_diagonal_layer_above_floor_is_not_fixed_point() {
+        let rule = fluid_rule();
+        let mut block = [Cell::EMPTY; 8];
+        let movable = [
+            false, false, false, false, // y=0 floor, immovable
+            true, true, true, true,
+        ];
+        for dx in 0..2 {
+            for dz in 0..2 {
+                block[block_index(dx, 0, dz)] = mat(SOLID_MAT);
+            }
+        }
+
+        for diagonal in [
+            [(0usize, 1usize, 0usize), (1, 1, 1)],
+            [(1usize, 1usize, 0usize), (0, 1, 1)],
+        ] {
+            let mut input = block;
+            for (dx, dy, dz) in diagonal {
+                input[block_index(dx, dy, dz)] = mat(FLUID_MAT);
+            }
+            let out = rule.step_block(&input, &movable);
+            assert_ne!(
+                out, input,
+                "diagonal fluid above a floor must not be a fixed point"
+            );
+            assert!(
+                !layer_is_diagonal(&out, 1, FLUID_MAT),
+                "diagonal fluid above a floor should become side-adjacent"
+            );
+            let second = rule.step_block(&out, &movable);
+            assert!(
+                second != input,
+                "diagonal fluid above a floor must not enter a two-step oscillator"
+            );
+            assert_mass_conserved(&input, &out);
+            assert_mass_conserved(&out, &second);
+        }
+    }
+
+    #[test]
+    fn fluid_diagonal_breaker_is_material_generic() {
+        const OTHER_FLUID: u16 = 4;
+        fn other_fluid_phase(cell: Cell) -> Phase {
+            if cell.is_empty() {
+                Phase::Gas
+            } else if cell.material() == OTHER_FLUID {
+                Phase::Liquid
+            } else {
+                Phase::Solid
+            }
+        }
+        let rule = FluidBlockRule::new(simple_density, other_fluid_phase, OTHER_FLUID);
+        let movable = [
+            false, false, false, false, // y=0 floor, immovable
+            true, true, true, true,
+        ];
+        let mut input = [Cell::EMPTY; 8];
+        for dx in 0..2 {
+            for dz in 0..2 {
+                input[block_index(dx, 0, dz)] = mat(SOLID_MAT);
+            }
+        }
+        input[block_index(0, 1, 0)] = mat(OTHER_FLUID);
+        input[block_index(1, 1, 1)] = mat(OTHER_FLUID);
+
+        let out = rule.step_block(&input, &movable);
+        assert_ne!(
+            out, input,
+            "diagonal breaker should apply to any FluidBlockRule material"
+        );
+        assert!(
+            !layer_is_diagonal(&out, 1, OTHER_FLUID),
+            "generic fluid diagonal should become side-adjacent"
+        );
+        assert_mass_conserved(&input, &out);
     }
 
     #[test]

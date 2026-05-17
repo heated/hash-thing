@@ -3,7 +3,7 @@
 //! Measures the latency of block place/break operations through the octree
 //! and the downstream flatten/SVDAG rebuild cost.
 //!
-//! Run with: `cargo test --release --test bench_edit -- --ignored --nocapture`
+//! Run with: `cargo test --profile perf --test bench_edit -- --ignored --nocapture`
 //!
 //! ## Baseline (2026-04-12, M-series Mac, release build)
 //!

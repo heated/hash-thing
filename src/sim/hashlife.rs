@@ -31,17 +31,21 @@
 //! phase alternates 0/1, so stable subtrees hit the cache every other frame;
 //! with slower divisors hits occur every `memo_period` frames at the same phase.
 //!
-//! **Cache-preserving compaction (m1f.15.4):** The recursive descent builds
+//! **Cache-key-preserving compaction (m1f.15.4):** The recursive descent builds
 //! intermediate nodes (27 per recursive level) that become cache keys but are
 //! NOT reachable from the step result. When compaction fires, cache keys are
-//! passed as extra roots to `compacted_with_remap_keeping`, keeping them alive
-//! through GC so cache entries survive.
+//! passed as extra roots to `compacted_with_remap_keeping`, keeping those
+//! lookup keys alive through GC. Cache entries still survive only when both
+//! key and value are reachable in the post-compaction remap; result-side
+//! eviction is deliberate so compaction does not retain unbounded cache-only
+//! result subgraphs.
 
-use super::world::World;
+use super::world::{HashlifeRuleMissDiag, MemoMissCauseStats, World};
 use crate::octree::node::octant_index;
 use crate::octree::{Cell, CellState, Node, NodeId};
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
 
 /// hash-thing-bjdl (vqke.2): process-wide gate for the memo-hit-rate
 /// diagnostic probes inside `step_node`. Lazily initialised from
@@ -162,6 +166,33 @@ const LEVEL3_CELL_COUNT: usize = LEVEL3_SIDE * LEVEL3_SIDE * LEVEL3_SIDE;
 const CENTER_LEVEL3_SIDE: usize = 4;
 const CENTER_LEVEL3_CELL_COUNT: usize =
     CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE * CENTER_LEVEL3_SIDE;
+const LEVEL4_SIDE: usize = 16;
+const LEVEL4_CELL_COUNT: usize = LEVEL4_SIDE * LEVEL4_SIDE * LEVEL4_SIDE;
+const CENTER_LEVEL4_SIDE: usize = 8;
+const CENTER_LEVEL4_CELL_COUNT: usize =
+    CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE;
+const BFS_FRONTIER_HARD_LIMIT: usize = 16_384;
+
+#[cfg(test)]
+thread_local! {
+    static BFS_FRONTIER_HARD_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn bfs_frontier_hard_limit() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(override_limit) = BFS_FRONTIER_HARD_LIMIT_OVERRIDE.with(|c| c.get()) {
+            return override_limit;
+        }
+    }
+    BFS_FRONTIER_HARD_LIMIT
+}
+
+#[cfg(test)]
+fn set_bfs_frontier_hard_limit_for_test(limit: Option<usize>) {
+    BFS_FRONTIER_HARD_LIMIT_OVERRIDE.with(|c| c.set(limit));
+}
 
 /// hash-thing-ecmn (vqke.4.1): one node-step entry in the BFS frontier.
 /// `node` is the input at level n; `result` is filled at level-(n-1)
@@ -188,6 +219,79 @@ enum BfsChildSlot {
 }
 
 impl World {
+    pub fn memo_miss_diag_enabled(&self) -> bool {
+        memo_diag_enabled()
+    }
+
+    fn stat_store_children(&mut self, node: NodeId) -> [NodeId; 8] {
+        let start = Instant::now();
+        let children = self.store.children(node);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        children
+    }
+
+    fn stat_store_interior(&mut self, level: u32, children: [NodeId; 8]) -> NodeId {
+        let start = Instant::now();
+        let node = self.store.interior(level, children);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        node
+    }
+
+    fn stat_store_child(&mut self, node: NodeId, octant: usize) -> NodeId {
+        let start = Instant::now();
+        let child = self.store.child(node, octant);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        child
+    }
+
+    fn stat_store_from_flat(&mut self, grid: &[CellState], side: usize) -> NodeId {
+        let start = Instant::now();
+        let node = self.store.from_flat(grid, side);
+        self.hashlife_stats.p3_store_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_store_calls += 1;
+        node
+    }
+
+    fn stat_cache_get(&mut self, key: (NodeId, u64)) -> Option<NodeId> {
+        let start = Instant::now();
+        let value = self.hashlife_cache.get(&key).copied();
+        self.hashlife_stats.p3_cache_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
+        value
+    }
+
+    fn stat_cache_insert(&mut self, key: (NodeId, u64), value: NodeId) {
+        let start = Instant::now();
+        self.hashlife_cache.insert(key, value);
+        self.hashlife_stats.p3_cache_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
+    }
+
+    fn record_p3_reindex(
+        &mut self,
+        start: Instant,
+        store_start_ns: u64,
+        cache_start_ns: u64,
+        slow_start_ns: u64,
+    ) {
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let nested_ns = self
+            .hashlife_stats
+            .p3_store_ns
+            .saturating_sub(store_start_ns)
+            .saturating_add(
+                self.hashlife_stats
+                    .p3_cache_ns
+                    .saturating_sub(cache_start_ns),
+            )
+            .saturating_add(self.hashlife_stats.p3_slow_ns.saturating_sub(slow_start_ns));
+        self.hashlife_stats.p3_reindex_ns += elapsed_ns.saturating_sub(nested_ns);
+        self.hashlife_stats.p3_reindex_calls += 1;
+    }
+
     /// Step the world forward one generation using the recursive Hashlife path.
     pub fn step_recursive(&mut self) {
         assert!(
@@ -311,12 +415,11 @@ impl World {
         let phase = self.generation % period;
         let t_step = std::time::Instant::now();
         let result = self.step_root_dispatch(padded_root, padded_level, phase, period);
-        let step_node_us = t_step.elapsed().as_micros() as u64;
+        let step_node_elapsed = t_step.elapsed();
+        let step_node_us = step_node_elapsed.as_micros() as u64;
+        self.hashlife_stats.step_node_wall_ns = step_node_elapsed.as_nanos() as u64;
         self.root = result;
-        let step_stats = self.hashlife_stats;
-        self.hashlife_stats_total.accumulate(&step_stats);
-        self.memo_window
-            .push(step_stats.cache_hits, step_stats.cache_misses);
+        let step_stats_pre_compact = self.hashlife_stats;
 
         // qy4g.2 option G: gap-fill post-pass deleted from production. StepProfile
         // fields preserved as zeros for back-compat with bench_hashlife consumers.
@@ -326,7 +429,16 @@ impl World {
 
         let t_compact = std::time::Instant::now();
         self.maybe_compact();
-        let compact_us = t_compact.elapsed().as_micros() as u64;
+        let compact_elapsed = t_compact.elapsed();
+        let compact_us = compact_elapsed.as_micros() as u64;
+        self.hashlife_stats.compact_ns = compact_elapsed.as_nanos() as u64;
+
+        let step_stats = self.hashlife_stats;
+        self.hashlife_stats_total.accumulate(&step_stats);
+        self.memo_window.push(
+            step_stats_pre_compact.cache_hits,
+            step_stats_pre_compact.cache_misses,
+        );
 
         StepProfile {
             total_us: t0.elapsed().as_micros() as u64,
@@ -381,13 +493,14 @@ impl World {
     }
 
     /// Compact the store when it has grown past 2× its post-compaction size,
-    /// keeping cache-referenced intermediate nodes alive (m1f.15.4).
+    /// keeping cache-key intermediate nodes alive (m1f.15.4).
     ///
     /// Deferred compaction lets intermediate nodes from recursive descent
     /// survive across frames, enabling cache hits. When compaction fires,
-    /// cache keys are passed as extra roots so they survive GC — without
-    /// this, every compaction destroys the cache and forces full
-    /// recomputation.
+    /// cache keys are passed as extra roots so they survive GC — without this,
+    /// every compaction destroys the lookup side of the cache and forces full
+    /// recomputation. Values that are no longer live are allowed to drop so GC
+    /// can still reclaim stale result subgraphs.
     fn maybe_compact(&mut self) {
         let current_size = self.store.stats();
         if self.store_size_at_last_compact == 0 {
@@ -401,11 +514,11 @@ impl World {
     }
 
     /// Unconditional compaction, preserving the world root, hashlife
-    /// cache-referenced nodes, and any caller-provided `extra_roots`.
+    /// cache key nodes, and any caller-provided `extra_roots`.
     ///
     /// Used by:
     /// - [`Self::maybe_compact`] when the 2× growth threshold is met
-    ///   (no extra roots beyond cache references).
+    ///   (no extra roots beyond cache keys).
     /// - The cswp.8.3 chunk-LOD path (hash-thing-e4ep) to shed ghost
     ///   interior chains accumulated by repeated `lod_collapse_chunk`
     ///   calls without losing the live `view_root`. Within the lib,
@@ -426,11 +539,12 @@ impl World {
     pub fn compact_keeping(&mut self, extra_roots: &[NodeId]) {
         let mut roots = self.cache_referenced_nodes();
         roots.extend_from_slice(extra_roots);
+        let old_cache_key_levels = memo_diag_enabled().then(|| self.cache_key_level_indices());
         let (new_store, new_root, remap) =
             self.store.compacted_with_remap_keeping(self.root, &roots);
         self.store = new_store;
         self.root = new_root;
-        self.remap_caches(&remap);
+        self.remap_caches(&remap, old_cache_key_levels.as_ref());
         self.last_compaction_remap = Some(match self.last_compaction_remap.take() {
             Some(existing) => super::world::compose_remap(existing, &remap),
             None => remap,
@@ -438,10 +552,12 @@ impl World {
         self.store_size_at_last_compact = self.store.stats();
     }
 
-    /// Collect cache key NodeIds that must survive compaction.
-    /// Cache keys are intermediate nodes not reachable from the world root;
-    /// cache values are step results that ARE reachable from root, so only
-    /// keys need to be kept alive as extra roots.
+    /// Collect cache key NodeIds that should survive compaction.
+    /// Cache keys are intermediate nodes often not reachable from the world
+    /// root. Cache values are not preserved as extra roots: if a result is no
+    /// longer reachable from the compacted root or another live root, the
+    /// cache entry drops. That keeps compaction from retaining unbounded
+    /// cache-only result subgraphs.
     fn cache_referenced_nodes(&self) -> Vec<NodeId> {
         let mut nodes =
             Vec::with_capacity(self.hashlife_cache.len() + self.hashlife_macro_cache.len());
@@ -452,6 +568,21 @@ impl World {
             nodes.push(node);
         }
         nodes
+    }
+
+    fn cache_key_level_indices(&self) -> FxHashMap<NodeId, usize> {
+        let mut levels = FxHashMap::default();
+        for &(node, _) in self.hashlife_cache.keys() {
+            levels.entry(node).or_insert_with(|| {
+                self.store
+                    .get(node)
+                    .level()
+                    .checked_sub(3)
+                    .map(|idx| idx as usize)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        levels
     }
 
     fn has_block_rule_cells(&mut self) -> bool {
@@ -571,8 +702,15 @@ impl World {
     }
 
     /// Remap hashlife cache keys and values through a compaction remap table.
-    /// Entries referencing unreachable nodes (not in remap) are dropped.
-    fn remap_caches(&mut self, remap: &FxHashMap<NodeId, NodeId>) {
+    /// Entries referencing unreachable keys or result values are dropped. Under
+    /// `compact_keeping`, key-side drops should be rare because cache keys are
+    /// extra roots; value-side drops are expected when the cached result is no
+    /// longer live after GC.
+    fn remap_caches(
+        &mut self,
+        remap: &FxHashMap<NodeId, NodeId>,
+        old_cache_key_levels: Option<&FxHashMap<NodeId, usize>>,
+    ) {
         // Remap hashlife_cache: (NodeId, schedule_phase) → NodeId
         let old_cache = std::mem::take(&mut self.hashlife_cache);
         let before = old_cache.len() as u64;
@@ -583,14 +721,50 @@ impl World {
         // change in this loop. Dropped is `before - kept` — exact.
         // Per Codex plan-review §3.
         let mut kept: u64 = 0;
+        let collect_miss_cause = memo_diag_enabled();
+        let mut cause_by_level = [MemoMissCauseStats::default(); 32];
         for ((node, phase), result) in old_cache {
-            if let (Some(&new_node), Some(&new_result)) = (remap.get(&node), remap.get(&result)) {
+            let new_node = remap.get(&node).copied();
+            let idx = collect_miss_cause
+                .then(|| {
+                    old_cache_key_levels
+                        .and_then(|levels| levels.get(&node).copied())
+                        .or_else(|| {
+                            new_node.and_then(|new_node| {
+                                self.store
+                                    .get(new_node)
+                                    .level()
+                                    .checked_sub(3)
+                                    .map(|idx| idx as usize)
+                            })
+                        })
+                        .filter(|&idx| idx < cause_by_level.len())
+                })
+                .flatten();
+            if let (Some(new_node), Some(&new_result)) = (new_node, remap.get(&result)) {
                 self.hashlife_cache.insert((new_node, phase), new_result);
                 kept += 1;
+                if let Some(idx) = idx {
+                    cause_by_level[idx].compact_entries_kept += 1;
+                }
+            } else if let Some(idx) = idx {
+                cause_by_level[idx].compact_entries_dropped += 1;
             }
         }
         self.hashlife_stats.compact_entries_kept += kept;
         self.hashlife_stats.compact_entries_dropped += before - kept;
+        self.memo_diag_seen_keys.clear();
+        self.memo_diag_seen_nodes.clear();
+        if collect_miss_cause {
+            for (dst, src) in self
+                .hashlife_stats
+                .miss_cause_by_level
+                .iter_mut()
+                .zip(cause_by_level.iter())
+            {
+                dst.accumulate(src);
+            }
+        }
 
         // Remap hashlife_macro_cache: (NodeId, generation) → NodeId
         let old_macro = std::mem::take(&mut self.hashlife_macro_cache);
@@ -717,13 +891,9 @@ impl World {
         // content. A fast subtree's descendants are by induction
         // also fast, so every recursive call inside the fast branch
         // sees the same predicate value and the same fold.
-        let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
-            schedule_phase % 2
-        } else {
-            schedule_phase
-        };
+        let effective_phase = self.effective_phase_for(node, schedule_phase, memo_period);
         let key = (node, effective_phase);
-        if let Some(&cached) = self.hashlife_cache.get(&key) {
+        if let Some(cached) = self.stat_cache_get(key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
         }
@@ -749,26 +919,99 @@ impl World {
         // higher alias rate, but post-fold is the relevant signal
         // for whether further key-shape changes (vqke.2.2) would
         // recoup more.
-        if memo_diag_enabled() && memo_period > 1 {
-            for p in 0..memo_period {
-                if p == effective_phase {
-                    continue;
-                }
-                if self.hashlife_cache.contains_key(&(node, p)) {
-                    self.hashlife_stats.cache_misses_phase_aliased += 1;
-                    break;
-                }
-            }
-        }
+        self.record_memo_miss_cause(node, level, effective_phase, memo_period);
 
-        let result = if level == 3 {
+        let result = if self.requires_wide_block_base_case() && level == 4 {
+            self.step_wide_block_base_case(node, effective_phase)
+        } else if level == 3 {
             self.step_base_case(node, effective_phase)
         } else {
             self.step_recursive_case(node, level, effective_phase, memo_period)
         };
 
-        self.hashlife_cache.insert(key, result);
+        self.stat_cache_insert(key, result);
         result
+    }
+
+    fn requires_wide_block_base_case(&self) -> bool {
+        self.materials
+            .block_rule_tick_divisors()
+            .iter()
+            .any(|&divisor| divisor > 1)
+    }
+
+    fn record_memo_miss_cause(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        effective_phase: u64,
+        memo_period: u64,
+    ) {
+        if !memo_diag_enabled() {
+            return;
+        }
+        let Some(idx) = level
+            .checked_sub(3)
+            .map(|idx| idx as usize)
+            .filter(|&idx| idx < self.hashlife_stats.miss_cause_by_level.len())
+        else {
+            return;
+        };
+
+        let key = (node, effective_phase);
+        let seen_key = self.memo_diag_seen_keys.contains(&key);
+        let seen_node = self.memo_diag_seen_nodes.contains(&node);
+
+        if memo_period <= 1 {
+            self.record_first_seen_or_no_surviving_miss(idx, seen_key, seen_node);
+            self.memo_diag_seen_keys.insert(key);
+            self.memo_diag_seen_nodes.insert(node);
+            return;
+        }
+
+        let mut saw_same_parity_alias = false;
+        let mut saw_other_parity_alias = false;
+        for p in 0..memo_period {
+            if p == effective_phase {
+                continue;
+            }
+            if self.hashlife_cache.contains_key(&(node, p)) {
+                if p % 2 == effective_phase % 2 {
+                    saw_same_parity_alias = true;
+                } else {
+                    saw_other_parity_alias = true;
+                }
+            }
+        }
+
+        if saw_same_parity_alias {
+            self.hashlife_stats.miss_cause_by_level[idx].slow_divisor_phase_aliased += 1;
+            self.hashlife_stats.cache_misses_phase_aliased += 1;
+        } else if saw_other_parity_alias {
+            self.hashlife_stats.miss_cause_by_level[idx].parity_aliased += 1;
+            self.hashlife_stats.cache_misses_phase_aliased += 1;
+        } else {
+            self.record_first_seen_or_no_surviving_miss(idx, seen_key, seen_node);
+        }
+        self.memo_diag_seen_keys.insert(key);
+        self.memo_diag_seen_nodes.insert(node);
+    }
+
+    fn record_first_seen_or_no_surviving_miss(
+        &mut self,
+        idx: usize,
+        seen_key: bool,
+        seen_node: bool,
+    ) {
+        let cause = &mut self.hashlife_stats.miss_cause_by_level[idx];
+        cause.first_seen_or_no_surviving_key += 1;
+        if seen_key {
+            cause.seen_key_missing_entry += 1;
+        } else if seen_node {
+            cause.seen_node_new_phase += 1;
+        } else {
+            cause.first_seen_key += 1;
+        }
     }
 
     /// Base case: level-3 node (8×8×8). Flatten, run CaRule on interior 6³,
@@ -782,10 +1025,32 @@ impl World {
         // Stack-allocated grid avoids heap allocation per base case (~16K calls).
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let (next, p1_ns, p2_ns) = self.step_grid_once(&grid, self.generation);
+        let (next, p1_ns, p2_ns, diag) = self.step_grid_once(&grid, self.generation);
         self.hashlife_stats.phase1_ns += p1_ns;
         self.hashlife_stats.phase2_ns += p2_ns;
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag);
         self.center_level3_grid_to_node(&next)
+    }
+
+    /// Base case for slowed block-rule worlds: level-4 node (16x16x16), one
+    /// generation, center 8x8x8 output.
+    ///
+    /// With mixed block-rule divisors, one generation may run both Margolus
+    /// offsets sequentially. A center cell can then depend on a pass-0 cell
+    /// two positions away before pass 1 runs. The legacy 8x8x8 -> 4x4x4
+    /// base case only has a two-cell halo, but its pass-0 boundary cells
+    /// themselves need a CA neighbor halo. A level-4 leaf gives the output
+    /// center a four-cell halo and keeps the recursive result bit-exact with
+    /// the full-grid brute step.
+    fn step_wide_block_base_case(&mut self, node: NodeId, _schedule_phase: u64) -> NodeId {
+        let mut grid = vec![0 as CellState; LEVEL4_CELL_COUNT];
+        self.store.flatten_buf(node, &mut grid, LEVEL4_SIDE);
+        let (next, p1_ns, p2_ns, diag) =
+            step_grid_once_vec(&grid, LEVEL4_SIDE, self.generation, &self.materials);
+        self.hashlife_stats.phase1_ns += p1_ns;
+        self.hashlife_stats.phase2_ns += p2_ns;
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag);
+        self.center_level4_grid_to_node(&next)
     }
 
     fn step_node_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
@@ -814,7 +1079,11 @@ impl World {
         }
 
         let key = (node, generation);
-        if let Some(&cached) = self.hashlife_macro_cache.get(&key) {
+        let cache_start = Instant::now();
+        let cached = self.hashlife_macro_cache.get(&key).copied();
+        self.hashlife_stats.p3_cache_ns += cache_start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
+        if let Some(cached) = cached {
             self.hashlife_stats.cache_hits += 1;
             return cached;
         }
@@ -829,17 +1098,22 @@ impl World {
             self.step_recursive_case_macro(node, level, generation)
         };
 
+        let cache_start = Instant::now();
         self.hashlife_macro_cache.insert(key, result);
+        self.hashlife_stats.p3_cache_ns += cache_start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_cache_calls += 1;
         result
     }
 
     fn step_base_case_macro(&mut self, node: NodeId, generation: u64) -> NodeId {
         let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
         self.store.flatten_buf(node, &mut grid, LEVEL3_SIDE);
-        let (next, p1_ns_a, p2_ns_a) = self.step_grid_once(&grid, generation);
-        let (next, p1_ns_b, p2_ns_b) = self.step_grid_once(&next, generation + 1);
+        let (next, p1_ns_a, p2_ns_a, diag_a) = self.step_grid_once(&grid, generation);
+        let (next, p1_ns_b, p2_ns_b, diag_b) = self.step_grid_once(&next, generation + 1);
         self.hashlife_stats.phase1_ns += p1_ns_a + p1_ns_b;
         self.hashlife_stats.phase2_ns += p2_ns_a + p2_ns_b;
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag_a);
+        self.hashlife_stats.rule_miss_diag.accumulate(&diag_b);
         self.center_level3_grid_to_node(&next)
     }
 
@@ -847,7 +1121,12 @@ impl World {
         &self,
         grid: &[CellState],
         generation: u64,
-    ) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
+    ) -> (
+        [CellState; LEVEL3_CELL_COUNT],
+        u64,
+        u64,
+        HashlifeRuleMissDiag,
+    ) {
         step_grid_once_pure(grid, generation, &self.materials)
     }
 
@@ -863,7 +1142,22 @@ impl World {
                 }
             }
         }
-        self.store.from_flat(&center_grid, CENTER_LEVEL3_SIDE)
+        self.stat_store_from_flat(&center_grid, CENTER_LEVEL3_SIDE)
+    }
+
+    fn center_level4_grid_to_node(&mut self, grid: &[CellState]) -> NodeId {
+        let mut center_grid = vec![0 as CellState; CENTER_LEVEL4_CELL_COUNT];
+        for cz in 0..CENTER_LEVEL4_SIDE {
+            for cy in 0..CENTER_LEVEL4_SIDE {
+                for cx in 0..CENTER_LEVEL4_SIDE {
+                    center_grid[cx
+                        + cy * CENTER_LEVEL4_SIDE
+                        + cz * CENTER_LEVEL4_SIDE * CENTER_LEVEL4_SIDE] = grid
+                        [(cx + 4) + (cy + 4) * LEVEL4_SIDE + (cz + 4) * LEVEL4_SIDE * LEVEL4_SIDE];
+                }
+            }
+        }
+        self.stat_store_from_flat(&center_grid, CENTER_LEVEL4_SIDE)
     }
 
     /// Recursive case: level ≥ 3.
@@ -874,8 +1168,12 @@ impl World {
         schedule_phase: u64,
         memo_period: u64,
     ) -> NodeId {
-        let children = self.store.children(node);
-        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+        let reindex_start = Instant::now();
+        let reindex_store_start = self.hashlife_stats.p3_store_ns;
+        let reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+        let reindex_slow_start = self.hashlife_stats.p3_slow_ns;
+        let children = self.stat_store_children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.stat_store_children(children[i]));
 
         // Build 3×3×3 = 27 intermediate nodes at level (n-1).
         let mut inter = [NodeId::EMPTY; 27];
@@ -898,7 +1196,7 @@ impl World {
                             }
                         }
                     }
-                    inter[px + py * 3 + pz * 9] = self.store.interior(level - 1, octants);
+                    inter[px + py * 3 + pz * 9] = self.stat_store_interior(level - 1, octants);
                 }
             }
         }
@@ -910,9 +1208,9 @@ impl World {
         }
 
         // Group into 8 overlapping sub-cubes (level n-1) and assemble their
-        // sub_roots up-front. The 8 step_node calls follow — at level==4
-        // (i.e. each sub-cube is a level-3 base case) the calls may be
-        // batched through rayon if `base_case_strategy == RayonPerFanout`.
+        // sub_roots up-front. The 8 step_node calls follow. When this fanout
+        // points directly at the active leaf level, the calls may be batched
+        // through rayon if `base_case_strategy == RayonPerFanout`.
         let mut sub_roots = [NodeId::EMPTY; 8];
         for oz in 0..2usize {
             for oy in 0..2usize {
@@ -927,27 +1225,37 @@ impl World {
                         }
                     }
                     sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.store.interior(level - 1, sub_cube);
+                        self.stat_store_interior(level - 1, sub_cube);
                 }
             }
         }
+        self.record_p3_reindex(
+            reindex_start,
+            reindex_store_start,
+            reindex_cache_start,
+            reindex_slow_start,
+        );
 
         let mut result_children = [NodeId::EMPTY; 8];
-        if level == 4
+        let leaf_level = if self.requires_wide_block_base_case() {
+            4
+        } else {
+            3
+        };
+        if level == leaf_level + 1
             && matches!(
                 self.base_case_strategy,
                 super::world::BaseCaseStrategy::RayonPerFanout
             )
         {
-            // hash-thing-ftuu (vqke.4): batch the 8 level-3 base cases through
-            // rayon. Replicates the prelude of `step_node` (empty / inert /
-            // cache lookup) inline so the parallel work is restricted to the
-            // pure `step_grid_once_pure` calls — the only non-trivial
-            // computation that can run without `&mut self`.
-            self.step_level4_fanout_rayon(
+            // hash-thing-ftuu (vqke.4): batch the 8 leaf base cases through
+            // rayon. Replicates the prelude of `step_node` inline so the
+            // parallel work is restricted to pure grid stepping.
+            self.step_leaf_fanout_rayon(
                 &sub_roots,
                 schedule_phase,
                 memo_period,
+                leaf_level,
                 &mut result_children,
             );
         } else {
@@ -957,12 +1265,14 @@ impl World {
             }
         }
 
-        self.store.interior(level - 1, result_children)
+        self.stat_store_interior(level - 1, result_children)
     }
 
-    /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 level-3
-    /// base cases under a level-4 fanout. Replaces the serial loop over
-    /// `step_node(sub_root, 3, ...)` calls when
+    /// hash-thing-ftuu (vqke.4): rayon-parallel evaluation of the 8 active
+    /// leaf base cases under the parent fanout. Normal worlds use level-3
+    /// leaves; slowed block-rule worlds use level-4 leaves for a wider halo.
+    /// Replaces the serial loop over `step_node(sub_root, leaf_level, ...)`
+    /// calls when
     /// `base_case_strategy == RayonPerFanout`.
     ///
     /// Phase A (sequential, mutates stats + reads store/cache): mirrors the
@@ -970,17 +1280,17 @@ impl World {
     /// fast-subtree phase fold, cache lookup. Sub-cubes that short-circuit
     /// or hit the cache are recorded directly into `result_children`.
     /// Sub-cubes that miss are recorded into a queue alongside their
-    /// flattened 8³ grid (read-only on store).
+    /// flattened leaf grid (read-only on store).
     ///
     /// Phase B (parallel, no `&self`): rayon `par_iter` over the queued
-    /// flat grids invokes `step_grid_once_pure` to compute each output
+    /// flat grids invokes the pure grid stepper to compute each output
     /// grid. The threshold below `4` falls back to serial `iter` because
     /// rayon's per-task overhead exceeds the win at very small batch sizes
     /// (a level-4 fanout caps at 8 base cases, and most steady-state
     /// fanouts have fewer than 8 misses).
     ///
     /// Phase C (sequential, mutates store + cache + stats): commits each
-    /// output grid via `from_flat` + `center_level3_grid_to_node`, inserts
+    /// output grid via the leaf center extractor, inserts
     /// the result into `hashlife_cache` under the same `(sub_root,
     /// effective_phase)` key the next `step_node` lookup would use, and
     /// folds `phase1_ns` / `phase2_ns` into stats so observability stays
@@ -988,14 +1298,25 @@ impl World {
     ///
     /// Bit-exact with the serial path — verified by
     /// `tests/base_case_rayon_parity.rs`.
-    fn step_level4_fanout_rayon(
+    fn step_leaf_fanout_rayon(
         &mut self,
         sub_roots: &[NodeId; 8],
         schedule_phase: u64,
         memo_period: u64,
+        leaf_level: u32,
         result_children: &mut [NodeId; 8],
     ) {
         use rayon::prelude::*;
+        debug_assert!(
+            leaf_level == 3 || leaf_level == 4,
+            "unsupported leaf level {leaf_level}"
+        );
+        let leaf_side = if leaf_level == 4 {
+            LEVEL4_SIDE
+        } else {
+            LEVEL3_SIDE
+        };
+        let leaf_cell_count = leaf_side * leaf_side * leaf_side;
 
         // Per-sub_root classification: either resolved (short-circuit or
         // cache hit) or pending (miss, needs base-case compute).
@@ -1010,7 +1331,7 @@ impl World {
         // (1 miss + N-1 hits) exactly.
         let mut resolved: [Option<NodeId>; 8] = [None; 8];
         let mut pending: Vec<(usize, u64)> = Vec::with_capacity(8); // (sub_root_index, effective_phase) for unique misses
-        let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> = Vec::with_capacity(8);
+        let mut pending_grids: Vec<Vec<CellState>> = Vec::with_capacity(8);
         let mut deferred_dupes: Vec<(usize, usize)> = Vec::new(); // (sub_root_index, pending_index) for duplicate misses
 
         for i in 0..8 {
@@ -1020,29 +1341,25 @@ impl World {
             // all-inert short-circuits.
             if self.store.population(nid) == 0 {
                 self.hashlife_stats.empty_skips += 1;
-                resolved[i] = Some(self.store.empty(2));
+                resolved[i] = Some(self.store.empty(leaf_level - 1));
                 continue;
             }
             if let Some(state) = self.inert_uniform_state(nid) {
                 self.hashlife_stats.fixed_point_skips += 1;
-                resolved[i] = Some(self.store.uniform(2, state));
+                resolved[i] = Some(self.store.uniform(leaf_level - 1, state));
                 continue;
             }
             if self.is_all_inert(nid) {
                 self.hashlife_stats.fixed_point_skips += 1;
-                resolved[i] = Some(self.center_node(nid, 3));
+                resolved[i] = Some(self.center_node(nid, leaf_level));
                 continue;
             }
 
             // Mirrors `step_node` lines 694-703: fast-subtree phase fold +
             // cache lookup.
-            let effective_phase = if memo_period > 2 && !self.subtree_has_slow_divisor(nid) {
-                schedule_phase % 2
-            } else {
-                schedule_phase
-            };
+            let effective_phase = self.effective_phase_for(nid, schedule_phase, memo_period);
             let key = (nid, effective_phase);
-            if let Some(&cached) = self.hashlife_cache.get(&key) {
+            if let Some(cached) = self.stat_cache_get(key) {
                 self.hashlife_stats.cache_hits += 1;
                 resolved[i] = Some(cached);
                 continue;
@@ -1064,23 +1381,12 @@ impl World {
             // Unique miss — record cache_misses now (matches `step_node`
             // line 704 which counts the miss before evaluation).
             self.hashlife_stats.cache_misses += 1;
-            self.hashlife_stats.misses_by_level[0] += 1; // level 3 = misses_by_level[0]
+            self.hashlife_stats.misses_by_level[(leaf_level - 3) as usize] += 1;
 
-            // hash-thing-bjdl phase-aliasing diag probe (env-gated).
-            if memo_diag_enabled() && memo_period > 1 {
-                for p in 0..memo_period {
-                    if p == effective_phase {
-                        continue;
-                    }
-                    if self.hashlife_cache.contains_key(&(nid, p)) {
-                        self.hashlife_stats.cache_misses_phase_aliased += 1;
-                        break;
-                    }
-                }
-            }
+            self.record_memo_miss_cause(nid, leaf_level, effective_phase, memo_period);
 
-            let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
-            self.store.flatten_buf(nid, &mut grid, LEVEL3_SIDE);
+            let mut grid = vec![0 as CellState; leaf_cell_count];
+            self.store.flatten_buf(nid, &mut grid, leaf_side);
             pending.push((i, effective_phase));
             pending_grids.push(grid);
         }
@@ -1092,28 +1398,33 @@ impl World {
         const RAYON_BATCH_THRESHOLD: usize = 4;
         let generation = self.generation;
         let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
-        let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> = if pending_grids.is_empty() {
-            Vec::new()
-        } else if pending_grids.len() < RAYON_BATCH_THRESHOLD {
-            pending_grids
-                .iter()
-                .map(|grid| step_grid_once_pure(grid, generation, materials))
-                .collect()
-        } else {
-            pending_grids
-                .par_iter()
-                .map(|grid| step_grid_once_pure(grid, generation, materials))
-                .collect()
-        };
+        let outputs: Vec<(Vec<CellState>, u64, u64, HashlifeRuleMissDiag)> =
+            if pending_grids.is_empty() {
+                Vec::new()
+            } else if pending_grids.len() < RAYON_BATCH_THRESHOLD {
+                pending_grids
+                    .iter()
+                    .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
+                    .collect()
+            } else {
+                pending_grids
+                    .par_iter()
+                    .map(|grid| step_grid_once_vec(grid, leaf_side, generation, materials))
+                    .collect()
+            };
 
         // Phase C: commit outputs into store + cache + stats.
         for (out_idx, &(sub_idx, effective_phase)) in pending.iter().enumerate() {
-            let (output_grid, p1ns, p2ns) = &outputs[out_idx];
+            let (output_grid, p1ns, p2ns, diag) = &outputs[out_idx];
             self.hashlife_stats.phase1_ns += p1ns;
             self.hashlife_stats.phase2_ns += p2ns;
-            let centered = self.center_level3_grid_to_node(output_grid);
-            self.hashlife_cache
-                .insert((sub_roots[sub_idx], effective_phase), centered);
+            self.hashlife_stats.rule_miss_diag.accumulate(diag);
+            let centered = if leaf_level == 4 {
+                self.center_level4_grid_to_node(output_grid)
+            } else {
+                self.center_level3_grid_to_node(output_grid)
+            };
+            self.stat_cache_insert((sub_roots[sub_idx], effective_phase), centered);
             resolved[sub_idx] = Some(centered);
         }
 
@@ -1128,7 +1439,7 @@ impl World {
 
         for i in 0..8 {
             result_children[i] =
-                resolved[i].expect("step_level4_fanout_rayon: every sub_root must be resolved");
+                resolved[i].expect("step_leaf_fanout_rayon: every sub_root must be resolved");
         }
     }
 
@@ -1165,15 +1476,11 @@ impl World {
     /// proceed to cache lookup. `result_level` is the level the result
     /// will live at (= input level - 1 in step_node terms).
     ///
-    /// Extracted from step_node + step_level4_fanout_rayon so all three
+    /// Extracted from step_node + step_leaf_fanout_rayon so all three
     /// callers (step_node, the per-fanout rayon path, and step_root_bfs)
     /// share one implementation. Standard-Codex review specifically
     /// asked for this consolidation.
-    fn try_resolve_short_circuit(
-        &mut self,
-        node: NodeId,
-        result_level: u32,
-    ) -> Option<NodeId> {
+    fn try_resolve_short_circuit(&mut self, node: NodeId, result_level: u32) -> Option<NodeId> {
         if self.store.population(node) == 0 {
             self.hashlife_stats.empty_skips += 1;
             return Some(self.store.empty(result_level));
@@ -1194,35 +1501,29 @@ impl World {
     /// (memo_period > 2) but the subtree at `node` contains no
     /// slow-divisor cells, fold the schedule phase to `phase % 2` so
     /// fast subtrees alias across every-other-generation pairs.
-    fn effective_phase_for(
-        &mut self,
-        node: NodeId,
-        schedule_phase: u64,
-        memo_period: u64,
-    ) -> u64 {
-        if memo_period > 2 && !self.subtree_has_slow_divisor(node) {
-            schedule_phase % 2
-        } else {
+    fn effective_phase_for(&mut self, node: NodeId, schedule_phase: u64, memo_period: u64) -> u64 {
+        if memo_period <= 2 {
+            return schedule_phase;
+        }
+        let start = Instant::now();
+        let has_slow = self.subtree_has_slow_divisor(node);
+        self.hashlife_stats.p3_slow_ns += start.elapsed().as_nanos() as u64;
+        self.hashlife_stats.p3_slow_calls += 1;
+        if has_slow {
             schedule_phase
+        } else {
+            schedule_phase % 2
         }
     }
 
-    /// hash-thing-ecmn: the env-gated phase-aliasing diagnostic probe
-    /// (mirror of `step_node` lines 728-738). Always-on cost was
-    /// estimated at single-digit ms/step at observed miss volumes, so
-    /// the probe is gated behind `HASH_THING_MEMO_DIAG=1`.
-    fn memo_diag_probe_alias(&mut self, node: NodeId, effective_phase: u64, memo_period: u64) {
-        if memo_diag_enabled() && memo_period > 1 {
-            for p in 0..memo_period {
-                if p == effective_phase {
-                    continue;
-                }
-                if self.hashlife_cache.contains_key(&(node, p)) {
-                    self.hashlife_stats.cache_misses_phase_aliased += 1;
-                    break;
-                }
-            }
-        }
+    fn memo_diag_probe_alias(
+        &mut self,
+        node: NodeId,
+        level: u32,
+        effective_phase: u64,
+        memo_period: u64,
+    ) {
+        self.record_memo_miss_cause(node, level, effective_phase, memo_period);
     }
 
     /// hash-thing-ecmn: build the 27 intermediate nodes + 8 sub-cube
@@ -1232,8 +1533,12 @@ impl World {
     /// case (a future cleanup bead can refactor `step_recursive_case`
     /// to call this helper too).
     fn build_subroots(&mut self, node: NodeId, level: u32) -> [NodeId; 8] {
-        let children = self.store.children(node);
-        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+        let reindex_start = Instant::now();
+        let reindex_store_start = self.hashlife_stats.p3_store_ns;
+        let reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+        let reindex_slow_start = self.hashlife_stats.p3_slow_ns;
+        let children = self.stat_store_children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.stat_store_children(children[i]));
 
         let mut inter = [NodeId::EMPTY; 27];
         for pz in 0..3usize {
@@ -1255,7 +1560,7 @@ impl World {
                             }
                         }
                     }
-                    inter[px + py * 3 + pz * 9] = self.store.interior(level - 1, octants);
+                    inter[px + py * 3 + pz * 9] = self.stat_store_interior(level - 1, octants);
                 }
             }
         }
@@ -1279,10 +1584,16 @@ impl World {
                         }
                     }
                     sub_roots[octant_index(ox as u32, oy as u32, oz as u32)] =
-                        self.store.interior(level - 1, sub_cube);
+                        self.stat_store_interior(level - 1, sub_cube);
                 }
             }
         }
+        self.record_p3_reindex(
+            reindex_start,
+            reindex_store_start,
+            reindex_cache_start,
+            reindex_slow_start,
+        );
         sub_roots
     }
 
@@ -1319,7 +1630,7 @@ impl World {
     /// across `World` instances may differ due to intern allocation
     /// order; the parity test compares `flatten()`, not NodeIds.
     ///
-    /// `step_grid_once_pure` receives the raw `self.generation`, NOT
+    /// The pure grid stepper receives the raw `self.generation`, NOT
     /// `effective_phase` — the compute path is generation-based and
     /// only the cache key uses effective_phase. (Per Adversarial-Codex
     /// plan-review feedback.)
@@ -1339,6 +1650,7 @@ impl World {
         memo_period: u64,
     ) -> NodeId {
         debug_assert!(root_level >= 3, "step_root_bfs requires level >= 3");
+        let stats_before_bfs = self.hashlife_stats;
 
         // Root prelude — mirrors step_node lines 650-738.
         if let Some(short) = self.try_resolve_short_circuit(root, root_level - 1) {
@@ -1346,23 +1658,34 @@ impl World {
         }
         let root_eff = self.effective_phase_for(root, schedule_phase, memo_period);
         let root_key = (root, root_eff);
-        if let Some(&cached) = self.hashlife_cache.get(&root_key) {
+        if let Some(cached) = self.stat_cache_get(root_key) {
             self.hashlife_stats.cache_hits += 1;
             return cached;
         }
         self.hashlife_stats.cache_misses += 1;
         self.hashlife_stats.misses_by_level[(root_level - 3) as usize] += 1;
-        self.memo_diag_probe_alias(root, root_eff, memo_period);
+        self.memo_diag_probe_alias(root, root_level, root_eff, memo_period);
 
-        // Level-3 root: no BFS frontier needed — step the base case directly.
-        if root_level == 3 {
-            let result = self.step_base_case(root, root_eff);
-            self.hashlife_cache.insert(root_key, result);
+        let leaf_level = if self.requires_wide_block_base_case() {
+            4
+        } else {
+            3
+        };
+        let frontier_hard_limit = bfs_frontier_hard_limit();
+
+        // Leaf root: no BFS frontier needed — step the base case directly.
+        if root_level == leaf_level {
+            let result = if leaf_level == 4 {
+                self.step_wide_block_base_case(root, root_eff)
+            } else {
+                self.step_base_case(root, root_eff)
+            };
+            self.stat_cache_insert(root_key, result);
             return result;
         }
 
         // Per-level frontier. tasks[idx] holds the unique tasks at level
-        // `(idx + 3)`. seen[idx] is the dedupe map keyed by
+        // `(idx + leaf_level)`. seen[idx] is the dedupe map keyed by
         // (NodeId, effective_phase) -> task index in tasks[idx].
         //
         // Cross-level dedupe is unnecessary because `Node::Interior`
@@ -1370,7 +1693,7 @@ impl World {
         // different NodeIds. NodeId::EMPTY-style sentinels are handled
         // by the empty short-circuit BEFORE reaching the seen/resolved
         // path.
-        let max_level_idx = (root_level - 3) as usize;
+        let max_level_idx = (root_level - leaf_level) as usize;
         let mut tasks: Vec<Vec<BfsTask>> = (0..=max_level_idx).map(|_| Vec::new()).collect();
         let mut seen: Vec<FxHashMap<(NodeId, u64), usize>> =
             (0..=max_level_idx).map(|_| FxHashMap::default()).collect();
@@ -1384,10 +1707,10 @@ impl World {
         });
         seen[max_level_idx].insert(root_key, 0);
 
-        // Phase 1: descending pass. Walk levels root_level..=4 (level-3
-        // tasks are pure leaves; they don't need sub_roots built).
-        for n in (4..=root_level).rev() {
-            let level_idx = (n - 3) as usize;
+        // Phase 1: descending pass. Walk down to the leaf frontier; leaf
+        // tasks are pure leaves and don't need sub_roots built.
+        for n in ((leaf_level + 1)..=root_level).rev() {
+            let level_idx = (n - leaf_level) as usize;
             let lower_idx = level_idx - 1;
             // Snapshot the count: tasks[level_idx] doesn't grow during
             // this loop (we only append to tasks[lower_idx]), so an
@@ -1402,17 +1725,14 @@ impl World {
                     let sub_nid = sub_roots[i];
 
                     // Mirror step_node prelude order: short-circuit FIRST.
-                    if let Some(short) =
-                        self.try_resolve_short_circuit(sub_nid, lower_level - 1)
-                    {
+                    if let Some(short) = self.try_resolve_short_circuit(sub_nid, lower_level - 1) {
                         child_slots[i] = BfsChildSlot::Direct(short);
                         continue;
                     }
-                    let sub_eff =
-                        self.effective_phase_for(sub_nid, schedule_phase, memo_period);
+                    let sub_eff = self.effective_phase_for(sub_nid, schedule_phase, memo_period);
                     let sub_key = (sub_nid, sub_eff);
 
-                    if let Some(&cached) = self.hashlife_cache.get(&sub_key) {
+                    if let Some(cached) = self.stat_cache_get(sub_key) {
                         self.hashlife_stats.cache_hits += 1;
                         child_slots[i] = BfsChildSlot::Direct(cached);
                         continue;
@@ -1432,7 +1752,7 @@ impl World {
                     // Unique miss — count and queue.
                     self.hashlife_stats.cache_misses += 1;
                     self.hashlife_stats.misses_by_level[(lower_level - 3) as usize] += 1;
-                    self.memo_diag_probe_alias(sub_nid, sub_eff, memo_period);
+                    self.memo_diag_probe_alias(sub_nid, lower_level, sub_eff, memo_period);
 
                     let new_idx = tasks[lower_idx].len();
                     tasks[lower_idx].push(BfsTask {
@@ -1441,6 +1761,27 @@ impl World {
                         children: [BfsChildSlot::Direct(NodeId::EMPTY); 8],
                         result: None,
                     });
+                    if tasks[lower_idx].len() > frontier_hard_limit {
+                        let frontier_count = tasks[lower_idx].len();
+                        // Check immediately after push, so the observed peak is
+                        // bounded to limit + 1 and no larger frontier level or
+                        // leaf pending/output batch is allocated.
+                        self.log_bfs_frontier_fallback(
+                            frontier_count,
+                            frontier_hard_limit,
+                            lower_level,
+                            leaf_level,
+                        );
+                        self.hashlife_stats = stats_before_bfs;
+                        let result = self.step_node(root, root_level, schedule_phase, memo_period);
+                        self.hashlife_stats.bfs_tasks_by_level[lower_idx] = frontier_count as u64;
+                        if lower_idx == 0 {
+                            self.hashlife_stats.bfs_level3_unique_misses = frontier_count as u64;
+                        }
+                        self.hashlife_stats.bfs_max_batch_len = frontier_count as u64;
+                        self.hashlife_stats.bfs_batches_serial_fallback += 1;
+                        return result;
+                    }
                     seen[lower_idx].insert(sub_key, new_idx);
                     child_slots[i] = BfsChildSlot::Pending(new_idx);
                 }
@@ -1454,44 +1795,18 @@ impl World {
             self.hashlife_stats.bfs_tasks_by_level[idx] = level_tasks.len() as u64;
         }
 
-        // Phase 2: level-3 parallel batch.
-        let level3_count = tasks[0].len();
-        self.hashlife_stats.bfs_level3_unique_misses = level3_count as u64;
-        self.hashlife_stats.bfs_max_batch_len = level3_count as u64;
+        // Phase 2: leaf parallel batch. The legacy counter name is level-3,
+        // but slowed block-rule worlds use level-4 leaves for a wider halo.
+        let leaf_count = tasks[0].len();
+        self.hashlife_stats.bfs_level3_unique_misses = leaf_count as u64;
+        self.hashlife_stats.bfs_max_batch_len = leaf_count as u64;
 
-        // hash-thing-ecmn (review-pass): soft warning when the
-        // unbounded BFS frontier crosses a soft sanity threshold. Plan
-        // §11 documented "no cap, but soft warning if
-        // bfs_level3_unique_misses > 16384". At ~1 KiB grid + ~1 KiB
-        // output per task, 16384 tasks ≈ 32 MiB peak — still safe but
-        // the doubling beyond that gets dangerous fast (262K tasks ≈
-        // 520 MiB at 256³ worst case, multi-GiB at 1024³). When this
-        // warning fires, file a chunked-wavefront follow-up bead. The
-        // log only fires on the BFS path — Serial/RayonPerFanout never
-        // reach this path. (BFS is the default since ite4; operators
-        // who want to revert can set HASH_THING_BASE_CASE_STRATEGY=
-        // per-fanout or serial.)
-        const BFS_FRONTIER_SOFT_LIMIT: usize = 16_384;
-        if level3_count > BFS_FRONTIER_SOFT_LIMIT {
-            log::warn!(
-                target: "hash_thing::hashlife::bfs",
-                "BFS level-3 frontier exceeded soft limit: {level3_count} unique tasks \
-                 (limit {BFS_FRONTIER_SOFT_LIMIT}). Memory peak ~{} MiB pending+output. \
-                 Consider chunked wavefront follow-up.",
-                (level3_count * (LEVEL3_CELL_COUNT * std::mem::size_of::<CellState>() * 2))
-                    / (1024 * 1024),
-            );
-        }
+        debug_assert!(
+            leaf_count <= frontier_hard_limit,
+            "oversized BFS frontier should have fallen back during descent"
+        );
 
         if !tasks[0].is_empty() {
-            let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> =
-                Vec::with_capacity(level3_count);
-            for task in &tasks[0] {
-                let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
-                self.store.flatten_buf(task.node, &mut grid, LEVEL3_SIDE);
-                pending_grids.push(grid);
-            }
-
             const RAYON_BATCH_THRESHOLD: usize = 4;
             // step_grid_once_pure receives raw self.generation, NOT
             // effective_phase — the rule schedule (CaRule per-cell gates,
@@ -1501,8 +1816,57 @@ impl World {
             // readers.)
             let generation = self.generation;
             let materials: &crate::terrain::materials::MaterialRegistry = &self.materials;
-            let outputs: Vec<([CellState; LEVEL3_CELL_COUNT], u64, u64)> =
-                if level3_count < RAYON_BATCH_THRESHOLD {
+            if leaf_level == 4 {
+                let mut pending_grids: Vec<Vec<CellState>> = Vec::with_capacity(leaf_count);
+                for task in &tasks[0] {
+                    let mut grid = vec![0 as CellState; LEVEL4_CELL_COUNT];
+                    self.store.flatten_buf(task.node, &mut grid, LEVEL4_SIDE);
+                    pending_grids.push(grid);
+                }
+                let outputs: Vec<(Vec<CellState>, u64, u64, HashlifeRuleMissDiag)> = if leaf_count
+                    < RAYON_BATCH_THRESHOLD
+                {
+                    self.hashlife_stats.bfs_batches_serial_fallback += 1;
+                    pending_grids
+                        .iter()
+                        .map(|grid| step_grid_once_vec(grid, LEVEL4_SIDE, generation, materials))
+                        .collect()
+                } else {
+                    use rayon::prelude::*;
+                    self.hashlife_stats.bfs_batches_parallel += 1;
+                    pending_grids
+                        .par_iter()
+                        .map(|grid| step_grid_once_vec(grid, LEVEL4_SIDE, generation, materials))
+                        .collect()
+                };
+
+                for (out_idx, (output_grid, p1ns, p2ns, diag)) in outputs.into_iter().enumerate() {
+                    self.hashlife_stats.phase1_ns += p1ns;
+                    self.hashlife_stats.phase2_ns += p2ns;
+                    self.hashlife_stats.rule_miss_diag.accumulate(&diag);
+                    let centered = self.center_level4_grid_to_node(&output_grid);
+                    let key = {
+                        let task = &tasks[0][out_idx];
+                        (task.node, task.effective_phase)
+                    };
+                    self.stat_cache_insert(key, centered);
+                    let task = &mut tasks[0][out_idx];
+                    task.result = Some(centered);
+                }
+            } else {
+                let mut pending_grids: Vec<[CellState; LEVEL3_CELL_COUNT]> =
+                    Vec::with_capacity(leaf_count);
+                for task in &tasks[0] {
+                    let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+                    self.store.flatten_buf(task.node, &mut grid, LEVEL3_SIDE);
+                    pending_grids.push(grid);
+                }
+                let outputs: Vec<(
+                    [CellState; LEVEL3_CELL_COUNT],
+                    u64,
+                    u64,
+                    HashlifeRuleMissDiag,
+                )> = if leaf_count < RAYON_BATCH_THRESHOLD {
                     self.hashlife_stats.bfs_batches_serial_fallback += 1;
                     pending_grids
                         .iter()
@@ -1517,20 +1881,25 @@ impl World {
                         .collect()
                 };
 
-            for (out_idx, (output_grid, p1ns, p2ns)) in outputs.into_iter().enumerate() {
-                self.hashlife_stats.phase1_ns += p1ns;
-                self.hashlife_stats.phase2_ns += p2ns;
-                let centered = self.center_level3_grid_to_node(&output_grid);
-                let task = &mut tasks[0][out_idx];
-                self.hashlife_cache
-                    .insert((task.node, task.effective_phase), centered);
-                task.result = Some(centered);
+                for (out_idx, (output_grid, p1ns, p2ns, diag)) in outputs.into_iter().enumerate() {
+                    self.hashlife_stats.phase1_ns += p1ns;
+                    self.hashlife_stats.phase2_ns += p2ns;
+                    self.hashlife_stats.rule_miss_diag.accumulate(&diag);
+                    let centered = self.center_level3_grid_to_node(&output_grid);
+                    let key = {
+                        let task = &tasks[0][out_idx];
+                        (task.node, task.effective_phase)
+                    };
+                    self.stat_cache_insert(key, centered);
+                    let task = &mut tasks[0][out_idx];
+                    task.result = Some(centered);
+                }
             }
         }
 
-        // Phase 3: ascend levels 4..=root_level.
-        for n in 4..=root_level {
-            let level_idx = (n - 3) as usize;
+        // Phase 3: ascend from one level above the leaf frontier to root.
+        for n in (leaf_level + 1)..=root_level {
+            let level_idx = (n - leaf_level) as usize;
             let lower_idx = level_idx - 1;
             let n_tasks_count = tasks[level_idx].len();
             for task_idx in 0..n_tasks_count {
@@ -1541,10 +1910,13 @@ impl World {
                             .result
                             .expect("BFS ascend: lower-level task must be resolved"),
                     });
-                let composed = self.store.interior(n - 1, result_children);
+                let composed = self.stat_store_interior(n - 1, result_children);
+                let key = {
+                    let task = &tasks[level_idx][task_idx];
+                    (task.node, task.effective_phase)
+                };
+                self.stat_cache_insert(key, composed);
                 let task = &mut tasks[level_idx][task_idx];
-                self.hashlife_cache
-                    .insert((task.node, task.effective_phase), composed);
                 task.result = Some(composed);
             }
         }
@@ -1554,10 +1926,37 @@ impl World {
             .expect("BFS root must be resolved after ascend")
     }
 
+    fn log_bfs_frontier_fallback(
+        &self,
+        frontier_count: usize,
+        limit: usize,
+        frontier_level: u32,
+        leaf_level: u32,
+    ) {
+        let leaf_cell_count = if leaf_level == 4 {
+            LEVEL4_CELL_COUNT
+        } else {
+            LEVEL3_CELL_COUNT
+        };
+        log::warn!(
+            target: "hash_thing::hashlife::bfs",
+            "BFS frontier level {frontier_level} exceeded hard limit: {frontier_count} unique \
+             tasks (limit {limit}). Falling back to serial recursive step before allocating \
+             a larger BFS frontier or the leaf pending+output batch. Leaf batch avoided at \
+             this frontier size would be ~{} MiB pending+output.",
+            (frontier_count * (leaf_cell_count * std::mem::size_of::<CellState>() * 2))
+                / (1024 * 1024),
+        );
+    }
+
     fn step_recursive_case_macro(&mut self, node: NodeId, level: u32, generation: u64) -> NodeId {
         debug_assert!(level > 3, "macro recursive case requires level > 3");
-        let children = self.store.children(node);
-        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.store.children(children[i]));
+        let mut reindex_start = Instant::now();
+        let mut reindex_store_start = self.hashlife_stats.p3_store_ns;
+        let mut reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+        let mut reindex_slow_start = self.hashlife_stats.p3_slow_ns;
+        let children = self.stat_store_children(node);
+        let sub: [[NodeId; 8]; 8] = std::array::from_fn(|i| self.stat_store_children(children[i]));
 
         let half_skip = 1u64 << (level - 3);
 
@@ -1583,9 +1982,19 @@ impl World {
                             }
                         }
                     }
-                    let inter = self.store.interior(level - 1, octants);
+                    let inter = self.stat_store_interior(level - 1, octants);
+                    self.record_p3_reindex(
+                        reindex_start,
+                        reindex_store_start,
+                        reindex_cache_start,
+                        reindex_slow_start,
+                    );
                     phased[px + py * 3 + pz * 9] =
                         self.step_node_macro(inter, level - 1, generation);
+                    reindex_start = Instant::now();
+                    reindex_store_start = self.hashlife_stats.p3_store_ns;
+                    reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+                    reindex_slow_start = self.hashlife_stats.p3_slow_ns;
                 }
             }
         }
@@ -1606,26 +2015,36 @@ impl World {
                             }
                         }
                     }
-                    let sub_root = self.store.interior(level - 1, sub_cube);
+                    let sub_root = self.stat_store_interior(level - 1, sub_cube);
+                    self.record_p3_reindex(
+                        reindex_start,
+                        reindex_store_start,
+                        reindex_cache_start,
+                        reindex_slow_start,
+                    );
                     result_children[octant_index(ox as u32, oy as u32, oz as u32)] =
                         self.step_node_macro(sub_root, level - 1, generation + half_skip);
+                    reindex_start = Instant::now();
+                    reindex_store_start = self.hashlife_stats.p3_store_ns;
+                    reindex_cache_start = self.hashlife_stats.p3_cache_ns;
+                    reindex_slow_start = self.hashlife_stats.p3_slow_ns;
                 }
             }
         }
 
-        self.store.interior(level - 1, result_children)
+        self.stat_store_interior(level - 1, result_children)
     }
 
     /// Extract the center (level n-1) of a level-n node.
     fn center_node(&mut self, node: NodeId, level: u32) -> NodeId {
         assert!(level >= 2, "center_node requires level >= 2");
-        let children = self.store.children(node);
+        let children = self.stat_store_children(node);
         let mut center_children = [NodeId::EMPTY; 8];
         for oct in 0..8usize {
             let inner = 7 - oct;
-            center_children[oct] = self.store.child(children[oct], inner);
+            center_children[oct] = self.stat_store_child(children[oct], inner);
         }
-        self.store.interior(level - 1, center_children)
+        self.stat_store_interior(level - 1, center_children)
     }
 }
 
@@ -1689,13 +2108,50 @@ pub(super) fn step_grid_once_pure(
     grid: &[CellState],
     generation: u64,
     materials: &crate::terrain::materials::MaterialRegistry,
-) -> ([CellState; LEVEL3_CELL_COUNT], u64, u64) {
-    let side = LEVEL3_SIDE;
+) -> (
+    [CellState; LEVEL3_CELL_COUNT],
+    u64,
+    u64,
+    HashlifeRuleMissDiag,
+) {
+    let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+    let (phase1_ns, phase2_ns, diag) =
+        step_grid_once_into(grid, &mut next, LEVEL3_SIDE, generation, materials);
+    (next, phase1_ns, phase2_ns, diag)
+}
+
+fn step_grid_once_vec(
+    grid: &[CellState],
+    side: usize,
+    generation: u64,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) -> (Vec<CellState>, u64, u64, HashlifeRuleMissDiag) {
+    let mut next = vec![0 as CellState; side * side * side];
+    let (phase1_ns, phase2_ns, diag) =
+        step_grid_once_into(grid, &mut next, side, generation, materials);
+    (next, phase1_ns, phase2_ns, diag)
+}
+
+fn step_grid_once_into(
+    grid: &[CellState],
+    next: &mut [CellState],
+    side: usize,
+    generation: u64,
+    materials: &crate::terrain::materials::MaterialRegistry,
+) -> (u64, u64, HashlifeRuleMissDiag) {
+    debug_assert_eq!(grid.len(), side * side * side);
+    debug_assert_eq!(next.len(), grid.len());
+
+    let mut diag = if memo_diag_enabled() {
+        Some(HashlifeRuleMissDiag::default())
+    } else {
+        None
+    };
+
     // Phase 1: CaRule on interior cells (1..side-1 on each axis).
     // The outermost ring cannot be evolved correctly because its neighbors
-    // would wrap outside the padded region. Callers only extract the center
-    // that remains valid after the requested number of steps.
-    let mut next = [0 as CellState; LEVEL3_CELL_COUNT];
+    // would read outside the padded region. Callers only extract a center
+    // whose halo remains valid after the requested block-rule passes.
     let phase1_start = std::time::Instant::now();
     let noop_by_material = materials.noop_flags();
     let divisor_by_material = materials.tick_divisor_flags();
@@ -1706,31 +2162,48 @@ pub(super) fn step_grid_once_pure(
                 let idx = x + y * side + z * side * side;
                 let raw = grid[idx];
                 if raw == 0 && air_is_noop {
+                    if let Some(diag) = &mut diag {
+                        diag.record_ca("NoopRule", true);
+                    }
                     continue;
                 }
                 let cell = Cell::from_raw(raw);
                 let mat = cell.material() as usize;
                 if mat < noop_by_material.len() && noop_by_material[mat] {
                     next[idx] = raw;
+                    if let Some(diag) = &mut diag {
+                        diag.record_ca("NoopRule", true);
+                    }
                     continue;
                 }
                 let divisor = divisor_by_material.get(mat).copied().unwrap_or(1) as u64;
                 if divisor > 1 && !generation.is_multiple_of(divisor) {
                     next[idx] = raw;
+                    if let Some(diag) = &mut diag {
+                        let rule_name = materials
+                            .rule_for_cell(cell)
+                            .map(|rule| rule.diag_name())
+                            .unwrap_or("CaRule");
+                        diag.record_ca(rule_name, true);
+                    }
                     continue;
                 }
                 let rule = materials
                     .rule_for_cell(cell)
                     .unwrap_or_else(|| panic!("missing CaRule for material {}", cell.material()));
                 let neighbors = get_neighbors_from_grid_unchecked(grid, side, x, y, z);
-                next[idx] = rule.step_cell(cell, &neighbors).raw();
+                let result = rule.step_cell(cell, &neighbors).raw();
+                next[idx] = result;
+                if let Some(diag) = &mut diag {
+                    diag.record_ca(rule.diag_name(), result == raw);
+                }
             }
         }
     }
     let phase1_ns = phase1_start.elapsed().as_nanos() as u64;
 
-    // Phase 2: BlockRule on aligned 2×2×2 blocks. See the comment at the
-    // wrapper site for the parity / divisor schedule details.
+    // Phase 2: BlockRule on aligned 2x2x2 blocks. See the brute-step comment
+    // for the parity / divisor schedule details.
     let phase2_start = std::time::Instant::now();
     let block_rule_divisors = materials.block_rule_tick_divisors();
     let all_divisors_one =
@@ -1743,7 +2216,7 @@ pub(super) fn step_grid_once_pure(
             while by + 1 < side - 1 {
                 let mut bx = offset;
                 while bx + 1 < side - 1 {
-                    apply_block_in_grid_pure(&mut next, side, bx, by, bz, materials);
+                    apply_block_in_grid_pure(next, side, bx, by, bz, materials, diag.as_mut());
                     bx += 2;
                 }
                 by += 2;
@@ -1759,7 +2232,7 @@ pub(super) fn step_grid_once_pure(
                     let mut bx = pass_offset;
                     while bx + 1 < side - 1 {
                         apply_block_in_grid_with_schedule_pure(
-                            &mut next,
+                            next,
                             side,
                             bx,
                             by,
@@ -1768,6 +2241,7 @@ pub(super) fn step_grid_once_pure(
                             generation,
                             block_rule_divisors,
                             materials,
+                            diag.as_mut(),
                         );
                         bx += 2;
                     }
@@ -1778,7 +2252,7 @@ pub(super) fn step_grid_once_pure(
         }
     }
     let phase2_ns = phase2_start.elapsed().as_nanos() as u64;
-    (next, phase1_ns, phase2_ns)
+    (phase1_ns, phase2_ns, diag.unwrap_or_default())
 }
 
 fn apply_block_in_grid_pure(
@@ -1788,6 +2262,7 @@ fn apply_block_in_grid_pure(
     by: usize,
     bz: usize,
     materials: &crate::terrain::materials::MaterialRegistry,
+    mut diag: Option<&mut HashlifeRuleMissDiag>,
 ) {
     let mut block = [Cell::EMPTY; 8];
     for dz in 0..2 {
@@ -1803,8 +2278,8 @@ fn apply_block_in_grid_pure(
         return;
     }
 
-    let rule_id = match unique_block_rule_pure(materials, &block) {
-        Some(id) => id,
+    let rule_match = match unique_block_rule_pure(materials, &block) {
+        Some(rule_match) => rule_match,
         None => return,
     };
 
@@ -1813,8 +2288,11 @@ fn apply_block_in_grid_pure(
         c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
     });
 
-    let rule = materials.block_rule(rule_id);
+    let rule = materials.block_rule(rule_match.id);
     let result = rule.step_block(&block, &movable);
+    if let Some(diag) = &mut diag {
+        diag.record_block(rule.diag_name(), Some(rule_match.material), result == block);
+    }
 
     debug_assert!(
         (0..8).all(|i| movable[i] || result[i] == block[i]),
@@ -1845,6 +2323,7 @@ fn apply_block_in_grid_with_schedule_pure(
     generation: u64,
     block_rule_divisors: &[u16],
     materials: &crate::terrain::materials::MaterialRegistry,
+    mut diag: Option<&mut HashlifeRuleMissDiag>,
 ) {
     let mut block = [Cell::EMPTY; 8];
     for dz in 0..2 {
@@ -1860,13 +2339,13 @@ fn apply_block_in_grid_with_schedule_pure(
         return;
     }
 
-    let rule_id = match unique_block_rule_pure(materials, &block) {
-        Some(id) => id,
+    let rule_match = match unique_block_rule_pure(materials, &block) {
+        Some(rule_match) => rule_match,
         None => return,
     };
 
     let divisor = block_rule_divisors
-        .get(rule_id.0)
+        .get(rule_match.id.0)
         .copied()
         .unwrap_or(1)
         .max(1) as u64;
@@ -1883,8 +2362,11 @@ fn apply_block_in_grid_with_schedule_pure(
         c.is_empty() || materials.block_rule_id_for_cell(c).is_some()
     });
 
-    let rule = materials.block_rule(rule_id);
+    let rule = materials.block_rule(rule_match.id);
     let result = rule.step_block(&block, &movable);
+    if let Some(diag) = &mut diag {
+        diag.record_block(rule.diag_name(), Some(rule_match.material), result == block);
+    }
 
     debug_assert!(
         (0..8).all(|i| movable[i] || result[i] == block[i]),
@@ -1904,29 +2386,44 @@ fn apply_block_in_grid_with_schedule_pure(
     }
 }
 
+#[derive(Clone, Copy)]
+struct BlockRuleMatch {
+    id: crate::terrain::materials::BlockRuleId,
+    material: u16,
+}
+
 fn unique_block_rule_pure(
     materials: &crate::terrain::materials::MaterialRegistry,
     block: &[Cell; 8],
-) -> Option<crate::terrain::materials::BlockRuleId> {
+) -> Option<BlockRuleMatch> {
     let mut found: Option<crate::terrain::materials::BlockRuleId> = None;
+    let mut material = None;
     for cell in block {
         if let Some(id) = materials.block_rule_id_for_cell(*cell) {
             match found {
-                None => found = Some(id),
+                None => {
+                    found = Some(id);
+                    material = Some(cell.material());
+                }
                 Some(existing) if existing == id => {}
                 Some(_) => return None,
             }
         }
     }
-    found
+    found.map(|id| BlockRuleMatch {
+        id,
+        material: material.expect("found BlockRuleId without source material"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sim::rule::ALIVE;
-    use crate::sim::{GameOfLife3D, WorldCoord};
-    use crate::terrain::materials::{DIRT_MATERIAL_ID, SAND_MATERIAL_ID, STONE, WATER_MATERIAL_ID};
+    use crate::sim::{BaseCaseStrategy, GameOfLife3D, WorldCoord};
+    use crate::terrain::materials::{
+        CLONE, DIRT, DIRT_MATERIAL_ID, SAND, SAND_MATERIAL_ID, STONE, WATER, WATER_MATERIAL_ID,
+    };
 
     fn wc(coord: u64) -> WorldCoord {
         WorldCoord(coord as i64)
@@ -2150,8 +2647,12 @@ mod tests {
         let mut brute = World::new(4);
         let mut recur = World::new(4);
         let params = TerrainParams::default();
-        brute.seed_terrain(&params).unwrap();
-        recur.seed_terrain(&params).unwrap();
+        brute
+            .seed_terrain(&params)
+            .expect("default terrain params should seed brute baseline");
+        recur
+            .seed_terrain(&params)
+            .expect("default terrain params should seed recursive baseline");
         assert_eq!(brute.flatten(), recur.flatten(), "initial state must match");
         for _ in 0..2 {
             brute.step();
@@ -2263,6 +2764,60 @@ mod tests {
         let pop_before = world.population();
         world.step_recursive();
         assert_eq!(world.population(), pop_before);
+    }
+
+    #[test]
+    fn bfs_frontier_over_hard_limit_falls_back_to_serial_recursive() {
+        struct ResetLimit;
+        impl Drop for ResetLimit {
+            fn drop(&mut self) {
+                set_bfs_frontier_hard_limit_for_test(None);
+            }
+        }
+
+        set_bfs_frontier_hard_limit_for_test(Some(1));
+        let _reset_limit = ResetLimit;
+
+        let mut bfs = gol_world(5, GameOfLife3D::rule445(), 1);
+        seed_random_alive_cells(&mut bfs, 0xbf5f_u64, 1);
+        bfs.set_base_case_strategy(BaseCaseStrategy::RayonBfs);
+
+        let mut serial = gol_world(5, GameOfLife3D::rule445(), 1);
+        seed_random_alive_cells(&mut serial, 0xbf5f_u64, 1);
+        serial.set_base_case_strategy(BaseCaseStrategy::Serial);
+
+        bfs.step_recursive();
+        serial.step_recursive();
+
+        assert_eq!(bfs.flatten(), serial.flatten());
+        assert_eq!(
+            bfs.hashlife_stats.cache_hits,
+            serial.hashlife_stats.cache_hits
+        );
+        assert_eq!(
+            bfs.hashlife_stats.cache_misses,
+            serial.hashlife_stats.cache_misses
+        );
+        assert_eq!(
+            bfs.hashlife_stats.empty_skips,
+            serial.hashlife_stats.empty_skips
+        );
+        assert_eq!(
+            bfs.hashlife_stats.fixed_point_skips,
+            serial.hashlife_stats.fixed_point_skips
+        );
+        assert_eq!(
+            bfs.hashlife_stats.misses_by_level,
+            serial.hashlife_stats.misses_by_level
+        );
+        assert!(
+            bfs.hashlife_stats.bfs_max_batch_len > 1,
+            "test must exercise an oversized BFS frontier"
+        );
+        assert!(
+            bfs.hashlife_stats.bfs_batches_serial_fallback > 0,
+            "oversized BFS frontier should fall back instead of allocating leaf grids"
+        );
     }
 
     /// hash-thing-4497 investigation: measure the actual divergence
@@ -2464,7 +3019,7 @@ mod tests {
     }
 
     /// Timing comparison: brute-force vs recursive Hashlife on 64³ terrain.
-    /// Run with `cargo test --release --lib bench_stepper_comparison -- --ignored --nocapture`.
+    /// Run with `cargo test --profile perf --lib bench_stepper_comparison -- --ignored --nocapture`.
     /// At 64³ the recursive path is roughly at parity with brute-force thanks to
     /// the empty-node short-circuit (6gf.14) and incremental cache (m1f.11/m1f.12).
     #[test]
@@ -2480,8 +3035,12 @@ mod tests {
         let params = TerrainParams::default();
         let mut brute = World::new(level);
         let mut recur = World::new(level);
-        brute.seed_terrain(&params).unwrap();
-        recur.seed_terrain(&params).unwrap();
+        brute
+            .seed_terrain(&params)
+            .expect("default terrain params should seed brute benchmark baseline");
+        recur
+            .seed_terrain(&params)
+            .expect("default terrain params should seed recursive benchmark baseline");
 
         // Brute-force timing.
         let t0 = Instant::now();
@@ -2551,10 +3110,9 @@ mod tests {
         assert_recursive_matches_bruteforce(brute, recur, 2, "level5-stone");
     }
 
-    /// Seed water and stone with a margin. CaRule boundaries now match
-    /// (both absorbing), but BlockRule still differs: brute-force clips
-    /// partial blocks at edges, hashlife processes them via overlapping
-    /// sub-cubes. Margins keep block-rule-bearing cells away from edges.
+    /// Seed water and stone with a margin. CaRule and BlockRule boundaries
+    /// now both use absorbing out-of-bounds cells; margins keep randomized
+    /// cases focused on interior recursive composition rather than edge loss.
     fn seed_random_material_cells_margined(world: &mut World, seed: u64, margin: u64) {
         let mut rng = SimpleRng::new(seed);
         let side = world.side() as u64;
@@ -2592,6 +3150,18 @@ mod tests {
         seed_random_material_cells_margined(&mut brute, 0xdee5_u64, 3);
         seed_random_material_cells_margined(&mut recur, 0xdee5_u64, 3);
         assert_recursive_matches_bruteforce(brute, recur, 2, "level5-materials");
+    }
+
+    #[test]
+    fn recursive_matches_brute_force_low_edge_odd_margolus_block() {
+        let mut brute = World::new(3);
+        let mut recur = World::new(3);
+        brute.generation = 1;
+        recur.generation = 1;
+        brute.set(wc(0), wc(2), wc(0), DIRT);
+        recur.set(wc(0), wc(2), wc(0), DIRT);
+
+        assert_recursive_matches_bruteforce(brute, recur, 1, "low-edge-odd-margolus");
     }
 
     #[test]
@@ -2885,7 +3455,9 @@ mod tests {
 
         let mut world = World::new(7);
         let params = TerrainParams::for_level(7);
-        world.seed_terrain(&params).unwrap();
+        world
+            .seed_terrain(&params)
+            .expect("level-7 terrain params should seed column gap-fill baseline");
         world.seed_water_and_sand();
 
         const GENS: u32 = 16;
@@ -3314,6 +3886,193 @@ mod tests {
         }
     }
 
+    /// hash-thing-neql: DefaultDemo cascade comparator drift localizer.
+    ///
+    /// Regression for the 8ppq.1.4 comparator caveat at a smaller level than
+    /// the recorded `medium · default-demo · cascade · churning` level-7 run.
+    /// The chunk-array baseline calls `brute_step_grid`; `World::step()` is
+    /// the same brute kernel with octree commit, so a brute-vs-recursive
+    /// mismatch here means the drift is in recursive semantics rather than
+    /// the scenario-runner comparator wrapper.
+    #[test]
+    #[ignore]
+    fn repro_neql_default_demo_cascade_brute_vs_recursive_drift() {
+        use crate::terrain::TerrainParams;
+        use std::collections::BTreeMap;
+
+        let level = 6u32;
+        let side = 1usize << level;
+
+        let make_world = || -> World {
+            let mut w = World::new(level);
+            let params = TerrainParams::for_level(level);
+            w.seed_terrain(&params).expect("terrain");
+            w.seed_water_and_sand();
+            w.seed_demo_spectacle();
+            w
+        };
+
+        let mut brute = make_world();
+        let mut recur = make_world();
+        assert_eq!(brute.flatten(), recur.flatten(), "initial state mismatch");
+
+        let idx = |x: usize, y: usize, z: usize| x + y * side + z * side * side;
+        let material_counts = |grid: &[CellState]| -> BTreeMap<u16, usize> {
+            let mut counts = BTreeMap::new();
+            for raw in grid {
+                let material = Cell::from_raw(*raw).material();
+                if material != 0 {
+                    *counts.entry(material).or_insert(0) += 1;
+                }
+            }
+            counts
+        };
+
+        for gen in 0..20u32 {
+            let pre = brute.flatten();
+            brute.step();
+            recur.step_margolus_only();
+
+            let brute_post = brute.flatten();
+            let recur_mid = recur.flatten();
+
+            if brute_post != recur_mid {
+                let mut pair_counts: BTreeMap<(u16, u16), usize> = BTreeMap::new();
+                let mut first = None;
+                for z in 0..side {
+                    for y in 0..side {
+                        for x in 0..side {
+                            let i = idx(x, y, z);
+                            let b = Cell::from_raw(brute_post[i]).material();
+                            let r = Cell::from_raw(recur_mid[i]).material();
+                            if b != r {
+                                first.get_or_insert((x, y, z, b, r));
+                                *pair_counts.entry((b, r)).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+
+                eprintln!("=== neql first drift at pre-step gen {gen} ===");
+                eprintln!("first divergent cell: {first:?}");
+                eprintln!("material pair counts brute->recursive: {pair_counts:?}");
+                eprintln!("pre non-air material counts: {:?}", material_counts(&pre));
+                eprintln!(
+                    "brute non-air material counts: {:?}",
+                    material_counts(&brute_post)
+                );
+                eprintln!(
+                    "recursive non-air material counts: {:?}",
+                    material_counts(&recur_mid)
+                );
+                if let Some((fx, fy, fz, _, _)) = first {
+                    let wx = (fx / 8) * 8;
+                    let wy = (fy / 8) * 8;
+                    let wz = (fz / 8) * 8;
+                    eprintln!("first divergent 8³ window origin: (x={wx}, y={wy}, z={wz})");
+                    let dump_window = |label: &str, grid: &[CellState]| {
+                        eprintln!("{label}:");
+                        for y in wy..(wy + 8).min(side) {
+                            eprintln!("  y={y}");
+                            for z in wz..(wz + 8).min(side) {
+                                let mut row = String::new();
+                                for x in wx..(wx + 8).min(side) {
+                                    let m = Cell::from_raw(grid[idx(x, y, z)]).material();
+                                    row.push_str(&format!(" {m:>2}"));
+                                }
+                                eprintln!("    z={z}:{row}");
+                            }
+                        }
+                    };
+                    dump_window("pre-step", &pre);
+                    dump_window("brute post-step", &brute_post);
+                    dump_window("recursive post-margolus", &recur_mid);
+
+                    for local_level in [4u32, 5u32] {
+                        let local_side = 1usize << local_level;
+                        let ox = fx.saturating_sub(local_side / 2);
+                        let oy = fy.saturating_sub(local_side / 2);
+                        let oz = fz.saturating_sub(local_side / 2);
+                        if ox + local_side > side
+                            || oy + local_side > side
+                            || oz + local_side > side
+                        {
+                            continue;
+                        }
+                        let mut local_brute = World::new(local_level);
+                        let mut local_recur = World::new(local_level);
+                        local_brute.generation = gen as u64;
+                        local_recur.generation = gen as u64;
+                        for z in 0..local_side {
+                            for y in 0..local_side {
+                                for x in 0..local_side {
+                                    let raw = pre[idx(ox + x, oy + y, oz + z)];
+                                    if raw != 0 {
+                                        local_brute.set(
+                                            wc(x as u64),
+                                            wc(y as u64),
+                                            wc(z as u64),
+                                            raw,
+                                        );
+                                        local_recur.set(
+                                            wc(x as u64),
+                                            wc(y as u64),
+                                            wc(z as u64),
+                                            raw,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        local_brute.step();
+                        local_recur.step_margolus_only();
+                        let lb = local_brute.flatten();
+                        let lr = local_recur.flatten();
+                        if lb == lr {
+                            eprintln!(
+                                "copied local level {local_level} window from full origin ({ox},{oy},{oz}) stayed byte-identical"
+                            );
+                        } else {
+                            let mut local_pairs: BTreeMap<(u16, u16), usize> = BTreeMap::new();
+                            let mut local_first = None;
+                            for z in 0..local_side {
+                                for y in 0..local_side {
+                                    for x in 0..local_side {
+                                        let i = x + y * local_side + z * local_side * local_side;
+                                        let b = Cell::from_raw(lb[i]).material();
+                                        let r = Cell::from_raw(lr[i]).material();
+                                        if b != r {
+                                            local_first.get_or_insert((x, y, z, b, r));
+                                            *local_pairs.entry((b, r)).or_insert(0) += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "copied local level {local_level} window from full origin ({ox},{oy},{oz}) drift: first={local_first:?} pairs={local_pairs:?}"
+                            );
+                        }
+                    }
+                }
+
+                recur.finalize_step_after_external_gap_fill();
+                assert_eq!(
+                    brute.generation, recur.generation,
+                    "generation counters must stay aligned after split finalize"
+                );
+                panic!(
+                    "DefaultDemo cascade drifted at pre-step gen {gen}: first={first:?} pairs={pair_counts:?}"
+                );
+            }
+
+            recur.finalize_step_after_external_gap_fill();
+            assert_eq!(
+                brute.generation, recur.generation,
+                "generation counters diverged after gen {gen}"
+            );
+        }
+    }
+
     // ============================================================
     // hash-thing-bjdl (vqke.2): targeted unit tests for the new
     // memo-hit-rate diagnostic counters. Per Codex plan-review §5,
@@ -3366,6 +4125,10 @@ mod tests {
             after_on > before_on,
             "with diag ON the alias precondition must fire the counter (before={before_on} after={after_on})"
         );
+        assert!(
+            world_on.hashlife_stats.miss_cause_by_level[0].parity_aliased > 0,
+            "with diag ON the per-level miss-cause table must classify the alternate-parity alias"
+        );
 
         // Arm B: gate OFF → counter must stay at 0.
         force_memo_diag_for_test(false);
@@ -3375,22 +4138,225 @@ mod tests {
             world_off.hashlife_stats.cache_misses_phase_aliased, 0,
             "with diag OFF the probe must not fire even when the alias precondition is satisfied"
         );
+        assert_eq!(
+            world_off.hashlife_stats.miss_cause_by_level[0].parity_aliased, 0,
+            "with diag OFF the miss-cause table must stay zero"
+        );
 
         // Reset the gate so any later (parallel) test sees the
         // production default.
         force_memo_diag_for_test(false);
     }
 
+    #[test]
+    fn memo_miss_cause_classifies_first_seen_and_slow_phase_alias() {
+        let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+        for x in 2..6 {
+            for y in 2..6 {
+                for z in 2..6 {
+                    world.set(wc(x), wc(y), wc(z), ALIVE.into());
+                }
+            }
+        }
+        let node = world.root;
+
+        force_memo_diag_for_test(true);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+        assert_eq!(
+            world.hashlife_stats.miss_cause_by_level[0].first_seen_or_no_surviving_key,
+            1
+        );
+        assert_eq!(
+            world.hashlife_stats.miss_cause_by_level[0].first_seen_key, 1,
+            "first observation of an exact memo key should be split from missing retained keys"
+        );
+
+        world.hashlife_cache.insert((node, 0), node);
+        world.record_memo_miss_cause(node, 3, 2, 4);
+        assert_eq!(
+            world.hashlife_stats.miss_cause_by_level[0].slow_divisor_phase_aliased, 1,
+            "same-parity alternate phase should classify as slow-divisor phase alias"
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn memo_miss_cause_splits_seen_exact_key_missing_entry() {
+        let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+        let node = world.root;
+
+        force_memo_diag_for_test(true);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+
+        let cause = world.hashlife_stats.miss_cause_by_level[0];
+        assert_eq!(cause.first_seen_or_no_surviving_key, 2);
+        assert_eq!(cause.first_seen_key, 1);
+        assert_eq!(cause.seen_key_missing_entry, 1);
+        assert_eq!(cause.seen_node_new_phase, 0);
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn memo_miss_cause_splits_seen_node_new_phase() {
+        let mut world = gol_world(3, GameOfLife3D::new(4, 7, 6, 8), 1);
+        let node = world.root;
+
+        force_memo_diag_for_test(true);
+        world.record_memo_miss_cause(node, 3, 1, 4);
+        world.record_memo_miss_cause(node, 3, 2, 4);
+
+        let cause = world.hashlife_stats.miss_cause_by_level[0];
+        assert_eq!(cause.first_seen_or_no_surviving_key, 2);
+        assert_eq!(cause.first_seen_key, 1);
+        assert_eq!(cause.seen_key_missing_entry, 0);
+        assert_eq!(cause.seen_node_new_phase, 1);
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_obeys_gate_for_base_case() {
+        let materials = crate::terrain::materials::MaterialRegistry::terrain_defaults();
+        let grid = [CLONE; LEVEL3_CELL_COUNT];
+
+        force_memo_diag_for_test(false);
+        let (_, _, _, off_diag) = step_grid_once_pure(&grid, 0, &materials);
+        assert!(
+            off_diag.is_empty(),
+            "diag must stay zero when HASH_THING_MEMO_DIAG gate is off: {off_diag:?}"
+        );
+
+        force_memo_diag_for_test(true);
+        let (_, _, _, on_diag) = step_grid_once_pure(&grid, 0, &materials);
+        let ca_total = on_diag.ca_noop_rule + on_diag.ca_game_of_life_3d + on_diag.ca_other_rule;
+        assert_eq!(ca_total, on_diag.ca_noop_rule);
+        assert_eq!(on_diag.ca_noop_rule, on_diag.ca_unchanged);
+        assert_eq!(
+            on_diag.block_gravity_rule
+                + on_diag.block_fluid_water_rule
+                + on_diag.block_fluid_lava_rule
+                + on_diag.block_fluid_acid_rule
+                + on_diag.block_fluid_oil_rule
+                + on_diag.block_identity_rule
+                + on_diag.block_other_rule,
+            0
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_counts_mixed_block_rules() {
+        let materials = crate::terrain::materials::MaterialRegistry::terrain_defaults();
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+
+        for z in 2..4 {
+            for y in 2..4 {
+                for x in 2..4 {
+                    grid[x + y * LEVEL3_SIDE + z * LEVEL3_SIDE * LEVEL3_SIDE] = SAND;
+                }
+            }
+        }
+        for z in 4..6 {
+            for y in 4..6 {
+                for x in 4..6 {
+                    grid[x + y * LEVEL3_SIDE + z * LEVEL3_SIDE * LEVEL3_SIDE] = WATER;
+                }
+            }
+        }
+
+        force_memo_diag_for_test(true);
+        let (_, _, _, diag) = step_grid_once_pure(&grid, 0, &materials);
+
+        assert!(
+            diag.block_gravity_rule > 0,
+            "sand block should attribute at least one GravityBlockRule miss: {diag:?}"
+        );
+        assert!(
+            diag.block_fluid_water_rule > 0,
+            "water block should attribute at least one FluidBlockRule miss: {diag:?}"
+        );
+        assert!(
+            diag.ca_fan_driven_rule > 0 && diag.ca_other_rule > 0,
+            "sand+water scene should include both fan-driven and other CaRule attribution: {diag:?}"
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_accumulates_through_base_case_stats() {
+        force_memo_diag_for_test(true);
+        let mut world = World::new(3);
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        for z in 4..6 {
+            for y in 4..6 {
+                for x in 4..6 {
+                    grid[x + y * LEVEL3_SIDE + z * LEVEL3_SIDE * LEVEL3_SIDE] = WATER;
+                }
+            }
+        }
+
+        let node = world.store.from_flat(&grid, LEVEL3_SIDE);
+        world.step_base_case(node, 0);
+        let diag = world.hashlife_stats.rule_miss_diag;
+        assert!(
+            diag.block_fluid_water_rule > 0,
+            "base-case miss should accumulate water FluidBlockRule attribution into HashlifeStats: {diag:?}"
+        );
+        assert!(
+            world.hashlife_stats_total.rule_miss_diag.is_empty(),
+            "direct base-case helper should update per-step stats only until step_recursive accumulates"
+        );
+
+        world.hashlife_stats_total.accumulate(&world.hashlife_stats);
+        assert!(
+            world
+                .hashlife_rule_miss_summary()
+                .contains("block_fluid_water="),
+            "debug summary should expose specific fluid buckets"
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
+    #[test]
+    fn rule_miss_diag_uses_rule_cell_material_for_fluid_bucket() {
+        let materials = crate::terrain::materials::MaterialRegistry::terrain_defaults();
+        let mut grid = [0 as CellState; LEVEL3_CELL_COUNT];
+        let bx = 2;
+        let by = 2;
+        let bz = 2;
+        grid[bx + by * LEVEL3_SIDE + bz * LEVEL3_SIDE * LEVEL3_SIDE] = STONE;
+        grid[(bx + 1) + by * LEVEL3_SIDE + bz * LEVEL3_SIDE * LEVEL3_SIDE] = WATER;
+
+        force_memo_diag_for_test(true);
+        let (_, _, _, diag) = step_grid_once_pure(&grid, 0, &materials);
+        assert_eq!(
+            diag.block_fluid_water_rule, 1,
+            "water rule cell should drive the fluid bucket even when stone is first in octant order: {diag:?}"
+        );
+        assert_eq!(
+            diag.block_other_rule, 0,
+            "stone-adjacent water block should not fall into block_other: {diag:?}"
+        );
+
+        force_memo_diag_for_test(false);
+    }
+
     /// `remap_caches` must split its outcome into kept (entries whose
     /// node + result both survived the remap) and dropped (everything
-    /// else). Three entries in, two survive, one dropped: counters
-    /// land at 2/1.
+    /// else). Three entries in, one survives, two drop: counters land
+    /// at 1/2.
     #[test]
     fn remap_caches_counts_kept_and_dropped() {
         let mut world = World::new(4);
-        let n1 = world.store.empty(2);
-        let n2 = world.store.empty(3);
-        let n3 = world.store.empty(4);
+        let n1 = world.store.empty(3);
+        let n2 = world.store.empty(4);
+        let n3 = world.store.empty(5);
         // Three cache entries: n1→n2, n2→n3, n3→n1. Two survive
         // remap, one drops.
         world.hashlife_cache.insert((n1, 0), n2);
@@ -3404,7 +4370,9 @@ mod tests {
         // touching n3 should be dropped.
 
         world.hashlife_stats = super::super::world::HashlifeStats::default();
-        world.remap_caches(&remap);
+        force_memo_diag_for_test(true);
+        let old_key_levels = world.cache_key_level_indices();
+        world.remap_caches(&remap, Some(&old_key_levels));
 
         // Survivors: only the (n1, 0) → n2 entry (both endpoints in
         // the remap). The (n2, 1) → n3 entry drops on the value side
@@ -3423,6 +4391,24 @@ mod tests {
             3,
             "kept + dropped must equal the pre-remap cache size (3)"
         );
+        let per_level_kept: u64 = world
+            .hashlife_stats
+            .miss_cause_by_level
+            .iter()
+            .map(|cause| cause.compact_entries_kept)
+            .sum();
+        let per_level_dropped: u64 = world
+            .hashlife_stats
+            .miss_cause_by_level
+            .iter()
+            .map(|cause| cause.compact_entries_dropped)
+            .sum();
+        assert_eq!(per_level_kept, world.hashlife_stats.compact_entries_kept);
+        assert_eq!(
+            per_level_dropped,
+            world.hashlife_stats.compact_entries_dropped
+        );
+        force_memo_diag_for_test(false);
     }
 
     /// `remap_caches` on an empty cache must report 0/0 — no
@@ -3434,7 +4420,7 @@ mod tests {
         world.hashlife_stats = super::super::world::HashlifeStats::default();
         // hashlife_cache is empty by default.
         let remap: FxHashMap<NodeId, NodeId> = FxHashMap::default();
-        world.remap_caches(&remap);
+        world.remap_caches(&remap, None);
         assert_eq!(world.hashlife_stats.compact_entries_kept, 0);
         assert_eq!(world.hashlife_stats.compact_entries_dropped, 0);
     }

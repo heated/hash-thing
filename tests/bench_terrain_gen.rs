@@ -1,7 +1,7 @@
 //! Terrain gen benchmarks at multiple world scales (hash-thing-72s).
 //!
 //! Measures heightmap precomputation + octree gen_region time.
-//! Run with: `cargo test --release --test bench_terrain_gen -- --ignored --nocapture`
+//! Run with: `cargo test --profile perf --test bench_terrain_gen -- --ignored --nocapture`
 //!
 //! Confidence note: this harness is observational only. The printed timings
 //! support manual regression checks; the enforced perf gate lives separately

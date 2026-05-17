@@ -1228,7 +1228,10 @@ mod tests {
             let lod_a = policy.chunk_lod.clone();
             let view_b = policy.recompute(&mut world.store, world.root, world.level, player);
             assert_eq!(view_a, view_b, "view churn at player={player:?}");
-            assert_eq!(policy.chunk_lod, lod_a, "chunk_lod churn at player={player:?}");
+            assert_eq!(
+                policy.chunk_lod, lod_a,
+                "chunk_lod churn at player={player:?}"
+            );
         }
     }
 

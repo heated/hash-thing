@@ -7,20 +7,22 @@
 //! - 100 random level-4 (16³) worlds with mixed materials (default `cargo test`).
 //! - The same corpus at level 5 (32³), exercising recursive descent into
 //!   multiple level-4 fanouts (`--ignored`).
+//! - A bounded level-6 (64³) random smoke in default `cargo test`, covering
+//!   deeper BFS frontier descent without the level-7 sweep's runtime.
 //! - 4 explicit fixtures hitting the BlockRule paths the random sweep
 //!   would mostly miss: empty, all-stone (inert short-circuit), sand
 //!   column (gravity), water lattice (fluid spread).
 //! - Random level-7 corpus (`--ignored`) — exercises the BFS dispatcher's
-//!   multi-level descent (root -> level-6 -> level-5 -> level-4 -> level-3
-//!   batch). Smaller corpus to stay under the project's command budget.
+//!   multi-level descent into the active leaf batch. Smaller corpus to stay
+//!   under the project's command budget.
 //!
 //! Strategies tested for parity vs serial:
 //!
 //! - [`BaseCaseStrategy::Serial`]: pre-ftuu DFS reference path.
-//! - [`BaseCaseStrategy::RayonPerFanout`] (ftuu): per-level-4-fanout
-//!   8-way rayon batching.
+//! - [`BaseCaseStrategy::RayonPerFanout`] (ftuu): per-leaf-fanout 8-way
+//!   rayon batching.
 //! - [`BaseCaseStrategy::RayonBfs`] (ecmn): breadth-first whole-step
-//!   level-3 batching.
+//!   leaf batching.
 //!
 //! Note: the test compares `World::flatten()` (cell content), not
 //! NodeIds. Distinct `World` instances have independent `NodeStore`
@@ -314,7 +316,7 @@ fn bfs_stats_parity_random_level5() {
 /// hash-thing-ecmn review-pass: assert that BFS actually queues
 /// non-trivial work — guards against a regression where the
 /// dispatcher silently routes through the DFS path or short-circuits
-/// every task. Asserts at least one step has a non-zero level-3 batch
+/// every task. Asserts at least one step has a non-zero leaf batch
 /// and at least one parallel batch (above the rayon threshold).
 #[test]
 fn bfs_observability_counters_fire_on_random_level5() {
@@ -341,6 +343,56 @@ fn bfs_observability_counters_fire_on_random_level5() {
         total_par + total_serfb > 0,
         "BFS observability: neither bfs_batches_parallel nor bfs_batches_serial_fallback \
          fired — Phase 2 did not execute",
+    );
+}
+
+/// hash-thing-a08q.6: bounded default coverage for deeper BFS frontier
+/// descent. Level 6 is the smallest non-ignored smoke that walks beyond the
+/// level-5 random corpus while staying inside normal crew command budgets.
+#[test]
+fn rayon_parity_random_level6_bfs_smoke() {
+    assert_parity(6, |w| seed_world(w, 0xa086_6000, 4), 1, "level6-bfs-smoke");
+}
+
+/// hash-thing-bfsq: slowed water BlockRule worlds use a level-4 leaf
+/// (16^3 -> 8^3) so both Margolus offsets have enough halo. This compares the
+/// BFS path directly against the brute world step, not only against serial
+/// Hashlife, and checks the active-leaf stats land in the level-4 bucket.
+#[test]
+fn bfs_wide_leaf_water_lattice_matches_brute() {
+    let mut brute = World::new(4);
+    seed_water_lattice(&mut brute);
+
+    let mut bfs = World::new(4);
+    seed_water_lattice(&mut bfs);
+    bfs.set_base_case_strategy(BaseCaseStrategy::RayonBfs);
+
+    for step in 0..3 {
+        brute.step();
+        bfs.step_recursive();
+        assert_eq!(
+            brute.flatten(),
+            bfs.flatten(),
+            "wide-leaf BFS diverged from brute at step {step}",
+        );
+        assert!(
+            bfs.hashlife_stats.bfs_level3_unique_misses > 0,
+            "wide-leaf BFS did not queue a leaf batch at step {step}",
+        );
+        assert!(
+            bfs.hashlife_stats.misses_by_level[1] > 0,
+            "wide-leaf BFS should count level-4 leaf misses at step {step}",
+        );
+        assert_eq!(
+            bfs.hashlife_stats.misses_by_level[0], 0,
+            "wide-leaf BFS should not use level-3 leaves at step {step}",
+        );
+    }
+
+    let summary = bfs.memo_summary();
+    assert!(
+        !summary.contains("memo_elision=0.0x"),
+        "wide-leaf memo_elision must use padded-root leaf count: {summary}",
     );
 }
 

@@ -18,6 +18,8 @@ const GT_READY: u8 = 2;
 /// `resolve_query_set` only requires the buffer to hold `query_count * 8`
 /// bytes (per wgpu-core/src/command/query.rs:475). 16 bytes is exactly that.
 const TIMESTAMP_BYTES: u64 = 16;
+const SVDAG_BUFFER_MIN_CAP: u64 = 65_536;
+const SVDAG_BUFFER_SHRINK_DIVISOR: u64 = 4;
 
 /// Convert raw GPU timestamp ticks to a `Duration`, using the
 /// adapter-reported `timestamp_period` (nanoseconds per tick). Pure
@@ -35,6 +37,23 @@ fn ticks_to_duration(start_ticks: u64, end_ticks: u64, period_ns: f32) -> Durati
     // stable. Ceiling it at u64::MAX is fine; such a value would be
     // "absurdly large" per the test rubric and we'd catch it upstream.
     Duration::from_nanos(ns as u64)
+}
+
+fn svdag_buffer_cap_for_needed(needed: u64) -> u64 {
+    let mut cap = SVDAG_BUFFER_MIN_CAP;
+    while cap < needed {
+        cap *= 2;
+    }
+    cap
+}
+
+fn should_reallocate_svdag_buffer(current_cap: u64, needed: u64) -> bool {
+    if current_cap == 0 || needed > current_cap {
+        return true;
+    }
+    current_cap > SVDAG_BUFFER_MIN_CAP
+        && needed <= current_cap / SVDAG_BUFFER_SHRINK_DIVISOR
+        && svdag_buffer_cap_for_needed(needed) < current_cap
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +93,23 @@ impl RendererLifecycleSnapshot {
     }
 }
 
+fn scaled_render_extent(width: u32, height: u32, render_scale: f32) -> (u32, u32) {
+    (
+        ((width as f32 * render_scale) as u32).max(1),
+        ((height as f32 * render_scale) as u32).max(1),
+    )
+}
+
+fn surface_and_raycast_extents(
+    width: u32,
+    height: u32,
+    render_scale: f32,
+) -> ((u32, u32), (u32, u32)) {
+    let surface = (width.max(1), height.max(1));
+    let raycast = scaled_render_extent(surface.0, surface.1, render_scale);
+    (surface, raycast)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -83,7 +119,8 @@ struct Uniforms {
     camera_right: [f32; 4],
     /// x: volume_size, y: aspect_ratio, z: fov_tan, w: screen_height
     params: [f32; 4],
-    /// x: debug_mode (0=normal, 1=step-count heatmap), y/z/w: reserved
+    /// x: debug_mode (0=normal, 1=step-count heatmap, 2+=dump diagnostics),
+    /// y/z/w: reserved
     debug: [f32; 4],
 }
 
@@ -125,6 +162,33 @@ pub struct RendererCpuPhaseTimes {
     /// else, e.g. swapchain pacing or compositor" (false). On the first
     /// frame this is false (no prior submission to wait on).
     pub prior_gpu_in_flight_at_acquire: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RendererGpuTimingSample {
+    pub duration: Duration,
+    /// Submit-sequence staleness in frames. `None` means the renderer
+    /// suppressed lag because the resolved sample could not be ordered
+    /// against the current submit sequence.
+    pub lag_frames: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedGpuTimingSample {
+    duration: Duration,
+    submit_seq: u64,
+}
+
+fn gpu_timing_lag_frames(current_submit_seq: u64, sample: ResolvedGpuTimingSample) -> Option<u64> {
+    let lag_frames = current_submit_seq.checked_sub(sample.submit_seq);
+    if lag_frames.is_none() {
+        log::warn!(
+            "gpu timing lag suppressed: resolved submit_seq={} is newer than current_submit_seq={}",
+            sample.submit_seq,
+            current_submit_seq,
+        );
+    }
+    lag_frames
 }
 
 /// hash-thing-hc0g: row-tightly-packed RGBA8 readback of the off-surface
@@ -201,6 +265,10 @@ struct GpuTiming {
     /// PENDING → IDLE on failure. The render thread transitions IDLE →
     /// PENDING (in `request_readback`) and READY → IDLE (in `poll`).
     state: Arc<AtomicU8>,
+    /// Submit sequence associated with the currently pending readback.
+    /// Stored separately from `state` because `map_async` completion is
+    /// callback-driven and can resolve after later frames have submitted.
+    pending_submit_seq: Arc<Mutex<Option<u64>>>,
     /// When true, the caller sandwiches the compute pass with
     /// `write_timestamp_begin`/`write_timestamp_end` on the encoder and
     /// `compute_pass_writes()` returns `None`. Requires the adapter to
@@ -246,6 +314,7 @@ impl GpuTiming {
             readback_buffer,
             period_ns,
             state: Arc::new(AtomicU8::new(GT_IDLE)),
+            pending_submit_seq: Arc::new(Mutex::new(None)),
             use_in_encoder,
         }
     }
@@ -329,10 +398,11 @@ impl GpuTiming {
         );
     }
 
-    /// Start async readback. Transitions IDLE → PENDING and issues
+    /// Start async readback. Transitions IDLE → PENDING, records the
+    /// submit sequence that owns this resolve, and issues
     /// `map_async`; the callback later flips PENDING → READY (success)
     /// or PENDING → IDLE (failure). Call exactly once per `encode_resolve`.
-    fn request_readback(&self) {
+    fn request_readback(&self, submit_seq: u64) {
         if self
             .state
             .compare_exchange(GT_IDLE, GT_PENDING, Ordering::AcqRel, Ordering::Acquire)
@@ -343,21 +413,26 @@ impl GpuTiming {
             // rather than panic.
             return;
         }
+        *self.pending_submit_seq.lock().unwrap() = Some(submit_seq);
         let state = self.state.clone();
+        let pending_submit_seq = Arc::clone(&self.pending_submit_seq);
         self.readback_buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| match result {
                 Ok(()) => state.store(GT_READY, Ordering::Release),
                 Err(e) => {
                     log::warn!("gpu timing readback failed: {e:?}");
+                    if let Ok(mut seq) = pending_submit_seq.lock() {
+                        *seq = None;
+                    }
                     state.store(GT_IDLE, Ordering::Release);
                 }
             });
     }
 
-    /// Consume a pending readback if one just became ready. Returns
-    /// the resolved `Duration` for the most recently completed frame,
-    /// or `None` if no readback is ready.
+    /// Consume a pending readback if one just became ready. Returns the
+    /// resolved GPU duration plus the submit sequence that produced it, or
+    /// `None` if no readback is ready.
     ///
     /// Does NOT call `device.poll` — callers must invoke
     /// `device.poll(Poll)` exactly once per frame (before polling any
@@ -366,10 +441,11 @@ impl GpuTiming {
     /// exist in the same frame (dlse.2.4).
     ///
     /// Transitions READY → IDLE on success.
-    fn take_resolved(&self) -> Option<Duration> {
+    fn take_resolved(&self) -> Option<ResolvedGpuTimingSample> {
         if self.state.load(Ordering::Acquire) != GT_READY {
             return None;
         }
+        let submit_seq = self.pending_submit_seq.lock().unwrap().take();
 
         let slice = self.readback_buffer.slice(..);
         let data = slice.get_mapped_range();
@@ -393,7 +469,15 @@ impl GpuTiming {
         // request_readback asserts the buffer is not already mapped.
         self.state.store(GT_IDLE, Ordering::Release);
 
-        Some(ticks_to_duration(start, end, self.period_ns))
+        let Some(submit_seq) = submit_seq else {
+            log::warn!("gpu timing readback resolved without submit attribution");
+            return None;
+        };
+
+        Some(ResolvedGpuTimingSample {
+            duration: ticks_to_duration(start, end, self.period_ns),
+            submit_seq,
+        })
     }
 }
 
@@ -416,6 +500,8 @@ pub struct Renderer {
     /// Storage texture for compute raycast output (hash-thing-5bb.6.1).
     raycast_texture: wgpu::Texture,
     raycast_texture_view: wgpu::TextureView,
+    raycast_width: u32,
+    raycast_height: u32,
 
     // Blit pass: samples raycast_texture, writes to swapchain (5bb.6.1)
     blit_pipeline: wgpu::RenderPipeline,
@@ -470,6 +556,7 @@ pub struct Renderer {
     memo_hud_tex_w: u32,
     memo_hud_tex_h: u32,
     pub memo_hud_visible: bool,
+    pub memo_hud_scale: u32,
 
     // Material palette (shared by all pipelines)
     palette_buffer: wgpu::Buffer,
@@ -482,8 +569,11 @@ pub struct Renderer {
     pub camera_dist: f32,
     pub camera_target: [f32; 3],
 
-    /// Debug render mode. 0 = normal, 1 = step-count heatmap.
+    /// Debug render mode. 0 = normal, 1 = step-count heatmap, 2+=dump diagnostics.
     pub debug_mode: u32,
+    /// Diagnostic layer switches for one-shot captures.
+    pub render_world_layer: bool,
+    pub render_particle_layer: bool,
     /// LOD bias multiplier. 1.0 = default, higher = more aggressive LOD.
     pub lod_bias: f32,
     /// Render resolution scale. 0.5 = half-res (4x fewer pixels), 1.0 = full.
@@ -512,12 +602,12 @@ pub struct Renderer {
     /// `take_last_gpu_frame_time()`. `None` means no new sample since
     /// the last take (or the adapter lacks TIMESTAMP_QUERY entirely).
     /// Consume-on-read avoids double-recording across frames.
-    last_gpu_frame_time: Option<Duration>,
+    last_gpu_frame_time: Option<ResolvedGpuTimingSample>,
     /// Most recently resolved GPU render-pass duration (blit + HUD +
     /// particles + hotbar + legend), bracketed in parallel with
     /// `last_gpu_frame_time`. Set by `render()`, consumed by
     /// `take_last_render_pass_gpu_frame_time()`. dlse.2.4.
-    last_render_pass_gpu_frame_time: Option<Duration>,
+    last_render_pass_gpu_frame_time: Option<ResolvedGpuTimingSample>,
     /// Most recent CPU-side frame phase timings, consumed by
     /// `take_last_cpu_phase_times()` so callers can record them once.
     last_cpu_phase_times: Option<RendererCpuPhaseTimes>,
@@ -561,9 +651,18 @@ enum RenderScaleSource {
     /// Env var was set but failed parsing or fell outside `0.125..=1.0`,
     /// and no CLI override fired either.
     EnvInvalidFallback,
-    /// `--demo` / `--res` CLI flag pinned a target pixel count.
+    /// `--res` CLI flag pinned a target pixel count.
     /// Env var was unset or invalid; CLI wins (hash-thing-06so).
-    CliOverride,
+    CliTargetPixels,
+    /// `--demo` CLI flag pinned a concrete render scale.
+    /// Env var was unset or invalid; CLI wins (hash-thing-uc2m).
+    CliFixedScale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderScaleOverride {
+    TargetPixels(u64),
+    FixedScale(f32),
 }
 
 /// Coarse GPU class — drives `render_scale` startup default per the
@@ -615,7 +714,9 @@ fn is_strong_discrete_name(name: &str) -> bool {
     }
     // AMD: RX 6700+ (RDNA2 high tier) and RX 7xxx+ (RDNA3). RX 6600
     // is borderline; left out. RX 5xxx (RDNA1) is below anchor.
-    if lower.contains("rx 67") || lower.contains("rx 68") || lower.contains("rx 69")
+    if lower.contains("rx 67")
+        || lower.contains("rx 68")
+        || lower.contains("rx 69")
         || lower.contains("rx 7")
     {
         return true;
@@ -703,7 +804,7 @@ fn auto_render_scale(physical_pixels: u64, volume_size: u32) -> f32 {
 
 /// Resolve the effective render scale + which branch fired. Precedence:
 /// 1. `HASH_THING_RENDER_SCALE` env (if present AND valid).
-/// 2. `--res` / `--demo` CLI override (if `cli_target` is `Some`).
+/// 2. `--res` / `--demo` CLI override (if `cli_override` is `Some`).
 /// 3. Auto-pick keyed by `volume_size`.
 ///
 /// Invalid env still loses to CLI when CLI is set; otherwise it falls
@@ -711,14 +812,22 @@ fn auto_render_scale(physical_pixels: u64, volume_size: u32) -> f32 {
 /// can surface the typo (hash-thing-zytn extended by hash-thing-06so).
 fn resolved_render_scale(
     env: Option<&str>,
-    cli_target: Option<u64>,
+    cli_override: Option<RenderScaleOverride>,
     physical_pixels: u64,
     volume_size: u32,
     adapter_info: Option<&wgpu::AdapterInfo>,
 ) -> (f32, RenderScaleSource) {
-    let cli_scale = cli_target.map(|target| {
-        let physical = physical_pixels.max(1) as f64;
-        ((target as f64 / physical).sqrt() as f32).clamp(0.125, 1.0)
+    let cli_scale = cli_override.map(|override_| match override_ {
+        RenderScaleOverride::TargetPixels(target) => {
+            let physical = physical_pixels.max(1) as f64;
+            (
+                ((target as f64 / physical).sqrt() as f32).clamp(0.125, 1.0),
+                RenderScaleSource::CliTargetPixels,
+            )
+        }
+        RenderScaleOverride::FixedScale(scale) => {
+            (scale.clamp(0.125, 1.0), RenderScaleSource::CliFixedScale)
+        }
     });
     // hash-thing-pfpn: when neither env nor CLI fired, prefer the
     // GPU-class default over the pixel-budget pick. Per trident plan
@@ -738,13 +847,13 @@ fn resolved_render_scale(
     };
     match env {
         None => match cli_scale {
-            Some(s) => (s, RenderScaleSource::CliOverride),
+            Some((s, source)) => (s, source),
             None => auto_pair,
         },
         Some(raw) => match raw.parse::<f32>() {
             Ok(s) if (0.125..=1.0).contains(&s) => (s, RenderScaleSource::EnvOverride),
             _ => match cli_scale {
-                Some(s) => (s, RenderScaleSource::CliOverride),
+                Some((s, source)) => (s, source),
                 None => (auto_pair.0, RenderScaleSource::EnvInvalidFallback),
             },
         },
@@ -773,13 +882,13 @@ fn parse_present_mode(s: &str) -> Option<wgpu::PresentMode> {
 }
 
 impl Renderer {
-    /// `cli_target_pixels`: when `Some`, pin the rendered-pixel budget to
-    /// this total (e.g. `1920 * 1080` for `--demo`). Env override still
-    /// wins if set. wasm/unit-test callers can pass `None`. (hash-thing-06so)
+    /// `cli_render_scale`: when `Some`, pin either the rendered-pixel budget
+    /// (`--res`) or a concrete scale (`--demo`). Env override still wins if set.
+    /// wasm/unit-test callers can pass `None`. (hash-thing-06so / uc2m)
     pub async fn new(
         window: Arc<Window>,
         volume_size: u32,
-        cli_target_pixels: Option<u64>,
+        cli_render_scale: Option<RenderScaleOverride>,
     ) -> Self {
         let size = window.inner_size();
 
@@ -796,9 +905,7 @@ impl Renderer {
                 m.scale_factor(),
                 scale_factor,
             ),
-            None => log::info!(
-                "monitor: none reported by winit (scale_factor={scale_factor})"
-            ),
+            None => log::info!("monitor: none reported by winit (scale_factor={scale_factor})"),
         }
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -899,7 +1006,7 @@ impl Renderer {
         let physical_pixels: u64 = (size.width as u64) * (size.height as u64);
         let (render_scale, scale_source) = resolved_render_scale(
             env_raw.as_deref(),
-            cli_target_pixels,
+            cli_render_scale,
             physical_pixels,
             volume_size,
             Some(&adapter_info),
@@ -940,8 +1047,8 @@ impl Renderer {
                 target_pixels_for_volume(volume_size),
             ),
             RenderScaleSource::AutoPickedByGpuClass => {
-                let (class, class_pick) = class_default
-                    .expect("AutoPickedByGpuClass implies classify_gpu returned Some");
+                let (class, class_pick) =
+                    class_default.expect("AutoPickedByGpuClass implies classify_gpu returned Some");
                 log::info!(
                     "render_scale={:.3} (auto-picked by GPU class: name={:?} device_type={:?} class={:?} class_pick={:.3} pixel_pick={:.3} volume_size={} physical={}x{}) — override with HASH_THING_RENDER_SCALE or use = / - keys at runtime",
                     render_scale,
@@ -970,13 +1077,13 @@ impl Renderer {
                     render_scale,
                 ),
             },
-            RenderScaleSource::CliOverride => {
+            RenderScaleSource::CliTargetPixels => {
                 // hash-thing-06so: surface the env-typo signal even when CLI
                 // wins, so a user passing both `HASH_THING_RENDER_SCALE=foo`
-                // and `--demo` still notices the typo.
+                // and `--res` still notices the typo.
                 if let Some(raw) = env_raw.as_deref() {
                     log::warn!(
-                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.125..=1.0); ignored — using --res / --demo CLI override instead",
+                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.125..=1.0); ignored — using --res CLI override instead",
                     );
                 }
                 // Show the resulting framebuffer dimensions so a user
@@ -985,16 +1092,34 @@ impl Renderer {
                 // pixel-budget interpretation of "1080p" means the
                 // rendered W×H is generally NOT literal 1920×1080
                 // (uniform scale preserves physical aspect ratio).
-                let rendered_w =
-                    ((size.width as f32 * render_scale) as u32).max(1);
-                let rendered_h =
-                    ((size.height as f32 * render_scale) as u32).max(1);
+                let (rendered_w, rendered_h) =
+                    scaled_render_extent(size.width, size.height, render_scale);
                 log::info!(
-                    "render_scale={:.3} (--res / --demo override; rendered={}x{}, cli_target={} px, physical={}x{})",
+                    "render_scale={:.3} (--res override; rendered={}x{}, cli_target={} px, physical={}x{})",
                     render_scale,
                     rendered_w,
                     rendered_h,
-                    cli_target_pixels.expect("CliOverride implies cli_target_pixels=Some"),
+                    match cli_render_scale {
+                        Some(RenderScaleOverride::TargetPixels(target)) => target,
+                        _ => unreachable!("CliTargetPixels implies TargetPixels override"),
+                    },
+                    size.width,
+                    size.height,
+                );
+            }
+            RenderScaleSource::CliFixedScale => {
+                if let Some(raw) = env_raw.as_deref() {
+                    log::warn!(
+                        "HASH_THING_RENDER_SCALE={raw} invalid (need a number in 0.125..=1.0); ignored — using --demo render-scale override instead",
+                    );
+                }
+                let (rendered_w, rendered_h) =
+                    scaled_render_extent(size.width, size.height, render_scale);
+                log::info!(
+                    "render_scale={:.3} (--demo override; rendered={}x{}, physical={}x{})",
+                    render_scale,
+                    rendered_w,
+                    rendered_h,
                     size.width,
                     size.height,
                 );
@@ -1046,11 +1171,13 @@ impl Renderer {
                 }
             },
         };
+        let ((surface_width, surface_height), (raycast_width, raycast_height)) =
+            surface_and_raycast_extents(size.width, size.height, render_scale);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: ((size.width as f32 * render_scale) as u32).max(1),
-            height: ((size.height as f32 * render_scale) as u32).max(1),
+            width: surface_width,
+            height: surface_height,
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -1063,10 +1190,16 @@ impl Renderer {
             surface_caps.formats,
         );
         log::info!(
-            "surface_config: present_mode={:?} alpha_mode={:?} format={:?} max_frame_latency={} render_scale={} size={}x{} (physical={}x{})",
-            config.present_mode, config.alpha_mode, config.format,
-            config.desired_maximum_frame_latency, render_scale,
-            config.width, config.height, size.width, size.height,
+            "surface_config: present_mode={:?} alpha_mode={:?} format={:?} max_frame_latency={} render_scale={} size={}x{} raycast={}x{}",
+            config.present_mode,
+            config.alpha_mode,
+            config.format,
+            config.desired_maximum_frame_latency,
+            render_scale,
+            config.width,
+            config.height,
+            raycast_width,
+            raycast_height,
         );
         surface.configure(&device, &config);
 
@@ -1112,13 +1245,14 @@ impl Renderer {
 
         // === SVDAG compute raycast pipeline (hash-thing-5bb.6.1) ===
 
-        // Storage texture for compute output. Dimensions match the scaled
-        // surface config (already half-res from render_scale).
+        // Storage texture for compute output. The surface remains at the
+        // physical window size; render_scale controls this smaller texture,
+        // which the blit pass nearest-upscales into the surface.
         let raycast_tex_format = wgpu::TextureFormat::Rgba16Float;
         let (raycast_texture, raycast_texture_view) = Self::create_raycast_texture_static(
             &device,
-            config.width,
-            config.height,
+            raycast_width,
+            raycast_height,
             raycast_tex_format,
         );
 
@@ -1668,6 +1802,8 @@ impl Renderer {
             svdag_uploaded_len: 0,
             raycast_texture,
             raycast_texture_view,
+            raycast_width,
+            raycast_height,
             blit_pipeline,
             blit_bind_group_layout,
             blit_bind_group,
@@ -1705,6 +1841,7 @@ impl Renderer {
             memo_hud_tex_w: 0,
             memo_hud_tex_h: 0,
             memo_hud_visible: false,
+            memo_hud_scale: 2,
             palette_buffer,
             uniform_buffer,
             volume_size,
@@ -1713,6 +1850,8 @@ impl Renderer {
             camera_dist: 2.0,
             camera_target: [0.5, 0.5, 0.5],
             debug_mode: 0,
+            render_world_layer: true,
+            render_particle_layer: true,
             lod_bias: 1.0,
             render_scale,
             gpu_timing,
@@ -1913,8 +2052,8 @@ impl Renderer {
         let lifecycle = RendererLifecycleSnapshot::from_renderer(self);
         let (tex, view) = Self::create_raycast_texture_static(
             &self.device,
-            self.config.width,
-            self.config.height,
+            self.raycast_width,
+            self.raycast_height,
             wgpu::TextureFormat::Rgba16Float,
         );
         self.raycast_texture = tex;
@@ -2014,8 +2153,8 @@ impl Renderer {
     }
 
     /// Consume and return the most recently resolved GPU
-    /// **compute-pass** duration (SVDAG raycast dispatch), or `None` if
-    /// no new sample has been captured since the last call. Call once
+    /// **compute-pass** timestamp sample (SVDAG raycast dispatch), or
+    /// `None` if no new sample has been captured since the last call. Call once
     /// per frame after `render()` returns; the value is intended to be
     /// fed into `Perf` as the `render_gpu` metric (see
     /// `hash-thing-6x3`).
@@ -2030,12 +2169,12 @@ impl Renderer {
     /// Adapters without `Features::TIMESTAMP_QUERY` always return
     /// `None` — in that case the only render metric is the CPU-submit
     /// `render_cpu` from `main.rs`.
-    pub fn take_last_gpu_frame_time(&mut self) -> Option<Duration> {
-        self.last_gpu_frame_time.take()
+    pub fn take_last_gpu_frame_time(&mut self) -> Option<RendererGpuTimingSample> {
+        self.take_resolved_gpu_sample(true)
     }
 
     /// Consume and return the most recently resolved GPU
-    /// **render-pass** duration (blit + particles + HUD + hotbar +
+    /// **render-pass** timestamp sample (blit + particles + HUD + hotbar +
     /// legend), or `None` if no new sample has been captured since the
     /// last call. Companion to `take_last_gpu_frame_time()` — together
     /// they bracket the two GPU-expensive chunks of the frame encoder
@@ -2043,12 +2182,26 @@ impl Renderer {
     ///
     /// Returns `None` on adapters without `Features::TIMESTAMP_QUERY`
     /// and when `HASH_THING_DISABLE_TIMESTAMP_RESOLVE=1` is set.
-    pub fn take_last_render_pass_gpu_frame_time(&mut self) -> Option<Duration> {
-        self.last_render_pass_gpu_frame_time.take()
+    pub fn take_last_render_pass_gpu_frame_time(&mut self) -> Option<RendererGpuTimingSample> {
+        self.take_resolved_gpu_sample(false)
     }
 
     pub fn take_last_cpu_phase_times(&mut self) -> Option<RendererCpuPhaseTimes> {
         self.last_cpu_phase_times.take()
+    }
+
+    fn take_resolved_gpu_sample(&mut self, compute_pass: bool) -> Option<RendererGpuTimingSample> {
+        let sample = if compute_pass {
+            self.last_gpu_frame_time.take()
+        } else {
+            self.last_render_pass_gpu_frame_time.take()
+        }?;
+        let current_submit_seq = self.submit_fence.lock().unwrap().submit_seq;
+        let lag_frames = gpu_timing_lag_frames(current_submit_seq, sample);
+        Some(RendererGpuTimingSample {
+            duration: sample.duration,
+            lag_frames,
+        })
     }
 
     /// Upload (or re-upload) a serialized SVDAG to the GPU.
@@ -2076,11 +2229,10 @@ impl Renderer {
         // Grow the GPU buffer if needed. Resets the upload watermark — the
         // fresh buffer has nothing on it, so the next write must cover all.
         let mut require_full = false;
-        if self.svdag_buffer.is_none() || needed > self.svdag_buffer_cap {
-            let mut cap = self.svdag_buffer_cap.max(65536);
-            while cap < needed {
-                cap *= 2;
-            }
+        if self.svdag_buffer.is_none()
+            || should_reallocate_svdag_buffer(self.svdag_buffer_cap, needed)
+        {
+            let cap = svdag_buffer_cap_for_needed(needed);
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("svdag_buffer"),
                 size: cap,
@@ -2249,12 +2401,12 @@ impl Renderer {
         label_tex: &str,
         label_bg: &str,
         uniform_buffer: &wgpu::Buffer,
+        scale: u32,
     ) -> Option<(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup, u32, u32)> {
         if lines.is_empty() || lines.iter().all(|l| l.is_empty()) {
             return None;
         }
 
-        let scale = 2u32;
         let (pixels, w, h) = super::font::render_text_rgba(lines, scale);
 
         let size = wgpu::Extent3d {
@@ -2320,6 +2472,7 @@ impl Renderer {
             "legend_tex",
             "legend_bg",
             &self.legend_uniform_buffer,
+            2,
         ) {
             Some((texture, view, bind_group, w, h)) => {
                 self.legend_tex_w = w;
@@ -2345,6 +2498,7 @@ impl Renderer {
             "memo_hud_tex",
             "memo_hud_bg",
             &self.memo_hud_uniform_buffer,
+            self.memo_hud_scale,
         ) {
             Some((texture, view, bind_group, w, h)) => {
                 self.memo_hud_tex_w = w;
@@ -2364,15 +2518,21 @@ impl Renderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             let s = self.render_scale;
-            self.config.width = ((width as f32 * s) as u32).max(1);
-            self.config.height = ((height as f32 * s) as u32).max(1);
+            let ((surface_width, surface_height), (raycast_width, raycast_height)) =
+                surface_and_raycast_extents(width, height, s);
+            self.config.width = surface_width;
+            self.config.height = surface_height;
+            self.raycast_width = raycast_width;
+            self.raycast_height = raycast_height;
             log::info!(
-                "resize: physical={}x{} render_scale={} config={}x{} (dlse.2.2 pixel-workload log)",
+                "resize: physical={}x{} render_scale={} config={}x{} raycast={}x{} (dlse.2.2 pixel-workload log)",
                 width,
                 height,
                 s,
                 self.config.width,
                 self.config.height,
+                self.raycast_width,
+                self.raycast_height,
             );
             self.surface.configure(&self.device, &self.config);
             // Recreate storage texture to match new dimensions (5bb.6.1).
@@ -2396,13 +2556,13 @@ impl Renderer {
         // callbacks.
         let _ = self.device.poll(wgpu::PollType::Poll);
         if let Some(gt) = &self.gpu_timing {
-            if let Some(d) = gt.take_resolved() {
-                self.last_gpu_frame_time = Some(d);
+            if let Some(sample) = gt.take_resolved() {
+                self.last_gpu_frame_time = Some(sample);
             }
         }
         if let Some(gt) = &self.gpu_timing_render_pass {
-            if let Some(d) = gt.take_resolved() {
-                self.last_render_pass_gpu_frame_time = Some(d);
+            if let Some(sample) = gt.take_resolved() {
+                self.last_render_pass_gpu_frame_time = Some(sample);
             }
         }
 
@@ -2498,13 +2658,13 @@ impl Renderer {
                 self.volume_size as f32,
                 aspect,
                 fov_tan,
-                self.config.height as f32,
+                self.raycast_height as f32,
             ],
             debug: [
                 self.debug_mode as f32,
                 self.lod_bias,
-                self.config.width as f32,
-                self.config.height as f32,
+                self.raycast_width as f32,
+                self.raycast_height as f32,
             ],
         };
         self.queue
@@ -2585,8 +2745,8 @@ impl Renderer {
                 });
                 compute_pass.set_pipeline(&self.svdag_compute_pipeline);
                 compute_pass.set_bind_group(0, bg, &[]);
-                let wg_x = self.config.width.div_ceil(8);
-                let wg_y = self.config.height.div_ceil(8);
+                let wg_x = self.raycast_width.div_ceil(8);
+                let wg_y = self.raycast_height.div_ceil(8);
                 compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
             if compute_in_encoder_capturing {
@@ -2633,14 +2793,14 @@ impl Renderer {
             });
 
             // Blit compute output to swapchain (fullscreen triangle).
-            if self.svdag_compute_bind_group.is_some() {
+            if self.render_world_layer && self.svdag_compute_bind_group.is_some() {
                 render_pass.set_pipeline(&self.blit_pipeline);
                 render_pass.set_bind_group(0, &self.blit_bind_group, &[]);
                 render_pass.draw(0..3, 0..1); // fullscreen triangle = 3 verts
             }
 
             // Particle overlay — drawn after voxels with alpha blending.
-            if self.particle_count > 0 {
+            if self.render_particle_layer && self.particle_count > 0 {
                 if let Some(bg) = &self.particle_bind_group {
                     render_pass.set_pipeline(&self.particle_pipeline);
                     render_pass.set_bind_group(0, bg, &[]);
@@ -2816,12 +2976,12 @@ impl Renderer {
 
         if captured_compute_this_frame {
             if let Some(gt) = &self.gpu_timing {
-                gt.request_readback();
+                gt.request_readback(this_seq);
             }
         }
         if captured_render_pass_this_frame {
             if let Some(gt) = &self.gpu_timing_render_pass {
-                gt.request_readback();
+                gt.request_readback(this_seq);
             }
         }
 
@@ -2832,9 +2992,11 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_render_scale, classify_gpu, parse_present_mode, resolved_render_scale,
-        target_pixels_for_volume, ticks_to_duration, FrameOutcome, GpuClass, GpuTiming,
-        RenderScaleSource, RendererLifecycleSnapshot, SubmitFenceState,
+        auto_render_scale, classify_gpu, gpu_timing_lag_frames, parse_present_mode,
+        resolved_render_scale, scaled_render_extent, should_reallocate_svdag_buffer,
+        surface_and_raycast_extents, svdag_buffer_cap_for_needed, target_pixels_for_volume,
+        ticks_to_duration, FrameOutcome, GpuClass, GpuTiming, RenderScaleOverride,
+        RenderScaleSource, RendererLifecycleSnapshot, ResolvedGpuTimingSample, SubmitFenceState,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -2972,44 +3134,111 @@ mod tests {
     #[test]
     fn resolved_render_scale_cli_used_when_no_env() {
         // 1080p budget (2.07 M px) on a 5.24 M physical → scale ≈ 0.629.
-        let (s, src) = resolved_render_scale(None, Some(1920 * 1080), 2940 * 1782, 512, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.629).abs() < 0.01, "scale was {s}");
     }
 
     #[test]
     fn resolved_render_scale_env_wins_over_cli() {
         // Valid env beats CLI override.
-        let (s, src) =
-            resolved_render_scale(Some("0.75"), Some(1920 * 1080), 2940 * 1782, 512, None);
+        let (s, src) = resolved_render_scale(
+            Some("0.75"),
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            None,
+        );
         assert_eq!(src, RenderScaleSource::EnvOverride);
         assert!((s - 0.75).abs() < 1e-6);
     }
 
     #[test]
     fn resolved_render_scale_cli_used_when_env_invalid() {
-        // Invalid env + CLI present → CliOverride (typo signal surfaced
+        // Invalid env + CLI present → CLI override (typo signal surfaced
         // separately by the call site's log line, not by source enum).
-        let (s, src) =
-            resolved_render_scale(Some("garbage"), Some(1920 * 1080), 2940 * 1782, 512, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            Some("garbage"),
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.629).abs() < 0.01, "scale was {s}");
     }
 
     #[test]
     fn resolved_render_scale_cli_clamps_high() {
         // Asking for 4K on a 720p screen → clamps to 1.0 (native, no upscale).
-        let (s, src) = resolved_render_scale(None, Some(3840 * 2160), 1280 * 720, 256, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(3840 * 2160)),
+            1280 * 720,
+            256,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 1.0).abs() < 1e-6, "scale was {s}");
     }
 
     #[test]
     fn resolved_render_scale_cli_clamps_low() {
         // Asking for tiny budget on a huge display clamps to the 0.125 floor.
-        let (s, src) = resolved_render_scale(None, Some(160 * 90), 5000 * 5000, 1024, None);
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(160 * 90)),
+            5000 * 5000,
+            1024,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.125).abs() < 1e-6, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_demo_fixed_scale_uses_floor() {
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::FixedScale(0.25)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliFixedScale);
+        assert!((s - 0.25).abs() < 1e-6, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_env_wins_over_demo_fixed_scale() {
+        let (s, src) = resolved_render_scale(
+            Some("0.75"),
+            Some(RenderScaleOverride::FixedScale(0.25)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::EnvOverride);
+        assert!((s - 0.75).abs() < 1e-6, "scale was {s}");
+    }
+
+    #[test]
+    fn resolved_render_scale_invalid_env_falls_back_to_demo_fixed_scale() {
+        let (s, src) = resolved_render_scale(
+            Some("garbage"),
+            Some(RenderScaleOverride::FixedScale(0.25)),
+            2940 * 1782,
+            512,
+            None,
+        );
+        assert_eq!(src, RenderScaleSource::CliFixedScale);
+        assert!((s - 0.25).abs() < 1e-6, "scale was {s}");
     }
 
     // --- hash-thing-pfpn: GPU-class classifier + class-default
@@ -3164,8 +3393,7 @@ mod tests {
         // clamp to ~0.74 instead of staying at the v3.1 spec's 1.0.
         // This test enforces the unclamped class default for the strong
         // dGPU bucket.
-        let info =
-            synthetic_adapter_info("NVIDIA GeForce RTX 3060", wgpu::DeviceType::DiscreteGpu);
+        let info = synthetic_adapter_info("NVIDIA GeForce RTX 3060", wgpu::DeviceType::DiscreteGpu);
         let (s, src) = resolved_render_scale(None, None, 2560 * 1440, 256, Some(&info));
         assert_eq!(src, RenderScaleSource::AutoPickedByGpuClass);
         assert!((s - 1.0).abs() < 1e-6, "scale was {s}, expected 1.0");
@@ -3178,10 +3406,12 @@ mod tests {
         // back to the class default (0.5), not the pixel-budget pick.
         // Source stays EnvInvalidFallback so the typo signal is visible.
         let info = synthetic_adapter_info("Apple M2", wgpu::DeviceType::IntegratedGpu);
-        let (s, src) =
-            resolved_render_scale(Some("garbage"), None, 2940 * 1782, 1024, Some(&info));
+        let (s, src) = resolved_render_scale(Some("garbage"), None, 2940 * 1782, 1024, Some(&info));
         assert_eq!(src, RenderScaleSource::EnvInvalidFallback);
-        assert!((s - 0.5).abs() < 1e-6, "scale was {s}, expected class default 0.5");
+        assert!(
+            (s - 0.5).abs() < 1e-6,
+            "scale was {s}, expected class default 0.5"
+        );
     }
 
     #[test]
@@ -3189,12 +3419,13 @@ mod tests {
         // Same contract as above for the strong dGPU bucket — the
         // class default of 1.0 must survive an env typo, not collapse
         // to the pixel-budget pick.
-        let info =
-            synthetic_adapter_info("NVIDIA GeForce RTX 3070", wgpu::DeviceType::DiscreteGpu);
-        let (s, src) =
-            resolved_render_scale(Some("nonsense"), None, 2560 * 1440, 256, Some(&info));
+        let info = synthetic_adapter_info("NVIDIA GeForce RTX 3070", wgpu::DeviceType::DiscreteGpu);
+        let (s, src) = resolved_render_scale(Some("nonsense"), None, 2560 * 1440, 256, Some(&info));
         assert_eq!(src, RenderScaleSource::EnvInvalidFallback);
-        assert!((s - 1.0).abs() < 1e-6, "scale was {s}, expected class default 1.0");
+        assert!(
+            (s - 1.0).abs() < 1e-6,
+            "scale was {s}, expected class default 1.0"
+        );
     }
 
     #[test]
@@ -3230,9 +3461,14 @@ mod tests {
     fn resolved_cli_still_wins_with_adapter() {
         // CLI beats class default.
         let info = synthetic_adapter_info("Apple M2", wgpu::DeviceType::IntegratedGpu);
-        let (s, src) =
-            resolved_render_scale(None, Some(1920 * 1080), 2940 * 1782, 512, Some(&info));
-        assert_eq!(src, RenderScaleSource::CliOverride);
+        let (s, src) = resolved_render_scale(
+            None,
+            Some(RenderScaleOverride::TargetPixels(1920 * 1080)),
+            2940 * 1782,
+            512,
+            Some(&info),
+        );
+        assert_eq!(src, RenderScaleSource::CliTargetPixels);
         assert!((s - 0.629).abs() < 0.01, "scale was {s}");
     }
 
@@ -3388,6 +3624,25 @@ mod tests {
     }
 
     #[test]
+    fn svdag_buffer_capacity_rounds_up_to_power_of_two_floor() {
+        assert_eq!(svdag_buffer_cap_for_needed(0), 65_536);
+        assert_eq!(svdag_buffer_cap_for_needed(1), 65_536);
+        assert_eq!(svdag_buffer_cap_for_needed(65_536), 65_536);
+        assert_eq!(svdag_buffer_cap_for_needed(65_537), 131_072);
+        assert_eq!(svdag_buffer_cap_for_needed(1_000_000), 1_048_576);
+    }
+
+    #[test]
+    fn svdag_buffer_reallocate_grows_and_shrinks_material_drops_only() {
+        assert!(should_reallocate_svdag_buffer(0, 1));
+        assert!(should_reallocate_svdag_buffer(65_536, 65_537));
+        assert!(!should_reallocate_svdag_buffer(65_536, 1));
+        assert!(!should_reallocate_svdag_buffer(1_048_576, 300_000));
+        assert!(should_reallocate_svdag_buffer(1_048_576, 262_144));
+        assert!(should_reallocate_svdag_buffer(1_048_576, 64_000));
+    }
+
+    #[test]
     fn frame_outcome_variants_are_distinct() {
         // hash-thing-8jp — if a future refactor collapses or removes a
         // variant, this pins the semantic split between the four cases so
@@ -3488,6 +3743,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scaled_render_extent_uses_scale_with_minimum_one_pixel() {
+        assert_eq!(scaled_render_extent(3840, 2160, 0.125), (480, 270));
+        assert_eq!(scaled_render_extent(1, 1, 0.125), (1, 1));
+    }
+
+    #[test]
+    fn surface_and_raycast_extents_keep_surface_physical() {
+        let (surface, raycast) = surface_and_raycast_extents(3840, 2160, 0.125);
+        assert_eq!(surface, (3840, 2160));
+        assert_eq!(raycast, (480, 270));
+
+        let (surface, raycast) = surface_and_raycast_extents(1, 100, 0.125);
+        assert_eq!(surface, (1, 100));
+        assert_eq!(raycast, (1, 12));
+    }
+
     // hash-thing-lwa2 — device-backed coverage for the two-instance
     // GpuTiming path introduced by dlse.2.4. Tests graceful-skip on
     // adapters without TIMESTAMP_QUERY so CI hosts without a supported
@@ -3577,7 +3849,7 @@ mod tests {
         compute.write_timestamp_end(&mut encoder);
         compute.encode_resolve(&mut encoder);
         queue.submit(std::iter::once(encoder.finish()));
-        compute.request_readback();
+        compute.request_readback(11);
 
         // Pump the `map_async` callback synchronously. The
         // `wait_indefinitely` variant blocks until every pending
@@ -3599,13 +3871,103 @@ mod tests {
         // Drain compute; confirm it returns a duration (the two
         // timestamps are close but non-negative per the saturating
         // subtract in `ticks_to_duration`). Render must still be IDLE.
-        let dur = compute
+        let sample = compute
             .take_resolved()
             .expect("compute readback must be ready after Wait poll");
-        let _ = dur; // value is backend-dependent; shape is what we pin.
+        let _ = sample.duration; // value is backend-dependent; shape is what we pin.
+        assert_eq!(sample.submit_seq, 11);
         assert!(compute.is_idle(), "compute must return to IDLE after take");
         assert!(render.is_idle(), "render still untouched");
         assert!(render.take_resolved().is_none());
+    }
+
+    #[test]
+    fn gpu_timing_resolved_sample_keeps_original_submit_seq_after_skipped_frame() {
+        let Some((device, queue, period, in_encoder)) = try_make_timestamp_device() else {
+            return;
+        };
+        if !in_encoder {
+            return;
+        }
+
+        let timing = GpuTiming::new(&device, period, true, "test_submit_seq");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_submit_seq_encoder"),
+        });
+        timing.write_timestamp_begin(&mut encoder);
+        timing.write_timestamp_end(&mut encoder);
+        timing.encode_resolve(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        timing.request_readback(41);
+
+        // Simulate an intervening skipped instrumentation frame: a later
+        // request must not overwrite the pending sample's submit sequence.
+        timing.request_readback(42);
+
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let sample = timing
+            .take_resolved()
+            .expect("readback must be ready after Wait poll");
+        assert_eq!(sample.submit_seq, 41);
+    }
+
+    #[test]
+    fn gpu_timing_independent_instances_preserve_distinct_submit_seqs() {
+        let Some((device, queue, period, in_encoder)) = try_make_timestamp_device() else {
+            return;
+        };
+        if !in_encoder {
+            return;
+        }
+
+        let compute = GpuTiming::new(&device, period, true, "test_seq_compute");
+        let render = GpuTiming::new(&device, period, true, "test_seq_render");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_independent_seq_encoder"),
+        });
+        compute.write_timestamp_begin(&mut encoder);
+        compute.write_timestamp_end(&mut encoder);
+        compute.encode_resolve(&mut encoder);
+        render.write_timestamp_begin(&mut encoder);
+        render.write_timestamp_end(&mut encoder);
+        render.encode_resolve(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        compute.request_readback(7);
+        render.request_readback(8);
+
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let compute_sample = compute
+            .take_resolved()
+            .expect("compute readback must be ready");
+        let render_sample = render
+            .take_resolved()
+            .expect("render readback must be ready");
+        assert_eq!(compute_sample.submit_seq, 7);
+        assert_eq!(render_sample.submit_seq, 8);
+    }
+
+    #[test]
+    fn gpu_timing_lag_frames_uses_current_submit_seq() {
+        let lag = gpu_timing_lag_frames(
+            7,
+            ResolvedGpuTimingSample {
+                duration: Duration::from_millis(2),
+                submit_seq: 4,
+            },
+        );
+        assert_eq!(lag, Some(3));
+    }
+
+    #[test]
+    fn gpu_timing_lag_frames_suppresses_impossible_ordering() {
+        let lag = gpu_timing_lag_frames(
+            7,
+            ResolvedGpuTimingSample {
+                duration: Duration::from_millis(5),
+                submit_seq: 8,
+            },
+        );
+        assert_eq!(lag, None);
     }
 
     // --- hash-thing-dbz5.1: SubmitFenceState semantics ---

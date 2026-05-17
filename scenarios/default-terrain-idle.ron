@@ -1,0 +1,13 @@
+(
+    name: "default-terrain-idle",
+    world: Tiny,
+    level: Some(5),
+    scene: DefaultTerrain,
+    rule_set: DefaultCa,
+    intensity: Idle,
+    regime: Saturated,
+    backend: HashlifeRecursive,
+    generations: 3,
+    seed: 1,
+    comparator: Some("chunk-array@same-scenario"),
+)
